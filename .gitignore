@@ -35,3 +35,9 @@ python/build
 # host arch, shipped in release wheels — not committed.
 python/vmon/_agent/
 
+# Python tooling caches and virtualenvs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
