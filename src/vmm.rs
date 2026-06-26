@@ -151,7 +151,7 @@ pub struct Vmm {
 	boot_mode:       BootMode,
 	firmware:        Option<PathBuf>,
 	#[cfg(target_arch = "x86_64")]
-	#[allow(dead_code)]
+	#[allow(dead_code, reason = "UEFI firmware mmap must stay alive but is not read afterwards")]
 	firmware_memory: Option<crate::memory::GuestMemoryMmap>,
 	gate:            Arc<PauseGate>,
 
@@ -1095,10 +1095,17 @@ fn deadline_to_unix(deadline: Instant) -> i64 {
 	let now = Instant::now();
 	let now_unix = unix_now_secs();
 	if deadline >= now {
-		now_unix.saturating_add(deadline.duration_since(now).as_secs() as i64)
+		let delta = i64::try_from(deadline.duration_since(now).as_secs()).unwrap_or(i64::MAX);
+		now_unix.saturating_add(delta)
 	} else {
-		now_unix.saturating_sub(now.duration_since(deadline).as_secs() as i64)
+		let delta = i64::try_from(now.duration_since(deadline).as_secs()).unwrap_or(i64::MAX);
+		now_unix.saturating_sub(delta)
 	}
+}
+
+fn checked_deadline(base: Instant, secs: u64, label: &str) -> Result<Instant> {
+	base.checked_add(Duration::from_secs(secs))
+		.ok_or_else(|| err(format!("{label} is too far in the future")))
 }
 
 /// Record the VMM exit reason; the first writer wins so the root cause is not
@@ -1216,14 +1223,32 @@ fn cleanup_control_server(control_server: Option<&control::ControlServer>) {
 /// `--count 1` is forced on the children so they take the single-fork path (no
 /// recursion).
 fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
-	use std::process::Command;
+	use std::process::{Child, Command};
 
-	fn wait_for_child(children: &mut Vec<(u32, std::process::Child)>) -> Result<()> {
+	fn terminate_fork_children(children: &mut Vec<(u32, Child)>) {
+		for (i, child) in children.iter_mut() {
+			if let Err(e) = child.kill() {
+				warn!("failed to stop fork child {i} after sibling failure: {e}");
+			}
+		}
+		while let Some((i, mut child)) = children.pop() {
+			if let Err(e) = child.wait() {
+				warn!("failed to reap fork child {i} after sibling failure: {e}");
+			}
+		}
+	}
+
+	fn wait_for_child(children: &mut Vec<(u32, Child)>) -> Result<()> {
 		let (i, mut child) = children.remove(0);
-		let status = child
-			.wait()
-			.map_err(|e| err(format!("waiting for fork child {i}: {e}")))?;
+		let status = match child.wait() {
+			Ok(status) => status,
+			Err(e) => {
+				terminate_fork_children(children);
+				return Err(err(format!("waiting for fork child {i}: {e}")));
+			},
+		};
 		if !status.success() {
+			terminate_fork_children(children);
 			return Err(err(format!("fork child {i} exited with {status}")));
 		}
 		Ok(())
@@ -1360,9 +1385,13 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 			}
 		}
 		info!("fork child {i}: tap=tap{i} mac=02:00:00:00:00:{:02x}", i + 1);
-		let child = cmd
-			.spawn()
-			.map_err(|e| err(format!("spawning fork child {i}: {e}")))?;
+		let child = match cmd.spawn() {
+			Ok(child) => child,
+			Err(e) => {
+				terminate_fork_children(&mut children);
+				return Err(err(format!("spawning fork child {i}: {e}")));
+			},
+		};
 		children.push((i, child));
 	}
 	while !children.is_empty() {
@@ -2336,7 +2365,8 @@ impl Vmm {
 			// VMM self-terminates; `extend` resets self.deadline live.
 			self.deadline = self
 				.timeout_secs
-				.map(|secs| self.started_at + Duration::from_secs(secs));
+				.map(|secs| checked_deadline(self.started_at, secs, "--timeout-secs"))
+				.transpose()?;
 			exit = loop {
 				self.sweep_pager_if_needed();
 				let wait = match self.deadline {
@@ -2382,7 +2412,8 @@ impl Vmm {
 			let deadline_timer = if self.pager.is_some() {
 				let deadline = self
 					.timeout_secs
-					.map(|secs| self.started_at + Duration::from_secs(secs));
+					.map(|secs| checked_deadline(self.started_at, secs, "--timeout-secs"))
+					.transpose()?;
 				loop {
 					if self.gate.state() == RunState::Stopping {
 						break None;
@@ -2399,10 +2430,12 @@ impl Vmm {
 					thread::sleep(Duration::from_millis(200));
 				}
 			} else {
-				self.timeout_secs.map(|secs| {
-					let gate = self.gate.clone();
-					let exit_reason = self.exit_reason.clone();
-					let deadline = self.started_at + Duration::from_secs(secs);
+				self
+					.timeout_secs
+					.map(|secs| {
+						let gate = self.gate.clone();
+						let exit_reason = self.exit_reason.clone();
+						let deadline = checked_deadline(self.started_at, secs, "--timeout-secs")?;
 					thread::spawn(move || {
 						loop {
 							let now = Instant::now();
@@ -2419,8 +2452,25 @@ impl Vmm {
 								Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
 							);
 						}
+						Ok(thread::spawn(move || {
+							loop {
+								let now = Instant::now();
+								if now >= deadline {
+									set_exit_reason(&exit_reason, VmmExit::Timeout);
+									gate.set_state(RunState::Stopping);
+									gate.signal_all_vcpus();
+									return;
+								}
+								if gate.state() == RunState::Stopping {
+									return;
+								}
+								thread::sleep(
+									Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
+								);
+							}
+						}))
 					})
-				})
+					.transpose()?
 			};
 			let handles = std::mem::take(&mut self.vcpu_handles);
 			let mut join_error = None;
@@ -2547,8 +2597,10 @@ impl Vmm {
 				// Re-arm the hard deadline to now + secs (works even when no
 				// --timeout-secs was set at launch); the run loop reads
 				// self.deadline each iteration.
-				self.deadline = Some(Instant::now() + Duration::from_secs(secs));
-				let deadline_unix = self.deadline.map_or_else(unix_now_secs, deadline_to_unix);
+				let deadline = checked_deadline(Instant::now(), secs, "extend params.secs")
+					.map_err(|e| control::ApiError::bad_request(e.to_string()))?;
+				self.deadline = Some(deadline);
+				let deadline_unix = deadline_to_unix(deadline);
 				Ok(json!({ "deadline_unix": deadline_unix }))
 			},
 		}
@@ -2784,14 +2836,23 @@ impl Vmm {
 			RunState::Stopping => return Err(err("resume failed: VM is stopping")),
 			RunState::Paused => {},
 		}
-		for d in &self.devices {
-			let _ = d.resume_evt.write(1);
+		for (device_index, d) in self.devices.iter().enumerate() {
+			if let Err(e) = d.resume_evt.write(1) {
+				return self.fail_resume(err(format!(
+					"resume worker signal failed for device {device_index} {}: {e}",
+					device_kind_name(d.kind)
+				)));
+			}
 		}
 		// Flip to Running BEFORE releasing vCPUs, else a woken vCPU re-checks the
 		// gate, still sees Paused, and immediately re-parks (resume would hang).
 		self.gate.set_state(RunState::Running);
-		for tx in &self.vcpu_cmd_txs {
-			let _ = tx.send(VcpuCmd::Resume);
+		for (vcpu_id, tx) in self.vcpu_cmd_txs.iter().enumerate() {
+			if tx.send(VcpuCmd::Resume).is_err() {
+				return self.fail_resume(err(format!(
+					"resume command failed for vCPU {vcpu_id}: vcpu thread gone"
+				)));
+			}
 		}
 		Ok(())
 	}
@@ -3309,7 +3370,7 @@ fn wire_device(
 /// Wire one x86 virtio-pci function: legacy irqfd fallback, PCI config-space
 /// function, BAR dispatcher entry, worker control eventfds, and worker spec.
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "Complexity is required to wire a PCI virtio device")]
 fn wire_pci_device(
 	vm: &Vm,
 	pci_root: &Arc<Mutex<PciRoot>>,
