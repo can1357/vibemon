@@ -42,7 +42,7 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 /// HVF uses the backend kicker installed on [`PauseGate`] instead of POSIX
 /// signals because Hypervisor.framework exposes an explicit vCPU-exit API.
 #[cfg(target_os = "linux")]
-pub(crate) mod pause_signal {
+pub mod pause_signal {
 	use parking_lot::Mutex;
 
 	use crate::result::Result;
@@ -52,7 +52,7 @@ pub(crate) mod pause_signal {
 		libc::SIGRTMIN()
 	}
 
-	extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+	const extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
 	/// Install the no-op handler without `SA_RESTART` so a delivered signal
 	/// makes an in-flight `KVM_RUN` ioctl return `EINTR`.
@@ -202,6 +202,7 @@ impl PauseGate {
 
 	/// Install a backend-specific wakeup for vCPU APIs that are not
 	/// signal-driven.
+	#[cfg(target_os = "macos")]
 	pub fn set_kicker(&self, kicker: Arc<dyn Fn() + Send + Sync>) {
 		*self.kicker.lock() = Some(kicker);
 	}
@@ -656,6 +657,7 @@ fn chown_path(path: &Path, owner: SocketOwner) -> Result<()> {
 	Ok(())
 }
 
+#[allow(clippy::useless_conversion, reason = "mode_t is u16 on macOS but u32 on Linux")]
 fn chmod_path(path: &Path, mode: libc::mode_t) -> Result<()> {
 	let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
 		err(format!("control socket path {} contains an interior NUL byte", path.display()))

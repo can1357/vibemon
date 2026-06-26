@@ -179,7 +179,7 @@ struct Cgroup {
 impl Cgroup {
 	fn setup(config: &Config, id: &str) -> Result<Self> {
 		match config.cgroup_mode {
-			CgroupMode::Off => Ok(Cgroup { path: None }),
+			CgroupMode::Off => Ok(Self { path: None }),
 			CgroupMode::V2 => Self::setup_v2(config, id),
 		}
 	}
@@ -205,7 +205,7 @@ impl Cgroup {
 			.unwrap_or(DEFAULT_PIDS_MAX)
 			.to_string();
 		write_value(&path.join("pids.max"), &pids_max)?;
-		Ok(Cgroup { path: Some(path) })
+		Ok(Self { path: Some(path) })
 	}
 
 	fn place(&self, pid: libc::pid_t) -> Result<()> {

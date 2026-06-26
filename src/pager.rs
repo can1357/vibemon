@@ -31,14 +31,14 @@ mod linux {
 	const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
 	const UFFD_FEATURE_MISSING_SHMEM: u64 = 1 << 5;
 	const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
-	#[allow(dead_code)]
+	#[allow(dead_code, reason = "kernel constant is kept for future userfaultfd mode support")]
 	const UFFD_USER_MODE_ONLY: i32 = 1;
 	const UFFDIO_API_IOCTL: u64 = 0xc018_aa3f;
 	const UFFDIO_REGISTER_IOCTL: u64 = 0xc020_aa00;
 	const UFFDIO_COPY_IOCTL: u64 = 0xc028_aa03;
 	const UFFD_REGISTER_COPY_BIT: u64 = 1 << 3;
 
-	pub(crate) const PAGE_SIZE: usize = 4096;
+	pub const PAGE_SIZE: usize = 4096;
 	const SWAP_SLOT_SIZE: usize = PAGE_SIZE + 1;
 	const MAX_EVICT_PER_SWEEP: usize = 8192;
 	const SHARDS: usize = 256;
@@ -121,7 +121,7 @@ mod linux {
 			self.free.push(slot);
 		}
 
-		fn used_pages(&self) -> usize {
+		const fn used_pages(&self) -> usize {
 			self.next as usize - self.free.len()
 		}
 	}
@@ -144,6 +144,10 @@ mod linux {
 		disabled:        AtomicBool,
 	}
 
+	#[allow(
+		clippy::non_send_fields_in_send_ty,
+		reason = "raw region pointers reference guest memory mappings owned for the Pager lifetime"
+	)]
 	// SAFETY: PagerRegion raw pointers point into GuestMemoryMmap mappings owned by
 	// Vmm. Vmm holds that memory for at least as long as the Pager and stops the
 	// handler before drop.
@@ -213,13 +217,11 @@ mod linux {
 				.truncate(true)
 				.mode(0o600)
 				.open(path)
-				.map_err(|e| err(format!("opening zram swap file {path:?}: {e}")))?;
+				.map_err(|e| err(format!("opening zram swap file {}: {e}", path.display())))?;
 			return Ok(file.into());
 		}
 
-		let dir = std::env::var_os("TMPDIR")
-			.map(PathBuf::from)
-			.unwrap_or_else(|| PathBuf::from("/tmp"));
+		let dir = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
 		match OpenOptions::new()
 			.read(true)
 			.write(true)
@@ -229,14 +231,11 @@ mod linux {
 		{
 			Ok(file) => Ok(file.into()),
 			Err(e)
-				if matches!(
-					e.raw_os_error(),
-					Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL)
-				) =>
+				if matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)) =>
 			{
 				open_unlinked_swap_file(&dir)
 			},
-			Err(e) => Err(err(format!("creating anonymous zram swap file in {dir:?}: {e}"))),
+			Err(e) => Err(err(format!("creating anonymous zram swap file in {}: {e}", dir.display()))),
 		}
 	}
 
@@ -249,14 +248,14 @@ mod linux {
 			.truncate(true)
 			.mode(0o600)
 			.open(&path)
-			.map_err(|e| err(format!("creating zram swap file {path:?}: {e}")))?;
+			.map_err(|e| err(format!("creating zram swap file {}: {e}", path.display())))?;
 		if let Err(e) = std::fs::remove_file(&path) {
-			return Err(err(format!("unlinking zram swap file {path:?}: {e}")));
+			return Err(err(format!("unlinking zram swap file {}: {e}", path.display())));
 		}
 		Ok(file.into())
 	}
 
-	pub(crate) fn register_missing(uffd: RawFd, start: u64, len: u64) -> Result<()> {
+	pub fn register_missing(uffd: RawFd, start: u64, len: u64) -> Result<()> {
 		let mut reg = UffdioRegister {
 			range:  UffdioRange { start, len },
 			mode:   UFFDIO_REGISTER_MODE_MISSING,
@@ -354,7 +353,7 @@ mod linux {
 			mem: &GuestMemoryMmap,
 			target_pages: usize,
 			store_max_bytes: usize,
-		) -> Result<Arc<Pager>> {
+		) -> Result<Arc<Self>> {
 			let mut regions = Vec::new();
 			let mut total_pages = 0usize;
 			for region in mem.iter() {
@@ -404,7 +403,7 @@ mod linux {
 			// SAFETY: `stop_fd` was just returned by `eventfd` and is not owned
 			// by any Rust value yet.
 			let stop_evt = unsafe { OwnedFd::from_raw_fd(stop_fd) };
-			Ok(Arc::new(Pager {
+			Ok(Arc::new(Self {
 				uffd,
 				stop_evt,
 				regions,
@@ -423,7 +422,7 @@ mod linux {
 			}))
 		}
 
-		pub fn handler_loop(self: Arc<Pager>) {
+		pub fn handler_loop(self: Arc<Self>) {
 			let uffd = self.uffd.as_raw_fd();
 			let stop = self.stop_evt.as_raw_fd();
 			loop {
@@ -774,18 +773,21 @@ mod linux {
 			None
 		}
 
+		#[allow(clippy::unused_self, reason = "keeps bit helpers as Pager methods for API symmetry")]
 		fn bit_is_set(&self, bits: &[AtomicU64], idx: usize) -> bool {
 			let word = idx / 64;
 			let bit = 1u64 << (idx % 64);
 			bits[word].load(Ordering::SeqCst) & bit != 0
 		}
 
+		#[allow(clippy::unused_self, reason = "keeps bit helpers as Pager methods for API symmetry")]
 		fn set_bit(&self, bits: &[AtomicU64], idx: usize) {
 			let word = idx / 64;
 			let bit = 1u64 << (idx % 64);
 			bits[word].fetch_or(bit, Ordering::SeqCst);
 		}
 
+		#[allow(clippy::unused_self, reason = "keeps bit helpers as Pager methods for API symmetry")]
 		fn clear_bit(&self, bits: &[AtomicU64], idx: usize) {
 			let word = idx / 64;
 			let bit = !(1u64 << (idx % 64));

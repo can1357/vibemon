@@ -11,7 +11,7 @@ const PAGE_SIZE: usize = 4096;
 /// Concrete guest-memory type used throughout the VMM (no dirty-page bitmap).
 pub type GuestMemoryMmap = VmGuestMemoryMmap<()>;
 
-/// Split a requested RAM size into guest-physical regions (x86_64): all RAM
+/// Split a requested RAM size into guest-physical regions (`x86_64)`: all RAM
 /// below the 32-bit MMIO gap at GPA 0, the remainder relocated above 4 GiB.
 #[cfg(target_arch = "x86_64")]
 pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
@@ -89,14 +89,14 @@ mod linux {
 		Ok(file)
 	}
 
-	pub(super) fn private_mmap_flags() -> libc::c_int {
+	pub(super) const fn private_mmap_flags() -> libc::c_int {
 		libc::MAP_NORESERVE | libc::MAP_PRIVATE
 	}
 
 	/// Hint the host KSM daemon to dedup identical anonymous/COW pages in guest
 	/// RAM across co-resident guests. No-op unless the operator enabled KSM
 	/// (/sys/kernel/mm/ksm/run). Only anonymous pages are scanned, so this is
-	/// effective for MAP_PRIVATE fork clones' COWed pages; harmless on the
+	/// effective for `MAP_PRIVATE` fork clones' `COWed` pages; harmless on the
 	/// shared memfd.
 	pub fn advise_mergeable(mem: &GuestMemoryMmap) {
 		use vm_memory::{GuestMemory, GuestMemoryRegion};

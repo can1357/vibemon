@@ -32,17 +32,17 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
-	pub fn new(
+	pub const fn new(
 		uid: Option<u32>,
 		gid: Option<u32>,
 		paths: SandboxPaths,
 		seccomp_action: SeccompAction,
 	) -> Self {
-		SandboxConfig { uid, gid, paths, seccomp_action }
+		Self { uid, gid, paths, seccomp_action }
 	}
 }
 
-/// Privilege phase: set no_new_privs and drop root. Runs BEFORE the VMM opens
+/// Privilege phase: set `no_new_privs` and drop root. Runs BEFORE the VMM opens
 /// /dev/kvm and backing files so every fd belongs to the dropped uid.
 pub fn apply_privilege_phase(config: &SandboxConfig) -> Result<()> {
 	set_no_new_privs()?;
@@ -249,7 +249,7 @@ pub fn compile_seccomp_filter(action: SeccompAction) -> Result<BpfProgram> {
 	Ok(filter)
 }
 
-fn seccomp_default_action(action: SeccompAction) -> SeccompilerAction {
+const fn seccomp_default_action(action: SeccompAction) -> SeccompilerAction {
 	match action {
 		// The CLI value is historically named `kill`, but Phase 5's audit
 		// default is SIGSYS/Trap so denials are diagnosable.
@@ -531,6 +531,8 @@ mod tests {
 		let pid = unsafe { libc::fork() };
 		assert!(pid >= 0, "fork failed");
 		if pid == 0 {
+			// SAFETY: the child passes constant arguments to libc and raw syscalls,
+			// checks each return value, and applies the parent-compiled seccomp program.
 			let code = unsafe {
 				if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
 					10
@@ -548,9 +550,13 @@ mod tests {
 					0
 				}
 			};
+			// SAFETY: this is the forked child path; `_exit` terminates immediately
+			// without running inherited parent destructors.
 			unsafe { libc::_exit(code) };
 		}
 		let mut status = 0i32;
+		// SAFETY: `status` points to valid local storage, `pid` is the child
+		// returned by `fork`, and options `0` is valid.
 		assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "waitpid");
 		assert!(libc::WIFEXITED(status), "child killed, status {status}");
 		assert_eq!(

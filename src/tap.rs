@@ -47,7 +47,7 @@ mod platform {
 
 	impl Tap {
 		/// Attach to (or create) the tap interface named `name`.
-		pub fn open(name: &str, mac: [u8; 6]) -> Result<Tap> {
+		pub fn open(name: &str, mac: [u8; 6]) -> Result<Self> {
 			if name.len() >= 16 {
 				bail!("tap name {name:?} too long");
 			}
@@ -72,7 +72,7 @@ mod platform {
 			set_offloads(file.as_raw_fd(), 0)?;
 
 			set_nonblocking(file.as_raw_fd())?;
-			Ok(Tap { file, mac })
+			Ok(Self { file, mac })
 		}
 
 		/// Read one vnet-header-prefixed Ethernet frame from the TAP fd.
@@ -100,7 +100,7 @@ mod platform {
 		}
 
 		/// Return the MAC address advertised to the virtio-net guest.
-		pub fn mac(&self) -> [u8; 6] {
+		pub const fn mac(&self) -> [u8; 6] {
 			self.mac
 		}
 

@@ -181,7 +181,8 @@ mod linux {
 			.store(swapped_pages as u64, Ordering::Relaxed);
 	}
 
-	/// Count one guest-memory region successfully marked MADV_MERGEABLE for KSM.
+	/// Count one guest-memory region successfully marked `MADV_MERGEABLE` for
+	/// KSM.
 	pub fn record_ksm_region() {
 		METRICS.ksm_regions_advised.fetch_add(1, Ordering::Relaxed);
 	}

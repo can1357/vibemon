@@ -6,6 +6,8 @@
 //! kernel. Once running, an optional Unix control socket drives
 //! pause/resume/snapshot.
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicBool;
 use std::{
 	collections::VecDeque,
 	fs,
@@ -18,7 +20,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicBool, AtomicU8, Ordering},
+		atomic::{AtomicU8, Ordering},
 	},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant},
@@ -579,7 +581,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn prebind_jail_sockets(config: &Config, launch_uid: u32) -> Result<PreboundSockets> {
+pub fn prebind_jail_sockets(config: &Config, launch_uid: u32) -> Result<PreboundSockets> {
 	Ok(PreboundSockets {
 		control_server: bind_control_socket(
 			config.api_sock.clone(),
@@ -1036,6 +1038,7 @@ fn signal_drain_resume_if_needed(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps, reason = "returns Result for API symmetry")]
 fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> {
 	let mut paths = crate::sandbox::SandboxPaths::default();
 	if let Some(path) = &config.kernel {
@@ -1154,6 +1157,16 @@ fn checked_deadline(base: Instant, secs: u64, label: &str) -> Result<Instant> {
 	base
 		.checked_add(Duration::from_secs(secs))
 		.ok_or_else(|| err(format!("{label} is too far in the future")))
+}
+
+fn deadline_or_now(base: Instant, secs: u64, label: &str) -> Instant {
+	match checked_deadline(base, secs, label) {
+		Ok(deadline) => deadline,
+		Err(e) => {
+			warn!("{e}; expiring immediately");
+			base
+		},
+	}
 }
 
 /// Record the VMM exit reason; the first writer wins so the root cause is not
@@ -2232,7 +2245,7 @@ impl Vmm {
 				let gate = self.gate.clone();
 				let exit_reason = self.exit_reason.clone();
 				self.vcpu_handles.push(thread::spawn(move || {
-					run_vcpu(vcpu, pio, mmio, id as u8, gate, exit_reason, rx, xsave_size)
+					run_vcpu(vcpu, pio, mmio, id as u8, gate, exit_reason, rx, xsave_size);
 				}));
 			}
 		}
@@ -2412,8 +2425,7 @@ impl Vmm {
 			// VMM self-terminates; `extend` resets self.deadline live.
 			self.deadline = self
 				.timeout_secs
-				.map(|secs| checked_deadline(self.started_at, secs, "--timeout-secs"))
-				.transpose()?;
+				.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
 			exit = loop {
 				self.sweep_pager_if_needed();
 				let wait = match self.deadline {
@@ -2459,8 +2471,7 @@ impl Vmm {
 			let deadline_timer = if self.pager.is_some() {
 				let deadline = self
 					.timeout_secs
-					.map(|secs| checked_deadline(self.started_at, secs, "--timeout-secs"))
-					.transpose()?;
+					.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
 				loop {
 					if self.gate.state() == RunState::Stopping {
 						break None;
@@ -2477,31 +2488,28 @@ impl Vmm {
 					thread::sleep(Duration::from_millis(200));
 				}
 			} else {
-				self
-					.timeout_secs
-					.map(|secs| {
-						let gate = self.gate.clone();
-						let exit_reason = self.exit_reason.clone();
-						let deadline = checked_deadline(self.started_at, secs, "--timeout-secs")?;
-						Ok(thread::spawn(move || {
-							loop {
-								let now = Instant::now();
-								if now >= deadline {
-									set_exit_reason(&exit_reason, VmmExit::Timeout);
-									gate.set_state(RunState::Stopping);
-									gate.signal_all_vcpus();
-									return;
-								}
-								if gate.state() == RunState::Stopping {
-									return;
-								}
-								thread::sleep(
-									Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
-								);
+				self.timeout_secs.map(|secs| {
+					let gate = self.gate.clone();
+					let exit_reason = self.exit_reason.clone();
+					let deadline = deadline_or_now(self.started_at, secs, "--timeout-secs");
+					thread::spawn(move || {
+						loop {
+							let now = Instant::now();
+							if now >= deadline {
+								set_exit_reason(&exit_reason, VmmExit::Timeout);
+								gate.set_state(RunState::Stopping);
+								gate.signal_all_vcpus();
+								return;
 							}
-						}))
+							if gate.state() == RunState::Stopping {
+								return;
+							}
+							thread::sleep(
+								Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
+							);
+						}
 					})
-					.transpose()?
+				})
 			};
 			let handles = std::mem::take(&mut self.vcpu_handles);
 			let mut join_error = None;
@@ -3490,7 +3498,7 @@ fn wire_pci_device(
 		kind,
 		mmio_base: bar_base,
 		gsi,
-		transport: DeviceTransport::Pci(transport.clone()),
+		transport: DeviceTransport::Pci(transport),
 		device: device.clone(),
 		interrupt,
 		backend,
@@ -3521,11 +3529,15 @@ fn wire_pci_device(
 	unused_variables,
 	clippy::ptr_arg,
 	clippy::needless_pass_by_ref_mut,
-	reason = "&mut String is required by push_str on x86"
+	clippy::missing_const_for_fn,
+	reason = "fixed signature for the x86 formatting path; non-const there, empty elsewhere"
 )]
-const fn push_virtio_cmdline(cmdline: &mut String, mmio_base: u64, gsi: u32) {
+fn push_virtio_cmdline(cmdline: &mut String, mmio_base: u64, gsi: u32) {
 	#[cfg(target_arch = "x86_64")]
-	cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{mmio_base:x}:{gsi}"));
+	{
+		use std::fmt::Write as _;
+		let _ = write!(cmdline, " virtio_mmio.device=4K@0x{mmio_base:x}:{gsi}");
+	}
 }
 
 fn cmdline_has_key(cmdline: &str, key: &str) -> bool {
