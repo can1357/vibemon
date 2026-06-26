@@ -945,8 +945,6 @@ mod tests {
 	fn parses_platform_registry_flags() {
 		let cfg = parse_config(&[
 			"vmon",
-			"--kernel",
-			"k",
 			"--snapshot-root",
 			"/var/lib/vmon/snaps",
 			"--agent-sock",

@@ -99,7 +99,7 @@ class FakeMicroVM:
             encoding="utf-8",
         )
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
         self.stopped = True
 
 
@@ -180,3 +180,19 @@ def test_create_rejects_invalid_resource_args_before_template_resolution(monkeyp
         sandbox_mod.Sandbox.create(template="t", disk_mb=0, block_network=True)
     with pytest.raises(ValueError):
         sandbox_mod.Sandbox.create(template="t", timeout_secs=86_401, block_network=True)
+
+
+def test_sandbox_exec_layers_image_caller_and_secret_env(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    from vmon.image import ImageSpec
+
+    spec = ImageSpec(reference="img", env=["PATH=/usr/bin:/bin", "HOME=/root"])
+    vm = FakeMicroVM("sb", mvm_home)
+    sb = sandbox_mod.Sandbox(vm, image_spec=spec, env={"PATH": "/custom/bin"})
+    sb._secret_env = {"TOKEN": "s3cret"}
+
+    sb.exec("true")
+    seen = vm._agent.exec_envs[-1]
+    assert seen["HOME"] == "/root"
+    assert seen["PATH"] == "/custom/bin"
+    assert seen["TOKEN"] == "s3cret"

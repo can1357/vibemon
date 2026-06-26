@@ -394,6 +394,11 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
 
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
+    # A bare pty reports a 0x0 winsize; seed a realistic size so the client's
+    # initial resize forwards a non-zero terminal size like a real TTY.
+    import fcntl
+    import struct
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     proc = _RecordingProc()
     monkeypatch.setattr(FakeSandbox, "exec", lambda self, *c, **k: proc)
     monkeypatch.setattr(sys, "stdin", _PtyStream(slave))
