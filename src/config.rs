@@ -443,7 +443,7 @@ impl Config {
 		if let Some(store_max) = cli.zram_store_max_mib
 			&& (store_max == 0 || store_max > mem_mib)
 		{
-			bail!("--zram-store-max-mib must be between 1 and {mem_mib}");
+			bail!("--zram-store-max-mib must be between 1 and {mem_mib} MiB (got {store_max})");
 		}
 		#[cfg(not(target_os = "linux"))]
 		if mem_target_mib.is_some() {
