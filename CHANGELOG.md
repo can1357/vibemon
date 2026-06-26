@@ -3,10 +3,18 @@
 All notable changes to this project are recorded here.
 
 ## Unreleased
+### Breaking Changes
+
+- Dropped all support for legacy snapshots; previous snapshots must be recaptured
+
+### Added
+
+- Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g. macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmon` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
 
 - Renamed the project from VibeVMM to Vibemon, and the `VVM`/`vvm` brand prefix to `VMON`/`vmon` throughout. The binary, Python package, CLI, and daemon are now `vmon`/`vmond` (`python -m vmon`); environment variables are `VMON_*` (e.g. `VMON_HOME`, `VMON_API_TOKEN`, `VMON_E2E`); the state directory is `~/.vmon` with the daemon socket at `~/.vmon/vmond.sock`; guest kernel-cmdline keys, serial markers (`VMON_OK`), the bundled `vmon-agent`, the served web UI title, and the Rich console theme keys all follow suit. The generic term "virtual machine monitor" (`vmm`/`VMM`) is unchanged.
+- Switched the snapshot on-disk format from bincode to postcard and reset it to format version 1, dropping every legacy snapshot format: the v3–v6 bincode migration paths and the pre-manifest `vmstate.bin`/`memory.bin` file pair. Snapshots captured by earlier builds are unsupported and must be recaptured.
 
 ## 0.2.0
 

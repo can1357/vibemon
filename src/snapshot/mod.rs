@@ -1,11 +1,9 @@
 //! Snapshot on-disk format and (de)serialization.
 //!
-//! A snapshot is a directory containing either the legacy pair:
-//!   - `vmstate.bin` — bincode of the arch-neutral [`Snapshot`] envelope.
-//!   - `memory.bin`  — raw guest RAM, regions concatenated in slot order.
-//!
-//! Or a manifest-selected generation (`current-generation` points at
-//! generation-specific state and memory files).
+//! A snapshot is a directory whose `current-generation` manifest selects the
+//! active generation's two files:
+//!   - `vmstate.<gen>.bin` — postcard of the arch-neutral [`Snapshot`] envelope.
+//!   - `memory.<gen>.bin`  — raw guest RAM, regions concatenated in slot order.
 //!
 //! The envelope is arch-neutral; the per-vCPU / machine payloads live in
 //! `crate::arch::state` (selected at compile time) and are referenced here only
@@ -28,14 +26,13 @@ use virtio_queue::QueueState;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
 use vm_superio::serial::SerialState as VmSerialState;
 
-/// Snapshot format version. Older versions must be recaptured for this backend-tagged format.
-pub const SNAPSHOT_VERSION: u32 = 10;
+/// Snapshot format version. This is the first postcard-encoded format; snapshots
+/// from earlier (bincode) builds are unsupported and must be recaptured.
+pub const SNAPSHOT_VERSION: u32 = 1;
 
 const DELTA_PAGE_SIZE: u64 = 4096;
 const MAX_DELTA_CHAIN_DEPTH: usize = 64;
 
-const STATE_FILE: &str = "vmstate.bin";
-const MEMORY_FILE: &str = "memory.bin";
 const CURRENT_GENERATION_FILE: &str = "current-generation";
 const MANIFEST_TMP_FILE: &str = "current-generation.tmp";
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -380,16 +377,15 @@ struct SnapshotLayout {
 }
 
 fn selected_layout(dir: &Path) -> Result<SnapshotLayout> {
-    if let Some(generation) = current_generation(dir)? {
-        return Ok(SnapshotLayout {
-            state_file: dir.join(generation_state_file(generation)),
-            memory_file: dir.join(generation_memory_file(generation)),
-        });
-    }
-
+    let generation = current_generation(dir)?.ok_or_else(|| {
+        err(format!(
+            "no {CURRENT_GENERATION_FILE} manifest in {}",
+            dir.display()
+        ))
+    })?;
     Ok(SnapshotLayout {
-        state_file: dir.join(STATE_FILE),
-        memory_file: dir.join(MEMORY_FILE),
+        state_file: dir.join(generation_state_file(generation)),
+        memory_file: dir.join(generation_memory_file(generation)),
     })
 }
 
@@ -455,8 +451,7 @@ fn read_state_file(path: &Path) -> Result<Snapshot> {
         )));
     }
     let bytes = fs::read(path).map_err(|e| err(format!("reading {}: {e}", path.display())))?;
-    let config = bincode::config::standard().with_limit::<MAX_STATE_BYTES>();
-    let (version, _): (u32, usize) = bincode::serde::decode_from_slice(&bytes, config)
+    let (version, _) = postcard::take_from_bytes::<u32>(&bytes)
         .map_err(|e| err(format!("decoding snapshot version: {e}")))?;
     if version > SNAPSHOT_VERSION {
         return Err(err(format!(
@@ -468,297 +463,16 @@ fn read_state_file(path: &Path) -> Result<Snapshot> {
             "snapshot version {version} is older than supported {SNAPSHOT_VERSION}; recapture required"
         )));
     }
-    let (snap, decoded) = match version {
-        SNAPSHOT_VERSION => {
-            let (snap, decoded): (Snapshot, usize) =
-                bincode::serde::decode_from_slice(&bytes, config)
-                    .map_err(|e| err(format!("decoding snapshot: {e}")))?;
-            (snap, decoded)
-        }
-        6 => {
-            let (legacy, decoded): (SnapshotV6, usize) =
-                bincode::serde::decode_from_slice(&bytes, config)
-                    .map_err(|e| err(format!("decoding snapshot v6: {e}")))?;
-            (migrate_snapshot_v6(legacy), decoded)
-        }
-        5 => {
-            let (legacy, decoded): (SnapshotV5, usize) =
-                bincode::serde::decode_from_slice(&bytes, config)
-                    .map_err(|e| err(format!("decoding snapshot v5: {e}")))?;
-            (migrate_snapshot_v5(legacy), decoded)
-        }
-        4 => {
-            let (legacy, decoded): (SnapshotV4, usize) =
-                bincode::serde::decode_from_slice(&bytes, config)
-                    .map_err(|e| err(format!("decoding snapshot v4: {e}")))?;
-            (migrate_snapshot_v4(legacy), decoded)
-        }
-        _ => {
-            let (legacy, decoded): (SnapshotV3, usize) =
-                bincode::serde::decode_from_slice(&bytes, config)
-                    .map_err(|e| err(format!("decoding snapshot v{version}: {e}")))?;
-            (migrate_snapshot_v3(version, legacy)?, decoded)
-        }
-    };
-    if decoded != bytes.len() {
+    let (snap, rest) = postcard::take_from_bytes::<Snapshot>(&bytes)
+        .map_err(|e| err(format!("decoding snapshot: {e}")))?;
+    if !rest.is_empty() {
         return Err(err(format!(
             "snapshot state has {} trailing bytes",
-            bytes.len() - decoded
+            rest.len()
         )));
     }
     validate_snapshot_header(&snap)?;
     Ok(snap)
-}
-
-#[derive(Serialize, Deserialize)]
-struct SnapshotV4 {
-    version: u32,
-    arch: String,
-    mem_mib: usize,
-    cpus: u8,
-    cmdline: String,
-    mem_regions: Vec<MemRegion>,
-    vcpus: Vec<VcpuState>,
-    machine: MachineState,
-    serial: SerialState,
-    devices: Vec<DeviceStateLegacy>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SnapshotV3 {
-    version: u32,
-    arch: String,
-    mem_mib: usize,
-    cpus: u8,
-    cmdline: String,
-    mem_regions: Vec<MemRegion>,
-    vcpus: Vec<VcpuState>,
-    machine: MachineState,
-    serial: SerialState,
-    devices: Vec<DeviceStateV3>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DeviceStateV3 {
-    kind: DeviceKind,
-    transport: DeviceTransportKind,
-    mmio_base: u64,
-    gsi: u32,
-    interrupt_status: u32,
-    device_features_select: u32,
-    driver_features_select: u32,
-    acked_features: u64,
-    status: u32,
-    activated: bool,
-    queues: Vec<QueueStateSer>,
-    backend: BackendHintLegacy,
-}
-
-/// v5 top-level envelope: identical to the current [`Snapshot`] except its
-/// devices carry the pre-v6 [`BackendHintLegacy`] (no virtio-fs `read_only`).
-#[derive(Serialize, Deserialize)]
-struct SnapshotV5 {
-    version: u32,
-    arch: String,
-    mem_mib: usize,
-    cpus: u8,
-    cmdline: String,
-    boot_mode: String,
-    firmware: Option<String>,
-    mem_regions: Vec<MemRegion>,
-    vcpus: Vec<VcpuState>,
-    machine: MachineState,
-    serial: SerialState,
-    devices: Vec<DeviceStateLegacy>,
-}
-
-/// Frozen v6 [`Snapshot`] shape: identical to v7 except it has no `delta` field.
-#[derive(Serialize, Deserialize)]
-struct SnapshotV6 {
-    version: u32,
-    arch: String,
-    mem_mib: usize,
-    cpus: u8,
-    cmdline: String,
-    boot_mode: String,
-    firmware: Option<String>,
-    mem_regions: Vec<MemRegion>,
-    vcpus: Vec<VcpuState>,
-    machine: MachineState,
-    serial: SerialState,
-    devices: Vec<DeviceState>,
-}
-
-/// Frozen pre-v6 [`BackendHint`]: the virtio-fs variant had no `read_only`
-/// field. Kept verbatim so v3/v4/v5 bincode payloads decode unchanged.
-#[derive(Serialize, Deserialize)]
-enum BackendHintLegacy {
-    Block { path: String, read_only: bool },
-    Net { tap: String, mac: [u8; 6] },
-    Console,
-    Fs { tag: String, shared_dir: String },
-}
-
-/// Frozen pre-v6 [`DeviceState`]: same fields, but the backend is the legacy
-/// [`BackendHintLegacy`]. Shared by the v4 and v5 decode paths.
-#[derive(Serialize, Deserialize)]
-struct DeviceStateLegacy {
-    kind: DeviceKind,
-    transport: DeviceTransportKind,
-    mmio_base: u64,
-    gsi: u32,
-    interrupt_status: u32,
-    device_features_select: u32,
-    driver_features_select: u32,
-    acked_features: u64,
-    status: u32,
-    activated: bool,
-    queues: Vec<QueueStateSer>,
-    backend: BackendHintLegacy,
-    transport_pci: Option<PciTransportStateSer>,
-    fs: Option<FsStateSer>,
-}
-
-fn migrate_snapshot_v3(version: u32, snap: SnapshotV3) -> Result<Snapshot> {
-    if version == 0 {
-        return Err(err("snapshot version 0 is invalid"));
-    }
-    if version > SNAPSHOT_VERSION {
-        return Err(err(format!(
-            "snapshot version {version} is newer than supported {SNAPSHOT_VERSION}"
-        )));
-    }
-    Ok(Snapshot {
-        version: SNAPSHOT_VERSION,
-        arch: snap.arch,
-        backend: current_backend(),
-        mem_mib: snap.mem_mib,
-        cpus: snap.cpus,
-        cmdline: snap.cmdline,
-        boot_mode: "direct".to_string(),
-        firmware: None,
-        mem_regions: snap.mem_regions,
-        vcpus: snap.vcpus,
-        machine: snap.machine,
-        serial: snap.serial,
-        devices: snap.devices.into_iter().map(DeviceState::from).collect(),
-        delta: None,
-    })
-}
-
-fn migrate_snapshot_v4(snap: SnapshotV4) -> Snapshot {
-    Snapshot {
-        version: SNAPSHOT_VERSION,
-        arch: snap.arch,
-        backend: current_backend(),
-        mem_mib: snap.mem_mib,
-        cpus: snap.cpus,
-        cmdline: snap.cmdline,
-        boot_mode: "direct".to_string(),
-        firmware: None,
-        mem_regions: snap.mem_regions,
-        vcpus: snap.vcpus,
-        machine: snap.machine,
-        serial: snap.serial,
-        devices: snap.devices.into_iter().map(DeviceState::from).collect(),
-        delta: None,
-    }
-}
-
-fn migrate_snapshot_v5(snap: SnapshotV5) -> Snapshot {
-    Snapshot {
-        version: SNAPSHOT_VERSION,
-        arch: snap.arch,
-        backend: current_backend(),
-        mem_mib: snap.mem_mib,
-        cpus: snap.cpus,
-        cmdline: snap.cmdline,
-        boot_mode: snap.boot_mode,
-        firmware: snap.firmware,
-        mem_regions: snap.mem_regions,
-        vcpus: snap.vcpus,
-        machine: snap.machine,
-        serial: snap.serial,
-        devices: snap.devices.into_iter().map(DeviceState::from).collect(),
-        delta: None,
-    }
-}
-
-fn migrate_snapshot_v6(snap: SnapshotV6) -> Snapshot {
-    Snapshot {
-        version: SNAPSHOT_VERSION,
-        arch: snap.arch,
-        backend: current_backend(),
-        mem_mib: snap.mem_mib,
-        cpus: snap.cpus,
-        cmdline: snap.cmdline,
-        boot_mode: snap.boot_mode,
-        firmware: snap.firmware,
-        mem_regions: snap.mem_regions,
-        vcpus: snap.vcpus,
-        machine: snap.machine,
-        serial: snap.serial,
-        devices: snap.devices,
-        delta: None,
-    }
-}
-
-impl From<DeviceStateV3> for DeviceState {
-    fn from(d: DeviceStateV3) -> Self {
-        Self {
-            kind: d.kind,
-            transport: d.transport,
-            mmio_base: d.mmio_base,
-            gsi: d.gsi,
-            interrupt_status: d.interrupt_status,
-            device_features_select: d.device_features_select,
-            driver_features_select: d.driver_features_select,
-            acked_features: d.acked_features,
-            status: d.status,
-            activated: d.activated,
-            queues: d.queues,
-            backend: d.backend.into(),
-            transport_pci: None,
-            fs: None,
-        }
-    }
-}
-
-impl From<BackendHintLegacy> for BackendHint {
-    fn from(b: BackendHintLegacy) -> Self {
-        match b {
-            BackendHintLegacy::Block { path, read_only } => Self::Block { path, read_only },
-            BackendHintLegacy::Net { tap, mac } => Self::Net { tap, mac },
-            BackendHintLegacy::Console => Self::Console,
-            // Pre-v6 shares were always read-only; preserve that on migration.
-            BackendHintLegacy::Fs { tag, shared_dir } => Self::Fs {
-                tag,
-                shared_dir,
-                read_only: true,
-            },
-        }
-    }
-}
-
-impl From<DeviceStateLegacy> for DeviceState {
-    fn from(d: DeviceStateLegacy) -> Self {
-        Self {
-            kind: d.kind,
-            transport: d.transport,
-            mmio_base: d.mmio_base,
-            gsi: d.gsi,
-            interrupt_status: d.interrupt_status,
-            device_features_select: d.device_features_select,
-            driver_features_select: d.driver_features_select,
-            acked_features: d.acked_features,
-            status: d.status,
-            activated: d.activated,
-            queues: d.queues,
-            backend: d.backend.into(),
-            transport_pci: d.transport_pci,
-            fs: d.fs,
-        }
-    }
 }
 
 fn validate_snapshot_header(snap: &Snapshot) -> Result<()> {
@@ -1273,8 +987,8 @@ fn validate_queue_ram_range(
 }
 
 fn write_state_file(path: &Path, snap: &Snapshot) -> Result<()> {
-    let bytes = bincode::serde::encode_to_vec(snap, bincode::config::standard())
-        .map_err(|e| err(format!("encoding snapshot: {e}")))?;
+    let bytes =
+        postcard::to_allocvec(snap).map_err(|e| err(format!("encoding snapshot: {e}")))?;
     let mut file =
         File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
     file.write_all(&bytes)
@@ -1313,11 +1027,12 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
         File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
     let regions = memory_region_table(mem)?;
     for region in &regions {
-        // SAFETY: get_host_address returns a valid pointer to `len` mapped
-        // bytes owned by `mem`, which outlives this read.
         let ptr = mem
             .get_host_address(GuestAddress(region.gpa))
             .map_err(|e| err(format!("host address for {gpa:#x}: {e}", gpa = region.gpa)))?;
+        // SAFETY: `get_host_address` returned a pointer into `mem` for this
+        // region; `memory_region_table` supplied the region length, and `mem`
+        // outlives the read-only slice used for `write_all`.
         let slice = unsafe { std::slice::from_raw_parts(ptr, region.len as usize) };
         file.write_all(slice)
             .map_err(|e| err(format!("writing region {gpa:#x}: {e}", gpa = region.gpa)))?;
@@ -1364,11 +1079,12 @@ fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -
     for r in regions {
         file.seek(SeekFrom::Start(r.file_offset))
             .map_err(|e| err(format!("seeking to region {:#x}: {e}", r.gpa)))?;
-        // SAFETY: get_host_address returns a valid pointer to a mapping of at
-        // least `r.len` bytes (the restored VM was sized from the snapshot).
         let ptr = mem
             .get_host_address(GuestAddress(r.gpa))
             .map_err(|e| err(format!("host address for {:#x}: {e}", r.gpa)))?;
+        // SAFETY: `get_host_address` returned a pointer into the destination
+        // guest mapping, which was sized from the snapshot to cover `r.len`
+        // bytes; the mutable slice is used only for this file read.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, r.len as usize) };
         file.read_exact(dst)
             .map_err(|e| err(format!("reading region {:#x}: {e}", r.gpa)))?;
@@ -1411,10 +1127,15 @@ fn diff_pages(
             let live_ptr = live
                 .get_host_address(GuestAddress(gpa))
                 .map_err(|e| err(format!("host address for live {gpa:#x}: {e}")))?;
-            let base_slice =
-                unsafe { std::slice::from_raw_parts(base_ptr, DELTA_PAGE_SIZE as usize) };
-            let live_slice =
-                unsafe { std::slice::from_raw_parts(live_ptr, DELTA_PAGE_SIZE as usize) };
+            // SAFETY: both pointers were resolved from guest mappings at a
+            // page-aligned GPA produced from `regions`, and each page has
+            // exactly `DELTA_PAGE_SIZE` mapped bytes for this comparison.
+            let (base_slice, live_slice) = unsafe {
+                (
+                    std::slice::from_raw_parts(base_ptr, DELTA_PAGE_SIZE as usize),
+                    std::slice::from_raw_parts(live_ptr, DELTA_PAGE_SIZE as usize),
+                )
+            };
             if base_slice != live_slice {
                 let byte_idx = (global_page / 8) as usize;
                 let bit_idx = (global_page % 8) as u8;
@@ -1452,6 +1173,9 @@ fn apply_delta_pages(
         let ptr = mem
             .get_host_address(GuestAddress(gpa))
             .map_err(|e| err(format!("host address for {gpa:#x}: {e}")))?;
+        // SAFETY: `gpa` was translated from the validated region table for a
+        // changed page, so the destination mapping contains one full delta page;
+        // the mutable slice is consumed by this single `read_exact`.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, DELTA_PAGE_SIZE as usize) };
         file.read_exact(dst)
             .map_err(|e| err(format!("reading delta page {page}: {e}")))?;
@@ -1613,8 +1337,8 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     fn machine_state() -> MachineState {
-        // Zero is a valid inert value for these KVM state blobs in migration-only
-        // unit tests; no ioctl consumes this synthetic state.
+        // SAFETY: zero is a valid inert value for these KVM state blobs in
+        // migration-only unit tests; no ioctl consumes this synthetic state.
         unsafe { std::mem::zeroed() }
     }
 
@@ -1627,95 +1351,6 @@ mod tests {
         #[cfg(target_os = "macos")]
         let gic = crate::arch::state::GicState::Hvf { blob: Vec::new() };
         MachineState { gic }
-    }
-
-    fn legacy_block_device(mmio_base: u64, gsi: u32) -> DeviceStateV3 {
-        DeviceStateV3 {
-            kind: DeviceKind::Block,
-            transport: DeviceTransportKind::Mmio,
-            mmio_base,
-            gsi,
-            interrupt_status: 0,
-            device_features_select: 0,
-            driver_features_select: 0,
-            acked_features: 0,
-            status: 0,
-            activated: false,
-            queues: vec![queue(false)],
-            backend: BackendHintLegacy::Block {
-                path: "disk.img".to_string(),
-                read_only: false,
-            },
-        }
-    }
-
-    fn snapshot_v3(version: u32) -> SnapshotV3 {
-        SnapshotV3 {
-            version,
-            arch: build_arch().to_string(),
-            mem_mib: 0,
-            cpus: 0,
-            cmdline: String::new(),
-            mem_regions: Vec::new(),
-            vcpus: Vec::new(),
-            machine: machine_state(),
-            serial: serial_state(),
-            devices: vec![legacy_block_device(MMIO_MEM_START, IRQ_BASE)],
-        }
-    }
-
-    fn snapshot_v4(version: u32) -> SnapshotV4 {
-        SnapshotV4 {
-            version,
-            arch: build_arch().to_string(),
-            mem_mib: 0,
-            cpus: 0,
-            cmdline: String::new(),
-            mem_regions: Vec::new(),
-            vcpus: Vec::new(),
-            machine: machine_state(),
-            serial: serial_state(),
-            devices: vec![legacy_device(MMIO_MEM_START, IRQ_BASE)],
-        }
-    }
-
-    fn legacy_device(mmio_base: u64, gsi: u32) -> DeviceStateLegacy {
-        DeviceStateLegacy {
-            kind: DeviceKind::Block,
-            transport: DeviceTransportKind::Mmio,
-            mmio_base,
-            gsi,
-            interrupt_status: 0,
-            device_features_select: 0,
-            driver_features_select: 0,
-            acked_features: 0,
-            status: 0,
-            activated: false,
-            queues: vec![queue(false)],
-            backend: BackendHintLegacy::Block {
-                path: "disk.img".to_string(),
-                read_only: false,
-            },
-            transport_pci: None,
-            fs: None,
-        }
-    }
-
-    fn snapshot_v5(version: u32, devices: Vec<DeviceStateLegacy>) -> SnapshotV5 {
-        SnapshotV5 {
-            version,
-            arch: build_arch().to_string(),
-            mem_mib: 0,
-            cpus: 0,
-            cmdline: String::new(),
-            boot_mode: "uefi".to_string(),
-            firmware: Some("OVMF.fd".to_string()),
-            mem_regions: Vec::new(),
-            vcpus: Vec::new(),
-            machine: machine_state(),
-            serial: serial_state(),
-            devices,
-        }
     }
 
     fn snapshot_with_devices(devices: Vec<DeviceState>) -> Snapshot {
@@ -1892,18 +1527,6 @@ mod tests {
     }
 
     #[test]
-    fn migrates_previous_snapshot_version() {
-        let migrated = migrate_snapshot_v4(snapshot_v4(4));
-
-        assert_eq!(migrated.version, SNAPSHOT_VERSION);
-        assert_eq!(migrated.boot_mode, "direct");
-        assert!(migrated.firmware.is_none());
-        assert_eq!(migrated.devices.len(), 1);
-        assert!(migrated.devices[0].transport_pci.is_none());
-        assert!(migrated.devices[0].fs.is_none());
-    }
-
-    #[test]
     fn rejects_too_new_snapshot_version_before_full_decode() {
         let path = std::env::temp_dir().join(format!(
             "vmon-too-new-{}-{}.bin",
@@ -1913,9 +1536,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let bytes =
-            bincode::serde::encode_to_vec(SNAPSHOT_VERSION + 1, bincode::config::standard())
-                .unwrap();
+        let bytes = postcard::to_allocvec(&(SNAPSHOT_VERSION + 1)).unwrap();
         fs::write(&path, bytes).unwrap();
 
         let err = match read_state_file(&path) {
@@ -1960,10 +1581,9 @@ mod tests {
         });
 
         let snap = snapshot_with_devices(vec![device]);
-        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-        let (decoded, consumed): (Snapshot, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(consumed, bytes.len());
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
+        assert!(rest.is_empty());
 
         let restored = &decoded.devices[0];
         assert_eq!(restored.transport, DeviceTransportKind::Pci);
@@ -2011,10 +1631,9 @@ mod tests {
 
         // serialize -> deserialize: the inode table must survive intact.
         let snap = snapshot_with_devices(vec![device]);
-        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-        let (decoded, consumed): (Snapshot, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(consumed, bytes.len());
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
+        assert!(rest.is_empty());
 
         let fs_ser = decoded.devices[0]
             .fs
@@ -2059,69 +1678,6 @@ mod tests {
         assert_eq!(saved.next, 4);
 
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn read_state_file_rejects_legacy_versions_that_require_recapture() {
-        let legacy_v3 =
-            bincode::serde::encode_to_vec(snapshot_v3(3), bincode::config::standard()).unwrap();
-        let legacy_v4 =
-            bincode::serde::encode_to_vec(snapshot_v4(4), bincode::config::standard()).unwrap();
-
-        let mut fs_device = legacy_device(MMIO_MEM_START, IRQ_BASE);
-        fs_device.kind = DeviceKind::Fs;
-        fs_device.queues = vec![queue(false), queue(false)];
-        fs_device.backend = BackendHintLegacy::Fs {
-            tag: "host".to_string(),
-            shared_dir: "/srv".to_string(),
-        };
-        fs_device.fs = Some(FsStateSer {
-            inodes: vec![(1, ".".to_string())],
-            next: 2,
-        });
-        let legacy_v5 = bincode::serde::encode_to_vec(
-            snapshot_v5(5, vec![fs_device]),
-            bincode::config::standard(),
-        )
-        .unwrap();
-
-        let legacy_v6 = bincode::serde::encode_to_vec(
-            SnapshotV6 {
-                version: 6,
-                arch: build_arch().to_string(),
-                mem_mib: 0,
-                cpus: 0,
-                cmdline: String::new(),
-                boot_mode: "direct".to_string(),
-                firmware: None,
-                mem_regions: Vec::new(),
-                vcpus: Vec::new(),
-                machine: machine_state(),
-                serial: serial_state(),
-                devices: vec![block_device(MMIO_MEM_START, IRQ_BASE)],
-            },
-            bincode::config::standard(),
-        )
-        .unwrap();
-
-        for (name, bytes) in [
-            ("v3", legacy_v3),
-            ("v4", legacy_v4),
-            ("v5", legacy_v5),
-            ("v6", legacy_v6),
-        ] {
-            let path = unique_temp_path(&format!("vmon-{name}-recapture"));
-            fs::write(&path, bytes).unwrap();
-
-            let err = match read_state_file(&path) {
-                Ok(_) => panic!("{name} snapshot was accepted without recapture"),
-                Err(e) => e.to_string(),
-            };
-            let _ = fs::remove_file(&path);
-
-            assert!(err.contains("older than supported"), "{name}: {err}");
-            assert!(err.contains("recapture required"), "{name}: {err}");
-        }
     }
 
     #[test]
@@ -2197,16 +1753,24 @@ mod tests {
 
         // Fill base with a fixed pattern, then copy it to live and restored.
         let base_ptr = base.get_host_address(gpa).unwrap();
+        // SAFETY: `base` was created with `sz` bytes, and `gpa` is the start of
+        // its first region, so this pointer covers the whole guest-memory range.
         let base_slice = unsafe { std::slice::from_raw_parts_mut(base_ptr, sz) };
         for (i, b) in base_slice.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
 
         let live_ptr = live.get_host_address(gpa).unwrap();
+        // SAFETY: `live` was created with the same `sz` byte length, and `gpa`
+        // is the start of its first region; the resulting mutable slice is the
+        // only live slice to this mapping in the test.
         let live_slice = unsafe { std::slice::from_raw_parts_mut(live_ptr, sz) };
         live_slice.copy_from_slice(base_slice);
 
         let restored_ptr = restored.get_host_address(gpa).unwrap();
+        // SAFETY: `restored` was created with the same `sz` byte length, and
+        // `gpa` is the start of its first region; this mutable slice is used
+        // only to seed the restored memory before delta application.
         let restored_slice = unsafe { std::slice::from_raw_parts_mut(restored_ptr, sz) };
         restored_slice.copy_from_slice(base_slice);
 
@@ -2236,6 +1800,9 @@ mod tests {
         let _ = fs::remove_file(&tmp_path);
 
         let restored_ptr = restored.get_host_address(gpa).unwrap();
+        // SAFETY: `restored` still owns the `sz` byte mapping starting at `gpa`;
+        // the earlier mutable restored slice is no longer used before this
+        // read-only comparison slice is created.
         let restored_slice = unsafe { std::slice::from_raw_parts(restored_ptr, sz) };
         assert_eq!(restored_slice, live_slice);
     }
