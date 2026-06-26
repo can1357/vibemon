@@ -36,7 +36,7 @@ To get the *full* thing on a Mac, run it inside a Linux VM with nested KVM
 
 **For the macOS path (panel + API only):**
 - Python 3.14+ (`python3 --version`)
-- Node.js 18+ and npm (`node --version`)
+- Bun (`bun --version`) — builds the web panel
 
 **For the full path (real microVMs), additionally:**
 - A Linux host with `/dev/kvm` (bare metal, a Linux box, or a Lima VM)
@@ -56,8 +56,8 @@ This is the part you can run right now on your Mac.
 
 ```sh
 cd ui
-npm install
-npm run build      # outputs into python/vmon/web so `vmon serve` can serve it
+bun install
+bun run build      # outputs into python/vmon/web so `vmon serve` can serve it
 ```
 
 ### Step 2 — install the server dependencies (once)
@@ -387,7 +387,7 @@ primitives; `python/README.md` has the full SDK reference.
 
 ```sh
 # Web panel: typecheck + production build
-cd ui && npm install && npm run typecheck && npm run build
+cd ui && bun install && bun run typecheck && bun run build
 
 # Python SDK / CLI / server unit + integration tests
 #   (the 4 KVM end-to-end tests auto-skip without KVM)

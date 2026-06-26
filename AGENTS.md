@@ -50,20 +50,20 @@ vmon-agent (guest agent, Linux guest only)
 just build           # debug build (auto-codesigns on macOS)
 just release         # release build (+ codesign on macOS)
 just run *args       # build then run vmon (sudo on Linux)
-just check           # cargo check --workspace --all-targets
-just clippy          # cargo clippy --workspace --all-targets -- -D warnings
-just fmt             # cargo fmt --all   (fmt-check for CI verification)
+just format          # format every language (biome | ruff | cargo fmt)
+just lint            # lint every language (biome | ruff | clippy)
+just check           # type-check every language (tsc | mypy | cargo check)
 just test            # cargo test (unit + integration; KVM-gated cases auto-skip)
 just integration     # VMON_E2E=1 cargo test --tests -- --test-threads=1
 just soak            # VMON_E2E=1 VMON_SOAK=1 cargo test --test soak -- --test-threads=1
 just fetch-assets    # ./demo/fetch-test-assets.sh  (kernels/images → target/test-assets/)
-just ui              # cd ui && npm install && npm run build  → python/vmon/web/
+just ui              # cd ui && bun install && bun run build  → python/vmon/web/
 just agent-musl      # build static vmon-agent → python/vmon/_agent/vmon-agent-<arch>
 ```
 
 macOS HVF requires the `vmon` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
 
-Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` live there): `cd python && uv run vmon ...`, `cd python && uv run pytest`, `cd python && uv run ruff check`, `cd python && uv run mypy`. UI dev server: `cd ui && npm run dev` (proxies API to `:8000`).
+Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` live there): `cd python && uv run vmon ...`, `cd python && uv run pytest`, `cd python && uv run ruff check`, `cd python && uv run mypy`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`).
 
 ## Code Conventions & Common Patterns
 
@@ -122,7 +122,7 @@ Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` liv
 
 - **Rust:** pinned `nightly-2026-04-29` (`rust-toolchain.toml`, with rustfmt/clippy/rust-analyzer). Release profile: `opt-level = 2`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 - **Python:** `>=3.14`; **`uv`** for everything, run from `python/` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime deps: `click`, `rich`; `[server]` extra adds `fastapi`, `uvicorn`.
-- **UI:** Node not pinned; React 18.3 / Vite 5.4 / TS 5.6. Both `bun.lock` and `package-lock.json` exist, but `just ui` and CI use **npm** — prefer npm to stay consistent with the build path.
+- **UI:** **bun** for everything (`bun.lock`; no `package-lock.json`). React 18.3 / Vite 5.4 / TS 5.6; biome (`ui/biome.json`) formats + lints `ui/src`, `tsc` type-checks. `just {fmt,lint,check}-ui` and CI all run via bun.
 - **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_REMOTE`. The Rust binary is located by `find_binary()` (cargo target dirs → `$VMON_BIN` → `PATH`).
 
 ## Testing & QA
