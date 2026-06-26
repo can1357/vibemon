@@ -181,7 +181,7 @@ fn open_fd_count() -> Option<libc::rlim_t> {
 		.map(|fds| fds.count() as libc::rlim_t)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
 pub fn apply_landlock_rules(paths: &SandboxPaths) -> Result<()> {
 	let abi = ABI::V3;
 	let all = AccessFs::from_all(abi);
@@ -208,13 +208,13 @@ pub fn apply_landlock_rules(paths: &SandboxPaths) -> Result<()> {
 	Ok(())
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
 pub fn apply_seccomp_filters(action: SeccompAction) -> Result<()> {
 	let filter = compile_seccomp_filter(action)?;
 	seccompiler::apply_filter(&filter).map_err(|e| err(format!("installing seccomp filter: {e}")))
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Unit tests compile the filter without installing it in normal builds.")]
 pub fn compile_seccomp_filter(action: SeccompAction) -> Result<BpfProgram> {
 	// `SeccompFilter::new(rules, mismatch_action, match_action, arch)`:
 	// `mismatch_action` hits syscalls outside the allowlist, `match_action`
@@ -252,7 +252,7 @@ fn seccomp_rules() -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
 }
 
 fn allowlisted_syscalls() -> BTreeSet<i64> {
-	#[allow(unused_mut)]
+	#[allow(unused_mut, reason = "x86_64 appends arch-specific syscalls after the base set.")]
 	let mut syscalls = BTreeSet::from([
 		libc::SYS_accept4,
 		libc::SYS_brk,
@@ -347,8 +347,9 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 	syscalls
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
 pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
+	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
 	let euid = unsafe { libc::geteuid() as u32 };
 	if euid != 0 {
 		if let Some(uid) = config.uid
@@ -357,6 +358,7 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 			return Err(err(format!("--sandbox-uid {uid} does not match current uid {euid}")));
 		}
 		if let Some(gid) = config.gid {
+			// SAFETY: `getegid` has no preconditions and only reads process credentials.
 			let egid = unsafe { libc::getegid() as u32 };
 			if gid != egid {
 				return Err(err(format!("--sandbox-gid {gid} does not match current gid {egid}")));
@@ -383,16 +385,42 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 	disable_keepcaps()?;
 	clear_supplementary_groups()?;
 
-	let rc = unsafe { libc::setgid(gid as libc::gid_t) };
+	let gid = gid as libc::gid_t;
+	// SAFETY: `setresgid` changes only this process' real/effective/saved gid;
+	// all three are set to the same non-root target to make the drop irreversible.
+	let rc = unsafe { libc::setresgid(gid, gid, gid) };
 	if rc != 0 {
-		return Err(os_error("setgid(--sandbox-gid)"));
+		return Err(os_error("setresgid(--sandbox-gid)"));
 	}
-	let rc = unsafe { libc::setuid(uid as libc::uid_t) };
+	let mut real_gid = 0;
+	let mut effective_gid = 0;
+	let mut saved_gid = 0;
+	// SAFETY: the pointers reference initialized local gid_t slots for libc to fill.
+	let rc = unsafe { libc::getresgid(&mut real_gid, &mut effective_gid, &mut saved_gid) };
 	if rc != 0 {
-		return Err(os_error("setuid(--sandbox-uid)"));
+		return Err(os_error("getresgid(after sandbox drop)"));
 	}
-	if unsafe { libc::geteuid() } == 0 {
-		return Err(err("--sandbox uid drop left effective uid 0"));
+	if (real_gid, effective_gid, saved_gid) != (gid, gid, gid) {
+		return Err(err("--sandbox gid drop left a privileged or mismatched gid"));
+	}
+
+	let uid = uid as libc::uid_t;
+	// SAFETY: `setresuid` changes only this process' real/effective/saved uid;
+	// all three are set to the same non-root target to make the drop irreversible.
+	let rc = unsafe { libc::setresuid(uid, uid, uid) };
+	if rc != 0 {
+		return Err(os_error("setresuid(--sandbox-uid)"));
+	}
+	let mut real_uid = 0;
+	let mut effective_uid = 0;
+	let mut saved_uid = 0;
+	// SAFETY: the pointers reference initialized local uid_t slots for libc to fill.
+	let rc = unsafe { libc::getresuid(&mut real_uid, &mut effective_uid, &mut saved_uid) };
+	if rc != 0 {
+		return Err(os_error("getresuid(after sandbox drop)"));
+	}
+	if (real_uid, effective_uid, saved_uid) != (uid, uid, uid) {
+		return Err(err("--sandbox uid drop left a privileged or mismatched uid"));
 	}
 	Ok(())
 }

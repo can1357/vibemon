@@ -10,7 +10,7 @@
 use crate::{config::Config, result::Result};
 pub fn fork_into_jail(config: &Config) -> Result<()> {
 	require_root()?;
-	let launch_uid = unsafe { libc::getuid() as u32 };
+	let launch_uid = launch_owner_uid()?;
 	let id = config
 		.id
 		.as_deref()
@@ -58,7 +58,7 @@ use std::{
 			fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
 		},
 	},
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	process,
 };
 
@@ -90,6 +90,15 @@ fn require_root() -> Result<()> {
 		return Err(err("--jail requires launching vmon as root"));
 	}
 	Ok(())
+}
+
+fn launch_owner_uid() -> Result<u32> {
+	// SAFETY: `getuid` has no preconditions and only reads process credentials.
+	let real_uid = unsafe { libc::getuid() as u32 };
+	if real_uid != 0 {
+		return Ok(real_uid);
+	}
+	Ok(parse_env_u32("SUDO_UID")?.filter(|uid| *uid != 0).unwrap_or(0))
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -326,6 +335,15 @@ fn path_in_chroot(chroot: &Path, absolute: &Path) -> Result<PathBuf> {
 	let relative = absolute
 		.strip_prefix("/")
 		.map_err(|_| err(format!("jail path {} must be absolute", absolute.display())))?;
+	if relative
+		.components()
+		.any(|component| !matches!(component, Component::Normal(_)))
+	{
+		return Err(err(format!(
+			"jail path {} must not contain '.' or '..' components",
+			absolute.display()
+		)));
+	}
 	Ok(chroot.join(relative))
 }
 
@@ -358,12 +376,15 @@ fn mount_bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
 
 fn remount_readonly(target: &Path) -> Result<()> {
 	let target_c = cstring_path(target)?;
+	let recursive = if target.is_dir() { libc::MS_REC } else { 0 };
+	// SAFETY: the target path is a valid C string for the duration of the call;
+	// null source/fstype/data are the documented remount form.
 	let rc = unsafe {
 		libc::mount(
 			std::ptr::null(),
 			target_c.as_ptr(),
 			std::ptr::null(),
-			(libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+			(libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | recursive) as libc::c_ulong,
 			std::ptr::null(),
 		)
 	};

@@ -272,8 +272,8 @@ mod platform {
 			let queue = unsafe { dispatch_get_global_queue(0, 0) };
 			let ready_evt = EventFd::new(EFD_NONBLOCK)
 				.map_err(|e| err(format!("creating vmnet readiness eventfd: {e}")))?;
-			let interface_desc = InterfaceDesc::new()?;
 			let requested_mac = mac;
+			let interface_desc = InterfaceDesc::new(requested_mac)?;
 			let virtio_header = interface_desc.virtio_header;
 
 			let status = start_interface(interface_desc.as_xpc(), queue)?;
@@ -388,7 +388,7 @@ mod platform {
 	}
 
 	impl InterfaceDesc {
-		fn new() -> Result<Self> {
+		fn new(mac: [u8; 6]) -> Result<Self> {
 			// SAFETY: xpc_dictionary_create_empty returns a retained XPC object or
 			// null; the result is checked before it is passed to other XPC calls.
 			let xpc = unsafe { xpc_dictionary_create_empty() };
@@ -408,6 +408,12 @@ mod platform {
 			desc.set_string(unsafe { vmnet_end_address_key }, DEFAULT_END_ADDRESS)?;
 			// SAFETY: vmnet_subnet_mask_key is a process-provided static C key.
 			desc.set_string(unsafe { vmnet_subnet_mask_key }, DEFAULT_SUBNET_MASK)?;
+			let mac_address = format!(
+				"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+				mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+			);
+			// SAFETY: vmnet_mac_address_key is a process-provided static C key.
+			desc.set_string(unsafe { vmnet_mac_address_key }, &mac_address)?;
 			// SAFETY: vmnet_allocate_mac_address_key is a process-provided static C key.
 			desc.set_bool(unsafe { vmnet_allocate_mac_address_key }, false);
 			if let Some(key) = dynamic_vmnet_key(b"vmnet_enable_virtio_header_key\0") {

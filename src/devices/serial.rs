@@ -17,17 +17,24 @@ use crate::{
 	result::{Result, err},
 };
 
+const UART_REGISTER_COUNT: u64 = 8;
+
 /// Unbuffered writer to the host stdout file descriptor.
 struct ConsoleOut;
 
 impl Write for ConsoleOut {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		// SAFETY: writing a valid byte slice to a valid fd.
-		let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
-		if n < 0 {
-			Err(io::Error::last_os_error())
-		} else {
-			Ok(n as usize)
+		loop {
+			// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is a
+			// process-global fd, and `write` does not retain the pointer.
+			let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
+			if n >= 0 {
+				return Ok(n as usize);
+			}
+			let err = io::Error::last_os_error();
+			if err.kind() != io::ErrorKind::Interrupted {
+				return Err(err);
+			}
 		}
 	}
 
@@ -71,13 +78,18 @@ impl SerialDevice {
 
 impl BusDevice for SerialDevice {
 	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		if let Some(b) = data.first_mut() {
+		data.fill(0xff);
+		if offset < UART_REGISTER_COUNT
+			&& let Some(b) = data.first_mut()
+		{
 			*b = self.inner.read(offset as u8);
 		}
 	}
 
 	fn write(&mut self, offset: u64, data: &[u8]) {
-		if let Some(b) = data.first() {
+		if offset < UART_REGISTER_COUNT
+			&& let Some(b) = data.first()
+		{
 			let _ = self.inner.write(offset as u8, *b);
 		}
 	}

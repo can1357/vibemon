@@ -35,20 +35,40 @@ impl Bus {
 
 	/// Map `[base, base+len)` to `device`.
 	pub fn register(&mut self, base: u64, len: u64, device: Arc<Mutex<dyn BusDevice>>) {
+		assert!(len > 0, "bus device range must not be empty");
+		let end = base.checked_add(len).expect("bus device range overflows u64");
+		for entry in &self.entries {
+			let entry_end = entry
+				.base
+				.checked_add(entry.len)
+				.expect("registered bus device range overflows u64");
+			assert!(
+				end <= entry.base || base >= entry_end,
+				"bus device range overlaps an existing mapping"
+			);
+		}
 		self.entries.push(Entry { base, len, device });
 	}
 
-	fn find(&self, addr: u64) -> Option<(u64, &Arc<Mutex<dyn BusDevice>>)> {
-		self
-			.entries
+	fn find(&self, addr: u64, access_len: usize) -> Option<(u64, &Arc<Mutex<dyn BusDevice>>)> {
+		let access_len = u64::try_from(access_len).ok()?;
+		if access_len == 0 {
+			return None;
+		}
+		self.entries
 			.iter()
-			.find(|e| addr >= e.base && addr < e.base + e.len)
+			.find(|e| {
+				let Some(offset) = addr.checked_sub(e.base) else {
+					return false;
+				};
+				offset < e.len && access_len <= e.len - offset
+			})
 			.map(|e| (e.base, &e.device))
 	}
 
 	/// Dispatch a read; returns false if no device owns `addr`.
 	pub fn read(&self, addr: u64, data: &mut [u8]) -> bool {
-		match self.find(addr) {
+		match self.find(addr, data.len()) {
 			Some((base, dev)) => {
 				dev.lock().read(addr - base, data);
 				true
@@ -59,7 +79,7 @@ impl Bus {
 
 	/// Dispatch a write; returns false if no device owns `addr`.
 	pub fn write(&self, addr: u64, data: &[u8]) -> bool {
-		match self.find(addr) {
+		match self.find(addr, data.len()) {
 			Some((base, dev)) => {
 				dev.lock().write(addr - base, data);
 				true
