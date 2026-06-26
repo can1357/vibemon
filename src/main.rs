@@ -1,7 +1,8 @@
 //! vmm — a barebones VM monitor that boots a Linux guest with a serial
 //! console and virtio IO. The hypervisor backend is selected at compile time:
 //! KVM on Linux (`x86_64/aarch64`), Apple Hypervisor.framework on macOS
-//! (aarch64 / Apple Silicon).
+//! (`aarch64` / Apple Silicon), and Windows Hypervisor Platform on `x86_64`
+//! Windows.
 
 mod arch;
 mod config;
@@ -14,6 +15,7 @@ mod layout;
 mod memory;
 mod metrics;
 mod os;
+#[cfg(not(target_os = "windows"))]
 mod pager;
 mod result;
 #[cfg(target_os = "linux")]

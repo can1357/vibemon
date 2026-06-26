@@ -2,6 +2,7 @@
 
 pub mod boot;
 mod cpuid;
+#[cfg(target_os = "linux")]
 mod gdt;
 mod interrupts;
 pub mod mptable;
@@ -9,9 +10,12 @@ mod msr;
 mod regs;
 pub mod state;
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::CpuId;
 use vm_memory::{Address, GuestAddress};
 
+#[cfg(target_os = "windows")]
+use crate::hv::CpuId;
 use crate::{hv::Vcpu, memory::GuestMemoryMmap, result::Result};
 
 /// Configure one x86 vCPU for boot. Every vCPU gets CPUID, boot MSRs and LAPIC

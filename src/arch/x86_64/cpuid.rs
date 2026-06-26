@@ -5,8 +5,11 @@
 //! `EBX[31:24]` and leaf 0xB `EDX`) and the "hypervisor present" hint (leaf 1
 //! `ECX[31]`). Correct per-vCPU APIC IDs are what let SMP guests boot.
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::CpuId;
 
+#[cfg(target_os = "windows")]
+use crate::hv::CpuId;
 use crate::{hv::Vcpu, result::Result};
 
 const LEAF_FEATURE_INFO: u32 = 0x1;
@@ -31,6 +34,9 @@ pub fn setup_cpuid(vcpu: &Vcpu, base: &CpuId, cpu_id: u8) -> Result<()> {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	vcpu.fd().set_cpuid2(&cpuid)?;
+	#[cfg(target_os = "windows")]
+	vcpu.set_cpuid_template(&cpuid, cpu_id)?;
 	Ok(())
 }

@@ -32,10 +32,15 @@ fn user_net_conflicts_with_tap() {
 	);
 }
 
-/// UEFI boot needs operator-supplied firmware everywhere.
+/// UEFI boot needs operator-supplied firmware on supported hosts.
 #[test]
 fn uefi_requires_firmware() {
-	assert_cli_rejects(&["--boot-mode", "uefi"], "requires --firmware");
+	let expected = if cfg!(target_os = "windows") {
+		"not supported on Windows"
+	} else {
+		"requires --firmware"
+	};
+	assert_cli_rejects(&["--boot-mode", "uefi"], expected);
 }
 
 /// Invalid tracing filters should be rejected instead of silently falling back.

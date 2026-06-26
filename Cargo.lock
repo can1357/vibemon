@@ -104,6 +104,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
 
 [[package]]
+name = "byteorder"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "652805b7e73fada9d85e9a6682a4abd490cb52d96aeecc12e33a0de34dfd0d23"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,6 +302,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2772370ce9b7fa05c7eae0bd033005e139a64d52cee498a7905b3eb5d243c5f4"
 dependencies = [
  "pkg-config",
+]
+
+[[package]]
+name = "libwhp"
+version = "0.1.4"
+source = "git+https://github.com/insula-rs/libwhp?rev=3ee2119fa8a889cccbc223b0858bd1cdb1635975#3ee2119fa8a889cccbc223b0858bd1cdb1635975"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "libc",
 ]
 
 [[package]]
@@ -744,8 +760,6 @@ checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 [[package]]
 name = "vm-memory"
 version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f39348a049689cabd3377cdd9182bf526ec76a6f823b79903896452e9d7a7380"
 dependencies = [
  "libc",
  "thiserror",
@@ -773,6 +787,7 @@ dependencies = [
  "landlock",
  "libc",
  "libslirp",
+ "libwhp",
  "linux-loader",
  "miniz_oxide",
  "parking_lot",
@@ -789,6 +804,7 @@ dependencies = [
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
+ "windows-sys",
 ]
 
 [[package]]

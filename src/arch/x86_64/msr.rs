@@ -4,6 +4,7 @@
 //! MSRs and the TSC, and enable fast-string operations in `IA32_MISC_ENABLE`
 //! (some kernels fault early without it).
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::{Msrs, kvm_msr_entry};
 
 use crate::{bail, hv::Vcpu, result::Result};
@@ -48,6 +49,7 @@ const MSR_IA32_XSS: u32 = 0xda0;
 /// MSR indices captured for snapshot/restore (and zeroed/seeded at boot).
 /// Superset; at save time this is filtered through `KVM_GET_MSR_INDEX_LIST` and
 /// only entries that `get_msrs` actually returns are kept.
+#[cfg(target_os = "linux")]
 pub const MIGRATION_MSRS: &[u32] = &[
 	MSR_IA32_SYSENTER_CS,
 	MSR_IA32_SYSENTER_ESP,
@@ -79,29 +81,37 @@ pub const MIGRATION_MSRS: &[u32] = &[
 	MSR_IA32_XSS,
 ];
 
+#[cfg(target_os = "linux")]
 fn entry(index: u32, data: u64) -> kvm_msr_entry {
 	kvm_msr_entry { index, data, ..Default::default() }
 }
 
 /// Write the boot MSR values into the vCPU.
 pub fn setup_msrs(vcpu: &Vcpu) -> Result<()> {
-	let entries = [
-		entry(MSR_IA32_SYSENTER_CS, 0),
-		entry(MSR_IA32_SYSENTER_ESP, 0),
-		entry(MSR_IA32_SYSENTER_EIP, 0),
-		entry(MSR_STAR, 0),
-		entry(MSR_CSTAR, 0),
-		entry(MSR_LSTAR, 0),
-		entry(MSR_SYSCALL_MASK, 0),
-		entry(MSR_KERNEL_GS_BASE, 0),
-		entry(MSR_IA32_TSC, 0),
-		entry(MSR_IA32_MISC_ENABLE, MSR_IA32_MISC_ENABLE_FAST_STRING),
-	];
+	#[cfg(target_os = "linux")]
+	{
+		let entries = [
+			entry(MSR_IA32_SYSENTER_CS, 0),
+			entry(MSR_IA32_SYSENTER_ESP, 0),
+			entry(MSR_IA32_SYSENTER_EIP, 0),
+			entry(MSR_STAR, 0),
+			entry(MSR_CSTAR, 0),
+			entry(MSR_LSTAR, 0),
+			entry(MSR_SYSCALL_MASK, 0),
+			entry(MSR_KERNEL_GS_BASE, 0),
+			entry(MSR_IA32_TSC, 0),
+			entry(MSR_IA32_MISC_ENABLE, MSR_IA32_MISC_ENABLE_FAST_STRING),
+		];
 
-	let msrs = Msrs::from_entries(&entries)?;
-	let written = vcpu.fd().set_msrs(&msrs)?;
-	if written != entries.len() {
-		bail!("set_msrs wrote {written} of {} entries", entries.len());
+		let msrs = Msrs::from_entries(&entries)?;
+		let written = vcpu.fd().set_msrs(&msrs)?;
+		if written != entries.len() {
+			bail!("set_msrs wrote {written} of {} entries", entries.len());
+		}
+		Ok(())
 	}
-	Ok(())
+	#[cfg(target_os = "windows")]
+	{
+		vcpu.setup_msrs()
+	}
 }

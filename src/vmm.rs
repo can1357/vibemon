@@ -11,12 +11,6 @@ use std::sync::atomic::AtomicBool;
 use std::{
 	collections::VecDeque,
 	fs,
-	io::{self, Read, Write},
-	os::unix::{
-		fs::{FileTypeExt, MetadataExt, PermissionsExt},
-		io::AsRawFd,
-		net::{UnixListener, UnixStream},
-	},
 	path::{Path, PathBuf},
 	sync::{
 		Arc, OnceLock,
@@ -24,6 +18,15 @@ use std::{
 	},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant},
+};
+#[cfg(unix)]
+use std::{
+	io::{self, Read, Write},
+	os::unix::{
+		fs::{FileTypeExt, MetadataExt, PermissionsExt},
+		io::AsRawFd,
+		net::{UnixListener, UnixStream},
+	},
 };
 
 use flume::{Receiver, RecvTimeoutError, Sender};
@@ -33,12 +36,14 @@ use tracing::{error, info, warn};
 
 #[cfg(target_arch = "aarch64")]
 use crate::hv::Gic;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::layout::{
 	PCI_CONFIG_IO_BASE, PCI_CONFIG_IO_SIZE, PCI_VIRTIO_BAR_SIZE, PCI_VIRTIO_MMIO_SIZE,
 	PCI_VIRTIO_MMIO_START,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(not(target_os = "windows"))]
+use crate::virtio::fs::Fs;
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::virtio::pci::{
 	PCI_ECAM_BASE, PCI_ECAM_SIZE, PciCommonState, PciEcam, PciMmioDispatcher, PciRoot, PciTransport,
 };
@@ -60,7 +65,6 @@ use crate::{
 		Interrupt, VirtioDevice, WorkerControl,
 		block::Block,
 		console::OUTPUT_CAP,
-		fs::Fs,
 		mmio::{MmioState, MmioTransport},
 		net::Net,
 		run_worker,
@@ -82,6 +86,7 @@ const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 earlycon=uart8250
 
 /// Saved host terminal settings, restored on shutdown. Captured at runtime
 /// (not known at declaration), so `OnceLock` — not `LazyLock` — is correct.
+#[cfg(unix)]
 static ORIG_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
 type ConsoleInput = (Arc<Mutex<VecDeque<u8>>>, EventFd);
@@ -101,7 +106,7 @@ struct WorkerSpec {
 
 enum DeviceTransport {
 	Mmio(Arc<Mutex<MmioTransport>>),
-	#[cfg(target_arch = "x86_64")]
+	#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 	Pci(Arc<Mutex<PciTransport>>),
 }
 
@@ -115,6 +120,7 @@ struct DeviceHandle {
 	device:      Arc<Mutex<dyn VirtioDevice>>,
 	interrupt:   Arc<Interrupt>,
 	backend:     BackendHint,
+	#[cfg(not(target_os = "windows"))]
 	fs:          Option<Arc<Mutex<Fs>>>,
 	/// Clones of the worker's control eventfds (the worker holds the originals).
 	pause_evt:   EventFd,
@@ -159,7 +165,7 @@ pub struct Vmm {
 
 	/// Prepared Linux vCPUs (configured/restored), drained into threads by
 	/// `start`.
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	vcpus:         Vec<Vcpu>,
 	/// Plain startup payload used to create/configure HVF vCPUs on their owning
 	/// threads.
@@ -169,7 +175,9 @@ pub struct Vmm {
 	vcpu_cmd_rxs:  Vec<Receiver<VcpuCmd>>,
 	vcpu_handles:  Vec<JoinHandle<()>>,
 
+	#[cfg(not(target_os = "windows"))]
 	pager:         Option<Arc<crate::pager::Pager>>,
+	#[cfg(not(target_os = "windows"))]
 	pager_handler: Option<JoinHandle<()>>,
 
 	pio_bus:        Arc<Bus>,
@@ -201,23 +209,29 @@ pub struct Vmm {
 	gic:            Option<Gic>,
 }
 
+#[cfg(unix)]
 struct AgentSocket {
 	path:       PathBuf,
 	listener:   UnixListener,
 	launch_uid: u32,
 }
 
+#[cfg(unix)]
 impl AgentSocket {
 	fn cleanup(&self) {
 		cleanup_agent_socket_path(&self.path);
 	}
 }
 
+#[cfg(unix)]
 impl Drop for AgentSocket {
 	fn drop(&mut self) {
 		self.cleanup();
 	}
 }
+
+#[cfg(not(unix))]
+struct AgentSocket;
 
 #[derive(Clone, Copy)]
 struct ControlPlaneOwner {
@@ -303,10 +317,15 @@ impl VmmExit {
 pub fn run(config: Config) -> Result<()> {
 	// --fork-from with --count > 1: this process is the fanout parent. It must
 	// spawn children before any per-child jail, control, or agent sockets exist.
+	#[cfg(not(target_os = "windows"))]
 	if let Some(dir) = &config.fork_from
 		&& config.count > 1
 	{
 		return spawn_fork_children(dir, &config);
+	}
+	#[cfg(target_os = "windows")]
+	if config.fork_from.is_some() {
+		return Err(err("--fork-from is not supported on Windows"));
 	}
 	if config.no_sandbox {
 		tracing::warn!("host process sandbox explicitly disabled");
@@ -328,14 +347,21 @@ pub fn run_inner(config: Config) -> Result<()> {
 }
 
 fn launch_owner_uid() -> Result<u32> {
-	// SAFETY: `getuid` has no preconditions and only reads process credentials.
-	let real_uid = unsafe { libc::getuid() as u32 };
-	if real_uid != 0 {
-		return Ok(real_uid);
+	#[cfg(unix)]
+	{
+		// SAFETY: `getuid` has no preconditions and only reads process credentials.
+		let real_uid = unsafe { libc::getuid() as u32 };
+		if real_uid != 0 {
+			return Ok(real_uid);
+		}
+		Ok(parse_env_u32("SUDO_UID")?
+			.filter(|uid| *uid != 0)
+			.unwrap_or(0))
 	}
-	Ok(parse_env_u32("SUDO_UID")?
-		.filter(|uid| *uid != 0)
-		.unwrap_or(0))
+	#[cfg(not(unix))]
+	{
+		Ok(0)
+	}
 }
 
 fn parse_env_u32(name: &str) -> Result<Option<u32>> {
@@ -386,10 +412,19 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 
 	// Kept for direct unit callers of `run_inner_with_prebound`; the public
 	// entry point handles this before jail/socket setup.
+	#[cfg(not(target_os = "windows"))]
 	if let Some(dir) = &config.fork_from
 		&& config.count > 1
 	{
 		return spawn_fork_children(dir, &config);
+	}
+	#[cfg(target_os = "windows")]
+	if config.restore.is_some() {
+		return Err(err("--restore is not supported on Windows"));
+	}
+	#[cfg(target_os = "windows")]
+	if config.fork_from.is_some() {
+		return Err(err("--fork-from is not supported on Windows"));
 	}
 
 	// Bind the control-plane and agent sockets FIRST, while still privileged.
@@ -418,6 +453,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// parent dir already exists here (bound above, or pre-created by the jailer).
 	let mut status_file = open_status_file(status_sock.as_deref());
 
+	#[cfg(not(target_os = "windows"))]
 	let pager_setup = match config.mem_target_mib {
 		Some(target_mib) => {
 			let setup = crate::pager::create_uffd().and_then(|uffd| {
@@ -477,6 +513,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	} else {
 		crate::metrics::record_boot_duration(reconstruct_elapsed);
 	}
+	#[cfg(not(target_os = "windows"))]
 	if let Some((uffd, swap, target_mib)) = pager_setup {
 		let pager_limits = (|| -> Result<(usize, usize)> {
 			let target_bytes = target_mib
@@ -604,6 +641,7 @@ fn bind_control_socket(
 	}
 }
 
+#[cfg(unix)]
 fn bind_agent_socket(
 	agent_sock: Option<PathBuf>,
 	jail: bool,
@@ -629,6 +667,19 @@ fn bind_agent_socket(
 	Ok(Some(AgentSocket { path: sock_path, listener, launch_uid }))
 }
 
+#[cfg(not(unix))]
+fn bind_agent_socket(
+	agent_sock: Option<PathBuf>,
+	_jail: bool,
+	_launch_uid: u32,
+) -> Result<Option<AgentSocket>> {
+	match agent_sock {
+		Some(_) => Err(err("--agent-sock is not supported on Windows")),
+		None => Ok(None),
+	}
+}
+
+#[cfg(unix)]
 fn spawn_agent_bridge(
 	agent_socket: Option<AgentSocket>,
 	vmm: &Vmm,
@@ -664,6 +715,15 @@ fn spawn_agent_bridge(
 		.map_err(|e| err(format!("spawning agent bridge thread failed: {e}")))
 }
 
+#[cfg(not(unix))]
+fn spawn_agent_bridge(
+	agent_socket: Option<AgentSocket>,
+	_vmm: &Vmm,
+) -> Result<Option<JoinHandle<()>>> {
+	let _ = agent_socket;
+	Ok(None)
+}
+
 fn join_agent_bridge(handle: Option<JoinHandle<()>>) -> Result<()> {
 	if let Some(handle) = handle
 		&& handle.join().is_err()
@@ -674,11 +734,15 @@ fn join_agent_bridge(handle: Option<JoinHandle<()>>) -> Result<()> {
 }
 
 fn cleanup_agent_socket(agent_socket: Option<&AgentSocket>) {
+	#[cfg(unix)]
 	if let Some(agent_socket) = agent_socket {
 		agent_socket.cleanup();
 	}
+	#[cfg(not(unix))]
+	let _ = agent_socket;
 }
 
+#[cfg(unix)]
 fn validate_jail_agent_socket_path(sock_path: &Path) -> Result<()> {
 	let root = Path::new("/run/vmon");
 	let escapes = sock_path
@@ -693,6 +757,7 @@ fn validate_jail_agent_socket_path(sock_path: &Path) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 fn prepare_agent_socket_path(sock_path: &Path, launch_uid: u32) -> Result<()> {
 	if sock_path.as_os_str().is_empty() {
 		return Err(err("agent socket path must not be empty"));
@@ -723,9 +788,11 @@ fn prepare_agent_socket_path(sock_path: &Path, launch_uid: u32) -> Result<()> {
 	remove_stale_agent_socket(sock_path)
 }
 
+#[cfg(unix)]
 fn agent_socket_parent(sock_path: &Path) -> &Path {
 	sock_path.parent().unwrap_or_else(|| Path::new("."))
 }
+#[cfg(unix)]
 fn verify_private_agent_socket_parent(
 	parent: &Path,
 	meta: &fs::Metadata,
@@ -748,6 +815,7 @@ fn verify_private_agent_socket_parent(
 	Ok(())
 }
 
+#[cfg(unix)]
 fn remove_stale_agent_socket(sock_path: &Path) -> Result<()> {
 	let meta = match fs::symlink_metadata(sock_path) {
 		Ok(meta) => meta,
@@ -775,6 +843,7 @@ fn remove_stale_agent_socket(sock_path: &Path) -> Result<()> {
 	}
 }
 
+#[cfg(unix)]
 fn cleanup_agent_socket_path(sock_path: &Path) {
 	let Ok(meta) = fs::symlink_metadata(sock_path) else {
 		return;
@@ -784,6 +853,7 @@ fn cleanup_agent_socket_path(sock_path: &Path) {
 	}
 }
 
+#[cfg(unix)]
 fn agent_bridge_loop(
 	socket: AgentSocket,
 	console_input: Arc<Mutex<VecDeque<u8>>>,
@@ -910,6 +980,7 @@ fn agent_bridge_loop(
 	}
 }
 
+#[cfg(unix)]
 fn accept_agent_client(listener: &UnixListener, launch_uid: u32) -> io::Result<Option<UnixStream>> {
 	match listener.accept() {
 		Ok((stream, _)) => {
@@ -954,12 +1025,13 @@ fn verify_agent_peer_credentials(stream: &UnixStream, launch_uid: u32) -> io::Re
 	))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[allow(clippy::unnecessary_wraps, reason = "uniform interface across platforms")]
 const fn verify_agent_peer_credentials(_: &UnixStream, _: u32) -> io::Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 fn read_agent_socket_to_console(
 	stream: &mut UnixStream,
 	console_input: &Arc<Mutex<VecDeque<u8>>>,
@@ -987,6 +1059,7 @@ fn read_agent_socket_to_console(
 	Ok(true)
 }
 
+#[cfg(unix)]
 fn drain_guest_output_to_socket(
 	stream: &mut UnixStream,
 	output: &Arc<Mutex<Vec<u8>>>,
@@ -1015,6 +1088,7 @@ fn drain_guest_output_to_socket(
 	}
 }
 
+#[cfg(unix)]
 fn discard_guest_output(
 	output: &Arc<Mutex<Vec<u8>>>,
 	drain_resume_evt: &EventFd,
@@ -1028,6 +1102,7 @@ fn discard_guest_output(
 	signal_drain_resume_if_needed(before, 0, drain_resume_evt)
 }
 
+#[cfg(unix)]
 fn signal_drain_resume_if_needed(
 	before: usize,
 	after: usize,
@@ -1507,13 +1582,18 @@ impl Vmm {
 				let firmware_path = firmware
 					.as_ref()
 					.ok_or_else(|| err("--boot-mode uefi requires --firmware"))?;
-				#[cfg(target_arch = "x86_64")]
+				#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 				{
 					arch::boot::load_uefi_firmware(firmware_path, vm.memory(), &vm.fd)?
 				}
-				#[cfg(target_arch = "aarch64")]
+				#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 				{
 					arch::boot::load_uefi_firmware(firmware_path, vm.memory())?
+				}
+				#[cfg(target_os = "windows")]
+				{
+					let _ = firmware_path;
+					return Err(err("--boot-mode uefi is not supported on Windows"));
 				}
 			},
 		};
@@ -1523,9 +1603,9 @@ impl Vmm {
 			None
 		};
 
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		let mut vcpus = Vec::with_capacity(config.cpus as usize);
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		for id in 0..config.cpus {
 			vcpus.push(vm.create_vcpu(id)?);
 		}
@@ -1547,12 +1627,14 @@ impl Vmm {
 		#[allow(unused_mut, reason = "pio_bus is only mutated (serial) on x86_64.")]
 		let mut pio_bus = Bus::new();
 		let mut mmio_bus = Bus::new();
+		#[cfg(target_os = "windows")]
+		vm.register_ioapic(&mut mmio_bus)?;
 		#[cfg(target_arch = "x86_64")]
 		let serial = setup_serial(&vm, &mut pio_bus, None)?;
 		#[cfg(target_arch = "aarch64")]
 		let serial = setup_serial(&vm, &mut mmio_bus, None)?;
 
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let (pci_root, pci_mmio) = if config.transport == Transport::Pci {
 			let root = Arc::new(Mutex::new(PciRoot::new()));
 			let mmio = Arc::new(Mutex::new(PciMmioDispatcher::new(PCI_VIRTIO_MMIO_START)));
@@ -1577,9 +1659,9 @@ impl Vmm {
 		let mut virtio_infos: Vec<(u64, u32)> = Vec::new();
 		let mut gsi = IRQ_BASE;
 		let mut mmio_base = MMIO_MEM_START;
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let mut pci_slot = 1u8;
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let mut pci_bar_base = PCI_VIRTIO_MMIO_START;
 		let mut console_input = None;
 		let mut console_output = None;
@@ -1618,7 +1700,7 @@ impl Vmm {
 					mmio_base += MMIO_DEVICE_SIZE;
 				},
 				Transport::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -1637,7 +1719,7 @@ impl Vmm {
 						pci_slot += 1;
 						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
@@ -1676,7 +1758,7 @@ impl Vmm {
 					mmio_base += MMIO_DEVICE_SIZE;
 				},
 				Transport::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -1695,13 +1777,14 @@ impl Vmm {
 						pci_slot += 1;
 						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
 			gsi += 1;
 		}
 
+		#[cfg(not(target_os = "windows"))]
 		if let (Some(tag), Some(dir)) = (&config.fs_tag, &config.fs_dir) {
 			let shared_dir = std::fs::canonicalize(dir)
 				.map_err(|e| err(format!("virtio-fs shared dir {}: {e}", dir.display())))?;
@@ -1733,7 +1816,7 @@ impl Vmm {
 					mmio_base += MMIO_DEVICE_SIZE;
 				},
 				Transport::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -1752,7 +1835,7 @@ impl Vmm {
 						pci_slot += 1;
 						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
@@ -1762,6 +1845,7 @@ impl Vmm {
 			gsi += 1;
 		}
 
+		#[cfg(not(target_os = "windows"))]
 		for m in &config.volumes {
 			let shared_dir = std::fs::canonicalize(&m.dir)
 				.map_err(|e| err(format!("virtio-fs volume dir {}: {e}", m.dir.display())))?;
@@ -1794,7 +1878,7 @@ impl Vmm {
 					mmio_base += MMIO_DEVICE_SIZE;
 				},
 				Transport::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -1813,7 +1897,7 @@ impl Vmm {
 						pci_slot += 1;
 						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
@@ -1844,7 +1928,7 @@ impl Vmm {
 					virtio_infos.push((mmio_base, gsi));
 				},
 				Transport::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -1861,7 +1945,7 @@ impl Vmm {
 							&mut devices,
 						)?;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
@@ -1885,14 +1969,16 @@ impl Vmm {
 			#[cfg(target_arch = "x86_64")]
 			firmware_memory: loaded.firmware_memory,
 			vm,
-			#[cfg(target_os = "linux")]
+			#[cfg(any(target_os = "linux", target_os = "windows"))]
 			vcpus,
 			#[cfg(target_os = "macos")]
 			macos_startup,
 			vcpu_cmd_txs: txs,
 			vcpu_cmd_rxs: rxs,
 			vcpu_handles: Vec::new(),
+			#[cfg(not(target_os = "windows"))]
 			pager: None,
+			#[cfg(not(target_os = "windows"))]
 			pager_handler: None,
 			pio_bus: Arc::new(pio_bus),
 			mmio_bus: Arc::new(mmio_bus),
@@ -1916,6 +2002,11 @@ impl Vmm {
 
 	/// Restore a previously snapshotted VM (no kernel boot).
 	fn restore(dir: &Path, config: &Config) -> Result<Self> {
+		#[cfg(target_os = "windows")]
+		{
+			let _ = (dir, config);
+			return Err(err("--restore is not supported on Windows"));
+		}
 		let image = snapshot::read_snapshot(dir)?;
 		snapshot::validate_snapshot(&image)?;
 		let mem_bytes = image
@@ -1960,7 +2051,7 @@ impl Vmm {
 	fn reconstruct(vm: Arc<Vm>, snap: Snapshot, config: &Config) -> Result<Self> {
 		let boot_mode = parse_snapshot_boot_mode(&snap.boot_mode)?;
 		let firmware = snap.firmware.as_deref().map(PathBuf::from);
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		let firmware_memory = match boot_mode {
 			BootMode::Direct => None,
 			BootMode::Uefi => {
@@ -1971,13 +2062,15 @@ impl Vmm {
 				Some(arch::boot::map_uefi_firmware(Path::new(path), vm.memory(), &vm.fd)?)
 			},
 		};
+		#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+		let firmware_memory = None;
 		// Machine + vCPU shells (register state applied last, pre-spawn).
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		arch::state::restore_machine(&vm.fd, &snap.machine)?;
 
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		let mut vcpus = Vec::with_capacity(snap.cpus as usize);
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		for id in 0..snap.cpus {
 			vcpus.push(vm.create_vcpu(id)?);
 		}
@@ -2007,17 +2100,19 @@ impl Vmm {
 		#[allow(unused_mut, reason = "pio_bus is only mutated (serial) on x86_64.")]
 		let mut pio_bus = Bus::new();
 		let mut mmio_bus = Bus::new();
+		#[cfg(target_os = "windows")]
+		vm.register_ioapic(&mut mmio_bus)?;
 		#[cfg(target_arch = "x86_64")]
 		let serial = setup_serial(&vm, &mut pio_bus, Some(&snap.serial))?;
 		#[cfg(target_arch = "aarch64")]
 		let serial = setup_serial(&vm, &mut mmio_bus, Some(&snap.serial))?;
 
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let needs_pci = snap
 			.devices
 			.iter()
 			.any(|d| d.transport == DeviceTransportKind::Pci);
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let (pci_root, pci_mmio) = if needs_pci {
 			let root = Arc::new(Mutex::new(PciRoot::new()));
 			let mmio = Arc::new(Mutex::new(PciMmioDispatcher::new(PCI_VIRTIO_MMIO_START)));
@@ -2032,9 +2127,9 @@ impl Vmm {
 		} else {
 			(None, None)
 		};
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 		let mut pci_slot = 1u8;
-		#[cfg(not(target_arch = "x86_64"))]
+		#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
 		if snap
 			.devices
 			.iter()
@@ -2049,6 +2144,7 @@ impl Vmm {
 		let mut console_output = None;
 		for ds in &snap.devices {
 			let backend = resolve_backend(ds, config);
+			#[cfg(not(target_os = "windows"))]
 			let mut fs_handle = None;
 			let device: Arc<Mutex<dyn VirtioDevice>> = match &backend {
 				BackendHint::Block { path, read_only } => {
@@ -2063,6 +2159,7 @@ impl Vmm {
 					Arc::new(Mutex::new(block))
 				},
 				BackendHint::Net { .. } | BackendHint::UserNet { .. } => open_net_device(&backend)?,
+				#[cfg(not(target_os = "windows"))]
 				BackendHint::Fs { tag, shared_dir, read_only } => {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
 						err("snapshot virtio-fs backend is missing serialized fs state")
@@ -2076,6 +2173,8 @@ impl Vmm {
 					fs_handle = Some(fs_dev.clone());
 					fs_dev
 				},
+				#[cfg(target_os = "windows")]
+				BackendHint::Fs { .. } => return Err(err("virtio-fs snapshots are not supported on Windows")),
 				BackendHint::Console => {
 					let console = crate::virtio::console::Console::new()?;
 					console_input = Some(console.input_handle());
@@ -2108,7 +2207,7 @@ impl Vmm {
 					)?;
 				},
 				DeviceTransportKind::Pci => {
-					#[cfg(target_arch = "x86_64")]
+					#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 					{
 						wire_pci_device(
 							&vm,
@@ -2126,10 +2225,11 @@ impl Vmm {
 						)?;
 						pci_slot += 1;
 					}
-					#[cfg(not(target_arch = "x86_64"))]
-					unreachable!("PCI snapshots are rejected above on non-x86_64");
+					#[cfg(any(not(target_arch = "x86_64"), target_os = "windows"))]
+					unreachable!("PCI snapshots are rejected during config parsing");
 				},
 			}
+			#[cfg(not(target_os = "windows"))]
 			if let Some(fs_handle) = fs_handle
 				&& let Some(device) = devices.last_mut()
 			{
@@ -2154,14 +2254,16 @@ impl Vmm {
 			#[cfg(target_arch = "x86_64")]
 			firmware_memory,
 			vm,
-			#[cfg(target_os = "linux")]
+			#[cfg(any(target_os = "linux", target_os = "windows"))]
 			vcpus,
 			#[cfg(target_os = "macos")]
 			macos_startup,
 			vcpu_cmd_txs: txs,
 			vcpu_cmd_rxs: rxs,
 			vcpu_handles: Vec::new(),
+			#[cfg(not(target_os = "windows"))]
 			pager: None,
+			#[cfg(not(target_os = "windows"))]
 			pager_handler: None,
 			pio_bus: Arc::new(pio_bus),
 			mmio_bus: Arc::new(mmio_bus),
@@ -2184,6 +2286,16 @@ impl Vmm {
 	}
 
 	// -- run loop ------------------------------------------------------------
+
+	#[cfg(target_os = "windows")]
+	fn set_windows_pause_kicker(&self) {
+		let vcpus = self.vcpus.clone();
+		self.gate.set_kicker(Arc::new(move || {
+			for vcpu in &vcpus {
+				vcpu.kick();
+			}
+		}));
+	}
 
 	/// Spawn the device-worker and vCPU threads and put the host console in raw
 	/// mode.
@@ -2220,19 +2332,21 @@ impl Vmm {
 		}
 
 		// XSAVE2 buffer size for full extended-state capture. `Cap::Xsave2` is an
-		// x86-only kvm-ioctls variant; on aarch64/HVF there is no XSAVE so it is 0
-		// (arm's save_state ignores it).
-		#[cfg(target_arch = "x86_64")]
+		// x86-only KVM ioctl; Windows/WHP and aarch64 backends do not use XSAVE
+		// state in the snapshot path, so they pass 0.
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		let xsave_size = self
 			.vm
 			.kvm
 			.check_extension_int(kvm_ioctls::Cap::Xsave2)
 			.max(0) as usize;
-		#[cfg(target_arch = "aarch64")]
+		#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 		let xsave_size = 0usize;
 
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		{
+			#[cfg(target_os = "windows")]
+			self.set_windows_pause_kicker();
 			let vcpus = std::mem::take(&mut self.vcpus);
 			let rxs = std::mem::take(&mut self.vcpu_cmd_rxs);
 			for (id, (vcpu, rx)) in vcpus.into_iter().zip(rxs).enumerate() {
@@ -2247,6 +2361,7 @@ impl Vmm {
 		}
 		#[cfg(target_os = "macos")]
 		self.start_macos_vcpus(xsave_size)?;
+		#[cfg(not(target_os = "windows"))]
 		if let Some(pager) = &self.pager {
 			let p = pager.clone();
 			self.pager_handler = Some(
@@ -2464,7 +2579,7 @@ impl Vmm {
 		} else {
 			// Arm the wall-clock hard deadline without a control socket: a timer
 			// thread stops the VM at the deadline so the vCPU joins return.
-			let deadline_timer = if self.pager.is_some() {
+			let deadline_timer = if self.has_pager() {
 				let deadline = self
 					.timeout_secs
 					.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
@@ -2539,6 +2654,7 @@ impl Vmm {
 		}
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	fn sweep_pager_if_needed(&self) {
 		let Some(pager) = self.pager.clone() else {
 			return;
@@ -2554,6 +2670,19 @@ impl Vmm {
 		if let Err(e) = self.resume() {
 			warn!("pager sweep completed but VM resume failed: {e}");
 		}
+	}
+
+	#[cfg(target_os = "windows")]
+	fn sweep_pager_if_needed(&self) {}
+
+	#[cfg(not(target_os = "windows"))]
+	const fn has_pager(&self) -> bool {
+		self.pager.is_some()
+	}
+
+	#[cfg(target_os = "windows")]
+	const fn has_pager(&self) -> bool {
+		false
 	}
 
 	fn handle_control(
@@ -2944,8 +3073,10 @@ impl Vmm {
 		}
 		self.ensure_not_stopping("snapshot machine state")?;
 
-		#[cfg(target_arch = "x86_64")]
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		let machine = arch::state::save_machine(&self.vm.fd)?;
+		#[cfg(all(not(target_os = "linux"), target_arch = "x86_64"))]
+		let machine = arch::state::save_machine()?;
 		#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 		let machine = arch::state::MachineState { gic: self.gic.save_state(u64::from(self.cpus))? };
 		#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2995,7 +3126,7 @@ impl Vmm {
 						None,
 					)
 				},
-				#[cfg(target_arch = "x86_64")]
+				#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 				DeviceTransport::Pci(transport) => {
 					let transport = transport.lock();
 					let common = transport.common_state();
@@ -3019,6 +3150,7 @@ impl Vmm {
 			} else {
 				live
 			};
+			#[cfg(not(target_os = "windows"))]
 			let fs = if d.kind == DeviceKind::Fs {
 				Some(
 					d.fs
@@ -3030,6 +3162,8 @@ impl Vmm {
 			} else {
 				None
 			};
+			#[cfg(target_os = "windows")]
+			let fs = None;
 			let transport_pci: Option<snapshot::PciTransportStateSer> = transport_pci;
 			let mmio_base = transport_pci
 				.as_ref()
@@ -3110,14 +3244,17 @@ impl Vmm {
 				join_error = Some("device worker thread panicked during shutdown");
 			}
 		}
-		if let Some(pager) = &self.pager {
-			pager.request_stop();
-		}
-		if let Some(handle) = self.pager_handler.take()
-			&& handle.join().is_err()
-			&& join_error.is_none()
+		#[cfg(not(target_os = "windows"))]
 		{
-			join_error = Some("pager handler thread panicked during shutdown");
+			if let Some(pager) = &self.pager {
+				pager.request_stop();
+			}
+			if let Some(handle) = self.pager_handler.take()
+				&& handle.join().is_err()
+				&& join_error.is_none()
+			{
+				join_error = Some("pager handler thread panicked during shutdown");
+			}
 		}
 		if let Some(message) = join_error {
 			Err(err(message))
@@ -3129,6 +3266,7 @@ impl Vmm {
 	}
 }
 
+#[cfg(unix)]
 fn wait_eventfd_read(evt: &EventFd, timeout: Duration) -> Result<bool> {
 	let mut pfd = libc::pollfd { fd: evt.as_raw_fd(), events: libc::POLLIN, revents: 0 };
 	// SAFETY: `pfd` points to one initialized pollfd for the duration of the call.
@@ -3157,6 +3295,24 @@ fn wait_eventfd_read(evt: &EventFd, timeout: Duration) -> Result<bool> {
 	Ok(true)
 }
 
+#[cfg(target_os = "windows")]
+fn wait_eventfd_read(evt: &EventFd, timeout: Duration) -> Result<bool> {
+	let deadline = Instant::now().checked_add(timeout);
+	loop {
+		match evt.read() {
+			Ok(_) => return Ok(true),
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+				if timeout.is_zero() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+					return Ok(false);
+				}
+				std::thread::sleep(min_duration(Duration::from_millis(1), timeout));
+			},
+			Err(e) => return Err(err(format!("eventfd read failed: {e}"))),
+		}
+	}
+}
+
+#[cfg(unix)]
 fn poll_timeout_ms(timeout: Duration) -> libc::c_int {
 	if timeout.is_zero() {
 		return 0;
@@ -3254,6 +3410,7 @@ fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
 				BackendHint::UserNet { mac }
 			}
 		},
+		#[cfg(not(target_os = "windows"))]
 		BackendHint::Fs { tag, shared_dir, read_only } => {
 			// Re-attach each virtio-fs device by matching its snapshot tag: a
 			// named volume re-binds to that volume's host dir + mode; the single
@@ -3279,6 +3436,12 @@ fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
 					(shared_dir.clone(), *read_only)
 				};
 			BackendHint::Fs { tag: tag.clone(), shared_dir, read_only }
+		},
+		#[cfg(target_os = "windows")]
+		BackendHint::Fs { tag, shared_dir, read_only } => BackendHint::Fs {
+			tag:        tag.clone(),
+			shared_dir: shared_dir.clone(),
+			read_only:  *read_only,
 		},
 		BackendHint::Console => BackendHint::Console,
 	}
@@ -3393,6 +3556,7 @@ fn wire_device(
 		device: device.clone(),
 		interrupt,
 		backend,
+		#[cfg(not(target_os = "windows"))]
 		fs: None,
 		pause_evt: pause_evt.try_clone()?,
 		resume_evt: resume_evt.try_clone()?,
@@ -3416,7 +3580,7 @@ fn wire_device(
 
 /// Wire one x86 virtio-pci function: legacy irqfd fallback, PCI config-space
 /// function, BAR dispatcher entry, worker control eventfds, and worker spec.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 #[allow(clippy::too_many_arguments, reason = "Complexity is required to wire a PCI virtio device")]
 fn wire_pci_device(
 	vm: &Vm,
@@ -3498,6 +3662,7 @@ fn wire_pci_device(
 		device: device.clone(),
 		interrupt,
 		backend,
+		#[cfg(not(target_os = "windows"))]
 		fs: None,
 		pause_evt: pause_evt.try_clone()?,
 		resume_evt: resume_evt.try_clone()?,
@@ -3597,14 +3762,21 @@ fn configure_and_boot(
 			}
 		},
 		BootMode::Uefi => {
-			arch::boot::configure_uefi_system(
-				vm.memory(),
-				u8::try_from(vcpus.len()).unwrap(),
-				crate::virtio::pci::PCI_ECAM_BASE,
-				crate::virtio::pci::PCI_ECAM_SIZE,
-			)?;
-			for (id, vcpu) in vcpus.iter().enumerate() {
-				arch::boot::configure_uefi_vcpu(vcpu, vm.supported_cpuid(), id as u8, loaded.entry)?;
+			#[cfg(target_os = "linux")]
+			{
+				arch::boot::configure_uefi_system(
+					vm.memory(),
+					u8::try_from(vcpus.len()).unwrap(),
+					crate::virtio::pci::PCI_ECAM_BASE,
+					crate::virtio::pci::PCI_ECAM_SIZE,
+				)?;
+				for (id, vcpu) in vcpus.iter().enumerate() {
+					arch::boot::configure_uefi_vcpu(vcpu, vm.supported_cpuid(), id as u8, loaded.entry)?;
+				}
+			}
+			#[cfg(target_os = "windows")]
+			{
+				return Err(err("--boot-mode uefi is not supported on Windows"));
 			}
 		},
 	}
@@ -3701,7 +3873,11 @@ fn run_vcpu(
 			RunState::Running => {},
 		}
 
-		match vcpu.run() {
+		#[cfg(target_os = "windows")]
+		let exit = vcpu.run_whp(&pio_bus, &mmio_bus);
+		#[cfg(not(target_os = "windows"))]
+		let exit = vcpu.run();
+		match exit {
 			Ok(Exit::PioIn { port, data }) => {
 				crate::metrics::record_vm_exit(VmExit::IoIn);
 				if !pio_bus.read(u64::from(port), data) {
@@ -3799,23 +3975,29 @@ fn fatal(gate: &PauseGate, exit_reason: &AtomicU8, exit: VmmExit, id: u8, reason
 /// Put the controlling terminal into raw mode (if any) and forward host stdin
 /// into the serial receive FIFO.
 fn setup_console(serial: Arc<Mutex<SerialDevice>>) {
-	// SAFETY: isatty on a fixed fd is always safe.
-	if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-		enable_raw_mode();
-	}
-	thread::spawn(move || {
-		let mut input = io::stdin().lock();
-		let mut buf = [0u8; 64];
-		loop {
-			match input.read(&mut buf) {
-				Ok(0) => break,
-				Ok(n) => serial.lock().enqueue(&buf[..n]),
-				Err(_) => break,
-			}
+	#[cfg(unix)]
+	{
+		// SAFETY: isatty on a fixed fd is always safe.
+		if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+			enable_raw_mode();
 		}
-	});
+		thread::spawn(move || {
+			let mut input = io::stdin().lock();
+			let mut buf = [0u8; 64];
+			loop {
+				match input.read(&mut buf) {
+					Ok(0) => break,
+					Ok(n) => serial.lock().enqueue(&buf[..n]),
+					Err(_) => break,
+				}
+			}
+		});
+	}
+	#[cfg(not(unix))]
+	let _ = serial;
 }
 
+#[cfg(unix)]
 fn enable_raw_mode() {
 	// SAFETY: termios calls on STDIN with valid pointers.
 	unsafe {
@@ -3832,6 +4014,7 @@ fn enable_raw_mode() {
 }
 
 fn restore_terminal() {
+	#[cfg(unix)]
 	if let Some(term) = ORIG_TERMIOS.get() {
 		// SAFETY: restoring previously saved, valid termios on STDIN.
 		unsafe {

@@ -659,4 +659,48 @@ mod platform {
 	}
 }
 
+#[cfg(target_os = "windows")]
+mod platform {
+	use std::io;
+
+	use crate::result::{Result, err};
+
+	/// Windows TAP placeholder. Host networking is intentionally unsupported in
+	/// the first WHP backend pass.
+	pub struct Tap {
+		mac: [u8; 6],
+	}
+
+	impl Tap {
+		/// Windows TAP/user networking is not supported yet.
+		pub fn open(name: &str, _mac: [u8; 6]) -> Result<Self> {
+			Err(err(format!("TAP networking is unsupported on Windows (requested {name:?})")))
+		}
+
+		pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+			Err(io::Error::new(io::ErrorKind::Unsupported, "TAP networking is unsupported on Windows"))
+		}
+
+		pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+			Err(io::Error::new(io::ErrorKind::Unsupported, "TAP networking is unsupported on Windows"))
+		}
+
+		pub fn set_offloads(&self, _offloads: u32) -> Result<()> {
+			Err(err("TAP networking is unsupported on Windows"))
+		}
+
+		#[expect(
+			clippy::unused_self,
+			reason = "all net backends expose the same instance-shaped offload API"
+		)]
+		pub const fn supported_offloads(&self) -> u32 {
+			0
+		}
+
+		pub const fn mac(&self) -> [u8; 6] {
+			self.mac
+		}
+	}
+}
+
 pub use platform::Tap;

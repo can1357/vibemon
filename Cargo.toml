@@ -125,7 +125,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 virtio-bindings = "0.2"
 virtio-queue = "0.17"
-vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = { version = "0.15", features = ["with-serde"] }
 linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 vm-superio = "0.8.1"
@@ -146,6 +146,10 @@ io-uring = "0.7"
 landlock = "0.4"
 seccompiler = "0.5"
 
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+libwhp = { git = "https://github.com/insula-rs/libwhp", rev = "3ee2119fa8a889cccbc223b0858bd1cdb1635975" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
@@ -155,6 +159,9 @@ libslirp = { version = "4.3.2", default-features = false }
 applevisor = { version = "1.0", default-features = false, features = ["macos-15-0"] }
 applevisor-sys = { version = "1.0", default-features = false, features = ["macos-15-0"] }
 squib-gic = "0.2"
+
+[patch.crates-io]
+vm-memory = { path = "vendor/vm-memory-0.17.1" }
 
 [profile.release]
 opt-level = 2

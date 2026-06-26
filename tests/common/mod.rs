@@ -2,13 +2,17 @@
 
 use std::{
 	fs,
-	io::{self, BufRead, BufReader, Read, Write},
-	os::unix::{fs::DirBuilderExt, net::UnixStream},
+	io::{self, Read, Write},
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
 	sync::{Arc, Mutex},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+#[cfg(unix)]
+use std::{
+	io::{BufRead, BufReader},
+	os::unix::{fs::DirBuilderExt, net::UnixStream},
 };
 
 use flume::{Receiver, Sender};
@@ -180,9 +184,11 @@ pub fn test_dir(name: &str) -> PathBuf {
 	let dir = Path::new(TEST_RUNS).join(format!("{name}-{}-{nanos}", std::process::id()));
 	// Private mode so control/agent sockets created here satisfy vmon's
 	// 0700-or-stricter parent-directory requirement on every host.
-	fs::DirBuilder::new()
-		.recursive(true)
-		.mode(0o700)
+	let mut builder = fs::DirBuilder::new();
+	builder.recursive(true);
+	#[cfg(unix)]
+	builder.mode(0o700);
+	builder
 		.create(&dir)
 		.unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
 	fs::canonicalize(&dir)
@@ -445,12 +451,14 @@ fn output_to_string(output: &Arc<Mutex<Vec<u8>>>) -> String {
 	String::from_utf8_lossy(&output.lock().expect("output lock poisoned")).into_owned()
 }
 
+#[cfg(unix)]
 pub struct ControlClient {
 	reader:  BufReader<UnixStream>,
 	writer:  UnixStream,
 	next_id: u64,
 }
 
+#[cfg(unix)]
 impl ControlClient {
 	pub fn connect(path: &Path, timeout: Duration) -> Self {
 		let deadline = Instant::now() + timeout;

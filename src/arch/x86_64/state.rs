@@ -1,28 +1,62 @@
-//! `x86_64` vCPU and machine snapshot state.
-//!
-//! Captures the full migratable KVM state of a paused vCPU and of the
-//! VM-global interrupt/timer devices, plus the inverse restore path. We
-//! serialize the dynamically sized `Xsave` wrapper so `KVM_XSAVE2` hosts keep
-//! the complete xstate image (legacy FPU/SSE, AVX, PKRU, and larger dynamic
-//! components such as AMX when present), paired with `kvm_xcrs`.
+#[cfg(not(target_os = "linux"))]
+use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_os = "linux"))]
+use crate::{bail, result::Result};
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VcpuState {}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MachineState {}
+
+#[cfg(not(target_os = "linux"))]
+pub fn save_vcpu(_: &crate::hv::Vcpu, _: usize) -> Result<VcpuState> {
+	bail!("x86_64 snapshots are not supported on this host");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restore_vcpu(_: &crate::hv::Vcpu, _: &VcpuState) -> Result<()> {
+	bail!("x86_64 snapshot restore is not supported on this host");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn save_machine() -> Result<MachineState> {
+	bail!("x86_64 snapshots are not supported on this host");
+}
+
+// `x86_64` vCPU and machine snapshot state.
+//
+// Captures the full migratable KVM state of a paused vCPU and of the
+// VM-global interrupt/timer devices, plus the inverse restore path. We
+// serialize the dynamically sized `Xsave` wrapper so `KVM_XSAVE2` hosts keep
+// the complete xstate image (legacy FPU/SSE, AVX, PKRU, and larger dynamic
+// components such as AMX when present), paired with `kvm_xcrs`.
+
+#[cfg(target_os = "linux")]
 use std::{collections::BTreeSet, mem::size_of};
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::{
 	CpuId, KVM_MAX_CPUID_ENTRIES, Msrs, Xsave, kvm_clock_data, kvm_debugregs, kvm_irqchip,
 	kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs,
 	kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
 };
+#[cfg(target_os = "linux")]
 use kvm_ioctls::{Kvm, VmFd};
-use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use vmm_sys_util::fam::FamStruct;
 
+#[cfg(target_os = "linux")]
 use crate::{
 	bail,
 	hv::Vcpu,
 	result::{Result, err},
 };
 
+#[cfg(target_os = "linux")]
 /// Complete migratable state of one x86 vCPU.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VcpuState {
@@ -47,6 +81,7 @@ pub struct VcpuState {
 
 /// VM-global x86 device state: the master/slave PICs, the IOAPIC, the PIT and
 /// the KVM paravirtual clock.
+#[cfg(target_os = "linux")]
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MachineState {
 	pub pic_master: kvm_irqchip,
@@ -57,6 +92,7 @@ pub struct MachineState {
 }
 
 /// Read the complete migratable state of a (paused) vCPU.
+#[cfg(target_os = "linux")]
 pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 	let vcpu = vcpu.fd();
 	// KVM_GET_MP_STATE calls into the in-kernel APIC event acceptance path and
@@ -122,6 +158,7 @@ pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 /// dependencies used by QEMU/Firecracker: restore register files before
 /// events, LAPIC before TSC-deadline MSRs, and events last because `SET_REGS`
 /// clears pending exceptions.
+#[cfg(target_os = "linux")]
 pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 	let vcpu = vcpu.fd();
 	vcpu.set_cpuid2(&st.cpuid)?;
@@ -161,6 +198,7 @@ pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 }
 
 /// Read the VM-global interrupt-controller, PIT and clock state.
+#[cfg(target_os = "linux")]
 pub fn save_machine(vm: &VmFd) -> Result<MachineState> {
 	let mut pic_master =
 		kvm_irqchip { chip_id: kvm_bindings::KVM_IRQCHIP_PIC_MASTER, ..Default::default() };
@@ -176,6 +214,7 @@ pub fn save_machine(vm: &VmFd) -> Result<MachineState> {
 }
 
 /// Restore the VM-global interrupt-controller, PIT and clock state.
+#[cfg(target_os = "linux")]
 pub fn restore_machine(vm: &VmFd, st: &MachineState) -> Result<()> {
 	vm.set_irqchip(&st.pic_master)?;
 	vm.set_irqchip(&st.pic_slave)?;

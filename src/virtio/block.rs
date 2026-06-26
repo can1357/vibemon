@@ -9,13 +9,15 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+#[cfg(not(target_os = "windows"))]
 use std::{
-	fs::{self, File, OpenOptions},
-	io::{self, Seek, SeekFrom},
-	os::unix::{
-		fs::{MetadataExt, OpenOptionsExt},
-		io::RawFd,
-	},
+	fs,
+	io::{Seek, SeekFrom},
+	os::unix::fs::{MetadataExt, OpenOptionsExt},
+};
+use std::{
+	fs::{File, OpenOptions},
+	io,
 	path::Path,
 	sync::Arc,
 };
@@ -41,7 +43,7 @@ use crate::os::EventFd;
 use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
 };
 
 /// Create `dest` as a copy-on-write reflink of `base` (instant on
@@ -50,6 +52,12 @@ use crate::{
 /// must not exist: it is created exclusively without following a final symlink,
 /// and the returned file descriptor is the one handed to the block backend so a
 /// later path swap cannot make the guest open some other host file.
+#[cfg(target_os = "windows")]
+pub fn create_cow_overlay(_base: &Path, _dest: &Path) -> Result<File> {
+	Err(err("copy-on-write block overlays are unsupported on Windows"))
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	let base_path_meta = fs::symlink_metadata(base)
 		.map_err(|e| err(format!("checking base disk {}: {e}", base.display())))?;
@@ -209,8 +217,8 @@ pub struct Block {
 	queue_sizes:      Vec<u16>,
 
 	/// Submission/completion ring for the data path. Built up front — before the
-	/// worker thread queries `worker_fds` — so its completion eventfd is always
-	/// available to epoll; it carries traffic only once the queue is activated.
+	/// worker thread queries `worker_wait_sources` — so its completion eventfd
+	/// is always available to epoll; it carries traffic only once activated.
 	#[cfg(target_os = "linux")]
 	ring:         IoUring,
 	/// Eventfd the ring signals on completion; epolled by the device worker.
@@ -253,9 +261,9 @@ impl Block {
 		#[cfg(target_os = "linux")]
 		let (ring, io_uring_evt) = {
 			// Build the ring eagerly and register its completion eventfd now: the
-			// worker thread reads `worker_fds()` before the guest driver ever
-			// activates the device, so the fd has to exist already or completions
-			// would never be polled.
+			// worker thread reads `worker_wait_sources()` before the guest driver
+			// ever activates the device, so the fd has to exist already or
+			// completions would never be polled.
 			let ring = IoUring::new(RING_ENTRIES)?;
 			let io_uring_evt = EventFd::new(libc::EFD_NONBLOCK)?;
 			ring
@@ -449,12 +457,12 @@ impl VirtioDevice for Block {
 		Ok(())
 	}
 
-	fn worker_fds(&self) -> Vec<RawFd> {
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
 		#[cfg(target_os = "linux")]
 		{
 			vec![self.io_uring_evt.as_raw_fd()]
 		}
-		#[cfg(target_os = "macos")]
+		#[cfg(any(target_os = "macos", target_os = "windows"))]
 		{
 			Vec::new()
 		}
@@ -495,17 +503,17 @@ impl VirtioDevice for Block {
 					.map_err(|e| err(format!("virtio-blk submit failed: {e}")))?;
 			}
 			// Inline completions (errors, flush, get-id, unsupported) need their own
-			// IRQ; asynchronous ones are signalled from `process_worker_fd`.
+			// IRQ; asynchronous ones are signalled from `process_worker_source`.
 			if sync_used {
 				interrupt.signal_used_queue()?;
 			}
 		}
 
-		#[cfg(target_os = "macos")]
+		#[cfg(any(target_os = "macos", target_os = "windows"))]
 		{
 			let mut sync_used = false;
 			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
-				match macos::process_chain(disk, capacity, read_only, &mem, queue, chain)? {
+				match sync_io::process_chain(disk, capacity, read_only, &mem, queue, chain)? {
 					Outcome::Synchronous => sync_used = true,
 				}
 			}
@@ -516,14 +524,14 @@ impl VirtioDevice for Block {
 		Ok(())
 	}
 
-	fn process_worker_fd(&mut self, _fd: RawFd) -> Result<()> {
+	fn process_worker_source(&mut self, _index: usize) -> Result<()> {
 		#[cfg(target_os = "linux")]
 		{
 			// Clear the completion notification (epoll is level-triggered).
 			let _ = self.io_uring_evt.read();
 			self.reap("completion reap")
 		}
-		#[cfg(target_os = "macos")]
+		#[cfg(any(target_os = "macos", target_os = "windows"))]
 		{
 			Ok(())
 		}
@@ -840,9 +848,12 @@ pub(super) mod linux {
 	}
 }
 
-#[cfg(target_os = "macos")]
-pub(super) mod macos {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(super) mod sync_io {
+	#[cfg(target_os = "macos")]
 	use std::os::unix::fs::FileExt;
+	#[cfg(target_os = "windows")]
+	use std::os::windows::fs::FileExt;
 
 	use super::*;
 
@@ -975,7 +986,7 @@ pub(super) mod macos {
 
 	fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
 		while !buf.is_empty() {
-			match file.read_at(buf, offset) {
+			match positioned_read(file, buf, offset) {
 				Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
 				Ok(n) => {
 					offset += n as u64;
@@ -991,7 +1002,7 @@ pub(super) mod macos {
 
 	fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
 		while !buf.is_empty() {
-			match file.write_at(buf, offset) {
+			match positioned_write(file, buf, offset) {
 				Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
 				Ok(n) => {
 					offset += n as u64;
@@ -1002,6 +1013,26 @@ pub(super) mod macos {
 			}
 		}
 		Ok(())
+	}
+
+	#[cfg(target_os = "macos")]
+	fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+		file.read_at(buf, offset)
+	}
+
+	#[cfg(target_os = "windows")]
+	fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+		file.seek_read(buf, offset)
+	}
+
+	#[cfg(target_os = "macos")]
+	fn positioned_write(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+		file.write_at(buf, offset)
+	}
+
+	#[cfg(target_os = "windows")]
+	fn positioned_write(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+		file.seek_write(buf, offset)
 	}
 }
 
@@ -1086,6 +1117,7 @@ mod tests {
 		assert!(!request_range_in_bounds(u64::MAX, 0, 1));
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn create_cow_overlay_rejects_symlink_base() {
 		let tmp = TestDir::new();
@@ -1099,6 +1131,7 @@ mod tests {
 		assert!(err.contains("symlink"), "unexpected error: {err}");
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn create_cow_overlay_rejects_existing_destination_file() {
 		let tmp = TestDir::new();
@@ -1111,6 +1144,7 @@ mod tests {
 		assert!(err.contains("already exists"), "unexpected error: {err}");
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn create_cow_overlay_copies_into_new_destination() {
 		let tmp = TestDir::new();
@@ -1132,6 +1166,7 @@ mod tests {
 		assert_eq!(std::fs::read(&base).expect("read base"), b"base");
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn create_cow_overlay_rejects_existing_destination_symlink_without_clobbering_target() {
 		let tmp = TestDir::new();

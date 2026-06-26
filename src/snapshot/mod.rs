@@ -1643,6 +1643,7 @@ mod tests {
 		assert_eq!(pci.msix.table[1].vector_ctrl, 1);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn fs_state_survives_serde_round_trip_and_restore_drops_stale() {
 		let root = temp_root_dir("vmon-snap-fs");

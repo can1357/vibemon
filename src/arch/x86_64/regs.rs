@@ -4,11 +4,14 @@
 //! 64-bit long mode: flat segments, identity-mapped 2 MiB pages covering the
 //! first 1 GiB, and `%rip`/`%rsi` set per the Linux boot ABI.
 
+#[cfg(target_os = "linux")]
 use std::mem::size_of;
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 
+#[cfg(target_os = "linux")]
 use super::gdt::{gdt_entry, kvm_segment_from_gdt};
 use crate::{
 	hv::Vcpu,
@@ -30,35 +33,57 @@ const X86_CR4_PAE: u64 = 0x20;
 
 /// Configure the x87/SSE control words to sane reset defaults.
 pub fn setup_fpu(vcpu: &Vcpu) -> Result<()> {
-	let fpu = kvm_fpu { fcw: 0x37f, mxcsr: 0x1f80, ..Default::default() };
-	vcpu.fd().set_fpu(&fpu)?;
-	Ok(())
+	#[cfg(target_os = "linux")]
+	{
+		let fpu = kvm_fpu { fcw: 0x37f, mxcsr: 0x1f80, ..Default::default() };
+		vcpu.fd().set_fpu(&fpu)?;
+		Ok(())
+	}
+	#[cfg(target_os = "windows")]
+	{
+		vcpu.setup_fpu()
+	}
 }
 
 /// Set the general-purpose registers for the boot entry point.
 pub fn setup_regs(vcpu: &Vcpu, boot_ip: u64) -> Result<()> {
-	let regs = kvm_regs {
-		rflags: 0x0000_0000_0000_0002,
-		rip: boot_ip,
-		rsp: BOOT_STACK_POINTER,
-		rbp: BOOT_STACK_POINTER,
-		// The Linux 64-bit boot ABI requires %rsi to point at the zero page.
-		rsi: ZERO_PAGE_START,
-		..Default::default()
-	};
-	vcpu.fd().set_regs(&regs)?;
-	Ok(())
+	#[cfg(target_os = "linux")]
+	{
+		let regs = kvm_regs {
+			rflags: 0x0000_0000_0000_0002,
+			rip: boot_ip,
+			rsp: BOOT_STACK_POINTER,
+			rbp: BOOT_STACK_POINTER,
+			// The Linux 64-bit boot ABI requires %rsi to point at the zero page.
+			rsi: ZERO_PAGE_START,
+			..Default::default()
+		};
+		vcpu.fd().set_regs(&regs)?;
+		Ok(())
+	}
+	#[cfg(target_os = "windows")]
+	{
+		vcpu.setup_regs(boot_ip)
+	}
 }
 
 /// Configure segment/control registers and install boot page tables.
 pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &Vcpu) -> Result<()> {
-	let mut sregs = vcpu.fd().get_sregs()?;
-	configure_segments_and_sregs(mem, &mut sregs)?;
-	setup_page_tables(mem, &mut sregs)?;
-	vcpu.fd().set_sregs(&sregs)?;
-	Ok(())
+	#[cfg(target_os = "linux")]
+	{
+		let mut sregs = vcpu.fd().get_sregs()?;
+		configure_segments_and_sregs(mem, &mut sregs)?;
+		setup_page_tables(mem, &mut sregs)?;
+		vcpu.fd().set_sregs(&sregs)?;
+		Ok(())
+	}
+	#[cfg(target_os = "windows")]
+	{
+		vcpu.setup_sregs(mem)
+	}
 }
 
+#[cfg(target_os = "linux")]
 fn write_gdt_table(table: &[u64], mem: &GuestMemoryMmap) -> Result<()> {
 	let boot_gdt_addr = GuestAddress(BOOT_GDT_OFFSET);
 	for (index, entry) in table.iter().enumerate() {
@@ -70,6 +95,7 @@ fn write_gdt_table(table: &[u64], mem: &GuestMemoryMmap) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
 	// NULL, CODE, DATA, TSS — flat 4 GiB segments for 64-bit boot.
 	let gdt_table: [u64; BOOT_GDT_MAX] = [
@@ -104,6 +130,7 @@ fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) ->
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
 	let boot_pml4_addr = GuestAddress(PML4_START);
 	let boot_pdpte_addr = GuestAddress(PDPTE_START);

@@ -2,7 +2,9 @@
 
 use std::{cmp::max, fs::File, io::Read, path::Path};
 
+#[cfg(target_os = "linux")]
 use kvm_bindings::{CpuId, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
+#[cfg(target_os = "linux")]
 use kvm_ioctls::VmFd;
 use linux_loader::loader::{
 	Cmdline, KernelLoader,
@@ -35,8 +37,11 @@ const E820_RAM: u32 = 1;
 const BZIMAGE_64BIT_ENTRY_OFFSET: u64 = 0x200;
 const GUEST_PAGE_SIZE: u64 = 4096;
 
+#[cfg(target_os = "linux")]
 pub const UEFI_RESET_VECTOR: u64 = FIRST_ADDR_PAST_32BITS - 0x10;
+#[cfg(target_os = "linux")]
 const UEFI_ACPI_RSDP_ADDR: u64 = 0x000e_0000;
+#[cfg(target_os = "linux")]
 const UEFI_ACPI_TABLES_START: u64 = 0x000e_1000;
 const ACPI_HEADER_LEN: usize = 36;
 /// A loaded guest kernel: where to start executing, plus the bzImage setup
@@ -50,9 +55,15 @@ pub struct LoadedKernel {
 
 /// Load a kernel image (raw ELF `vmlinux` or `bzImage`) into guest memory.
 pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
-	let mut file =
-		File::open(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
 	let himem = Some(GuestAddress(HIMEM_START));
+	#[cfg(not(windows))]
+	let mut file = File::open(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
+	#[cfg(windows)]
+	let mut file = {
+		let bytes =
+			std::fs::read(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
+		std::io::Cursor::new(bytes)
+	};
 
 	// Try ELF (uncompressed vmlinux) first; fall back to bzImage.
 	if let Ok(res) = Elf::load(mem, None, &mut file, himem) {
@@ -82,6 +93,7 @@ pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
 /// physical `0xfffffff0`; the whole file is therefore placed at the top of the
 /// 32-bit address space. The mapping is separate from guest RAM so normal RAM
 /// snapshots do not include operator-supplied firmware bytes.
+#[cfg(target_os = "linux")]
 pub fn load_uefi_firmware(
 	path: &Path,
 	ram: &GuestMemoryMmap,
@@ -95,6 +107,7 @@ pub fn load_uefi_firmware(
 }
 
 /// Register the firmware ROM memslot used for fresh UEFI boots and restores.
+#[cfg(target_os = "linux")]
 pub fn map_uefi_firmware(
 	path: &Path,
 	ram: &GuestMemoryMmap,
@@ -247,6 +260,7 @@ pub fn configure_system(
 }
 
 /// Write minimal ACPI tables discoverable by x86 UEFI firmware/guests.
+#[cfg(target_os = "linux")]
 pub fn configure_uefi_system(
 	mem: &GuestMemoryMmap,
 	num_cpus: u8,
@@ -286,6 +300,7 @@ pub fn configure_uefi_system(
 
 /// Configure one x86 vCPU for a firmware reset-vector entry instead of the
 /// direct Linux 64-bit boot protocol.
+#[cfg(target_os = "linux")]
 pub fn configure_uefi_vcpu(
 	vcpu: &Vcpu,
 	base_cpuid: &CpuId,
@@ -304,6 +319,7 @@ pub fn configure_uefi_vcpu(
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn setup_uefi_reset_regs(vcpu: &Vcpu, entry: u64) -> Result<()> {
 	let regs = kvm_bindings::kvm_regs {
 		rflags: 0x0000_0000_0000_0002,
@@ -314,6 +330,7 @@ fn setup_uefi_reset_regs(vcpu: &Vcpu, entry: u64) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn setup_uefi_reset_sregs(vcpu: &Vcpu) -> Result<()> {
 	const X86_CR0_PE: u64 = 0x1;
 	const X86_CR0_PG: u64 = 0x8000_0000;
@@ -333,6 +350,7 @@ fn setup_uefi_reset_sregs(vcpu: &Vcpu) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn segment(selector: u16, base: u64, type_: u8) -> kvm_segment {
 	kvm_segment { base, limit: 0xffff, selector, type_, present: 1, s: 1, ..Default::default() }
 }
@@ -509,13 +527,12 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
 	Ok(())
 }
 
-/// Small extension so we can rewind a `File` between loader attempts.
+/// Small extension so we can rewind a loader source between loader attempts.
 trait RewindExt {
 	fn rewind_to_start(&mut self) -> Result<()>;
 }
-impl RewindExt for File {
+impl<T: std::io::Seek> RewindExt for T {
 	fn rewind_to_start(&mut self) -> Result<()> {
-		use std::io::Seek;
 		self.seek(std::io::SeekFrom::Start(0))?;
 		Ok(())
 	}

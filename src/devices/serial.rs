@@ -24,6 +24,7 @@ struct ConsoleOut;
 
 impl Write for ConsoleOut {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		#[cfg(unix)]
 		loop {
 			// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is a
 			// process-global fd, and `write` does not retain the pointer.
@@ -35,6 +36,13 @@ impl Write for ConsoleOut {
 			if err.kind() != io::ErrorKind::Interrupted {
 				return Err(err);
 			}
+		}
+		#[cfg(not(unix))]
+		{
+			let mut stdout = io::stdout().lock();
+			let n = stdout.write(buf)?;
+			stdout.flush()?;
+			Ok(n)
 		}
 	}
 

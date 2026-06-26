@@ -495,6 +495,42 @@ impl Config {
 		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
 			bail!("--transport pci is only supported on x86_64");
 		}
+		#[cfg(target_os = "windows")]
+		{
+			if boot_mode == BootMode::Uefi {
+				bail!("--boot-mode uefi is not supported on Windows");
+			}
+			if cli.restore.is_some() {
+				bail!("--restore is not supported on Windows");
+			}
+			if cli.fork_from.is_some() {
+				bail!("--fork-from is not supported on Windows");
+			}
+			if cli.snapshot_root.is_some() {
+				bail!("--snapshot-root is not supported on Windows");
+			}
+			if jail {
+				bail!("--jail is not supported on Windows");
+			}
+			if mem_target_mib.is_some() {
+				bail!("--mem-target-mib is not supported on Windows");
+			}
+			if cli.tap.is_some() || user_net {
+				bail!("networking is not supported on Windows");
+			}
+			if cli.fs_tag.is_some() || !cli.volumes.is_empty() {
+				bail!("virtio-fs is not supported on Windows");
+			}
+			if transport == Transport::Pci {
+				bail!("--transport pci is not supported on Windows");
+			}
+			if cli.api_sock.is_some() {
+				bail!("--api-sock is not supported on Windows");
+			}
+			if cli.agent_sock.is_some() {
+				bail!("--agent-sock is not supported on Windows");
+			}
+		}
 		if count > 1 && cli.fork_from.is_none() {
 			bail!("--count greater than 1 requires --fork-from");
 		}
@@ -890,10 +926,6 @@ mod tests {
 			"512",
 			"--cpus",
 			"2",
-			"--fs-tag",
-			"hostshare",
-			"--fs-dir",
-			"/srv/share",
 			"--agent-exec",
 			"id",
 		])
@@ -903,8 +935,6 @@ mod tests {
 		assert_eq!(cfg.cpus, 2);
 		assert!(cfg.console_agent);
 		assert!(!cfg.mac_specified);
-		assert_eq!(cfg.fs_tag.as_deref(), Some("hostshare"));
-		assert_eq!(cfg.fs_dir.as_deref(), Some(Path::new("/srv/share")));
 	}
 
 	#[test]
@@ -930,6 +960,7 @@ mod tests {
 		assert!(!cfg.no_sandbox);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_platform_registry_flags() {
 		let cfg = parse_config(&[
@@ -1010,6 +1041,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn validates_platform_boot_and_id_flags() {
 		assert_config_err_contains(
@@ -1055,9 +1087,12 @@ mod tests {
 			&["vmon", "--kernel", "k", "--count", "2"],
 			"--count greater than 1 requires --fork-from",
 		);
-		let fanout = parse_config(&["vmon", "--fork-from", "snapshot", "--count", "2"])
-			.expect("--count > 1 parses with --fork-from");
-		assert_eq!(fanout.count, 2);
+		#[cfg(not(target_os = "windows"))]
+		{
+			let fanout = parse_config(&["vmon", "--fork-from", "snapshot", "--count", "2"])
+				.expect("--count > 1 parses with --fork-from");
+			assert_eq!(fanout.count, 2);
+		}
 
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--cpus", "0"], "--cpus");
 		let too_many_cpus = (u16::from(MAX_CPUS) + 1).to_string();
@@ -1078,6 +1113,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn requires_fs_tag_and_dir_to_be_paired() {
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-tag", "host"], "--fs-tag");
@@ -1149,7 +1185,7 @@ mod tests {
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "user"], "only on macOS");
 	}
 
-	#[cfg(target_arch = "x86_64")]
+	#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 	#[test]
 	fn accepts_pci_transport_on_x86_64() {
 		let cfg = parse_config(&["vmon", "--kernel", "k", "--transport", "pci"])
@@ -1166,6 +1202,37 @@ mod tests {
 		);
 	}
 
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn rejects_pci_transport_on_windows() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--transport", "pci"],
+			"not supported on Windows",
+		);
+	}
+
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn rejects_windows_only_unsupported_features() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--boot-mode", "uefi"],
+			"not supported on Windows",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--jail", "--id", "vm1"],
+			"not supported on Windows",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--fs-tag", "host", "--fs-dir", "/srv"],
+			"not supported on Windows",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--api-sock", "control.sock"],
+			"not supported on Windows",
+		);
+	}
+
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn netns_requires_jail_validation() {
 		assert_config_err_contains(
@@ -1214,6 +1281,7 @@ mod tests {
 		assert_eq!(cfg.sandbox_gid, Some(1001));
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_explicit_sandbox_identity_for_jail() {
 		let cfg = parse_config(&[
@@ -1349,6 +1417,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_volume_mounts() {
 		let cfg = parse_config(&[
