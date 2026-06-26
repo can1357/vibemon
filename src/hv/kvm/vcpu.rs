@@ -15,12 +15,13 @@ pub struct Vcpu {
 
 impl Vcpu {
 	/// Wrap a newly-created KVM vCPU fd.
-	pub(super) fn new(vm_fd: Arc<VmFd>, fd: VcpuFd) -> Vcpu {
-		Vcpu { vm_fd, fd }
+	pub(super) const fn new(vm_fd: Arc<VmFd>, fd: VcpuFd) -> Self {
+		Self { vm_fd, fd }
 	}
 
 	/// Return the underlying KVM vCPU fd for KVM-specific arch helpers.
-	pub fn fd(&self) -> &VcpuFd {
+	#[cfg_attr(target_arch = "aarch64", allow(dead_code, reason = "x86_64-only accessor"))]
+	pub const fn fd(&self) -> &VcpuFd {
 		&self.fd
 	}
 
@@ -89,7 +90,7 @@ mod aarch64 {
 			self.init(false)
 		}
 
-		/// Initialize a secondary vCPU as powered off until PSCI CPU_ON.
+		/// Initialize a secondary `vCPU` as powered off until PSCI `CPU_ON`.
 		pub fn init_secondary(&self) -> Result<()> {
 			self.init(true)
 		}
@@ -112,6 +113,7 @@ mod aarch64 {
 		}
 
 		/// Read one aarch64 general-purpose register X0..X30.
+		#[allow(dead_code, reason = "part of public API platform abstraction")]
 		pub fn get_gpr(&self, idx: u8) -> Result<u64> {
 			if idx > 30 {
 				bail!("aarch64 GPR index {idx} is outside X0..X30");
@@ -134,6 +136,7 @@ mod aarch64 {
 		}
 
 		/// Set an aarch64 system register.
+		#[allow(dead_code, reason = "part of public API platform abstraction")]
 		pub fn set_sys_reg(&self, r: SysReg, v: u64) -> Result<()> {
 			self.set_u64_reg(sys_reg_id(r), v)
 		}

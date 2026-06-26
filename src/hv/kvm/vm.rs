@@ -61,17 +61,17 @@ impl Vm {
 			fd.create_irq_chip()?;
 			fd.create_pit2(kvm_pit_config { flags: KVM_PIT_SPEAKER_DUMMY, ..Default::default() })?;
 			let supported_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
-			Ok(Vm { kvm, fd, memory, supported_cpuid })
+			Ok(Self { kvm, fd, memory, supported_cpuid })
 		}
 
 		#[cfg(target_arch = "aarch64")]
 		{
-			Ok(Vm { kvm, fd, memory })
+			Ok(Self { kvm, fd, memory })
 		}
 	}
 
 	/// Return the guest memory owned by this VM.
-	pub fn memory(&self) -> &GuestMemoryMmap {
+	pub const fn memory(&self) -> &GuestMemoryMmap {
 		&self.memory
 	}
 
@@ -115,7 +115,7 @@ impl Vm {
 		Ok(())
 	}
 
-	/// Create the in-kernel GICv3 after all vCPUs exist.
+	/// Create the in-kernel `GICv3` after all `vCPUs` exist.
 	#[cfg(target_arch = "aarch64")]
 	pub fn create_gic(&self, num_cpus: u64) -> Result<Gic> {
 		Gic::new(&self.fd, num_cpus)
@@ -123,7 +123,7 @@ impl Vm {
 
 	/// Return the host-supported CPUID template for x86 vCPU setup.
 	#[cfg(target_arch = "x86_64")]
-	pub fn supported_cpuid(&self) -> &CpuId {
+	pub const fn supported_cpuid(&self) -> &CpuId {
 		&self.supported_cpuid
 	}
 }

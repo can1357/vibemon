@@ -11,8 +11,8 @@ pub struct IrqLine {
 
 impl IrqLine {
 	/// Wrap an already-registered eventfd as an interrupt line.
-	pub(super) fn new(evt: EventFd) -> IrqLine {
-		IrqLine { evt }
+	pub(super) const fn new(evt: EventFd) -> Self {
+		Self { evt }
 	}
 
 	/// Pulse the guest interrupt line.

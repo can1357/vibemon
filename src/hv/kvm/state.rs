@@ -1,9 +1,9 @@
-//! KVM aarch64 vCPU and GICv3 snapshot / restore.
+//! `KVM` `aarch64` `vCPU` and `GICv3` snapshot / restore.
 //!
-//! The GICv3 register groups, MMIO offsets, conditional active-priority
-//! register handling, and the MPIDR -> device-attr packing below are
+//! The `GICv3` register groups, `MMIO` offsets, conditional active-priority
+//! register handling, and the `MPIDR` -> device-attr packing below are
 //! transcribed from Firecracker v1.10.0 (Apache-2.0). The serialized structs
-//! live in `arch::state`; this module only captures and replays KVM-specific
+//! live in `arch::state`; this module only captures and replays `KVM`-specific
 //! state.
 
 use kvm_bindings::{
@@ -20,7 +20,7 @@ use kvm_bindings::{
 use kvm_ioctls::{DeviceFd, VcpuFd};
 
 use crate::{
-	arch::state::{GicState, MachineState, VcpuState},
+	arch::state::{GicState, VcpuState},
 	bail,
 	result::{Result, err},
 };
@@ -28,7 +28,7 @@ use crate::{
 /// First SPI INTID (SGIs 0-15 and PPIs 16-31 are private / per-redistributor).
 const IRQ_BASE: u32 = 32;
 
-fn reg_size(id: u64) -> usize {
+const fn reg_size(id: u64) -> usize {
 	1usize << (((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT) as u32)
 }
 
@@ -81,11 +81,10 @@ pub fn save_vcpu(vcpu: &VcpuFd, _xsave_size: usize) -> Result<VcpuState> {
 	Ok(VcpuState::Kvm { regs, mp_state, vcpu_events })
 }
 
-/// Apply saved KVM arm64 vCPU state after KVM_ARM_VCPU_INIT.
+/// Apply saved `KVM` arm64 `vCPU` state after `KVM_ARM_VCPU_INIT`.
 pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
-	let (regs, mp_state, vcpu_events) = match st {
-		VcpuState::Kvm { regs, mp_state, vcpu_events } => (regs, mp_state, vcpu_events),
-		_ => bail!("cannot restore non-KVM vCPU state with the KVM backend"),
+	let VcpuState::Kvm { regs, mp_state, vcpu_events } = st else {
+		bail!("cannot restore non-KVM vCPU state with the KVM backend");
 	};
 
 	for (id, val) in regs {
@@ -183,7 +182,7 @@ const REDIST_REGS: &[(u64, u64)] = &[
 
 /// Build the CPU-interface sysreg "offset" used as the low bits of a
 /// `KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS` attr (the (op0,op1,crn,crm,op2) encoding
-/// without the KVM ONE_REG prefix). Mirrors Firecracker
+/// without the `KVM_ONE_REG` prefix). Mirrors Firecracker
 /// `SimpleReg::vgic_sys_reg`.
 const fn icc_off(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 	((op0 << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
@@ -193,7 +192,7 @@ const fn icc_off(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 		| ((op2 << KVM_REG_ARM64_SYSREG_OP2_SHIFT) & KVM_REG_ARM64_SYSREG_OP2_MASK as u64)
 }
 
-/// ICC_CTLR_EL1 — read to discover the implemented number of priority bits.
+/// `ICC_CTLR_EL1` — read to discover the implemented number of priority bits.
 const ICC_CTLR_EL1: u64 = icc_off(3, 0, 12, 12, 4);
 const ICC_CTLR_EL1_PRIBITS_SHIFT: u64 = 8;
 const ICC_CTLR_EL1_PRIBITS_MASK: u64 = 7 << ICC_CTLR_EL1_PRIBITS_SHIFT;
@@ -209,7 +208,7 @@ const ICC_MAIN_REGS: &[u64] = &[
 	icc_off(3, 0, 12, 12, 3), // ICC_BPR1_EL1
 ];
 
-/// Active-priority registers (`AP_VGIC_ICC_REGS` order) with their AnRn index
+/// Active-priority registers (`AP_VGIC_ICC_REGS` order) with their `AnRn` index
 /// `n`, which gates availability (Firecracker `is_ap_reg_available`).
 const ICC_AP_REGS: &[(u64, u32)] = &[
 	(icc_off(3, 0, 12, 8, 4), 0), // ICC_AP0R0_EL1
@@ -222,9 +221,9 @@ const ICC_AP_REGS: &[(u64, u32)] = &[
 	(icc_off(3, 0, 12, 9, 3), 3), // ICC_AP1R3_EL1
 ];
 
-/// Whether AnRn (index `n`) is implemented for `priority_bits` priority bits.
-/// n==0 always; n==1 needs >=6; n>=2 needs exactly 7.
-fn ap_reg_available(n: u32, priority_bits: u64) -> bool {
+/// Whether `AnRn` (index `n`) is implemented for `priority_bits` priority bits.
+/// `n == 0` always; `n == 1` needs >= 6; `n >= 2` needs exactly 7.
+const fn ap_reg_available(n: u32, priority_bits: u64) -> bool {
 	match n {
 		0 => true,
 		1 => priority_bits >= 6,
@@ -232,13 +231,14 @@ fn ap_reg_available(n: u32, priority_bits: u64) -> bool {
 	}
 }
 
-/// Pack a vCPU index into the GIC device-attr `mpidr` field (bits [63:32]).
+/// Pack a `vCPU` index into the `GIC` device-attr `mpidr` field (bits [63:32]).
 ///
-/// KVM `reset_mpidr` assigns vCPU `i` the affinity Aff0=i[3:0], Aff1=i[11:4],
-/// Aff2=i[19:12] (Aff3 unused). Firecracker's `construct_kvm_mpidrs` then packs
-/// that affinity (`cpu_affid`) and shifts it into the attribute's high half.
-/// Because Aff3 is always 0 here, `cpu_affid` equals MPIDR_EL1[23:0].
-fn vcpu_mpidr_attr(index: u64) -> u64 {
+/// `KVM` `reset_mpidr` assigns `vCPU` `i` the affinity `Aff0=i[3:0]`,
+/// `Aff1=i[11:4]`, `Aff2=i[19:12]` (`Aff3` unused). Firecracker's
+/// `construct_kvm_mpidrs` then packs that affinity (`cpu_affid`) and shifts it
+/// into the attribute's high half. Because `Aff3` is always 0 here, `cpu_affid`
+/// equals `MPIDR_EL1`[23:0].
+const fn vcpu_mpidr_attr(index: u64) -> u64 {
 	let aff0 = index & 0xf;
 	let aff1 = (index >> 4) & 0xff;
 	let aff2 = (index >> 12) & 0xff;
@@ -333,7 +333,7 @@ fn save_icc_regs(gic: &DeviceFd, mpidr: u64, out: &mut Vec<(u32, u64, u64)>) -> 
 // GIC machine state
 // ===========================================================================
 
-/// Snapshot the whole KVM GICv3 from its device fd.
+/// Snapshot the whole `KVM` `GICv3` from its device fd.
 pub fn save_gic(gic: &DeviceFd, num_cpus: u64, num_irqs: u32) -> Result<GicState> {
 	let pending = kvm_device_attr {
 		flags: 0,
@@ -368,7 +368,7 @@ pub fn save_gic(gic: &DeviceFd, num_cpus: u64, num_irqs: u32) -> Result<GicState
 	Ok(GicState::Kvm { entries })
 }
 
-/// Restore KVM GICv3 state by replaying every saved register.
+/// Restore `KVM` `GICv3` state by replaying every saved register.
 pub fn restore_gic(gic: &DeviceFd, st: &GicState) -> Result<()> {
 	let GicState::Kvm { entries } = st else {
 		bail!("cannot restore HVF GIC state with KVM backend");
