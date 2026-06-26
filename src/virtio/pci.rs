@@ -255,10 +255,12 @@ impl PciMmioDispatcher {
 }
 
 impl BusDevice for PciMmioDispatcher {
+	fn read(&mut self, offset: u64, data: &mut [u8]) {
 		let Some(addr) = self.aperture_base.checked_add(offset) else {
 			data.fill(0xff);
 			return;
 		};
+		for transport in &self.functions {
 			let mut transport = transport.lock();
 			if let Some(bar_offset) = transport.bar_offset(addr) {
 				transport.read_bar(bar_offset, data);
@@ -268,9 +270,11 @@ impl BusDevice for PciMmioDispatcher {
 		data.fill(0xff);
 	}
 
+	fn write(&mut self, offset: u64, data: &[u8]) {
 		let Some(addr) = self.aperture_base.checked_add(offset) else {
 			return;
 		};
+		for transport in &self.functions {
 			let mut transport = transport.lock();
 			if let Some(bar_offset) = transport.bar_offset(addr) {
 				transport.write_bar(bar_offset, data);
@@ -636,6 +640,7 @@ impl PciTransport {
 
 	/// Snapshot the virtio common control-plane registers shared with MMIO
 	/// state.
+	pub fn common_state(&self) -> PciCommonState {
 		let live_queues = self.device.lock().queue_states();
 		let queues = if live_queues.is_empty() {
 			self.queues.iter().map(|q| q.state()).collect()

@@ -1150,6 +1150,7 @@ impl FsState {
 				},
 				Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 			},
+			FUSE_LOOKUP => {
 				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
