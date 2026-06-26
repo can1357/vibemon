@@ -103,7 +103,7 @@ export function CreateModal({
             <input
               className="input mono"
               value={form.image ?? ""}
-              placeholder="alpine, python:3.12, …"
+              placeholder="alpine, python:3.14, …"
               onChange={(e) => set("image", e.currentTarget.value || null)}
             />
           </label>
