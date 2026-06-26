@@ -98,7 +98,9 @@ def test_list_sandboxes_filters_by_tag(client):
 def test_snapshot_extend_network_and_tunnels_endpoints(client):
     client.post("/v1/sandboxes", json={"template": "tpl", "name": "sb1"})
 
-    assert client.post("/v1/sandboxes/sb1/snapshot", json={"name": "img"}).json() == {"image": "img1"}
+    assert client.post("/v1/sandboxes/sb1/snapshot", json={"name": "img"}).json() == {
+        "image": "img1"
+    }
     assert client.post("/v1/sandboxes/sb1/extend", json={"secs": 60}).json() == {"deadline_unix": 1}
 
     network = client.put(
@@ -121,16 +123,57 @@ def test_bearer_auth_required_when_token_is_configured(monkeypatch):
     monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
     with TestClient(server_mod.create_app()) as client:
         assert client.post("/v1/sandboxes", json={"template": "tpl"}).status_code == 401
-        assert client.post(
-            "/v1/sandboxes",
-            json={"template": "tpl"},
-            headers={"Authorization": "Bearer wrong"},
-        ).status_code == 401
-        assert client.post(
-            "/v1/sandboxes",
-            json={"template": "tpl", "name": "ok"},
-            headers={"Authorization": "Bearer secret"},
-        ).status_code == 201
+        assert (
+            client.post(
+                "/v1/sandboxes",
+                json={"template": "tpl"},
+                headers={"Authorization": "Bearer wrong"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/v1/sandboxes",
+                json={"template": "tpl", "name": "ok"},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 201
+        )
+
+
+def test_server_rejects_bad_request_inputs(client):
+    client.post("/v1/sandboxes", json={"template": "tpl", "name": "sb1"})
+
+    invalid_exec = client.post("/v1/sandboxes/sb1/exec", json={})
+    assert invalid_exec.status_code == 400
+    assert invalid_exec.json() == {"detail": "exec cmd must not be empty"}
+
+    invalid_extend = client.post("/v1/sandboxes/sb1/extend", json={"secs": 0})
+    assert invalid_extend.status_code == 400
+    assert invalid_extend.json() == {"detail": "secs must be positive"}
+
+    invalid_network = client.put("/v1/sandboxes/sb1/network", json={"cidr_allow": ["not-a-cidr"]})
+    assert invalid_network.status_code == 400
+    assert invalid_network.json() == {"detail": "cidr_allow entries must be valid CIDR networks"}
+
+    invalid_create = client.post(
+        "/v1/sandboxes",
+        json={"template": "tpl", "name": "bad", "ports": [70000]},
+    )
+    assert invalid_create.status_code == 400
+    assert invalid_create.json() == {"detail": "ports must be TCP port numbers from 1 to 65535"}
+
+
+def test_expired_sandbox_is_reaped_by_supervisor(app, client):
+    client.post("/v1/sandboxes", json={"template": "tpl", "name": "idle", "timeout": 0.01})
+    record = app.state.supervisor.get("idle")
+    record.last_active -= 1.0
+
+    asyncio.run(app.state.supervisor.reap_expired())
+
+    assert record.status == "terminated"
+    assert record.detail["terminated_reason"] == "idle_timeout"
+    assert record.sandbox is None
 
 
 def test_events_stream_includes_created_event(app):
@@ -163,14 +206,16 @@ def test_events_stream_includes_created_event(app):
             return {"type": "http.disconnect"}
 
         async def send(message):
-            if message["type"] == "http.response.body" and message.get("body", b"").startswith(b"data: "):
+            if message["type"] == "http.response.body" and message.get("body", b"").startswith(
+                b"data: "
+            ):
                 if not body_seen.done():
                     body_seen.set_result(message["body"])
 
         task = asyncio.create_task(app(scope, receive, send))
         try:
             for _ in range(100):
-                if getattr(app.state.supervisor, "_event_subscribers"):
+                if app.state.supervisor._event_subscribers:
                     break
                 await asyncio.sleep(0.01)
             app.state.supervisor.emit("created", id="evt", name="evt", tags={})

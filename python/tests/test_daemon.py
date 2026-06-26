@@ -17,12 +17,12 @@ import time
 
 import pytest
 
+import vmon.core as core
 from vmon.agent import ByteStream
 from vmon.client import DaemonClient, DaemonError
 from vmon.daemon import Daemon, acquire_owner_lock, daemon_paths, release_owner_lock
 from vmon.vmm import MicroVM
 from vmon.volume import Volume
-import vmon.core as core
 
 
 class FakeProc:
@@ -83,8 +83,9 @@ class FakeSandbox:
         name = kwargs.get("name") or "sb-fake"
         sb = cls(name)
         sb._child = subprocess.Popen(["sleep", "300"])
-        sb.vm._save_meta(pid=sb._child.pid, image=kwargs.get("image") or "fake",
-                         sandbox=True, status="running")
+        sb.vm._save_meta(
+            pid=sb._child.pid, image=kwargs.get("image") or "fake", sandbox=True, status="running"
+        )
         cls.instances[name] = sb
         return sb
 
@@ -116,6 +117,7 @@ def short_home(monkeypatch):
     monkeypatch.setenv("VMON_HOME", home)
     import vmon.vmm as vmm_mod
     import vmon.volume as volume_mod
+
     monkeypatch.setattr(vmm_mod, "STATE", __import__("pathlib").Path(home))
     monkeypatch.setattr(volume_mod, "STATE", __import__("pathlib").Path(home))
     monkeypatch.setattr(volume_mod, "VOLUME_DIR", __import__("pathlib").Path(home) / "volumes")
@@ -127,8 +129,7 @@ def short_home(monkeypatch):
 
 @pytest.fixture
 def fake_engine(monkeypatch, short_home):
-    monkeypatch.setattr("vmon.core.Engine._sandbox_class",
-                        staticmethod(lambda: FakeSandbox))
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
     FakeSandbox.instances = {}
     return core.Engine()
 
@@ -139,8 +140,7 @@ def client(fake_engine):
     sock = str(daemon_paths()["sock"])
     daemon = Daemon(fake_engine, sock_path=sock)
     ready = threading.Event()
-    threading.Thread(target=daemon.serve_forever, kwargs={"ready": ready},
-                     daemon=True).start()
+    threading.Thread(target=daemon.serve_forever, kwargs={"ready": ready}, daemon=True).start()
     assert ready.wait(2)
     try:
         yield DaemonClient(sock_path=sock, autostart=False)
@@ -167,11 +167,32 @@ def test_round_trip_run_ps_stop_rm(client):
 def test_exec_streams_ordered_base64_then_exit(client):
     client.call("run", image="alpine", detach=True, name="vm2")
     frames = []
-    result = client.stream("exec", lambda stream, data: frames.append((stream, data)),
-                           name="vm2", cmd=["echo", "hi"])
+    result = client.stream(
+        "exec", lambda stream, data: frames.append((stream, data)), name="vm2", cmd=["echo", "hi"]
+    )
     assert frames == [("stdout", b"hello\n"), ("stdout", b"world\n")]
     assert result == {"returncode": 0}
     client.call("rm", name="vm2")
+
+
+def test_exec_streams_stdout_stderr_bytes_faithfully(client, monkeypatch):
+    def exec_bytes(self, *cmd, **kwargs):
+        return FakeProc([("stdout", b"\x00\xffline\n"), ("stderr", b"\xfeerr\x00")], rc=7)
+
+    monkeypatch.setattr(FakeSandbox, "exec", exec_bytes)
+    client.call("run", image="alpine", detach=True, name="vm-bytes")
+    frames = []
+    result = client.stream(
+        "exec", lambda stream, data: frames.append((stream, data)), name="vm-bytes", cmd=["bytes"]
+    )
+    assert sorted(frames) == sorted(
+        [
+            ("stdout", b"\x00\xffline\n"),
+            ("stderr", b"\xfeerr\x00"),
+        ]
+    )
+    assert result == {"returncode": 7}
+    client.call("rm", name="vm-bytes")
 
 
 def test_unknown_vm_raises_not_found(client):
@@ -180,15 +201,72 @@ def test_unknown_vm_raises_not_found(client):
     assert excinfo.value.code == "not_found"
 
 
+def test_resume_stopped_vm_raises_not_running(client):
+    client.call("run", image="alpine", detach=True, name="vm-stopped")
+    client.call("stop", name="vm-stopped")
+    try:
+        with pytest.raises(DaemonError) as excinfo:
+            client.call("resume", name="vm-stopped")
+        assert excinfo.value.code == "not_running"
+    finally:
+        client.call("rm", name="vm-stopped")
+
+
+def test_terminate_preserves_status_returncode_across_ps_and_rehydrate(fake_engine):
+    record = fake_engine.create({"name": "api-dead", "image": "alpine"})
+    record.sandbox.returncode = 23
+    try:
+        terminated = fake_engine.terminate("api-dead")
+        assert terminated.view()["status"] == "terminated"
+        assert terminated.view()["returncode"] == 23
+
+        rows = fake_engine.ps()
+        assert rows == [
+            {
+                "name": "api-dead",
+                "status": "terminated",
+                "pid": record.pid,
+                "source": "alpine",
+            }
+        ]
+        assert terminated.view()["status"] == "terminated"
+        assert terminated.view()["returncode"] == 23
+
+        rehydrated = core.Engine()
+        revived = rehydrated.get("api-dead")
+        assert revived.view()["status"] == "terminated"
+        assert revived.view()["returncode"] == 23
+    finally:
+        try:
+            fake_engine.remove("api-dead")
+        except core.EngineError:
+            pass
+
+
 def test_shell_boots_ephemeral_streams_and_cleans_up(client):
     frames = []
-    result = client.interactive("shell", lambda s, d: frames.append((s, d)),
-                                tty=False, image="alpine")
+    result = client.interactive(
+        "shell", lambda s, d: frames.append((s, d)), tty=False, image="alpine"
+    )
     assert result["returncode"] == 0
     assert result["name"]  # the daemon reports the ephemeral VM's name
     assert ("stdout", b"hello\n") in frames
     # Ephemeral: the VM is gone by the time the result is delivered.
     assert client.call("ps") == {"vms": []}
+
+
+def test_shell_cleanup_failure_is_not_reported_as_success(client, fake_engine, monkeypatch):
+    def cleanup():
+        raise RuntimeError("cleanup boom")
+
+    def start_shell(params):
+        return FakeProc([], rc=0), "ephemeral", cleanup
+
+    monkeypatch.setattr(fake_engine, "start_shell", start_shell)
+    with pytest.raises(DaemonError) as excinfo:
+        client.interactive("shell", lambda stream, data: None, tty=False, image="alpine")
+    assert excinfo.value.code == "internal"
+    assert "cleanup boom" in excinfo.value.message
 
 
 def test_start_shell_attaches_without_removing(fake_engine):
@@ -317,13 +395,12 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
     live = threading.Event()
     # Feed input only after raw mode is established (setraw's TCSAFLUSH has run),
     # else the typed bytes are discarded before the forwarder reads them.
-    threading.Thread(target=lambda: live.wait(5) and os.write(master, b"hi\n"),
-                     daemon=True).start()
-    threading.Thread(target=lambda: (time.sleep(8), proc.kill()),
-                     daemon=True).start()
+    threading.Thread(target=lambda: live.wait(5) and os.write(master, b"hi\n"), daemon=True).start()
+    threading.Thread(target=lambda: (time.sleep(8), proc.kill()), daemon=True).start()
     try:
-        result = client.interactive("shell", cli._write_event, tty=True,
-                                    on_ready=lambda name: live.set(), image="alpine")
+        result = client.interactive(
+            "shell", cli._write_event, tty=True, on_ready=lambda name: live.set(), image="alpine"
+        )
     finally:
         termios.tcsetattr(slave, termios.TCSANOW, before)
         reading.clear()
@@ -332,8 +409,8 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
         os.close(slave)
 
     assert result["returncode"] == 0
-    assert bytes(proc.stdin_data) == b"hi\n"            # raw stdin was forwarded
-    assert proc.resizes and proc.resizes[0][0] > 0      # initial winsize was sent
+    assert bytes(proc.stdin_data) == b"hi\n"  # raw stdin was forwarded
+    assert proc.resizes and proc.resizes[0][0] > 0  # initial winsize was sent
     assert b"vm$ " in bytes(seen) and b"ok" in bytes(seen)  # output reached the TTY
 
 
@@ -358,9 +435,12 @@ def test_single_owner_second_daemon_exits_without_rebinding(short_home):
     lock_fd = acquire_owner_lock(paths["lock"])
     assert lock_fd is not None
     try:
-        proc = subprocess.Popen([sys.executable, "-m", "vmon.daemon"],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vmon.daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
         assert proc.wait(timeout=10) == 0
         # Lock was held, so the second daemon must not have bound the socket.
         assert not paths["sock"].exists()
@@ -369,13 +449,16 @@ def test_single_owner_second_daemon_exits_without_rebinding(short_home):
 
 
 def test_rehydrate_lists_disk_vms_and_reacquires_volume_locks(monkeypatch):
-    monkeypatch.setattr("vmon.core.Engine._sandbox_class",
-                        staticmethod(lambda: FakeSandbox))
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
     child = subprocess.Popen(["sleep", "300"])
     try:
         MicroVM("rvm")._save_meta(
-            pid=child.pid, image="alpine", sandbox=True, status="running",
-            volumes={"/data": {"name": "vol_r", "tag": "vol_r", "read_only": False}})
+            pid=child.pid,
+            image="alpine",
+            sandbox=True,
+            status="running",
+            volumes={"/data": {"name": "vol_r", "tag": "vol_r", "read_only": False}},
+        )
         Volume("vol_r").ensure()
 
         engine = core.Engine()  # rehydrates from disk

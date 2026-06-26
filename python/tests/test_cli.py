@@ -14,26 +14,34 @@ class RecordingClient:
     """Stand-in for ``DaemonClient`` that records the last request it received."""
 
     last: dict = {}
+    returncode = 0
 
     def __init__(self, *args, **kwargs):
         pass
 
     def call(self, method, **params):
         RecordingClient.last = {"method": method, "params": params}
-        return {"name": params.get("name") or "vm", "pid": 1,
-                "image": params.get("image"), "socket": "/tmp/x/vmond.sock",
-                "version": "1", "dir": "/snap", "clones": [],
-                "reconstruct_ms": 5, "restore_ms": 9}
+        return {
+            "name": params.get("name") or "vm",
+            "pid": 1,
+            "image": params.get("image"),
+            "socket": "/tmp/x/vmond.sock",
+            "version": "1",
+            "dir": "/snap",
+            "clones": [],
+            "reconstruct_ms": 5,
+            "restore_ms": 9,
+        }
 
     def stream(self, method, on_event, stdin=None, **params):
         RecordingClient.last = {"method": method, "params": params, "stream": True}
-        return {"returncode": 0}
+        return {"returncode": RecordingClient.returncode}
 
     def interactive(self, method, on_event, *, tty=True, on_ready=None, **params):
         RecordingClient.last = {"method": method, "params": params, "tty": tty}
         if on_ready is not None:
             on_ready("vm")
-        return {"returncode": 0, "name": "vm"}
+        return {"returncode": RecordingClient.returncode, "name": "vm"}
 
     def ensure_running(self):
         return {"pid": 1, "socket": "/tmp/x/vmond.sock"}
@@ -46,10 +54,12 @@ class RecordingClient:
 def rec(monkeypatch):
     monkeypatch.setattr(cli, "DaemonClient", RecordingClient)
     RecordingClient.last = {}
+    RecordingClient.returncode = 0
     return RecordingClient
 
 
 # -- help rendering --------------------------------------------------------
+
 
 def test_group_help_renders_grouped_panels(capsys):
     rc = cli.main(["--help"])
@@ -77,6 +87,7 @@ def test_version(capsys):
 
 
 # -- run: REMAINDER parsing ------------------------------------------------
+
 
 def test_run_strips_dashdash_separator(rec):
     assert cli.main(["run", "alpine", "--", "sh", "-c", "echo hi"]) == 0
@@ -106,6 +117,7 @@ def test_run_without_image_or_dockerfile_is_usage_error(rec, capsys):
 
 # -- exec: tty routing -----------------------------------------------------
 
+
 def test_exec_without_tty_streams_and_forwards_stdin(rec):
     assert cli.main(["exec", "vm1", "--", "sh", "-lc", "echo hi"]) == 0
     assert rec.last["method"] == "exec"
@@ -127,13 +139,21 @@ def test_exec_requires_command(rec, capsys):
 
 # -- shell -----------------------------------------------------------------
 
+
 def test_shell_wraps_cmd_and_disables_pty_without_tty(rec):
     # stdin/stdout are not a TTY under pytest, so PTY auto-resolves off.
-    assert cli.main(["shell", "--image", "alpine", "-c", "echo hi"]) == 0
+    rec.returncode = 7
+    assert cli.main(["shell", "--image", "alpine", "-c", "echo hi"]) == 7
     assert rec.last["method"] == "shell"
     assert rec.last["tty"] is False
     assert rec.last["params"]["image"] == "alpine"
     assert rec.last["params"]["cmd"] == ["/bin/sh", "-c", "echo hi"]
+
+
+def test_shell_empty_cmd_is_still_a_command(rec):
+    assert cli.main(["shell", "--image", "alpine", "-c", ""]) == 0
+    assert rec.last["params"]["cmd"] == ["/bin/sh", "-c", ""]
+
 
 def test_shell_default_command_without_pty_needs_tty_fails(rec, capsys):
     assert cli.main(["shell", "myvm"]) == 2
@@ -141,7 +161,8 @@ def test_shell_default_command_without_pty_needs_tty_fails(rec, capsys):
 
 
 def test_shell_default_command_with_no_pty_works(rec):
-    assert cli.main(["shell", "myvm", "--no-pty"]) == 0
+    rec.returncode = 9
+    assert cli.main(["shell", "myvm", "--no-pty"]) == 9
     assert rec.last["params"]["ref"] == "myvm"
     assert rec.last["params"]["cmd"] is None  # daemon picks bash/sh
     assert rec.last["tty"] is False
@@ -149,6 +170,7 @@ def test_shell_default_command_with_no_pty_works(rec):
 
 def test_shell_default_command_is_interactive_shell_mocked_tty(rec, monkeypatch):
     import sys
+
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     assert cli.main(["shell", "myvm"]) == 0
@@ -167,11 +189,25 @@ def test_shell_env_pairs_parsed(rec):
     assert rec.last["params"]["env"] == {"A": "1", "B": "2"}
 
 
+def test_shell_bare_env_copies_host_value(rec, monkeypatch):
+    monkeypatch.setenv("FROM_HOST", "copied")
+    assert cli.main(["shell", "--image", "alpine", "--no-pty", "-e", "FROM_HOST"]) == 0
+    assert rec.last["params"]["env"] == {"FROM_HOST": "copied"}
+
+
+def test_shell_bare_env_missing_is_usage_error(rec, monkeypatch, capsys):
+    monkeypatch.delenv("VMON_TEST_MISSING", raising=False)
+    assert cli.main(["shell", "--image", "alpine", "--no-pty", "-e", "VMON_TEST_MISSING"]) == 2
+    assert "not set" in capsys.readouterr().err.lower()
+
+
 def test_shell_bad_env_is_usage_error(rec, capsys):
     assert cli.main(["shell", "--image", "alpine", "--no-pty", "-e", "=bad"]) == 2
     assert "env" in capsys.readouterr().err.lower()
 
+
 # -- misc ------------------------------------------------------------------
+
 
 def test_unknown_command_is_usage_error(capsys):
     assert cli.main(["bogus"]) == 2

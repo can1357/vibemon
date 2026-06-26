@@ -30,6 +30,7 @@ Usage:
   python3 python/cli_e2e.py --home ~/.vmon    # reuse a home (skip template rebuild)
   VMON_E2E_IMAGE=alpine:latest python3 python/cli_e2e.py
 """
+
 from __future__ import annotations
 
 import argparse
@@ -65,6 +66,7 @@ CREATED: set[str] = set()
 # harness
 # --------------------------------------------------------------------------- #
 
+
 class Skip(Exception):
     """Raised by a test to report it cannot run in this environment."""
 
@@ -85,18 +87,24 @@ def uid(prefix: str) -> str:
     return f"{prefix}-{RUN}-{_seq}"
 
 
-def cli(*args: str, timeout: float = FAST_TIMEOUT, input_bytes: bytes | None = None,
-        check: bool = False) -> tuple[int, str, str]:
+def cli(
+    *args: str, timeout: float = FAST_TIMEOUT, input_bytes: bytes | None = None, check: bool = False
+) -> tuple[int, str, str]:
     """Run ``vmon <args>`` against the isolated home; return ``(rc, stdout, stderr)``."""
     proc = subprocess.run(
         [sys.executable, "-m", "vmon", *args],
-        env=ENV, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout)
+        env=ENV,
+        input=input_bytes,
+        capture_output=True,
+        timeout=timeout,
+    )
     out = proc.stdout.decode("utf-8", "replace")
     err = proc.stderr.decode("utf-8", "replace")
     if check and proc.returncode != 0:
         raise AssertionError(
-            f"`vmon {' '.join(args)}` exited {proc.returncode}\n--stdout--\n{out}\n--stderr--\n{err}")
+            f"`vmon {' '.join(args)}` exited {proc.returncode}\n"
+            f"--stdout--\n{out}\n--stderr--\n{err}"
+        )
     return proc.returncode, out, err
 
 
@@ -166,6 +174,7 @@ def wait_daemon_stopped(timeout: float = 10) -> None:
 # tests
 # --------------------------------------------------------------------------- #
 
+
 @e2e
 def t_daemon_lifecycle(_):
     """status is not-running on a clean home; the first command auto-starts vmond."""
@@ -182,8 +191,9 @@ def t_daemon_lifecycle(_):
 @e2e
 def t_run_foreground(_):
     """run streams the entry command's stdout and exits 0."""
-    rc, out, err = cli("run", IMAGE, "--", "sh", "-c", "echo hello-" + RUN + "; uname -s",
-                       timeout=BOOT_TIMEOUT)
+    rc, out, err = cli(
+        "run", IMAGE, "--", "sh", "-c", "echo hello-" + RUN + "; uname -s", timeout=BOOT_TIMEOUT
+    )
     assert rc == 0, f"rc={rc} err={err}"
     assert ("hello-" + RUN) in out, f"streamed stdout missing marker: {out!r}"
     assert "Linux" in out, f"uname -s not Linux: {out!r}"
@@ -214,8 +224,9 @@ def t_detach_ps_exec_stop_rm(_):
 def t_shell_ephemeral(_):
     """shell -c boots a fresh ephemeral VM, runs the command, and removes it."""
     marker = "shelled-" + RUN
-    rc, out, err = cli("shell", "--image", IMAGE, "-c",
-                       f"echo {marker}; uname -s", timeout=BOOT_TIMEOUT)
+    rc, out, err = cli(
+        "shell", "--image", IMAGE, "-c", f"echo {marker}; uname -s", timeout=BOOT_TIMEOUT
+    )
     assert rc == 0, f"shell rc={rc} err={err}"
     assert marker in out, f"shell stdout missing marker: {out!r}"
     assert "Linux" in out, f"uname -s not Linux: {out!r}"
@@ -266,8 +277,18 @@ def t_logs(_):
     """logs shows a --no-agent VM's serial console (where its command output lands)."""
     name = uid("logs")
     marker = "console-" + RUN
-    args = ["run", "-d", "--no-agent", "--name", name, IMAGE, "--", "sh", "-c",
-            f"echo {marker}; sleep 300"]
+    args = [
+        "run",
+        "-d",
+        "--no-agent",
+        "--name",
+        name,
+        IMAGE,
+        "--",
+        "sh",
+        "-c",
+        f"echo {marker}; sleep 300",
+    ]
     cli(*args, timeout=BOOT_TIMEOUT, check=True)
     track(name)
     try:
@@ -314,8 +335,7 @@ def t_snapshot_restore(_):
         cli("snapshot", name, tpl, "--stop", timeout=BOOT_TIMEOUT, check=True)
         cli("rm", name, check=True)
         untrack(name)
-        cli("restore", tpl, "--name", restored, "--agent", "-d",
-            timeout=BOOT_TIMEOUT, check=True)
+        cli("restore", tpl, "--name", restored, "--agent", "-d", timeout=BOOT_TIMEOUT, check=True)
         track(restored)
         exec_until(restored, "cat", "/root/m", want=marker)
     finally:
@@ -338,8 +358,7 @@ def t_fork(_):
         untrack(name)
         rc, out, err = cli("fork", tpl, "--count", "2", timeout=BOOT_TIMEOUT)
         assert rc == 0, f"fork failed: {err}"
-        clones = [line.split()[0] for line in out.splitlines()
-                  if "(pid" in line and line.split()]
+        clones = [line.split()[0] for line in out.splitlines() if "(pid" in line and line.split()]
         assert len(clones) == 2, f"expected 2 clones, parsed {clones} from:\n{out}"
         for c in clones:
             track(c)
@@ -369,20 +388,25 @@ def t_daemon_stop(_):
 # runner
 # --------------------------------------------------------------------------- #
 
+
 def preflight() -> str | None:
     """Return a human-readable reason the e2e cannot run, or None when ready."""
     if platform.system() == "Darwin":
-        return ("the vmon CLI e2e builds a Linux container rootfs (docker + mke2fs) "
-                "and is Linux-only; on macOS/HVF run the Rust e2e instead: "
-                "`just integration`.")
+        return (
+            "the vmon CLI e2e builds a Linux container rootfs (docker + mke2fs) "
+            "and is Linux-only; on macOS/HVF run the Rust e2e instead: "
+            "`just integration`."
+        )
     if platform.system() != "Linux":
         return f"needs a Linux + /dev/kvm host; this is {platform.system()}"
     if not Path("/dev/kvm").exists():
         return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
-    for probe, hint in ((find_binary, "vmon binary"),
-                        (default_kernel, "guest kernel"),
-                        (detect_engine, "container engine"),
-                        (find_agent_binary, "static guest agent")):
+    for probe, hint in (
+        (find_binary, "vmon binary"),
+        (default_kernel, "guest kernel"),
+        (detect_engine, "container engine"),
+        (find_agent_binary, "static guest agent"),
+    ):
         try:
             probe()
         except RuntimeError as exc:
@@ -425,8 +449,9 @@ def main(argv=None) -> int:
     if args.image:
         IMAGE = args.image
 
-    selected = [fn for fn in TESTS
-                if not args.tests or any(f in display_name(fn) for f in args.tests)]
+    selected = [
+        fn for fn in TESTS if not args.tests or any(f in display_name(fn) for f in args.tests)
+    ]
 
     reason = preflight()
     if reason:

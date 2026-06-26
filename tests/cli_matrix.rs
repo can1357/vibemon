@@ -38,6 +38,15 @@ fn uefi_requires_firmware() {
 	assert_cli_rejects(&["--boot-mode", "uefi"], "requires --firmware");
 }
 
+/// Invalid tracing filters should be rejected instead of silently falling back.
+#[test]
+fn invalid_log_level_is_reported() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--no-sandbox", "--log-level", "???"],
+		"invalid --log-level",
+	);
+}
+
 /// User-mode NAT is the macOS/HVF networking path; KVM hosts must use TAP.
 #[cfg(not(target_os = "macos"))]
 #[test]

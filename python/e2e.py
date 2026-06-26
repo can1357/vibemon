@@ -43,6 +43,7 @@ Usage:
   python3 python/e2e.py --keep          # leave volumes/snapshots in place
   VMON_E2E_IMAGE=alpine:latest python3 python/e2e.py
 """
+
 from __future__ import annotations
 
 import argparse
@@ -77,6 +78,7 @@ _template: Path | None = None
 # --------------------------------------------------------------------------- #
 # harness
 # --------------------------------------------------------------------------- #
+
 
 class Skip(Exception):
     """Raised by a test to report it cannot run in this environment."""
@@ -117,11 +119,9 @@ def make_sandbox(**kw) -> Sandbox:
     return Sandbox.create(image=IMAGE, **kw)
 
 
-def run(sb: Sandbox, *argv, timeout: float = 30, pty: bool = False,
-        env=None, workdir=None):
+def run(sb: Sandbox, *argv, timeout: float = 30, pty: bool = False, env=None, workdir=None):
     """Exec ``argv`` in ``sb``; return ``(returncode, stdout, stderr)`` as text."""
-    proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir,
-                   _track_entry=False)
+    proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir, _track_entry=False)
     try:
         rc = proc.wait(timeout=timeout)
     except TimeoutError:
@@ -174,6 +174,7 @@ def net_admin() -> bool:
     """True if the host can create TAP devices (root or CAP_NET_ADMIN)."""
     try:
         from vmon import net
+
         return bool(net.has_net_admin())
     except Exception:
         return False
@@ -182,6 +183,7 @@ def net_admin() -> bool:
 # --------------------------------------------------------------------------- #
 # tests
 # --------------------------------------------------------------------------- #
+
 
 @e2e
 def t_exec(_):
@@ -277,7 +279,9 @@ def t_snapshot_restore(_):
         restored = Sandbox.from_snapshot(name, block_network=True)
         assert restored.filesystem.read_text("/root/marker") == "snapshotted"
         u1 = uptime(restored)
-        assert u1 >= u0 - 1, f"restored uptime {u1:.1f} < pre-snapshot {u0:.1f} - 1; cold boot, not restore"
+        assert u1 >= u0 - 1, (
+            f"restored uptime {u1:.1f} < pre-snapshot {u0:.1f} - 1; cold boot, not restore"
+        )
         rc, out, _ = run(restored, "sh", "-lc", "echo warm")
         assert rc == 0 and "warm" in out
     finally:
@@ -331,8 +335,9 @@ def t_delta_snapshot(_):
         delta_bytes = snapshot_memory_bytes(delta_dir)
         assert delta_bytes < base_bytes, f"delta memory {delta_bytes} not < base {base_bytes}"
         restored = Sandbox.from_snapshot(delta, block_network=True)
-        assert restored.filesystem.read_text("/root/fill").strip() == "post-base", \
+        assert restored.filesystem.read_text("/root/fill").strip() == "post-base", (
             "post-base state not visible after delta restore"
+        )
         rc, out, _ = run(restored, "sh", "-lc", "echo delta-ok")
         assert rc == 0 and "delta-ok" in out
     finally:
@@ -445,6 +450,7 @@ def t_network_block(_):
 def t_network_lease(_):
     """Host-side networking allocates a deterministic, non-overlapping guest lease."""
     from vmon import net
+
     name = uid("net")
     cfg = net.allocate_guest_config(name)
     try:
@@ -485,10 +491,13 @@ def t_ports_tunnels(_):
         assert isinstance(sb.create_connect_token(), str) and sb.create_connect_token()
         # Serve a known response inside the guest, then fetch it through the tunnel.
         listener = sb.exec(
-            "sh", "-lc",
+            "sh",
+            "-lc",
             "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nhi'"
             " | nc -l -p 18080; done",
-            timeout=60, _track_entry=False)
+            timeout=60,
+            _track_entry=False,
+        )
         deadline = time.time() + 10
         while time.time() < deadline and not sb.agent().tcp_probe(18080):
             time.sleep(0.3)
@@ -589,10 +598,12 @@ def t_async(_):
     """The aio facade mirrors the sync SDK for exec."""
     sb = make_sandbox()
     try:
+
         async def go():
             proc = await sb.aio.exec("sh", "-lc", "printf aio")
             rc = proc.wait(timeout=15)
             return rc, proc.stdout.read().decode()
+
         rc, out = asyncio.run(go())
         assert rc == 0 and out == "aio", f"rc={rc} out={out!r}"
     finally:
@@ -603,20 +614,25 @@ def t_async(_):
 # runner
 # --------------------------------------------------------------------------- #
 
+
 def preflight() -> str | None:
     """Return a human-readable reason the e2e cannot run, or None when ready."""
     if platform.system() == "Darwin":
-        return ("the Python SDK e2e builds a Linux container rootfs (docker + "
-                "mke2fs) and is Linux-only; on macOS/HVF run the Rust e2e instead: "
-                "`just integration`.")
+        return (
+            "the Python SDK e2e builds a Linux container rootfs (docker + "
+            "mke2fs) and is Linux-only; on macOS/HVF run the Rust e2e instead: "
+            "`just integration`."
+        )
     if platform.system() != "Linux":
         return f"needs a Linux + /dev/kvm host; this is {platform.system()}"
     if not Path("/dev/kvm").exists():
         return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
-    for probe, hint in ((find_binary, "vmon binary"),
-                        (default_kernel, "guest kernel"),
-                        (detect_engine, "container engine"),
-                        (find_agent_binary, "static guest agent")):
+    for probe, hint in (
+        (find_binary, "vmon binary"),
+        (default_kernel, "guest kernel"),
+        (detect_engine, "container engine"),
+        (find_agent_binary, "static guest agent"),
+    ):
         try:
             probe()
         except RuntimeError as exc:
@@ -646,8 +662,9 @@ def main(argv=None) -> int:
     if args.image:
         IMAGE = args.image
 
-    selected = [fn for fn in TESTS
-                if not args.tests or any(f in display_name(fn) for f in args.tests)]
+    selected = [
+        fn for fn in TESTS if not args.tests or any(f in display_name(fn) for f in args.tests)
+    ]
 
     reason = preflight()
     if reason:

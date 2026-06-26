@@ -1,6 +1,8 @@
 import io
 import json
 
+import pytest
+
 
 class FakeSession:
     def __init__(self):
@@ -146,3 +148,20 @@ def test_volume_tag_collisions_get_unique_restore_tags(monkeypatch, mvm_home):
     assert tags == ["a_b", "a_b_2"]
     assert len(tags) == len(set(tags))
     sb.terminate()
+
+
+def test_create_rejects_invalid_resource_args_before_template_resolution(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+
+    def fail_resolve(**kwargs):
+        raise AssertionError("_resolve_template should not run for invalid resources")
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "_resolve_template", staticmethod(fail_resolve))
+    with pytest.raises(ValueError):
+        sandbox_mod.Sandbox.create(template="t", cpus=0, block_network=True)
+    with pytest.raises(ValueError):
+        sandbox_mod.Sandbox.create(template="t", memory=0, block_network=True)
+    with pytest.raises(ValueError):
+        sandbox_mod.Sandbox.create(template="t", disk_mb=0, block_network=True)
+    with pytest.raises(ValueError):
+        sandbox_mod.Sandbox.create(template="t", timeout_secs=86_401, block_network=True)

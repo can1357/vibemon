@@ -1,3 +1,4 @@
+import hashlib
 import struct
 
 import pytest
@@ -8,11 +9,11 @@ def _write_elf64(path, p_type):
     header = struct.pack(
         "<16sHHIQQQIHHHHHH",
         ident,
-        2,      # ET_EXEC
-        62,     # EM_X86_64
+        2,  # ET_EXEC
+        62,  # EM_X86_64
         1,
         0,
-        64,     # e_phoff immediately after ELF header
+        64,  # e_phoff immediately after ELF header
         0,
         0,
         64,
@@ -81,3 +82,74 @@ def test_first_static_accepts_non_executable(tmp_path):
     static = _write_elf64(tmp_path / "bundled-agent", 1)
     static.chmod(0o644)
     assert _first_static([static]) == static
+
+
+def test_find_agent_binary_expands_user_override(monkeypatch, tmp_path):
+    from vmon.image import find_agent_binary
+
+    home = tmp_path / "home"
+    agent = home / "bin" / "agent"
+    agent.parent.mkdir(parents=True)
+    _write_elf64(agent, 1)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("VMON_AGENT", "~/bin/agent")
+
+    assert find_agent_binary() == agent
+
+
+def test_find_agent_binary_reports_missing_arch_and_checked_asset(monkeypatch, tmp_path):
+    import vmon.image as image
+
+    fake_pkg = tmp_path / "pkg" / "vmon" / "image.py"
+    monkeypatch.setattr(image, "__file__", str(fake_pkg))
+    monkeypatch.setattr(image.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(image.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("VMON_AGENT", raising=False)
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+
+    with pytest.raises(RuntimeError, match=r"x86_64.*vmon-agent-x86_64"):
+        image.find_agent_binary()
+
+
+def test_build_or_pull_normalizes_and_rejects_image_refs(monkeypatch):
+    import vmon.image as image
+
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return Result()
+
+    monkeypatch.setattr(image.subprocess, "run", fake_run)
+
+    assert image.build_or_pull(" alpine:latest ", None, engine="docker") == (
+        "docker",
+        "alpine:latest",
+    )
+    assert calls[0][0] == ["docker", "image", "inspect", "alpine:latest"]
+
+    with pytest.raises(ValueError, match="must not contain whitespace"):
+        image.build_or_pull("bad ref", None, engine="docker")
+
+
+def test_ensure_kernel_expands_home_and_normalizes_arch(monkeypatch, tmp_path):
+    import vmon.assets as assets
+
+    home = tmp_path / "home"
+    data = b"kernel"
+    digest = hashlib.sha256(data).hexdigest()
+    cached = home / "vmon-state" / "assets" / "Image"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(data)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("VMON_HOME", "~/vmon-state")
+    monkeypatch.setattr(
+        assets, "_KERNELS", {"aarch64": ("Image", "https://example.invalid/kernel", digest)}
+    )
+
+    assert assets.ensure_kernel("arm64") == cached
