@@ -100,7 +100,7 @@ class WarmPool:
                 return False
             path.relative_to(root)
             return True
-        except (OSError, TypeError, ValueError):
+        except OSError, TypeError, ValueError:
             return False
 
     @staticmethod

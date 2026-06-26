@@ -405,7 +405,7 @@ class MicroVM:
         if proc_stat.exists():
             try:
                 state = proc_stat.read_text().split(") ", 1)[1].split(" ", 1)[0]
-            except (FileNotFoundError, ProcessLookupError, IndexError):
+            except FileNotFoundError, ProcessLookupError, IndexError:
                 return False
             if state in ("Z", "X", "x"):
                 try:
@@ -854,7 +854,7 @@ class MicroVM:
         self._close_agent()
         try:
             self.control.quit()
-        except (OSError, RuntimeError):
+        except OSError, RuntimeError:
             pid = self._meta_pid(self.meta.get("pid"))
             if pid:
                 try:
