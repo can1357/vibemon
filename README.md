@@ -52,7 +52,7 @@ vmon serve (FastAPI, server.py)
    │ Unix socket  $VMON_HOME/vmond.sock
 vmond (daemon.py) ──> Engine (core.py, single registry owner)
    │ spawns subprocess per VM, --api-sock JSON control socket
-vmon binary (Rust VMM)
+vmm binary (Rust VMM)
    │ virtio-console, length-prefixed binary frames
 vmon-agent (guest agent, Linux guest only)
 ```
@@ -206,7 +206,7 @@ sudo ./target/release/vmm \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-Snapshots record the virtio-fs mode in the v10 snapshot format and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Snapshot restores are backend-specific: a KVM snapshot restores only on a KVM build, and a macOS/HVF snapshot restores only on a macOS/HVF build (cross-hypervisor migration is out of scope). Delta snapshots follow the same backend-specific rule.
+Snapshots record the virtio-fs mode in the v1 snapshot format and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Snapshot restores are backend-specific: a KVM snapshot restores only on a KVM build, and a macOS/HVF snapshot restores only on a macOS/HVF build (cross-hypervisor migration is out of scope). Delta snapshots follow the same backend-specific rule.
 
 ### Production platform flags
 

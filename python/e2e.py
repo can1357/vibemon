@@ -26,7 +26,7 @@ non-zero exit code if anything fails.
 
 Prerequisites (a Linux + KVM host, e.g. bare metal or a nested-KVM Lima VM):
   * ``/dev/kvm`` present and accessible
-  * a built vmon binary       (``cargo build --release`` or ``VMON_BIN``)
+  * a built vmm binary        (``cargo build --release`` or ``VMON_BIN``)
   * a static guest agent         (``just agent-musl`` or ``VMON_AGENT``)
   * a guest kernel               (``/boot/vmlinuz-$(uname -r)`` or ``VMON_KERNEL``)
   * ``docker`` or ``podman``     (to build the image rootfs)
@@ -634,7 +634,7 @@ def preflight() -> str | None:
     if not Path("/dev/kvm").exists():
         return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
     for probe, hint in (
-        (find_binary, "vmon binary"),
+        (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
         (detect_engine, "container engine"),
         (find_agent_binary, "static guest agent"),

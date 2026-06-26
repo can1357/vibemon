@@ -354,7 +354,12 @@ class Sandbox:
                 sb.agent().mount(spec["tag"], spec["mountpoint"], ro=bool(spec["read_only"]))
             if net_handle is not None:
                 gc = net_handle.guest_config
-                sb.agent().net_config(gc["ip"], int(gc["prefix"]), gc["gw"], gc.get("dns") or [])
+                sb.agent().net_config(
+                    gc["guest_ip"],
+                    int(gc["prefix"]),
+                    gc["host_ip"],
+                    gc.get("dns") or [],
+                )
                 sb._network_policy = {
                     "egress_allow": list(egress_allow) if egress_allow is not None else None,
                     "egress_allow_domains": list(egress_allow_domains)
@@ -460,7 +465,12 @@ class Sandbox:
                 sb._network = net_handle
                 wait_for_agent_ready(sb.vm, timeout=timeout)
                 gc = net_handle.guest_config
-                sb.agent().net_config(gc["ip"], int(gc["prefix"]), gc["gw"], gc.get("dns") or [])
+                sb.agent().net_config(
+                    gc["guest_ip"],
+                    int(gc["prefix"]),
+                    gc["host_ip"],
+                    gc.get("dns") or [],
+                )
             vm._save_meta(
                 sandbox=True,
                 restored_snapshot=str(name),
@@ -727,12 +737,10 @@ class Sandbox:
                 vol.release()
             self._volumes.clear()
 
-    stop = terminate
-
     def tunnels(self) -> dict[int, tuple[str, int]]:
-        if self._network is not None and hasattr(self._network, "tunnels"):
-            return dict(self._network.tunnels())
-        return {}
+        if self._network is None:
+            return {}
+        return dict(self._network.tunnels())
 
     def create_connect_token(self) -> str:
         if self.connect_token is None:
@@ -740,15 +748,7 @@ class Sandbox:
         return self.connect_token
 
     def extend(self, secs: int) -> dict[str, Any]:
-        control = self.vm.control
-        extend = getattr(control, "extend", None)
-        if callable(extend):
-            result = extend(int(secs))
-        else:
-            request = getattr(control, "_request", None)
-            if not callable(request):
-                raise RuntimeError("control client does not support extend")
-            result = request("extend", {"secs": int(secs)})
+        result = self.vm.control.extend(int(secs))
         # Realign the host watchdog backstop with the new VMM deadline so it does
         # not terminate the sandbox at the original (now-stale) deadline.
         self._timeout_secs = int(secs)
@@ -764,23 +764,13 @@ class Sandbox:
     ) -> None:
         if self._network is None:
             return
-        try:
-            from . import net
-        except ImportError:
-            return
-        cfg = getattr(self._network, "guest_config", None) or getattr(self._network, "config", None)
-        if not hasattr(net, "setup_tap"):
-            return
-        if isinstance(cfg, dict):
-            tap = str(cfg.get("tap") or getattr(getattr(self._network, "tap", None), "name", ""))
-            guest_ip = str(cfg.get("guest_ip") or cfg.get("ip") or "")
-            host_ip = str(cfg.get("host_ip") or cfg.get("gw") or "")
-            prefix = int(cfg.get("prefix", 30))
-        else:
-            tap = str(getattr(self._network, "name", ""))
-            guest_ip = str(getattr(self._network, "guest_ip", ""))
-            host_ip = str(getattr(self._network, "host_ip", ""))
-            prefix = int(getattr(self._network, "prefix", 30))
+        from . import net
+
+        cfg = self._network.guest_config
+        tap = str(cfg["tap"])
+        guest_ip = str(cfg["guest_ip"])
+        host_ip = str(cfg["host_ip"])
+        prefix = int(cfg["prefix"])
         if block_network is True:
             allow_list: list[str] | None = []
         elif cidr_allow is not None:
@@ -821,12 +811,8 @@ class Sandbox:
     def _teardown_network(self) -> None:
         network = self._network
         self._network = None
-        if network is None:
-            return
-        if hasattr(network, "teardown"):
+        if network is not None:
             network.teardown()
-        elif callable(network):
-            network()
 
 
 class _AsyncSandbox:

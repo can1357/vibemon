@@ -7,13 +7,13 @@ All notable changes to this project are recorded here.
 
 - Renamed Rust hypervisor binary/crate from `vmon` to `vmm`, mapping the user-facing self-identification and binary name in build and CI scripts, and resolved naming collision between the Rust binary and Python CLI.
 - Renamed Python guest-agent host client from `vmon/agent.py` to `vmon/agent_client.py` and updated all importers (`sandbox.py`, `vmm.py`, test suite) to resolve "agent" naming collision.
-- Removed the collision-only helper functions (`_is_python_console_script` and `_which_all`) from python binary locator in `vmm.py`.
+- Removed the now-unneeded PATH collision-skip logic from the Python binary locator in `vmm.py`.
 - Dropped all support for legacy snapshots; previous snapshots must be recaptured
 
 ### Added
 
 - Added automatic guest kernel provisioning for environments without a local kernel (e.g., macOS/HVF)
-- Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g. macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmon` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
+- Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g., macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmm` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
 
@@ -45,7 +45,7 @@ All notable changes to this project are recorded here.
 - Snapshot restore and copy-on-write fork paths for MMIO-backed block, net, console, and serial state.
 - x86_64 virtio PCI transport snapshot, restore, and copy-on-write fork, complementing the MMIO snapshot path.
 - Writable and read-only virtio-fs device state (shared tag, mount metadata, inode table, and mode) captured in snapshots and reconstructed on restore.
-- Snapshots use on-disk format version 10, recording the hypervisor-backend tag and distinct virtio-net backend variants so a snapshot is only restored on the backend that captured it (KVM on KVM, macOS/HVF on macOS/HVF); cross-backend or unsupported-version restores are rejected with a clear error.
+- Snapshots use on-disk format version 1, recording the hypervisor-backend tag and distinct virtio-net backend variants so a snapshot is only restored on the backend that captured it (KVM on KVM, macOS/HVF on macOS/HVF); cross-backend or unsupported-version restores are rejected with a clear error.
 - Virtio-fs device support for exposing host directories to the guest, including writable named volumes.
 - Virtio-console guest-agent channel and post-restore command dispatch.
 - `metrics` JSON lifecycle method exposing additive runtime counters over the v1 control API.
@@ -79,4 +79,4 @@ All notable changes to this project are recorded here.
 
 - Production isolation is not claimed; the VMM has not had a security audit.
 - CI does not boot guests and does not require `/dev/kvm`.
-- Snapshot restore requires a matching build architecture, the same hypervisor backend that captured the snapshot, and the current on-disk format version (10); snapshots from older or newer versions are rejected with a clear error (recapture required).
+- Snapshot restore requires a matching build architecture, the same hypervisor backend that captured the snapshot, and the current on-disk format version (1); snapshots from older or newer versions are rejected with a clear error (recapture required).

@@ -741,6 +741,8 @@ class GatewayClient:
             except Exception:
                 pass
 
+        stdin_thread: threading.Thread | None = None
+
         def start_input() -> None:
             nonlocal raw, stdin_thread
             if stdin_thread is not None:
@@ -754,7 +756,6 @@ class GatewayClient:
             stdin_thread = threading.Thread(target=forward, args=(src,), daemon=True)
             stdin_thread.start()
 
-        stdin_thread: threading.Thread | None = None
         try:
             if not wait_ready:
                 start_input()

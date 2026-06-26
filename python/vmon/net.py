@@ -72,11 +72,9 @@ class SandboxNetwork:
         )
         self.guest_config = {
             "tap": config["tap"],
-            "ip": config["guest_ip"],
             "guest_ip": config["guest_ip"],
-            "prefix": config["prefix"],
-            "gw": config["host_ip"],
             "host_ip": config["host_ip"],
+            "prefix": config["prefix"],
             "dns": list(cast(Sequence[str], config["dns"])),
         }
 

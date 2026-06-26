@@ -776,7 +776,7 @@ class Engine:
         returncode = self._sandbox_returncode(sandbox)
         if sandbox is not None:
             try:
-                term = getattr(sandbox, "terminate", None) or getattr(sandbox, "stop", None)
+                term = getattr(sandbox, "terminate", None)
                 if term is not None:
                     term()
             except Exception:
@@ -912,7 +912,7 @@ class Engine:
 
     def snapshot_filesystem(self, name: str, snapshot: str | None = None) -> str:
         sandbox = self._sandbox_for(name)
-        fn = getattr(sandbox, "snapshot_filesystem", None) or getattr(sandbox, "snapshot", None)
+        fn = getattr(sandbox, "snapshot_filesystem", None)
         if fn is None:
             raise Unsupported("sandbox snapshot API unavailable")
         snap = fn(snapshot)

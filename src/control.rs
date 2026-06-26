@@ -757,8 +757,8 @@ fn verify_peer_credentials(_: &UnixStream, _: u32) -> io::Result<()> {
 
 #[derive(Serialize)]
 struct Banner<'a> {
-	vmm:  &'a str,
-	api:  u8,
+	vmm: &'a str,
+	api: u8,
 }
 
 #[derive(Deserialize)]

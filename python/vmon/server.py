@@ -226,12 +226,6 @@ class Supervisor:
         with self._lock:
             self._counters[name] = self._counters.get(name, 0) + by
 
-    @staticmethod
-    def _model_dict(model: BaseModel) -> dict[str, Any]:
-        if hasattr(model, "model_dump"):
-            return model.model_dump(exclude_none=True)  # pydantic v2
-        return model.dict(exclude_none=True)  # pydantic v1
-
     def subscribe_events(self) -> asyncio.Queue[dict[str, Any]]:
         queue_: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -261,7 +255,7 @@ class Supervisor:
     # -- registry (delegated to the engine) --------------------------------
 
     async def create(self, request: SandboxCreate) -> VMRecord:
-        record = await self._run(self._engine.create, self._model_dict(request))
+        record = await self._run(self._engine.create, request.model_dump(exclude_none=True))
         latency = float(record.detail.get("create_latency_ms") or 0.0)
         with self._lock:
             self._counters["created"] += 1
@@ -1524,7 +1518,7 @@ def create_app(
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
     async def create_sandbox(request: Request, body: SandboxCreate) -> JSONResponse:
         _validate_create_request(body)
-        body_dict = supervisor._model_dict(body)
+        body_dict = body.model_dump(exclude_none=True)
         if (
             mesh.enabled
             and not request.headers.get("x-vmon-mesh-hop")

@@ -298,8 +298,8 @@ impl Block {
 				return Ok(());
 			}
 			return Err(err(format!(
-				"vmm: virtio-blk {context} missing active state while reaping {pending_len} \
-				 in-flight io_uring request(s)"
+				"vmm: virtio-blk {context} missing active state while reaping {pending_len} in-flight \
+				 io_uring request(s)"
 			)));
 		};
 		let Some(queue) = self.queue.as_mut() else {

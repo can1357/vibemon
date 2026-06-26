@@ -379,7 +379,7 @@ def preflight() -> str | None:
     if not Path("/dev/kvm").exists():
         return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
     for probe, hint in (
-        (find_binary, "vmon binary"),
+        (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
         (detect_engine, "container engine"),
         (find_agent_binary, "static guest agent"),
