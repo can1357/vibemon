@@ -21,11 +21,10 @@ engine (`docker` or `podman`), and the `vmon` binary built (`cargo build --relea
 A guest kernel is auto-detected from `/boot/vmlinuz-$(uname -r)` (override with
 `VMON_KERNEL`).
 
-`run` boots an agent-enabled microVM by default: a small, statically linked guest
-agent (`vmon-agent`) is injected into the image rootfs. Release wheels ship it; in
-a source checkout, build and bundle it once with `just agent-musl` (or point
-`VMON_AGENT` at a static build). Pass `--no-agent` to use the legacy initramfs
-console path instead, which needs no agent or guest block device.
+`run` boots an agent-enabled microVM: a small, statically linked guest agent
+(`vmon-agent`) is injected into the image rootfs. Release wheels ship it; in a
+source checkout, build and bundle it once with `just agent-musl` (or point
+`VMON_AGENT` at a static build).
 
 ## Install
 
@@ -91,24 +90,18 @@ vmon daemon start    # explicitly start it
 ## SDK
 
 ```python
-from vmon import MicroVM
+from vmon import Sandbox
 
-# Boot a container
-vm = MicroVM.run(image="alpine", cmd=["sh", "-c", "echo hi"], mem=256)
+sb = Sandbox.create(image="alpine", memory=256)
+proc = sb.exec("sh", "-c", "echo hi")
+print(proc.wait())
 
 # ...or from a Dockerfile
-vm = MicroVM.run(dockerfile="Dockerfile", context=".")
+sb = Sandbox.create(dockerfile="Dockerfile", context=".")
 
-vm.pause(); vm.resume()                 # suspend / resume
-
-vm.snapshot("template", keep_running=False)   # pause + snapshot a template
-
-warm = MicroVM.restore("template")            # warm-boot (~120ms)
-print(warm.meta["reconstruct_ms"])            # vmon-reported reconstruct time
-
-clones = warm.fork("template", count=3)        # CoW clones (shared pages)
-for c in clones:
-    print(c.name, c.meta["reconstruct_ms"])    # ~3ms each
+img = sb.snapshot_filesystem("template")      # snapshot the guest filesystem
+again = Sandbox.create(template=img)          # warm-boot from the template
+print(again.name)
 ```
 
 ## Sandbox SDK
@@ -189,9 +182,9 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 
 ## How it works
 
-- **run** — `docker/podman` builds/exports the image filesystem; `vmon` injects a
-  tiny PID-1 that mounts `/proc /sys /dev`, restores the image's env/workdir, and
-  runs its entrypoint, then packs it as an initramfs and boots it under vmon.
+- **run** — `docker/podman` builds/exports the image filesystem; `vmon` injects
+  the static guest agent, boots an ext4 rootfs under vmon, and execs the image's
+  entrypoint through the agent-backed sandbox API.
 - **pause/resume** — vmon parks the vCPUs at a safe point and quiesces device
   workers over its Unix control socket.
 - **snapshot** — serializes the full machine state (vCPU regs/MSRs/xstate, the

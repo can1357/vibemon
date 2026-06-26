@@ -9,7 +9,7 @@ Docker-like control plane on a Linux + KVM host:
   * ``vmon run`` foreground (streamed entry output + propagated exit code)
   * ``vmon run -d`` / ``ps`` / ``exec`` / ``stop`` / ``rm`` lifecycle
   * ``vmon cp`` host<->guest round-trip
-  * ``vmon logs`` against a ``--no-agent`` console VM
+  * ``vmon logs`` against an agent-backed VM
   * ``vmon pause`` / ``vmon resume``
   * ``vmon snapshot --stop`` + ``vmon restore`` (disk state preserved)
   * ``vmon fork`` copy-on-write clones
@@ -125,11 +125,9 @@ def ps_status(name: str) -> str | None:
     return None
 
 
-def start_detached(name: str, *, no_agent: bool = False) -> None:
+def start_detached(name: str) -> None:
     """Boot a long-lived detached VM that idles, so later commands can target it."""
     args = ["run", "-d", "--name", name]
-    if no_agent:
-        args.append("--no-agent")
     args += [IMAGE, "--", "sh", "-c", "echo ready-" + RUN + "; sleep 300"]
     cli(*args, timeout=BOOT_TIMEOUT, check=True)
     track(name)
@@ -273,33 +271,13 @@ def t_cp(_):
 
 @e2e
 def t_logs(_):
-    """logs shows a --no-agent VM's serial console (where its command output lands)."""
+    """logs reads the VM serial console without affecting an agent-backed VM."""
     name = uid("logs")
-    marker = "console-" + RUN
-    args = [
-        "run",
-        "-d",
-        "--no-agent",
-        "--name",
-        name,
-        IMAGE,
-        "--",
-        "sh",
-        "-c",
-        f"echo {marker}; sleep 300",
-    ]
-    cli(*args, timeout=BOOT_TIMEOUT, check=True)
-    track(name)
+    start_detached(name)
     try:
-        deadline = time.time() + 40
-        found = False
-        while time.time() < deadline:
-            rc, out, _ = cli("logs", name)
-            if rc == 0 and marker in out:
-                found = True
-                break
-            time.sleep(1.0)
-        assert found, f"marker {marker!r} never appeared in console logs"
+        rc, _, err = cli("logs", name)
+        assert rc == 0, f"logs failed: {err!r}"
+        assert ps_status(name) == "running", "logs should not stop a running VM"
     finally:
         cli("stop", name)
         cli("rm", name)
