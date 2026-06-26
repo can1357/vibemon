@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
+
 use crate::{
 	bail,
 	result::{Result, err},
@@ -157,154 +159,250 @@ pub struct Config {
 	pub volumes:            Vec<FsMount>,
 }
 
+/// Raw command-line surface parsed by clap; flag tokenization only.
+///
+/// Numeric bounds, host-capability gating, and inter-flag invariants live in
+/// [`Config::from_cli`], which lowers this into the runtime [`Config`].
+/// Structured values reuse the module's `parse_*` validators as clap value
+/// parsers, so a malformed flag reports the same diagnostic through every entry
+/// point.
+#[derive(Parser)]
+#[command(
+	name = "vmon",
+	version,
+	about = "a barebones KVM (Linux) / Hypervisor.framework (macOS) monitor for Linux guests",
+	override_usage = "vmon (--kernel <image> | --boot-mode uefi --firmware <fd>) [options]",
+	long_about = "vmon boots a Linux guest with a serial console and virtio IO on KVM (Linux) or \
+	              Apple Hypervisor.framework (macOS, Apple Silicon); the backend is selected at \
+	              compile time."
+)]
+struct CliArgs {
+	/// Kernel image (vmlinux/bzImage on x86_64, arm64 Image on aarch64); required for direct boot
+	#[arg(long, value_name = "PATH")]
+	kernel: Option<PathBuf>,
+
+	/// Kernel command line (default: console=ttyS0 ...)
+	#[arg(long, value_name = "STRING", allow_hyphen_values = true)]
+	cmdline: Option<String>,
+
+	/// Guest RAM in MiB
+	#[arg(long, value_name = "MIB", default_value_t = 256)]
+	mem: u64,
+
+	/// Keep guest host-RAM resident set near <n> MiB (transparent zram+paging)
+	#[arg(long, value_name = "MIB")]
+	mem_target_mib: Option<u64>,
+
+	/// Cap the in-RAM compressed store before spilling to swap
+	#[arg(long, value_name = "MIB")]
+	zram_store_max_mib: Option<u64>,
+
+	/// Swap file for paging overflow (default: anonymous temp in $TMPDIR)
+	#[arg(long, value_name = "PATH")]
+	zram_swap_file: Option<PathBuf>,
+
+	/// madvise(MADV_MERGEABLE) guest RAM for host KSM dedup
+	#[arg(long)]
+	ksm: bool,
+
+	/// Number of vCPUs
+	#[arg(long, value_name = "N", default_value_t = 1)]
+	cpus: u64,
+
+	/// Disk image exposed as virtio-blk /dev/vda
+	#[arg(long, value_name = "PATH")]
+	rootfs: Option<PathBuf>,
+
+	/// Open the rootfs read-only
+	#[arg(long)]
+	rootfs_ro: bool,
+
+	/// initramfs image
+	#[arg(long, value_name = "PATH")]
+	initrd: Option<PathBuf>,
+
+	/// Host TAP/vmnet interface for virtio-net
+	#[arg(long, value_name = "NAME")]
+	tap: Option<String>,
+
+	/// Entitlement-free user-mode NAT networking (macOS); only value is `user`
+	#[arg(long, value_name = "MODE")]
+	net: Option<String>,
+
+	/// Guest MAC (default: 02:00:00:00:00:01)
+	#[arg(long, value_name = "ADDR", value_parser = parse_mac)]
+	mac: Option<[u8; 6]>,
+
+	/// Virtio transport: mmio|pci (pci x86_64 only)
+	#[arg(long, value_name = "KIND", value_parser = parse_transport, default_value = "mmio")]
+	transport: Transport,
+
+	/// virtio-fs mount tag (requires --fs-dir)
+	#[arg(long, value_name = "TAG")]
+	fs_tag: Option<String>,
+
+	/// Host directory exposed read-only by virtio-fs
+	#[arg(long, value_name = "PATH")]
+	fs_dir: Option<PathBuf>,
+
+	/// Writable virtio-fs volume <tag>:<host_dir> (:ro read-only); repeatable
+	#[arg(long = "volume", value_name = "T:D[:RO]", value_parser = parse_volume)]
+	volumes: Vec<FsMount>,
+
+	/// Unix control socket (pause/resume/snapshot/quit)
+	#[arg(long, value_name = "PATH")]
+	api_sock: Option<PathBuf>,
+
+	/// Root for named JSON lifecycle snapshots
+	#[arg(long, value_name = "DIR")]
+	snapshot_root: Option<PathBuf>,
+
+	/// Guest-agent socket (under --jail: /run/vmon/*)
+	#[arg(long, value_name = "PATH")]
+	agent_sock: Option<PathBuf>,
+
+	/// Restore a snapshot directory instead of booting
+	#[arg(long, value_name = "DIR")]
+	restore: Option<PathBuf>,
+
+	/// Fork (CoW) from a template snapshot directory
+	#[arg(long, value_name = "DIR")]
+	fork_from: Option<PathBuf>,
+
+	/// Create a new no-overwrite CoW overlay at --rootfs
+	#[arg(long, value_name = "BASE")]
+	disk_overlay_of: Option<PathBuf>,
+
+	/// Number of children to spawn with --fork-from
+	#[arg(long, value_name = "N", default_value_t = 1)]
+	count: u64,
+
+	/// Attach a virtio-console agent channel (/dev/hvc0)
+	#[arg(long)]
+	console_agent: bool,
+
+	/// Send <cmd> to the guest agent after (warm) boot
+	#[arg(long, value_name = "CMD", allow_hyphen_values = true)]
+	agent_exec: Option<String>,
+
+	/// Run inside Linux cgroup/namespace/pivot-root jail
+	#[arg(long)]
+	jail: bool,
+
+	/// VM/jail id (required with --jail; ASCII alnum, '-' or '_')
+	#[arg(long, value_name = "NAME")]
+	id: Option<String>,
+
+	/// Absolute jail root directory
+	#[arg(long, value_name = "DIR")]
+	jail_root: Option<PathBuf>,
+
+	/// cgroup cpu.max value
+	#[arg(long, value_name = "V")]
+	cgroup_cpu_max: Option<String>,
+
+	/// cgroup memory.max value
+	#[arg(long, value_name = "V")]
+	cgroup_mem_max: Option<String>,
+
+	/// cgroup pids.max value (>0)
+	#[arg(long, value_name = "N")]
+	cgroup_pids_max: Option<u64>,
+
+	/// cgroup mode: v2|off
+	#[arg(long, value_name = "M", value_parser = parse_cgroup_mode, default_value = "v2")]
+	cgroup_mode: CgroupMode,
+
+	/// seccomp action: kill|errno|log
+	#[arg(long, value_name = "A", value_parser = parse_seccomp_action, default_value = "errno")]
+	seccomp_action: SeccompAction,
+
+	/// Operator-created network namespace path
+	#[arg(long, value_name = "PATH")]
+	netns: Option<PathBuf>,
+
+	/// Boot mode: direct|uefi
+	#[arg(long, value_name = "MODE", value_parser = parse_boot_mode, default_value = "direct")]
+	boot_mode: BootMode,
+
+	/// UEFI firmware image for --boot-mode uefi
+	#[arg(long, value_name = "PATH")]
+	firmware: Option<PathBuf>,
+
+	/// Log format: text|json
+	#[arg(long, value_name = "FMT", value_parser = parse_log_format, default_value = "text")]
+	log_format: LogFormat,
+
+	/// Log level filter
+	#[arg(long, value_name = "LEVEL", default_value = "info")]
+	log_level: String,
+
+	/// Apply the Linux process sandbox (default: on)
+	#[arg(long)]
+	sandbox: bool,
+
+	/// Disable the default sandbox (not valid with --jail)
+	#[arg(long)]
+	no_sandbox: bool,
+
+	/// UID drop target (>0); required as root unless --no-sandbox
+	#[arg(long, value_name = "UID")]
+	sandbox_uid: Option<u32>,
+
+	/// GID drop target (>0); required as root unless --no-sandbox
+	#[arg(long, value_name = "GID")]
+	sandbox_gid: Option<u32>,
+
+	/// Exit after n seconds (1..=86400)
+	#[arg(long, value_name = "N")]
+	timeout_secs: Option<u64>,
+}
+
 impl Config {
+	/// Parse `std::env::args`, letting clap handle `--help`/`--version` and
+	/// malformed flags (it prints to the right stream and exits), then run
+	/// cross-flag validation.
 	pub fn from_args() -> Result<Self> {
-		Self::from_iter(std::env::args())
+		Self::from_cli(CliArgs::parse())
 	}
 
+	/// Parse `args` without exiting the process. clap failures — including the
+	/// `--help`/`--version` requests, which clap models as errors — surface as
+	/// [`Error`] so tests can assert on them instead of the process exiting.
+	#[cfg(test)]
 	pub fn from_iter<I, S>(args: I) -> Result<Self>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		let mut args = args.into_iter().map(Into::into);
-		let prog = args.next().unwrap_or_else(|| "vmon".into());
+		let args: Vec<String> = args.into_iter().map(Into::into).collect();
+		let cli = CliArgs::try_parse_from(args).map_err(|e| err(e.to_string()))?;
+		Self::from_cli(cli)
+	}
 
-		let mut kernel = None;
-		let mut cmdline = None;
-		let mut mem_mib = 256u64;
-		let mut mem_target_mib: Option<u64> = None;
-		let mut zram_store_max_mib: Option<u64> = None;
-		let mut zram_swap_file = None;
-		let mut ksm = false;
-		let mut cpus = 1u64;
-		let mut rootfs = None;
-		let mut rootfs_read_only = false;
-		let mut initrd = None;
-		let mut tap = None;
-		let mut user_net = false;
-		let mut mac_specified = false;
-		let mut mac = DEFAULT_MAC;
-		let mut transport = Transport::Mmio;
-		let mut fs_tag = None;
-		let mut fs_dir = None;
-		let mut api_sock = None;
-		let mut snapshot_root = None;
-		let mut agent_sock = None;
-		let mut restore = None;
-		let mut fork_from = None;
-		let mut disk_overlay_of = None;
-		let mut count = 1u64;
-		let mut console_agent = false;
-		let mut agent_exec = None;
-		let mut jail = false;
-		let mut id = None;
-		let mut jail_root = None;
-		let mut cgroup_cpu_max = None;
-		let mut cgroup_mem_max = None;
-		let mut cgroup_pids_max = None;
-		let mut cgroup_mode = CgroupMode::V2;
-		let mut seccomp_action = SeccompAction::Errno;
-		let mut netns = None;
-		let mut boot_mode = BootMode::Direct;
-		let mut firmware = None;
-		let mut log_format = LogFormat::Text;
-		let mut log_level = String::from("info");
-		let mut sandbox = true;
-		let mut sandbox_specified = false;
-		let mut no_sandbox = false;
-		let mut sandbox_uid = None;
-		let mut sandbox_gid = None;
-		let mut timeout_secs = None;
-		let mut volumes = Vec::new();
-
-		while let Some(arg) = args.next() {
-			match arg.as_str() {
-				"--kernel" => kernel = Some(PathBuf::from(next(&mut args, "--kernel")?)),
-				"--cmdline" => cmdline = Some(next(&mut args, "--cmdline")?),
-				"--mem" => mem_mib = parse(&next(&mut args, "--mem")?, "--mem")?,
-				"--mem-target-mib" => {
-					mem_target_mib =
-						Some(parse(&next(&mut args, "--mem-target-mib")?, "--mem-target-mib")?);
-				},
-				"--zram-store-max-mib" => {
-					zram_store_max_mib =
-						Some(parse(&next(&mut args, "--zram-store-max-mib")?, "--zram-store-max-mib")?);
-				},
-				"--zram-swap-file" => {
-					zram_swap_file = Some(PathBuf::from(next(&mut args, "--zram-swap-file")?));
-				},
-				"--ksm" => ksm = true,
-				"--cpus" => cpus = parse(&next(&mut args, "--cpus")?, "--cpus")?,
-				"--rootfs" => rootfs = Some(PathBuf::from(next(&mut args, "--rootfs")?)),
-				"--rootfs-ro" => rootfs_read_only = true,
-				"--initrd" => initrd = Some(PathBuf::from(next(&mut args, "--initrd")?)),
-				"--tap" => tap = Some(next(&mut args, "--tap")?),
-				"--net" => user_net = parse_net(&next(&mut args, "--net")?)?,
-				"--mac" => {
-					mac = parse_mac(&next(&mut args, "--mac")?)?;
-					mac_specified = true;
-				},
-				"--transport" => transport = parse_transport(&next(&mut args, "--transport")?)?,
-				"--fs-tag" => fs_tag = Some(next(&mut args, "--fs-tag")?),
-				"--fs-dir" => fs_dir = Some(PathBuf::from(next(&mut args, "--fs-dir")?)),
-				"--api-sock" => api_sock = Some(PathBuf::from(next(&mut args, "--api-sock")?)),
-				"--snapshot-root" => {
-					snapshot_root = Some(PathBuf::from(next(&mut args, "--snapshot-root")?));
-				},
-				"--agent-sock" => {
-					agent_sock = Some(PathBuf::from(next(&mut args, "--agent-sock")?));
-				},
-				"--restore" => restore = Some(PathBuf::from(next(&mut args, "--restore")?)),
-				"--fork-from" => fork_from = Some(PathBuf::from(next(&mut args, "--fork-from")?)),
-				"--disk-overlay-of" => {
-					disk_overlay_of = Some(PathBuf::from(next(&mut args, "--disk-overlay-of")?));
-				},
-				"--count" => count = parse(&next(&mut args, "--count")?, "--count")?,
-				"--console-agent" => console_agent = true,
-				"--agent-exec" => agent_exec = Some(next(&mut args, "--agent-exec")?),
-				"--jail" => jail = true,
-				"--id" => id = Some(next(&mut args, "--id")?),
-				"--jail-root" => jail_root = Some(PathBuf::from(next(&mut args, "--jail-root")?)),
-				"--cgroup-cpu-max" => cgroup_cpu_max = Some(next(&mut args, "--cgroup-cpu-max")?),
-				"--cgroup-mem-max" => cgroup_mem_max = Some(next(&mut args, "--cgroup-mem-max")?),
-				"--cgroup-pids-max" => {
-					cgroup_pids_max =
-						Some(parse(&next(&mut args, "--cgroup-pids-max")?, "--cgroup-pids-max")?);
-				},
-				"--cgroup-mode" => {
-					cgroup_mode = parse_cgroup_mode(&next(&mut args, "--cgroup-mode")?)?;
-				},
-				"--seccomp-action" => {
-					seccomp_action = parse_seccomp_action(&next(&mut args, "--seccomp-action")?)?;
-				},
-				"--netns" => netns = Some(PathBuf::from(next(&mut args, "--netns")?)),
-				"--boot-mode" => boot_mode = parse_boot_mode(&next(&mut args, "--boot-mode")?)?,
-				"--firmware" => firmware = Some(PathBuf::from(next(&mut args, "--firmware")?)),
-				"--log-format" => log_format = parse_log_format(&next(&mut args, "--log-format")?)?,
-				"--log-level" => log_level = next(&mut args, "--log-level")?,
-				"--sandbox" => {
-					sandbox = true;
-					sandbox_specified = true;
-				},
-				"--no-sandbox" => no_sandbox = true,
-				"--sandbox-uid" => {
-					sandbox_uid = Some(parse(&next(&mut args, "--sandbox-uid")?, "--sandbox-uid")?);
-				},
-				"--sandbox-gid" => {
-					sandbox_gid = Some(parse(&next(&mut args, "--sandbox-gid")?, "--sandbox-gid")?);
-				},
-				"--timeout-secs" => {
-					timeout_secs = Some(parse(&next(&mut args, "--timeout-secs")?, "--timeout-secs")?);
-				},
-				"--volume" => volumes.push(parse_volume(&next(&mut args, "--volume")?)?),
-				"-h" | "--help" => {
-					print_help(&prog);
-					std::process::exit(0);
-				},
-				other => bail!("unknown argument {other} (try --help)"),
-			}
-		}
+	/// Validate parsed flags and lower them into a runtime [`Config`].
+	///
+	/// Every numeric bound, host-capability gate, and inter-flag invariant lives
+	/// here so both entry points share one source of truth.
+	fn from_cli(cli: CliArgs) -> Result<Self> {
+		let mem_mib = cli.mem;
+		let mem_target_mib = cli.mem_target_mib;
+		let cpus = cli.cpus;
+		let count = cli.count;
+		let transport = cli.transport;
+		let boot_mode = cli.boot_mode;
+		let jail = cli.jail;
+		let no_sandbox = cli.no_sandbox;
+		// `--net`'s only accepted value is `user`; lower it to the bool the VMM
+		// uses, reusing `parse_net` so the diagnostic matches every other flag.
+		let user_net = match &cli.net {
+			Some(value) => parse_net(value)?,
+			None => false,
+		};
+		let mac_specified = cli.mac.is_some();
+		let mac = cli.mac.unwrap_or(DEFAULT_MAC);
+		let mut sandbox_uid = cli.sandbox_uid;
+		let mut sandbox_gid = cli.sandbox_gid;
 
 		if count == 0 || count > u64::from(MAX_COUNT) {
 			bail!("--count must be between 1 and {MAX_COUNT} (got {count})");
@@ -323,10 +421,12 @@ impl Config {
 				mem_mib - 1
 			);
 		}
-		if (zram_store_max_mib.is_some() || zram_swap_file.is_some()) && mem_target_mib.is_none() {
+		if (cli.zram_store_max_mib.is_some() || cli.zram_swap_file.is_some())
+			&& mem_target_mib.is_none()
+		{
 			bail!("--zram-store-max-mib/--zram-swap-file require --mem-target-mib");
 		}
-		if let Some(store_max) = zram_store_max_mib
+		if let Some(store_max) = cli.zram_store_max_mib
 			&& (store_max == 0 || store_max > mem_mib)
 		{
 			bail!("--zram-store-max-mib must be between 1 and {mem_mib}");
@@ -335,30 +435,30 @@ impl Config {
 		if mem_target_mib.is_some() {
 			bail!("--mem-target-mib (transparent paging) requires a Linux host");
 		}
-		if let Some(n) = timeout_secs
+		if let Some(n) = cli.timeout_secs
 			&& !(1..=86_400).contains(&n)
 		{
 			bail!("--timeout-secs must be between 1 and 86400 (got {n})");
 		}
-		if cgroup_pids_max == Some(0) {
+		if cli.cgroup_pids_max == Some(0) {
 			bail!("--cgroup-pids-max must be greater than 0");
 		}
 
-		if fs_tag.is_some() != fs_dir.is_some() {
+		if cli.fs_tag.is_some() != cli.fs_dir.is_some() {
 			bail!("--fs-tag and --fs-dir must be used together");
 		}
-		if volumes.len() > 8 {
-			bail!("at most 8 --volume mounts are supported (got {})", volumes.len());
+		if cli.volumes.len() > 8 {
+			bail!("at most 8 --volume mounts are supported (got {})", cli.volumes.len());
 		}
 		{
 			let mut seen: Vec<&str> = Vec::new();
-			if let Some(tag) = &fs_tag {
+			if let Some(tag) = &cli.fs_tag {
 				if !is_valid_volume_tag(tag) {
 					bail!("--fs-tag must match [a-z0-9_]{{1,32}} (got {tag})");
 				}
 				seen.push(tag.as_str());
 			}
-			for m in &volumes {
+			for m in &cli.volumes {
 				let tag = &m.tag;
 				if !is_valid_volume_tag(tag) {
 					bail!("--volume tag {tag} must match [a-z0-9_]{{1,32}}");
@@ -369,7 +469,7 @@ impl Config {
 				seen.push(tag.as_str());
 			}
 		}
-		if user_net && tap.is_some() {
+		if user_net && cli.tap.is_some() {
 			bail!("--net user cannot be combined with --tap");
 		}
 		if user_net && !cfg!(target_os = "macos") {
@@ -378,59 +478,59 @@ impl Config {
 		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
 			bail!("--transport pci is only supported on x86_64");
 		}
-		if count > 1 && fork_from.is_none() {
+		if count > 1 && cli.fork_from.is_none() {
 			bail!("--count greater than 1 requires --fork-from");
 		}
-		match (boot_mode, firmware.is_some()) {
+		match (boot_mode, cli.firmware.is_some()) {
 			(BootMode::Uefi, false) => bail!("--boot-mode uefi requires --firmware"),
 			(BootMode::Direct, true) => bail!("--firmware requires --boot-mode uefi"),
 			(BootMode::Uefi, true) | (BootMode::Direct, false) => {},
 		}
-		if let Some(id) = &id {
+		if let Some(id) = &cli.id {
 			validate_id(id)?;
 		}
-		if jail && id.is_none() {
+		if jail && cli.id.is_none() {
 			bail!("--jail requires --id");
 		}
-		if let Some(root) = &jail_root {
+		if let Some(root) = &cli.jail_root {
 			if !jail {
 				bail!("--jail-root requires --jail");
 			}
 			validate_jail_root(root)?;
 		}
-		if jail && let Some(sock) = &agent_sock {
+		if jail && let Some(sock) = &cli.agent_sock {
 			validate_jail_agent_sock(sock)?;
 		}
-		if no_sandbox && sandbox_specified {
+		if no_sandbox && cli.sandbox {
 			bail!("--sandbox and --no-sandbox cannot be combined");
 		}
 		if no_sandbox && jail {
 			bail!("--no-sandbox cannot be combined with --jail");
 		}
-		if netns.is_some() && !jail {
+		if cli.netns.is_some() && !jail {
 			bail!("--netns requires --jail");
 		}
 		// A fresh direct boot needs a kernel. UEFI boots enter firmware instead;
 		// restore/fork reconstruct state from a snapshot.
 		if boot_mode == BootMode::Direct
-			&& kernel.is_none()
-			&& restore.is_none()
-			&& fork_from.is_none()
+			&& cli.kernel.is_none()
+			&& cli.restore.is_none()
+			&& cli.fork_from.is_none()
 		{
 			bail!("--kernel <path> is required for --boot-mode direct (unless --restore/--fork-from)");
 		}
-		if restore.is_some() && fork_from.is_some() {
+		if cli.restore.is_some() && cli.fork_from.is_some() {
 			bail!("--restore and --fork-from are mutually exclusive");
 		}
-		if mem_target_mib.is_some() && fork_from.is_some() {
+		if mem_target_mib.is_some() && cli.fork_from.is_some() {
 			bail!(
 				"--mem-target-mib is not supported with --fork-from; forked clone RAM is copy-on-write"
 			);
 		}
-		if let Some(base) = &disk_overlay_of {
-			validate_overlay_paths(base, rootfs.as_deref())?;
+		if let Some(base) = &cli.disk_overlay_of {
+			validate_overlay_paths(base, cli.rootfs.as_deref())?;
 		}
-		let filters_enabled = jail || (sandbox && !no_sandbox);
+		let filters_enabled = jail || !no_sandbox;
 		if filters_enabled {
 			if sandbox_uid.is_none() {
 				sandbox_uid = parse_env_u32("VMON_SANDBOX_UID")?;
@@ -462,55 +562,56 @@ impl Config {
 			}
 		}
 
-		let console_agent = console_agent || agent_exec.is_some() || agent_sock.is_some();
+		let console_agent =
+			cli.console_agent || cli.agent_exec.is_some() || cli.agent_sock.is_some();
 
 		Ok(Self {
-			kernel,
-			cmdline,
+			kernel: cli.kernel,
+			cmdline: cli.cmdline,
 			mem_mib: mem_mib as usize,
 			mem_target_mib: mem_target_mib.map(|v| v as usize),
-			zram_store_max_mib: zram_store_max_mib.map(|v| v as usize),
-			zram_swap_file,
-			ksm,
+			zram_store_max_mib: cli.zram_store_max_mib.map(|v| v as usize),
+			zram_swap_file: cli.zram_swap_file,
+			ksm: cli.ksm,
 			cpus: cpus as u8,
-			rootfs,
-			rootfs_read_only,
-			initrd,
-			tap,
+			rootfs: cli.rootfs,
+			rootfs_read_only: cli.rootfs_ro,
+			initrd: cli.initrd,
+			tap: cli.tap,
 			user_net,
 			mac_specified,
 			mac,
 			transport,
-			fs_tag,
-			fs_dir,
-			api_sock,
-			snapshot_root,
-			agent_sock,
-			restore,
-			fork_from,
-			disk_overlay_of,
+			fs_tag: cli.fs_tag,
+			fs_dir: cli.fs_dir,
+			api_sock: cli.api_sock,
+			snapshot_root: cli.snapshot_root,
+			agent_sock: cli.agent_sock,
+			restore: cli.restore,
+			fork_from: cli.fork_from,
+			disk_overlay_of: cli.disk_overlay_of,
 			count: count as u32,
 			console_agent,
-			agent_exec,
+			agent_exec: cli.agent_exec,
 			jail,
-			id,
-			jail_root,
-			cgroup_cpu_max,
-			cgroup_mem_max,
-			cgroup_pids_max,
-			cgroup_mode,
-			seccomp_action,
-			netns,
+			id: cli.id,
+			jail_root: cli.jail_root,
+			cgroup_cpu_max: cli.cgroup_cpu_max,
+			cgroup_mem_max: cli.cgroup_mem_max,
+			cgroup_pids_max: cli.cgroup_pids_max,
+			cgroup_mode: cli.cgroup_mode,
+			seccomp_action: cli.seccomp_action,
+			netns: cli.netns,
 			boot_mode,
-			firmware,
-			log_format,
-			log_level,
-			sandbox,
+			firmware: cli.firmware,
+			log_format: cli.log_format,
+			log_level: cli.log_level,
+			sandbox: true,
 			no_sandbox,
 			sandbox_uid,
 			sandbox_gid,
-			timeout_secs,
-			volumes,
+			timeout_secs: cli.timeout_secs,
+			volumes: cli.volumes,
 		})
 	}
 }
@@ -548,21 +649,6 @@ fn validate_overlay_paths(base: &Path, rootfs: Option<&Path>) -> Result<()> {
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
 		Err(e) => Err(err(format!("checking --rootfs overlay destination {}: {e}", dest.display()))),
 	}
-}
-
-fn next<I>(args: &mut I, flag: &str) -> Result<String>
-where
-	I: Iterator<Item = String>,
-{
-	args
-		.next()
-		.ok_or_else(|| err(format!("{flag} requires a value")))
-}
-
-fn parse<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T> {
-	value
-		.parse()
-		.map_err(|_| err(format!("invalid value {value} for {flag}")))
 }
 
 fn parse_env_u32(name: &str) -> Result<Option<u32>> {
@@ -705,56 +791,6 @@ fn validate_jail_agent_sock(sock: &Path) -> Result<()> {
 		bail!("--agent-sock must be inside /run/vmon when --jail is enabled (got {sock:?})");
 	}
 	Ok(())
-}
-
-fn print_help(prog: &str) {
-	#[cfg(target_arch = "x86_64")]
-	let kfmt = "uncompressed ELF vmlinux or bzImage";
-	#[cfg(target_arch = "aarch64")]
-	let kfmt = "uncompressed arm64 Image";
-	eprintln!(
-		"vmon - a barebones KVM (Linux) / Hypervisor.framework (macOS) monitor for Linux \
-		 guests\n\nUSAGE:\n    {prog} (--kernel <image> | --boot-mode uefi --firmware <fd>) \
-		 [options]\n\nOPTIONS:\n\x20   --kernel <path>     Kernel image ({kfmt}); required for \
-		 direct boot\n\x20   --cmdline <string>  Kernel command line (default: console=ttyS0 \
-		 ...)\n\x20   --mem <MiB>         Guest RAM in MiB (default: 256)\n\x20   --mem-target-mib \
-		 <n> Keep guest host-RAM resident set near <n> MiB (transparent zram+paging)\n\x20   \
-		 --zram-store-max-mib <n> Cap the in-RAM compressed store before spilling to swap\n\x20   \
-		 --zram-swap-file <path> Swap file for paging overflow (default: anonymous temp in \
-		 $TMPDIR)\n\x20   --ksm              madvise(MADV_MERGEABLE) guest RAM for host KSM \
-		 dedup\n\x20   --cpus <n>          Number of vCPUs (default: 1)\n\x20   --rootfs <path>     \
-		 Disk image exposed as virtio-blk /dev/vda\n\x20   --rootfs-ro         Open the rootfs \
-		 read-only\n\x20   --initrd <path>     initramfs image\n\x20   --tap <name>        Host \
-		 TAP/vmnet interface for virtio-net\n\x20   --net user          Entitlement-free user-mode \
-		 NAT networking (macOS)\n\x20   --mac <addr>        Guest MAC (default: \
-		 02:00:00:00:00:01)\n\x20   --transport <kind>  Virtio transport: mmio|pci (default: mmio; \
-		 pci x86_64 only)\n\x20   --fs-tag <tag>      virtio-fs mount tag (requires --fs-dir)\n\x20   \
-		 --fs-dir <path>     Host directory exposed read-only by virtio-fs\n\x20   --volume \
-		 <t:d[:ro]> Writable virtio-fs volume <tag>:<host_dir> (:ro read-only)\n\x20   --api-sock \
-		 <path>   Unix control socket (pause/resume/snapshot/quit)\n\x20   --snapshot-root <dir>  \
-		 Root for named JSON lifecycle snapshots\n\x20   --agent-sock <path> Guest-agent socket \
-		 (under --jail: /run/vmon/*)\n\x20   --restore <dir>     Restore a snapshot directory \
-		 instead of booting\n\x20   --fork-from <dir>   Fork (CoW) from a template snapshot \
-		 directory\n\x20   --count <n>         Number of children to spawn with --fork-from \
-		 (default 1)\n\x20   --disk-overlay-of <base>  Create a new no-overwrite CoW overlay at \
-		 --rootfs\n\x20   --console-agent     Attach a virtio-console agent channel \
-		 (/dev/hvc0)\n\x20   --agent-exec <cmd>  Send <cmd> to the guest agent after (warm) \
-		 boot\n\x20   --jail              Run inside Linux cgroup/namespace/pivot-root jail\n\x20   \
-		 --id <name>         VM/jail id (required with --jail; ASCII alnum, '-' or '_')\n\x20   \
-		 --jail-root <dir>   Absolute jail root directory\n\x20   --cgroup-cpu-max <v> cgroup \
-		 cpu.max value\n\x20   --cgroup-mem-max <v> cgroup memory.max value\n\x20   \
-		 --cgroup-pids-max <n> cgroup pids.max value (>0)\n\x20   --cgroup-mode <m>   cgroup mode: \
-		 v2|off (default: v2)\n\x20   --seccomp-action <a> seccomp action: kill|errno|log (default: \
-		 errno)\n\x20   --netns <path>      Operator-created network namespace path\n\x20   \
-		 --boot-mode <mode>  Boot mode: direct|uefi (default: direct)\n\x20   --firmware <path>   \
-		 UEFI firmware image for --boot-mode uefi\n\x20   --log-format <fmt>  Log format: text|json \
-		 (default: text)\n\x20   --log-level <level> Log level filter (default: info)\n\x20   \
-		 --sandbox           Apply the Linux process sandbox (default: on)\n\x20   --no-sandbox        \
-		 Disable the default sandbox (not valid with --jail)\n\x20   --sandbox-uid <uid> UID drop \
-		 target (>0); required as root unless --no-sandbox\n\x20   --sandbox-gid <gid> GID drop \
-		 target (>0); required as root unless --no-sandbox\n\x20   --timeout-secs <n>  Exit after n \
-		 seconds (1..=86400)\n\x20   -h, --help          Show this help"
-	);
 }
 
 #[cfg(test)]

@@ -121,6 +121,7 @@ too_many_arguments = "allow" # Argument count is rarely the real complexity sign
 too_many_lines = "allow"     # Arbitrary limits don't account for necessary complexity
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 virtio-bindings = "0.2"
 virtio-queue = "0.17"
