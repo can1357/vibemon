@@ -87,6 +87,8 @@ const PR_SET_KEEPCAPS: libc::c_int = 8;
 const NOFILE_LIMIT_CEILING: libc::rlim_t = 1024;
 const NOFILE_RESERVE: libc::rlim_t = 64;
 fn set_no_new_privs() -> Result<()> {
+	// SAFETY: `prctl` is called with scalar arguments only; the return value is
+	// checked.
 	let rc = unsafe {
 		libc::prctl(
 			PR_SET_NO_NEW_PRIVS,
@@ -103,6 +105,8 @@ fn set_no_new_privs() -> Result<()> {
 }
 
 fn disable_keepcaps() -> Result<()> {
+	// SAFETY: `prctl` is called with scalar arguments only; the return value is
+	// checked.
 	let rc = unsafe {
 		libc::prctl(
 			PR_SET_KEEPCAPS,
@@ -156,6 +160,7 @@ fn set_limit(
 
 fn get_limit(resource: libc::__rlimit_resource_t, context: &str) -> Result<libc::rlimit> {
 	let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+	// SAFETY: `limit` points to a valid `rlimit` for libc to fill.
 	let rc = unsafe { libc::getrlimit(resource, &mut limit) };
 	if rc != 0 {
 		return Err(os_error(context));
@@ -168,6 +173,7 @@ fn set_rlimit(
 	limit: libc::rlimit,
 	context: &str,
 ) -> Result<()> {
+	// SAFETY: `limit` points to a valid `rlimit`; libc copies it during the call.
 	let rc = unsafe { libc::setrlimit(resource, &limit) };
 	if rc != 0 {
 		return Err(os_error(context));
@@ -181,7 +187,10 @@ fn open_fd_count() -> Option<libc::rlim_t> {
 		.map(|fds| fds.count() as libc::rlim_t)
 }
 
-#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
+#[allow(
+	dead_code,
+	reason = "Linux sandbox hooks are compiled even when a target run disables them."
+)]
 pub fn apply_landlock_rules(paths: &SandboxPaths) -> Result<()> {
 	let abi = ABI::V3;
 	let all = AccessFs::from_all(abi);
@@ -208,13 +217,19 @@ pub fn apply_landlock_rules(paths: &SandboxPaths) -> Result<()> {
 	Ok(())
 }
 
-#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
+#[allow(
+	dead_code,
+	reason = "Linux sandbox hooks are compiled even when a target run disables them."
+)]
 pub fn apply_seccomp_filters(action: SeccompAction) -> Result<()> {
 	let filter = compile_seccomp_filter(action)?;
 	seccompiler::apply_filter(&filter).map_err(|e| err(format!("installing seccomp filter: {e}")))
 }
 
-#[allow(dead_code, reason = "Unit tests compile the filter without installing it in normal builds.")]
+#[allow(
+	dead_code,
+	reason = "Unit tests compile the filter without installing it in normal builds."
+)]
 pub fn compile_seccomp_filter(action: SeccompAction) -> Result<BpfProgram> {
 	// `SeccompFilter::new(rules, mismatch_action, match_action, arch)`:
 	// `mismatch_action` hits syscalls outside the allowlist, `match_action`
@@ -347,7 +362,10 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 	syscalls
 }
 
-#[allow(dead_code, reason = "Linux sandbox hooks are compiled even when a target run disables them.")]
+#[allow(
+	dead_code,
+	reason = "Linux sandbox hooks are compiled even when a target run disables them."
+)]
 pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
 	let euid = unsafe { libc::geteuid() as u32 };
@@ -395,7 +413,8 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 	let mut real_gid = 0;
 	let mut effective_gid = 0;
 	let mut saved_gid = 0;
-	// SAFETY: the pointers reference initialized local gid_t slots for libc to fill.
+	// SAFETY: the pointers reference initialized local gid_t slots for libc to
+	// fill.
 	let rc = unsafe { libc::getresgid(&mut real_gid, &mut effective_gid, &mut saved_gid) };
 	if rc != 0 {
 		return Err(os_error("getresgid(after sandbox drop)"));
@@ -414,7 +433,8 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 	let mut real_uid = 0;
 	let mut effective_uid = 0;
 	let mut saved_uid = 0;
-	// SAFETY: the pointers reference initialized local uid_t slots for libc to fill.
+	// SAFETY: the pointers reference initialized local uid_t slots for libc to
+	// fill.
 	let rc = unsafe { libc::getresuid(&mut real_uid, &mut effective_uid, &mut saved_uid) };
 	if rc != 0 {
 		return Err(os_error("getresuid(after sandbox drop)"));
@@ -426,6 +446,7 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 }
 
 fn clear_supplementary_groups() -> Result<()> {
+	// SAFETY: a null group pointer is valid when the group count is zero.
 	let rc = unsafe { libc::setgroups(0, std::ptr::null()) };
 	if rc != 0 {
 		return Err(os_error("setgroups(0)"));
@@ -434,6 +455,8 @@ fn clear_supplementary_groups() -> Result<()> {
 }
 
 fn clear_ambient_capabilities() -> Result<()> {
+	// SAFETY: `prctl` is called with scalar arguments only; the return value is
+	// checked.
 	let rc = unsafe {
 		libc::prctl(
 			PR_CAP_AMBIENT,
@@ -454,6 +477,8 @@ fn clear_ambient_capabilities() -> Result<()> {
 
 fn drop_capability_bounding_set() -> Result<()> {
 	for cap in 0..=last_capability() {
+		// SAFETY: `prctl` is called with scalar arguments only; the return value is
+		// checked.
 		let rc = unsafe {
 			libc::prctl(
 				PR_CAPBSET_DROP,

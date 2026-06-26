@@ -78,7 +78,7 @@ impl SerialDevice {
 
 impl BusDevice for SerialDevice {
 	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		data.fill(0xff);
+		data.fill(0);
 		if offset < UART_REGISTER_COUNT
 			&& let Some(b) = data.first_mut()
 		{

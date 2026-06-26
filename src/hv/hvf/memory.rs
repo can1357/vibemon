@@ -19,10 +19,7 @@ pub fn map_guest_memory(memory: &GuestMemoryMmap) -> Result<()> {
 		let len = region.len();
 		let host = region.as_ptr() as *const c_void;
 		let host_addr = host as usize as u64;
-		if gpa % HVF_PAGE_SIZE != 0
-			|| len % HVF_PAGE_SIZE != 0
-			|| host_addr % HVF_PAGE_SIZE != 0
-		{
+		if gpa % HVF_PAGE_SIZE != 0 || len % HVF_PAGE_SIZE != 0 || host_addr % HVF_PAGE_SIZE != 0 {
 			return Err(err(format!(
 				"HVF memory region is not 16KiB-aligned: host={host:p} gpa={gpa:#x} len={len:#x}"
 			)));

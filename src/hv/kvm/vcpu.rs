@@ -8,10 +8,7 @@ use crate::{hv::Exit, result::Result};
 
 /// A KVM vCPU plus the VM fd needed for arm64 initialization.
 pub struct Vcpu {
-	#[cfg_attr(
-		target_arch = "x86_64",
-		allow(dead_code, reason = "arm64 init needs the VM fd")
-	)]
+	#[cfg_attr(target_arch = "x86_64", allow(dead_code, reason = "arm64 init needs the VM fd"))]
 	vm_fd: Arc<VmFd>,
 	fd:    VcpuFd,
 }

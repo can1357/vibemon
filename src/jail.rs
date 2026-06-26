@@ -28,12 +28,16 @@ pub fn fork_into_jail(config: &Config) -> Result<()> {
 	make_jail_root_mount(&chroot)?;
 	bind_configured_paths(config, &chroot)?;
 
+	// SAFETY: no Rust locks are held across fork; both parent and child immediately
+	// follow simple, checked control-flow paths.
 	let pid = unsafe { libc::fork() };
 	if pid < 0 {
 		return Err(os_error("fork jail child"));
 	}
 	if pid > 0 {
 		if let Err(e) = cgroup.place(pid) {
+			// SAFETY: the child pid came from `fork`; best-effort kill/reap is confined
+			// to that child after cgroup placement failed.
 			unsafe {
 				libc::kill(pid, libc::SIGKILL);
 				let mut status = 0;
@@ -86,6 +90,7 @@ fn child_main(config: &mut Config, launch_uid: u32, chroot: &Path) -> Result<()>
 }
 
 fn require_root() -> Result<()> {
+	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
 	if unsafe { libc::geteuid() } != 0 {
 		return Err(err("--jail requires launching vmon as root"));
 	}
@@ -98,7 +103,9 @@ fn launch_owner_uid() -> Result<u32> {
 	if real_uid != 0 {
 		return Ok(real_uid);
 	}
-	Ok(parse_env_u32("SUDO_UID")?.filter(|uid| *uid != 0).unwrap_or(0))
+	Ok(parse_env_u32("SUDO_UID")?
+		.filter(|uid| *uid != 0)
+		.unwrap_or(0))
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -157,6 +164,7 @@ fn chmod(path: &Path, mode: u32) -> Result<()> {
 
 fn chown_root(path: &Path) -> Result<()> {
 	let c_path = cstring_path(path)?;
+	// SAFETY: `c_path` is a valid C string; uid/gid are scalar root ids.
 	let rc = unsafe { libc::chown(c_path.as_ptr(), 0, 0) };
 	if rc != 0 {
 		return Err(os_error_path("chown root:root", path));
@@ -220,6 +228,7 @@ fn write_value(path: &Path, value: &str) -> Result<()> {
 
 fn unshare_jail_namespaces() -> Result<()> {
 	let flags = libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
+	// SAFETY: `unshare` takes scalar clone flags and returns synchronously.
 	let rc = unsafe { libc::unshare(flags) };
 	if rc != 0 {
 		return Err(os_error("unshare(CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC|CLONE_NEWUTS)"));
@@ -229,6 +238,8 @@ fn unshare_jail_namespaces() -> Result<()> {
 
 fn make_mounts_private() -> Result<()> {
 	let target = CString::new("/").expect("literal has no NUL");
+	// SAFETY: the target path is a valid C string for the duration of the call;
+	// null source/fstype/data are the documented propagation-change form.
 	let rc = unsafe {
 		libc::mount(
 			std::ptr::null(),
@@ -351,6 +362,8 @@ fn mount_bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
 	let source_c = cstring_path(source)?;
 	let target_c = cstring_path(target)?;
 	let recursive = if source.is_dir() { libc::MS_REC } else { 0 };
+	// SAFETY: source and target are valid C strings for the duration of the call;
+	// null fstype/data are the documented bind-mount form.
 	let rc = unsafe {
 		libc::mount(
 			source_c.as_ptr(),
@@ -400,6 +413,8 @@ fn mount_proc(chroot: &Path) -> Result<()> {
 	let source = CString::new("proc").expect("literal has no NUL");
 	let fstype = CString::new("proc").expect("literal has no NUL");
 	let target_c = cstring_path(&target)?;
+	// SAFETY: source, fstype, and target are valid C strings for the duration of
+	// the call.
 	let rc = unsafe {
 		libc::mount(source.as_ptr(), target_c.as_ptr(), fstype.as_ptr(), 0, std::ptr::null())
 	};
@@ -414,15 +429,18 @@ fn pivot_into(chroot: &Path) -> Result<()> {
 	create_dir(&put_old, 0o700)?;
 	let chroot_c = cstring_path(chroot)?;
 	let put_old_c = cstring_path(&put_old)?;
+	// SAFETY: both paths are valid C strings and refer to prepared mount points.
 	let rc = unsafe { libc::syscall(libc::SYS_pivot_root, chroot_c.as_ptr(), put_old_c.as_ptr()) };
 	if rc != 0 {
 		return Err(os_error("pivot_root"));
 	}
 	let slash = CString::new("/").expect("literal has no NUL");
+	// SAFETY: the slash C string is valid for the duration of the call.
 	if unsafe { libc::chdir(slash.as_ptr()) } != 0 {
 		return Err(os_error("chdir(/) after pivot_root"));
 	}
 	let old = CString::new("/.pivot_old").expect("literal has no NUL");
+	// SAFETY: the old-root C string is valid and names the detached old root mount.
 	if unsafe { libc::umount2(old.as_ptr(), libc::MNT_DETACH) } != 0 {
 		return Err(os_error("umount old root"));
 	}
@@ -444,7 +462,12 @@ fn configure_jail_socket_paths(config: &mut Config) -> Result<()> {
 }
 
 fn ensure_runtime_socket(flag: &str, path: &Path) -> Result<()> {
-	if !path.is_absolute() || !path.starts_with(JAIL_RUN_DIR) {
+	if !path.is_absolute()
+		|| !path.starts_with(JAIL_RUN_DIR)
+		|| path
+			.components()
+			.any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+	{
 		return Err(err(format!(
 			"{flag} under --jail must be inside {JAIL_RUN_DIR} (got {})",
 			path.display()
@@ -456,6 +479,7 @@ fn ensure_runtime_socket(flag: &str, path: &Path) -> Result<()> {
 fn setns_net(path: &Path) -> Result<()> {
 	let file =
 		File::open(path).map_err(|e| err(format!("opening --netns {}: {e}", path.display())))?;
+	// SAFETY: `file` is an open namespace fd and `setns` does not retain it.
 	let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
 	if rc != 0 {
 		return Err(os_error_path("setns(CLONE_NEWNET)", path));
@@ -495,13 +519,29 @@ fn jail_socket_cleanup_paths(config: &Config, chroot: &Path) -> Vec<PathBuf> {
 	let mut paths = Vec::new();
 	let control = config
 		.api_sock
-		.clone()
-		.unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCK));
-	paths.push(chroot.join(control.strip_prefix("/").unwrap_or(&control)));
-	if let Some(agent) = &config.agent_sock {
-		paths.push(chroot.join(agent.strip_prefix("/").unwrap_or(agent)));
+		.as_deref()
+		.unwrap_or_else(|| Path::new(DEFAULT_CONTROL_SOCK));
+	if let Some(path) = runtime_socket_cleanup_path(chroot, control) {
+		paths.push(path);
+	}
+	if let Some(agent) = &config.agent_sock
+		&& let Some(path) = runtime_socket_cleanup_path(chroot, agent)
+	{
+		paths.push(path);
 	}
 	paths
+}
+
+fn runtime_socket_cleanup_path(chroot: &Path, path: &Path) -> Option<PathBuf> {
+	if !path.is_absolute()
+		|| !path.starts_with(JAIL_RUN_DIR)
+		|| path
+			.components()
+			.any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+	{
+		return None;
+	}
+	Some(chroot.join(path.strip_prefix("/").ok()?))
 }
 
 fn cleanup_jail_runtime_sockets(paths: &[PathBuf]) {
@@ -518,6 +558,7 @@ fn cleanup_jail_runtime_sockets(paths: &[PathBuf]) {
 fn wait_for_child_and_exit(pid: libc::pid_t, cleanup_paths: &[PathBuf]) -> ! {
 	let mut status = 0;
 	loop {
+		// SAFETY: `pid` is the forked child and `status` points to initialized storage.
 		let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
 		if rc == pid {
 			break;

@@ -49,6 +49,7 @@ const OSLAR_EL1: SysReg = SysReg::new(2, 0, 1, 0, 4);
 const OSLSR_EL1: SysReg = SysReg::new(2, 0, 1, 1, 4);
 const OSDLR_EL1: SysReg = SysReg::new(2, 0, 1, 3, 4);
 const PSTATE_EL1H_MASKED: u64 = 0x3c5;
+const PSCI_FUNCTION_MASK: u64 = 0xffff_ffff;
 const POWERED_OFF_POLL: Duration = Duration::from_millis(100);
 /// How long an idle (WFI/WFE) vCPU sleeps before re-entering the guest so the
 /// virtual timer and pending device interrupts can be delivered.
@@ -389,7 +390,7 @@ impl Vcpu {
 	}
 
 	fn handle_psci(&self) -> Result<Exit<'static>> {
-		let function = self.get_gpr(0)?;
+		let function = self.get_gpr(0)? & PSCI_FUNCTION_MASK;
 		let ret = match function {
 			PSCI_VERSION => PSCI_VERSION_1_0 as i64,
 			PSCI_CPU_ON_32 => {
@@ -418,7 +419,7 @@ impl Vcpu {
 			},
 			PSCI_SYSTEM_OFF => return Ok(Exit::Shutdown),
 			PSCI_SYSTEM_RESET => return Ok(Exit::SystemEvent(0)),
-			PSCI_FEATURES => Self::psci_features(self.get_gpr(1)?) as i64,
+			PSCI_FEATURES => Self::psci_features(self.get_gpr(1)? & PSCI_FUNCTION_MASK) as i64,
 			PSCI_MIGRATE_INFO_TYPE => 2,
 			_ => PSCI_NOT_SUPPORTED,
 		};

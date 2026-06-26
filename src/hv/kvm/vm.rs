@@ -82,9 +82,9 @@ impl Vm {
 			let region = kvm_userspace_memory_region {
 				slot,
 				guest_phys_addr: region.start_addr().raw_value(),
-				memory_size:     region.len(),
-				userspace_addr:  region.as_ptr() as u64,
-				flags:           0,
+				memory_size: region.len(),
+				userspace_addr: region.as_ptr() as u64,
+				flags: 0,
 			};
 			// SAFETY: the userspace_addr points at an mmap owned by `memory`
 			// that outlives the VM, and the regions are non-overlapping.

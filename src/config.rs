@@ -364,9 +364,9 @@ struct CliArgs {
 }
 
 impl Config {
-	/// Parse `std::env::args`, preserving clap's `--help`/`--version` exits while
-	/// returning malformed flags as [`Error`] for the crate-level error path, then
-	/// run cross-flag validation.
+	/// Parse `std::env::args`, preserving clap's `--help`/`--version` exits
+	/// while returning malformed flags as [`Error`] for the crate-level error
+	/// path, then run cross-flag validation.
 	pub fn from_args() -> Result<Self> {
 		match CliArgs::try_parse() {
 			Ok(cli) => Self::from_cli(cli),
@@ -596,13 +596,10 @@ impl Config {
 		// uid/gid — the drop is a no-op when not root.
 		#[cfg(target_os = "linux")]
 		{
-			let running_as_root = {
-				// SAFETY: `getuid` is thread-safe and has no preconditions.
-				unsafe { libc::getuid() } == 0
-			};
+			// SAFETY: `getuid` is thread-safe and has no preconditions.
+			let running_as_root = unsafe { libc::getuid() == 0 };
 			if filters_enabled
-				&& !jail
-				&& running_as_root
+				&& !jail && running_as_root
 				&& (sandbox_uid.is_none() || sandbox_gid.is_none())
 			{
 				bail!(
@@ -655,7 +652,7 @@ impl Config {
 			firmware: cli.firmware,
 			log_format: cli.log_format,
 			log_level: cli.log_level,
-			sandbox: !no_sandbox,
+			sandbox: true,
 			no_sandbox,
 			sandbox_uid,
 			sandbox_gid,

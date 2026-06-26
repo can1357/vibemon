@@ -214,7 +214,10 @@ impl PsciCoordinator {
 
 	fn clear_start(&self, vcpu_id: usize) -> Result<()> {
 		let (lock, _) = &self.starts[vcpu_id];
-		lock.lock().map_err(|_| err("PSCI start slot poisoned"))?.pending = None;
+		lock
+			.lock()
+			.map_err(|_| err("PSCI start slot poisoned"))?
+			.pending = None;
 		Ok(())
 	}
 }

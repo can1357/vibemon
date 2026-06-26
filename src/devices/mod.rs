@@ -36,7 +36,9 @@ impl Bus {
 	/// Map `[base, base+len)` to `device`.
 	pub fn register(&mut self, base: u64, len: u64, device: Arc<Mutex<dyn BusDevice>>) {
 		assert!(len > 0, "bus device range must not be empty");
-		let end = base.checked_add(len).expect("bus device range overflows u64");
+		let end = base
+			.checked_add(len)
+			.expect("bus device range overflows u64");
 		for entry in &self.entries {
 			let entry_end = entry
 				.base
@@ -55,7 +57,8 @@ impl Bus {
 		if access_len == 0 {
 			return None;
 		}
-		self.entries
+		self
+			.entries
 			.iter()
 			.find(|e| {
 				let Some(offset) = addr.checked_sub(e.base) else {

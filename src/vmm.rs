@@ -321,9 +321,30 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 pub fn run_inner(config: Config) -> Result<()> {
-	// SAFETY: `getuid` is thread-safe and has no preconditions.
-	let launch_uid = unsafe { libc::getuid() as u32 };
+	let launch_uid = launch_owner_uid()?;
 	run_inner_with_prebound(config, PreboundSockets::none(launch_uid))
+}
+
+fn launch_owner_uid() -> Result<u32> {
+	// SAFETY: `getuid` has no preconditions and only reads process credentials.
+	let real_uid = unsafe { libc::getuid() as u32 };
+	if real_uid != 0 {
+		return Ok(real_uid);
+	}
+	Ok(parse_env_u32("SUDO_UID")?
+		.filter(|uid| *uid != 0)
+		.unwrap_or(0))
+}
+
+fn parse_env_u32(name: &str) -> Result<Option<u32>> {
+	match std::env::var(name) {
+		Ok(value) => value
+			.parse()
+			.map(Some)
+			.map_err(|_| err(format!("invalid value {value:?} for {name}"))),
+		Err(std::env::VarError::NotPresent) => Ok(None),
+		Err(std::env::VarError::NotUnicode(_)) => Err(err(format!("{name} must be valid UTF-8"))),
+	}
 }
 
 /// Main VMM lifecycle path after any entry-point-only launch wrapping.
@@ -368,9 +389,10 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	}
 
 	// Bind the control-plane and agent sockets FIRST, while still privileged.
-	// GC5: they are created as the launch uid (root) before any privilege drop
-	// so SO_PEERCRED can later accept {0, launch_uid}. Under --jail the jailer
-	// has already pivoted and pre-bound them, so reuse those.
+	// They are created before any privilege drop; SO_PEERCRED later accepts root
+	// plus the original launch owner (SUDO_UID when launched through sudo).
+	// Under --jail the jailer has already pivoted and pre-bound them, so reuse
+	// those.
 	let control_server = match prebound.control_server.take() {
 		Some(server) => Some(server),
 		None => bind_control_socket(api_sock, control_owner)?,
@@ -452,11 +474,28 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 		crate::metrics::record_boot_duration(reconstruct_elapsed);
 	}
 	if let Some((uffd, swap, target_mib)) = pager_setup {
-		let target_pages = (target_mib << 20) / 4096;
-		let store_max = config
-			.zram_store_max_mib
-			.unwrap_or_else(|| (config.mem_mib / 4).max(16))
-			<< 20;
+		let pager_limits = (|| -> Result<(usize, usize)> {
+			let target_bytes = target_mib
+				.checked_mul(1 << 20)
+				.ok_or_else(|| err("--mem-target-mib overflows usize"))?;
+			let target_pages = target_bytes / 4096;
+			let store_max_mib = config
+				.zram_store_max_mib
+				.unwrap_or_else(|| (config.mem_mib / 4).max(16));
+			let store_max = store_max_mib
+				.checked_mul(1 << 20)
+				.ok_or_else(|| err("--zram-store-max-mib overflows usize"))?;
+			Ok((target_pages, store_max))
+		})();
+		let (target_pages, store_max) = match pager_limits {
+			Ok(limits) => limits,
+			Err(e) => {
+				write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+				cleanup_agent_socket(agent_socket.as_ref());
+				cleanup_control_server(control_server.as_ref());
+				return Err(e);
+			},
+		};
 		let pager =
 			match crate::pager::Pager::new(uffd, swap, vmm.vm.memory(), target_pages, store_max) {
 				Ok(pager) => pager,
@@ -759,7 +798,7 @@ fn agent_bridge_loop(
 			return Ok(());
 		}
 		if client.is_none() {
-			discard_guest_output(&output, &drain_resume_evt);
+			discard_guest_output(&output, &drain_resume_evt)?;
 		}
 		let had_client = client.is_some();
 
@@ -805,7 +844,7 @@ fn agent_bridge_loop(
 		};
 		if rc == 0 {
 			if client.is_none() {
-				discard_guest_output(&output, &drain_resume_evt);
+				discard_guest_output(&output, &drain_resume_evt)?;
 			}
 			continue;
 		}
@@ -822,15 +861,15 @@ fn agent_bridge_loop(
 		let client_revents = client_index.map_or(0, |index| pollfds[index].revents);
 		let mut output_ready = false;
 		if output_revents & libc::POLLIN != 0 {
-			let _ = output_evt.read();
+			output_evt.read()?;
 			if had_client {
 				output_ready = true;
 			} else {
-				discard_guest_output(&output, &drain_resume_evt);
+				discard_guest_output(&output, &drain_resume_evt)?;
 			}
 		}
 		if listener_revents & libc::POLLIN != 0 && client.is_none() {
-			discard_guest_output(&output, &drain_resume_evt);
+			discard_guest_output(&output, &drain_resume_evt)?;
 			if let Some(stream) = accept_agent_client(&socket.listener, socket.launch_uid)? {
 				client = Some(stream);
 			}
@@ -858,11 +897,11 @@ fn agent_bridge_loop(
 		{
 			client = None;
 			crate::metrics::record_agent_bridge_disconnect();
-			discard_guest_output(&output, &drain_resume_evt);
+			discard_guest_output(&output, &drain_resume_evt)?;
 		}
 
 		if client.is_none() {
-			discard_guest_output(&output, &drain_resume_evt);
+			discard_guest_output(&output, &drain_resume_evt)?;
 		}
 	}
 }
@@ -939,7 +978,7 @@ fn read_agent_socket_to_console(
 		}
 	}
 	if appended {
-		let _ = input_evt.write(1);
+		input_evt.write(1)?;
 	}
 	Ok(true)
 }
@@ -964,7 +1003,7 @@ fn drain_guest_output_to_socket(
 			Ok(n) => {
 				let before = out.len();
 				out.drain(..n);
-				signal_drain_resume_if_needed(before, out.len(), drain_resume_evt);
+				signal_drain_resume_if_needed(before, out.len(), drain_resume_evt)?;
 			},
 			Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
 			Err(e) => return Err(e),
@@ -972,20 +1011,28 @@ fn drain_guest_output_to_socket(
 	}
 }
 
-fn discard_guest_output(output: &Arc<Mutex<Vec<u8>>>, drain_resume_evt: &EventFd) {
+fn discard_guest_output(
+	output: &Arc<Mutex<Vec<u8>>>,
+	drain_resume_evt: &EventFd,
+) -> io::Result<()> {
 	let mut out = output.lock();
 	let before = out.len();
 	if before == 0 {
-		return;
+		return Ok(());
 	}
 	out.clear();
-	signal_drain_resume_if_needed(before, 0, drain_resume_evt);
+	signal_drain_resume_if_needed(before, 0, drain_resume_evt)
 }
 
-fn signal_drain_resume_if_needed(before: usize, after: usize, drain_resume_evt: &EventFd) {
+fn signal_drain_resume_if_needed(
+	before: usize,
+	after: usize,
+	drain_resume_evt: &EventFd,
+) -> io::Result<()> {
 	if before >= OUTPUT_CAP && after < OUTPUT_CAP {
-		let _ = drain_resume_evt.write(1);
+		drain_resume_evt.write(1)?;
 	}
+	Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1104,7 +1151,8 @@ fn deadline_to_unix(deadline: Instant) -> i64 {
 }
 
 fn checked_deadline(base: Instant, secs: u64, label: &str) -> Result<Instant> {
-	base.checked_add(Duration::from_secs(secs))
+	base
+		.checked_add(Duration::from_secs(secs))
 		.ok_or_else(|| err(format!("{label} is too far in the future")))
 }
 
@@ -1351,10 +1399,9 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 			}
 		}
 		// Children re-parse args from scratch, so propagate the effective
-		// sandbox state. Filters default on; keep the redundant --sandbox for
-		// back-compat, forward --no-sandbox to carry an explicit opt-out, and
-		// always forward the uid/gid drop target so each child drops identically.
-		if config.sandbox {
+		// sandbox state. Filters default on; --no-sandbox is the only state that
+		// needs an explicit flag because redundant --sandbox would conflict with it.
+		if config.sandbox && !config.no_sandbox {
 			cmd.arg("--sandbox");
 		}
 		if config.no_sandbox {
@@ -1585,7 +1632,7 @@ impl Vmm {
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
-			if !cmdline.contains("root=") {
+			if !cmdline_has_key(&cmdline, "root") {
 				cmdline.push_str(if config.rootfs_read_only {
 					" root=/dev/vda ro"
 				} else {
@@ -2436,22 +2483,6 @@ impl Vmm {
 						let gate = self.gate.clone();
 						let exit_reason = self.exit_reason.clone();
 						let deadline = checked_deadline(self.started_at, secs, "--timeout-secs")?;
-					thread::spawn(move || {
-						loop {
-							let now = Instant::now();
-							if now >= deadline {
-								set_exit_reason(&exit_reason, VmmExit::Timeout);
-								gate.set_state(RunState::Stopping);
-								gate.signal_all_vcpus();
-								return;
-							}
-							if gate.state() == RunState::Stopping {
-								return;
-							}
-							thread::sleep(
-								Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
-							);
-						}
 						Ok(thread::spawn(move || {
 							loop {
 								let now = Instant::now();
@@ -2658,6 +2689,18 @@ impl Vmm {
 			let _ = d.kill_evt.write(1);
 		}
 		Err(err(format!("pause failed; VM is stopping: {cause}")))
+	}
+
+	fn fail_resume(&self, cause: crate::result::Error) -> Result<()> {
+		self.gate.set_state(RunState::Stopping);
+		self.gate.signal_all_vcpus();
+		for tx in &self.vcpu_cmd_txs {
+			let _ = tx.send(VcpuCmd::Stop);
+		}
+		for d in &self.devices {
+			let _ = d.kill_evt.write(1);
+		}
+		Err(err(format!("resume failed; VM is stopping: {cause}")))
 	}
 
 	fn wait_for_vcpu_parking(&self) -> Result<()> {
@@ -3483,6 +3526,13 @@ fn wire_pci_device(
 const fn push_virtio_cmdline(cmdline: &mut String, mmio_base: u64, gsi: u32) {
 	#[cfg(target_arch = "x86_64")]
 	cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{mmio_base:x}:{gsi}"));
+}
+
+fn cmdline_has_key(cmdline: &str, key: &str) -> bool {
+	cmdline.split_whitespace().any(|arg| {
+		arg.strip_prefix(key)
+			.is_some_and(|rest| rest.starts_with('='))
+	})
 }
 
 #[cfg(target_arch = "x86_64")]
