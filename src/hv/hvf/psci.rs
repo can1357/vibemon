@@ -54,6 +54,8 @@ pub const PSCI_AFFINITY_OFF: u64 = 1;
 /// PSCI `AFFINITY_INFO` reports a target currently transitioning to on.
 pub const PSCI_AFFINITY_ON_PENDING: u64 = 2;
 
+const CPU_ON_ENTRY_ALIGN: u64 = 4;
+
 /// Boot parameters delivered to a secondary vCPU after PSCI `CPU_ON`.
 #[derive(Clone, Copy, Debug)]
 pub struct StartInfo {
@@ -100,6 +102,7 @@ impl PsciCoordinator {
 	/// Mark a vCPU as initially running.
 	pub fn mark_booted(&self, vcpu_id: usize) -> Result<()> {
 		self.check_id(vcpu_id)?;
+		self.clear_start(vcpu_id)?;
 		self.powered[vcpu_id].store(true, Ordering::Release);
 		Ok(())
 	}
@@ -107,12 +110,16 @@ impl PsciCoordinator {
 	/// Mark a vCPU as initially powered off.
 	pub fn mark_off(&self, vcpu_id: usize) -> Result<()> {
 		self.check_id(vcpu_id)?;
+		self.clear_start(vcpu_id)?;
 		self.powered[vcpu_id].store(false, Ordering::Release);
 		Ok(())
 	}
 
 	/// Power on the target MPIDR and wake its vCPU thread with entry/context.
 	pub fn power_on(&self, target_affinity: u64, entry: u64, context_id: u64) -> i64 {
+		if !entry.is_multiple_of(CPU_ON_ENTRY_ALIGN) {
+			return PSCI_INVALID_PARAMETERS;
+		}
 		let target = mpidr_affinity(target_affinity);
 		let Ok(vcpu_id) = self
 			.mpidr_to_id
@@ -195,15 +202,19 @@ impl PsciCoordinator {
 
 	/// Mark a vCPU powered off after PSCI `CPU_OFF`.
 	pub fn power_off(&self, vcpu_id: usize) -> Result<()> {
-		self.check_id(vcpu_id)?;
-		self.powered[vcpu_id].store(false, Ordering::Release);
-		Ok(())
+		self.mark_off(vcpu_id)
 	}
 
 	fn check_id(&self, vcpu_id: usize) -> Result<()> {
 		if vcpu_id >= self.powered.len() {
 			return Err(err(format!("vCPU id {vcpu_id} exceeds PSCI coordinator size")));
 		}
+		Ok(())
+	}
+
+	fn clear_start(&self, vcpu_id: usize) -> Result<()> {
+		let (lock, _) = &self.starts[vcpu_id];
+		lock.lock().map_err(|_| err("PSCI start slot poisoned"))?.pending = None;
 		Ok(())
 	}
 }

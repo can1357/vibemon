@@ -7,7 +7,7 @@ mod linux {
 		fs::{File, OpenOptions},
 		io, mem,
 		os::{
-			fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+			fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 			unix::fs::OpenOptionsExt,
 		},
 		path::{Path, PathBuf},
@@ -148,6 +148,8 @@ mod linux {
 	// Vmm. Vmm holds that memory for at least as long as the Pager and stops the
 	// handler before drop.
 	unsafe impl Send for Pager {}
+	// SAFETY: same as `Send`; shared access is synchronized through atomics and
+	// mutexes, and raw mapping pointers remain valid for the pager lifetime.
 	unsafe impl Sync for Pager {}
 
 	static ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
@@ -166,6 +168,8 @@ mod linux {
 				Err(e) => return Err(err(format!("userfaultfd: {e}"))),
 			};
 			let mut api = UffdioApi { api: UFFD_API, features, ioctls: 0 };
+			// SAFETY: `fd` is a live userfaultfd, and `api` points to writable
+			// storage matching the UFFDIO_API ABI for the duration of the ioctl.
 			let rc = unsafe {
 				libc::ioctl(
 					fd.as_raw_fd(),
@@ -188,10 +192,14 @@ mod linux {
 
 	fn raw_uffd() -> io::Result<OwnedFd> {
 		let flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
+		// SAFETY: `syscall` is invoked with the userfaultfd number and plain
+		// integer flags; on success it returns a new owned file descriptor.
 		let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags as libc::c_int) };
 		if fd < 0 {
 			Err(io::Error::last_os_error())
 		} else {
+			// SAFETY: `fd` was just returned by `userfaultfd` and is not owned
+			// by any Rust value yet.
 			Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 		}
 	}
@@ -206,7 +214,7 @@ mod linux {
 				.mode(0o600)
 				.open(path)
 				.map_err(|e| err(format!("opening zram swap file {path:?}: {e}")))?;
-			return Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) });
+			return Ok(file.into());
 		}
 
 		let dir = std::env::var_os("TMPDIR")
@@ -219,7 +227,7 @@ mod linux {
 			.mode(0o600)
 			.open(&dir)
 		{
-			Ok(file) => Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) }),
+			Ok(file) => Ok(file.into()),
 			Err(e)
 				if matches!(
 					e.raw_os_error(),
@@ -245,7 +253,7 @@ mod linux {
 		if let Err(e) = std::fs::remove_file(&path) {
 			return Err(err(format!("unlinking zram swap file {path:?}: {e}")));
 		}
-		Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
+		Ok(file.into())
 	}
 
 	pub(crate) fn register_missing(uffd: RawFd, start: u64, len: u64) -> Result<()> {
@@ -254,6 +262,8 @@ mod linux {
 			mode:   UFFDIO_REGISTER_MODE_MISSING,
 			ioctls: 0,
 		};
+		// SAFETY: `uffd` is a userfaultfd, and `reg` points to initialized,
+		// writable storage matching the UFFDIO_REGISTER ABI.
 		let rc = unsafe {
 			libc::ioctl(uffd, UFFDIO_REGISTER_IOCTL as libc::c_ulong, &mut reg as *mut UffdioRegister)
 		};
@@ -269,6 +279,8 @@ mod linux {
 	fn uffd_copy(uffd: RawFd, dst_page_va: u64, src: *const u8, len: usize) -> io::Result<()> {
 		let mut copy =
 			UffdioCopy { dst: dst_page_va, src: src as u64, len: len as u64, mode: 0, copy: 0 };
+		// SAFETY: `uffd` is a userfaultfd; `copy` points to writable storage
+		// matching the UFFDIO_COPY ABI, and `src` names at least `len` bytes.
 		let rc = unsafe {
 			libc::ioctl(uffd, UFFDIO_COPY_IOCTL as libc::c_ulong, &mut copy as *mut UffdioCopy)
 		};
@@ -277,6 +289,12 @@ mod linux {
 		}
 		if copy.copy < 0 {
 			return Err(io::Error::from_raw_os_error((-copy.copy) as i32));
+		}
+		if copy.copy as u64 != len as u64 {
+			return Err(io::Error::new(
+				io::ErrorKind::WriteZero,
+				format!("UFFDIO_COPY copied {} bytes, expected {len}", copy.copy),
+			));
 		}
 		Ok(())
 	}
@@ -372,6 +390,8 @@ mod linux {
 			}
 			let cap = u32::try_from(total_pages)
 				.map_err(|_| err("pager supports at most u32::MAX guest pages"))?;
+			// SAFETY: `eventfd` has no Rust-side preconditions; on success it
+			// returns a new owned file descriptor.
 			let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
 			if stop_fd < 0 {
 				return Err(io::Error::last_os_error().into());
@@ -381,9 +401,12 @@ mod linux {
 			for _ in 0..SHARDS {
 				shards.push(Mutex::new(HashMap::new()));
 			}
+			// SAFETY: `stop_fd` was just returned by `eventfd` and is not owned
+			// by any Rust value yet.
+			let stop_evt = unsafe { OwnedFd::from_raw_fd(stop_fd) };
 			Ok(Arc::new(Pager {
 				uffd,
-				stop_evt: unsafe { OwnedFd::from_raw_fd(stop_fd) },
+				stop_evt,
 				regions,
 				total_pages,
 				target_pages,
@@ -410,6 +433,8 @@ mod linux {
 						events:  libc::POLLIN,
 						revents: 0,
 					}];
+				// SAFETY: `fds` points to `pollfd` entries valid for the call;
+				// null timeout and signal mask request an indefinite wait.
 				let rc = unsafe {
 					libc::ppoll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ptr::null(), ptr::null())
 				};
@@ -430,6 +455,8 @@ mod linux {
 				}
 				loop {
 					let mut msg = mem::MaybeUninit::<UffdMsg>::zeroed();
+					// SAFETY: `msg` points to enough uninitialized storage for one
+					// `UffdMsg`, and `uffd` is opened O_NONBLOCK.
 					let n = unsafe {
 						libc::read(uffd, msg.as_mut_ptr() as *mut libc::c_void, mem::size_of::<UffdMsg>())
 					};
@@ -438,6 +465,9 @@ mod linux {
 						if e.raw_os_error() == Some(libc::EAGAIN) {
 							break;
 						}
+						if e.raw_os_error() == Some(libc::EINTR) {
+							continue;
+						}
 						warn!("pager uffd read failed: {e}");
 						break;
 					}
@@ -445,6 +475,7 @@ mod linux {
 						warn!("pager uffd short read: {n}");
 						break;
 					}
+					// SAFETY: the preceding read filled exactly one `UffdMsg`.
 					let msg = unsafe { msg.assume_init() };
 					if msg.event == UFFD_EVENT_PAGEFAULT {
 						self.serve(msg.pf_address);
@@ -476,43 +507,52 @@ mod linux {
 			let Some(loc) = guard.remove(&(idx as u32)) else {
 				drop(guard);
 				self.disable_once(format!("pager missing backing blob for page {idx}"));
-				let _ = uffd_copy(self.uffd.as_raw_fd(), page_va, ZERO_PAGE.as_ptr(), PAGE_SIZE);
+				if let Err(e) = uffd_copy(self.uffd.as_raw_fd(), page_va, ZERO_PAGE.as_ptr(), PAGE_SIZE)
+				{
+					self.disable_once(format!("zero-fill missing pager blob failed: {e}"));
+					return;
+				}
+				self.clear_bit(&self.evicted, idx);
+				self.set_bit(&self.referenced, idx);
+				self.resident_pages.fetch_add(1, Ordering::SeqCst);
+				crate::metrics::record_pager_fault_in();
+				self.publish_gauges();
 				return;
 			};
 			drop(guard);
 
 			let mut tmp = [0u8; PAGE_SIZE];
-			let src: *const u8 = match loc {
+			let src: *const u8 = match &loc {
 				Loc::Zero => ZERO_PAGE.as_ptr(),
 				Loc::Ram(buf) => {
-					if let Err(e) = decode(&buf, &mut tmp) {
+					if let Err(e) = decode(buf, &mut tmp) {
 						self.disable_once(format!("decoding pager RAM page {idx}: {e}"));
 						ZERO_PAGE.as_ptr()
 					} else {
-						self.store_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
 						tmp.as_ptr()
 					}
 				},
 				Loc::Swap { slot, len } => {
-					let mut sbuf = vec![0u8; len as usize];
+					let mut sbuf = vec![0u8; *len as usize];
 					let fd = self.swap.lock().fd.as_raw_fd();
-					if let Err(e) = pread_exact(fd, &mut sbuf, swap_offset(slot)) {
+					if let Err(e) = pread_exact(fd, &mut sbuf, swap_offset(*slot)) {
 						self.disable_once(format!("reading pager swap slot {slot}: {e}"));
 						ZERO_PAGE.as_ptr()
 					} else if let Err(e) = decode(&sbuf, &mut tmp) {
 						self.disable_once(format!("decoding pager swap slot {slot}: {e}"));
 						ZERO_PAGE.as_ptr()
 					} else {
-						self.swap.lock().free(slot);
 						tmp.as_ptr()
 					}
 				},
 			};
 
 			if let Err(e) = uffd_copy(self.uffd.as_raw_fd(), page_va, src, PAGE_SIZE) {
+				self.shards[shard_idx].lock().insert(idx as u32, loc);
 				self.disable_once(format!("fault-in UFFDIO_COPY failed: {e}"));
 				return;
 			}
+			self.release_loc(loc);
 			self.clear_bit(&self.evicted, idx);
 			self.set_bit(&self.referenced, idx);
 			self.resident_pages.fetch_add(1, Ordering::SeqCst);
@@ -557,9 +597,9 @@ mod linux {
 
 		pub fn request_stop(&self) {
 			let one = 1u64.to_ne_bytes();
-			let _ = unsafe {
-				libc::write(self.stop_evt.as_raw_fd(), one.as_ptr() as *const libc::c_void, one.len())
-			};
+			while eventfd_write(self.stop_evt.as_raw_fd(), &one).is_err_and(|e| {
+				e.raw_os_error() == Some(libc::EINTR)
+			}) {}
 		}
 
 		fn next_victim(&self) -> Option<usize> {
@@ -604,6 +644,8 @@ mod linux {
 			let region = &self.regions[region_i];
 			let off = page_in_region * PAGE_SIZE;
 			let mut page = [0u8; PAGE_SIZE];
+			// SAFETY: `off` was derived from `idx` inside `region`; `page` is
+			// exactly one page of writable stack storage.
 			unsafe {
 				ptr::copy_nonoverlapping(region.base.add(off), page.as_mut_ptr(), PAGE_SIZE);
 			}
@@ -620,6 +662,12 @@ mod linux {
 				Some(buf) => self.place_encoded(buf),
 			};
 
+			guard.insert(idx as u32, loc);
+			self.set_bit(&self.evicted, idx);
+			self.clear_bit(&self.referenced, idx);
+
+			// SAFETY: `region.memfd` backs this mapping; offset and length name
+			// the page selected above and fit in off_t on supported targets.
 			let rc = unsafe {
 				libc::fallocate(
 					region.memfd.as_raw_fd(),
@@ -629,7 +677,12 @@ mod linux {
 				)
 			};
 			if rc < 0 {
-				self.release_loc(loc);
+				let loc = guard.remove(&(idx as u32));
+				self.clear_bit(&self.evicted, idx);
+				drop(guard);
+				if let Some(loc) = loc {
+					self.release_loc(loc);
+				}
 				self.disable_once(format!(
 					"punching guest RAM page {idx} (gpa {:#x}): {}",
 					region.gpa + off as u64,
@@ -637,6 +690,9 @@ mod linux {
 				));
 				return;
 			}
+			// SAFETY: the address range is the live page selected above from the
+			// guest mapping; MADV_DONTNEED drops the present PTE after the backing
+			// file hole is punched so the next access faults through userfaultfd.
 			let rc = unsafe {
 				libc::madvise(region.base.add(off) as *mut libc::c_void, PAGE_SIZE, libc::MADV_DONTNEED)
 			};
@@ -648,9 +704,6 @@ mod linux {
 				));
 			}
 
-			guard.insert(idx as u32, loc);
-			self.set_bit(&self.evicted, idx);
-			self.clear_bit(&self.referenced, idx);
 			self.resident_pages.fetch_sub(1, Ordering::SeqCst);
 			crate::metrics::record_pager_eviction();
 		}
@@ -761,11 +814,33 @@ mod linux {
 
 	fn drain_eventfd(fd: RawFd) {
 		let mut buf = [0u8; 8];
-		let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+		while eventfd_read(fd, &mut buf).is_err_and(|e| e.raw_os_error() == Some(libc::EINTR)) {}
+	}
+
+	fn eventfd_read(fd: RawFd, buf: &mut [u8; 8]) -> io::Result<()> {
+		// SAFETY: `buf` is exactly the 8-byte eventfd counter size and is valid
+		// for writes; `fd` is expected to be an eventfd owned by the pager.
+		let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+		if n < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(())
+	}
+
+	fn eventfd_write(fd: RawFd, buf: &[u8; 8]) -> io::Result<()> {
+		// SAFETY: `buf` is exactly the 8-byte eventfd counter size and is valid
+		// for reads; `fd` is expected to be an eventfd owned by the pager.
+		let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+		if n < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(())
 	}
 
 	fn pread_exact(fd: RawFd, mut buf: &mut [u8], mut offset: i64) -> io::Result<()> {
 		while !buf.is_empty() {
+			// SAFETY: `buf` is valid writable memory, `fd` is an open file
+			// descriptor, and `offset` is maintained within the requested range.
 			let n = unsafe {
 				libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset as libc::off_t)
 			};
@@ -789,6 +864,8 @@ mod linux {
 
 	fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: i64) -> io::Result<()> {
 		while !buf.is_empty() {
+			// SAFETY: `buf` is valid readable memory, `fd` is an open file
+			// descriptor, and `offset` is maintained within the requested range.
 			let n = unsafe {
 				libc::pwrite(fd, buf.as_ptr() as *const libc::c_void, buf.len(), offset as libc::off_t)
 			};
@@ -858,6 +935,8 @@ mod linux {
 			}
 
 			fn write_page(&self, page: usize, bytes: &[u8; PAGE_SIZE]) {
+				// SAFETY: `page_ptr` returns a page inside the fixture's live guest
+				// memory mapping, and `bytes` is exactly one page.
 				unsafe {
 					ptr::copy_nonoverlapping(bytes.as_ptr(), self.page_ptr(page), PAGE_SIZE);
 				}
@@ -865,6 +944,8 @@ mod linux {
 
 			fn read_page(&self, page: usize) -> [u8; PAGE_SIZE] {
 				let mut out = [0u8; PAGE_SIZE];
+				// SAFETY: `page_ptr` returns a page inside the fixture's live guest
+				// memory mapping, and `out` is exactly one page.
 				unsafe {
 					ptr::copy_nonoverlapping(self.page_ptr(page), out.as_mut_ptr(), PAGE_SIZE);
 				}

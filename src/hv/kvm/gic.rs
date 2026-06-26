@@ -8,12 +8,14 @@ use kvm_bindings::{
 use kvm_ioctls::{DeviceFd, VmFd};
 
 use crate::{
-	layout::{GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE, GIC_REDIST_SIZE_PER_CPU},
-	result::Result,
+	layout::{
+		GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE, GIC_REDIST_SIZE_PER_CPU, GIC_SPI_COUNT,
+	},
+	result::{Result, err},
 };
 
-/// Number of interrupt lines the GIC supports (must be a multiple of 32).
-const GIC_NR_IRQS: u32 = 128;
+/// Number of interrupt IDs the GIC supports (SGIs + PPIs + SPIs, multiple of 32).
+const GIC_NR_IRQS: u32 = 32 + GIC_SPI_COUNT;
 /// GICv3 maintenance interrupt (PPI 9).
 const GIC_MAINT_IRQ: u32 = 9;
 
@@ -60,7 +62,10 @@ impl Gic {
 		};
 		device.set_device_attr(&init)?;
 
-		Ok(Gic { device, redist_size: GIC_REDIST_SIZE_PER_CPU * num_cpus })
+		let redist_size = GIC_REDIST_SIZE_PER_CPU
+			.checked_mul(num_cpus)
+			.ok_or_else(|| err("GIC redistributor size overflow"))?;
+		Ok(Gic { device, redist_size })
 	}
 
 	/// Return FDT `reg` pairs: distributor then redistributor.

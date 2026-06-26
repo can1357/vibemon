@@ -9,10 +9,12 @@
 use std::{
 	io,
 	os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-	sync::{Arc, Mutex, MutexGuard},
+	sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
 const LINUX_EFD_NONBLOCK: i32 = 0x800;
+const LINUX_EFD_CLOEXEC: i32 = 0x80000;
+const SUPPORTED_FLAGS: i32 = LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC | libc::O_NONBLOCK;
 
 #[derive(Debug, Default)]
 struct CounterState {
@@ -26,12 +28,16 @@ pub struct EventFd {
 	read_fd:     OwnedFd,
 	write_fd:    OwnedFd,
 	nonblocking: bool,
-	state:       Arc<Mutex<CounterState>>,
+	state:       Arc<(Mutex<CounterState>, Condvar)>,
 }
 
 impl EventFd {
 	/// Creates a pipe-backed eventfd-compatible wakeup object.
 	pub fn new(flags: i32) -> io::Result<Self> {
+		if flags & !SUPPORTED_FLAGS != 0 {
+			return Err(io::Error::from_raw_os_error(libc::EINVAL));
+		}
+
 		let mut fds = [-1; 2];
 		// SAFETY: `fds` is a valid pointer to two `c_int` slots that `pipe`
 		// initializes on success; the return value is checked before use.
@@ -55,7 +61,7 @@ impl EventFd {
 			read_fd,
 			write_fd,
 			nonblocking,
-			state: Arc::new(Mutex::new(CounterState::default())),
+			state: Arc::new((Mutex::new(CounterState::default()), Condvar::new())),
 		})
 	}
 
@@ -71,13 +77,19 @@ impl EventFd {
 			return Ok(());
 		}
 
-		let mut state = lock_state(&self.state)?;
+		let (lock, cv) = &*self.state;
+		let mut state = lock_state(lock)?;
+		while state.value > (u64::MAX - 1).saturating_sub(v) {
+			if self.nonblocking {
+				return Err(io::Error::new(io::ErrorKind::WouldBlock, "eventfd counter overflow"));
+			}
+			state = cv
+				.wait(state)
+				.map_err(|_| io::Error::other("eventfd counter state poisoned"))?;
+		}
 		let old_value = state.value;
 		let old_pending_wake = state.pending_wake;
-		state.value = state
-			.value
-			.checked_add(v)
-			.ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "eventfd counter overflow"))?;
+		state.value += v;
 
 		if state.pending_wake {
 			return Ok(());
@@ -99,12 +111,14 @@ impl EventFd {
 	pub fn read(&self) -> io::Result<u64> {
 		loop {
 			{
-				let mut state = lock_state(&self.state)?;
+				let (lock, cv) = &*self.state;
+				let mut state = lock_state(lock)?;
 				if state.value != 0 {
 					drain_pipe(self.read_fd.as_raw_fd())?;
 					let total = state.value;
 					state.value = 0;
 					state.pending_wake = false;
+					cv.notify_all();
 					return Ok(total);
 				}
 				if state.pending_wake {

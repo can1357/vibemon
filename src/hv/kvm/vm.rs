@@ -28,7 +28,10 @@ const KVM_IDENTITY_MAP_ADDRESS: u64 = 0xfffb_c000;
 /// Owns the KVM handles and guest RAM for a single virtual machine.
 pub struct Vm {
 	/// KVM system fd kept alive for the VM lifetime.
-	#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+	#[cfg_attr(
+		target_arch = "aarch64",
+		allow(dead_code, reason = "keeps the KVM fd alive on every backend")
+	)]
 	pub kvm:         Kvm,
 	/// KVM VM fd shared by backend-owned vCPUs and arch setup code.
 	pub fd:          Arc<VmFd>,
@@ -75,8 +78,9 @@ impl Vm {
 	/// Hand every guest-RAM region to KVM as a userspace memory slot.
 	fn register_memory(fd: &VmFd, memory: &GuestMemoryMmap) -> Result<()> {
 		for (slot, region) in memory.iter().enumerate() {
+			let slot = u32::try_from(slot)?;
 			let region = kvm_userspace_memory_region {
-				slot:            slot as u32,
+				slot,
 				guest_phys_addr: region.start_addr().raw_value(),
 				memory_size:     region.len(),
 				userspace_addr:  region.as_ptr() as u64,
@@ -105,9 +109,7 @@ impl Vm {
 	pub fn register_ioevent(&self, evt: &EventFd, addr: u64, datamatch: Option<u64>) -> Result<()> {
 		let ioevent_addr = IoEventAddress::Mmio(addr);
 		match datamatch {
-			Some(value) => self
-				.fd
-				.register_ioevent(evt, &ioevent_addr, u32::try_from(value)?)?,
+			Some(value) => self.fd.register_ioevent(evt, &ioevent_addr, value)?,
 			None => self.fd.register_ioevent(evt, &ioevent_addr, NoDatamatch)?,
 		}
 		Ok(())

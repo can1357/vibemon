@@ -251,6 +251,10 @@ pub fn configure_uefi_system(
 	pci_mmconfig_base: u64,
 	pci_mmconfig_size: u64,
 ) -> Result<()> {
+	if num_cpus == 0 {
+		bail!("UEFI ACPI tables require at least one vCPU");
+	}
+
 	let mut next = GuestAddress(UEFI_ACPI_TABLES_START);
 
 	let dsdt = build_dsdt();

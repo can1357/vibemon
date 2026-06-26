@@ -49,6 +49,7 @@ const VIRTQ_AVAIL_META_SIZE: u64 = 6;
 const VIRTQ_AVAIL_ELEMENT_SIZE: u64 = 2;
 const VIRTQ_USED_META_SIZE: u64 = 6;
 const VIRTQ_USED_ELEMENT_SIZE: u64 = 8;
+const VIRTQ_EVENT_ELEMENT_SIZE: u64 = 2;
 
 /// The complete, self-contained state of a paused VM (minus guest RAM, which is
 /// stored in the selected memory file).
@@ -337,22 +338,30 @@ where
 	let memory_file = dir.join(generation_memory_file(generation));
 	let state_file = dir.join(generation_state_file(generation));
 
-	let (mem_regions, delta) = match base {
-		None => (dump_memory_file(&memory_tmp, mem)?, None),
-		Some(b) => {
-			let (r, d) = dump_delta_memory_file(&memory_tmp, dir, b, mem)?;
-			(r, Some(d))
-		},
-	};
-	let snap = build_snapshot(mem_regions, delta);
-	validate_snapshot_metadata(&snap, &memory_tmp)?;
-	write_state_file(&state_tmp, &snap)?;
+	let prepare = (|| -> Result<()> {
+		let (mem_regions, delta) = match base {
+			None => (dump_memory_file(&memory_tmp, mem)?, None),
+			Some(b) => {
+				let (r, d) = dump_delta_memory_file(&memory_tmp, dir, b, mem)?;
+				(r, Some(d))
+			},
+		};
+		let snap = build_snapshot(mem_regions, delta);
+		validate_snapshot_metadata(&snap, &memory_tmp)?;
+		write_state_file(&state_tmp, &snap)?;
 
-	fs::rename(&memory_tmp, &memory_file)
-		.map_err(|e| err(format!("publishing {}: {e}", memory_file.display())))?;
-	fs::rename(&state_tmp, &state_file)
-		.map_err(|e| err(format!("publishing {}: {e}", state_file.display())))?;
-	sync_dir(dir)?;
+		fs::rename(&memory_tmp, &memory_file)
+			.map_err(|e| err(format!("publishing {}: {e}", memory_file.display())))?;
+		fs::rename(&state_tmp, &state_file)
+			.map_err(|e| err(format!("publishing {}: {e}", state_file.display())))?;
+		sync_dir(dir)?;
+		Ok(())
+	})();
+
+	if let Err(e) = prepare {
+		cleanup_unpublished_generation(dir, generation);
+		return Err(e);
+	}
 
 	publish_generation(dir, generation)?;
 	Ok(())
@@ -430,14 +439,23 @@ fn parse_generation(contents: &str) -> Result<u64> {
 fn publish_generation(dir: &Path, generation: u64) -> Result<()> {
 	let tmp = dir.join(MANIFEST_TMP_FILE);
 	let current = dir.join(CURRENT_GENERATION_FILE);
-	let mut file =
-		File::create(&tmp).map_err(|e| err(format!("creating {}: {e}", tmp.display())))?;
-	writeln!(file, "{generation}").map_err(|e| err(format!("writing {}: {e}", tmp.display())))?;
-	file
-		.sync_all()
-		.map_err(|e| err(format!("syncing {}: {e}", tmp.display())))?;
-	drop(file);
-	fs::rename(&tmp, &current).map_err(|e| err(format!("publishing {}: {e}", current.display())))?;
+	let publish = (|| -> Result<()> {
+		let mut file =
+			File::create(&tmp).map_err(|e| err(format!("creating {}: {e}", tmp.display())))?;
+		writeln!(file, "{generation}")
+			.map_err(|e| err(format!("writing {}: {e}", tmp.display())))?;
+		file
+			.sync_all()
+			.map_err(|e| err(format!("syncing {}: {e}", tmp.display())))?;
+		drop(file);
+		fs::rename(&tmp, &current)
+			.map_err(|e| err(format!("publishing {}: {e}", current.display())))?;
+		Ok(())
+	})();
+	if let Err(e) = publish {
+		let _ = fs::remove_file(&tmp);
+		return Err(e);
+	}
 	sync_dir(dir)
 }
 
@@ -864,6 +882,7 @@ fn validate_ready_queue_ram(
 	regions: &[MemRegion],
 ) -> Result<()> {
 	let queue_size = u64::from(queue.size);
+	let event_len = if queue.event_idx_enabled { VIRTQ_EVENT_ELEMENT_SIZE } else { 0 };
 	let desc_len = VIRTQ_DESC_ELEMENT_SIZE
 		.checked_mul(queue_size)
 		.ok_or_else(|| err("virtqueue descriptor table size overflows"))?;
@@ -873,6 +892,7 @@ fn validate_ready_queue_ram(
 				.checked_mul(queue_size)
 				.ok_or_else(|| err("virtqueue available ring size overflows"))?,
 		)
+		.and_then(|len| len.checked_add(event_len))
 		.ok_or_else(|| err("virtqueue available ring size overflows"))?;
 	let used_len = VIRTQ_USED_META_SIZE
 		.checked_add(
@@ -880,6 +900,7 @@ fn validate_ready_queue_ram(
 				.checked_mul(queue_size)
 				.ok_or_else(|| err("virtqueue used ring size overflows"))?,
 		)
+		.and_then(|len| len.checked_add(event_len))
 		.ok_or_else(|| err("virtqueue used ring size overflows"))?;
 
 	validate_queue_ram_range(
@@ -937,6 +958,12 @@ fn validate_queue_ram_range(
 
 fn write_state_file(path: &Path, snap: &Snapshot) -> Result<()> {
 	let bytes = postcard::to_allocvec(snap).map_err(|e| err(format!("encoding snapshot: {e}")))?;
+	if bytes.len() > MAX_STATE_BYTES {
+		return Err(err(format!(
+			"encoded snapshot state is {} bytes, over {MAX_STATE_BYTES} byte limit",
+			bytes.len()
+		)));
+	}
 	let mut file =
 		File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
 	file
@@ -1028,7 +1055,7 @@ fn dump_delta_memory_file(
 	let live_regions = memory_region_table(live)?;
 	let base_dir = base_dir_of(delta_dir, base)?;
 	let base_image = read_snapshot(&base_dir)?;
-	let total_ram: u64 = live_regions.iter().map(|r| r.len).sum();
+	let total_ram = regions_total_len(&live_regions)?;
 	let total_bytes =
 		usize::try_from(total_ram).map_err(|_| err("guest RAM size overflows usize"))?;
 	let scratch = memory::create_guest_memory(total_bytes)?;
@@ -1174,7 +1201,9 @@ fn apply_delta_pages(
 		file
 			.read_exact(dst)
 			.map_err(|e| err(format!("reading delta page {page}: {e}")))?;
-		file_offset += DELTA_PAGE_SIZE;
+		file_offset = file_offset
+			.checked_add(DELTA_PAGE_SIZE)
+			.ok_or_else(|| err(format!("delta memory file offset for page {page} overflows")))?;
 	}
 	Ok(())
 }
@@ -1266,6 +1295,17 @@ fn generation_state_tmp_file(generation: u64) -> String {
 
 fn generation_memory_tmp_file(generation: u64) -> String {
 	format!("memory.{generation}.bin.tmp")
+}
+
+fn cleanup_unpublished_generation(dir: &Path, generation: u64) {
+	for path in [
+		dir.join(generation_memory_tmp_file(generation)),
+		dir.join(generation_state_tmp_file(generation)),
+		dir.join(generation_memory_file(generation)),
+		dir.join(generation_state_file(generation)),
+	] {
+		let _ = fs::remove_file(path);
+	}
 }
 
 #[cfg(test)]

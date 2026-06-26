@@ -16,6 +16,7 @@ use crate::{
 const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241; // "ARM\x64"
 const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
 const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+const LEGACY_ARM64_IMAGE_SIZE: u64 = 16 << 20;
 const GUEST_PAGE_SIZE: u64 = 4096;
 const FDT_ALIGN: u64 = 0x20_0000;
 
@@ -50,11 +51,16 @@ pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
 		bail!("kernel {path_display} is not an arm64 Image (bad magic {magic:#x})");
 	}
 
-	let image_size = u64::from_le_bytes(
+	let header_image_size = u64::from_le_bytes(
 		buf[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
 			.try_into()
 			.unwrap(),
-	)
+	);
+	let image_size = if header_image_size == 0 {
+		LEGACY_ARM64_IMAGE_SIZE
+	} else {
+		header_image_size
+	}
 	.max(buf.len() as u64);
 	let entry = GuestAddress(DRAM_BASE + KERNEL_OFFSET);
 	let Some(end) = entry.checked_add(image_size) else {

@@ -80,6 +80,13 @@ fn ms(duration: Duration) -> u64 {
 	duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+#[inline]
+fn saturating_add(counter: &AtomicU64, value: u64) {
+	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+		Some(current.saturating_add(value))
+	});
+}
+
 /// Record the wall-clock time a fresh boot (`Vmm::build`) took.
 pub fn record_boot_duration(duration: Duration) {
 	METRICS
@@ -144,9 +151,7 @@ pub fn record_snapshot(duration: Duration) {
 	METRICS
 		.snapshot_last_duration_ms
 		.store(d, Ordering::Relaxed);
-	METRICS
-		.snapshot_total_duration_ms
-		.fetch_add(d, Ordering::Relaxed);
+	saturating_add(&METRICS.snapshot_total_duration_ms, d);
 }
 
 #[cfg(target_os = "linux")]
@@ -202,15 +207,15 @@ pub fn snapshot_json() -> Value {
 	let internal_error = load(&e.internal_error);
 	let other = load(&e.other);
 	let vm_exit_total = io_in
-		.wrapping_add(io_out)
-		.wrapping_add(mmio_read)
-		.wrapping_add(mmio_write)
-		.wrapping_add(hlt)
-		.wrapping_add(shutdown)
-		.wrapping_add(system_event)
-		.wrapping_add(fail_entry)
-		.wrapping_add(internal_error)
-		.wrapping_add(other);
+		.saturating_add(io_out)
+		.saturating_add(mmio_read)
+		.saturating_add(mmio_write)
+		.saturating_add(hlt)
+		.saturating_add(shutdown)
+		.saturating_add(system_event)
+		.saturating_add(fail_entry)
+		.saturating_add(internal_error)
+		.saturating_add(other);
 
 	json!({
 		 "boot_duration_ms": load(&METRICS.boot_duration_ms),

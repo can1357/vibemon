@@ -392,7 +392,13 @@ impl Vcpu {
 		let function = self.get_gpr(0)?;
 		let ret = match function {
 			PSCI_VERSION => PSCI_VERSION_1_0 as i64,
-			PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => {
+			PSCI_CPU_ON_32 => {
+				let target = self.get_gpr(1)? as u32 as u64;
+				let entry = self.get_gpr(2)? as u32 as u64;
+				let context_id = self.get_gpr(3)? as u32 as u64;
+				self.psci.power_on(target, entry, context_id)
+			},
+			PSCI_CPU_ON_64 => {
 				let target = self.get_gpr(1)?;
 				let entry = self.get_gpr(2)?;
 				let context_id = self.get_gpr(3)?;
@@ -402,7 +408,11 @@ impl Vcpu {
 				self.psci.power_off(usize::from(self.id))?;
 				PSCI_SUCCESS
 			},
-			PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64 => {
+			PSCI_AFFINITY_INFO_32 => {
+				let target = self.get_gpr(1)? as u32 as u64;
+				self.psci.affinity_info(target) as i64
+			},
+			PSCI_AFFINITY_INFO_64 => {
 				let target = self.get_gpr(1)?;
 				self.psci.affinity_info(target) as i64
 			},
@@ -531,6 +541,7 @@ pub fn sys_reg_to_hvf(r: SysReg) -> Result<HvSysReg> {
 	Ok(match enc {
 		0xc005 => HvSysReg::MPIDR_EL1,
 		0xc080 => HvSysReg::SCTLR_EL1,
+		0xc081 => HvSysReg::ACTLR_EL1,
 		0xc082 => HvSysReg::CPACR_EL1,
 		0xc100 => HvSysReg::TTBR0_EL1,
 		0xc101 => HvSysReg::TTBR1_EL1,
@@ -559,6 +570,7 @@ pub fn sys_reg_to_hvf(r: SysReg) -> Result<HvSysReg> {
 		0xc681 => HvSysReg::CONTEXTIDR_EL1,
 		0xc684 => HvSysReg::TPIDR_EL1,
 		0xc708 => HvSysReg::CNTKCTL_EL1,
+		0xd000 => HvSysReg::CSSELR_EL1,
 		0xde82 => HvSysReg::TPIDR_EL0,
 		0xde83 => HvSysReg::TPIDRRO_EL0,
 		0xdf19 => HvSysReg::CNTV_CTL_EL0,

@@ -11,6 +11,9 @@ use crate::{bail, result::Result};
 
 const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
+// Device-tree CPU `reg` uses MPIDR affinity bits Aff3:Aff2:Aff1:Aff0,
+// excluding MT/U/reserved bits.
+const MPIDR_HWID_BITMASK: u64 = 0x00ff_00ff_ffff;
 
 // Interrupt specifier encodings (dt-bindings/interrupt-controller).
 const IRQ_TYPE_SPI: u32 = 0;
@@ -68,7 +71,7 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 	fdt.property_u32("#address-cells", 2)?;
 	fdt.property_u32("#size-cells", 0)?;
 	for &mpidr in p.mpidrs {
-		let reg = mpidr & 0x7f_ffff;
+		let reg = mpidr & MPIDR_HWID_BITMASK;
 		let cpu = fdt.begin_node(&format!("cpu@{reg:x}"))?;
 		fdt.property_string("device_type", "cpu")?;
 		fdt.property_string("compatible", "arm,arm-v8")?;
@@ -77,7 +80,7 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 		fdt.end_node(cpu)?;
 	}
 	fdt.end_node(cpus)?;
-	let mem = fdt.begin_node("memory@ram")?;
+	let mem = fdt.begin_node(&format!("memory@{:x}", p.mem_start))?;
 	fdt.property_string("device_type", "memory")?;
 	fdt.property_array_u64("reg", &[p.mem_start, p.mem_size])?;
 	fdt.end_node(mem)?;
@@ -95,7 +98,7 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 	fdt.end_node(chosen)?;
 
 	// GIC.
-	let intc = fdt.begin_node("intc")?;
+	let intc = fdt.begin_node(&format!("intc@{:x}", p.gic_reg[0]))?;
 	fdt.property_string("compatible", p.gic_compatible)?;
 	fdt.property_null("interrupt-controller")?;
 	fdt.property_u32("#interrupt-cells", 3)?;

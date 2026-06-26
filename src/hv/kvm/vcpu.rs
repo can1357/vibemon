@@ -8,7 +8,10 @@ use crate::{hv::Exit, result::Result};
 
 /// A KVM vCPU plus the VM fd needed for arm64 initialization.
 pub struct Vcpu {
-	#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+	#[cfg_attr(
+		target_arch = "x86_64",
+		allow(dead_code, reason = "arm64 init needs the VM fd")
+	)]
 	vm_fd: Arc<VmFd>,
 	fd:    VcpuFd,
 }
@@ -71,7 +74,7 @@ mod aarch64 {
 	};
 
 	use super::Vcpu;
-	use crate::{hv::SysReg, result::Result};
+	use crate::{bail, hv::SysReg, result::Result};
 
 	impl Vcpu {
 		/// Capture backend-specific vCPU state into the arch serialized form.
@@ -103,6 +106,9 @@ mod aarch64 {
 
 		/// Set one aarch64 general-purpose register X0..X30.
 		pub fn set_gpr(&self, idx: u8, v: u64) -> Result<()> {
+			if idx > 30 {
+				bail!("aarch64 GPR index {idx} is outside X0..X30");
+			}
 			let base = offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, regs);
 			let off = base + usize::from(idx) * std::mem::size_of::<u64>();
 			self.set_u64_reg(core_reg_id(off), v)
@@ -110,6 +116,9 @@ mod aarch64 {
 
 		/// Read one aarch64 general-purpose register X0..X30.
 		pub fn get_gpr(&self, idx: u8) -> Result<u64> {
+			if idx > 30 {
+				bail!("aarch64 GPR index {idx} is outside X0..X30");
+			}
 			let base = offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, regs);
 			let off = base + usize::from(idx) * std::mem::size_of::<u64>();
 			self.get_u64_reg(core_reg_id(off))
@@ -144,14 +153,14 @@ mod aarch64 {
 		}
 
 		fn set_u64_reg(&self, id: u64, v: u64) -> Result<()> {
-			self.fd.set_one_reg(id, &v.to_le_bytes())?;
+			self.fd.set_one_reg(id, &v.to_ne_bytes())?;
 			Ok(())
 		}
 
 		fn get_u64_reg(&self, id: u64) -> Result<u64> {
 			let mut buf = [0u8; 8];
 			self.fd.get_one_reg(id, &mut buf)?;
-			Ok(u64::from_le_bytes(buf))
+			Ok(u64::from_ne_bytes(buf))
 		}
 	}
 

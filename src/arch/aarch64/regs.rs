@@ -19,11 +19,14 @@ const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_
 /// `MPIDR_EL1` — Multiprocessor Affinity Register.
 pub const MPIDR_EL1: SysReg = SysReg::new(3, 0, 0, 0, 5);
 
-/// Set PSTATE, PC and X0 on the boot vCPU.
+/// Set PSTATE, PC, X0 (FDT), and the boot-ABI-reserved argument registers.
 pub fn setup_boot_regs(vcpu: &Vcpu, entry: u64, fdt_addr: u64) -> Result<()> {
 	vcpu.set_pstate(PSTATE_FAULT_BITS_64)?;
 	vcpu.set_pc(entry)?;
 	vcpu.set_gpr(0, fdt_addr)?;
+	for reg in 1..=3 {
+		vcpu.set_gpr(reg, 0)?;
+	}
 	Ok(())
 }
 

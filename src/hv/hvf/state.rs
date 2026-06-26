@@ -21,6 +21,7 @@ use crate::{
 const MIGRATION_SYSREGS: &[SysReg] = &[
 	SysReg::new(3, 0, 0, 0, 5),  // MPIDR_EL1
 	SysReg::new(3, 0, 1, 0, 0),  // SCTLR_EL1
+	SysReg::new(3, 0, 1, 0, 1),  // ACTLR_EL1
 	SysReg::new(3, 0, 1, 0, 2),  // CPACR_EL1
 	SysReg::new(3, 0, 2, 0, 0),  // TTBR0_EL1
 	SysReg::new(3, 0, 2, 0, 1),  // TTBR1_EL1
@@ -49,6 +50,7 @@ const MIGRATION_SYSREGS: &[SysReg] = &[
 	SysReg::new(3, 0, 13, 0, 1), // CONTEXTIDR_EL1
 	SysReg::new(3, 0, 13, 0, 4), // TPIDR_EL1
 	SysReg::new(3, 0, 14, 1, 0), // CNTKCTL_EL1
+	SysReg::new(3, 2, 0, 0, 0),  // CSSELR_EL1
 	SysReg::new(3, 3, 13, 0, 2), // TPIDR_EL0
 	SysReg::new(3, 3, 13, 0, 3), // TPIDRRO_EL0
 	SysReg::new(3, 3, 14, 3, 1), // CNTV_CTL_EL0

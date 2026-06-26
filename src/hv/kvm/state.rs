@@ -51,6 +51,9 @@ pub fn save_vcpu(vcpu: &VcpuFd, _xsave_size: usize) -> Result<VcpuState> {
 	}
 
 	let mp = vcpu.get_mp_state()?;
+	// SAFETY: `mp` is a fully initialized plain KVM UAPI struct returned by the
+	// kernel. Reading exactly its byte representation into an owned Vec does not
+	// outlive or mutate the source object.
 	let mp_state = unsafe {
 		std::slice::from_raw_parts(
 			(&mp as *const kvm_mp_state) as *const u8,
@@ -60,6 +63,9 @@ pub fn save_vcpu(vcpu: &VcpuFd, _xsave_size: usize) -> Result<VcpuState> {
 	.to_vec();
 
 	let ev = vcpu.get_vcpu_events()?;
+	// SAFETY: `ev` is a fully initialized plain KVM UAPI struct returned by the
+	// kernel. Reading exactly its byte representation into an owned Vec does not
+	// outlive or mutate the source object.
 	let vcpu_events = unsafe {
 		std::slice::from_raw_parts(
 			(&ev as *const kvm_vcpu_events) as *const u8,
@@ -86,6 +92,9 @@ pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
 
 	if mp_state.len() == std::mem::size_of::<kvm_mp_state>() {
 		let mut mp = kvm_mp_state::default();
+		// SAFETY: the length check above guarantees the source slice contains
+		// exactly one `kvm_mp_state` byte representation, and `mp` is a valid,
+		// writable destination of that size.
 		unsafe {
 			std::ptr::copy_nonoverlapping(
 				mp_state.as_ptr(),
@@ -100,6 +109,9 @@ pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
 
 	if vcpu_events.len() == std::mem::size_of::<kvm_vcpu_events>() {
 		let mut ev = kvm_vcpu_events::default();
+		// SAFETY: the length check above guarantees the source slice contains
+		// exactly one `kvm_vcpu_events` byte representation, and `ev` is a valid,
+		// writable destination of that size.
 		unsafe {
 			std::ptr::copy_nonoverlapping(
 				vcpu_events.as_ptr(),
@@ -108,8 +120,9 @@ pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
 			);
 		}
 		vcpu.set_vcpu_events(&ev)?;
+	} else {
+		bail!("invalid KVM vCPU events length {}", vcpu_events.len());
 	}
-
 	Ok(())
 }
 
