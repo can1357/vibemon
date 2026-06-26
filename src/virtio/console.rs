@@ -347,6 +347,7 @@ impl VirtioDevice for Console {
 
 	fn reset(&mut self) -> Result<()> {
 		self.acked_features = 0;
+		self.pending_tx = None;
 		self.mem = None;
 		self.interrupt = None;
 		self.rx_queue = None;
@@ -399,6 +400,17 @@ impl VirtioDevice for Console {
 			v.push(q.state());
 		}
 		v
+	}
+
+	fn drain(&mut self) -> Result<()> {
+		let used = self.drain_tx()?;
+		if used {
+			self.signal_used()?;
+		}
+		if self.pending_tx.is_some() {
+			return Err(err("virtio-console snapshot blocked by backpressured TX output"));
+		}
+		Ok(())
 	}
 }
 

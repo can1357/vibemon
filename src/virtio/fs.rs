@@ -876,16 +876,49 @@ impl FsState {
 		fh
 	}
 
+	/// Return the current host path for `nodeid` after proving its parent still
+	/// resolves under the shared root. The final component is not followed, so
+	/// symlink inodes can still be observed with GETATTR.
+	fn confined_lstat_path(&self, nodeid: u64) -> std::io::Result<PathBuf> {
+		let path = self
+			.inodes
+			.get(&nodeid)
+			.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+		if path == &self.root {
+			return Ok(path.clone());
+		}
+		let parent = path
+			.parent()
+			.ok_or_else(|| std::io::Error::from_raw_os_error(libc::EACCES))?;
+		let parent_canon = fs::canonicalize(parent)?;
+		if !parent_canon.starts_with(&self.root) {
+			return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+		}
+		Ok(path.clone())
+	}
+
+	/// Return the current host path for `nodeid`, refusing stale inode-table
+	/// entries that now escape the shared root through parent symlink swaps or a
+	/// final-component symlink.
+	fn confined_existing_path(&self, nodeid: u64) -> std::io::Result<PathBuf> {
+		let path = self.confined_lstat_path(nodeid)?;
+		if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+			return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+		}
+		let canon = fs::canonicalize(path)?;
+		if !canon.starts_with(&self.root) {
+			return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+		}
+		Ok(canon)
+	}
+
 	/// Reopen the host path for `nodeid` (confined under root) without following
 	/// a final-component symlink. This is the unknown-fh fallback for
 	/// READ/WRITE/FALLOCATE after a snapshot restore, where the session-local
 	/// handle table is empty but the guest still references pre-snapshot fhs.
 	fn open_confined(&self, nodeid: u64, write: bool) -> std::io::Result<File> {
-		let path = self
-			.inodes
-			.get(&nodeid)
-			.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-		open_nofollow(path, write)
+		let path = self.confined_existing_path(nodeid)?;
+		open_nofollow(&path, write)
 	}
 
 	/// LOOKUP-style reply for a freshly created `child`: lstat it, intern a
@@ -1016,8 +1049,8 @@ impl FsState {
 				};
 				write_reply(mem, writable, unique, 0, struct_bytes(&out))
 			},
-			FUSE_GETATTR => match self.inodes.get(&nodeid) {
-				Some(p) => match fs::symlink_metadata(p) {
+			FUSE_GETATTR => match self.confined_lstat_path(nodeid) {
+				Ok(p) => match fs::symlink_metadata(&p) {
 					Ok(md) => {
 						let out = FuseAttrOut {
 							attr_valid:      TIMEOUT_SEC,
@@ -1027,9 +1060,9 @@ impl FsState {
 						};
 						write_reply(mem, writable, unique, 0, struct_bytes(&out))
 					},
-					Err(_) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				},
-				None => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+				Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 			},
 			FUSE_LOOKUP => {
 				let name = req
@@ -1064,8 +1097,9 @@ impl FsState {
 				}
 			},
 			FUSE_OPEN | FUSE_OPENDIR => {
-				let Some(path) = self.inodes.get(&nodeid).cloned() else {
-					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				let path = match self.confined_existing_path(nodeid) {
+					Ok(path) => path,
+					Err(e) => return write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				};
 				let is_dir = h.opcode == FUSE_OPENDIR;
 				// `fuse_open_in.flags` are the guest's open(2) flags. Any
@@ -1122,17 +1156,16 @@ impl FsState {
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
-			FUSE_READDIR => match (
-				read_struct::<FuseReadIn>(req, IN_HEADER_SIZE),
-				self.inodes.get(&nodeid).cloned(),
-			) {
-				(Some(rin), Some(path)) => {
-					let max = (rin.size as usize).min(body_cap);
-					let body = build_readdir(&path, rin.offset, max);
-					write_reply(mem, writable, unique, 0, &body)
+			FUSE_READDIR => match read_struct::<FuseReadIn>(req, IN_HEADER_SIZE) {
+				Some(rin) => match self.confined_existing_path(nodeid) {
+					Ok(path) => {
+						let max = (rin.size as usize).min(body_cap);
+						let body = build_readdir(&path, rin.offset, max);
+						write_reply(mem, writable, unique, 0, &body)
+					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				},
-				(None, _) => write_reply(mem, writable, unique, -libc::EINVAL, &[]),
-				(_, None) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+				None => write_reply(mem, writable, unique, -libc::EINVAL, &[]),
 			},
 			FUSE_STATFS => {
 				let st = FuseKstatfs { bsize: 4096, namelen: 255, frsize: 4096, ..Default::default() };
@@ -1252,8 +1285,9 @@ impl FsState {
 				let Some(sin) = read_struct::<FuseSetattrIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
-				let Some(path) = self.inodes.get(&nodeid).cloned() else {
-					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				let path = match self.confined_existing_path(nodeid) {
+					Ok(path) => path,
+					Err(e) => return write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				};
 				// Truncation prefers the tracked handle (FATTR_FH); without one
 				// apply_setattr reopens the confined path with O_NOFOLLOW.
@@ -2002,5 +2036,34 @@ mod tests {
 		assert_eq!(err, -libc::ELOOP, "fallback WRITE refuses a final-component symlink");
 
 		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn stale_parent_symlink_escape_is_rejected() {
+		let root = temp_dir("vmon-fs-parent-symlink");
+		let outside = temp_dir("vmon-fs-parent-outside");
+		fs::create_dir(root.join("d")).unwrap();
+		fs::write(root.join("d").join("f"), b"inside").unwrap();
+		fs::write(outside.join("f"), b"outside").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_LOOKUP, FUSE_ROOT_ID, b"d\0"));
+		assert_eq!(err, 0, "lookup of original directory");
+		let dir: FuseEntryOut = read_struct(&body, 0).unwrap();
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_LOOKUP, dir.nodeid, b"f\0"));
+		assert_eq!(err, 0, "lookup of original child");
+		let file: FuseEntryOut = read_struct(&body, 0).unwrap();
+
+		fs::remove_dir_all(root.join("d")).unwrap();
+		std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_GETATTR, file.nodeid, &[]));
+		assert_eq!(err, -libc::EACCES, "GETATTR refuses parent symlink escape");
+		let rin = FuseReadIn { fh: 0, size: 7, ..Default::default() };
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_READ, file.nodeid, struct_bytes(&rin)));
+		assert_eq!(err, -libc::EACCES, "fallback READ refuses parent symlink escape");
+
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(outside).unwrap();
 	}
 }

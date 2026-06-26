@@ -390,7 +390,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// so the exit-time write lands through this held fd even after dropping to
 	// the sandbox uid and installing path-based Landlock rules. The socket
 	// parent dir already exists here (bound above, or pre-created by the jailer).
-	let status_file = open_status_file(status_sock.as_deref());
+	let mut status_file = open_status_file(status_sock.as_deref());
 
 	let pager_setup = match config.mem_target_mib {
 		Some(target_mib) => {
@@ -401,6 +401,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 			match setup {
 				Ok(setup) => Some(setup),
 				Err(e) => {
+					write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 					cleanup_agent_socket(agent_socket.as_ref());
 					cleanup_control_server(control_server.as_ref());
 					return Err(e);
@@ -418,6 +419,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// so the NOFILE clamp can account for the fds Vmm::build opens.)
 	#[cfg(target_os = "linux")]
 	if filters_enabled && let Err(e) = crate::sandbox::apply_privilege_phase(&sandbox_config) {
+		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
 		cleanup_control_server(control_server.as_ref());
 		return Err(e);
@@ -435,6 +437,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	let mut vmm = match build_result {
 		Ok(vmm) => vmm,
 		Err(e) => {
+			write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 			cleanup_agent_socket(agent_socket.as_ref());
 			cleanup_control_server(control_server.as_ref());
 			return Err(e);
@@ -452,12 +455,13 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 		let target_pages = (target_mib << 20) / 4096;
 		let store_max = config
 			.zram_store_max_mib
-			.unwrap_or((config.mem_mib / 4).max(16))
+			.unwrap_or_else(|| (config.mem_mib / 4).max(16))
 			<< 20;
 		let pager =
 			match crate::pager::Pager::new(uffd, swap, vmm.vm.memory(), target_pages, store_max) {
 				Ok(pager) => pager,
 				Err(e) => {
+					write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 					cleanup_agent_socket(agent_socket.as_ref());
 					cleanup_control_server(control_server.as_ref());
 					return Err(e);
@@ -468,6 +472,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 
 	// Installed before any vCPU can be asked to pause; harmless without a socket.
 	if let Err(e) = control::pause_signal::install() {
+		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
 		cleanup_control_server(control_server.as_ref());
 		return Err(e);
@@ -477,6 +482,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// before vmm.start() spawns the vCPU/device-worker threads so they inherit it.
 	#[cfg(target_os = "linux")]
 	if filters_enabled && let Err(e) = crate::sandbox::apply_filter_phase(&sandbox_config) {
+		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
 		cleanup_control_server(control_server.as_ref());
 		return Err(e);
@@ -484,6 +490,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 
 	if let Err(e) = vmm.start() {
 		let shutdown = vmm.shutdown_threads();
+		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
 		cleanup_control_server(control_server.as_ref());
 		return match shutdown {
@@ -493,16 +500,20 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 			},
 		};
 	}
-	if let Err(e) = spawn_agent_bridge(agent_socket, &vmm) {
-		let shutdown = vmm.shutdown_threads();
-		cleanup_control_server(control_server.as_ref());
-		return match shutdown {
-			Ok(()) => Err(e),
-			Err(shutdown_err) => {
-				Err(err(format!("spawning agent bridge failed: {e}; shutdown failed: {shutdown_err}")))
-			},
-		};
-	}
+	let agent_bridge = match spawn_agent_bridge(agent_socket, &vmm) {
+		Ok(handle) => handle,
+		Err(e) => {
+			let shutdown = vmm.shutdown_threads();
+			write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+			cleanup_control_server(control_server.as_ref());
+			return match shutdown {
+				Ok(()) => Err(e),
+				Err(shutdown_err) => Err(err(format!(
+					"spawning agent bridge failed: {e}; shutdown failed: {shutdown_err}"
+				))),
+			};
+		},
+	};
 	if warm {
 		info!("warm-boot reconstruct took {:?}", t0.elapsed());
 	}
@@ -510,17 +521,22 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	if let Some(cmd) = &agent_exec {
 		if let Err(e) = vmm.agent_send(cmd) {
 			let shutdown = vmm.shutdown_threads();
+			let agent_shutdown = join_agent_bridge(agent_bridge);
+			write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 			cleanup_control_server(control_server.as_ref());
-			return match shutdown {
-				Ok(()) => Err(e),
-				Err(shutdown_err) => {
+			return match (shutdown, agent_shutdown) {
+				(Ok(()), Ok(())) => Err(e),
+				(Err(shutdown_err), _) => {
 					Err(err(format!("sending agent exec failed: {e}; shutdown failed: {shutdown_err}")))
 				},
+				(Ok(()), Err(agent_err)) => Err(err(format!(
+					"sending agent exec failed: {e}; agent bridge shutdown failed: {agent_err}"
+				))),
 			};
 		}
 		info!("agent exec dispatched at {:?} from launch", t0.elapsed());
 	}
-	vmm.serve_and_wait(control_server, snapshot_root.as_deref(), status_file)
+	vmm.serve_and_wait(control_server, snapshot_root.as_deref(), status_file, agent_bridge)
 }
 
 #[cfg(target_os = "linux")]
@@ -570,9 +586,12 @@ fn bind_agent_socket(
 	Ok(Some(AgentSocket { path: sock_path, listener, launch_uid }))
 }
 
-fn spawn_agent_bridge(agent_socket: Option<AgentSocket>, vmm: &Vmm) -> Result<()> {
+fn spawn_agent_bridge(
+	agent_socket: Option<AgentSocket>,
+	vmm: &Vmm,
+) -> Result<Option<JoinHandle<()>>> {
 	let Some(socket) = agent_socket else {
-		return Ok(());
+		return Ok(None);
 	};
 	let (input, input_evt) = vmm
 		.console_input
@@ -598,8 +617,17 @@ fn spawn_agent_bridge(agent_socket: Option<AgentSocket>, vmm: &Vmm) -> Result<()
 				warn!("agent bridge exited: {e}");
 			}
 		})
-		.map(|_| ())
+		.map(Some)
 		.map_err(|e| err(format!("spawning agent bridge thread failed: {e}")))
+}
+
+fn join_agent_bridge(handle: Option<JoinHandle<()>>) -> Result<()> {
+	if let Some(handle) = handle
+		&& handle.join().is_err()
+	{
+		return Err(err("agent bridge thread panicked during shutdown"));
+	}
+	Ok(())
 }
 
 fn cleanup_agent_socket(agent_socket: Option<&AgentSocket>) {
@@ -653,12 +681,8 @@ fn prepare_agent_socket_path(sock_path: &Path, launch_uid: u32) -> Result<()> {
 }
 
 fn agent_socket_parent(sock_path: &Path) -> &Path {
-	sock_path
-		.parent()
-		.filter(|parent| !parent.as_os_str().is_empty())
-		.unwrap_or(Path::new("."))
+	sock_path.parent().unwrap_or_else(|| Path::new("."))
 }
-
 fn verify_private_agent_socket_parent(
 	parent: &Path,
 	meta: &fs::Metadata,
@@ -888,6 +912,7 @@ fn verify_agent_peer_credentials(stream: &UnixStream, launch_uid: u32) -> io::Re
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, reason = "uniform interface across platforms")]
 const fn verify_agent_peer_credentials(_: &UnixStream, _: u32) -> io::Result<()> {
 	Ok(())
 }
@@ -909,7 +934,6 @@ fn read_agent_socket_to_console(
 					break;
 				}
 			},
-			Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 			Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
 			Err(e) => return Err(e),
 		}
@@ -942,7 +966,6 @@ fn drain_guest_output_to_socket(
 				out.drain(..n);
 				signal_drain_resume_if_needed(before, out.len(), drain_resume_evt);
 			},
-			Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 			Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
 			Err(e) => return Err(e),
 		}
@@ -1034,7 +1057,7 @@ fn machine_info(vmm: &Vmm) -> MachineInfo {
 			.iter()
 			.map(|device| device_kind_name(device.kind))
 			.collect(),
-		deadline_unix: deadline_to_unix(vmm.deadline),
+		deadline_unix: vmm.deadline.map(deadline_to_unix),
 		uptime_ms:     vmm.started_at.elapsed().as_millis() as u64,
 	}
 }
@@ -1068,16 +1091,14 @@ fn unix_now_secs() -> i64 {
 }
 
 /// Convert a monotonic deadline `Instant` to wall-clock unix seconds.
-fn deadline_to_unix(deadline: Option<Instant>) -> Option<i64> {
-	deadline.map(|deadline| {
-		let now = Instant::now();
-		let now_unix = unix_now_secs();
-		if deadline >= now {
-			now_unix.saturating_add(deadline.duration_since(now).as_secs() as i64)
-		} else {
-			now_unix.saturating_sub(now.duration_since(deadline).as_secs() as i64)
-		}
-	})
+fn deadline_to_unix(deadline: Instant) -> i64 {
+	let now = Instant::now();
+	let now_unix = unix_now_secs();
+	if deadline >= now {
+		now_unix.saturating_add(deadline.duration_since(now).as_secs() as i64)
+	} else {
+		now_unix.saturating_sub(now.duration_since(deadline).as_secs() as i64)
+	}
 }
 
 /// Record the VMM exit reason; the first writer wins so the root cause is not
@@ -1130,9 +1151,24 @@ fn open_status_file(api_sock: Option<&Path>) -> Option<std::fs::File> {
 	}
 }
 
+fn write_final_status(file: Option<&mut std::fs::File>, api_sock: Option<&Path>, exit: VmmExit) {
+	if let Some(file) = file {
+		write_status_to(file, exit);
+	} else if let Some(api_sock) = api_sock {
+		write_status_json(api_sock, exit);
+	}
+}
+
 fn write_status_to(file: &mut std::fs::File, exit: VmmExit) {
-	use std::io::Write;
+	use std::io::{Seek, SeekFrom, Write};
 	let body = status_body(exit);
+	if let Err(e) = file
+		.set_len(0)
+		.and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+	{
+		warn!("failed to reset status.json: {e}");
+		return;
+	}
 	if let Err(e) = file.write_all(body.as_bytes()) {
 		warn!("failed to write status.json: {e}");
 		return;
@@ -2217,10 +2253,7 @@ impl Vmm {
 					},
 				};
 
-				let phase = match phase_rx.recv() {
-					Ok(phase) => phase,
-					Err(_) => return,
-				};
+				let Ok(phase) = phase_rx.recv() else { return };
 				let configured = match phase {
 					MacosPhaseB::Boot { entry, fdt_addr } => {
 						arch::configure_vcpu(&vcpu, id as u8, entry, fdt_addr)
@@ -2292,6 +2325,7 @@ impl Vmm {
 		control_server: Option<control::ControlServer>,
 		snapshot_root: Option<&Path>,
 		mut status_file: Option<std::fs::File>,
+		agent_bridge: Option<JoinHandle<()>>,
 	) -> Result<()> {
 		let exit;
 		if let Some(server) = control_server {
@@ -2399,30 +2433,28 @@ impl Vmm {
 				let _ = timer.join();
 			}
 			let shutdown = self.shutdown_threads();
-			restore_terminal();
+			let agent_shutdown = join_agent_bridge(agent_bridge);
 			// No control loop: the guest ran to completion or a thread stopped it.
 			let exit_now = VmmExit::from_u8(self.exit_reason.load(Ordering::SeqCst));
-			if let Some(file) = status_file.as_mut() {
-				write_status_to(file, exit_now);
-			} else if let Some(api_sock) = self.api_sock.clone() {
-				write_status_json(&api_sock, exit_now);
-			}
+			write_final_status(status_file.as_mut(), self.api_sock.as_deref(), exit_now);
 			if let Some(message) = join_error {
 				return Err(err(message));
 			}
-			return shutdown;
+			return match shutdown {
+				Ok(()) => agent_shutdown,
+				Err(e) => Err(e),
+			};
 		}
 		let shutdown = self.shutdown_threads();
-		restore_terminal();
-		if let Some(file) = status_file.as_mut() {
-			write_status_to(file, exit);
-		} else if let Some(api_sock) = self.api_sock.clone() {
-			write_status_json(&api_sock, exit);
+		let agent_shutdown = join_agent_bridge(agent_bridge);
+		write_final_status(status_file.as_mut(), self.api_sock.as_deref(), exit);
+		match shutdown {
+			Ok(()) => agent_shutdown,
+			Err(e) => Err(e),
 		}
-		shutdown
 	}
 
-	fn sweep_pager_if_needed(&mut self) {
+	fn sweep_pager_if_needed(&self) {
 		let Some(pager) = self.pager.clone() else {
 			return;
 		};
@@ -2516,7 +2548,7 @@ impl Vmm {
 				// --timeout-secs was set at launch); the run loop reads
 				// self.deadline each iteration.
 				self.deadline = Some(Instant::now() + Duration::from_secs(secs));
-				let deadline_unix = deadline_to_unix(self.deadline).unwrap_or_else(unix_now_secs);
+				let deadline_unix = self.deadline.map_or_else(unix_now_secs, deadline_to_unix);
 				Ok(json!({ "deadline_unix": deadline_unix }))
 			},
 		}
@@ -2526,7 +2558,7 @@ impl Vmm {
 
 	/// Park every vCPU at a safe point and quiesce every device worker.
 	/// Idempotent: pausing an already-paused VM is a no-op `Ok`.
-	fn pause(&mut self) -> Result<()> {
+	fn pause(&self) -> Result<()> {
 		match self.gate.state() {
 			RunState::Paused => return Ok(()),
 			RunState::Stopping => return Err(err("pause failed: VM is stopping")),
@@ -2564,7 +2596,7 @@ impl Vmm {
 		Ok(())
 	}
 
-	fn fail_pause(&mut self, cause: crate::result::Error) -> Result<()> {
+	fn fail_pause(&self, cause: crate::result::Error) -> Result<()> {
 		self.gate.set_state(RunState::Stopping);
 		self.gate.signal_all_vcpus();
 		for tx in &self.vcpu_cmd_txs {
@@ -2746,7 +2778,7 @@ impl Vmm {
 		}
 	}
 
-	fn resume(&mut self) -> Result<()> {
+	fn resume(&self) -> Result<()> {
 		match self.gate.state() {
 			RunState::Running => return Ok(()),
 			RunState::Stopping => return Err(err("resume failed: VM is stopping")),
@@ -2784,7 +2816,7 @@ impl Vmm {
 	/// Write a complete snapshot of the (paused) VM to `dir`.
 	/// If `base` is `Some`, store only the pages that differ from that sibling
 	/// snapshot.
-	fn snapshot(&mut self, dir: &Path, base: Option<&str>) -> Result<()> {
+	fn snapshot(&self, dir: &Path, base: Option<&str>) -> Result<()> {
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
 			RunState::Paused => {},
@@ -2952,6 +2984,7 @@ impl Vmm {
 	fn shutdown_threads(&mut self) -> Result<()> {
 		let mut join_error = None;
 		self.gate.set_state(RunState::Stopping);
+		restore_terminal();
 		self.gate.signal_all_vcpus();
 		for tx in &self.vcpu_cmd_txs {
 			let _ = tx.send(VcpuCmd::Stop);
@@ -3380,7 +3413,12 @@ fn wire_pci_device(
 
 /// On x86 there is no FDT, so virtio-mmio devices are described on the kernel
 /// command line. On aarch64 they are declared in the device tree instead.
-#[allow(unused_variables, clippy::ptr_arg, reason = "&mut String is required by push_str on x86")]
+#[allow(
+	unused_variables,
+	clippy::ptr_arg,
+	clippy::needless_pass_by_ref_mut,
+	reason = "&mut String is required by push_str on x86"
+)]
 const fn push_virtio_cmdline(cmdline: &mut String, mmio_base: u64, gsi: u32) {
 	#[cfg(target_arch = "x86_64")]
 	cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{mmio_base:x}:{gsi}"));

@@ -51,10 +51,13 @@ use crate::{
 /// and the returned file descriptor is the one handed to the block backend so a
 /// later path swap cannot make the guest open some other host file.
 pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
-	let base_path_meta =
-		fs::symlink_metadata(base).map_err(|e| err(format!("checking base disk {}: {e}", base.display())))?;
+	let base_path_meta = fs::symlink_metadata(base)
+		.map_err(|e| err(format!("checking base disk {}: {e}", base.display())))?;
 	if base_path_meta.file_type().is_symlink() {
-		return Err(err(format!("base disk {} must be a regular file, not a symlink", base.display())));
+		return Err(err(format!(
+			"base disk {} must be a regular file, not a symlink",
+			base.display()
+		)));
 	}
 	if !base_path_meta.is_file() {
 		return Err(err(format!("base disk {} must be a regular file", base.display())));
@@ -75,7 +78,9 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		.read(true)
 		.custom_flags(libc::O_NOFOLLOW)
 		.open(base)
-		.map_err(|e| err(format!("opening base disk {} without following symlinks: {e}", base.display())))?;
+		.map_err(|e| {
+			err(format!("opening base disk {} without following symlinks: {e}", base.display()))
+		})?;
 	let opened_base_meta = src
 		.metadata()
 		.map_err(|e| err(format!("checking opened base disk {}: {e}", base.display())))?;
@@ -95,7 +100,10 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		.custom_flags(libc::O_NOFOLLOW)
 		.open(dest)
 		.map_err(|e| {
-			err(format!("creating overlay {} exclusively without following symlinks: {e}", dest.display()))
+			err(format!(
+				"creating overlay {} exclusively without following symlinks: {e}",
+				dest.display()
+			))
 		})?;
 	let dst_meta = dst
 		.metadata()
@@ -128,7 +136,11 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	dst.set_len(0)
 		.map_err(|e| err(format!("resetting overlay {}: {e}", dest.display())))?;
 	io::copy(&mut src, &mut dst).map_err(|e| {
-		err(format!("copying {} -> {} after reflink failed ({clone_err}): {e}", base.display(), dest.display()))
+		err(format!(
+			"copying {} -> {} after reflink failed ({clone_err}): {e}",
+			base.display(),
+			dest.display()
+		))
 	})?;
 	Ok(dst)
 }

@@ -62,7 +62,7 @@ enum Backend {
 }
 
 impl Backend {
-	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+	fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
 		match self {
 			Self::Tap(tap) => tap.read(buf),
 			#[cfg(target_os = "macos")]
@@ -70,7 +70,7 @@ impl Backend {
 		}
 	}
 
-	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+	fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
 		match self {
 			Self::Tap(tap) => tap.write(buf),
 			#[cfg(target_os = "macos")]
@@ -171,12 +171,12 @@ impl Net {
 
 	fn process_rx(&mut self) -> Result<()> {
 		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
-			drain_backend(&mut self.backend);
+			drain_backend(&self.backend);
 			return Ok(());
 		};
 		let mergeable = self.mergeable_rx_buffers();
 		let Some(rx_queue) = self.rx_queue.as_mut() else {
-			drain_backend(&mut self.backend);
+			drain_backend(&self.backend);
 			return Ok(());
 		};
 		let backend = &mut self.backend;
@@ -354,7 +354,7 @@ fn deliver_rx(
 	mergeable: bool,
 ) -> Result<bool> {
 	if packet.len() < VNET_HDR_SIZE {
-		return Ok(true);
+		return Ok(false);
 	}
 	let Some(first) = pop_rx_buffer(mem, rx_queue) else {
 		return Ok(false);
@@ -385,7 +385,14 @@ fn deliver_rx(
 			}
 			return Ok(true);
 		};
-		cap += buf.cap;
+		let Some(next_cap) = cap.checked_add(buf.cap) else {
+			for b in buffers {
+				add_rx_used(mem, rx_queue, b.head, 0)?;
+			}
+			add_rx_used(mem, rx_queue, buf.head, 0)?;
+			return Ok(true);
+		};
+		cap = next_cap;
 		if !buf.valid {
 			for b in buffers {
 				add_rx_used(mem, rx_queue, b.head, 0)?;
@@ -419,7 +426,10 @@ fn pop_rx_buffer(mem: &GuestMemoryMmap, rx_queue: &mut Queue) -> Option<RxBuffer
 		if !d.is_write_only() || !descriptor_range_valid(mem, d.addr(), d.len()) {
 			return Some(RxBuffer { head, descs, cap: 0, valid: false });
 		}
-		cap = cap.checked_add(d.len() as usize)?;
+		let Some(next_cap) = cap.checked_add(d.len() as usize) else {
+			return Some(RxBuffer { head, descs, cap: 0, valid: false });
+		};
+		cap = next_cap;
 	}
 	Some(RxBuffer { head, descs, cap, valid: true })
 }
@@ -538,8 +548,8 @@ const fn tap_offload_flags(features: u64) -> u32 {
 }
 
 /// Read and discard pending frames so epoll does not keep firing.
-fn drain_backend(backend: &mut Backend) {
-	let mut scratch = [0u8; 2048];
+fn drain_backend(backend: &Backend) {
+	let mut scratch = vec![0u8; FRAME_BUF_SIZE].into_boxed_slice();
 	loop {
 		match backend.read(&mut scratch) {
 			Ok(n) if n > 0 => {},
@@ -704,6 +714,20 @@ mod tests {
 
 		let chain = queue.pop_descriptor_chain(&mem).expect("descriptor chain");
 		assert!(gather_tx_frame(&mem, chain).is_none());
+	}
+
+	#[test]
+	fn deliver_rx_ignores_malformed_short_backend_frame_without_consuming_buffer() {
+		let mem = guest_mem();
+		let mut queue = queue_with_descs(&mem, &[SplitDescriptor::new(
+			0x4000,
+			(VNET_HDR_SIZE + 4) as u32,
+			VRING_DESC_F_WRITE as u16,
+			0,
+		)]);
+
+		assert!(!deliver_rx(&mem, &mut queue, &[0u8; VNET_HDR_SIZE - 1], false).expect("deliver_rx"));
+		assert_eq!(used_idx(&mem), 0);
 	}
 
 	#[test]

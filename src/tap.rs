@@ -76,13 +76,13 @@ mod platform {
 		}
 
 		/// Read one vnet-header-prefixed Ethernet frame from the TAP fd.
-		pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-			self.file.read(buf)
+		pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+			(&self.file).read(buf)
 		}
 
 		/// Write one vnet-header-prefixed Ethernet frame to the TAP fd.
-		pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-			self.file.write(buf)
+		pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+			(&self.file).write(buf)
 		}
 
 		/// Enable the negotiated Linux TAP offloads.
@@ -301,7 +301,7 @@ mod platform {
 		}
 
 		/// Read one vnet-header-prefixed Ethernet frame from vmnet.
-		pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 			let _ = self.ready_evt.read();
 			if self.virtio_header {
 				return read_vmnet_packet(self.interface, buf);
@@ -318,7 +318,7 @@ mod platform {
 		}
 
 		/// Write one vnet-header-prefixed Ethernet frame to vmnet.
-		pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
 			if self.virtio_header {
 				return write_vmnet_packet(self.interface, buf);
 			}

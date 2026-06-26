@@ -832,8 +832,7 @@ impl PciTransport {
 			self.queue_select = usize::from(read_u16(&common, COMMON_QUEUE_SELECT));
 		}
 		if touches(offset, data.len(), COMMON_QUEUE_SIZE, 2) {
-			let size = read_u16(&common, COMMON_QUEUE_SIZE);
-			self.with_queue_mut(|q| q.set_size(size));
+			self.set_selected_queue_size(read_u16(&common, COMMON_QUEUE_SIZE));
 		}
 		if touches(offset, data.len(), COMMON_QUEUE_MSIX_VECTOR, 2)
 			&& self.queue_select < self.queue_count
@@ -926,6 +925,17 @@ impl PciTransport {
 		if let Some(q) = self.queues.get_mut(self.queue_select) {
 			f(q);
 		}
+	}
+
+	fn set_selected_queue_size(&mut self, size: u16) {
+		if size == 0 {
+			return;
+		}
+		self.with_queue_mut(|q| {
+			if size <= q.max_size() {
+				q.set_size(size);
+			}
+		});
 	}
 
 	fn reset(&mut self) -> Result<()> {

@@ -115,13 +115,19 @@ impl MmioTransport {
 
 	/// Snapshot the transport's control-plane state for serialization.
 	pub fn save(&self) -> MmioState {
+		let live_queues = self.device.lock().queue_states();
+		let queues = if live_queues.is_empty() {
+			self.queues.iter().map(|q| q.state()).collect()
+		} else {
+			live_queues
+		};
 		MmioState {
 			device_features_select: self.device_features_select,
 			driver_features_select: self.driver_features_select,
-			acked_features:         self.acked_features,
-			status:                 self.status,
-			activated:              self.activated,
-			queues:                 self.queues.iter().map(|q| q.state()).collect(),
+			acked_features: self.acked_features,
+			status: self.status,
+			activated: self.activated,
+			queues,
 		}
 	}
 
@@ -208,6 +214,13 @@ impl MmioTransport {
 	}
 
 	fn activate(&mut self) {
+		if !self.queues.iter().all(|q| q.is_valid(&self.mem)) {
+			error!("virtio device activation refused invalid queue configuration");
+			crate::metrics::record_device_worker_error();
+			self.status |= VIRTIO_CONFIG_S_FAILED;
+			return;
+		}
+
 		let queues = std::mem::take(&mut self.queues);
 		let mut device = self.device.lock();
 		device.ack_features(self.acked_features);
@@ -227,6 +240,9 @@ impl MmioTransport {
 	/// Unlike `activate`, which records failure in the status register, this
 	/// propagates activation errors to the caller.
 	pub fn reactivate(&mut self) -> crate::result::Result<()> {
+		if !self.queues.iter().all(|q| q.is_valid(&self.mem)) {
+			crate::bail!("virtio device restore refused invalid queue configuration");
+		}
 		let queues = std::mem::take(&mut self.queues);
 		let mut device = self.device.lock();
 		device.ack_features(self.acked_features);
@@ -271,13 +287,19 @@ impl BusDevice for MmioTransport {
 		let value = read_le(data);
 		match offset {
 			DEVICE_FEATURES_SEL => self.device_features_select = value,
-			DRIVER_FEATURES => {
-				let sel = self.driver_features_select.min(1);
-				self.acked_features |= u64::from(value) << (32 * sel);
+			DRIVER_FEATURES if self.driver_features_select < 2 => {
+				let shift = 32 * self.driver_features_select;
+				let mask = 0xffff_ffffu64 << shift;
+				let selected = (u64::from(value) << shift) & self.device_features & mask;
+				self.acked_features = (self.acked_features & !mask) | selected;
 			},
 			DRIVER_FEATURES_SEL => self.driver_features_select = value,
 			QUEUE_SEL => self.queue_select = value as usize,
-			QUEUE_NUM => self.with_queue_mut(|q| q.set_size(value as u16)),
+			QUEUE_NUM => self.with_queue_mut(|q| {
+				if u16::try_from(value).is_ok() {
+					let _ = q.try_set_size(value as u16);
+				}
+			}),
 			QUEUE_READY => self.with_queue_mut(|q| q.set_ready(value == 1)),
 			QUEUE_NOTIFY => {}, // serviced via ioeventfd
 			INTERRUPT_ACK => self.interrupt.ack(value),

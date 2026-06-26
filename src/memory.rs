@@ -4,7 +4,9 @@ use std::{fs::File, io, os::unix::io::AsRawFd};
 
 use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap as VmGuestMemoryMmap};
 
-use crate::result::Result;
+use crate::result::{Result, err};
+
+const PAGE_SIZE: usize = 4096;
 
 /// Concrete guest-memory type used throughout the VMM (no dirty-page bitmap).
 pub type GuestMemoryMmap = VmGuestMemoryMmap<()>;
@@ -15,7 +17,9 @@ pub type GuestMemoryMmap = VmGuestMemoryMmap<()>;
 pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
 	use crate::layout::{FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
 	let size = size as u64;
-	if size <= MMIO_MEM_START {
+	if size == 0 {
+		Vec::new()
+	} else if size <= MMIO_MEM_START {
 		vec![(GuestAddress(0), size as usize)]
 	} else {
 		vec![
@@ -29,12 +33,23 @@ pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
 /// devices and GIC live below it.
 #[cfg(target_arch = "aarch64")]
 pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
-	vec![(GuestAddress(crate::layout::DRAM_BASE), size)]
+	if size == 0 {
+		Vec::new()
+	} else {
+		vec![(GuestAddress(crate::layout::DRAM_BASE), size)]
+	}
 }
 
-/// Allocate guest RAM of `size` bytes as file-backed, `MAP_SHARED` regions so
-/// snapshots can copy RAM and `CoW` forks can remap the snapshot privately.
+/// Allocate non-zero, page-aligned guest RAM of `size` bytes as file-backed,
+/// `MAP_SHARED` regions so snapshots can copy RAM and `CoW` forks can remap
+/// the snapshot privately.
 pub fn create_guest_memory(size: usize) -> Result<GuestMemoryMmap> {
+	if size == 0 {
+		return Err(err("guest memory size is zero"));
+	}
+	if !size.is_multiple_of(PAGE_SIZE) {
+		return Err(err(format!("guest memory size {size} is not page-aligned")));
+	}
 	let regions = arrange_memory(size);
 	let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
 		Vec::with_capacity(regions.len());
@@ -129,7 +144,10 @@ mod macos {
 				},
 				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
 				Err(e) => {
-					return Err(crate::result::err(format!("creating RAM backing {}: {e}", path.display())));
+					return Err(crate::result::err(format!(
+						"creating RAM backing {}: {e}",
+						path.display()
+					)));
 				},
 			}
 		}
@@ -154,18 +172,20 @@ use macos::{create_shared_memory_file, private_mmap_flags};
 
 /// Resize a backing file to exactly `len` bytes.
 fn size_file(file: &File, len: usize) -> Result<()> {
+	let len =
+		libc::off_t::try_from(len).map_err(|_| err("RAM backing file size overflows off_t"))?;
 	// SAFETY: fd is valid; sizing the file to `len` bytes.
-	let ret = unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) };
+	let ret = unsafe { libc::ftruncate(file.as_raw_fd(), len) };
 	if ret < 0 {
 		return Err(io::Error::last_os_error().into());
 	}
 	Ok(())
 }
 
-/// Map a snapshot's memory file `MAP_PRIVATE` per region for a `CoW` fork:
-/// clean pages are shared via the host page cache across every child process,
-/// while a write faults a private copy. `regions` is `(gpa, len, file_offset)`
-/// matching the snapshot's region table.
+/// Map a validated full snapshot memory file `MAP_PRIVATE` per region for a
+/// `CoW` fork: clean pages are shared via the host page cache across every
+/// child process, while a write faults a private copy. `regions` is `(gpa, len,
+/// file_offset)` matching the snapshot's contiguous region table.
 pub fn create_guest_memory_private(
 	mem_file: &std::path::Path,
 	regions: &[(u64, u64, u64)],
@@ -184,10 +204,32 @@ pub fn create_guest_memory_private(
 	if regions.is_empty() {
 		return Err(crate::result::err("snapshot has no memory regions"));
 	}
+	let mut next_file_offset = 0u64;
 	let mut gregions = Vec::with_capacity(regions.len());
-	for &(gpa, len, file_offset) in regions {
+	for (idx, &(gpa, len, file_offset)) in regions.iter().enumerate() {
+		if gpa % PAGE_SIZE as u64 != 0 {
+			return Err(crate::result::err(format!(
+				"snapshot memory region {idx} GPA {gpa:#x} is not page-aligned"
+			)));
+		}
 		if len == 0 {
 			return Err(crate::result::err(format!("snapshot memory region @ {gpa:#x} is empty")));
+		}
+		if len % PAGE_SIZE as u64 != 0 {
+			return Err(crate::result::err(format!(
+				"snapshot memory region @ {gpa:#x} length {len} is not page-aligned"
+			)));
+		}
+		if file_offset % PAGE_SIZE as u64 != 0 {
+			return Err(crate::result::err(format!(
+				"snapshot memory region @ {gpa:#x} file offset {file_offset} is not page-aligned"
+			)));
+		}
+		if file_offset != next_file_offset {
+			return Err(crate::result::err(format!(
+				"snapshot memory region @ {gpa:#x} file offset {file_offset} != expected \
+				 {next_file_offset}"
+			)));
 		}
 		let end = file_offset.checked_add(len).ok_or_else(|| {
 			crate::result::err(format!("snapshot memory region @ {gpa:#x} file offset overflows"))
@@ -197,6 +239,7 @@ pub fn create_guest_memory_private(
 				"snapshot memory region @ {gpa:#x} exceeds snapshot memory file length {file_len}"
 			)));
 		}
+		next_file_offset = end;
 		let len = usize::try_from(len).map_err(|_| {
 			crate::result::err(format!("snapshot memory region @ {gpa:#x} is too large"))
 		})?;
@@ -214,14 +257,56 @@ pub fn create_guest_memory_private(
 			GuestRegionMmap::new(region, GuestAddress(gpa)).ok_or("guest region address overflow")?;
 		gregions.push(greg);
 	}
+	if next_file_offset != file_len {
+		return Err(crate::result::err(format!(
+			"snapshot memory regions cover {next_file_offset} bytes but memory file is {file_len} \
+			 bytes"
+		)));
+	}
 	GuestMemoryMmap::from_regions(gregions)
 		.map_err(|e| crate::result::err(format!("assembling private guest memory: {e}")))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 
+	fn result_err<T>(result: Result<T>) -> String {
+		match result {
+			Ok(_) => panic!("operation unexpectedly succeeded"),
+			Err(e) => e.to_string(),
+		}
+	}
+
+	#[test]
+	fn create_guest_memory_rejects_zero_size() {
+		let err = result_err(create_guest_memory(0));
+		assert!(err.contains("zero"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn create_guest_memory_rejects_unaligned_size() {
+		let err = result_err(create_guest_memory(PAGE_SIZE + 1));
+		assert!(err.contains("page-aligned"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn create_guest_memory_private_rejects_trailing_file_bytes() {
+		let path = std::env::temp_dir().join(format!(
+			"vmon-private-memory-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::write(&path, vec![0; PAGE_SIZE * 2]).unwrap();
+		let err = result_err(create_guest_memory_private(&path, &[(0, PAGE_SIZE as u64, 0)]));
+		let _ = std::fs::remove_file(&path);
+		assert!(err.contains("memory file is"), "unexpected error: {err}");
+	}
+
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn advise_mergeable_smoke() {
 		let mem = create_guest_memory(2 << 20).expect("guest memory");

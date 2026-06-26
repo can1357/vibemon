@@ -101,7 +101,7 @@ impl UserNet {
 	}
 
 	/// Read one vnet-header-prefixed Ethernet frame produced by libslirp.
-	pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+	pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 		let _ = self.packet_evt.read();
 		let Some(packet) = self.packets.lock().pop_front() else {
 			return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -120,7 +120,7 @@ impl UserNet {
 
 	/// Send one vnet-header-prefixed Ethernet frame from the guest into
 	/// libslirp.
-	pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+	pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
 		if buf.len() < VNET_HDR_SIZE {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,

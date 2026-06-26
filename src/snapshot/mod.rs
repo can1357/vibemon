@@ -953,16 +953,43 @@ fn write_state_file(path: &Path, snap: &Snapshot) -> Result<()> {
 fn memory_region_table(mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>> {
 	let mut regions = Vec::new();
 	let mut file_offset = 0u64;
-	for region in mem.iter() {
+	for (idx, region) in mem.iter().enumerate() {
 		let gpa = region.start_addr().raw_value();
 		let len = region.len();
+		if gpa % DELTA_PAGE_SIZE != 0 {
+			return Err(err(format!("guest memory region {idx} GPA {gpa:#x} is not page-aligned")));
+		}
+		if len == 0 {
+			return Err(err(format!("guest memory region {idx} at {gpa:#x} is empty")));
+		}
 		if len % DELTA_PAGE_SIZE != 0 {
 			return Err(err(format!("guest memory region {gpa:#x} length {len} is not page-aligned")));
 		}
 		regions.push(MemRegion { gpa, len, file_offset });
-		file_offset += len;
+		file_offset = file_offset
+			.checked_add(len)
+			.ok_or_else(|| err(format!("guest memory region {idx} file offset overflows")))?;
+	}
+	if regions.is_empty() {
+		return Err(err("guest memory has no regions"));
 	}
 	Ok(regions)
+}
+
+fn region_len_usize(region: &MemRegion) -> Result<usize> {
+	usize::try_from(region.len).map_err(|_| {
+		err(format!("snapshot memory region @ {:#x} length {} exceeds usize", region.gpa, region.len))
+	})
+}
+
+fn regions_total_len(regions: &[MemRegion]) -> Result<u64> {
+	let mut total = 0u64;
+	for (idx, region) in regions.iter().enumerate() {
+		total = total
+			.checked_add(region.len)
+			.ok_or_else(|| err(format!("snapshot memory region {idx} total length overflows")))?;
+	}
+	Ok(total)
 }
 
 /// Dump every guest-RAM region into `path` (slot order) and return the region
@@ -975,10 +1002,11 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
 		let ptr = mem
 			.get_host_address(GuestAddress(region.gpa))
 			.map_err(|e| err(format!("host address for {gpa:#x}: {e}", gpa = region.gpa)))?;
+		let len = region_len_usize(region)?;
 		// SAFETY: `get_host_address` returned a pointer into `mem` for this
 		// region; `memory_region_table` supplied the region length, and `mem`
 		// outlives the read-only slice used for `write_all`.
-		let slice = unsafe { std::slice::from_raw_parts(ptr, region.len as usize) };
+		let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 		file
 			.write_all(slice)
 			.map_err(|e| err(format!("writing region {gpa:#x}: {e}", gpa = region.gpa)))?;
@@ -1016,6 +1044,14 @@ fn dump_delta_memory_file(
 }
 
 fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -> Result<()> {
+	ensure_guest_memory_layout(mem, regions, "snapshot restore destination")?;
+	let expected_len = regions_total_len(regions)?;
+	let memory_len = snapshot_memory_len(path)?;
+	if memory_len != expected_len {
+		return Err(err(format!(
+			"snapshot memory data length {expected_len} != memory file length {memory_len}"
+		)));
+	}
 	let mut file = File::open(path).map_err(|e| err(format!("reading {}: {e}", path.display())))?;
 	for r in regions {
 		file
@@ -1024,10 +1060,11 @@ fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -
 		let ptr = mem
 			.get_host_address(GuestAddress(r.gpa))
 			.map_err(|e| err(format!("host address for {:#x}: {e}", r.gpa)))?;
+		let len = region_len_usize(r)?;
 		// SAFETY: `get_host_address` returned a pointer into the destination
-		// guest mapping, which was sized from the snapshot to cover `r.len`
-		// bytes; the mutable slice is used only for this file read.
-		let dst = unsafe { std::slice::from_raw_parts_mut(ptr, r.len as usize) };
+		// guest mapping, which was checked above to match `regions`; the mutable
+		// slice is used only for this file read.
+		let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 		file
 			.read_exact(dst)
 			.map_err(|e| err(format!("reading region {:#x}: {e}", r.gpa)))?;
@@ -1038,10 +1075,19 @@ fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -
 /// Translate a global page index (across all regions in ascending order) to the
 /// guest physical address it represents.
 fn page_index_to_gpa(page: u64, regions: &[MemRegion]) -> Result<u64> {
-	let byte = page * DELTA_PAGE_SIZE;
+	let byte = page
+		.checked_mul(DELTA_PAGE_SIZE)
+		.ok_or_else(|| err(format!("delta page index {page} byte offset overflows")))?;
 	for region in regions {
-		if byte >= region.file_offset && byte < region.file_offset + region.len {
-			return Ok(region.gpa + (byte - region.file_offset));
+		let end = region
+			.file_offset
+			.checked_add(region.len)
+			.ok_or_else(|| err("snapshot memory region file offset overflows"))?;
+		if byte >= region.file_offset && byte < end {
+			return region
+				.gpa
+				.checked_add(byte - region.file_offset)
+				.ok_or_else(|| err(format!("delta page index {page} guest address overflows")));
 		}
 	}
 	Err(err(format!("delta page index {page} is outside region table")))
@@ -1055,6 +1101,8 @@ fn diff_pages(
 	regions: &[MemRegion],
 	out: &mut File,
 ) -> Result<Vec<u8>> {
+	ensure_guest_memory_layout(base, regions, "base memory")?;
+	ensure_guest_memory_layout(live, regions, "live memory")?;
 	let total_pages = regions.iter().map(|r| r.len / DELTA_PAGE_SIZE).sum::<u64>();
 	let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
 	let mut global_page: u64 = 0;
@@ -1098,9 +1146,13 @@ fn apply_delta_pages(
 	d: &DeltaMemory,
 	regions: &[MemRegion],
 ) -> Result<()> {
+	ensure_guest_memory_layout(mem, regions, "snapshot restore destination")?;
+	let total_ram = regions_total_len(regions)?;
+	let memory_len = snapshot_memory_len(memory_file)?;
+	validate_delta_memory(d, total_ram, memory_len)?;
 	let mut file = File::open(memory_file)
 		.map_err(|e| err(format!("reading {}: {e}", memory_file.display())))?;
-	let total_pages = regions.iter().map(|r| r.len / DELTA_PAGE_SIZE).sum::<u64>();
+	let total_pages = total_ram / DELTA_PAGE_SIZE;
 	let mut file_offset = 0u64;
 	for page in 0..total_pages {
 		let byte_idx = (page / 8) as usize;
@@ -1144,7 +1196,19 @@ fn same_layout(a: &[MemRegion], b: &[MemRegion]) -> bool {
 		&& a
 			.iter()
 			.zip(b.iter())
-			.all(|(x, y)| x.gpa == y.gpa && x.len == y.len)
+			.all(|(x, y)| x.gpa == y.gpa && x.len == y.len && x.file_offset == y.file_offset)
+}
+
+fn ensure_guest_memory_layout(
+	mem: &GuestMemoryMmap,
+	expected: &[MemRegion],
+	context: &str,
+) -> Result<()> {
+	let actual = memory_region_table(mem)?;
+	if !same_layout(&actual, expected) {
+		return Err(err(format!("{context} RAM layout differs from snapshot metadata")));
+	}
+	Ok(())
 }
 
 /// Load a full snapshot's memory file into `mem`.
@@ -1176,6 +1240,7 @@ fn load_layer(
 /// chain.
 pub fn load_memory_chain(dir: &Path, image: &SnapshotImage, mem: &GuestMemoryMmap) -> Result<()> {
 	let expected = image.snapshot().mem_regions.clone();
+	ensure_guest_memory_layout(mem, &expected, "snapshot restore destination")?;
 	load_layer(dir, image, mem, &expected, 0)
 }
 
@@ -1321,6 +1386,19 @@ mod tests {
 		let path = unique_temp_path(prefix);
 		fs::create_dir(&path).unwrap();
 		path
+	}
+
+	fn mem_regions_for_mib(mem_mib: usize) -> Vec<MemRegion> {
+		let mut file_offset = 0u64;
+		memory::arrange_memory(mem_mib << 20)
+			.into_iter()
+			.map(|(addr, len)| {
+				let len = len as u64;
+				let region = MemRegion { gpa: addr.raw_value(), len, file_offset };
+				file_offset += len;
+				region
+			})
+			.collect()
 	}
 
 	#[test]
@@ -1586,6 +1664,33 @@ mod tests {
 		assert_eq!(saved.next, 4);
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[test]
+	fn validate_memory_regions_rejects_full_memory_file_length_mismatch() {
+		let mut snap = snapshot_with_devices(Vec::new());
+		snap.mem_mib = 1;
+		snap.mem_regions = mem_regions_for_mib(1);
+
+		let err = validate_memory_regions(&snap, (1 << 20) + DELTA_PAGE_SIZE)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("memory file length"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn load_memory_chain_rejects_destination_layout_mismatch_before_copy() {
+		let mut snap = snapshot_with_devices(Vec::new());
+		snap.mem_mib = 2;
+		snap.mem_regions = mem_regions_for_mib(2);
+		let image =
+			SnapshotImage { snapshot: snap, memory_file: unique_temp_path("vmon-missing-memory") };
+		let mem = memory::create_guest_memory(1 << 20).unwrap();
+
+		let err = load_memory_chain(Path::new("."), &image, &mem)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("layout differs"), "unexpected error: {err}");
 	}
 
 	#[test]

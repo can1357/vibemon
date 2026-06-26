@@ -340,7 +340,11 @@ mod linux {
 			let mut regions = Vec::new();
 			let mut total_pages = 0usize;
 			for region in mem.iter() {
-				let len = region.len() as usize;
+				let len = usize::try_from(region.len())
+					.map_err(|_| err("pager region length exceeds usize"))?;
+				if len == 0 {
+					return Err(err("pager memory region is empty"));
+				}
 				if !len.is_multiple_of(PAGE_SIZE) {
 					return Err(err(format!("pager region length {len} is not page-aligned")));
 				}
@@ -362,6 +366,9 @@ mod linux {
 				total_pages = total_pages
 					.checked_add(len / PAGE_SIZE)
 					.ok_or_else(|| err("pager page count overflow"))?;
+			}
+			if total_pages == 0 {
+				return Err(err("pager guest memory has no pages"));
 			}
 			let cap = u32::try_from(total_pages)
 				.map_err(|_| err("pager supports at most u32::MAX guest pages"))?;
