@@ -403,10 +403,13 @@ mod linux_agent {
 				}
 
 				let payload = match status {
-					Ok(status) => json!({
-						 "code": status.code().unwrap_or(-1),
-						 "signal": status.signal(),
-					}),
+					Ok(status) => {
+						let signal = status.signal();
+						json!({
+							 "code": status.code().unwrap_or_else(|| signal.map_or(-1, |sig| -sig)),
+							 "signal": signal,
+						})
+					},
 					Err(err) => json!({
 						 "code": -1,
 						 "signal": Value::Null,
