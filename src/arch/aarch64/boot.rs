@@ -14,13 +14,15 @@ use crate::{
 };
 
 const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241; // "ARM\x64"
+const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
 const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
 const GUEST_PAGE_SIZE: u64 = 4096;
+const FDT_ALIGN: u64 = 0x20_0000;
 
 /// A loaded guest kernel.
 pub struct LoadedKernel {
 	pub entry: GuestAddress,
-	/// Exclusive end of the bytes loaded for the arm64 Image.
+	/// Exclusive end of the arm64 Image's reserved in-memory footprint.
 	pub end:   GuestAddress,
 }
 
@@ -48,10 +50,24 @@ pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
 		bail!("kernel {path_display} is not an arm64 Image (bad magic {magic:#x})");
 	}
 
+	let image_size = u64::from_le_bytes(
+		buf[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+			.try_into()
+			.unwrap(),
+	)
+	.max(buf.len() as u64);
 	let entry = GuestAddress(DRAM_BASE + KERNEL_OFFSET);
-	let Some(end) = entry.checked_add(buf.len() as u64) else {
-		bail!("kernel {path_display} end address overflows");
+	let Some(end) = entry.checked_add(image_size) else {
+		bail!("kernel {path_display} reserved end address overflows");
 	};
+	let fdt_addr = checked_fdt_addr(mem)?;
+	if end.raw_value() > fdt_addr {
+		bail!(
+			"kernel {path_display} ({} bytes, reserves {image_size} bytes) overlaps FDT area at \
+			 {fdt_addr:#x}",
+			buf.len()
+		);
+	}
 	mem.write_slice(&buf, entry)?;
 	Ok(LoadedKernel { entry, end })
 }
@@ -72,7 +88,7 @@ pub fn load_uefi_firmware(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKe
 	let Some(end) = entry.checked_add(buf.len() as u64) else {
 		bail!("firmware {path_display} end address overflows");
 	};
-	let fdt_addr = get_fdt_addr(mem);
+	let fdt_addr = checked_fdt_addr(mem)?;
 	if end.raw_value() > fdt_addr {
 		bail!("firmware {path_display} ({} bytes) overlaps FDT area at {fdt_addr:#x}", buf.len());
 	}
@@ -80,12 +96,25 @@ pub fn load_uefi_firmware(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKe
 	Ok(LoadedKernel { entry, end })
 }
 
-/// Guest-physical address where the FDT is placed (top of the first RAM
-/// region).
-pub fn get_fdt_addr(mem: &GuestMemoryMmap) -> u64 {
-	let region = mem.find_region(GuestAddress(DRAM_BASE)).unwrap();
-	let end = region.start_addr().raw_value() + region.len();
-	(end - FDT_MAX_SIZE) & !(0x20_0000 - 1)
+fn checked_fdt_addr(mem: &GuestMemoryMmap) -> Result<u64> {
+	let Some(region) = mem.find_region(GuestAddress(DRAM_BASE)) else {
+		bail!("guest RAM does not contain DRAM base {DRAM_BASE:#x}");
+	};
+	let region_start = region.start_addr().raw_value();
+	let Some(region_end) = region_start.checked_add(region.len()) else {
+		bail!("guest RAM region {region_start:#x}+{:#x} overflows", region.len());
+	};
+	let Some(fdt_floor) = region_end.checked_sub(FDT_MAX_SIZE) else {
+		bail!("guest RAM region is smaller than the reserved FDT area ({FDT_MAX_SIZE:#x} bytes)");
+	};
+	let fdt_addr = fdt_floor & !(FDT_ALIGN - 1);
+	if fdt_addr < region_start {
+		bail!(
+			"guest RAM region {region_start:#x}-{region_end:#x} is too small for an aligned FDT \
+			 reservation"
+		);
+	}
+	Ok(fdt_addr)
 }
 
 /// Load an initrd into RAM just below the FDT.
@@ -101,12 +130,14 @@ pub fn load_initrd(
 	let size = buf.len();
 	let size_u64 = size as u64;
 
-	let fdt_addr = get_fdt_addr(mem);
+	let fdt_addr = checked_fdt_addr(mem)?;
 	let Some(unrounded_addr) = fdt_addr.checked_sub(size_u64) else {
 		bail!("initrd ({size} bytes) does not fit below FDT");
 	};
 	let addr = unrounded_addr & !(GUEST_PAGE_SIZE - 1);
-	let initrd_end = addr + size_u64;
+	let Some(initrd_end) = addr.checked_add(size_u64) else {
+		bail!("initrd ({size} bytes at {addr:#x}) end address overflows");
+	};
 	let kernel_entry = kernel.entry.raw_value();
 	let kernel_end = kernel.end.raw_value();
 	if addr < kernel_end {
@@ -132,8 +163,13 @@ pub fn configure_system(
 	serial: &FdtDevice,
 	virtio: &[FdtDevice],
 ) -> Result<u64> {
-	let region = mem.find_region(GuestAddress(DRAM_BASE)).unwrap();
+	let Some(region) = mem.find_region(GuestAddress(DRAM_BASE)) else {
+		bail!("guest RAM does not contain DRAM base {DRAM_BASE:#x}");
+	};
+	let fdt_addr = checked_fdt_addr(mem)?;
 	let params = FdtParams {
+		fdt_addr,
+		fdt_size: FDT_MAX_SIZE,
 		mem_start: region.start_addr().raw_value(),
 		mem_size: region.len(),
 		mpidrs,
@@ -147,7 +183,6 @@ pub fn configure_system(
 	};
 	let blob = fdt::build_fdt(&params)?;
 
-	let fdt_addr = get_fdt_addr(mem);
 	if blob.len() as u64 > FDT_MAX_SIZE {
 		bail!("device tree ({} bytes) exceeds FDT_MAX_SIZE", blob.len());
 	}

@@ -60,17 +60,17 @@ struct MpfIntel {
 #[repr(C, packed)]
 #[derive(Copy, Clone, Default)]
 struct MpcTable {
-	signature: [u8; 4],
-	length:    u16,
-	spec:      u8,
-	checksum:  u8,
-	oem:       [u8; 8],
-	productid: [u8; 12],
-	oemptr:    u32,
-	oemsize:   u16,
-	oemcount:  u16,
-	lapic:     u32,
-	reserved:  u32,
+	signature:   [u8; 4],
+	length:      u16,
+	spec:        u8,
+	checksum:    u8,
+	oem:         [u8; 8],
+	productid:   [u8; 12],
+	oemptr:      u32,
+	oemsize:     u16,
+	entry_count: u16,
+	lapic:       u32,
+	reserved:    u32,
 }
 
 #[repr(C, packed)]
@@ -157,6 +157,9 @@ fn mp_size(num_cpus: u8) -> usize {
 
 /// Write the MP table describing `num_cpus` processors into guest memory.
 pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
+	if num_cpus == 0 {
+		bail!("MP table requires at least one vCPU");
+	}
 	if num_cpus > MAX_SUPPORTED_CPUS {
 		bail!("{num_cpus} vCPUs exceeds MP table maximum of {MAX_SUPPORTED_CPUS}");
 	}
@@ -190,7 +193,6 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
 		mpf.checksum = mpf_intel_checksum(&mpf);
 		mem.write_obj(mpf, base)?;
 		base = base.unchecked_add(size);
-		num_entries += 1;
 	}
 
 	// Reserve space for the configuration header (filled in last).
@@ -294,7 +296,7 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
 		spec: MPC_SPEC,
 		oem: *b"VMON    ",
 		productid: *b"0000000000\0\0",
-		oemcount: num_entries,
+		entry_count: num_entries,
 		lapic: APIC_DEFAULT_PHYS_BASE,
 		..Default::default()
 	};
@@ -303,4 +305,36 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
 	mem.write_obj(mpc_table, table_base)?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::layout::HIMEM_START;
+
+	#[test]
+	fn entry_count_excludes_floating_pointer() {
+		let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), HIMEM_START as usize)])
+			.expect("guest memory");
+
+		setup_mptable(&mem, 2).expect("MP table");
+
+		let mpf: MpfIntel = mem
+			.read_obj(GuestAddress(EBDA_START))
+			.expect("MP floating pointer");
+		assert_eq!(compute_checksum(&mpf), 0);
+		let physptr = mpf.physptr;
+		let table_addr = GuestAddress(u64::from(physptr));
+		let table: MpcTable = mem.read_obj(table_addr).expect("MP config table");
+		let entry_count = table.entry_count;
+		let length = table.length;
+
+		assert_eq!(entry_count, u16::from(2u8) + 1 + 1 + NUM_IOAPIC_PINS as u16 + 2);
+
+		let mut bytes = vec![0; usize::from(length)];
+		mem.read_slice(&mut bytes, table_addr)
+			.expect("MP config bytes");
+		let checksum = bytes.iter().fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+		assert_eq!(checksum, 0);
+	}
 }

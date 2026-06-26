@@ -211,6 +211,7 @@ impl Config {
 		let mut log_format = LogFormat::Text;
 		let mut log_level = String::from("info");
 		let mut sandbox = true;
+		let mut sandbox_specified = false;
 		let mut no_sandbox = false;
 		let mut sandbox_uid = None;
 		let mut sandbox_gid = None;
@@ -282,7 +283,10 @@ impl Config {
 				"--firmware" => firmware = Some(PathBuf::from(next(&mut args, "--firmware")?)),
 				"--log-format" => log_format = parse_log_format(&next(&mut args, "--log-format")?)?,
 				"--log-level" => log_level = next(&mut args, "--log-level")?,
-				"--sandbox" => sandbox = true,
+				"--sandbox" => {
+					sandbox = true;
+					sandbox_specified = true;
+				},
 				"--no-sandbox" => no_sandbox = true,
 				"--sandbox-uid" => {
 					sandbox_uid = Some(parse(&next(&mut args, "--sandbox-uid")?, "--sandbox-uid")?);
@@ -336,6 +340,9 @@ impl Config {
 		{
 			bail!("--timeout-secs must be between 1 and 86400 (got {n})");
 		}
+		if cgroup_pids_max == Some(0) {
+			bail!("--cgroup-pids-max must be greater than 0");
+		}
 
 		if fs_tag.is_some() != fs_dir.is_some() {
 			bail!("--fs-tag and --fs-dir must be used together");
@@ -346,6 +353,9 @@ impl Config {
 		{
 			let mut seen: Vec<&str> = Vec::new();
 			if let Some(tag) = &fs_tag {
+				if !is_valid_volume_tag(tag) {
+					bail!("--fs-tag must match [a-z0-9_]{{1,32}} (got {tag})");
+				}
 				seen.push(tag.as_str());
 			}
 			for m in &volumes {
@@ -368,6 +378,9 @@ impl Config {
 		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
 			bail!("--transport pci is only supported on x86_64");
 		}
+		if count > 1 && fork_from.is_none() {
+			bail!("--count greater than 1 requires --fork-from");
+		}
 		match (boot_mode, firmware.is_some()) {
 			(BootMode::Uefi, false) => bail!("--boot-mode uefi requires --firmware"),
 			(BootMode::Direct, true) => bail!("--firmware requires --boot-mode uefi"),
@@ -376,8 +389,20 @@ impl Config {
 		if let Some(id) = &id {
 			validate_id(id)?;
 		}
+		if jail && id.is_none() {
+			bail!("--jail requires --id");
+		}
+		if let Some(root) = &jail_root {
+			if !jail {
+				bail!("--jail-root requires --jail");
+			}
+			validate_jail_root(root)?;
+		}
 		if jail && let Some(sock) = &agent_sock {
 			validate_jail_agent_sock(sock)?;
+		}
+		if no_sandbox && sandbox_specified {
+			bail!("--sandbox and --no-sandbox cannot be combined");
 		}
 		if no_sandbox && jail {
 			bail!("--no-sandbox cannot be combined with --jail");
@@ -413,6 +438,7 @@ impl Config {
 			if sandbox_gid.is_none() {
 				sandbox_gid = parse_env_u32("VMON_SANDBOX_GID")?;
 			}
+			validate_sandbox_identity(sandbox_uid, sandbox_gid)?;
 		} else if sandbox_uid.is_some() || sandbox_gid.is_some() {
 			bail!("--sandbox-uid/--sandbox-gid require the sandbox (drop --no-sandbox) or --jail");
 		}
@@ -557,7 +583,13 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
 	}
 	let mut mac = [0u8; 6];
 	for (i, p) in parts.iter().enumerate() {
+		if p.len() != 2 {
+			bail!("invalid MAC byte {p} in {s} (expected two hex digits)");
+		}
 		mac[i] = u8::from_str_radix(p, 16).map_err(|_| err(format!("invalid MAC byte {p}")))?;
+	}
+	if mac[0] & 1 != 0 {
+		bail!("invalid MAC {s} (guest MAC must be unicast)");
 	}
 	Ok(mac)
 }
@@ -644,6 +676,26 @@ fn validate_id(id: &str) -> Result<()> {
 	Ok(())
 }
 
+fn validate_jail_root(root: &Path) -> Result<()> {
+	let escapes = root
+		.components()
+		.any(|component| matches!(component, std::path::Component::ParentDir));
+	if !root.is_absolute() || escapes {
+		bail!("--jail-root must be an absolute path without '..' components (got {root:?})");
+	}
+	Ok(())
+}
+
+fn validate_sandbox_identity(uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+	if uid == Some(0) {
+		bail!("--sandbox-uid/VMON_SANDBOX_UID must be greater than 0");
+	}
+	if gid == Some(0) {
+		bail!("--sandbox-gid/VMON_SANDBOX_GID must be greater than 0");
+	}
+	Ok(())
+}
+
 fn validate_jail_agent_sock(sock: &Path) -> Result<()> {
 	let root = Path::new("/run/vmon");
 	let escapes = sock
@@ -688,19 +740,20 @@ fn print_help(prog: &str) {
 		 --rootfs\n\x20   --console-agent     Attach a virtio-console agent channel \
 		 (/dev/hvc0)\n\x20   --agent-exec <cmd>  Send <cmd> to the guest agent after (warm) \
 		 boot\n\x20   --jail              Run inside Linux cgroup/namespace/pivot-root jail\n\x20   \
-		 --id <name>         VM/jail id (ASCII alnum, '-' or '_')\n\x20   --jail-root <dir>   Jail \
-		 root directory\n\x20   --cgroup-cpu-max <v> cgroup cpu.max value\n\x20   --cgroup-mem-max \
-		 <v> cgroup memory.max value\n\x20   --cgroup-pids-max <n> cgroup pids.max value\n\x20   \
-		 --cgroup-mode <m>   cgroup mode: v2|off (default: v2)\n\x20   --seccomp-action <a> seccomp \
-		 action: kill|errno|log (default: errno)\n\x20   --netns <path>      Operator-created \
-		 network namespace path\n\x20   --boot-mode <mode>  Boot mode: direct|uefi (default: \
-		 direct)\n\x20   --firmware <path>   UEFI firmware image for --boot-mode uefi\n\x20   \
-		 --log-format <fmt>  Log format: text|json (default: text)\n\x20   --log-level <level> Log \
-		 level filter (default: info)\n\x20   --sandbox           Apply the Linux process sandbox \
-		 (default: on)\n\x20   --no-sandbox        Disable the default sandbox (not valid with \
-		 --jail)\n\x20   --sandbox-uid <uid> UID drop target; required as root unless \
-		 --no-sandbox\n\x20   --sandbox-gid <gid> GID drop target; required as root unless \
-		 --no-sandbox\n\x20   -h, --help          Show this help"
+		 --id <name>         VM/jail id (required with --jail; ASCII alnum, '-' or '_')\n\x20   \
+		 --jail-root <dir>   Absolute jail root directory\n\x20   --cgroup-cpu-max <v> cgroup \
+		 cpu.max value\n\x20   --cgroup-mem-max <v> cgroup memory.max value\n\x20   \
+		 --cgroup-pids-max <n> cgroup pids.max value (>0)\n\x20   --cgroup-mode <m>   cgroup mode: \
+		 v2|off (default: v2)\n\x20   --seccomp-action <a> seccomp action: kill|errno|log (default: \
+		 errno)\n\x20   --netns <path>      Operator-created network namespace path\n\x20   \
+		 --boot-mode <mode>  Boot mode: direct|uefi (default: direct)\n\x20   --firmware <path>   \
+		 UEFI firmware image for --boot-mode uefi\n\x20   --log-format <fmt>  Log format: text|json \
+		 (default: text)\n\x20   --log-level <level> Log level filter (default: info)\n\x20   \
+		 --sandbox           Apply the Linux process sandbox (default: on)\n\x20   --no-sandbox        \
+		 Disable the default sandbox (not valid with --jail)\n\x20   --sandbox-uid <uid> UID drop \
+		 target (>0); required as root unless --no-sandbox\n\x20   --sandbox-gid <gid> GID drop \
+		 target (>0); required as root unless --no-sandbox\n\x20   --timeout-secs <n>  Exit after n \
+		 seconds (1..=86400)\n\x20   -h, --help          Show this help"
 	);
 }
 
@@ -908,8 +961,17 @@ mod tests {
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--id", "bad.name"], "--id");
 		let long_id = "a".repeat(65);
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--id", long_id.as_str()], "--id");
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--jail"], "--jail requires --id");
 		assert_config_err_contains(
-			&["vmon", "--kernel", "k", "--jail", "--agent-sock", "/tmp/agent.sock"],
+			&["vmon", "--kernel", "k", "--jail-root", "/srv/jailer/vm1"],
+			"--jail-root requires --jail",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--jail", "--id", "vm1", "--jail-root", "relative"],
+			"--jail-root must be an absolute path",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--jail", "--id", "vm1", "--agent-sock", "/tmp/agent.sock"],
 			"--agent-sock must be inside /run/vmon",
 		);
 	}
@@ -922,6 +984,13 @@ mod tests {
 			&["vmon", "--kernel", "k", "--count", too_many_count.as_str()],
 			"--count",
 		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--count", "2"],
+			"--count greater than 1 requires --fork-from",
+		);
+		let fanout = parse_config(&["vmon", "--fork-from", "snapshot", "--count", "2"])
+			.expect("--count > 1 parses with --fork-from");
+		assert_eq!(fanout.count, 2);
 
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--cpus", "0"], "--cpus");
 		let too_many_cpus = (u16::from(MAX_CPUS) + 1).to_string();
@@ -936,12 +1005,20 @@ mod tests {
 			&["vmon", "--kernel", "k", "--mem", too_much_mem.as_str()],
 			"--mem",
 		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--cgroup-pids-max", "0"],
+			"--cgroup-pids-max must be greater than 0",
+		);
 	}
 
 	#[test]
 	fn requires_fs_tag_and_dir_to_be_paired() {
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-tag", "host"], "--fs-tag");
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-dir", "/srv"], "--fs-tag");
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--fs-tag", "Bad-Tag", "--fs-dir", "/srv"],
+			"--fs-tag must match [a-z0-9_]",
+		);
 
 		let cfg = parse_config(&["vmon", "--kernel", "k", "--fs-tag", "host", "--fs-dir", "/srv"])
 			.expect("paired virtio-fs flags parse");
@@ -985,6 +1062,18 @@ mod tests {
 			.expect("explicit --mac parses");
 		assert!(cfg.mac_specified);
 		assert_eq!(cfg.mac, [0x02, 0x00, 0x00, 0x00, 0x00, 0x2a]);
+	}
+
+	#[test]
+	fn rejects_invalid_mac_overrides() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--mac", "2:00:00:00:00:01"],
+			"expected two hex digits",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--mac", "03:00:00:00:00:01"],
+			"guest MAC must be unicast",
+		);
 	}
 
 	#[cfg(not(target_os = "macos"))]
@@ -1033,9 +1122,9 @@ mod tests {
 		assert!(cfg.jail);
 	}
 	#[test]
-	fn rejects_sandbox_identity_when_disabled() {
-		// The sandbox is default-on, so identity flags only error when the
-		// sandbox is explicitly disabled (--no-sandbox) and --jail is unset.
+	fn rejects_invalid_sandbox_identity_flags() {
+		// The sandbox is default-on, so identity flags only require an enabled
+		// sandbox unless it is explicitly disabled (--no-sandbox) and --jail is unset.
 		assert_config_err_contains(
 			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-uid", "1000"],
 			"require the sandbox",
@@ -1044,6 +1133,12 @@ mod tests {
 			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-gid", "1000"],
 			"require the sandbox",
 		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--sandbox", "--no-sandbox"],
+			"cannot be combined",
+		);
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--sandbox-uid", "0"], "--sandbox-uid");
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--sandbox-gid", "0"], "--sandbox-gid");
 	}
 
 	#[cfg(target_os = "linux")]

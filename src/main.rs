@@ -35,26 +35,28 @@ fn main() {
 
 fn run() -> result::Result<()> {
 	let config = Config::from_args()?;
-	init_logging(&config);
+	init_logging(&config)?;
 	vmm::run(config)
 }
 
-fn init_logging(config: &Config) {
-	let filter = || EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_logging(config: &Config) -> result::Result<()> {
+	let filter = EnvFilter::try_new(&config.log_level)
+		.map_err(|e| result::err(format!("invalid --log-level {}: {e}", config.log_level)))?;
 
 	match config.log_format {
 		LogFormat::Text => {
 			let _ = tracing_subscriber::fmt()
-				.with_env_filter(filter())
+				.with_env_filter(filter)
 				.with_writer(std::io::stderr)
 				.try_init();
 		},
 		LogFormat::Json => {
 			let _ = tracing_subscriber::fmt()
 				.json()
-				.with_env_filter(filter())
+				.with_env_filter(filter)
 				.with_writer(std::io::stderr)
 				.try_init();
 		},
 	}
+	Ok(())
 }

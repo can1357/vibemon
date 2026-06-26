@@ -136,13 +136,14 @@ pub fn map_uefi_firmware(
 	Ok(firmware)
 }
 
-/// Read an initrd/initramfs image into low guest RAM, below the kernel's
-/// highest permitted initrd address.
+/// Read an initrd/initramfs image into guest RAM above the low boot-data area,
+/// below the kernel's highest permitted initrd address.
 ///
 /// `initrd_addr_max` is the kernel's documented ceiling (from the bzImage setup
 /// header, or `0x37FF_FFFF` for raw ELF / old protocols). The image is placed
 /// page-aligned as high as possible within `min(lowmem_end,
-/// initrd_addr_max+1)`.
+/// initrd_addr_max+1)`, but never below 1 MiB where the zero page, command
+/// line, page tables, MP table and legacy firmware-reserved areas live.
 pub fn load_initrd(
 	path: &Path,
 	mem: &GuestMemoryMmap,
@@ -152,6 +153,7 @@ pub fn load_initrd(
 	let mut buf = Vec::new();
 	file.read_to_end(&mut buf)?;
 	let size = buf.len();
+	let size_u64 = u64::try_from(size).map_err(|_| "initrd size does not fit in u64")?;
 
 	let first = mem
 		.find_region(GuestAddress(0))
@@ -159,10 +161,14 @@ pub fn load_initrd(
 	let lowmem = first.len();
 	// Exclusive upper bound: stay within RAM and at/below the kernel's ceiling.
 	let ceiling = lowmem.min(initrd_addr_max.saturating_add(1));
-	if (size as u64) > ceiling {
-		bail!("initrd ({size} bytes) does not fit below {ceiling:#x}");
+	if ceiling <= HIMEM_START {
+		bail!("no room for initrd above x86 boot data below {ceiling:#x}");
 	}
-	let addr = (ceiling - size as u64) & !(GUEST_PAGE_SIZE - 1);
+	let available = ceiling - HIMEM_START;
+	if size_u64 > available {
+		bail!("initrd ({size} bytes) does not fit between {HIMEM_START:#x} and {ceiling:#x}");
+	}
+	let addr = (ceiling - size_u64) & !(GUEST_PAGE_SIZE - 1);
 	let addr = GuestAddress(addr);
 	mem.write_slice(&buf, addr)?;
 	Ok((addr, size))
@@ -200,8 +206,11 @@ pub fn configure_system(
 	params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
 	params.hdr.cmd_line_ptr = u32::try_from(CMDLINE_START).unwrap();
 	if let Some((addr, size)) = initrd {
-		params.hdr.ramdisk_image = u32::try_from(addr.raw_value()).unwrap();
-		params.hdr.ramdisk_size = u32::try_from(size).unwrap();
+		validate_initrd_range(mem, addr, size)?;
+		params.hdr.ramdisk_image = u32::try_from(addr.raw_value())
+			.map_err(|_| "initrd address exceeds 32-bit Linux boot protocol field")?;
+		params.hdr.ramdisk_size =
+			u32::try_from(size).map_err(|_| "initrd size exceeds 32-bit Linux boot protocol field")?;
 	}
 	if have_setup_header {
 		// `cmdline_size` is the kernel's read-only maximum; just check we fit.
@@ -458,6 +467,28 @@ fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
 	buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn validate_initrd_range(mem: &GuestMemoryMmap, addr: GuestAddress, size: usize) -> Result<()> {
+	if size == 0 {
+		return Ok(());
+	}
+	if addr.raw_value() < HIMEM_START {
+		bail!("initrd at {:#x} overlaps x86 boot data below {HIMEM_START:#x}", addr.raw_value());
+	}
+	let end = addr
+		.checked_add(size as u64 - 1)
+		.ok_or("initrd address range overflow")?;
+	if end.raw_value() > u64::from(u32::MAX) {
+		bail!(
+			"initrd at {:#x} ({size} bytes) exceeds 32-bit Linux boot protocol range",
+			addr.raw_value()
+		);
+	}
+	if !mem.check_range(addr, size) {
+		bail!("initrd at {:#x} ({size} bytes) is outside guest RAM", addr.raw_value());
+	}
+	Ok(())
 }
 
 fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32) -> Result<()> {

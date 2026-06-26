@@ -192,12 +192,12 @@ impl PauseGate {
 	/// all vCPUs are parked.
 	pub fn wait_for_all_parked(&self, timeout: Duration) -> bool {
 		let mut g = self.parked.lock();
-		if g.iter().filter(|parked| **parked).count() >= self.cpus as usize {
-			true
-		} else {
-			self.cv.wait_for(&mut g, timeout);
-			g.iter().filter(|parked| **parked).count() >= self.cpus as usize
-		}
+		self.cv.wait_while_for(
+			&mut g,
+			|parked| parked.iter().filter(|is_parked| **is_parked).count() < self.cpus as usize,
+			timeout,
+		);
+		g.iter().filter(|parked| **parked).count() >= self.cpus as usize
 	}
 
 	/// Install a backend-specific wakeup for vCPU APIs that are not
@@ -281,6 +281,22 @@ pub struct SocketOwner {
 	pub gid: u32,
 }
 
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+	dev: u64,
+	ino: u64,
+}
+
+impl SocketIdentity {
+	fn from_metadata(meta: &fs::Metadata) -> Self {
+		Self { dev: meta.dev(), ino: meta.ino() }
+	}
+
+	fn matches(self, meta: &fs::Metadata) -> bool {
+		self.dev == meta.dev() && self.ino == meta.ino()
+	}
+}
+
 /// Bound control socket listener. Binding can happen before sandbox uid/gid
 /// drops; serving starts later, after the process sandbox is in place.
 pub struct ControlServer {
@@ -288,20 +304,26 @@ pub struct ControlServer {
 	owner_uid:  u32,
 	launch_uid: u32,
 	listener:   UnixListener,
+	identity:   SocketIdentity,
 }
 
 pub struct ControlCleanup {
 	sock_path: PathBuf,
 	owner_uid: u32,
+	identity:  SocketIdentity,
 }
 
 impl ControlServer {
 	pub fn cleanup(&self) {
-		cleanup_socket_for_uid(&self.sock_path, self.owner_uid);
+		cleanup_socket_for_uid(&self.sock_path, self.owner_uid, Some(self.identity));
 	}
 
 	pub fn cleanup_token(&self) -> ControlCleanup {
-		ControlCleanup { sock_path: self.sock_path.clone(), owner_uid: self.owner_uid }
+		ControlCleanup {
+			sock_path: self.sock_path.clone(),
+			owner_uid: self.owner_uid,
+			identity:  self.identity,
+		}
 	}
 
 	pub fn start(self, tx: Sender<ControlCmd>) {
@@ -323,7 +345,7 @@ impl ControlServer {
 
 impl ControlCleanup {
 	pub fn cleanup(&self) {
-		cleanup_socket_for_uid(&self.sock_path, self.owner_uid);
+		cleanup_socket_for_uid(&self.sock_path, self.owner_uid, Some(self.identity));
 	}
 }
 
@@ -348,23 +370,51 @@ pub fn bind(
 	if let Some(owner) = owner
 		&& let Err(e) = chown_path(&sock_path, owner)
 	{
-		cleanup_socket_for_uid(&sock_path, current_euid());
+		cleanup_socket_for_uid(&sock_path, current_euid(), None);
 		return Err(e);
 	}
 	if let Err(e) = chmod_path(&sock_path, 0o600) {
-		cleanup_socket_for_uid(&sock_path, owner_uid);
+		cleanup_socket_for_uid(&sock_path, owner_uid, None);
 		return Err(e);
 	}
-	Ok(ControlServer { sock_path, owner_uid, launch_uid, listener })
+	let identity = match bound_socket_identity(&sock_path, owner_uid) {
+		Ok(identity) => identity,
+		Err(e) => {
+			cleanup_socket_for_uid(&sock_path, owner_uid, None);
+			return Err(e);
+		},
+	};
+	Ok(ControlServer { sock_path, owner_uid, launch_uid, listener, identity })
 }
 
-fn cleanup_socket_for_uid(sock_path: &Path, expected_uid: u32) {
+fn bound_socket_identity(sock_path: &Path, expected_uid: u32) -> Result<SocketIdentity> {
+	let meta = fs::symlink_metadata(sock_path)?;
+	if !meta.file_type().is_socket() {
+		return Err(err(format!("bound control path {} is not a socket", sock_path.display())));
+	}
+	if meta.uid() != expected_uid {
+		return Err(err(format!(
+			"bound control socket {} is owned by uid {}, expected uid {expected_uid}",
+			sock_path.display(),
+			meta.uid()
+		)));
+	}
+	Ok(SocketIdentity::from_metadata(&meta))
+}
+
+fn cleanup_socket_for_uid(sock_path: &Path, expected_uid: u32, identity: Option<SocketIdentity>) {
 	let Ok(meta) = fs::symlink_metadata(sock_path) else {
 		return;
 	};
-	if meta.file_type().is_socket() && meta.uid() == expected_uid {
-		let _ = fs::remove_file(sock_path);
+	if !meta.file_type().is_socket() || meta.uid() != expected_uid {
+		return;
 	}
+	if let Some(identity) = identity
+		&& !identity.matches(&meta)
+	{
+		return;
+	}
+	let _ = fs::remove_file(sock_path);
 }
 
 fn prepare_socket_path(sock_path: &Path, owner: Option<SocketOwner>) -> Result<()> {
@@ -730,7 +780,7 @@ struct Response {
 
 enum RequestLine {
 	Text(String),
-	BadRequest(&'static str),
+	BadRequest { message: &'static str, close: bool },
 }
 
 /// Serve one client connection until EOF or an IO error.
@@ -749,8 +799,10 @@ fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 	loop {
 		let request = match read_request_line(&mut reader, &mut line) {
 			Ok(Some(RequestLine::Text(request))) => request,
-			Ok(Some(RequestLine::BadRequest(message))) => {
-				if write_error(&mut writer, None, ApiError::bad_request(message)).is_err() {
+			Ok(Some(RequestLine::BadRequest { message, close })) => {
+				let write_failed =
+					write_error(&mut writer, None, ApiError::bad_request(message)).is_err();
+				if write_failed || close {
 					return;
 				}
 				continue;
@@ -817,11 +869,10 @@ fn read_request_line(
 	line: &mut Vec<u8>,
 ) -> io::Result<Option<RequestLine>> {
 	line.clear();
-	let mut overlong = false;
 	loop {
 		let available = reader.fill_buf()?;
 		if available.is_empty() {
-			if line.is_empty() && !overlong {
+			if line.is_empty() {
 				return Ok(None);
 			}
 			break;
@@ -833,25 +884,25 @@ fn read_request_line(
 			.map_or(available.len(), |pos| pos + 1);
 		let newline = available[..take].last() == Some(&b'\n');
 		let payload_len = take - usize::from(newline);
-		if !overlong {
-			if line.len() + payload_len > CONTROL_MAX_REQUEST_LINE {
-				overlong = true;
-				line.clear();
-			} else {
-				line.extend_from_slice(&available[..take]);
-			}
+		if line.len() + payload_len > CONTROL_MAX_REQUEST_LINE {
+			reader.consume(take);
+			return Ok(Some(RequestLine::BadRequest {
+				message: "control request line exceeds 65536 bytes",
+				close:   true,
+			}));
 		}
+		line.extend_from_slice(&available[..take]);
 		reader.consume(take);
 		if newline {
 			break;
 		}
 	}
 
-	if overlong {
-		return Ok(Some(RequestLine::BadRequest("control request line exceeds 65536 bytes")));
-	}
 	let Ok(request) = std::str::from_utf8(line) else {
-		return Ok(Some(RequestLine::BadRequest("control request line is not valid UTF-8")));
+		return Ok(Some(RequestLine::BadRequest {
+			message: "control request line is not valid UTF-8",
+			close:   false,
+		}));
 	};
 	Ok(Some(RequestLine::Text(request.trim().to_owned())))
 }
@@ -956,6 +1007,58 @@ mod tests {
 		assert!(socket_owner_is_allowed(1000, 1000, None));
 		assert!(socket_owner_is_allowed(0, 1000, Some(0)));
 		assert!(!socket_owner_is_allowed(1001, 1000, Some(0)));
+	}
+
+	#[test]
+	fn oversized_request_line_is_rejected_and_connection_is_closed() {
+		use std::{io::Write, os::unix::net::UnixStream, thread};
+
+		let (mut writer, reader) = UnixStream::pair().unwrap();
+		let handle = thread::spawn(move || {
+			let payload = vec![b'a'; CONTROL_MAX_REQUEST_LINE + 1];
+			let _ = writer.write_all(&payload);
+		});
+		let mut reader = BufReader::new(reader);
+		let mut line = Vec::new();
+
+		let request = read_request_line(&mut reader, &mut line).unwrap();
+
+		assert!(matches!(
+			request,
+			Some(RequestLine::BadRequest {
+				message: "control request line exceeds 65536 bytes",
+				close:   true,
+			})
+		));
+		drop(reader);
+		handle.join().unwrap();
+	}
+
+	#[test]
+	fn cleanup_skips_reused_socket_path_with_different_inode() {
+		use std::{fs, os::unix::net::UnixListener};
+
+		let dir = std::env::temp_dir().join(format!(
+			"vmon-control-cleanup-{}-{}",
+			std::process::id(),
+			"reuse"
+		));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir(&dir).unwrap();
+		let sock = dir.join("control.sock");
+		let listener = UnixListener::bind(&sock).unwrap();
+		let meta = fs::symlink_metadata(&sock).unwrap();
+		let identity = SocketIdentity::from_metadata(&meta);
+		drop(listener);
+		fs::remove_file(&sock).unwrap();
+
+		let replacement = UnixListener::bind(&sock).unwrap();
+		cleanup_socket_for_uid(&sock, meta.uid(), Some(identity));
+
+		assert!(sock.exists(), "cleanup removed a replacement socket");
+		drop(replacement);
+		fs::remove_file(&sock).unwrap();
+		fs::remove_dir(&dir).unwrap();
 	}
 
 	#[test]

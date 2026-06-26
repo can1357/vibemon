@@ -5,9 +5,9 @@
 //! Structure follows Firecracker's aarch64 FDT (Apache-2.0), trimmed to the
 //! nodes a barebones VMM needs.
 
-use vm_fdt::FdtWriter;
+use vm_fdt::{FdtReserveEntry, FdtWriter};
 
-use crate::result::Result;
+use crate::{bail, result::Result};
 
 const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
@@ -27,6 +27,8 @@ pub struct FdtDevice {
 
 /// Inputs for building the device tree.
 pub struct FdtParams<'a> {
+	pub fdt_addr:       u64,
+	pub fdt_size:       u64,
 	pub mem_start:      u64,
 	pub mem_size:       u64,
 	pub mpidrs:         &'a [u64],
@@ -41,7 +43,19 @@ pub struct FdtParams<'a> {
 
 /// Build the flattened device tree blob.
 pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
-	let mut fdt = FdtWriter::new()?;
+	if p.mpidrs.is_empty() {
+		bail!("FDT requires at least one CPU");
+	}
+	let mut reservations = Vec::new();
+	if p.fdt_size != 0 {
+		reservations.push(FdtReserveEntry::new(p.fdt_addr, p.fdt_size)?);
+	}
+	if let Some((addr, size)) = p.initrd
+		&& size != 0
+	{
+		reservations.push(FdtReserveEntry::new(addr, size as u64)?);
+	}
+	let mut fdt = FdtWriter::new_with_mem_reserv(&reservations)?;
 
 	let root = fdt.begin_node("")?;
 	fdt.property_string("compatible", "linux,dummy-virt")?;
@@ -53,12 +67,13 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 	let cpus = fdt.begin_node("cpus")?;
 	fdt.property_u32("#address-cells", 2)?;
 	fdt.property_u32("#size-cells", 0)?;
-	for (i, &mpidr) in p.mpidrs.iter().enumerate() {
-		let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
+	for &mpidr in p.mpidrs {
+		let reg = mpidr & 0x7f_ffff;
+		let cpu = fdt.begin_node(&format!("cpu@{reg:x}"))?;
 		fdt.property_string("device_type", "cpu")?;
 		fdt.property_string("compatible", "arm,arm-v8")?;
 		fdt.property_string("enable-method", "psci")?;
-		fdt.property_u64("reg", mpidr & 0x7f_ffff)?;
+		fdt.property_u64("reg", reg)?;
 		fdt.end_node(cpu)?;
 	}
 	fdt.end_node(cpus)?;
@@ -71,8 +86,11 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 	let chosen = fdt.begin_node("chosen")?;
 	fdt.property_string("bootargs", p.cmdline)?;
 	if let Some((addr, size)) = p.initrd {
+		let Some(end) = addr.checked_add(size as u64) else {
+			bail!("initrd end address overflows in FDT");
+		};
 		fdt.property_u64("linux,initrd-start", addr)?;
-		fdt.property_u64("linux,initrd-end", addr + size as u64)?;
+		fdt.property_u64("linux,initrd-end", end)?;
 	}
 	fdt.end_node(chosen)?;
 
@@ -111,7 +129,7 @@ pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
 
 	// PSCI (for SMP bring-up + power-off).
 	let psci = fdt.begin_node("psci")?;
-	fdt.property_string("compatible", "arm,psci-0.2")?;
+	fdt.property_string_list("compatible", vec!["arm,psci-1.0".into(), "arm,psci-0.2".into()])?;
 	fdt.property_string("method", "hvc")?;
 	fdt.end_node(psci)?;
 

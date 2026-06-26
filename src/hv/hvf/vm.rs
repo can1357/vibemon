@@ -62,9 +62,19 @@ impl Vm {
 		gic_cfg.set_distributor_base(crate::layout::GIC_DIST_BASE)?;
 		gic_cfg.set_redistributor_base(crate::layout::GIC_REDIST_BASE)?;
 
-		let instance = VirtualMachine::with_gic(vm_cfg, gic_cfg)?;
+		let instance = VirtualMachine::with_gic(vm_cfg, gic_cfg).map_err(|e| {
+			err(format!(
+				"creating HVF VM with GIC failed: {e}; on macOS this usually means the process lacks \
+				 the Hypervisor entitlement or Hypervisor.framework is unavailable"
+			))
+		})?;
 		Self::register_memory(&memory)?;
-		let max_vcpus = HvVcpuApi::get_max_count()? as usize;
+		let max_vcpus = HvVcpuApi::get_max_count().map_err(|e| {
+			err(format!(
+				"querying HVF vCPU limit failed: {e}; on macOS this can indicate missing Hypervisor \
+				 entitlement"
+			))
+		})? as usize;
 		Ok(Self {
 			instance,
 			memory,
@@ -154,7 +164,12 @@ fn create_vcpu(
 	id: u8,
 	hv_run: Arc<AtomicBool>,
 ) -> Result<Vcpu> {
-	let inner = vm.vcpu_create()?;
+	let inner = vm.vcpu_create().map_err(|e| {
+		err(format!(
+			"creating HVF vCPU {id} failed: {e}; on macOS this can indicate missing Hypervisor \
+			 entitlement"
+		))
+	})?;
 	let mpidr = mpidr_for_id(id);
 	inner.set_sys_reg(HvSysReg::MPIDR_EL1, mpidr)?;
 	psci.register_mpidr(usize::from(id), mpidr)?;
