@@ -127,23 +127,68 @@ seccomp-audit: fetch-assets
 seccomp-audit:
     @{{just_executable()}} lima-seccomp-audit
 
-# --------------------------------------------------------------- checks / misc
+# ------------------------------------------------------- format / lint / check
+#
+# Umbrella recipes fan out across all three toolchains: the web UI (biome), the
+# Python SDK/CLI (ruff + mypy), and the Rust workspace (cargo fmt/clippy/check).
+# Per-language recipes (`*-rust`, `*-py`, `*-ui`) run one toolchain in isolation.
 
-# Type-check the workspace for the host target.
-check:
-    cargo check --workspace --all-targets
+# Format every language in place.
+format: fmt-rust fmt-py fmt-ui
 
-# Clippy with warnings denied.
-clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+# Verify formatting across every language without writing (CI gate).
+fmt-check: fmt-check-rust fmt-check-py fmt-check-ui
 
-# Format the workspace.
-fmt:
+# Lint every language (biome | ruff | clippy).
+lint: lint-rust lint-py lint-ui
+
+# Static/type-check every language (tsc | mypy | cargo check).
+check: check-rust check-py check-ui
+
+# -- Rust --
+fmt-rust:
     cargo fmt --all
 
-# Verify formatting without writing.
-fmt-check:
+fmt-check-rust:
     cargo fmt --all -- --check
+
+lint-rust:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+check-rust:
+    cargo check --workspace --all-targets
+
+# -- Python (python/) --
+fmt-py:
+    cd python && uv run ruff format .
+
+fmt-check-py:
+    cd python && uv run ruff format --check .
+
+lint-py:
+    cd python && uv run ruff check .
+
+check-py:
+    cd python && uv run mypy
+
+# Python test suite (server extra pulls in the FastAPI gateway tests).
+test-py:
+    cd python && uv run --extra server pytest
+
+# -- Web UI (ui/) --
+fmt-ui:
+    cd ui && bun run format
+
+fmt-check-ui:
+    cd ui && bun run format:check
+
+lint-ui:
+    cd ui && bun run lint
+
+check-ui:
+    cd ui && bun run typecheck
+
+# ----------------------------------------------------------------------- assets
 
 # Download pinned UEFI firmware + guest images used by the integration suite.
 fetch-assets:
@@ -154,7 +199,7 @@ fetch-test-assets: fetch-assets
 
 # Build the React/Vite web UI into python/vmon/web.
 ui:
-    cd ui && npm install && npm run build
+    cd ui && bun install && bun run build
 
 # Build the statically linked (musl) guest agent for the host arch and bundle it
 # into the Python package (python/vmon/_agent) so `vmon run` finds it unflagged.
