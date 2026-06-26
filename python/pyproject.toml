@@ -16,9 +16,20 @@ dependencies = [
 server = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    # pydantic v2 evaluates `X | Y` model annotations at import time; on Python
+    # <3.10 that PEP 604 syntax needs this backport to resolve.
+    "eval-type-backport>=0.2; python_version < '3.10'",
 ]
 test = [
     "pytest",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15",
+    "mypy>=1.13",
+    "pytest>=8",
+    "httpx>=0.28",       # starlette TestClient, used by tests/test_server.py
 ]
 
 [project.scripts]
@@ -30,3 +41,32 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 vmon = ["web/**/*", "_agent/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# pyflakes (F) + pycodestyle (E/W) + isort (I) + pyupgrade (UP) + bugbear (B)
+# + comprehensions (C4): a strong, non-pedantic baseline.
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+    # `dict(key=value)` reads cleanly as kwargs and is used consistently here;
+    # forcing quoted-key literals would be a readability downgrade.
+    "C408",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's dependency-injection idiom puts Query()/Depends() calls in argument
+# defaults, which B008 (function-call-in-default-argument) flags as a bug.
+"vmon/server.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["vmon"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
