@@ -324,6 +324,7 @@ async def _close_servers(servers: Sequence[asyncio.AbstractServer]) -> None:
         server.close()
     await asyncio.gather(*(server.wait_closed() for server in servers), return_exceptions=True)
 
+
 async def _cancel_tasks(tasks: set[asyncio.Task[None]]) -> None:
     for task in tasks:
         task.cancel()
