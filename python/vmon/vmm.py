@@ -52,41 +52,75 @@ def _which_all(name: str):
             yield candidate
 
 
-def find_binary() -> str:
-    """Locate the vmon VMM binary (env override, repo target dirs, or PATH).
+def _cargo_target_dir(repo: Path) -> Path | None:
+    """The cargo target directory for *repo* (``$CARGO_TARGET_DIR`` or ``cargo metadata``).
 
-    The PATH fallback skips the ``vmon`` Python console script so the daemon never
-    re-execs the CLI as the per-VM runtime.
+    Honors a custom ``build.target-dir`` set in cargo config, which a bare
+    ``$CARGO_TARGET_DIR`` env lookup misses.
+    """
+    if env := os.environ.get("CARGO_TARGET_DIR"):
+        return Path(env)
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout
+        return Path(json.loads(out)["target_directory"])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def find_binary() -> str:
+    """Locate the vmon VMM binary (env override, cargo target dirs, or PATH).
+
+    Searches ``$VMON_BIN``, then the repo's cargo target directory across native
+    and cross ``release``/``debug`` layouts, then ``PATH``. The PATH fallback
+    skips the ``vmon`` Python console script so the daemon never re-execs the CLI
+    as the per-VM runtime. On macOS a plain ``cargo build`` of the repo produces a
+    binary ad-hoc codesigned with ``com.apple.security.hypervisor``, which this
+    resolver finds without any flags.
     """
     if env := os.environ.get("VMON_BIN"):
         return env
-    triple = f"{_arch()}-unknown-linux-gnu"
-    here = Path(__file__).resolve()
-    repo = here.parents[2]
-    candidates = [
-        repo / "target" / triple / "release" / "vmon",
-        repo / "target" / "release" / "vmon",
-    ]
-    if target_dir := os.environ.get("CARGO_TARGET_DIR"):
-        candidates.append(Path(target_dir) / triple / "release" / "vmon")
-    for c in candidates:
-        if c.is_file() and os.access(c, os.X_OK):
-            return str(c)
+    arch = _arch()
+    repo = Path(__file__).resolve().parents[2]
+    triples = ["", f"{arch}-unknown-linux-gnu", f"{arch}-unknown-linux-musl",
+               f"{arch}-apple-darwin"]
+
+    def probe(root: Path) -> str | None:
+        for triple in triples:
+            for profile in ("release", "debug"):
+                c = root / triple / profile / "vmon"
+                if c.is_file() and os.access(c, os.X_OK):
+                    return str(c)
+        return None
+
+    if found := probe(repo / "target"):
+        return found
+    if (target_dir := _cargo_target_dir(repo)) is not None and (found := probe(target_dir)):
+        return found
     for found in _which_all("vmon"):
         if not _is_python_console_script(found):
             return found
     raise RuntimeError(
-        "vmon binary not found. Build it (cargo build --release) or set VMON_BIN."
+        "vmon binary not found. Build it (cargo build) or set VMON_BIN."
     )
 
 
 def default_kernel() -> str:
+    """Resolve a guest kernel for the host arch.
+
+    Order: ``$VMON_KERNEL`` override, a matching host kernel under ``/boot``
+    (Linux), then a pinned kernel auto-downloaded into ``$VMON_HOME/assets`` on
+    first use (so macOS/HVF hosts need no manual setup).
+    """
     if env := os.environ.get("VMON_KERNEL"):
         return env
     k = Path(f"/boot/vmlinuz-{platform.release()}")
     if k.is_file():
         return str(k)
-    raise RuntimeError("no kernel found; set VMON_KERNEL=/path/to/Image-or-bzImage")
+    from .assets import ensure_kernel
+    return str(ensure_kernel())
 
 
 def _cmdline() -> str:
@@ -114,12 +148,11 @@ def _valid_snapshot_name(name: str) -> str:
 def _snapshot_state_present(snap_dir: Path) -> bool:
     """True if *snap_dir* holds restorable snapshot state.
 
-    Mirrors vmon's ``selected_layout``: a snapshot is either a manifest-published
-    generation (``current-generation`` + ``vmstate.<gen>.bin``) or the legacy
-    ``vmstate.bin`` pair. Gating on ``vmstate.bin`` alone rejects every snapshot the
-    current VMM writes, since the writer only emits generation files.
+    Mirrors vmon's ``selected_layout``: a snapshot is a manifest-published
+    generation (``current-generation`` + ``vmstate.<gen>.bin``). The writer only
+    emits generation files, so the manifest's presence is the gate.
     """
-    return (snap_dir / "current-generation").is_file() or (snap_dir / "vmstate.bin").is_file()
+    return (snap_dir / "current-generation").is_file()
 
 
 def copy_reflink(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> Path:

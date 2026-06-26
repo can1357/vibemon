@@ -140,16 +140,8 @@ def uptime(sb: Sandbox) -> float:
 
 def snapshot_memory_bytes(snap_dir: Path) -> int:
     """Size of the current generation's memory file (delta vs full comparison)."""
-    cur = snap_dir / "current-generation"
-    if cur.is_file():
-        gen = cur.read_text().strip()
-        p = snap_dir / f"memory.{gen}.bin"
-        if p.is_file():
-            return p.stat().st_size
-    legacy = snap_dir / "memory.bin"
-    if legacy.is_file():
-        return legacy.stat().st_size
-    return sum(p.stat().st_size for p in snap_dir.glob("memory*.bin"))
+    gen = (snap_dir / "current-generation").read_text().strip()
+    return (snap_dir / f"memory.{gen}.bin").stat().st_size
 
 
 def read_status(vm: MicroVM):

@@ -221,31 +221,17 @@ pub fn copy_rootfs(test_name: &str) -> PathBuf {
 
 pub fn assert_snapshot_written(dir: &Path) {
     let current = dir.join("current-generation");
-    if current.exists() {
-        let generation = fs::read_to_string(&current)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", current.display()));
-        let generation = generation.trim();
-        assert!(
-            dir.join(format!("vmstate.{generation}.bin")).is_file(),
-            "snapshot generation {generation} state file missing in {}",
-            dir.display()
-        );
-        assert!(
-            dir.join(format!("memory.{generation}.bin")).is_file(),
-            "snapshot generation {generation} memory file missing in {}",
-            dir.display()
-        );
-        return;
-    }
-
+    let generation = fs::read_to_string(&current)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", current.display()));
+    let generation = generation.trim();
     assert!(
-        dir.join("vmstate.bin").is_file(),
-        "legacy snapshot state file missing in {}",
+        dir.join(format!("vmstate.{generation}.bin")).is_file(),
+        "snapshot generation {generation} state file missing in {}",
         dir.display()
     );
     assert!(
-        dir.join("memory.bin").is_file(),
-        "legacy snapshot memory file missing in {}",
+        dir.join(format!("memory.{generation}.bin")).is_file(),
+        "snapshot generation {generation} memory file missing in {}",
         dir.display()
     );
 }

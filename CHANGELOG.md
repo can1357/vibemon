@@ -3,12 +3,14 @@
 All notable changes to this project are recorded here.
 
 ## Unreleased
+
 ### Breaking Changes
 
 - Dropped all support for legacy snapshots; previous snapshots must be recaptured
 
 ### Added
 
+- Added automatic guest kernel provisioning for environments without a local kernel (e.g., macOS/HVF)
 - Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g. macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmon` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed

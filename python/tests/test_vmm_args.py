@@ -4,7 +4,8 @@ from pathlib import Path
 def _snapshot(mvm_home, name):
     snap = mvm_home / "snapshots" / name
     snap.mkdir(parents=True)
-    (snap / "vmstate.bin").touch()
+    (snap / "current-generation").write_text("1\n")
+    (snap / "vmstate.1.bin").touch()
     return snap
 
 
