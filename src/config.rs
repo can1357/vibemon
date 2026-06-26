@@ -143,14 +143,12 @@ pub struct Config {
 	pub log_format:         LogFormat,
 	/// Log level filter string.
 	pub log_level:          String,
-	/// Apply the opt-in host process sandbox before vCPU/worker threads start.
-	pub sandbox:            bool,
-	/// Explicit opt-out from standalone `--sandbox`; `--jail` still forces
-	/// filters.
+	/// Explicit opt-out from standalone default-on filters; `--jail` still
+	/// forces filters.
 	pub no_sandbox:         bool,
-	/// UID to drop to when `--sandbox` is enabled and vmon starts as root.
+	/// UID to drop to when filters are enabled and vmon starts as root.
 	pub sandbox_uid:        Option<u32>,
-	/// GID to drop to when `--sandbox` is enabled and vmon starts as root.
+	/// GID to drop to when filters are enabled and vmon starts as root.
 	pub sandbox_gid:        Option<u32>,
 	/// Wall-clock hard deadline in seconds; the VMM self-terminates when
 	/// reached.
@@ -342,10 +340,6 @@ struct CliArgs {
 	#[arg(long, value_name = "LEVEL", default_value = "info")]
 	log_level: String,
 
-	/// Apply the Linux process sandbox (default: on)
-	#[arg(long)]
-	sandbox: bool,
-
 	/// Disable the default sandbox (not valid with --jail)
 	#[arg(long)]
 	no_sandbox: bool,
@@ -532,9 +526,6 @@ impl Config {
 		if jail && let Some(sock) = &cli.agent_sock {
 			validate_jail_agent_sock(sock)?;
 		}
-		if no_sandbox && cli.sandbox {
-			bail!("--sandbox and --no-sandbox cannot be combined");
-		}
 		if no_sandbox && jail {
 			bail!("--no-sandbox cannot be combined with --jail");
 		}
@@ -652,7 +643,6 @@ impl Config {
 			firmware: cli.firmware,
 			log_format: cli.log_format,
 			log_level: cli.log_level,
-			sandbox: true,
 			no_sandbox,
 			sandbox_uid,
 			sandbox_gid,
@@ -938,7 +928,6 @@ mod tests {
 		assert_eq!(cfg.log_format, LogFormat::Text);
 		assert_eq!(cfg.log_level, "info");
 		assert!(!cfg.no_sandbox);
-		assert!(cfg.sandbox);
 	}
 
 	#[test]
@@ -995,11 +984,9 @@ mod tests {
 		assert_eq!(cfg.log_level, "debug");
 		assert!(!cfg.no_sandbox);
 
-		// The sandbox is default-on; --no-sandbox opts out. The explicit
-		// --sandbox stays accepted (redundant) for back-compat.
+		// The sandbox is default-on; --no-sandbox opts out.
 		let opt_out = parse_config(&["vmon", "--kernel", "k", "--no-sandbox"])
 			.expect("--no-sandbox opts out of the default sandbox");
-		assert!(opt_out.sandbox);
 		assert!(opt_out.no_sandbox);
 	}
 
@@ -1213,30 +1200,16 @@ mod tests {
 			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-gid", "1000"],
 			"require the sandbox",
 		);
-		assert_config_err_contains(
-			&["vmon", "--kernel", "k", "--sandbox", "--no-sandbox"],
-			"cannot be combined",
-		);
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--sandbox-uid", "0"], "--sandbox-uid");
 		assert_config_err_contains(&["vmon", "--kernel", "k", "--sandbox-gid", "0"], "--sandbox-gid");
 	}
 
 	#[cfg(target_os = "linux")]
 	#[test]
-	fn parses_explicit_sandbox_identity_when_enabled() {
-		let cfg = parse_config(&[
-			"vmon",
-			"--kernel",
-			"k",
-			"--sandbox",
-			"--sandbox-uid",
-			"1000",
-			"--sandbox-gid",
-			"1001",
-		])
-		.expect("explicit sandbox identity parses on Linux");
-
-		assert!(cfg.sandbox);
+	fn parses_explicit_sandbox_identity_when_filters_enabled() {
+		let cfg =
+			parse_config(&["vmon", "--kernel", "k", "--sandbox-uid", "1000", "--sandbox-gid", "1001"])
+				.expect("explicit sandbox identity parses on Linux");
 		assert_eq!(cfg.sandbox_uid, Some(1000));
 		assert_eq!(cfg.sandbox_gid, Some(1001));
 	}
@@ -1268,7 +1241,6 @@ mod tests {
 		// Filters are default-on and config parsing is host-agnostic, so a
 		// non-Linux host parses the default and honors the opt-out.
 		let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("default config parses");
-		assert!(cfg.sandbox);
 		assert!(!cfg.no_sandbox);
 
 		let opt_out =

@@ -81,7 +81,6 @@ fn child_main(config: &mut Config, launch_uid: u32, chroot: &Path) -> Result<()>
 		setns_net(netns)?;
 	}
 	let (uid, gid) = sandbox_identity(config)?;
-	config.sandbox = true;
 	config.sandbox_uid = Some(uid);
 	config.sandbox_gid = Some(gid);
 

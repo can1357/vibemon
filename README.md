@@ -226,7 +226,6 @@ The CLI accepts the production lifecycle, agent, jail, networking, and logging f
 - `--netns <path>`: operator-supplied network namespace entered before TAP open.
 - `--log-format text|json`, `--log-level <level>`: tracing output controls.
 - `--no-sandbox`: opt out of the default-on Stage-B process filters (seccomp + Landlock + `no_new_privs` + resource-limit tightening) for local development; cannot be combined with `--jail`.
-- `--sandbox`: accepted for back-compat but redundant, since the filters are already on by default.
 - `--sandbox-uid <uid>`, `--sandbox-gid <gid>`: UID/GID to drop to after the filters are applied. Required only under `--jail`; for default-on standalone filters they are optional, and the privilege drop runs only when vmon starts as root and both are supplied.
 
 ## Self-hosted sandbox API

@@ -194,9 +194,6 @@ check-ui:
 fetch-assets:
     ./demo/fetch-test-assets.sh
 
-# Compatibility alias for the old asset-fetch command name.
-fetch-test-assets: fetch-assets
-
 # Build the React/Vite web UI into python/vmon/web.
 ui:
     cd ui && bun install && bun run build

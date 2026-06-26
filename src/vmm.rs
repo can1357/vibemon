@@ -358,10 +358,12 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	let snapshot_root = config.snapshot_root.clone();
 	let agent_sock = config.agent_sock.clone();
 	let agent_exec = config.agent_exec.clone();
-	let filters_enabled =
-		cfg!(target_os = "linux") && (config.jail || (config.sandbox && !config.no_sandbox));
+	#[cfg(target_os = "linux")]
+	let filters_enabled = config.jail || !config.no_sandbox;
 	#[cfg(not(target_os = "linux"))]
-	if config.sandbox && !config.no_sandbox {
+	let filters_enabled = false;
+	#[cfg(not(target_os = "linux"))]
+	if !config.no_sandbox {
 		warn!("host sandbox is unavailable on this OS; continuing without it");
 	}
 	#[cfg(not(target_os = "linux"))]
@@ -1410,12 +1412,6 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 			if let Some(netns) = &config.netns {
 				cmd.arg("--netns").arg(netns);
 			}
-		}
-		// Children re-parse args from scratch, so propagate the effective
-		// sandbox state. Filters default on; --no-sandbox is the only state that
-		// needs an explicit flag because redundant --sandbox would conflict with it.
-		if config.sandbox && !config.no_sandbox {
-			cmd.arg("--sandbox");
 		}
 		if config.no_sandbox {
 			cmd.arg("--no-sandbox");
