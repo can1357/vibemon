@@ -76,6 +76,31 @@ Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` liv
 
 **Python**
 - `PascalCase` classes, `snake_case` functions, `_leading_underscore` privates; `ruff` (line-length 100, target py314, select E/F/W/I/UP/B/C4) and `mypy` (typed, `ignore_missing_imports` + `warn_redundant_casts`/`warn_unused_ignores`; not `--strict`).
+- Project Python is 3.14+. Write for that target instead of preserving older
+  compatibility, and verify syntax claims with `cd python && uv run python -m
+  compileall ...` or targeted `py_compile` before changing working code.
+- PEP 758 is in scope here: `except ValueError, AttributeError:` is valid
+  parenthesis-free multiple-exception syntax because this project targets Python
+  3.14+. Do not call it Python 2 syntax, do not rewrite it only to add
+  parentheses, and do not generalize this to older Python or to `as exc` forms
+  unless the configured interpreter, formatter, or linter verifies the syntax.
+- Prefer modern annotations: built-in generics (`dict[str, Any]`), PEP 604
+  unions (`Path | str`), `collections.abc` protocols for inputs, concrete
+  containers for owned return values, `Self` for fluent APIs, `type` statements
+  for aliases, and PEP 695 generic syntax where it improves clarity. Avoid
+  `typing.List`/`Dict`/`Tuple`/`Set`, `Optional`, `Union`, and compatibility
+  aliases.
+- Keep annotation runtime behavior intentional. Add or remove
+  `from __future__ import annotations` only after checking code that inspects
+  annotations; Python 3.14's default annotation semantics are not the same as
+  stringized future annotations.
+- Prefer modern stdlib idioms: `pathlib.Path`/`PathLike`, `Path.open()`,
+  explicit `encoding="utf-8"` for text files, `time.monotonic()` for deadlines,
+  `contextlib.suppress()` for deliberately ignored cleanup errors, and
+  `hashlib.file_digest()` for file hashes.
+- After changing `requires-python` or dependency constraints, regenerate
+  `python/uv.lock` with `cd python && uv lock`; never hand-edit generated
+  lockfile markers.
 - **Synchronous core:** `Engine` and the daemon are threaded/blocking (registry guarded by `RLock`). Only `server.py` (FastAPI, via `asyncio.to_thread`) and `net.py` tunnels use `asyncio`. CLI rendering (`click` + `rich`) lives only in `console.py`; core stays dependency-light and FastAPI is lazy-imported for `vmon serve`.
 - **Errors:** typed exceptions with `code` fields (`EngineError`, `NotFound`, `NotRunning`, `Busy`, `Invalid`, `Unsupported`; `DaemonError`, `AgentError`). Adapters map codes → JSON frames / HTTP status.
 - **State:** single daemon per `$VMON_HOME` (flock `vmond.lock`); `VMRecord`s persist to `~/.vmon/vms/*/meta.json` and rehydrate on restart. Secrets live in memory only — never written to disk.

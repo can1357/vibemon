@@ -166,6 +166,10 @@ pub struct Config {
 /// Structured values reuse the module's `parse_*` validators as clap value
 /// parsers, so a malformed flag reports the same diagnostic through every entry
 /// point.
+// These doc comments are clap `--help` text, not rustdoc; backticking the file
+// paths, MAC literals, and syscall names would render the backticks verbatim in
+// the terminal output.
+#[allow(clippy::doc_markdown, reason = "field docs are CLI help, not rustdoc")]
 #[derive(Parser)]
 #[command(
 	name = "vmon",
