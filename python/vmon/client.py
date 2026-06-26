@@ -741,11 +741,11 @@ class GatewayClient:
             except Exception:
                 pass
 
-        stdin_thread: threading.Thread | None = None
+        stdin_thread_ref: list[threading.Thread | None] = [None]
 
         def start_input() -> None:
-            nonlocal raw, stdin_thread
-            if stdin_thread is not None:
+            nonlocal raw
+            if stdin_thread_ref[0] is not None:
                 return
             src = stdin
             if src is None and tty and sys.stdin.isatty() and sys.stdout.isatty():
@@ -753,8 +753,9 @@ class GatewayClient:
                 src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
             elif src is None:
                 src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
-            stdin_thread = threading.Thread(target=forward, args=(src,), daemon=True)
-            stdin_thread.start()
+            thread = threading.Thread(target=forward, args=(src,), daemon=True)
+            stdin_thread_ref[0] = thread
+            thread.start()
 
         try:
             if not wait_ready:
@@ -780,7 +781,7 @@ class GatewayClient:
                     raise DaemonError(str(frame["error"]))
         finally:
             stop.set()
-            if stdin_thread is not None and raw is not None:
+            if (stdin_thread := stdin_thread_ref[0]) is not None and raw is not None:
                 stdin_thread.join(timeout=0.3)
             if winch is not None:
                 DaemonClient._restore_winch(winch)
