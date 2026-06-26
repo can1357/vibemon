@@ -55,8 +55,20 @@ def test_pty_exec_reports_isatty_true():
 
     sb = Sandbox.create(image=_image(), timeout=300)
     try:
-        proc = sb.exec("python3", "-c", "import sys; print(sys.stdout.isatty())", pty=True)
-        assert _read_stdout(proc).strip() == "True"
+        # A PTY exec must allocate a real /dev/pts slave. This regressed when the
+        # guest agent did not mount devpts, so assert the mount and the slave tty
+        # explicitly (portable shell, no python3 dependency on the guest image).
+        proc = sb.exec(
+            "sh",
+            "-lc",
+            "tty; test -t 1 && echo ISATTY; "
+            "mount | grep -q 'on /dev/pts type devpts' && echo DEVPTS",
+            pty=True,
+        )
+        out = _read_stdout(proc)
+        assert "/dev/pts/" in out, f"pty not backed by a devpts slave: {out!r}"
+        assert "ISATTY" in out, f"stdout is not a tty: {out!r}"
+        assert "DEVPTS" in out, f"devpts not mounted in guest: {out!r}"
     finally:
         sb.terminate()
 

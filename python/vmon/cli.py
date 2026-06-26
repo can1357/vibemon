@@ -65,11 +65,12 @@ def _parse_env(pairs: tuple[str, ...]) -> dict[str, str]:
         env[key] = os.environ[key]
     return env
 
+
 def _exit_code(result: dict[str, object]) -> int:
     """Translate daemon ``returncode`` into a valid process exit status."""
     try:
         code = int(result["returncode"])
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return 1
     if code < 0:
         return min(255, 128 + abs(code))

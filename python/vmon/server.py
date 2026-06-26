@@ -706,7 +706,7 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
         writer.write(request.encode("latin-1"))
         await writer.drain()
         response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
-    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+    except OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError:
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()

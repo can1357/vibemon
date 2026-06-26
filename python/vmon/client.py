@@ -254,7 +254,7 @@ class DaemonClient:
     def _send_winsize(conn: _Conn) -> None:
         try:
             size = os.get_terminal_size(sys.stdout.fileno())
-        except (OSError, ValueError, AttributeError):
+        except OSError, ValueError, AttributeError:
             import shutil
 
             size = shutil.get_terminal_size((80, 24))
@@ -345,7 +345,7 @@ class DaemonClient:
         if event in ("stdout", "stderr"):
             try:
                 payload = base64.b64decode(data, validate=True)
-            except (binascii.Error, ValueError) as e:
+            except (binascii.Error, TypeError, ValueError) as e:
                 raise DaemonError(f"invalid {event} frame from daemon", code="protocol") from e
             on_event(event, payload)
         else:  # console / logs are plain UTF-8

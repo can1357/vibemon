@@ -177,7 +177,7 @@ def build_rootfs(
     _export_image(engine, reference, rootfs, work)
 
     init = rootfs / "init"
-    init.write_text(_init_script(spec, argv))
+    init.write_text(_init_script(spec, argv), encoding="utf-8")
     init.chmod(0o755)
 
     initramfs = work / "initramfs.cpio.gz"
@@ -227,7 +227,7 @@ def cached_template(
                 os.replace(tmp_ext4, rootfs_ext4)
             finally:
                 tmp_ext4.unlink(missing_ok=True)
-    spec_path.write_text(json.dumps(asdict(spec), indent=2))
+    spec_path.write_text(json.dumps(asdict(spec), indent=2), encoding="utf-8")
 
     tpl_name = f"tpl-{digest[:12]}-{disk_mb}"
     tpl_dir = _state() / "templates" / tpl_name
@@ -262,7 +262,8 @@ def cached_template(
             tpl_name, keep_running=False, disk_src=rootfs_ext4, snapshot_root=_state() / "templates"
         )
         marker.write_text(
-            json.dumps({"image": spec.reference, "digest": digest, "disk_mb": disk_mb}, indent=2)
+            json.dumps({"image": spec.reference, "digest": digest, "disk_mb": disk_mb}, indent=2),
+            encoding="utf-8",
         )
     finally:
         if vm.is_running():
@@ -285,6 +286,8 @@ def _is_static_elf(path: Path) -> bool:
             return False
         ei_class = header[4]  # 1 = ELFCLASS32, 2 = ELFCLASS64
         ei_data = header[5]  # 1 = little-endian, 2 = big-endian
+        if ei_data not in (1, 2):
+            return False
         endian = "<" if ei_data == 1 else ">"
         if ei_class == 1:
             if len(header) < 48:

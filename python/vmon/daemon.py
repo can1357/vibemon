@@ -441,9 +441,7 @@ class Daemon:
         conn.send({"id": rid, "ok": True, "result": {"returncode": rc, **(result_extra or {})}})
 
     @staticmethod
-    def _exec_input(
-        conn: _Conn, proc: Any, stop: threading.Event, cancel: threading.Event
-    ) -> None:
+    def _exec_input(conn: _Conn, proc: Any, stop: threading.Event, cancel: threading.Event) -> None:
         """Forward client stdin/eof/resize frames; kill the process on disconnect."""
         while not stop.is_set():
             msg = conn.read_obj()
