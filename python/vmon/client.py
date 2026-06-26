@@ -480,3 +480,296 @@ class DaemonClient:
                 conn.close()
             else:
                 sock.close()
+
+
+class GatewayClient:
+    """HTTP/WebSocket transport that talks to a local or remote vmon gateway."""
+
+    def __init__(self, base_url: str, token: str | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._token = token or os.environ.get("VMON_API_TOKEN")
+        if not self._token:
+            raise DaemonError("VMON_API_TOKEN required for mesh CLI", code="invalid")
+
+    def call(self, method: str, **params: Any) -> dict[str, Any]:
+        if method == "ps":
+            data = self._json("GET", "/v1/sandboxes")
+            rows = []
+            for item in data.get("sandboxes") or []:
+                rows.append(
+                    {
+                        "name": item.get("name") or item.get("id"),
+                        "status": item.get("status"),
+                        "pid": item.get("pid"),
+                        "source": item.get("source") or item.get("image") or item.get("template"),
+                        "node": item.get("node"),
+                    }
+                )
+            return {"vms": rows}
+        if method in {"pause", "resume", "stop"}:
+            return self._json("POST", f"/v1/sandboxes/{self._q(params['name'])}/{method}", {})
+        if method == "rm":
+            return self._json("DELETE", f"/v1/sandboxes/{self._q(params['name'])}/remove")
+        if method == "snapshot":
+            return self._json(
+                "POST",
+                f"/v1/sandboxes/{self._q(params['name'])}/snapshot_template",
+                {"snapshot": params.get("snapshot"), "stop": params.get("stop")},
+            )
+        if method == "fork":
+            return self._json("POST", "/v1/fork", params)
+        if method == "cp_read":
+            path = self._urlencode({"path": params["path"]})
+            data = self._bytes("GET", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}")
+            return {"data": base64.b64encode(data).decode("ascii")}
+        if method == "cp_write":
+            path = self._urlencode({"path": params["path"]})
+            raw = base64.b64decode(str(params["data"]))
+            self._bytes("PUT", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}", raw)
+            return {"written": len(raw)}
+        if method == "run":
+            return self._json("POST", "/v1/run?detach=1", params)
+        if method == "restore":
+            payload = {**params, "detach": True}
+            return self._json("POST", "/v1/restore", payload)
+        raise DaemonError(f"gateway does not support {method}", code="unsupported")
+
+    def stream(
+        self, method: str, on_event: OnEvent, stdin: BinaryIO | None = None, **params: Any
+    ) -> dict[str, Any]:
+        if method in {"run", "restore"}:
+            return self._sse("POST", f"/v1/{method}", params, on_event)
+        if method == "logs":
+            query = self._urlencode({"follow": "1" if params.get("follow") else "0"})
+            path = f"/v1/sandboxes/{self._q(params['name'])}/logs?{query}"
+            if params.get("follow"):
+                return self._sse("GET", path, None, on_event)
+            on_event("console", self._bytes("GET", path))
+            return {}
+        if method == "exec":
+            return self._ws_exec(params, on_event, tty=False, stdin=stdin)
+        raise DaemonError(f"gateway does not support streaming {method}", code="unsupported")
+
+    def interactive(
+        self,
+        method: str,
+        on_event: OnEvent,
+        *,
+        tty: bool = True,
+        on_ready: Callable[[str], None] | None = None,
+        **params: Any,
+    ) -> dict[str, Any]:
+        if method == "exec":
+            return self._ws_exec(params, on_event, tty=tty, on_ready=on_ready)
+        if method == "shell":
+            return self._ws_shell(params, on_event, tty=tty, on_ready=on_ready)
+        raise DaemonError(f"gateway does not support interactive {method}", code="unsupported")
+
+    def ensure_running(self) -> dict[str, Any]:
+        self._json("GET", "/healthz")
+        return {}
+
+    def stop_daemon(self) -> dict[str, Any]:
+        raise DaemonError("not supported over gateway", code="unsupported")
+
+    @staticmethod
+    def _q(value: object) -> str:
+        import urllib.parse
+
+        return urllib.parse.quote(str(value), safe="")
+
+    @staticmethod
+    def _urlencode(values: dict[str, object]) -> str:
+        import urllib.parse
+
+        return urllib.parse.urlencode(values)
+
+    def _request(
+        self, method: str, path: str, payload: Any | None = None, *, raw: bytes | None = None
+    ) -> Any:
+        import urllib.error
+        import urllib.request
+
+        headers = {"Authorization": f"Bearer {self._token}"}
+        data = raw
+        if payload is not None:
+            data = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(
+            self.base_url + path, data=data, method=method, headers=headers
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            detail = body.decode("utf-8", "replace")
+            with contextlib.suppress(Exception):
+                parsed = json.loads(detail)
+                if isinstance(parsed, dict):
+                    detail = str(parsed.get("detail") or detail)
+            raise DaemonError(detail or f"gateway HTTP {exc.code}", code=str(exc.code)) from exc
+        except urllib.error.URLError as exc:
+            raise DaemonError(
+                f"cannot reach gateway {self.base_url}: {exc.reason}", code="unreachable"
+            ) from exc
+
+    def _json(self, method: str, path: str, payload: Any | None = None) -> dict[str, Any]:
+        with self._request(method, path, payload) as response:
+            raw = response.read()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+
+    def _bytes(self, method: str, path: str, raw: bytes | None = None) -> bytes:
+        with self._request(method, path, raw=raw) as response:
+            return response.read()
+
+    def _sse(
+        self, method: str, path: str, payload: Any | None, on_event: OnEvent
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        with self._request(method, path, payload) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                frame = json.loads(line[5:].strip())
+                if "stream" in frame:
+                    on_event(str(frame["stream"]), str(frame.get("data") or "").encode())
+                elif "exit" in frame:
+                    result["returncode"] = frame.get("exit")
+                    result.update({key: value for key, value in frame.items() if value is not None})
+                elif "error" in frame:
+                    raise DaemonError(str(frame["error"]))
+        return result
+
+    def _open_ws(self, path: str) -> socket.socket:
+        import ssl
+        import urllib.parse
+
+        from .wsframe import client_handshake
+
+        parsed = urllib.parse.urlsplit(self.base_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        sock = socket.create_connection((host, port), timeout=30.0)
+        if parsed.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        client_handshake(sock, host, port, path, {"Authorization": f"Bearer {self._token}"})
+        return sock
+
+    def _ws_exec(
+        self,
+        params: dict[str, Any],
+        on_event: OnEvent,
+        *,
+        tty: bool,
+        stdin: BinaryIO | None = None,
+        on_ready: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        name = self._q(params["name"])
+        sock = self._open_ws(f"/v1/sandboxes/{name}/exec/ws")
+        request = {
+            "cmd": params.get("cmd") or [],
+            "tty": tty,
+            "env": params.get("env"),
+            "workdir": params.get("workdir"),
+            "timeout": params.get("timeout"),
+        }
+        return self._ws_session(sock, request, on_event, tty=tty, stdin=stdin, on_ready=on_ready)
+
+    def _ws_shell(
+        self,
+        params: dict[str, Any],
+        on_event: OnEvent,
+        *,
+        tty: bool,
+        on_ready: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        import urllib.parse
+
+        request = {**params, "tty": tty}
+        query: dict[str, str] = {}
+        for key, value in request.items():
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                query[key] = json.dumps(value, separators=(",", ":"))
+            else:
+                query[key] = str(value)
+        path = "/v1/shell/ws?" + urllib.parse.urlencode(query)
+        sock = self._open_ws(path)
+        return self._ws_session(sock, request, on_event, tty=tty, on_ready=on_ready)
+
+    def _ws_session(
+        self,
+        sock: socket.socket,
+        request: dict[str, Any],
+        on_event: OnEvent,
+        *,
+        tty: bool,
+        stdin: BinaryIO | None = None,
+        on_ready: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        from .wsframe import encode_frame, read_frame_sync
+
+        stop = threading.Event()
+        raw: tuple[int, Any] | None = None
+        winch: Any = None
+        sock.sendall(encode_frame(1, json.dumps(request, separators=(",", ":")).encode()))
+
+        def send_obj(obj: dict[str, Any]) -> None:
+            sock.sendall(encode_frame(1, json.dumps(obj, separators=(",", ":")).encode()))
+
+        def forward(src: BinaryIO) -> None:
+            try:
+                while not stop.is_set():
+                    chunk = src.read(65536)
+                    if not chunk:
+                        send_obj({"close_stdin": True})
+                        return
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode()
+                    send_obj({"stdin_b64": base64.b64encode(chunk).decode("ascii")})
+            except Exception:
+                pass
+
+        stdin_thread: threading.Thread | None = None
+        try:
+            while True:
+                opcode, payload = read_frame_sync(sock)
+                if opcode == 8:
+                    raise DaemonError("gateway websocket closed", code="closed")
+                if opcode != 1:
+                    continue
+                frame = json.loads(payload.decode("utf-8", "replace"))
+                if "ready" in frame:
+                    if on_ready is not None:
+                        on_ready(str(frame.get("ready") or ""))
+                    src = stdin
+                    if src is None and tty and sys.stdin.isatty() and sys.stdout.isatty():
+                        raw = DaemonClient._enter_raw()
+                        src = getattr(sys.stdin, "buffer", sys.stdin)
+                    elif src is None:
+                        src = getattr(sys.stdin, "buffer", sys.stdin)
+                    stdin_thread = threading.Thread(target=forward, args=(src,), daemon=True)
+                    stdin_thread.start()
+                    continue
+                if "stream" in frame:
+                    on_event(str(frame["stream"]), str(frame.get("data") or "").encode())
+                    continue
+                if "exit" in frame:
+                    return {"returncode": frame.get("exit"), "name": frame.get("name")}
+                if "error" in frame:
+                    raise DaemonError(str(frame["error"]))
+        finally:
+            stop.set()
+            if stdin_thread is not None and raw is not None:
+                stdin_thread.join(timeout=0.3)
+            if winch is not None:
+                DaemonClient._restore_winch(winch)
+            if raw is not None:
+                DaemonClient._exit_raw(raw)
+            with contextlib.suppress(OSError):
+                sock.close()

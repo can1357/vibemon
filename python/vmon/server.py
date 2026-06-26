@@ -16,13 +16,14 @@ import json
 import math
 import os
 import queue
+import re
 import secrets
 import threading
 import time
 from collections.abc import AsyncIterator, MutableMapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, status
 from fastapi.exceptions import RequestValidationError
@@ -31,8 +32,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.background import BackgroundTask
 
 from .core import Engine, EngineError, VMRecord
+from .mesh import HttpxTransport, Mesh, MeshError, NodeCaps, NodeState, default_advertise
+from .wsframe import encode_frame, read_frame
 
 
 class SandboxCreate(BaseModel):
@@ -72,6 +76,11 @@ class ExecRequest(BaseModel):
 
 class SnapshotRequest(BaseModel):
     name: str | None = None
+
+
+class SnapshotTemplateRequest(BaseModel):
+    snapshot: str
+    stop: bool = False
 
 
 class ExtendRequest(BaseModel):
@@ -288,6 +297,35 @@ class Supervisor:
             returncode=returncode,
         )
         return record
+
+    async def pause(self, sid: str) -> dict[str, Any]:
+        return await self._run(self._engine.pause, sid)
+
+    async def resume(self, sid: str) -> dict[str, Any]:
+        return await self._run(self._engine.resume, sid)
+
+    async def stop(self, sid: str) -> dict[str, Any]:
+        result = await self._run(self._engine.stop, sid)
+        self.emit("stopped", id=sid, name=sid)
+        return result
+
+    async def remove(self, sid: str) -> dict[str, Any]:
+        result = await self._run(self._engine.remove, sid)
+        self.emit("removed", id=sid, name=sid)
+        return result
+
+    async def logs(self, sid: str) -> str:
+        return await self._run(self._engine.logs, sid)
+
+    async def snapshot_template(
+        self, sid: str, snapshot: str, stop: bool = False
+    ) -> dict[str, str]:
+        path = await self._run(self._engine.snapshot_template, sid, snapshot, stop)
+        self.count("snapshot")
+        return {"snapshot": snapshot, "dir": path}
+
+    async def fork(self, params: dict[str, Any]) -> builtins.list[dict[str, Any]]:
+        return await self._run(self._engine.fork, params)
 
     async def reap_expired(self) -> None:
         now = time.time()
@@ -527,6 +565,185 @@ async def _exec_sse(supervisor: Supervisor, record: VMRecord, request: ExecReque
             return
 
 
+async def _logs_sse(supervisor: Supervisor, name: str, request: Request):
+    events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    cancel = threading.Event()
+
+    def _on_line(stream: str, data: bytes) -> None:
+        events.put({"stream": stream, "data": _chunk_to_text(data)})
+
+    def _run() -> None:
+        try:
+            supervisor._engine.logs(name, follow=True, on_line=_on_line, cancel=cancel)
+        except EngineError as exc:
+            events.put({"error": exc.message})
+        except Exception as exc:
+            events.put({"error": str(exc)})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=_run, name=f"vmon-logs-{name}", daemon=True).start()
+    try:
+        while True:
+            if await request.is_disconnected():
+                return
+            payload = await run_in_threadpool(events.get)
+            if payload is None:
+                return
+            yield _sse(payload)
+    finally:
+        cancel.set()
+
+
+async def _creator_sse(supervisor: Supervisor, verb: str, params: dict[str, Any], request: Request):
+    events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    cancel = threading.Event()
+    method = supervisor._engine.run if verb == "run" else supervisor._engine.restore
+
+    def _on_output(stream: str, data: bytes) -> None:
+        events.put({"stream": stream, "data": _chunk_to_text(data)})
+
+    def _run() -> None:
+        try:
+            result = method(params, on_output=_on_output, cancel=cancel)
+        except EngineError as exc:
+            events.put({"error": exc.message})
+        except Exception as exc:
+            events.put({"error": str(exc)})
+        else:
+            events.put(
+                {
+                    "exit": result.get("returncode", 0),
+                    "name": result.get("name"),
+                    "image": result.get("image"),
+                    "reconstruct_ms": result.get("reconstruct_ms"),
+                    "restore_ms": result.get("restore_ms"),
+                }
+            )
+        finally:
+            events.put(None)
+
+    threading.Thread(target=_run, name=f"vmon-{verb}", daemon=True).start()
+    try:
+        while True:
+            if await request.is_disconnected():
+                return
+            payload = await run_in_threadpool(events.get)
+            if payload is None:
+                return
+            yield _sse(payload)
+    finally:
+        cancel.set()
+
+
+def _query_shell_params(websocket: WebSocket) -> dict[str, Any]:
+    params = dict(websocket.query_params)
+    if "command" in params and "cmd" not in params:
+        params["cmd"] = ["/bin/sh", "-c", params.pop("command")]
+    if isinstance(params.get("cmd"), str):
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            loaded = json.loads(str(params["cmd"]))
+            if isinstance(loaded, list):
+                params["cmd"] = loaded
+    if isinstance(params.get("env"), str):
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            loaded = json.loads(str(params["env"]))
+            if isinstance(loaded, dict):
+                params["env"] = loaded
+    for key in ("mem", "cpus", "disk_mb"):
+        if key in params:
+            params[key] = int(params[key])
+    if "timeout" in params:
+        params["timeout"] = float(params["timeout"])
+    if "pty" in params:
+        params["tty"] = str(params.pop("pty")).lower() not in {"0", "false", "no"}
+    return params
+
+
+async def _shell_ws(
+    supervisor: Supervisor,
+    params: dict[str, Any],
+    websocket: WebSocket,
+    *,
+    accepted: bool = False,
+) -> None:
+    cleanup = None
+    try:
+        process, name, cleanup = await supervisor._run(supervisor._engine.start_shell, params)
+    except HTTPException as exc:
+        if not accepted:
+            await websocket.accept()
+        await websocket.send_json({"error": exc.detail})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    except Exception as exc:
+        if not accepted:
+            await websocket.accept()
+        await websocket.send_json({"error": str(exc)})
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+    if not accepted:
+        await websocket.accept()
+    await websocket.send_json({"ready": name})
+    try:
+        await _pump_exec_ws(process, websocket)
+    finally:
+        if cleanup is not None:
+            cleanup()
+
+
+async def _pump_exec_ws(process: Any, websocket: WebSocket) -> None:
+    events = _spawn_exec_readers(process)
+    write_stdin = getattr(process, "write_stdin", None)
+    close_stdin = getattr(process, "close_stdin", None)
+    resize = getattr(process, "resize", None)
+    clean_exit = False
+
+    async def _pump_output() -> None:
+        nonlocal clean_exit
+        eof: set[str] = set()
+        exit_code: int | None = None
+        while True:
+            kind, payload = await run_in_threadpool(events.get)
+            if kind in {"stdout", "stderr"}:
+                await websocket.send_json({"stream": kind, "data": payload})
+            elif kind.endswith("_eof"):
+                eof.add(kind.removesuffix("_eof"))
+            elif kind == "error":
+                await websocket.send_json({"error": payload})
+            elif kind == "exit":
+                exit_code = int(payload) if payload is not None else 0
+            if exit_code is not None and {"stdout", "stderr"}.issubset(eof):
+                await websocket.send_json({"exit": exit_code})
+                clean_exit = True
+                return
+
+    async def _pump_input() -> None:
+        while True:
+            msg = await websocket.receive_json()
+            if "stdin_b64" in msg and write_stdin is not None:
+                await run_in_threadpool(write_stdin, base64.b64decode(msg["stdin_b64"]))
+            elif msg.get("close_stdin") and close_stdin is not None:
+                await run_in_threadpool(close_stdin)
+            elif "resize" in msg and resize is not None:
+                size = msg.get("resize") or {}
+                await run_in_threadpool(
+                    resize, int(size.get("rows", 24)), int(size.get("cols", 80))
+                )
+
+    tasks = {asyncio.create_task(_pump_output()), asyncio.create_task(_pump_input())}
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        with contextlib.suppress(Exception):
+            task.result()
+    if not clean_exit:
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
 def _tokens_match(supplied: str | None, expected: str) -> bool:
     return supplied is not None and secrets.compare_digest(supplied, expected)
 
@@ -647,43 +864,125 @@ async def _proxy_http_request(request: Request, target: tuple[str, int], rest: s
     )
 
 
-def _ws_build_path(rest: str, websocket: WebSocket) -> str:
-    path = "/" + rest.lstrip("/")
-    query = _target_query(list(websocket.query_params.multi_items()))
+_SANDBOX_PATH_RE = re.compile(r"^/v1/sandboxes/(?:from_id/)?([^/]+)(?:/.*)?$")
+_RESERVED_SANDBOX_SEGMENTS = {"from_id"}
+_HOP_HEADERS = {"host", "connection", "content-length", "transfer-encoding"}
+
+
+def _filter_resp_headers(headers: MutableMapping[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in {"connection", "content-length", "transfer-encoding"}
+    }
+
+
+async def _proxy_to_peer(request: Request, peer_url: str, token: str) -> Response:
+    import httpx
+
+    headers = {
+        key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS
+    }
+    headers["Authorization"] = f"Bearer {token}"
+    headers["X-Vmon-Mesh-Hop"] = "1"
+    body = await request.body()
+    target = peer_url.rstrip("/") + request.url.path
+    if request.url.query:
+        target += f"?{request.url.query}"
+    client = request.app.state.mesh_http
+    req = client.build_request(request.method, target, content=body, headers=headers)
+    try:
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
+        ) from exc
+    return StreamingResponse(
+        resp.aiter_raw(),
+        status_code=resp.status_code,
+        headers=_filter_resp_headers(resp.headers),
+        background=BackgroundTask(resp.aclose),
+    )
+
+
+def _sandbox_id_in_path(path: str) -> str | None:
+    match = _SANDBOX_PATH_RE.match(path)
+    if match is None:
+        return None
+    sid = match.group(1)
+    return None if sid in _RESERVED_SANDBOX_SEGMENTS else sid
+
+
+def _engine_has(supervisor: Supervisor, sandbox_id: str) -> bool:
+    try:
+        supervisor._engine.get(sandbox_id)
+    except EngineError:
+        return False
+    return True
+
+
+async def _scatter_locate(mesh: Mesh, sandbox_id: str) -> str | None:
+    for peer in mesh.peers():
+        try:
+            response = await asyncio.to_thread(
+                mesh.transport.get, peer.advertise, f"/v1/mesh/locate/{sandbox_id}"
+            )
+        except Exception:
+            continue
+        owner = response.get("owner")
+        if isinstance(owner, str) and owner:
+            mesh.record_owner(sandbox_id, owner)
+            return owner
+    return None
+
+
+def _require_bearer(request: Request, expected_token: str | None) -> None:
+    if expected_token is None:
+        return
+    if not _tokens_match(_request_bearer_token(request), expected_token):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail="unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _mesh_http_status(exc: MeshError) -> int:
+    return {
+        "unauthorized": status.HTTP_401_UNAUTHORIZED,
+        "unreachable": status.HTTP_502_BAD_GATEWAY,
+        "conflict": status.HTTP_409_CONFLICT,
+    }.get(exc.code, status.HTTP_400_BAD_REQUEST)
+
+
+def _split_http_authority(url: str) -> tuple[str, int]:
+    parsed = urlsplit(url)
+    if parsed.scheme == "https":
+        raise MeshError("ws across https peer unsupported", code="unreachable")
+    if parsed.scheme and parsed.scheme != "http":
+        raise MeshError("unsupported peer URL scheme", code="invalid")
+    if not parsed.hostname:
+        raise MeshError("invalid peer URL", code="invalid")
+    return parsed.hostname, parsed.port or 80
+
+
+def _ws_build_path(rest: str, websocket: WebSocket, *, preserve_query: bool = False) -> str:
+    path = rest if preserve_query and rest.startswith("/") else "/" + rest.lstrip("/")
+    if preserve_query:
+        query = websocket.url.query
+    else:
+        query = _target_query(list(websocket.query_params.multi_items()))
     return path + (f"?{query}" if query else "")
 
 
-def _ws_encode_frame(opcode: int, payload: bytes = b"") -> bytes:
-    first = 0x80 | (opcode & 0x0F)
-    mask_key = os.urandom(4)
-    length = len(payload)
-    if length < 126:
-        header = bytes([first, 0x80 | length])
-    elif length <= 0xFFFF:
-        header = bytes([first, 0x80 | 126]) + length.to_bytes(2, "big")
-    else:
-        header = bytes([first, 0x80 | 127]) + length.to_bytes(8, "big")
-    masked = bytes(byte ^ mask_key[i % 4] for i, byte in enumerate(payload))
-    return header + mask_key + masked
-
-
-async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
-    head = await reader.readexactly(2)
-    opcode = head[0] & 0x0F
-    masked = bool(head[1] & 0x80)
-    length = head[1] & 0x7F
-    if length == 126:
-        length = int.from_bytes(await reader.readexactly(2), "big")
-    elif length == 127:
-        length = int.from_bytes(await reader.readexactly(8), "big")
-    mask = await reader.readexactly(4) if masked else b""
-    payload = await reader.readexactly(length) if length else b""
-    if masked:
-        payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
-    return opcode, payload
-
-
-async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: str) -> None:
+async def _proxy_websocket(
+    websocket: WebSocket,
+    target: tuple[str, int],
+    rest: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
+    preserve_query: bool = False,
+) -> None:
     # Minimal RFC 6455 client relay: FastAPI decodes the public WebSocket, then
     # this bridge re-encodes frames to the sandbox's localhost tunnel.
     host, port = target
@@ -693,15 +992,18 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="tunnel connect failed")
         return
     key = base64.b64encode(os.urandom(16)).decode()
-    path = _ws_build_path(rest, websocket)
-    request = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n"
-    )
+    path = _ws_build_path(rest, websocket, preserve_query=preserve_query)
+    request_headers = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {host}:{port}",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        f"Sec-WebSocket-Key: {key}",
+        "Sec-WebSocket-Version: 13",
+    ]
+    for header, value in (extra_headers or {}).items():
+        request_headers.append(f"{header}: {value}")
+    request = "\r\n".join(request_headers) + "\r\n\r\n"
     try:
         writer.write(request.encode("latin-1"))
         await writer.drain()
@@ -735,19 +1037,19 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
         while True:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
-                writer.write(_ws_encode_frame(8))
+                writer.write(encode_frame(8))
                 await writer.drain()
                 return
             if message.get("bytes") is not None:
-                writer.write(_ws_encode_frame(2, bytes(message["bytes"])))
+                writer.write(encode_frame(2, bytes(message["bytes"])))
                 await writer.drain()
             elif message.get("text") is not None:
-                writer.write(_ws_encode_frame(1, str(message["text"]).encode()))
+                writer.write(encode_frame(1, str(message["text"]).encode()))
                 await writer.drain()
 
     async def _guest_to_client() -> None:
         while True:
-            opcode, payload = await _ws_read_frame(reader)
+            opcode, payload = await read_frame(reader)
             if opcode == 1:
                 await websocket.send_text(payload.decode("utf-8", "replace"))
             elif opcode == 2:
@@ -756,7 +1058,7 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
                 await websocket.close()
                 return
             elif opcode == 9:
-                writer.write(_ws_encode_frame(10, payload))
+                writer.write(encode_frame(10, payload))
                 await writer.drain()
 
     tasks = {asyncio.create_task(_client_to_guest()), asyncio.create_task(_guest_to_client())}
@@ -972,17 +1274,38 @@ def _mount_web_ui(app: FastAPI) -> None:
         return FileResponse(str(index))
 
 
-def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> FastAPI:
+def create_app(
+    *,
+    token: str | None = None,
+    idle_timeout: float = 300.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> FastAPI:
     supervisor = Supervisor(Engine(), idle_poll=max(1.0, min(float(idle_timeout), 30.0)))
     expected_token = token if token is not None else os.environ.get("VMON_API_TOKEN")
+    mesh = Mesh(
+        supervisor._engine,
+        advertise=default_advertise(host, port),
+        token=expected_token or "",
+        transport=HttpxTransport(expected_token or ""),
+    )
     bearer = HTTPBearer(auto_error=False)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        import httpx
+
+        app.state.mesh_http = httpx.AsyncClient(timeout=None)
+        mesh.load()
+        if mesh.enabled:
+            ensure_mesh_heartbeat()
         app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
         try:
             yield
         finally:
+            stop = getattr(app.state, "mesh_stop", None)
+            if stop is not None:
+                stop.set()
             task = getattr(app.state, "reaper_task", None)
             if task is not None:
                 task.cancel()
@@ -990,9 +1313,25 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
                     await task
                 except asyncio.CancelledError:
                     pass
+            await app.state.mesh_http.aclose()
+            close = getattr(mesh.transport, "close", None)
+            if close is not None:
+                close()
 
     app = FastAPI(title="vmon sandbox server", version="1", lifespan=lifespan)
     app.state.supervisor = supervisor
+    app.state.mesh = mesh
+
+    def ensure_mesh_heartbeat() -> None:
+        thread = getattr(app.state, "mesh_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        stop = threading.Event()
+        app.state.mesh_stop = stop
+        app.state.mesh_thread = threading.Thread(
+            target=mesh.run_heartbeat, args=(stop,), name="vmon-mesh-hb", daemon=True
+        )
+        app.state.mesh_thread.start()
 
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(
@@ -1038,6 +1377,51 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+    @app.middleware("http")
+    async def _mesh_router(request: Request, call_next: Any) -> Response:
+        if not mesh.enabled or request.headers.get("x-vmon-mesh-hop"):
+            return await call_next(request)
+        sandbox_id = _sandbox_id_in_path(request.url.path)
+        if sandbox_id is None or _engine_has(supervisor, sandbox_id):
+            return await call_next(request)
+        owner = mesh.owner_of(sandbox_id) or await _scatter_locate(mesh, sandbox_id)
+        if owner is None or owner == mesh.node_id:
+            return await call_next(request)
+        peer_url = mesh.peer_url(owner)
+        if peer_url is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable")
+        _require_bearer(request, expected_token)
+        return await _proxy_to_peer(request, peer_url, expected_token or "")
+
+    async def proxy_ws_owner(websocket: WebSocket, sandbox_id: str) -> bool:
+        if not mesh.enabled or websocket.headers.get("x-vmon-mesh-hop"):
+            return False
+        if _engine_has(supervisor, sandbox_id):
+            return False
+        owner = mesh.owner_of(sandbox_id) or await _scatter_locate(mesh, sandbox_id)
+        if owner is None or owner == mesh.node_id:
+            return False
+        url = mesh.peer_url(owner)
+        if url is None:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="owner unreachable")
+            return True
+        try:
+            target = _split_http_authority(url)
+        except MeshError as exc:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=exc.message)
+            return True
+        await _proxy_websocket(
+            websocket,
+            target,
+            websocket.url.path,
+            extra_headers={
+                "Authorization": f"Bearer {expected_token or ''}",
+                "X-Vmon-Mesh-Hop": "1",
+            },
+            preserve_query=True,
+        )
+        return True
+
     async def events_stream(request: Request):
         subscriber = supervisor.subscribe_events()
         try:
@@ -1061,19 +1445,208 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
     async def metrics() -> PlainTextResponse:
         return PlainTextResponse(supervisor.metrics_text(), media_type="text/plain; version=0.0.4")
 
+    @app.post("/v1/mesh/setup", dependencies=[Depends(require_auth)])
+    async def mesh_setup(body: dict[str, Any]) -> dict[str, Any]:
+        caps = None
+        if body.get("max_vcpus") is not None or body.get("max_mem_mib") is not None:
+            caps = NodeCaps(
+                int(body.get("max_vcpus") or mesh.caps.vcpus),
+                int(body.get("max_mem_mib") or mesh.caps.mem_mib),
+            )
+        try:
+            blob = mesh.setup(
+                str(body.get("advertise") or mesh._default_advertise),
+                region=str(body.get("region") or ""),
+                caps=caps,
+            )
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+        ensure_mesh_heartbeat()
+        return {"blob": blob, "node_id": mesh.node_id, "advertise": mesh.advertise}
+
+    @app.post("/v1/mesh/join", dependencies=[Depends(require_auth)])
+    async def mesh_join(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            status_view = mesh.join(
+                str(body.get("blob") or ""),
+                advertise=str(body["advertise"]) if body.get("advertise") else None,
+                region=str(body.get("region") or ""),
+            )
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+        ensure_mesh_heartbeat()
+        return status_view
+
+    @app.post("/v1/mesh/leave", dependencies=[Depends(require_auth)])
+    async def mesh_leave() -> dict[str, bool]:
+        mesh.leave()
+        return {"ok": True}
+
+    @app.get("/v1/mesh/status", dependencies=[Depends(require_auth)])
+    async def mesh_status() -> dict[str, Any]:
+        return mesh.status()
+
+    @app.post("/v1/mesh/members", dependencies=[Depends(require_auth)])
+    async def mesh_members(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return mesh.register(NodeState.from_wire(body))
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    @app.post("/v1/mesh/heartbeat", dependencies=[Depends(require_auth)])
+    async def mesh_heartbeat(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            state = NodeState.from_wire(dict(body.get("state") or {}))
+            known = list(body.get("known") or [])
+            return mesh.heartbeat(state, known)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    @app.post("/v1/mesh/depart", dependencies=[Depends(require_auth)])
+    async def mesh_depart(body: dict[str, Any]) -> dict[str, bool]:
+        mesh.depart(str(body.get("node_id") or ""))
+        return {"ok": True}
+
+    @app.get("/v1/mesh/locate/{sandbox_id}", dependencies=[Depends(require_auth)])
+    async def mesh_locate(sandbox_id: str) -> dict[str, str]:
+        if _engine_has(supervisor, sandbox_id):
+            return {"owner": mesh.node_id}
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown sandbox")
+
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
-    async def create_sandbox(body: SandboxCreate) -> JSONResponse:
+    async def create_sandbox(request: Request, body: SandboxCreate) -> JSONResponse:
         _validate_create_request(body)
+        body_dict = supervisor._model_dict(body)
+        if (
+            mesh.enabled
+            and not request.headers.get("x-vmon-mesh-hop")
+            and not mesh.pinned_local(body_dict)
+        ):
+            name = body_dict.get("name")
+            if isinstance(name, str) and (
+                _engine_has(supervisor, name)
+                or mesh.owner_of(name)
+                or await _scatter_locate(mesh, name)
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, detail=f"sandbox {name!r} already exists"
+                )
+            tried: set[str] = set()
+            for _ in range(2):
+                owner = mesh.place(body_dict)
+                if owner == mesh.node_id or owner in tried:
+                    break
+                url = mesh.peer_url(owner)
+                tried.add(owner)
+                if url is None:
+                    mesh.mark_unhealthy(owner)
+                    continue
+                mesh.note_inflight(1)
+                try:
+                    view = await asyncio.to_thread(
+                        mesh.transport.post, url, "/v1/sandboxes", body_dict
+                    )
+                except MeshError:
+                    mesh.mark_unhealthy(owner)
+                    continue
+                finally:
+                    mesh.note_inflight(-1)
+                sid = str(view.get("id") or view.get("name") or "")
+                if sid:
+                    mesh.record_owner(sid, owner)
+                return JSONResponse(view, status_code=status.HTTP_201_CREATED)
         record = await supervisor.create(body)
         return JSONResponse(record.view(), status_code=status.HTTP_201_CREATED)
 
     @app.get("/v1/sandboxes", dependencies=[Depends(require_auth)])
     async def list_sandboxes(
+        request: Request,
         tag: list[str] | None = Query(None),
     ) -> dict[str, list[dict[str, Any]]]:
-        return {
-            "sandboxes": [record.view() for record in supervisor.list(tags=parse_tag_filters(tag))]
-        }
+        rows: dict[str, dict[str, Any]] = {}
+        for record in supervisor.list(tags=parse_tag_filters(tag)):
+            view = record.view()
+            if mesh.enabled:
+                view["node"] = mesh.node_id
+            rows[str(view["id"])] = view
+        if mesh.enabled and not request.headers.get("x-vmon-mesh-hop"):
+            query = urlencode([("tag", value) for value in tag or []])
+            path = "/v1/sandboxes" + (f"?{query}" if query else "")
+            now = time.time()
+            for peer in mesh.peers():
+                if not peer.healthy(now, mesh.interval):
+                    continue
+                try:
+                    response = await asyncio.to_thread(mesh.transport.get, peer.advertise, path)
+                except Exception:
+                    continue
+                for item in response.get("sandboxes") or []:
+                    if not isinstance(item, dict) or "id" not in item:
+                        continue
+                    item = dict(item)
+                    item["node"] = peer.node_id
+                    rows[str(item["id"])] = item
+        return {"sandboxes": list(rows.values())}
+
+    @app.post("/v1/run", dependencies=[Depends(require_auth)])
+    async def run_gateway(request: Request, detach: bool = False) -> Response:
+        params = dict(await request.json())
+        params["detach"] = detach or bool(params.get("detach"))
+        if (
+            mesh.enabled
+            and not request.headers.get("x-vmon-mesh-hop")
+            and not mesh.pinned_local(params)
+        ):
+            owner = mesh.place(params)
+            if owner != mesh.node_id:
+                url = mesh.peer_url(owner)
+                if url is None:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
+                    )
+                return await _proxy_to_peer(request, url, expected_token or "")
+        if params["detach"]:
+            return JSONResponse(await supervisor._run(supervisor._engine.run, params))
+        return StreamingResponse(
+            _creator_sse(supervisor, "run", params, request), media_type="text/event-stream"
+        )
+
+    @app.post("/v1/restore", dependencies=[Depends(require_auth)])
+    async def restore_gateway(request: Request) -> Response:
+        params = dict(await request.json())
+        if mesh.enabled and not request.headers.get("x-vmon-mesh-hop"):
+            owner = mesh.place(params)
+            if owner != mesh.node_id:
+                url = mesh.peer_url(owner)
+                if url is None:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
+                    )
+                return await _proxy_to_peer(request, url, expected_token or "")
+        if params.get("detach"):
+            return JSONResponse(await supervisor._run(supervisor._engine.restore, params))
+        return StreamingResponse(
+            _creator_sse(supervisor, "restore", params, request), media_type="text/event-stream"
+        )
+
+    @app.post("/v1/fork", dependencies=[Depends(require_auth)])
+    async def fork_gateway(request: Request) -> dict[str, Any]:
+        params = dict(await request.json())
+        if mesh.enabled and not request.headers.get("x-vmon-mesh-hop"):
+            owner = mesh.place(params)
+            if owner != mesh.node_id:
+                url = mesh.peer_url(owner)
+                if url is None:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
+                    )
+                response = await asyncio.to_thread(mesh.transport.post, url, "/v1/fork", params)
+                for clone in response.get("clones") or []:
+                    if isinstance(clone, dict) and clone.get("name"):
+                        mesh.record_owner(str(clone["name"]), owner)
+                return response
+        clones = await supervisor.fork(params)
+        return {"clones": clones}
 
     @app.get("/v1/sandboxes/from_id/{sandbox_id}", dependencies=[Depends(require_auth)])
     async def get_sandbox_from_id(sandbox_id: str) -> dict[str, Any]:
@@ -1087,6 +1660,42 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
     async def delete_sandbox(sandbox_id: str) -> dict[str, Any]:
         record = await supervisor.terminate(sandbox_id)
         return record.view()
+
+    @app.post("/v1/sandboxes/{sandbox_id}/pause", dependencies=[Depends(require_auth)])
+    async def pause_sandbox(sandbox_id: str) -> dict[str, Any]:
+        return await supervisor.pause(sandbox_id)
+
+    @app.post("/v1/sandboxes/{sandbox_id}/resume", dependencies=[Depends(require_auth)])
+    async def resume_sandbox(sandbox_id: str) -> dict[str, Any]:
+        return await supervisor.resume(sandbox_id)
+
+    @app.post("/v1/sandboxes/{sandbox_id}/stop", dependencies=[Depends(require_auth)])
+    async def stop_sandbox(sandbox_id: str) -> dict[str, Any]:
+        result = await supervisor.stop(sandbox_id)
+        mesh.forget_owner(sandbox_id)
+        return result
+
+    @app.delete("/v1/sandboxes/{sandbox_id}/remove", dependencies=[Depends(require_auth)])
+    async def remove_sandbox(sandbox_id: str) -> dict[str, Any]:
+        result = await supervisor.remove(sandbox_id)
+        mesh.forget_owner(sandbox_id)
+        return result
+
+    @app.get("/v1/sandboxes/{sandbox_id}/logs", dependencies=[Depends(require_auth)])
+    async def logs_sandbox(
+        request: Request, sandbox_id: str, follow: bool = False
+    ) -> PlainTextResponse | StreamingResponse:
+        if follow:
+            return StreamingResponse(
+                _logs_sse(supervisor, sandbox_id, request), media_type="text/event-stream"
+            )
+        return PlainTextResponse(await supervisor.logs(sandbox_id))
+
+    @app.post("/v1/sandboxes/{sandbox_id}/snapshot_template", dependencies=[Depends(require_auth)])
+    async def snapshot_template_sandbox(
+        sandbox_id: str, body: SnapshotTemplateRequest
+    ) -> dict[str, str]:
+        return await supervisor.snapshot_template(sandbox_id, body.snapshot, body.stop)
 
     @app.post("/v1/sandboxes/{sandbox_id}/extend", dependencies=[Depends(require_auth)])
     async def extend_sandbox(sandbox_id: str, body: ExtendRequest) -> dict[str, Any]:
@@ -1109,6 +1718,8 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
         ):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
+            return
+        if await proxy_ws_owner(websocket, sandbox_id):
             return
         await websocket.accept()
         try:
@@ -1135,6 +1746,60 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await _exec_ws(supervisor, record, request, websocket)
+
+    @app.websocket("/v1/shell/ws")
+    async def shell_gateway_ws(websocket: WebSocket) -> None:
+        if expected_token is not None and not _tokens_match(
+            _ws_bearer_token(websocket), expected_token
+        ):
+            supervisor.count("auth_failed")
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
+            return
+        accepted = False
+        params = _query_shell_params(websocket)
+        if not params:
+            await websocket.accept()
+            accepted = True
+            try:
+                params = dict(await websocket.receive_json())
+            except Exception as exc:
+                await websocket.send_json({"error": f"invalid shell request: {exc}"})
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+        ref = str(params.get("ref") or "")
+        if ref and not accepted and await proxy_ws_owner(websocket, ref):
+            return
+        if (
+            mesh.enabled
+            and not accepted
+            and not websocket.headers.get("x-vmon-mesh-hop")
+            and not mesh.pinned_local(params)
+        ):
+            owner = mesh.place(params)
+            if owner != mesh.node_id:
+                url = mesh.peer_url(owner)
+                if url is None:
+                    await websocket.close(
+                        code=status.WS_1011_INTERNAL_ERROR, reason="owner unreachable"
+                    )
+                    return
+                try:
+                    target = _split_http_authority(url)
+                except MeshError as exc:
+                    await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=exc.message)
+                    return
+                await _proxy_websocket(
+                    websocket,
+                    target,
+                    websocket.url.path,
+                    extra_headers={
+                        "Authorization": f"Bearer {expected_token or ''}",
+                        "X-Vmon-Mesh-Hop": "1",
+                    },
+                    preserve_query=True,
+                )
+                return
+        await _shell_ws(supervisor, params, websocket, accepted=accepted)
 
     @app.get("/v1/sandboxes/{sandbox_id}/files", dependencies=[Depends(require_auth)])
     async def get_file(sandbox_id: str, path: str) -> Response:
@@ -1205,6 +1870,8 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
+        if await proxy_ws_owner(websocket, sandbox_id):
+            return
         try:
             record = supervisor.get(sandbox_id, require_running=True)
             require_connect_token(record, _ws_connect_token(websocket))
@@ -1255,7 +1922,7 @@ def serve(
     resolved_token = token or os.environ.get("VMON_API_TOKEN")
     if not resolved_token:
         raise RuntimeError("vmon serve requires --token or VMON_API_TOKEN")
-    app = create_app(token=resolved_token, idle_timeout=idle_timeout)
+    app = create_app(token=resolved_token, idle_timeout=idle_timeout, host=host, port=port)
 
     from .daemon import Daemon, acquire_owner_lock, daemon_paths, parse_tcp_addr, release_owner_lock
 
