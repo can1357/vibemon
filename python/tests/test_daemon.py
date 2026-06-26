@@ -35,6 +35,7 @@ class FakeProc:
         self.stderr = ByteStream()
         self._rc = rc
         self._chunks = chunks
+        self.stdin_closed = False
         self._exit = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -60,7 +61,7 @@ class FakeProc:
         pass
 
     def close_stdin(self):
-        pass
+        self.stdin_closed = True
 
     def resize(self, rows, cols):
         pass
@@ -71,6 +72,7 @@ class FakeSandbox:
 
     instances: dict[str, FakeSandbox] = {}
     last_create_kwargs: dict | None = None
+    last_proc: FakeProc | None = None
 
     def __init__(self, name):
         self.name = name
@@ -98,7 +100,9 @@ class FakeSandbox:
         return cls.instances.get(name) or cls(name)
 
     def exec(self, *cmd, **kwargs):
-        return FakeProc([("stdout", b"hello\n"), ("stdout", b"world\n")], rc=0)
+        proc = FakeProc([("stdout", b"hello\n"), ("stdout", b"world\n")], rc=0)
+        type(self).last_proc = proc
+        return proc
 
     def terminate(self, *a, **k):
         self.terminated = True
@@ -164,6 +168,19 @@ def test_round_trip_run_ps_stop_rm(client):
     client.call("stop", name="vm1")
     client.call("rm", name="vm1")
     assert client.call("ps") == {"vms": []}
+
+
+def test_run_gives_payload_eof_like_docker(fake_engine):
+    """Foreground `vmon run` closes the payload's stdin so it gets EOF.
+
+    `vmon run` forwards no stdin, so a default `/bin/sh` would block forever
+    waiting for input; closing stdin mirrors `docker run` without -i.
+    """
+    FakeSandbox.last_proc = None
+    result = fake_engine.run({"image": "alpine", "detach": False}, on_output=lambda *_: None)
+    assert result["returncode"] == 0
+    assert FakeSandbox.last_proc is not None
+    assert FakeSandbox.last_proc.stdin_closed is True
 
 
 def test_exec_streams_ordered_base64_then_exit(client):

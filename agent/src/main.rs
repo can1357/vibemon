@@ -1,6 +1,6 @@
 // `proto` is consumed only by the Linux-gated `linux_agent` below; the guest
 // agent only ever runs inside Linux guests, so on other hosts it is unused.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the guest agent is Linux-only"))]
 mod proto;
 
 #[cfg(target_os = "linux")]
@@ -262,6 +262,8 @@ mod linux_agent {
 			if tty {
 				let mut master_fd: libc::c_int = -1;
 				let mut slave_fd: libc::c_int = -1;
+				// SAFETY: `openpty` initializes the two out-pointers on success;
+				// name, termios, and winsize are optional and intentionally null.
 				let rc = unsafe {
 					libc::openpty(
 						&mut master_fd,
@@ -275,7 +277,23 @@ mod linux_agent {
 					self.send_error(id, format!("openpty: {}", io::Error::last_os_error()));
 					return;
 				}
+				if let Err(err) = set_cloexec(master_fd) {
+					close_fd(master_fd);
+					close_fd(slave_fd);
+					self.send_error(id, format!("openpty master cloexec: {err}"));
+					return;
+				}
+				if let Err(err) = set_cloexec(slave_fd) {
+					close_fd(master_fd);
+					close_fd(slave_fd);
+					self.send_error(id, format!("openpty slave cloexec: {err}"));
+					return;
+				}
 				pty_fds = Some((master_fd, slave_fd));
+				// SAFETY: `pre_exec` runs in the child after fork and before
+				// exec. The closure only invokes async-signal-safe libc calls to
+				// create a new session, attach the controlling tty, duplicate the
+				// pty slave onto stdio, and close inherited pty descriptors.
 				unsafe {
 					command.pre_exec(move || {
 						if libc::setsid() < 0 {
@@ -302,6 +320,9 @@ mod linux_agent {
 					.stdin(Stdio::piped())
 					.stdout(Stdio::piped())
 					.stderr(Stdio::piped());
+				// SAFETY: `pre_exec` runs in the child after fork and before
+				// exec. `setsid` is async-signal-safe and isolates the process
+				// group used by later kill requests.
 				unsafe {
 					command.pre_exec(|| {
 						if libc::setsid() < 0 {
@@ -317,10 +338,8 @@ mod linux_agent {
 				Ok(child) => child,
 				Err(err) => {
 					if let Some((master_fd, slave_fd)) = pty_fds {
-						unsafe {
-							libc::close(master_fd);
-							libc::close(slave_fd);
-						}
+						close_fd(master_fd);
+						close_fd(slave_fd);
 					}
 					self.send_error(id, format!("spawn: {err}"));
 					return;
@@ -331,16 +350,14 @@ mod linux_agent {
 
 			let (stdin, tty_master, joins) = if let Some((master_fd, slave_fd)) = pty_fds {
 				// The child holds its own slave reference now; drop the parent's.
-				unsafe {
-					libc::close(slave_fd);
-				}
+				close_fd(slave_fd);
+				// SAFETY: `master_fd` came from `openpty`, is still owned by this
+				// process, and has not been wrapped in a `File` before this point.
 				let master = unsafe { File::from_raw_fd(master_fd) };
 				let reader = match master.try_clone() {
 					Ok(reader) => reader,
 					Err(err) => {
-						unsafe {
-							libc::kill(-pid, libc::SIGKILL);
-						}
+						let _ = signal_process_group(pid, libc::SIGKILL);
 						self.send_error(id, format!("pty clone: {err}"));
 						return;
 					},
@@ -408,17 +425,27 @@ mod linux_agent {
 			let mut sessions = lock(&self.sessions);
 			let Some(session) = sessions.get_mut(&id) else {
 				drop(sessions);
-				self.send_error(id, "unknown stdin session");
+				// An empty payload is an EOF / close-stdin signal. A quick command
+				// can exit and have its session removed before the client's EOF
+				// arrives, so closing a gone session's stdin is a benign no-op,
+				// not an error.
+				if !payload.is_empty() {
+					self.send_error(id, "unknown stdin session");
+				}
 				return;
 			};
 
 			if session.tty_master.is_some() {
-				if payload.is_empty() {
-					session.tty_master = None;
-					return;
-				}
+				// PTYs cannot be half-closed like pipes. An empty stdin frame is
+				// the protocol EOF marker, so send the terminal EOF character
+				// instead of dropping the master fd (the reader clone would keep
+				// the pty open and leave shells waiting forever).
+				let input: &[u8] = if payload.is_empty() { b"\x04" } else { payload };
 				if let Some(master) = session.tty_master.as_mut() {
-					if let Err(err) = master.write_all(payload) {
+					if let Err(err) = master.write_all(input) {
+						if payload.is_empty() {
+							return;
+						}
 						drop(sessions);
 						self.send_error(id, format!("tty stdin write: {err}"));
 					}
@@ -495,9 +522,8 @@ mod linux_agent {
 				},
 			};
 
-			let rc = unsafe { libc::kill(-pid, signal) };
-			if rc < 0 {
-				self.send_error(id, format!("kill: {}", io::Error::last_os_error()));
+			if let Err(err) = signal_process_group(pid, signal) {
+				self.send_error(id, format!("kill: {err}"));
 			}
 		}
 
@@ -732,21 +758,22 @@ mod linux_agent {
 
 		fn resize(&self, id: u32, request: &Value) {
 			let rows = match request.get("rows").and_then(Value::as_u64) {
-				Some(rows) if rows <= u16::MAX as u64 => rows as u16,
+				Some(rows) if rows > 0 && rows <= u16::MAX as u64 => rows as u16,
 				_ => {
-					self.send_error(id, "rows must be a u16");
+					self.send_error(id, "rows must be 1..=u16::MAX");
 					return;
 				},
 			};
 			let cols = match request.get("cols").and_then(Value::as_u64) {
-				Some(cols) if cols <= u16::MAX as u64 => cols as u16,
+				Some(cols) if cols > 0 && cols <= u16::MAX as u64 => cols as u16,
 				_ => {
-					self.send_error(id, "cols must be a u16");
+					self.send_error(id, "cols must be 1..=u16::MAX");
 					return;
 				},
 			};
 
-			let fd = {
+			let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+			let rc = {
 				let sessions = lock(&self.sessions);
 				let Some(session) = sessions.get(&id) else {
 					drop(sessions);
@@ -758,12 +785,10 @@ mod linux_agent {
 					self.send_error(id, "session has no tty");
 					return;
 				};
-				master.as_raw_fd()
+				// SAFETY: `master` stays alive while the sessions lock is held;
+				// TIOCSWINSZ reads the provided winsize and updates the pty.
+				unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) }
 			};
-
-			let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-			// SAFETY: fd refers to the pty master; TIOCSWINSZ reads a winsize.
-			let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
 			if rc < 0 {
 				self.send_error(id, format!("resize: {}", io::Error::last_os_error()));
 			} else {
@@ -893,7 +918,7 @@ mod linux_agent {
 							return;
 						}
 					},
-					Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+					Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
 					Err(_) => break,
 				}
 			}
@@ -917,6 +942,43 @@ mod linux_agent {
 		match mutex.lock() {
 			Ok(guard) => guard,
 			Err(poisoned) => poisoned.into_inner(),
+		}
+	}
+
+	fn close_fd(fd: libc::c_int) {
+		if fd < 0 {
+			return;
+		}
+		// SAFETY: `fd` is an owned raw file descriptor on all call paths that
+		// reach here. Cleanup ignores close errors because there is no recovery.
+		let _ = unsafe { libc::close(fd) };
+	}
+
+	fn set_cloexec(fd: libc::c_int) -> io::Result<()> {
+		// SAFETY: `fd` is an open descriptor; F_GETFD reads descriptor flags and
+		// does not dereference any pointers.
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		if flags < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `fd` is an open descriptor; F_SETFD only updates descriptor
+		// flags. FD_CLOEXEC prevents pty fds leaking into unrelated execs.
+		let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+		if rc < 0 {
+			Err(io::Error::last_os_error())
+		} else {
+			Ok(())
+		}
+	}
+
+	fn signal_process_group(pid: i32, signal: i32) -> io::Result<()> {
+		// SAFETY: `kill` with a negative pid targets the process group created
+		// for this exec session by `setsid`; no pointers are involved.
+		let rc = unsafe { libc::kill(-pid, signal) };
+		if rc < 0 {
+			Err(io::Error::last_os_error())
+		} else {
+			Ok(())
 		}
 	}
 
@@ -1009,7 +1071,11 @@ mod linux_agent {
 		let leaders: HashSet<i32> = lock(sessions).values().map(|s| s.pid).collect();
 
 		loop {
+			// SAFETY: an all-zero `siginfo_t` is a valid initial buffer for
+			// `waitid`, which fully initializes the fields it reports.
 			let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+			// SAFETY: `info` is a valid writable pointer, and WNOWAIT ensures
+			// tracked session leaders remain reapable by their waiter threads.
 			let rc = unsafe {
 				libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
 			};
@@ -1017,7 +1083,8 @@ mod linux_agent {
 			if rc == -1 {
 				break;
 			}
-			// WNOHANG with nothing waitable leaves si_pid == 0 (we pre-zeroed it).
+			// SAFETY: `waitid` returned success and `info` has been initialized.
+			// WNOHANG with nothing waitable leaves si_pid == 0.
 			let pid = unsafe { info.si_pid() };
 			if pid == 0 {
 				break;
@@ -1033,11 +1100,14 @@ mod linux_agent {
 			}
 			// Untracked orphan reparented to us: reap it and discard the status.
 			let mut status = 0;
-			unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+			// SAFETY: `pid` came from `waitid` and is still waitable because the
+			// earlier call used WNOWAIT.
+			let _ = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
 		}
 	}
 
 	fn setup_pid1() -> Result<(), String> {
+		// SAFETY: `getpid` has no preconditions and touches no Rust memory.
 		if unsafe { libc::getpid() } != 1 {
 			return Ok(());
 		}
@@ -1047,6 +1117,8 @@ mod linux_agent {
 		mount_fs("proc", "/proc", "proc")?;
 		mount_fs("sysfs", "/sys", "sysfs")?;
 		mount_fs("devtmpfs", "/dev", "devtmpfs")?;
+		fs::create_dir_all("/dev/pts").map_err(|err| format!("create /dev/pts: {err}"))?;
+		mount_fs("devpts", "/dev/pts", "devpts")?;
 		Ok(())
 	}
 
@@ -1054,6 +1126,8 @@ mod linux_agent {
 		let source = CString::new(source).map_err(|err| err.to_string())?;
 		let target = CString::new(target).map_err(|err| err.to_string())?;
 		let fstype = CString::new(fstype).map_err(|err| err.to_string())?;
+		// SAFETY: all C strings are nul-terminated and live across the call;
+		// data is null because these pseudo-filesystems need no mount options.
 		let rc = unsafe {
 			libc::mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), 0, std::ptr::null())
 		};
@@ -1069,6 +1143,8 @@ mod linux_agent {
 	}
 
 	fn set_child_subreaper() -> Result<(), String> {
+		// SAFETY: PR_SET_CHILD_SUBREAPER takes integer arguments only; enabling
+		// it for the agent lets PID1 reap orphaned descendants.
 		let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
 		if rc == 0 {
 			Ok(())
@@ -1168,6 +1244,8 @@ mod linux_agent {
 	}
 
 	fn reboot_guest() -> Result<(), String> {
+		// SAFETY: `sync` and `reboot` take no Rust pointers; RB_AUTOBOOT asks
+		// the kernel to restart the guest after pending writes are flushed.
 		unsafe {
 			libc::sync();
 			if libc::reboot(libc::RB_AUTOBOOT) == 0 {
@@ -1188,6 +1266,7 @@ mod linux_agent {
 		let ip = Ipv4Addr::from_str(ip).map_err(|err| format!("ip: {err}"))?;
 		let gw = Ipv4Addr::from_str(gw).map_err(|err| format!("gw: {err}"))?;
 		let ifname = CString::new(iface).map_err(|err| err.to_string())?;
+		// SAFETY: `ifname` is a nul-terminated string that lives across the call.
 		let ifindex = unsafe { libc::if_nametoindex(ifname.as_ptr()) };
 		if ifindex == 0 {
 			return Err(format!("if_nametoindex {iface}: {}", io::Error::last_os_error()));
@@ -1280,6 +1359,8 @@ mod linux_agent {
 	}
 
 	fn netlink_request(message_type: u16, flags: u16, payload: &[u8]) -> io::Result<()> {
+		// SAFETY: `socket` takes integer arguments only and returns a new fd on
+		// success, which this function closes before returning.
 		let fd = unsafe {
 			libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE)
 		};
@@ -1300,10 +1381,13 @@ mod linux_agent {
 			push_struct(&mut request, &header);
 			request.extend_from_slice(payload);
 
+			// SAFETY: zero is a valid sockaddr_nl baseline; fields are filled below.
 			let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
 			addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
 			addr.nl_pid = 0;
 			addr.nl_groups = 0;
+			// SAFETY: `fd` is an open netlink socket; request and addr point to
+			// initialized buffers that live for the duration of the syscall.
 			let sent = unsafe {
 				libc::sendto(
 					fd,
@@ -1319,6 +1403,7 @@ mod linux_agent {
 			}
 
 			let mut ack = [0u8; 4096];
+			// SAFETY: `ack` is a valid writable buffer for `recv`.
 			let len = unsafe { libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0) };
 			if len < 0 {
 				return Err(io::Error::last_os_error());
@@ -1326,6 +1411,7 @@ mod linux_agent {
 			parse_netlink_ack(&ack[..len as usize])
 		})();
 
+		// SAFETY: `fd` is owned by this function and is closed exactly once here.
 		let close_result = unsafe { libc::close(fd) };
 		if result.is_ok() && close_result < 0 {
 			Err(io::Error::last_os_error())
@@ -1339,6 +1425,8 @@ mod linux_agent {
 		if buf.len() < header_len {
 			return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short netlink ack"));
 		}
+		// SAFETY: the length check above guarantees a complete header; unaligned
+		// reads are required because the header starts in a byte slice.
 		let header = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<libc::nlmsghdr>()) };
 		if header.nlmsg_type != libc::NLMSG_ERROR as u16 {
 			return Ok(());
@@ -1346,6 +1434,8 @@ mod linux_agent {
 		if buf.len() < header_len + std::mem::size_of::<libc::nlmsgerr>() {
 			return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short netlink error"));
 		}
+		// SAFETY: the length check above guarantees a complete nlmsgerr; unaligned
+		// reads are required because the payload starts in a byte slice.
 		let err =
 			unsafe { std::ptr::read_unaligned(buf[header_len..].as_ptr().cast::<libc::nlmsgerr>()) };
 		if err.error == 0 {
@@ -1356,6 +1446,8 @@ mod linux_agent {
 	}
 
 	fn push_struct<T>(buf: &mut Vec<u8>, value: &T) {
+		// SAFETY: callers pass fully initialized repr(C)/libc netlink structs
+		// whose byte representation is sent directly to the kernel.
 		let bytes = unsafe {
 			std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
 		};

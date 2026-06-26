@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
+from collections.abc import AsyncIterator, MutableMapping
 import contextlib
 import hashlib
 import ipaddress
@@ -473,7 +474,10 @@ def _spawn_exec_readers(process: Any) -> queue.Queue[tuple[str, str | int | None
         try:
             if stream is None:
                 return
-            if hasattr(stream, "read"):
+            if stream.__class__.__name__ == "ByteStream" and hasattr(stream, "__next__"):
+                for chunk in stream:
+                    events.put((name, _chunk_to_text(chunk)))
+            elif hasattr(stream, "read"):
                 while True:
                     chunk = stream.read(65536)
                     if not chunk:
@@ -698,9 +702,16 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n"
     )
-    writer.write(request.encode("latin-1"))
-    await writer.drain()
-    response = await reader.readuntil(b"\r\n\r\n")
+    try:
+        writer.write(request.encode("latin-1"))
+        await writer.drain()
+        response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
+    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="websocket upgrade failed")
+        return
     expected = base64.b64encode(
         hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
     ).decode()
@@ -769,7 +780,7 @@ def _coerce_stdin(value: Any) -> bytes:
     return str(value).encode()
 
 
-def _ws_stdin_action(message: dict[str, Any]) -> tuple[str, Any] | None:
+def _ws_stdin_action(message: MutableMapping[str, Any]) -> tuple[str, Any] | None:
     """Translate a client websocket frame into a stdin/resize action.
 
     Returns ("write", bytes) to forward stdin, ("close", None) to half-close
@@ -795,8 +806,14 @@ def _ws_stdin_action(message: dict[str, Any]) -> tuple[str, Any] | None:
         or kind in {"close_stdin", "stdin_close", "eof"}
     ):
         return ("close", None)
-    if "resize" in payload and isinstance(payload["resize"], dict):
-        r, c = payload["resize"].get("rows"), payload["resize"].get("cols")
+    if "resize" in payload:
+        resize = payload["resize"]
+        if isinstance(resize, dict):
+            r, c = resize.get("rows"), resize.get("cols")
+        elif isinstance(resize, (list, tuple)) and len(resize) == 2:
+            r, c = resize
+        else:
+            r = c = None
         if isinstance(r, int) and isinstance(c, int) and r > 0 and c > 0:
             return ("resize", (r, c))
     if "stdin" in payload:
@@ -959,7 +976,22 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
     supervisor = Supervisor(Engine(), idle_poll=max(1.0, min(float(idle_timeout), 30.0)))
     expected_token = token if token is not None else os.environ.get("VMON_API_TOKEN")
     bearer = HTTPBearer(auto_error=False)
-    app = FastAPI(title="vmon sandbox server", version="1")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
+        try:
+            yield
+        finally:
+            task = getattr(app.state, "reaper_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    app = FastAPI(title="vmon sandbox server", version="1", lifespan=lifespan)
     app.state.supervisor = supervisor
 
     @app.exception_handler(RequestValidationError)
@@ -1021,20 +1053,6 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
         finally:
             supervisor.unsubscribe_events(subscriber)
 
-    @app.on_event("startup")
-    async def _startup() -> None:
-        app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
-
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        task = getattr(app.state, "reaper_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
     @app.get("/healthz")
     async def healthz() -> dict[str, bool]:
         return {"ok": True}
@@ -1086,13 +1104,13 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     @app.websocket("/v1/sandboxes/{sandbox_id}/exec/ws")
     async def exec_sandbox_ws(websocket: WebSocket, sandbox_id: str) -> None:
-        await websocket.accept()
         if expected_token is not None and not _tokens_match(
             _ws_bearer_token(websocket), expected_token
         ):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
+        await websocket.accept()
         try:
             record = supervisor.get(sandbox_id, require_running=True)
         except HTTPException as exc:
@@ -1261,7 +1279,7 @@ def serve(
         daemon.shutdown()
         release_owner_lock(lock_fd)
         raise RuntimeError(f"failed to bind the local vmond socket at {paths['sock']}")
-    paths["pid"].write_text(f"{os.getpid()}\n")
+    paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
     try:
         uvicorn.run(app, host=host, port=port)
     finally:

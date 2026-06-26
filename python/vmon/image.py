@@ -135,10 +135,17 @@ def _init_script(spec: ImageSpec, argv: list[str]) -> str:
     )
     run_line = " ".join(_sh_quote(a) for a in argv) if argv else "/bin/sh"
     workdir = spec.workdir or "/"
+    # The legacy console path streams output only (the VMM is spawned with stdin
+    # closed), so the payload runs non-interactively like `docker run` without
+    # -i: its stdin is /dev/null. Binding stdin to the serial tty instead makes
+    # a shell command (e.g. Alpine's default /bin/sh) sit at a prompt it can
+    # never receive input on, printing "can't access tty; job control turned
+    # off" and leaking the terminal's cursor-position reply into the stream. Use
+    # `vmon shell` for an interactive agent-PTY session.
     return f"""#!/bin/sh
 # Auto-generated microVM PID 1 for image: {spec.reference}
 mount -t devtmpfs dev /dev 2>/dev/null
-exec >/dev/console 2>&1 </dev/console
+exec >/dev/console 2>&1 </dev/null
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 {exports}

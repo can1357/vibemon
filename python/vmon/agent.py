@@ -126,12 +126,15 @@ class ByteStream(Iterator[bytes]):
 class ExecSession:
     """A live guest exec session."""
 
-    def __init__(self, conn: AgentConn, session_id: int, timeout: float | None = None) -> None:
+    def __init__(
+        self, conn: AgentConn, session_id: int, timeout: float | None = None, tty: bool = False
+    ) -> None:
         self._conn = conn
         self.id = session_id
         self.stdout = ByteStream()
         self.stderr = ByteStream()
         self._default_timeout = timeout
+        self._tty = bool(tty)
         self._exit = threading.Event()
         self._code: int | None = None
         self._signal: int | None = None
@@ -154,7 +157,10 @@ class ExecSession:
             self._conn._send_frame(TYPE_STDIN, self.id, raw[off : off + MAX_PAYLOAD])
 
     def close_stdin(self) -> None:
-        self._conn._send_frame(TYPE_STDIN, self.id, b"")
+        if self._tty:
+            self._conn._send_frame(TYPE_STDIN, self.id, b"\x04")
+        else:
+            self._conn._send_frame(TYPE_STDIN, self.id, b"")
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize the pty for this session.
@@ -294,7 +300,7 @@ class AgentConn:
         if not cmd:
             raise ValueError("exec command must not be empty")
         req_id = self._new_id()
-        session = ExecSession(self, req_id, timeout=timeout)
+        session = ExecSession(self, req_id, timeout=timeout, tty=tty)
         payload: dict[str, Any] = {"op": "exec", "cmd": [str(c) for c in cmd], "tty": bool(tty)}
         if cwd is not None:
             payload["cwd"] = str(cwd)
@@ -498,6 +504,8 @@ class AgentConn:
         with self._lock:
             session = self._sessions.pop(frame_id, None)
         if session is not None:
+            session.stdout.close()
+            session.stderr.close()
             session._set_exit(int(result.get("code", -1)), result.get("signal"))
 
     def _abort(self, error: BaseException) -> None:

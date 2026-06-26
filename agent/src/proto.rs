@@ -74,7 +74,7 @@ fn read_first_byte<R: Read>(reader: &mut R) -> io::Result<Option<u8>> {
 			Ok(0) => return Ok(None),
 			Ok(1) => return Ok(Some(byte[0])),
 			Ok(_) => unreachable!("one-byte buffer cannot read more than one byte"),
-			Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+			Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
 			Err(err) => return Err(err),
 		}
 	}

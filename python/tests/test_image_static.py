@@ -154,3 +154,22 @@ def test_ensure_kernel_expands_home_and_normalizes_arch(monkeypatch, tmp_path):
     )
 
     assert assets.ensure_kernel("arm64") == cached
+
+
+def test_init_script_runs_payload_non_interactively():
+    """Legacy console boot is output-only, so the payload's stdin is /dev/null.
+
+    A serial-tty stdin would make a shell command sit at an unusable interactive
+    prompt ("can't access tty; job control turned off" plus a leaked
+    cursor-position reply); /dev/null gives it EOF like ``docker run`` without -i.
+    """
+    from vmon.image import ImageSpec, _init_script
+
+    spec = ImageSpec(reference="alpine", cmd=["/bin/sh"], workdir="/root")
+    script = _init_script(spec, spec.argv(None))
+
+    assert "</dev/null" in script
+    assert "</dev/console" not in script
+    # Output still streams to the serial console for `vmon logs`/foreground run.
+    assert ">/dev/console 2>&1" in script
+    assert "'/bin/sh'" in script

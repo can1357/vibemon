@@ -15,6 +15,7 @@ result; :meth:`stream` invokes ``on_event(stream, data: bytes)`` for each frame
 from __future__ import annotations
 
 import base64
+import binascii
 import fcntl
 import itertools
 import json
@@ -174,8 +175,11 @@ class DaemonClient:
         stop = threading.Event()
         raw: tuple[int, Any] | None = None
         winch: Any = None
-        # The daemon allocates a guest PTY iff the client will run one.
-        params = {**params, "tty": bool(tty)}
+        # Ask the daemon for a guest PTY only when requested; the local side may
+        # still fall back to plain stdin forwarding if this process is not on a TTY.
+        requested_tty = bool(tty)
+        params = {**params, "tty": requested_tty}
+        stdin_thread: threading.Thread | None = None
         try:
             conn.send_request(method, params)
             while True:
@@ -183,19 +187,26 @@ class DaemonClient:
                 if frame is None:
                     raise DaemonError("daemon closed the connection", code="closed")
                 if frame.get("event") == "ready":
-                    use_tty = bool(tty) and sys.stdin.isatty() and sys.stdout.isatty()
-                    if use_tty:
+                    use_raw_tty = requested_tty and sys.stdin.isatty() and sys.stdout.isatty()
+                    if use_raw_tty:
                         raw = self._enter_raw()
                         self._send_winsize(conn)
                         winch = self._install_winch(conn)
-                    threading.Thread(
-                        target=self._forward_raw_stdin,
-                        args=(conn, stop),
+                        target = self._forward_raw_stdin
+                        args = (conn, stop)
+                    else:
+                        stdin = getattr(sys.stdin, "buffer", sys.stdin)
+                        target = self._forward_stdin
+                        args = (conn, stdin, stop)
+                    stdin_thread = threading.Thread(
+                        target=target,
+                        args=args,
                         name="vmon-stdin",
                         daemon=True,
-                    ).start()
-                    # After raw mode + stdin forwarding are live: input typed from
-                    # here on is preserved (raw mode's TCSAFLUSH has already run).
+                    )
+                    stdin_thread.start()
+                    # After the stdin path is live, stop any boot spinner so the
+                    # guest prompt/output owns the terminal from this point on.
                     if on_ready is not None:
                         on_ready(str(frame.get("data") or ""))
                     continue
@@ -211,6 +222,8 @@ class DaemonClient:
                 )
         finally:
             stop.set()
+            if stdin_thread is not None and raw is not None:
+                stdin_thread.join(timeout=0.3)
             if winch is not None:
                 self._restore_winch(winch)
             if raw is not None:
@@ -224,7 +237,7 @@ class DaemonClient:
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
-        _tty.setraw(fd)
+        _tty.setraw(fd, termios.TCSANOW)
         return fd, old
 
     @staticmethod
@@ -239,9 +252,12 @@ class DaemonClient:
 
     @staticmethod
     def _send_winsize(conn: _Conn) -> None:
-        import shutil
+        try:
+            size = os.get_terminal_size(sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            import shutil
 
-        size = shutil.get_terminal_size((80, 24))
+            size = shutil.get_terminal_size((80, 24))
         conn.send_resize(size.lines, size.columns)
 
     def _install_winch(self, conn: _Conn) -> Any:
@@ -327,7 +343,11 @@ class DaemonClient:
             return  # PTY handshake; consumed by interactive(), ignored elsewhere
         data = frame.get("data") or ""
         if event in ("stdout", "stderr"):
-            on_event(event, base64.b64decode(data))
+            try:
+                payload = base64.b64decode(data, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise DaemonError(f"invalid {event} frame from daemon", code="protocol") from e
+            on_event(event, payload)
         else:  # console / logs are plain UTF-8
             on_event(event, str(data).encode("utf-8"))
 
@@ -339,6 +359,8 @@ class DaemonClient:
                 if not chunk:
                     conn.send_eof()
                     return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode()
                 conn.send_stdin(chunk)
         except Exception:
             pass

@@ -480,6 +480,10 @@ class Engine:
         )
         argv = default_command(sandbox.image_spec, cmd)
         proc = sandbox.exec(argv)
+        # `vmon run` has no stdin channel (the client never forwards it), so give
+        # the payload EOF like `docker run` without -i; otherwise an image whose
+        # command reads stdin (e.g. the default /bin/sh) blocks forever.
+        proc.close_stdin()
         result = {
             "name": sandbox.name,
             "pid": sandbox.vm.meta.get("pid"),
@@ -1022,7 +1026,10 @@ class Engine:
             )
             thread.start()
             threads.append(thread)
-        rc = self._wait_cancellable(proc, cancel)
+        try:
+            rc = self._wait_cancellable(proc, cancel)
+        finally:
+            self._close_streams(proc)
         for thread in threads:
             thread.join(timeout=5.0)
         return rc
@@ -1035,6 +1042,17 @@ class Engine:
                     on_output(stream_name, chunk if isinstance(chunk, bytes) else bytes(chunk))
         except Exception:
             pass
+
+    @staticmethod
+    def _close_streams(proc: Any) -> None:
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _wait_cancellable(proc: Any, cancel: threading.Event | None) -> int:

@@ -64,7 +64,10 @@ class _Conn:
         self._wlock = threading.Lock()
 
     def read_obj(self) -> dict[str, Any] | None:
-        line = self._rfile.readline()
+        try:
+            line = self._rfile.readline()
+        except OSError:
+            return None
         if not line:
             return None
         try:
@@ -73,13 +76,20 @@ class _Conn:
             return None
         return obj if isinstance(obj, dict) else None
 
-    def send(self, obj: dict[str, Any]) -> None:
+    def send(self, obj: dict[str, Any]) -> bool:
         data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
         with self._wlock:
             try:
                 self._sock.sendall(data)
             except OSError:
-                pass
+                return False
+        return True
+
+    def shutdown_read(self) -> None:
+        try:
+            self._sock.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
 
     def close(self) -> None:
         try:
@@ -246,9 +256,13 @@ class Daemon:
     def _serve_request(self, conn: _Conn, req: dict[str, Any]) -> None:
         rid = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
+        params = req.get("params", {})
+        if params is None:
+            params = {}
         handler = self._dispatch.get(str(method))
         try:
+            if not isinstance(params, dict):
+                raise EngineError("params must be an object", code="invalid")
             if handler is None:
                 raise EngineError(f"unknown method {method!r}", code="invalid")
             handler(conn, rid, params)
@@ -362,12 +376,16 @@ class Daemon:
 
     def _h_exec(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         name = self._name(params)
+        workdir = params.get("workdir")
+        if workdir is None:
+            workdir = params.get("cwd")
         proc = self._engine.start_exec(
             name,
             list(params.get("cmd") or []),
             env=params.get("env"),
-            workdir=params.get("workdir"),
+            workdir=workdir,
             tty=bool(params.get("tty")),
+            timeout=params.get("timeout"),
         )
         self._pump_interactive(conn, rid, proc, name)
 
@@ -394,14 +412,19 @@ class Daemon:
         ``None`` for attach) always runs.
         """
         stop = threading.Event()
+        cancel = threading.Event()
         rc = -1
         try:
-            conn.send({"id": rid, "event": "ready", "data": name})
+            if not conn.send({"id": rid, "event": "ready", "data": name}):
+                raise EngineError("client disconnected", code="closed")
             reader = threading.Thread(
-                target=self._exec_input, args=(conn, proc, stop), name="vmond-stdin", daemon=True
+                target=self._exec_input,
+                args=(conn, proc, stop, cancel),
+                name="vmond-stdin",
+                daemon=True,
             )
             reader.start()
-            rc = self._engine.pump_process(proc, _emitter(conn, rid), cancel=None)
+            rc = self._engine.pump_process(proc, _emitter(conn, rid), cancel=cancel)
         except Exception:
             try:
                 proc.kill()
@@ -410,6 +433,7 @@ class Daemon:
             raise
         finally:
             stop.set()
+            conn.shutdown_read()
             if cleanup is not None:
                 cleanup()
         # Result is sent only after ephemeral teardown, so a client that polls
@@ -417,15 +441,19 @@ class Daemon:
         conn.send({"id": rid, "ok": True, "result": {"returncode": rc, **(result_extra or {})}})
 
     @staticmethod
-    def _exec_input(conn: _Conn, proc: Any, stop: threading.Event) -> None:
+    def _exec_input(
+        conn: _Conn, proc: Any, stop: threading.Event, cancel: threading.Event
+    ) -> None:
         """Forward client stdin/eof/resize frames; kill the process on disconnect."""
         while not stop.is_set():
             msg = conn.read_obj()
             if msg is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                cancel.set()
+                if not stop.is_set():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
                 return
             try:
                 if "stdin" in msg:
@@ -480,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         # Another daemon already owns this home; nothing to do.
         return 0
     try:
-        paths["pid"].write_text(f"{os.getpid()}\n")
+        paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
         engine = Engine()
         token = os.environ.get("VMON_API_TOKEN")
         tcp_addr = parse_tcp_addr(os.environ.get("VMON_DAEMON_TCP"))
