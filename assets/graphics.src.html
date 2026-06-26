@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  /* vmon brand tokens — lifted from ui/src/styles.css (OKLCH, accent hue 230) */
+  :root {
+    --bg:        oklch(0.155 0.012 230);
+    --bg2:       oklch(0.185 0.014 230);
+    --raised:    oklch(0.215 0.015 230);
+    --inset:     oklch(0.135 0.010 230);
+    --fg:        oklch(0.94 0.006 230);
+    --muted:     oklch(0.68 0.012 230);
+    --faint:     oklch(0.50 0.014 230);
+    --accent:    oklch(0.80 0.135 230);
+    --accent-hi: oklch(0.88 0.14 230);
+    --accent-dim:oklch(0.62 0.10 230);
+    --border:    oklch(0.34 0.016 230 / 0.7);
+    --border-hi: oklch(0.46 0.03 230 / 0.8);
+    --ok:        oklch(0.78 0.15 150);
+    --warn:      oklch(0.82 0.15 80);
+    --mag:       oklch(0.74 0.15 320);
+    --mono: "SF Mono", "JetBrains Mono", "Cascadia Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0e12; font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  .frame { margin: 24px; }
+
+  /* ============ shared bits ============ */
+  .grid-dots {
+    background-image: radial-gradient(oklch(0.42 0.02 230 / 0.30) 1px, transparent 1.4px);
+    background-size: 22px 22px;
+  }
+  .chip {
+    font-family: var(--mono); font-size: 13px; letter-spacing: 0.01em;
+    color: var(--muted); padding: 5px 11px; border-radius: 5px;
+    border: 1px solid var(--border); background: oklch(0.20 0.014 230 / 0.6);
+    white-space: nowrap;
+  }
+  .chip b { color: var(--accent); font-weight: 600; }
+
+  /* ============ HERO ============ */
+  #hero {
+    position: relative; width: 1280px; height: 500px; overflow: hidden;
+    background:
+      radial-gradient(120% 150% at 86% -10%, oklch(0.30 0.10 230 / 0.55) 0%, transparent 46%),
+      radial-gradient(90% 120% at 110% 120%, oklch(0.26 0.10 300 / 0.30) 0%, transparent 50%),
+      linear-gradient(160deg, var(--bg2) 0%, var(--bg) 60%, var(--inset) 100%);
+    border-radius: 16px; border: 1px solid var(--border-hi);
+    box-shadow: 0 30px 80px oklch(0.05 0.02 230 / 0.6), inset 0 1px 0 oklch(0.6 0.03 230 / 0.12);
+  }
+  #hero .dots {
+    position: absolute; inset: 0; opacity: 0.5;
+    -webkit-mask-image: linear-gradient(105deg, #000 0%, transparent 62%);
+            mask-image: linear-gradient(105deg, #000 0%, transparent 62%);
+  }
+  #hero .scan { position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent 0 3px, oklch(0.5 0.02 230 / 0.025) 3px 4px); }
+  #hero .accentbar { position: absolute; top: 0; left: 44px; width: 220px; height: 3px;
+    background: linear-gradient(90deg, var(--accent), transparent); border-radius: 0 0 3px 3px; }
+
+  #hero .wrap { position: relative; height: 100%; display: flex; padding: 46px 52px; }
+  #hero .left { width: 58%; display: flex; flex-direction: column; }
+
+  .eyebrow { display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 14px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--accent); font-weight: 500; }
+  .eyebrow .sq { width: 9px; height: 9px; background: var(--accent); border-radius: 2px;
+    box-shadow: 0 0 12px var(--accent); }
+  .eyebrow .dim { color: var(--faint); letter-spacing: 0.16em; }
+
+  .wordmark { margin-top: 20px; font-weight: 800; font-size: 96px; line-height: 0.92;
+    letter-spacing: -0.04em; color: var(--fg); }
+  .wordmark .mon {
+    background: linear-gradient(180deg, var(--accent-hi), var(--accent-dim));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+
+  .tagline { margin-top: 20px; font-size: 21px; line-height: 1.42; color: var(--muted);
+    max-width: 600px; font-weight: 400; }
+  .tagline b { color: var(--fg); font-weight: 600; }
+
+  .term { margin-top: 26px; align-self: flex-start; display: flex; align-items: center; gap: 12px;
+    font-family: var(--mono); font-size: 17px; color: var(--fg);
+    background: oklch(0.12 0.01 230 / 0.85); border: 1px solid var(--border-hi);
+    border-radius: 9px; padding: 13px 18px; box-shadow: inset 0 1px 0 oklch(0.6 0.03 230 / 0.08); }
+  .term .p { color: var(--accent); font-weight: 700; }
+  .term .cmd { color: var(--fg); }
+  .term .arg { color: var(--muted); }
+  .term .cur { width: 10px; height: 19px; background: var(--accent); display: inline-block;
+    margin-left: 4px; border-radius: 1px; box-shadow: 0 0 10px var(--accent); }
+
+  /* right — CoW fork motif: a template card with offset clone cards behind */
+  #hero .right { width: 42%; position: relative; }
+  .stack { position: absolute; top: 30px; right: 6px; width: 318px; height: 300px; }
+  .card { position: absolute; width: 240px; border-radius: 12px;
+    border: 1px solid var(--border-hi); background: linear-gradient(160deg, var(--raised), var(--bg2));
+    box-shadow: 0 18px 40px oklch(0.05 0.02 230 / 0.5); }
+  .card .hd { display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+    border-bottom: 1px solid var(--border); }
+  .card .hd .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .card .hd .t { font-family: var(--mono); font-size: 13px; color: var(--muted); margin-left: 2px; }
+  .card .bd { padding: 13px 14px; font-family: var(--mono); font-size: 12.5px; color: var(--faint);
+    line-height: 1.7; }
+  .card .bd .k { color: var(--accent-dim); }
+  .clone { top: 64px; right: 60px; height: 150px; opacity: 0.45; transform: rotate(-3deg); }
+  .clone2 { top: 44px; right: 30px; height: 150px; opacity: 0.7; transform: rotate(-1.5deg); }
+  .tmpl { top: 18px; right: 0; }
+  .tmpl .dot { background: var(--accent); box-shadow: 0 0 9px var(--accent); }
+  .badge-ms { position: absolute; bottom: 8px; right: 36px; font-family: var(--mono);
+    font-size: 13px; color: var(--bg); font-weight: 700; background: var(--accent);
+    padding: 6px 12px; border-radius: 999px; box-shadow: 0 8px 22px oklch(0.6 0.13 230 / 0.45);
+    display: flex; align-items: center; gap: 7px; }
+  .badge-ms .lbl { color: oklch(0.18 0.03 230); font-weight: 600; }
+
+  .caps { margin-top: auto; padding-top: 30px; display: flex; gap: 9px; flex-wrap: wrap;
+    width: 100%; }
+
+  /* ============ ARCHITECTURE ============ */
+  #arch { position: relative; width: 1120px; padding: 40px 44px 44px;
+    background: linear-gradient(165deg, var(--bg2), var(--bg) 70%, var(--inset));
+    border-radius: 16px; border: 1px solid var(--border-hi); }
+  .a-title { font-family: var(--mono); font-size: 15px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .a-title .sq { width: 9px; height: 9px; background: var(--accent); border-radius: 2px; box-shadow: 0 0 12px var(--accent); }
+  .a-sub { color: var(--faint); font-size: 15px; margin-bottom: 26px; font-family: var(--sans); }
+
+  .layer { display: flex; align-items: stretch; gap: 0; }
+  .lbox { flex: 1; display: flex; align-items: center; gap: 18px;
+    border: 1px solid var(--border-hi); border-radius: 12px; padding: 16px 22px;
+    background: linear-gradient(160deg, var(--raised), var(--bg2)); }
+  .lbox.host { background: linear-gradient(160deg, oklch(0.22 0.05 230), oklch(0.18 0.03 230)); }
+  .lbox .ic { width: 46px; height: 46px; border-radius: 10px; flex: none;
+    display: flex; align-items: center; justify-content: center; font-family: var(--mono);
+    font-size: 19px; font-weight: 700; color: var(--accent);
+    background: oklch(0.26 0.05 230 / 0.6); border: 1px solid var(--border-hi); }
+  .lbox .meta { display: flex; flex-direction: column; gap: 3px; }
+  .lbox .name { font-size: 19px; font-weight: 700; color: var(--fg); }
+  .lbox .name .mono { font-family: var(--mono); color: var(--accent); font-weight: 600; }
+  .lbox .desc { font-size: 13.5px; color: var(--muted); }
+  .lbox .tag { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--faint);
+    border: 1px solid var(--border); border-radius: 5px; padding: 3px 9px; white-space: nowrap; }
+
+  .conn { display: flex; align-items: center; justify-content: center; height: 38px; position: relative; }
+  .conn .line { width: 2px; height: 100%; background: linear-gradient(var(--border-hi), var(--accent-dim)); }
+  .conn .pill { position: absolute; font-family: var(--mono); font-size: 12px; color: var(--accent);
+    background: var(--inset); border: 1px solid var(--border-hi); border-radius: 999px; padding: 3px 12px; }
+
+  /* ============ LIFECYCLE ============ */
+  #flow { position: relative; width: 1200px; padding: 40px 44px 46px;
+    background: linear-gradient(165deg, var(--bg2), var(--bg) 70%, var(--inset));
+    border-radius: 16px; border: 1px solid var(--border-hi); }
+  .f-row { display: flex; align-items: center; gap: 0; margin-top: 30px; }
+  .node { border: 1px solid var(--border-hi); border-radius: 13px; background: linear-gradient(160deg, var(--raised), var(--bg2));
+    padding: 18px 22px; min-width: 184px; box-shadow: 0 14px 34px oklch(0.05 0.02 230 / 0.4); }
+  .node .lab { font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--faint); }
+  .node .big { font-size: 21px; font-weight: 700; color: var(--fg); margin-top: 5px; }
+  .node .small { font-size: 13px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+  .node.tmpl { border-color: var(--accent-dim); box-shadow: 0 0 0 1px oklch(0.5 0.1 230 / 0.4), 0 14px 34px oklch(0.5 0.1 230 / 0.18); }
+  .node.tmpl .lab { color: var(--accent); }
+
+  .arrow { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    position: relative; min-width: 86px; }
+  .arrow .ln { width: 100%; height: 2px; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); position: relative; }
+  .arrow .ln::after { content: ""; position: absolute; right: -1px; top: -4px; border: 5px solid transparent;
+    border-left-color: var(--accent); }
+  .arrow .pill { font-family: var(--mono); font-size: 12.5px; color: var(--bg); background: var(--accent);
+    font-weight: 700; padding: 4px 11px; border-radius: 999px; margin-bottom: 9px; }
+  .arrow .pill.dim { color: var(--fg); background: oklch(0.26 0.03 230); border: 1px solid var(--border-hi); }
+
+  .branch { display: flex; flex-direction: column; gap: 16px; }
+  .lanes { display: flex; flex-direction: column; gap: 18px; margin-left: 6px; }
+  .lane { display: flex; align-items: center; }
+  .f-title { font-family: var(--mono); font-size: 15px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); display: flex; align-items: center; gap: 10px; }
+  .f-title .sq { width: 9px; height: 9px; background: var(--accent); border-radius: 2px; box-shadow: 0 0 12px var(--accent); }
+  .f-sub { color: var(--faint); font-size: 15px; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<!-- ===================== HERO ===================== -->
+<div class="frame">
+<div id="hero" class="">
+  <div class="dots grid-dots"></div>
+  <div class="scan"></div>
+  <div class="accentbar"></div>
+  <div class="wrap">
+    <div class="left">
+      <div class="eyebrow"><span class="sq"></span> KVM <span class="dim">·</span> HVF microVM monitor</div>
+      <div class="wordmark">Vibe<span class="mon">mon</span></div>
+      <div class="tagline">Run containers as <b>hardware-isolated microVMs</b>. Boot, snapshot, and <b>fork in milliseconds</b> — a Rust VMM with a Docker-like CLI and a Modal-style sandbox SDK.</div>
+      <div class="term">
+        <span class="p">$</span><span class="cmd">vmon&nbsp;run</span><span class="arg">&nbsp;alpine&nbsp;--&nbsp;uname&nbsp;-a</span><span class="cur"></span>
+      </div>
+      <div class="caps">
+        <span class="chip">virtio-<b>blk</b></span>
+        <span class="chip">virtio-<b>net</b></span>
+        <span class="chip">virtio-<b>fs</b></span>
+        <span class="chip"><b>snapshot</b> / restore</span>
+        <span class="chip"><b>CoW</b> fork</span>
+        <span class="chip">seccomp + <b>landlock</b></span>
+        <span class="chip">warm <b>pools</b></span>
+      </div>
+    </div>
+    <div class="right">
+      <div class="stack">
+        <div class="card clone"></div>
+        <div class="card clone2"></div>
+        <div class="card tmpl">
+          <div class="hd"><span class="dot"></span><span class="t">template.snap</span></div>
+          <div class="bd"><span class="k">mem</span> MAP_PRIVATE<br><span class="k">cow</span> clean pages shared<br><span class="k">boot</span> none — restored</div>
+        </div>
+        <div class="badge-ms"><span class="lbl">fork</span> ~3 ms · 22 MiB</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<div class="frame">
+<div id="arch">
+  <div class="a-title"><span class="sq"></span> Architecture</div>
+  <div class="a-sub">Three layers. One process per microVM; the guest agent talks back over a virtio-console channel.</div>
+
+  <div class="layer">
+    <div class="lbox">
+      <div class="ic">UI</div>
+      <div class="meta"><div class="name">Web panel <span class="mono">(React SPA)</span></div>
+        <div class="desc">Dashboard, terminal, files, metrics — OKLCH dark theme</div></div>
+      <div class="tag">ui/ → python/vmon/web/</div>
+    </div>
+  </div>
+  <div class="conn"><div class="line"></div><div class="pill">HTTP / WebSocket</div></div>
+
+  <div class="layer">
+    <div class="lbox">
+      <div class="ic">api</div>
+      <div class="meta"><div class="name"><span class="mono">vmon serve</span> · FastAPI</div>
+        <div class="desc">REST + WS gateway, port proxy, SSE events, OpenAPI docs</div></div>
+      <div class="tag">server.py</div>
+    </div>
+  </div>
+  <div class="conn"><div class="line"></div><div class="pill">Unix socket · vmond.sock</div></div>
+
+  <div class="layer">
+    <div class="lbox">
+      <div class="ic">d</div>
+      <div class="meta"><div class="name"><span class="mono">vmond</span> daemon → Engine</div>
+        <div class="desc">Single owner of <span style="font-family:var(--mono);color:var(--muted)">~/.vmon</span>: VM registry, rehydrate-on-restart, spawns one VMM per VM</div></div>
+      <div class="tag">daemon.py · core.py</div>
+    </div>
+  </div>
+  <div class="conn"><div class="line"></div><div class="pill">spawn subprocess · --api-sock JSON</div></div>
+
+  <div class="layer">
+    <div class="lbox host">
+      <div class="ic">vm</div>
+      <div class="meta"><div class="name"><span class="mono">vmon</span> binary · Rust VMM</div>
+        <div class="desc">vCPU threads (KVM / HVF) + virtio device workers · pause / snapshot / fork</div></div>
+      <div class="tag">src/ · KVM &amp; HVF</div>
+    </div>
+  </div>
+  <div class="conn"><div class="line"></div><div class="pill">virtio-console · length-prefixed frames</div></div>
+
+  <div class="layer">
+    <div class="lbox">
+      <div class="ic">ag</div>
+      <div class="meta"><div class="name"><span class="mono">vmon-agent</span> · guest agent</div>
+        <div class="desc">PID-1 helper inside the guest: exec, files, network config (Linux guest)</div></div>
+      <div class="tag">agent/</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===================== LIFECYCLE ===================== -->
+<div class="frame">
+<div id="flow">
+  <div class="f-title"><span class="sq"></span> Snapshot · Restore · Fork</div>
+  <div class="f-sub">Capture a booted container once; warm-boot or copy-on-write clone it without rebooting the kernel.</div>
+  <div class="f-row">
+    <div class="node">
+      <div class="lab">microVM</div>
+      <div class="big">booted</div>
+      <div class="small">container running</div>
+    </div>
+    <div class="arrow"><div class="pill dim">snapshot</div><div class="ln"></div></div>
+    <div class="node tmpl">
+      <div class="lab">template</div>
+      <div class="big">on disk</div>
+      <div class="small">RAM + device state</div>
+    </div>
+    <div class="lanes">
+      <div class="lane">
+        <div class="arrow" style="min-width:150px;flex:none"><div class="pill">restore · ~120 ms</div><div class="ln"></div></div>
+        <div class="node" style="min-width:168px">
+          <div class="lab">warm VM</div>
+          <div class="big">cold restore</div>
+          <div class="small">fresh, no kernel boot</div>
+        </div>
+      </div>
+      <div class="lane">
+        <div class="arrow" style="min-width:150px;flex:none"><div class="pill">fork · ~3 ms · CoW</div><div class="ln"></div></div>
+        <div class="node" style="min-width:168px">
+          <div class="lab">clones ×N</div>
+          <div class="big">CoW fork</div>
+          <div class="small">~22 MiB RSS each</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+</body>
+</html>
