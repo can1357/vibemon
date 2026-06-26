@@ -22,7 +22,20 @@ from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_
 from .volume import Volume
 
 _POOLS: dict[str, WarmPool] = {}
+_POOL_REFS: dict[str, str] = {}
 _POOLS_LOCK = threading.Lock()
+
+
+def pool_inventory() -> dict[str, int]:
+    """Ready warm-pool counts keyed by the portable image/template ref."""
+    with _POOLS_LOCK:
+        inventory: dict[str, int] = {}
+        for key, pool in _POOLS.items():
+            ref = _POOL_REFS.get(key)
+            if ref is None:
+                continue
+            inventory[ref] = int(pool.stats().get("ready_count") or 0)
+        return inventory
 
 
 def _setup_sandbox_network(
@@ -274,6 +287,7 @@ class Sandbox:
                         old_pool = pool
                         pool = WarmPool(template_dir, int(pool_size))
                         _POOLS[key] = pool
+                    _POOL_REFS[key] = str(template) if template else str(image)
                 if old_pool is not None:
                     old_pool.shutdown()
                 vm = pool.claim()

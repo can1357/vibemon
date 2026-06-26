@@ -109,6 +109,37 @@ def vm_table(rows: Sequence[Mapping[str, Any]]) -> None:
     console.print(table)
 
 
+def mesh_table(status: Mapping[str, Any]) -> None:
+    """Render mesh member health, capacity, ownership, and warm-pool counts."""
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("NODE", style="vmon.command", no_wrap=True)
+    table.add_column("ADVERTISE", overflow="fold")
+    table.add_column("REGION", no_wrap=True)
+    table.add_column("HEALTH", no_wrap=True)
+    table.add_column("VCPU", no_wrap=True)
+    table.add_column("MEM", no_wrap=True)
+    table.add_column("SANDBOXES", no_wrap=True)
+    table.add_column("WARM", no_wrap=True)
+    nodes = [status.get("self") or {}, *(status.get("peers") or [])]
+    for node in nodes:
+        caps_vcpus = int(node.get("vcpus") or 0)
+        caps_mem = int(node.get("mem_mib") or 0)
+        free_vcpus = int(node.get("free_vcpus") or 0)
+        free_mem = int(node.get("free_mem_mib") or 0)
+        healthy = bool(node.get("healthy", True))
+        table.add_row(
+            str(node.get("node_id") or "-")[:8],
+            str(node.get("advertise") or "-"),
+            str(node.get("region") or "-"),
+            Text("✓" if healthy else "✗", style="vmon.success" if healthy else "vmon.error"),
+            f"{free_vcpus}/{caps_vcpus}",
+            f"{free_mem}/{caps_mem}",
+            str(len(node.get("owned") or [])),
+            str(sum(int(value) for value in (node.get("pools") or {}).values())),
+        )
+    console.print(table)
+
+
 def _status_text(status: str) -> Text:
     palette = {
         "running": "vmon.success",

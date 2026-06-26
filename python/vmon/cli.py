@@ -14,7 +14,7 @@ import click
 
 from . import __version__
 from . import console as ui
-from .client import DaemonClient, DaemonError
+from .client import DaemonClient, DaemonError, GatewayClient
 from .console import RichGroup
 
 # ``-h`` as well as ``--help``; PTY/REMAINDER commands stop option parsing at the
@@ -89,6 +89,61 @@ def _parse_remote(spec: str) -> tuple[str, str] | None:
     return name, path
 
 
+def _mesh_call(
+    method: str, path: str, payload: dict[str, object] | None = None
+) -> dict[str, object]:
+    """Call the local HTTP gateway's mesh API using the shared bearer token."""
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+
+    base = os.environ.get("VMON_SERVER", "http://127.0.0.1:8000").rstrip("/")
+    token = os.environ.get("VMON_API_TOKEN")
+    if not token:
+        raise click.ClickException("VMON_API_TOKEN is required for mesh commands")
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        base + path,
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise click.ClickException(f"mesh API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(
+            f"cannot reach local gateway at {base}: {exc.reason}; is `vmon serve` running?"
+        ) from exc
+    return json.loads(raw or b"{}")
+
+
+def _client() -> DaemonClient | GatewayClient:
+    """Select daemon or gateway transport for one CLI request."""
+    import json
+    import os
+
+    if os.environ.get("VMON_REMOTE"):
+        return DaemonClient()
+    server = os.environ.get("VMON_SERVER")
+    if server:
+        return GatewayClient(server)
+    home = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+    mesh_path = home / "mesh.json"
+    if mesh_path.exists():
+        try:
+            data = json.loads(mesh_path.read_text(encoding="utf-8"))
+        except OSError, json.JSONDecodeError:
+            data = {}
+        if data.get("enabled") is True and data.get("advertise"):
+            return GatewayClient(str(data["advertise"]))
+    return DaemonClient()
+
+
 @click.group(
     cls=RichGroup,
     context_settings=_CTX,
@@ -122,12 +177,11 @@ def cli() -> None:
 @click.option(
     "--timeout", type=float, default=300.0, show_default=True, help="create timeout in seconds"
 )
-@click.option("--no-agent", is_flag=True, help="use the legacy initramfs console path")
 @click.option("-d", "--detach", is_flag=True, help="run in background")
-def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, no_agent, detach):
+def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, detach):
     if not image and not dockerfile:
         raise click.UsageError("provide an image (vmon run alpine) or -f Dockerfile")
-    client = DaemonClient()
+    client = _client()
     params = {
         "image": image,
         "dockerfile": dockerfile,
@@ -138,15 +192,13 @@ def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, no_a
         "disk_mb": disk_mb,
         "timeout": timeout,
         "cmd": _strip_dashdash(cmd) or None,
-        "no_agent": no_agent,
         "detach": detach,
     }
     if detach:
         r = client.call("run", **params)
         vm = r.get("name")
         ui.success(f"started [vmon.command]{vm}[/] (pid {r.get('pid')})  image={r.get('image')}")
-        verb = "logs" if no_agent else "exec"
-        ui.hint(f"vmon {verb} {vm} … │ vmon snapshot {vm} <tpl> │ vmon stop {vm}")
+        ui.hint(f"vmon exec {vm} … │ vmon snapshot {vm} <tpl> │ vmon stop {vm}")
         return 0
     r = client.stream("run", _write_event, **params)
     return _exit_code(r)
@@ -204,7 +256,7 @@ def shell(ref, command, image, env, mem, cpus, disk_mb, timeout, pty):
         "disk_mb": disk_mb,
         "timeout": timeout,
     }
-    client = DaemonClient()
+    client = _client()
     spinner = (
         ui.console.status("[vmon.accent]Booting microVM…[/]", spinner="dots")
         if ui.console.is_terminal
@@ -239,7 +291,7 @@ def exec(name, cmd, tty):
     argv = _strip_dashdash(cmd)
     if not argv:
         raise click.UsageError("exec requires a command (vmon exec NAME -- <cmd>)")
-    client = DaemonClient()
+    client = _client()
     if tty:
         r = client.interactive("exec", _write_event, tty=True, name=name, cmd=argv)
         return _exit_code(r)
@@ -257,7 +309,7 @@ def exec(name, cmd, tty):
 def cp(src, dst):
     import base64
 
-    client = DaemonClient()
+    client = _client()
     src_remote = _parse_remote(src)
     dst_remote = _parse_remote(dst)
     if bool(src_remote) == bool(dst_remote):
@@ -281,7 +333,7 @@ def cp(src, dst):
 
 @cli.command(panel="Commands", context_settings=_CTX, help="List microVMs.")
 def ps():
-    vms = DaemonClient().call("ps").get("vms") or []
+    vms = _client().call("ps").get("vms") or []
     if not vms:
         ui.console.print(
             "[vmon.muted]no microVMs[/] — boot one with [vmon.command]vmon run <image>[/]"
@@ -295,7 +347,7 @@ def ps():
 @click.argument("name")
 @click.option("-f", "--follow", is_flag=True, help="follow output")
 def logs(name, follow):
-    DaemonClient().stream("logs", _write_event, name=name, follow=follow)
+    _client().stream("logs", _write_event, name=name, follow=follow)
     return 0
 
 
@@ -305,7 +357,7 @@ def logs(name, follow):
 @cli.command(panel="Lifecycle", context_settings=_CTX, help="Suspend a running microVM.")
 @click.argument("name")
 def pause(name):
-    DaemonClient().call("pause", name=name)
+    _client().call("pause", name=name)
     ui.success(f"paused [vmon.command]{name}[/]")
     return 0
 
@@ -313,7 +365,7 @@ def pause(name):
 @cli.command(panel="Lifecycle", context_settings=_CTX, help="Resume a suspended microVM.")
 @click.argument("name")
 def resume(name):
-    DaemonClient().call("resume", name=name)
+    _client().call("resume", name=name)
     ui.success(f"resumed [vmon.command]{name}[/]")
     return 0
 
@@ -321,7 +373,7 @@ def resume(name):
 @cli.command(panel="Lifecycle", context_settings=_CTX, help="Stop a running microVM.")
 @click.argument("name")
 def stop(name):
-    DaemonClient().call("stop", name=name)
+    _client().call("stop", name=name)
     ui.success(f"stopped [vmon.command]{name}[/]")
     return 0
 
@@ -329,7 +381,7 @@ def stop(name):
 @cli.command(panel="Lifecycle", context_settings=_CTX, help="Remove a microVM.")
 @click.argument("name")
 def rm(name):
-    DaemonClient().call("rm", name=name)
+    _client().call("rm", name=name)
     ui.success(f"removed [vmon.command]{name}[/]")
     return 0
 
@@ -346,7 +398,7 @@ def rm(name):
 @click.argument("snapshot")
 @click.option("--stop", is_flag=True, help="stop the VM after snapshotting")
 def snapshot(name, snapshot, stop):
-    r = DaemonClient().call("snapshot", name=name, snapshot=snapshot, stop=stop)
+    r = _client().call("snapshot", name=name, snapshot=snapshot, stop=stop)
     ui.success(f"snapshot [vmon.command]{snapshot}[/] → {r.get('dir')}")
     return 0
 
@@ -359,7 +411,7 @@ def snapshot(name, snapshot, stop):
 @click.option("--agent", is_flag=True, help="attach an agent socket")
 @click.option("-d", "--detach", is_flag=True, help="run in background")
 def restore(snapshot, name, agent, detach):
-    client = DaemonClient()
+    client = _client()
     params = {"snapshot": snapshot, "name": name, "agent": agent, "detach": detach}
     r = (
         client.call("restore", **params)
@@ -381,7 +433,7 @@ def restore(snapshot, name, agent, detach):
 @click.argument("snapshot")
 @click.option("--count", type=int, default=2, show_default=True, help="number of clones")
 def fork(snapshot, count):
-    clones = DaemonClient().call("fork", snapshot=snapshot, count=count).get("clones") or []
+    clones = _client().call("fork", snapshot=snapshot, count=count).get("clones") or []
     ui.info(f"forked {len(clones)} CoW clone(s) from [vmon.command]{snapshot}[/]:")
     for c in clones:
         # Name first so scripts can ``line.split()[0]``; keep the ``(pid`` marker.
@@ -389,6 +441,65 @@ def fork(snapshot, count):
             f"[vmon.command]{c['name']}[/]  "
             f"(pid {c.get('pid')}, CoW reconstruct={c.get('reconstruct_ms')}ms)"
         )
+    return 0
+
+
+# -- mesh ------------------------------------------------------------------
+
+
+@cli.group(
+    cls=RichGroup,
+    panel="Mesh",
+    context_settings=_CTX,
+    help="Form and manage a server cluster.",
+)
+def mesh() -> None:
+    pass
+
+
+@mesh.command(
+    context_settings=_CTX, help="Initialize this node as a cluster and print a join blob."
+)
+@click.option("--advertise", help="URL peers use to reach this node")
+@click.option("--region", default="", help="locality label for same-region routing")
+@click.option("--max-vcpus", type=int, help="advertised vCPU capacity")
+@click.option("--max-mem-mib", type=int, help="advertised RAM capacity in MiB")
+def setup(advertise, region, max_vcpus, max_mem_mib):
+    payload = {
+        "advertise": advertise,
+        "region": region,
+        "max_vcpus": max_vcpus,
+        "max_mem_mib": max_mem_mib,
+    }
+    result = _mesh_call("POST", "/v1/mesh/setup", payload)
+    ui.success(f"cluster ready on {result['advertise']}")
+    ui.info("share this with other nodes:")
+    ui.hint(f"vmon mesh join {result['blob']}")
+    return 0
+
+
+@mesh.command(context_settings=_CTX, help="Join an existing cluster using its join blob.")
+@click.argument("blob")
+@click.option("--advertise", help="URL peers use to reach this node")
+@click.option("--region", default="", help="locality label for same-region routing")
+def join(blob, advertise, region):
+    result = _mesh_call(
+        "POST", "/v1/mesh/join", {"blob": blob, "advertise": advertise, "region": region}
+    )
+    ui.success(f"joined cluster ({len(result.get('peers', []))} peer(s))")
+    return 0
+
+
+@mesh.command(context_settings=_CTX, help="Show cluster members, health, and capacity.")
+def status():
+    ui.mesh_table(_mesh_call("GET", "/v1/mesh/status"))
+    return 0
+
+
+@mesh.command(context_settings=_CTX, help="Leave the cluster (does not migrate running VMs).")
+def leave():
+    _mesh_call("POST", "/v1/mesh/leave")
+    ui.success("left the cluster")
     return 0
 
 
