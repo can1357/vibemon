@@ -130,16 +130,14 @@ const KERNEL_ASSET: &str = "vmlinux-x86_64";
 const KERNEL_ASSET: &str = "Image-aarch64";
 
 #[cfg(target_arch = "x86_64")]
-const INITRAMFS_ASSETS: &[&str] =
-	&["busybox-initramfs-x86_64.cpio.gz", "busybox-initramfs.cpio.gz"];
+const INITRAMFS_ASSET: &str = "busybox-initramfs-x86_64.cpio.gz";
 #[cfg(target_arch = "aarch64")]
-const INITRAMFS_ASSETS: &[&str] =
-	&["busybox-initramfs-aarch64.cpio.gz", "busybox-initramfs.cpio.gz"];
+const INITRAMFS_ASSET: &str = "busybox-initramfs-aarch64.cpio.gz";
 
 #[cfg(target_arch = "x86_64")]
-const ROOTFS_ASSETS: &[&str] = &["rootfs-x86_64.ext4", "rootfs.ext4"];
+const ROOTFS_ASSET: &str = "rootfs-x86_64.ext4";
 #[cfg(target_arch = "aarch64")]
-const ROOTFS_ASSETS: &[&str] = &["rootfs-aarch64.ext4", "rootfs.ext4"];
+const ROOTFS_ASSET: &str = "rootfs-aarch64.ext4";
 
 /// Direct-boot kernel for the host architecture: raw ELF `vmlinux` on `x86_64`,
 /// uncompressed arm64 `Image` on aarch64. `VMON_KERNEL` overrides the
@@ -155,26 +153,12 @@ pub fn kernel() -> PathBuf {
 
 /// busybox initramfs for the host architecture.
 pub fn initramfs() -> PathBuf {
-	first_existing_asset(INITRAMFS_ASSETS, "busybox initramfs")
+	required_asset(INITRAMFS_ASSET)
 }
 
 /// ext4 rootfs fixture for the host architecture.
 pub fn rootfs() -> PathBuf {
-	first_existing_asset(ROOTFS_ASSETS, "ext4 rootfs")
-}
-
-fn first_existing_asset(names: &[&str], label: &str) -> PathBuf {
-	for name in names {
-		let path = Path::new(TEST_ASSETS).join(name);
-		if path.is_file() {
-			return fs::canonicalize(&path)
-				.unwrap_or_else(|e| panic!("canonicalizing {label} asset {}: {e}", path.display()));
-		}
-	}
-	panic!(
-		"missing {label} in {TEST_ASSETS} (looked for {names:?}); run demo/fetch-test-assets.sh \
-		 before e2e tests"
-	);
+	required_asset(ROOTFS_ASSET)
 }
 
 fn required_asset(name: &str) -> PathBuf {
@@ -207,7 +191,7 @@ pub fn test_dir(name: &str) -> PathBuf {
 
 pub fn copy_rootfs(test_name: &str) -> PathBuf {
 	let dir = test_dir(test_name);
-	let dest = dir.join("rootfs.ext4");
+	let dest = dir.join(ROOTFS_ASSET);
 	fs::copy(rootfs(), &dest)
 		.unwrap_or_else(|e| panic!("copying rootfs fixture to {}: {e}", dest.display()));
 	dest

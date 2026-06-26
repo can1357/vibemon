@@ -17,7 +17,6 @@ from typing import cast
 
 from .agent import AgentClosed, AgentConn
 from .control import Control
-from .image import build_rootfs
 
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 _MAX_CPUS = 64
@@ -436,65 +435,6 @@ class MicroVM:
             return self.log.read_text(errors="replace")
         except FileNotFoundError:
             return ""
-
-    @classmethod
-    def run(
-        cls,
-        image: str | None = None,
-        dockerfile: str | None = None,
-        context: str = ".",
-        name: str | None = None,
-        mem: int = 256,
-        cpus: int = 1,
-        cmd: list[str] | None = None,
-        console_agent: bool = False,
-        agent: bool = False,
-    ) -> MicroVM:
-        """Legacy initramfs boot path; the higher-level Sandbox API is agent-first."""
-        if agent:
-            from .sandbox import Sandbox
-
-            sb = Sandbox.create(
-                image=image,
-                dockerfile=dockerfile,
-                context=context,
-                name=name,
-                cpus=cpus,
-                memory=mem,
-            )
-            return sb.vm
-        mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
-        cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
-        name = name or _instance_name("vm")
-        vm = cls(name)
-        vm.dir.mkdir(parents=True, exist_ok=True)
-        initramfs, spec = build_rootfs(image, dockerfile, context, cmd, out_dir=str(vm.dir))
-        args = [
-            "--kernel",
-            default_kernel(),
-            "--initrd",
-            str(initramfs),
-            "--mem",
-            str(mem),
-            "--cpus",
-            str(cpus),
-            "--api-sock",
-            str(vm.sock),
-            "--cmdline",
-            _cmdline(),
-        ]
-        if console_agent:
-            args.append("--console-agent")
-        vm._launch(
-            args,
-            control_sock=vm.sock,
-            image=spec.reference,
-            mem=mem,
-            cpus=cpus,
-            initramfs=str(initramfs),
-            snapshot_root=None,
-        )
-        return vm
 
     @classmethod
     def boot_rootfs(

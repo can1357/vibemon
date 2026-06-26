@@ -333,6 +333,31 @@ class Engine:
                 out.append(record)
         return out
 
+    def committed(self) -> tuple[int, int]:
+        """Return vCPU and MiB committed by non-terminal sandboxes."""
+        with self._lock:
+            records = [record for record in self._records.values() if record.status != "terminated"]
+        vcpus = sum(int(record.detail.get("cpus") or 1) for record in records)
+        mem_mib = sum(int(record.detail.get("memory") or 512) for record in records)
+        return vcpus, mem_mib
+
+    def owned_ids(self) -> builtins.list[str]:
+        """Return sandbox ids that this engine still owns."""
+        with self._lock:
+            return [record.id for record in self._records.values() if record.status != "terminated"]
+
+    def templates_present(self) -> builtins.list[str]:
+        """Return local snapshot and template names available for placement."""
+        names: set[str] = set()
+        for root in (state_dir() / "templates", state_dir() / "snapshots"):
+            if not root.is_dir():
+                continue
+            try:
+                names.update(child.name for child in root.iterdir() if child.is_dir())
+            except OSError:
+                continue
+        return sorted(names)
+
     def ps(self) -> builtins.list[dict[str, Any]]:
         """``[{name, status, pid, source}]`` with live records refreshed."""
         rows: builtins.list[dict[str, Any]] = []
@@ -432,34 +457,16 @@ class Engine:
         on_output: OnOutput | None = None,
         cancel: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Boot a container image (agent sandbox by default), Docker ``run`` style.
+        """Boot a container image as an agent sandbox, Docker ``run`` style.
 
-        Agent mode creates a :class:`Sandbox` and execs the image entrypoint;
-        foreground streams stdout/stderr and ``run --rm``-terminates on exit or
-        client cancel. ``no_agent`` uses the legacy console path. ``detach``
-        returns immediately, leaving the VM running.
+        Creates a :class:`Sandbox` and execs the image entrypoint; foreground
+        streams stdout/stderr and ``run --rm``-terminates on exit or client
+        cancel. ``detach`` returns immediately, leaving the VM running.
         """
         from .sandbox import default_command
 
         detach = bool(params.get("detach"))
         cmd = params.get("cmd") or None
-        if params.get("no_agent"):
-            vm = MicroVM.run(
-                image=params.get("image"),
-                dockerfile=params.get("dockerfile"),
-                context=params.get("context") or ".",
-                name=params.get("name"),
-                mem=int(params.get("mem", 512)),
-                cpus=int(params.get("cpus", 1)),
-                cmd=cmd,
-            )
-            record = self._record_vm(vm, source=self._source_of(vm.meta))
-            result = {"name": vm.name, "pid": vm.meta.get("pid"), "image": vm.meta.get("image")}
-            if detach:
-                return {**result, "detached": True}
-            console_rc = self._stream_console(vm, on_output, cancel, terminate_on_cancel=True)
-            self._persist_record_status(record, "stopped", returncode=console_rc)
-            return {**result, "returncode": console_rc}
 
         sandbox_cls = self._sandbox_class()
         sandbox = self._create_sandbox(

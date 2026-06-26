@@ -17,7 +17,7 @@ from pathlib import Path
 
 @dataclass
 class ImageSpec:
-    """The bits of an OCI image config the microVM init or sandbox default command needs."""
+    """The bits of an OCI image config the sandbox default command needs."""
 
     reference: str
     entrypoint: list[str] = field(default_factory=list)
@@ -123,66 +123,6 @@ def _image_digest(engine: str, reference: str) -> str:
     if not digest:
         digest = hashlib.sha256(reference.encode()).hexdigest()
     return re.sub(r"[^A-Za-z0-9_.-]", "-", digest.replace("sha256:", ""))
-
-
-def _sh_quote(arg: str) -> str:
-    return "'" + arg.replace("'", "'\\''") + "'"
-
-
-def _init_script(spec: ImageSpec, argv: list[str]) -> str:
-    exports = "\n".join(
-        f"export {e.split('=', 1)[0]}={_sh_quote(e.split('=', 1)[1])}" for e in spec.env if "=" in e
-    )
-    run_line = " ".join(_sh_quote(a) for a in argv) if argv else "/bin/sh"
-    workdir = spec.workdir or "/"
-    # The legacy console path streams output only (the VMM is spawned with stdin
-    # closed), so the payload runs non-interactively like `docker run` without
-    # -i: its stdin is /dev/null. Binding stdin to the serial tty instead makes
-    # a shell command (e.g. Alpine's default /bin/sh) sit at a prompt it can
-    # never receive input on, printing "can't access tty; job control turned
-    # off" and leaking the terminal's cursor-position reply into the stream. Use
-    # `vmon shell` for an interactive agent-PTY session.
-    return f"""#!/bin/sh
-# Auto-generated microVM PID 1 for image: {spec.reference}
-mount -t devtmpfs dev /dev 2>/dev/null
-exec >/dev/console 2>&1 </dev/null
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sysfs /sys 2>/dev/null
-{exports}
-cd {_sh_quote(workdir)} 2>/dev/null || cd /
-echo "[vmon] container up: {spec.reference} ($(uname -srm))"
-{run_line}
-echo "[vmon] container exited rc=$?"
-reboot -f 2>/dev/null || poweroff -f 2>/dev/null || while true; do sleep 3600; done
-"""
-
-
-def build_rootfs(
-    reference: str | None = None,
-    dockerfile: str | None = None,
-    context: str = ".",
-    cmd_override: list[str] | None = None,
-    out_dir: str | None = None,
-    engine: str | None = None,
-) -> tuple[Path, ImageSpec]:
-    """Build a legacy initramfs cpio.gz for the image/Dockerfile."""
-    engine, reference = build_or_pull(reference, dockerfile, context, engine)
-    spec = _inspect(engine, reference)
-    argv = spec.argv(cmd_override)
-
-    work = Path(out_dir or tempfile.mkdtemp(prefix="vmon-rootfs-"))
-    rootfs = work / "rootfs"
-    rootfs.mkdir(parents=True, exist_ok=True)
-
-    _export_image(engine, reference, rootfs, work)
-
-    init = rootfs / "init"
-    init.write_text(_init_script(spec, argv), encoding="utf-8")
-    init.chmod(0o755)
-
-    initramfs = work / "initramfs.cpio.gz"
-    _pack_cpio(rootfs, initramfs)
-    return initramfs, spec
 
 
 def cached_template(
@@ -334,8 +274,7 @@ def _first_static(paths: list[Path]) -> Path | None:
 # The injected agent must be static so it runs on an arbitrary (even
 # distroless/scratch) guest rootfs; a dynamically linked one is rejected.
 _STATIC_AGENT_HINT = (
-    "Build and bundle it with `just agent-musl`, set VMON_AGENT=/path/to/static-agent, "
-    "or pass `--no-agent` to use the legacy console path."
+    "Build and bundle it with `just agent-musl`, or set VMON_AGENT=/path/to/static-agent."
 )
 
 
@@ -452,25 +391,3 @@ def _mkfs_ext4(rootfs: Path, out: Path, disk_mb: int) -> None:
     if Path(mkfs).name == "mke2fs":
         cmd[1:1] = ["-t", "ext4"]
     subprocess.run(cmd, check=True)
-
-
-def _pack_cpio(rootfs: Path, out: Path) -> None:
-    find = subprocess.Popen(["find", ".", "-print0"], cwd=rootfs, stdout=subprocess.PIPE)
-    cpio = subprocess.Popen(
-        ["cpio", "--null", "-o", "-H", "newc"],
-        cwd=rootfs,
-        stdin=find.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    with out.open("wb") as fh:
-        gzip = subprocess.Popen(["gzip", "-1"], stdin=cpio.stdout, stdout=fh)
-    if find.stdout is not None:
-        find.stdout.close()
-    if cpio.stdout is not None:
-        cpio.stdout.close()
-    gzip.communicate()
-    find.wait()
-    cpio.wait()
-    if gzip.returncode != 0 or cpio.returncode not in (0, None) or find.returncode not in (0, None):
-        raise RuntimeError("failed to pack initramfs")
