@@ -27,35 +27,34 @@ use config::{Config, LogFormat};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("vmon: error: {e}");
-        std::process::exit(1);
-    }
+	if let Err(e) = run() {
+		eprintln!("vmon: error: {e}");
+		std::process::exit(1);
+	}
 }
 
 fn run() -> result::Result<()> {
-    let config = Config::from_args()?;
-    init_logging(&config);
-    vmm::run(config)
+	let config = Config::from_args()?;
+	init_logging(&config);
+	vmm::run(config)
 }
 
 fn init_logging(config: &Config) {
-    let filter =
-        || EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+	let filter = || EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    match config.log_format {
-        LogFormat::Text => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter())
-                .with_writer(std::io::stderr)
-                .try_init();
-        }
-        LogFormat::Json => {
-            let _ = tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter())
-                .with_writer(std::io::stderr)
-                .try_init();
-        }
-    }
+	match config.log_format {
+		LogFormat::Text => {
+			let _ = tracing_subscriber::fmt()
+				.with_env_filter(filter())
+				.with_writer(std::io::stderr)
+				.try_init();
+		},
+		LogFormat::Json => {
+			let _ = tracing_subscriber::fmt()
+				.json()
+				.with_env_filter(filter())
+				.with_writer(std::io::stderr)
+				.try_init();
+		},
+	}
 }

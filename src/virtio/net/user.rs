@@ -139,7 +139,11 @@ impl UserNet {
 	}
 
 	/// Reject TAP offloads; libslirp consumes plain Ethernet frames.
-	pub fn set_offloads(offloads: u32) -> Result<()> {
+	#[expect(
+		clippy::unused_self,
+		reason = "all net backends expose the same instance-shaped offload API"
+	)]
+	pub fn set_offloads(&self, offloads: u32) -> Result<()> {
 		if offloads == 0 {
 			Ok(())
 		} else {
@@ -150,7 +154,11 @@ impl UserNet {
 	}
 
 	/// Return offload flags this backend can safely advertise.
-	pub const fn supported_offloads() -> u32 {
+	#[expect(
+		clippy::unused_self,
+		reason = "all net backends expose the same instance-shaped offload API"
+	)]
+	pub const fn supported_offloads(&self) -> u32 {
 		0
 	}
 

@@ -52,39 +52,40 @@ use crate::{
 /// later path swap cannot make the guest open some other host file.
 pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	let base_path_meta =
-		fs::symlink_metadata(base).map_err(|e| err(format!("checking base disk {base:?}: {e}")))?;
+		fs::symlink_metadata(base).map_err(|e| err(format!("checking base disk {}: {e}", base.display())))?;
 	if base_path_meta.file_type().is_symlink() {
-		return Err(err(format!("base disk {base:?} must be a regular file, not a symlink")));
+		return Err(err(format!("base disk {} must be a regular file, not a symlink", base.display())));
 	}
 	if !base_path_meta.is_file() {
-		return Err(err(format!("base disk {base:?} must be a regular file")));
+		return Err(err(format!("base disk {} must be a regular file", base.display())));
 	}
 
 	match fs::symlink_metadata(dest) {
 		Ok(_) => {
 			return Err(err(format!(
-				"overlay destination {dest:?} already exists; refusing to overwrite"
+				"overlay destination {} already exists; refusing to overwrite",
+				dest.display()
 			)));
 		},
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {},
-		Err(e) => return Err(err(format!("checking overlay destination {dest:?}: {e}"))),
+		Err(e) => return Err(err(format!("checking overlay destination {}: {e}", dest.display()))),
 	}
 
 	let mut src = OpenOptions::new()
 		.read(true)
 		.custom_flags(libc::O_NOFOLLOW)
 		.open(base)
-		.map_err(|e| err(format!("opening base disk {base:?} without following symlinks: {e}")))?;
+		.map_err(|e| err(format!("opening base disk {} without following symlinks: {e}", base.display())))?;
 	let opened_base_meta = src
 		.metadata()
-		.map_err(|e| err(format!("checking opened base disk {base:?}: {e}")))?;
+		.map_err(|e| err(format!("checking opened base disk {}: {e}", base.display())))?;
 	if !opened_base_meta.is_file() {
-		return Err(err(format!("base disk {base:?} must be a regular file")));
+		return Err(err(format!("base disk {} must be a regular file", base.display())));
 	}
 	if opened_base_meta.dev() != base_path_meta.dev()
 		|| opened_base_meta.ino() != base_path_meta.ino()
 	{
-		return Err(err(format!("base disk {base:?} changed while creating overlay")));
+		return Err(err(format!("base disk {} changed while creating overlay", base.display())));
 	}
 
 	let mut dst = OpenOptions::new()
@@ -94,13 +95,13 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		.custom_flags(libc::O_NOFOLLOW)
 		.open(dest)
 		.map_err(|e| {
-			err(format!("creating overlay {dest:?} exclusively without following symlinks: {e}"))
+			err(format!("creating overlay {} exclusively without following symlinks: {e}", dest.display()))
 		})?;
 	let dst_meta = dst
 		.metadata()
-		.map_err(|e| err(format!("checking overlay {dest:?}: {e}")))?;
+		.map_err(|e| err(format!("checking overlay {}: {e}", dest.display())))?;
 	if !dst_meta.is_file() {
-		return Err(err(format!("overlay destination {dest:?} must be a regular file")));
+		return Err(err(format!("overlay destination {} must be a regular file", dest.display())));
 	}
 
 	#[cfg(target_os = "linux")]
@@ -121,13 +122,13 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	// the already-open no-follow source and exclusive destination fds. Do not use
 	// path-based copy helpers here; the path may be attacker-controlled.
 	src.seek(SeekFrom::Start(0))
-		.map_err(|e| err(format!("seeking base disk {base:?}: {e}")))?;
+		.map_err(|e| err(format!("seeking base disk {}: {e}", base.display())))?;
 	dst.seek(SeekFrom::Start(0))
-		.map_err(|e| err(format!("seeking overlay {dest:?}: {e}")))?;
+		.map_err(|e| err(format!("seeking overlay {}: {e}", dest.display())))?;
 	dst.set_len(0)
-		.map_err(|e| err(format!("resetting overlay {dest:?}: {e}")))?;
+		.map_err(|e| err(format!("resetting overlay {}: {e}", dest.display())))?;
 	io::copy(&mut src, &mut dst).map_err(|e| {
-		err(format!("copying {base:?} -> {dest:?} after reflink failed ({clone_err}): {e}"))
+		err(format!("copying {} -> {} after reflink failed ({clone_err}): {e}", base.display(), dest.display()))
 	})?;
 	Ok(dst)
 }
@@ -214,7 +215,7 @@ impl Block {
 			.read(true)
 			.write(!read_only)
 			.open(path)
-			.map_err(|e| err(format!("opening disk {path:?}: {e}")))?;
+			.map_err(|e| err(format!("opening disk {}: {e}", path.display())))?;
 		Self::from_file(disk, read_only)
 	}
 

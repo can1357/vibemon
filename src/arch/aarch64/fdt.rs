@@ -20,127 +20,121 @@ const IRQ_TYPE_LEVEL_HI: u32 = 4;
 
 /// One MMIO device to describe in the FDT.
 pub struct FdtDevice {
-    pub addr: u64,
-    pub len: u64,
-    pub gsi: u32,
+	pub addr: u64,
+	pub len:  u64,
+	pub gsi:  u32,
 }
 
 /// Inputs for building the device tree.
 pub struct FdtParams<'a> {
-    pub mem_start: u64,
-    pub mem_size: u64,
-    pub mpidrs: &'a [u64],
-    pub cmdline: &'a str,
-    pub initrd: Option<(u64, usize)>,
-    pub gic_reg: [u64; 4],
-    pub gic_compatible: &'a str,
-    pub gic_maint_irq: u32,
-    pub serial: &'a FdtDevice,
-    pub virtio: &'a [FdtDevice],
+	pub mem_start:      u64,
+	pub mem_size:       u64,
+	pub mpidrs:         &'a [u64],
+	pub cmdline:        &'a str,
+	pub initrd:         Option<(u64, usize)>,
+	pub gic_reg:        [u64; 4],
+	pub gic_compatible: &'a str,
+	pub gic_maint_irq:  u32,
+	pub serial:         &'a FdtDevice,
+	pub virtio:         &'a [FdtDevice],
 }
 
 /// Build the flattened device tree blob.
 pub fn build_fdt(p: &FdtParams) -> Result<Vec<u8>> {
-    let mut fdt = FdtWriter::new()?;
+	let mut fdt = FdtWriter::new()?;
 
-    let root = fdt.begin_node("")?;
-    fdt.property_string("compatible", "linux,dummy-virt")?;
-    fdt.property_u32("#address-cells", 2)?;
-    fdt.property_u32("#size-cells", 2)?;
-    fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+	let root = fdt.begin_node("")?;
+	fdt.property_string("compatible", "linux,dummy-virt")?;
+	fdt.property_u32("#address-cells", 2)?;
+	fdt.property_u32("#size-cells", 2)?;
+	fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
 
-    // CPUs.
-    let cpus = fdt.begin_node("cpus")?;
-    fdt.property_u32("#address-cells", 2)?;
-    fdt.property_u32("#size-cells", 0)?;
-    for (i, &mpidr) in p.mpidrs.iter().enumerate() {
-        let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
-        fdt.property_string("device_type", "cpu")?;
-        fdt.property_string("compatible", "arm,arm-v8")?;
-        fdt.property_string("enable-method", "psci")?;
-        fdt.property_u64("reg", mpidr & 0x7F_FFFF)?;
-        fdt.end_node(cpu)?;
-    }
-    fdt.end_node(cpus)?;
-    let mem = fdt.begin_node("memory@ram")?;
-    fdt.property_string("device_type", "memory")?;
-    fdt.property_array_u64("reg", &[p.mem_start, p.mem_size])?;
-    fdt.end_node(mem)?;
+	// CPUs.
+	let cpus = fdt.begin_node("cpus")?;
+	fdt.property_u32("#address-cells", 2)?;
+	fdt.property_u32("#size-cells", 0)?;
+	for (i, &mpidr) in p.mpidrs.iter().enumerate() {
+		let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
+		fdt.property_string("device_type", "cpu")?;
+		fdt.property_string("compatible", "arm,arm-v8")?;
+		fdt.property_string("enable-method", "psci")?;
+		fdt.property_u64("reg", mpidr & 0x7f_ffff)?;
+		fdt.end_node(cpu)?;
+	}
+	fdt.end_node(cpus)?;
+	let mem = fdt.begin_node("memory@ram")?;
+	fdt.property_string("device_type", "memory")?;
+	fdt.property_array_u64("reg", &[p.mem_start, p.mem_size])?;
+	fdt.end_node(mem)?;
 
-    // Chosen (command line + initrd).
-    let chosen = fdt.begin_node("chosen")?;
-    fdt.property_string("bootargs", p.cmdline)?;
-    if let Some((addr, size)) = p.initrd {
-        fdt.property_u64("linux,initrd-start", addr)?;
-        fdt.property_u64("linux,initrd-end", addr + size as u64)?;
-    }
-    fdt.end_node(chosen)?;
+	// Chosen (command line + initrd).
+	let chosen = fdt.begin_node("chosen")?;
+	fdt.property_string("bootargs", p.cmdline)?;
+	if let Some((addr, size)) = p.initrd {
+		fdt.property_u64("linux,initrd-start", addr)?;
+		fdt.property_u64("linux,initrd-end", addr + size as u64)?;
+	}
+	fdt.end_node(chosen)?;
 
-    // GIC.
-    let intc = fdt.begin_node("intc")?;
-    fdt.property_string("compatible", p.gic_compatible)?;
-    fdt.property_null("interrupt-controller")?;
-    fdt.property_u32("#interrupt-cells", 3)?;
-    fdt.property_array_u64("reg", &p.gic_reg)?;
-    fdt.property_u32("phandle", GIC_PHANDLE)?;
-    fdt.property_u32("#address-cells", 2)?;
-    fdt.property_u32("#size-cells", 2)?;
-    fdt.property_null("ranges")?;
-    fdt.property_array_u32(
-        "interrupts",
-        &[IRQ_TYPE_PPI, p.gic_maint_irq, IRQ_TYPE_LEVEL_HI],
-    )?;
-    fdt.end_node(intc)?;
+	// GIC.
+	let intc = fdt.begin_node("intc")?;
+	fdt.property_string("compatible", p.gic_compatible)?;
+	fdt.property_null("interrupt-controller")?;
+	fdt.property_u32("#interrupt-cells", 3)?;
+	fdt.property_array_u64("reg", &p.gic_reg)?;
+	fdt.property_u32("phandle", GIC_PHANDLE)?;
+	fdt.property_u32("#address-cells", 2)?;
+	fdt.property_u32("#size-cells", 2)?;
+	fdt.property_null("ranges")?;
+	fdt.property_array_u32("interrupts", &[IRQ_TYPE_PPI, p.gic_maint_irq, IRQ_TYPE_LEVEL_HI])?;
+	fdt.end_node(intc)?;
 
-    // Architected timer (fixed PPIs 13,14,11,10).
-    let timer = fdt.begin_node("timer")?;
-    fdt.property_string("compatible", "arm,armv8-timer")?;
-    fdt.property_null("always-on")?;
-    let mut timer_irqs = Vec::new();
-    for irq in [13u32, 14, 11, 10] {
-        timer_irqs.extend_from_slice(&[IRQ_TYPE_PPI, irq, IRQ_TYPE_LEVEL_HI]);
-    }
-    fdt.property_array_u32("interrupts", &timer_irqs)?;
-    fdt.end_node(timer)?;
+	// Architected timer (fixed PPIs 13,14,11,10).
+	let timer = fdt.begin_node("timer")?;
+	fdt.property_string("compatible", "arm,armv8-timer")?;
+	fdt.property_null("always-on")?;
+	let mut timer_irqs = Vec::new();
+	for irq in [13u32, 14, 11, 10] {
+		timer_irqs.extend_from_slice(&[IRQ_TYPE_PPI, irq, IRQ_TYPE_LEVEL_HI]);
+	}
+	fdt.property_array_u32("interrupts", &timer_irqs)?;
+	fdt.end_node(timer)?;
 
-    // Reference clock for the UART.
-    let clock = fdt.begin_node("apb-pclk")?;
-    fdt.property_string("compatible", "fixed-clock")?;
-    fdt.property_u32("#clock-cells", 0)?;
-    fdt.property_u32("clock-frequency", 24_000_000)?;
-    fdt.property_string("clock-output-names", "clk24mhz")?;
-    fdt.property_u32("phandle", CLOCK_PHANDLE)?;
-    fdt.end_node(clock)?;
+	// Reference clock for the UART.
+	let clock = fdt.begin_node("apb-pclk")?;
+	fdt.property_string("compatible", "fixed-clock")?;
+	fdt.property_u32("#clock-cells", 0)?;
+	fdt.property_u32("clock-frequency", 24_000_000)?;
+	fdt.property_string("clock-output-names", "clk24mhz")?;
+	fdt.property_u32("phandle", CLOCK_PHANDLE)?;
+	fdt.end_node(clock)?;
 
-    // PSCI (for SMP bring-up + power-off).
-    let psci = fdt.begin_node("psci")?;
-    fdt.property_string("compatible", "arm,psci-0.2")?;
-    fdt.property_string("method", "hvc")?;
-    fdt.end_node(psci)?;
+	// PSCI (for SMP bring-up + power-off).
+	let psci = fdt.begin_node("psci")?;
+	fdt.property_string("compatible", "arm,psci-0.2")?;
+	fdt.property_string("method", "hvc")?;
+	fdt.end_node(psci)?;
 
-    // 16550 serial.
-    let uart = fdt.begin_node(&format!("uart@{:x}", p.serial.addr))?;
-    fdt.property_string("compatible", "ns16550a")?;
-    fdt.property_array_u64("reg", &[p.serial.addr, p.serial.len])?;
-    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
-    fdt.property_string("clock-names", "apb_pclk")?;
-    fdt.property_array_u32(
-        "interrupts",
-        &[IRQ_TYPE_SPI, p.serial.gsi, IRQ_TYPE_EDGE_RISING],
-    )?;
-    fdt.end_node(uart)?;
+	// 16550 serial.
+	let uart = fdt.begin_node(&format!("uart@{:x}", p.serial.addr))?;
+	fdt.property_string("compatible", "ns16550a")?;
+	fdt.property_array_u64("reg", &[p.serial.addr, p.serial.len])?;
+	fdt.property_u32("clocks", CLOCK_PHANDLE)?;
+	fdt.property_string("clock-names", "apb_pclk")?;
+	fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, p.serial.gsi, IRQ_TYPE_EDGE_RISING])?;
+	fdt.end_node(uart)?;
 
-    // virtio-mmio devices.
-    for dev in p.virtio {
-        let node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev.addr))?;
-        fdt.property_null("dma-coherent")?;
-        fdt.property_string("compatible", "virtio,mmio")?;
-        fdt.property_array_u64("reg", &[dev.addr, dev.len])?;
-        fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, dev.gsi, IRQ_TYPE_EDGE_RISING])?;
-        fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
-        fdt.end_node(node)?;
-    }
+	// virtio-mmio devices.
+	for dev in p.virtio {
+		let node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev.addr))?;
+		fdt.property_null("dma-coherent")?;
+		fdt.property_string("compatible", "virtio,mmio")?;
+		fdt.property_array_u64("reg", &[dev.addr, dev.len])?;
+		fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, dev.gsi, IRQ_TYPE_EDGE_RISING])?;
+		fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+		fdt.end_node(node)?;
+	}
 
-    fdt.end_node(root)?;
-    Ok(fdt.finish()?)
+	fdt.end_node(root)?;
+	Ok(fdt.finish()?)
 }

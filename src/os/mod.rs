@@ -6,8 +6,9 @@
 //! real `eventfd(2)` (required by KVM irqfd/ioeventfd). On macOS it is a
 //! pipe-backed shim with the same surface.
 
-/// `EFD_NONBLOCK` flag for [`EventFd::new`]. Same numeric value on both backends
-/// (the macOS shim recognizes it); on Linux it equals `libc::EFD_NONBLOCK`.
+/// `EFD_NONBLOCK` flag for [`EventFd::new`]. Same numeric value on both
+/// backends (the macOS shim recognizes it); on Linux it equals
+/// `libc::EFD_NONBLOCK`.
 pub const EFD_NONBLOCK: i32 = 0x800;
 
 #[cfg(target_os = "linux")]

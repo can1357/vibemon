@@ -2,8 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bail;
-use crate::result::{Result, err};
+use crate::{
+	bail,
+	result::{Result, err},
+};
 
 /// Default locally-administered guest MAC (02:00:00:00:00:01).
 const DEFAULT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -15,1345 +17,1250 @@ pub const MAX_MEM_MIB: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    Mmio,
-    Pci,
+	Mmio,
+	Pci,
 }
 
 impl Transport {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Mmio => "mmio",
-            Self::Pci => "pci",
-        }
-    }
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Mmio => "mmio",
+			Self::Pci => "pci",
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CgroupMode {
-    V2,
-    Off,
+	V2,
+	Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeccompAction {
-    Kill,
-    Errno,
-    Log,
+	Kill,
+	Errno,
+	Log,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootMode {
-    Direct,
-    Uefi,
+	Direct,
+	Uefi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogFormat {
-    Text,
-    Json,
+	Text,
+	Json,
 }
 
 /// A named virtio-fs volume: a host directory exposed to the guest under `tag`.
 #[derive(Clone)]
 pub struct FsMount {
-    pub tag: String,
-    pub dir: PathBuf,
-    pub read_only: bool,
+	pub tag:       String,
+	pub dir:       PathBuf,
+	pub read_only: bool,
 }
 
 #[derive(Clone)]
 pub struct Config {
-    /// Kernel image. Required for a fresh boot; `None` when restoring/forking.
-    pub kernel: Option<PathBuf>,
-    pub cmdline: Option<String>,
-    pub mem_mib: usize,
-    /// Host-RAM resident page target in MiB for transparent zram+paging.
-    pub mem_target_mib: Option<usize>,
-    /// Maximum in-process compressed page store in MiB before spilling to swap.
-    pub zram_store_max_mib: Option<usize>,
-    /// Optional operator-provided swap file for pager overflow.
-    pub zram_swap_file: Option<PathBuf>,
-    /// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
-    pub ksm: bool,
-    pub cpus: u8,
-    pub rootfs: Option<PathBuf>,
-    pub rootfs_read_only: bool,
-    pub initrd: Option<PathBuf>,
-    pub tap: Option<String>,
-    /// Attach entitlement-free user-mode NAT networking instead of host TAP/vmnet.
-    pub user_net: bool,
-    /// Whether `--mac` was explicitly supplied (used for snapshot restore overrides).
-    pub mac_specified: bool,
-    pub mac: [u8; 6],
-    /// virtio transport (`mmio` everywhere, `pci` on `x86_64` only).
-    pub transport: Transport,
-    /// One read-only virtio-fs mount tag exposed to the guest.
-    pub fs_tag: Option<String>,
-    /// Host directory backing the read-only virtio-fs share.
-    pub fs_dir: Option<PathBuf>,
-    /// Unix control socket (pause/resume/snapshot/quit). `None` disables the control plane.
-    pub api_sock: Option<PathBuf>,
-    /// Root for named lifecycle snapshots. `None` disables named snapshots.
-    pub snapshot_root: Option<PathBuf>,
-    /// Host Unix socket bridged byte-for-byte to the virtio-console agent port.
-    pub agent_sock: Option<PathBuf>,
-    /// Restore a snapshot directory instead of booting a kernel.
-    pub restore: Option<PathBuf>,
-    /// Fork (`CoW`) from a template snapshot directory instead of booting.
-    pub fork_from: Option<PathBuf>,
-    /// Create a `CoW` overlay of this base disk and serve it as `--rootfs`.
-    pub disk_overlay_of: Option<PathBuf>,
-    /// Number of children to spawn with `--fork-from` (default 1).
-    pub count: u32,
-    /// Attach a virtio-console agent channel (/dev/hvc0) for warm-boot exec.
-    pub console_agent: bool,
-    /// After (warm) boot, send this command line to the guest agent over the console.
-    pub agent_exec: Option<String>,
-    /// Two-process jailer toggle.
-    pub jail: bool,
-    /// VM/jail identifier.
-    pub id: Option<String>,
-    /// Jail root directory.
-    pub jail_root: Option<PathBuf>,
-    /// cgroup v2 cpu.max value.
-    pub cgroup_cpu_max: Option<String>,
-    /// cgroup v2 memory.max value.
-    pub cgroup_mem_max: Option<String>,
-    /// cgroup v2 pids.max value.
-    pub cgroup_pids_max: Option<u64>,
-    /// cgroup mode.
-    pub cgroup_mode: CgroupMode,
-    /// Seccomp default action.
-    pub seccomp_action: SeccompAction,
-    /// Operator-supplied network namespace path.
-    pub netns: Option<PathBuf>,
-    /// Boot mode.
-    pub boot_mode: BootMode,
-    /// Firmware image for UEFI boot.
-    pub firmware: Option<PathBuf>,
-    /// Log output format.
-    pub log_format: LogFormat,
-    /// Log level filter string.
-    pub log_level: String,
-    /// Apply the opt-in host process sandbox before vCPU/worker threads start.
-    pub sandbox: bool,
-    /// Explicit opt-out from standalone `--sandbox`; `--jail` still forces filters.
-    pub no_sandbox: bool,
-    /// UID to drop to when `--sandbox` is enabled and vmon starts as root.
-    pub sandbox_uid: Option<u32>,
-    /// GID to drop to when `--sandbox` is enabled and vmon starts as root.
-    pub sandbox_gid: Option<u32>,
-    /// Wall-clock hard deadline in seconds; the VMM self-terminates when reached.
-    pub timeout_secs: Option<u64>,
-    /// Named writable (or `:ro`) virtio-fs volumes; one device per entry.
-    pub volumes: Vec<FsMount>,
+	/// Kernel image. Required for a fresh boot; `None` when restoring/forking.
+	pub kernel:             Option<PathBuf>,
+	pub cmdline:            Option<String>,
+	pub mem_mib:            usize,
+	/// Host-RAM resident page target in MiB for transparent zram+paging.
+	pub mem_target_mib:     Option<usize>,
+	/// Maximum in-process compressed page store in MiB before spilling to swap.
+	pub zram_store_max_mib: Option<usize>,
+	/// Optional operator-provided swap file for pager overflow.
+	pub zram_swap_file:     Option<PathBuf>,
+	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
+	pub ksm:                bool,
+	pub cpus:               u8,
+	pub rootfs:             Option<PathBuf>,
+	pub rootfs_read_only:   bool,
+	pub initrd:             Option<PathBuf>,
+	pub tap:                Option<String>,
+	/// Attach entitlement-free user-mode NAT networking instead of host
+	/// TAP/vmnet.
+	pub user_net:           bool,
+	/// Whether `--mac` was explicitly supplied (used for snapshot restore
+	/// overrides).
+	pub mac_specified:      bool,
+	pub mac:                [u8; 6],
+	/// virtio transport (`mmio` everywhere, `pci` on `x86_64` only).
+	pub transport:          Transport,
+	/// One read-only virtio-fs mount tag exposed to the guest.
+	pub fs_tag:             Option<String>,
+	/// Host directory backing the read-only virtio-fs share.
+	pub fs_dir:             Option<PathBuf>,
+	/// Unix control socket (pause/resume/snapshot/quit). `None` disables the
+	/// control plane.
+	pub api_sock:           Option<PathBuf>,
+	/// Root for named lifecycle snapshots. `None` disables named snapshots.
+	pub snapshot_root:      Option<PathBuf>,
+	/// Host Unix socket bridged byte-for-byte to the virtio-console agent port.
+	pub agent_sock:         Option<PathBuf>,
+	/// Restore a snapshot directory instead of booting a kernel.
+	pub restore:            Option<PathBuf>,
+	/// Fork (`CoW`) from a template snapshot directory instead of booting.
+	pub fork_from:          Option<PathBuf>,
+	/// Create a `CoW` overlay of this base disk and serve it as `--rootfs`.
+	pub disk_overlay_of:    Option<PathBuf>,
+	/// Number of children to spawn with `--fork-from` (default 1).
+	pub count:              u32,
+	/// Attach a virtio-console agent channel (/dev/hvc0) for warm-boot exec.
+	pub console_agent:      bool,
+	/// After (warm) boot, send this command line to the guest agent over the
+	/// console.
+	pub agent_exec:         Option<String>,
+	/// Two-process jailer toggle.
+	pub jail:               bool,
+	/// VM/jail identifier.
+	pub id:                 Option<String>,
+	/// Jail root directory.
+	pub jail_root:          Option<PathBuf>,
+	/// cgroup v2 cpu.max value.
+	pub cgroup_cpu_max:     Option<String>,
+	/// cgroup v2 memory.max value.
+	pub cgroup_mem_max:     Option<String>,
+	/// cgroup v2 pids.max value.
+	pub cgroup_pids_max:    Option<u64>,
+	/// cgroup mode.
+	pub cgroup_mode:        CgroupMode,
+	/// Seccomp default action.
+	pub seccomp_action:     SeccompAction,
+	/// Operator-supplied network namespace path.
+	pub netns:              Option<PathBuf>,
+	/// Boot mode.
+	pub boot_mode:          BootMode,
+	/// Firmware image for UEFI boot.
+	pub firmware:           Option<PathBuf>,
+	/// Log output format.
+	pub log_format:         LogFormat,
+	/// Log level filter string.
+	pub log_level:          String,
+	/// Apply the opt-in host process sandbox before vCPU/worker threads start.
+	pub sandbox:            bool,
+	/// Explicit opt-out from standalone `--sandbox`; `--jail` still forces
+	/// filters.
+	pub no_sandbox:         bool,
+	/// UID to drop to when `--sandbox` is enabled and vmon starts as root.
+	pub sandbox_uid:        Option<u32>,
+	/// GID to drop to when `--sandbox` is enabled and vmon starts as root.
+	pub sandbox_gid:        Option<u32>,
+	/// Wall-clock hard deadline in seconds; the VMM self-terminates when
+	/// reached.
+	pub timeout_secs:       Option<u64>,
+	/// Named writable (or `:ro`) virtio-fs volumes; one device per entry.
+	pub volumes:            Vec<FsMount>,
 }
 
 impl Config {
-    pub fn from_args() -> Result<Self> {
-        Self::from_iter(std::env::args())
-    }
+	pub fn from_args() -> Result<Self> {
+		Self::from_iter(std::env::args())
+	}
 
-    pub fn from_iter<I, S>(args: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let mut args = args.into_iter().map(Into::into);
-        let prog = args.next().unwrap_or_else(|| "vmon".into());
+	pub fn from_iter<I, S>(args: I) -> Result<Self>
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<String>,
+	{
+		let mut args = args.into_iter().map(Into::into);
+		let prog = args.next().unwrap_or_else(|| "vmon".into());
 
-        let mut kernel = None;
-        let mut cmdline = None;
-        let mut mem_mib = 256u64;
-        let mut mem_target_mib: Option<u64> = None;
-        let mut zram_store_max_mib: Option<u64> = None;
-        let mut zram_swap_file = None;
-        let mut ksm = false;
-        let mut cpus = 1u64;
-        let mut rootfs = None;
-        let mut rootfs_read_only = false;
-        let mut initrd = None;
-        let mut tap = None;
-        let mut user_net = false;
-        let mut mac_specified = false;
-        let mut mac = DEFAULT_MAC;
-        let mut transport = Transport::Mmio;
-        let mut fs_tag = None;
-        let mut fs_dir = None;
-        let mut api_sock = None;
-        let mut snapshot_root = None;
-        let mut agent_sock = None;
-        let mut restore = None;
-        let mut fork_from = None;
-        let mut disk_overlay_of = None;
-        let mut count = 1u64;
-        let mut console_agent = false;
-        let mut agent_exec = None;
-        let mut jail = false;
-        let mut id = None;
-        let mut jail_root = None;
-        let mut cgroup_cpu_max = None;
-        let mut cgroup_mem_max = None;
-        let mut cgroup_pids_max = None;
-        let mut cgroup_mode = CgroupMode::V2;
-        let mut seccomp_action = SeccompAction::Errno;
-        let mut netns = None;
-        let mut boot_mode = BootMode::Direct;
-        let mut firmware = None;
-        let mut log_format = LogFormat::Text;
-        let mut log_level = String::from("info");
-        let mut sandbox = true;
-        let mut no_sandbox = false;
-        let mut sandbox_uid = None;
-        let mut sandbox_gid = None;
-        let mut timeout_secs = None;
-        let mut volumes = Vec::new();
+		let mut kernel = None;
+		let mut cmdline = None;
+		let mut mem_mib = 256u64;
+		let mut mem_target_mib: Option<u64> = None;
+		let mut zram_store_max_mib: Option<u64> = None;
+		let mut zram_swap_file = None;
+		let mut ksm = false;
+		let mut cpus = 1u64;
+		let mut rootfs = None;
+		let mut rootfs_read_only = false;
+		let mut initrd = None;
+		let mut tap = None;
+		let mut user_net = false;
+		let mut mac_specified = false;
+		let mut mac = DEFAULT_MAC;
+		let mut transport = Transport::Mmio;
+		let mut fs_tag = None;
+		let mut fs_dir = None;
+		let mut api_sock = None;
+		let mut snapshot_root = None;
+		let mut agent_sock = None;
+		let mut restore = None;
+		let mut fork_from = None;
+		let mut disk_overlay_of = None;
+		let mut count = 1u64;
+		let mut console_agent = false;
+		let mut agent_exec = None;
+		let mut jail = false;
+		let mut id = None;
+		let mut jail_root = None;
+		let mut cgroup_cpu_max = None;
+		let mut cgroup_mem_max = None;
+		let mut cgroup_pids_max = None;
+		let mut cgroup_mode = CgroupMode::V2;
+		let mut seccomp_action = SeccompAction::Errno;
+		let mut netns = None;
+		let mut boot_mode = BootMode::Direct;
+		let mut firmware = None;
+		let mut log_format = LogFormat::Text;
+		let mut log_level = String::from("info");
+		let mut sandbox = true;
+		let mut no_sandbox = false;
+		let mut sandbox_uid = None;
+		let mut sandbox_gid = None;
+		let mut timeout_secs = None;
+		let mut volumes = Vec::new();
 
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--kernel" => kernel = Some(PathBuf::from(next(&mut args, "--kernel")?)),
-                "--cmdline" => cmdline = Some(next(&mut args, "--cmdline")?),
-                "--mem" => mem_mib = parse(&next(&mut args, "--mem")?, "--mem")?,
-                "--mem-target-mib" => {
-                    mem_target_mib = Some(parse(
-                        &next(&mut args, "--mem-target-mib")?,
-                        "--mem-target-mib",
-                    )?);
-                }
-                "--zram-store-max-mib" => {
-                    zram_store_max_mib = Some(parse(
-                        &next(&mut args, "--zram-store-max-mib")?,
-                        "--zram-store-max-mib",
-                    )?);
-                }
-                "--zram-swap-file" => {
-                    zram_swap_file = Some(PathBuf::from(next(&mut args, "--zram-swap-file")?));
-                }
-                "--ksm" => ksm = true,
-                "--cpus" => cpus = parse(&next(&mut args, "--cpus")?, "--cpus")?,
-                "--rootfs" => rootfs = Some(PathBuf::from(next(&mut args, "--rootfs")?)),
-                "--rootfs-ro" => rootfs_read_only = true,
-                "--initrd" => initrd = Some(PathBuf::from(next(&mut args, "--initrd")?)),
-                "--tap" => tap = Some(next(&mut args, "--tap")?),
-                "--net" => user_net = parse_net(&next(&mut args, "--net")?)?,
-                "--mac" => {
-                    mac = parse_mac(&next(&mut args, "--mac")?)?;
-                    mac_specified = true;
-                }
-                "--transport" => transport = parse_transport(&next(&mut args, "--transport")?)?,
-                "--fs-tag" => fs_tag = Some(next(&mut args, "--fs-tag")?),
-                "--fs-dir" => fs_dir = Some(PathBuf::from(next(&mut args, "--fs-dir")?)),
-                "--api-sock" => api_sock = Some(PathBuf::from(next(&mut args, "--api-sock")?)),
-                "--snapshot-root" => {
-                    snapshot_root = Some(PathBuf::from(next(&mut args, "--snapshot-root")?));
-                }
-                "--agent-sock" => {
-                    agent_sock = Some(PathBuf::from(next(&mut args, "--agent-sock")?));
-                }
-                "--restore" => restore = Some(PathBuf::from(next(&mut args, "--restore")?)),
-                "--fork-from" => fork_from = Some(PathBuf::from(next(&mut args, "--fork-from")?)),
-                "--disk-overlay-of" => {
-                    disk_overlay_of = Some(PathBuf::from(next(&mut args, "--disk-overlay-of")?));
-                }
-                "--count" => count = parse(&next(&mut args, "--count")?, "--count")?,
-                "--console-agent" => console_agent = true,
-                "--agent-exec" => agent_exec = Some(next(&mut args, "--agent-exec")?),
-                "--jail" => jail = true,
-                "--id" => id = Some(next(&mut args, "--id")?),
-                "--jail-root" => jail_root = Some(PathBuf::from(next(&mut args, "--jail-root")?)),
-                "--cgroup-cpu-max" => cgroup_cpu_max = Some(next(&mut args, "--cgroup-cpu-max")?),
-                "--cgroup-mem-max" => cgroup_mem_max = Some(next(&mut args, "--cgroup-mem-max")?),
-                "--cgroup-pids-max" => {
-                    cgroup_pids_max = Some(parse(
-                        &next(&mut args, "--cgroup-pids-max")?,
-                        "--cgroup-pids-max",
-                    )?);
-                }
-                "--cgroup-mode" => {
-                    cgroup_mode = parse_cgroup_mode(&next(&mut args, "--cgroup-mode")?)?;
-                }
-                "--seccomp-action" => {
-                    seccomp_action = parse_seccomp_action(&next(&mut args, "--seccomp-action")?)?;
-                }
-                "--netns" => netns = Some(PathBuf::from(next(&mut args, "--netns")?)),
-                "--boot-mode" => boot_mode = parse_boot_mode(&next(&mut args, "--boot-mode")?)?,
-                "--firmware" => firmware = Some(PathBuf::from(next(&mut args, "--firmware")?)),
-                "--log-format" => log_format = parse_log_format(&next(&mut args, "--log-format")?)?,
-                "--log-level" => log_level = next(&mut args, "--log-level")?,
-                "--sandbox" => sandbox = true,
-                "--no-sandbox" => no_sandbox = true,
-                "--sandbox-uid" => {
-                    sandbox_uid = Some(parse(&next(&mut args, "--sandbox-uid")?, "--sandbox-uid")?);
-                }
-                "--sandbox-gid" => {
-                    sandbox_gid = Some(parse(&next(&mut args, "--sandbox-gid")?, "--sandbox-gid")?);
-                }
-                "--timeout-secs" => {
-                    timeout_secs = Some(parse(
-                        &next(&mut args, "--timeout-secs")?,
-                        "--timeout-secs",
-                    )?);
-                }
-                "--volume" => volumes.push(parse_volume(&next(&mut args, "--volume")?)?),
-                "-h" | "--help" => {
-                    print_help(&prog);
-                    std::process::exit(0);
-                }
-                other => bail!("unknown argument {other} (try --help)"),
-            }
-        }
+		while let Some(arg) = args.next() {
+			match arg.as_str() {
+				"--kernel" => kernel = Some(PathBuf::from(next(&mut args, "--kernel")?)),
+				"--cmdline" => cmdline = Some(next(&mut args, "--cmdline")?),
+				"--mem" => mem_mib = parse(&next(&mut args, "--mem")?, "--mem")?,
+				"--mem-target-mib" => {
+					mem_target_mib =
+						Some(parse(&next(&mut args, "--mem-target-mib")?, "--mem-target-mib")?);
+				},
+				"--zram-store-max-mib" => {
+					zram_store_max_mib =
+						Some(parse(&next(&mut args, "--zram-store-max-mib")?, "--zram-store-max-mib")?);
+				},
+				"--zram-swap-file" => {
+					zram_swap_file = Some(PathBuf::from(next(&mut args, "--zram-swap-file")?));
+				},
+				"--ksm" => ksm = true,
+				"--cpus" => cpus = parse(&next(&mut args, "--cpus")?, "--cpus")?,
+				"--rootfs" => rootfs = Some(PathBuf::from(next(&mut args, "--rootfs")?)),
+				"--rootfs-ro" => rootfs_read_only = true,
+				"--initrd" => initrd = Some(PathBuf::from(next(&mut args, "--initrd")?)),
+				"--tap" => tap = Some(next(&mut args, "--tap")?),
+				"--net" => user_net = parse_net(&next(&mut args, "--net")?)?,
+				"--mac" => {
+					mac = parse_mac(&next(&mut args, "--mac")?)?;
+					mac_specified = true;
+				},
+				"--transport" => transport = parse_transport(&next(&mut args, "--transport")?)?,
+				"--fs-tag" => fs_tag = Some(next(&mut args, "--fs-tag")?),
+				"--fs-dir" => fs_dir = Some(PathBuf::from(next(&mut args, "--fs-dir")?)),
+				"--api-sock" => api_sock = Some(PathBuf::from(next(&mut args, "--api-sock")?)),
+				"--snapshot-root" => {
+					snapshot_root = Some(PathBuf::from(next(&mut args, "--snapshot-root")?));
+				},
+				"--agent-sock" => {
+					agent_sock = Some(PathBuf::from(next(&mut args, "--agent-sock")?));
+				},
+				"--restore" => restore = Some(PathBuf::from(next(&mut args, "--restore")?)),
+				"--fork-from" => fork_from = Some(PathBuf::from(next(&mut args, "--fork-from")?)),
+				"--disk-overlay-of" => {
+					disk_overlay_of = Some(PathBuf::from(next(&mut args, "--disk-overlay-of")?));
+				},
+				"--count" => count = parse(&next(&mut args, "--count")?, "--count")?,
+				"--console-agent" => console_agent = true,
+				"--agent-exec" => agent_exec = Some(next(&mut args, "--agent-exec")?),
+				"--jail" => jail = true,
+				"--id" => id = Some(next(&mut args, "--id")?),
+				"--jail-root" => jail_root = Some(PathBuf::from(next(&mut args, "--jail-root")?)),
+				"--cgroup-cpu-max" => cgroup_cpu_max = Some(next(&mut args, "--cgroup-cpu-max")?),
+				"--cgroup-mem-max" => cgroup_mem_max = Some(next(&mut args, "--cgroup-mem-max")?),
+				"--cgroup-pids-max" => {
+					cgroup_pids_max =
+						Some(parse(&next(&mut args, "--cgroup-pids-max")?, "--cgroup-pids-max")?);
+				},
+				"--cgroup-mode" => {
+					cgroup_mode = parse_cgroup_mode(&next(&mut args, "--cgroup-mode")?)?;
+				},
+				"--seccomp-action" => {
+					seccomp_action = parse_seccomp_action(&next(&mut args, "--seccomp-action")?)?;
+				},
+				"--netns" => netns = Some(PathBuf::from(next(&mut args, "--netns")?)),
+				"--boot-mode" => boot_mode = parse_boot_mode(&next(&mut args, "--boot-mode")?)?,
+				"--firmware" => firmware = Some(PathBuf::from(next(&mut args, "--firmware")?)),
+				"--log-format" => log_format = parse_log_format(&next(&mut args, "--log-format")?)?,
+				"--log-level" => log_level = next(&mut args, "--log-level")?,
+				"--sandbox" => sandbox = true,
+				"--no-sandbox" => no_sandbox = true,
+				"--sandbox-uid" => {
+					sandbox_uid = Some(parse(&next(&mut args, "--sandbox-uid")?, "--sandbox-uid")?);
+				},
+				"--sandbox-gid" => {
+					sandbox_gid = Some(parse(&next(&mut args, "--sandbox-gid")?, "--sandbox-gid")?);
+				},
+				"--timeout-secs" => {
+					timeout_secs = Some(parse(&next(&mut args, "--timeout-secs")?, "--timeout-secs")?);
+				},
+				"--volume" => volumes.push(parse_volume(&next(&mut args, "--volume")?)?),
+				"-h" | "--help" => {
+					print_help(&prog);
+					std::process::exit(0);
+				},
+				other => bail!("unknown argument {other} (try --help)"),
+			}
+		}
 
-        if count == 0 || count > u64::from(MAX_COUNT) {
-            bail!("--count must be between 1 and {MAX_COUNT} (got {count})");
-        }
-        if cpus == 0 || cpus > u64::from(MAX_CPUS) {
-            bail!("--cpus must be between 1 and {MAX_CPUS} (got {cpus})");
-        }
-        if mem_mib == 0 || mem_mib > MAX_MEM_MIB as u64 {
-            bail!("--mem must be between 1 and {MAX_MEM_MIB} MiB (got {mem_mib})");
-        }
-        if let Some(target) = mem_target_mib
-            && (target == 0 || target >= mem_mib)
-        {
-            bail!(
-                "--mem-target-mib must be between 1 and {} (one less than --mem) (got {target})",
-                mem_mib - 1
-            );
-        }
-        if (zram_store_max_mib.is_some() || zram_swap_file.is_some()) && mem_target_mib.is_none() {
-            bail!("--zram-store-max-mib/--zram-swap-file require --mem-target-mib");
-        }
-        if let Some(store_max) = zram_store_max_mib
-            && (store_max == 0 || store_max > mem_mib)
-        {
-            bail!("--zram-store-max-mib must be between 1 and {mem_mib}");
-        }
-        #[cfg(not(target_os = "linux"))]
-        if mem_target_mib.is_some() {
-            bail!("--mem-target-mib (transparent paging) requires a Linux host");
-        }
-        if let Some(n) = timeout_secs
-            && !(1..=86_400).contains(&n)
-        {
-            bail!("--timeout-secs must be between 1 and 86400 (got {n})");
-        }
+		if count == 0 || count > u64::from(MAX_COUNT) {
+			bail!("--count must be between 1 and {MAX_COUNT} (got {count})");
+		}
+		if cpus == 0 || cpus > u64::from(MAX_CPUS) {
+			bail!("--cpus must be between 1 and {MAX_CPUS} (got {cpus})");
+		}
+		if mem_mib == 0 || mem_mib > MAX_MEM_MIB as u64 {
+			bail!("--mem must be between 1 and {MAX_MEM_MIB} MiB (got {mem_mib})");
+		}
+		if let Some(target) = mem_target_mib
+			&& (target == 0 || target >= mem_mib)
+		{
+			bail!(
+				"--mem-target-mib must be between 1 and {} (one less than --mem) (got {target})",
+				mem_mib - 1
+			);
+		}
+		if (zram_store_max_mib.is_some() || zram_swap_file.is_some()) && mem_target_mib.is_none() {
+			bail!("--zram-store-max-mib/--zram-swap-file require --mem-target-mib");
+		}
+		if let Some(store_max) = zram_store_max_mib
+			&& (store_max == 0 || store_max > mem_mib)
+		{
+			bail!("--zram-store-max-mib must be between 1 and {mem_mib}");
+		}
+		#[cfg(not(target_os = "linux"))]
+		if mem_target_mib.is_some() {
+			bail!("--mem-target-mib (transparent paging) requires a Linux host");
+		}
+		if let Some(n) = timeout_secs
+			&& !(1..=86_400).contains(&n)
+		{
+			bail!("--timeout-secs must be between 1 and 86400 (got {n})");
+		}
 
-        if fs_tag.is_some() != fs_dir.is_some() {
-            bail!("--fs-tag and --fs-dir must be used together");
-        }
-        if volumes.len() > 8 {
-            bail!(
-                "at most 8 --volume mounts are supported (got {})",
-                volumes.len()
-            );
-        }
-        {
-            let mut seen: Vec<&str> = Vec::new();
-            if let Some(tag) = &fs_tag {
-                seen.push(tag.as_str());
-            }
-            for m in &volumes {
-                let tag = &m.tag;
-                if !is_valid_volume_tag(tag) {
-                    bail!("--volume tag {tag} must match [a-z0-9_]{{1,32}}");
-                }
-                if seen.contains(&tag.as_str()) {
-                    bail!("--volume tags must be unique");
-                }
-                seen.push(tag.as_str());
-            }
-        }
-        if user_net && tap.is_some() {
-            bail!("--net user cannot be combined with --tap");
-        }
-        if user_net && !cfg!(target_os = "macos") {
-            bail!("--net user is currently supported only on macOS");
-        }
-        if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
-            bail!("--transport pci is only supported on x86_64");
-        }
-        match (boot_mode, firmware.is_some()) {
-            (BootMode::Uefi, false) => bail!("--boot-mode uefi requires --firmware"),
-            (BootMode::Direct, true) => bail!("--firmware requires --boot-mode uefi"),
-            (BootMode::Uefi, true) | (BootMode::Direct, false) => {}
-        }
-        if let Some(id) = &id {
-            validate_id(id)?;
-        }
-        if jail && let Some(sock) = &agent_sock {
-            validate_jail_agent_sock(sock)?;
-        }
-        if no_sandbox && jail {
-            bail!("--no-sandbox cannot be combined with --jail");
-        }
-        if netns.is_some() && !jail {
-            bail!("--netns requires --jail");
-        }
-        // A fresh direct boot needs a kernel. UEFI boots enter firmware instead;
-        // restore/fork reconstruct state from a snapshot.
-        if boot_mode == BootMode::Direct
-            && kernel.is_none()
-            && restore.is_none()
-            && fork_from.is_none()
-        {
-            bail!(
-                "--kernel <path> is required for --boot-mode direct (unless --restore/--fork-from)"
-            );
-        }
-        if restore.is_some() && fork_from.is_some() {
-            bail!("--restore and --fork-from are mutually exclusive");
-        }
-        if mem_target_mib.is_some() && fork_from.is_some() {
-            bail!(
-                "--mem-target-mib is not supported with --fork-from; forked clone RAM is copy-on-write"
-            );
-        }
-        if let Some(base) = &disk_overlay_of {
-            validate_overlay_paths(base, rootfs.as_deref())?;
-        }
-        let filters_enabled = jail || (sandbox && !no_sandbox);
-        if filters_enabled {
-            if sandbox_uid.is_none() {
-                sandbox_uid = parse_env_u32("VMON_SANDBOX_UID")?;
-            }
-            if sandbox_gid.is_none() {
-                sandbox_gid = parse_env_u32("VMON_SANDBOX_GID")?;
-            }
-        } else if sandbox_uid.is_some() || sandbox_gid.is_some() {
-            bail!("--sandbox-uid/--sandbox-gid require the sandbox (drop --no-sandbox) or --jail");
-        }
+		if fs_tag.is_some() != fs_dir.is_some() {
+			bail!("--fs-tag and --fs-dir must be used together");
+		}
+		if volumes.len() > 8 {
+			bail!("at most 8 --volume mounts are supported (got {})", volumes.len());
+		}
+		{
+			let mut seen: Vec<&str> = Vec::new();
+			if let Some(tag) = &fs_tag {
+				seen.push(tag.as_str());
+			}
+			for m in &volumes {
+				let tag = &m.tag;
+				if !is_valid_volume_tag(tag) {
+					bail!("--volume tag {tag} must match [a-z0-9_]{{1,32}}");
+				}
+				if seen.contains(&tag.as_str()) {
+					bail!("--volume tags must be unique");
+				}
+				seen.push(tag.as_str());
+			}
+		}
+		if user_net && tap.is_some() {
+			bail!("--net user cannot be combined with --tap");
+		}
+		if user_net && !cfg!(target_os = "macos") {
+			bail!("--net user is currently supported only on macOS");
+		}
+		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
+			bail!("--transport pci is only supported on x86_64");
+		}
+		match (boot_mode, firmware.is_some()) {
+			(BootMode::Uefi, false) => bail!("--boot-mode uefi requires --firmware"),
+			(BootMode::Direct, true) => bail!("--firmware requires --boot-mode uefi"),
+			(BootMode::Uefi, true) | (BootMode::Direct, false) => {},
+		}
+		if let Some(id) = &id {
+			validate_id(id)?;
+		}
+		if jail && let Some(sock) = &agent_sock {
+			validate_jail_agent_sock(sock)?;
+		}
+		if no_sandbox && jail {
+			bail!("--no-sandbox cannot be combined with --jail");
+		}
+		if netns.is_some() && !jail {
+			bail!("--netns requires --jail");
+		}
+		// A fresh direct boot needs a kernel. UEFI boots enter firmware instead;
+		// restore/fork reconstruct state from a snapshot.
+		if boot_mode == BootMode::Direct
+			&& kernel.is_none()
+			&& restore.is_none()
+			&& fork_from.is_none()
+		{
+			bail!("--kernel <path> is required for --boot-mode direct (unless --restore/--fork-from)");
+		}
+		if restore.is_some() && fork_from.is_some() {
+			bail!("--restore and --fork-from are mutually exclusive");
+		}
+		if mem_target_mib.is_some() && fork_from.is_some() {
+			bail!(
+				"--mem-target-mib is not supported with --fork-from; forked clone RAM is copy-on-write"
+			);
+		}
+		if let Some(base) = &disk_overlay_of {
+			validate_overlay_paths(base, rootfs.as_deref())?;
+		}
+		let filters_enabled = jail || (sandbox && !no_sandbox);
+		if filters_enabled {
+			if sandbox_uid.is_none() {
+				sandbox_uid = parse_env_u32("VMON_SANDBOX_UID")?;
+			}
+			if sandbox_gid.is_none() {
+				sandbox_gid = parse_env_u32("VMON_SANDBOX_GID")?;
+			}
+		} else if sandbox_uid.is_some() || sandbox_gid.is_some() {
+			bail!("--sandbox-uid/--sandbox-gid require the sandbox (drop --no-sandbox) or --jail");
+		}
 
-        // Stage-B filters default on, so a root launch must drop to an
-        // unprivileged uid/gid (or opt out with --no-sandbox); otherwise the
-        // VMM would keep running as root with the sandbox active, defeating the
-        // privilege drop. The jailer enforces its own uid/gid requirement after
-        // pivot_root, so --jail is exempt here. Non-root launches need no
-        // uid/gid — the drop is a no-op when not root.
-        #[cfg(target_os = "linux")]
-        {
-            if filters_enabled
-                && !jail
-                && unsafe { libc::getuid() } == 0
-                && (sandbox_uid.is_none() || sandbox_gid.is_none())
-            {
-                bail!(
-                    "running as root with the sandbox enabled requires --sandbox-uid/--sandbox-gid (or pass --no-sandbox)"
-                );
-            }
-        }
+		// Stage-B filters default on, so a root launch must drop to an
+		// unprivileged uid/gid (or opt out with --no-sandbox); otherwise the
+		// VMM would keep running as root with the sandbox active, defeating the
+		// privilege drop. The jailer enforces its own uid/gid requirement after
+		// pivot_root, so --jail is exempt here. Non-root launches need no
+		// uid/gid — the drop is a no-op when not root.
+		#[cfg(target_os = "linux")]
+		{
+			if filters_enabled
+				&& !jail && unsafe { libc::getuid() } == 0
+				&& (sandbox_uid.is_none() || sandbox_gid.is_none())
+			{
+				bail!(
+					"running as root with the sandbox enabled requires --sandbox-uid/--sandbox-gid (or \
+					 pass --no-sandbox)"
+				);
+			}
+		}
 
-        let console_agent = console_agent || agent_exec.is_some() || agent_sock.is_some();
+		let console_agent = console_agent || agent_exec.is_some() || agent_sock.is_some();
 
-        Ok(Self {
-            kernel,
-            cmdline,
-            mem_mib: mem_mib as usize,
-            mem_target_mib: mem_target_mib.map(|v| v as usize),
-            zram_store_max_mib: zram_store_max_mib.map(|v| v as usize),
-            zram_swap_file,
-            ksm,
-            cpus: cpus as u8,
-            rootfs,
-            rootfs_read_only,
-            initrd,
-            tap,
-            user_net,
-            mac_specified,
-            mac,
-            transport,
-            fs_tag,
-            fs_dir,
-            api_sock,
-            snapshot_root,
-            agent_sock,
-            restore,
-            fork_from,
-            disk_overlay_of,
-            count: count as u32,
-            console_agent,
-            agent_exec,
-            jail,
-            id,
-            jail_root,
-            cgroup_cpu_max,
-            cgroup_mem_max,
-            cgroup_pids_max,
-            cgroup_mode,
-            seccomp_action,
-            netns,
-            boot_mode,
-            firmware,
-            log_format,
-            log_level,
-            sandbox,
-            no_sandbox,
-            sandbox_uid,
-            sandbox_gid,
-            timeout_secs,
-            volumes,
-        })
-    }
+		Ok(Self {
+			kernel,
+			cmdline,
+			mem_mib: mem_mib as usize,
+			mem_target_mib: mem_target_mib.map(|v| v as usize),
+			zram_store_max_mib: zram_store_max_mib.map(|v| v as usize),
+			zram_swap_file,
+			ksm,
+			cpus: cpus as u8,
+			rootfs,
+			rootfs_read_only,
+			initrd,
+			tap,
+			user_net,
+			mac_specified,
+			mac,
+			transport,
+			fs_tag,
+			fs_dir,
+			api_sock,
+			snapshot_root,
+			agent_sock,
+			restore,
+			fork_from,
+			disk_overlay_of,
+			count: count as u32,
+			console_agent,
+			agent_exec,
+			jail,
+			id,
+			jail_root,
+			cgroup_cpu_max,
+			cgroup_mem_max,
+			cgroup_pids_max,
+			cgroup_mode,
+			seccomp_action,
+			netns,
+			boot_mode,
+			firmware,
+			log_format,
+			log_level,
+			sandbox,
+			no_sandbox,
+			sandbox_uid,
+			sandbox_gid,
+			timeout_secs,
+			volumes,
+		})
+	}
 }
 
 fn validate_overlay_paths(base: &Path, rootfs: Option<&Path>) -> Result<()> {
-    let Some(dest) = rootfs else {
-        bail!("--disk-overlay-of requires --rootfs (the overlay destination)");
-    };
-    if dest == base {
-        bail!("--disk-overlay-of base must differ from --rootfs");
-    }
+	let Some(dest) = rootfs else {
+		bail!("--disk-overlay-of requires --rootfs (the overlay destination)");
+	};
+	if dest == base {
+		bail!("--disk-overlay-of base must differ from --rootfs");
+	}
 
-    let base_meta = std::fs::symlink_metadata(base)
-        .map_err(|e| err(format!("checking --disk-overlay-of base {base:?}: {e}")))?;
-    if base_meta.file_type().is_symlink() {
-        bail!("--disk-overlay-of base {base:?} must be a regular file, not a symlink");
-    }
-    if !base_meta.is_file() {
-        bail!("--disk-overlay-of base {base:?} must be a regular file");
-    }
+	let base_meta = std::fs::symlink_metadata(base)
+		.map_err(|e| err(format!("checking --disk-overlay-of base {}: {e}", base.display())))?;
+	if base_meta.file_type().is_symlink() {
+		bail!("--disk-overlay-of base {base:?} must be a regular file, not a symlink");
+	}
+	if !base_meta.is_file() {
+		bail!("--disk-overlay-of base {base:?} must be a regular file");
+	}
 
-    match std::fs::symlink_metadata(dest) {
-        Ok(meta) => {
-            let kind = if meta.file_type().is_symlink() {
-                "symlink"
-            } else if meta.is_dir() {
-                "directory"
-            } else {
-                "file"
-            };
-            bail!(
-                "--rootfs overlay destination {dest:?} already exists as a {kind}; choose a new path"
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(err(format!(
-            "checking --rootfs overlay destination {dest:?}: {e}"
-        ))),
-    }
+	match std::fs::symlink_metadata(dest) {
+		Ok(meta) => {
+			let kind = if meta.file_type().is_symlink() {
+				"symlink"
+			} else if meta.is_dir() {
+				"directory"
+			} else {
+				"file"
+			};
+			bail!(
+				"--rootfs overlay destination {dest:?} already exists as a {kind}; choose a new path"
+			);
+		},
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(e) => Err(err(format!("checking --rootfs overlay destination {}: {e}", dest.display()))),
+	}
 }
 
 fn next<I>(args: &mut I, flag: &str) -> Result<String>
 where
-    I: Iterator<Item = String>,
+	I: Iterator<Item = String>,
 {
-    args.next()
-        .ok_or_else(|| err(format!("{flag} requires a value")))
+	args
+		.next()
+		.ok_or_else(|| err(format!("{flag} requires a value")))
 }
 
 fn parse<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T> {
-    value
-        .parse()
-        .map_err(|_| err(format!("invalid value {value} for {flag}")))
+	value
+		.parse()
+		.map_err(|_| err(format!("invalid value {value} for {flag}")))
 }
 
 fn parse_env_u32(name: &str) -> Result<Option<u32>> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map(Some)
-            .map_err(|_| err(format!("invalid value {value} for {name}"))),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(err(format!("{name} must be valid UTF-8"))),
-    }
+	match std::env::var(name) {
+		Ok(value) => value
+			.parse()
+			.map(Some)
+			.map_err(|_| err(format!("invalid value {value} for {name}"))),
+		Err(std::env::VarError::NotPresent) => Ok(None),
+		Err(std::env::VarError::NotUnicode(_)) => Err(err(format!("{name} must be valid UTF-8"))),
+	}
 }
 
 fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 6 {
-        bail!("invalid MAC {s} (expected aa:bb:cc:dd:ee:ff)");
-    }
-    let mut mac = [0u8; 6];
-    for (i, p) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(p, 16).map_err(|_| err(format!("invalid MAC byte {p}")))?;
-    }
-    Ok(mac)
+	let parts: Vec<&str> = s.split(':').collect();
+	if parts.len() != 6 {
+		bail!("invalid MAC {s} (expected aa:bb:cc:dd:ee:ff)");
+	}
+	let mut mac = [0u8; 6];
+	for (i, p) in parts.iter().enumerate() {
+		mac[i] = u8::from_str_radix(p, 16).map_err(|_| err(format!("invalid MAC byte {p}")))?;
+	}
+	Ok(mac)
 }
 
 fn parse_transport(s: &str) -> Result<Transport> {
-    match s {
-        "mmio" => Ok(Transport::Mmio),
-        "pci" => Ok(Transport::Pci),
-        _ => bail!("invalid --transport {s} (expected mmio or pci)"),
-    }
+	match s {
+		"mmio" => Ok(Transport::Mmio),
+		"pci" => Ok(Transport::Pci),
+		_ => bail!("invalid --transport {s} (expected mmio or pci)"),
+	}
 }
 
 fn parse_net(s: &str) -> Result<bool> {
-    match s {
-        "user" => Ok(true),
-        _ => bail!("invalid --net {s} (expected user)"),
-    }
+	match s {
+		"user" => Ok(true),
+		_ => bail!("invalid --net {s} (expected user)"),
+	}
 }
 
 fn parse_cgroup_mode(s: &str) -> Result<CgroupMode> {
-    match s {
-        "v2" => Ok(CgroupMode::V2),
-        "off" => Ok(CgroupMode::Off),
-        _ => bail!("invalid --cgroup-mode {s} (expected v2 or off)"),
-    }
+	match s {
+		"v2" => Ok(CgroupMode::V2),
+		"off" => Ok(CgroupMode::Off),
+		_ => bail!("invalid --cgroup-mode {s} (expected v2 or off)"),
+	}
 }
 
 fn parse_seccomp_action(s: &str) -> Result<SeccompAction> {
-    match s {
-        "kill" => Ok(SeccompAction::Kill),
-        "errno" => Ok(SeccompAction::Errno),
-        "log" => Ok(SeccompAction::Log),
-        _ => bail!("invalid --seccomp-action {s} (expected kill, errno, or log)"),
-    }
+	match s {
+		"kill" => Ok(SeccompAction::Kill),
+		"errno" => Ok(SeccompAction::Errno),
+		"log" => Ok(SeccompAction::Log),
+		_ => bail!("invalid --seccomp-action {s} (expected kill, errno, or log)"),
+	}
 }
 
 fn parse_boot_mode(s: &str) -> Result<BootMode> {
-    match s {
-        "direct" => Ok(BootMode::Direct),
-        "uefi" => Ok(BootMode::Uefi),
-        _ => bail!("invalid --boot-mode {s} (expected direct or uefi)"),
-    }
+	match s {
+		"direct" => Ok(BootMode::Direct),
+		"uefi" => Ok(BootMode::Uefi),
+		_ => bail!("invalid --boot-mode {s} (expected direct or uefi)"),
+	}
 }
 
 fn parse_log_format(s: &str) -> Result<LogFormat> {
-    match s {
-        "text" => Ok(LogFormat::Text),
-        "json" => Ok(LogFormat::Json),
-        _ => bail!("invalid --log-format {s} (expected text or json)"),
-    }
+	match s {
+		"text" => Ok(LogFormat::Text),
+		"json" => Ok(LogFormat::Json),
+		_ => bail!("invalid --log-format {s} (expected text or json)"),
+	}
 }
 
 fn parse_volume(s: &str) -> Result<FsMount> {
-    let (body, read_only) = match s.strip_suffix(":ro") {
-        Some(rest) => (rest, true),
-        None => (s, false),
-    };
-    let (tag, dir) = body.split_once(':').ok_or_else(|| {
-        err(format!(
-            "invalid --volume {s} (expected <tag>:<dir>[:ro])"
-        ))
-    })?;
-    if tag.is_empty() || dir.is_empty() {
-        bail!("invalid --volume {s} (expected <tag>:<dir>[:ro])");
-    }
-    Ok(FsMount {
-        tag: tag.to_string(),
-        dir: PathBuf::from(dir),
-        read_only,
-    })
+	let (body, read_only) = match s.strip_suffix(":ro") {
+		Some(rest) => (rest, true),
+		None => (s, false),
+	};
+	let (tag, dir) = body
+		.split_once(':')
+		.ok_or_else(|| err(format!("invalid --volume {s} (expected <tag>:<dir>[:ro])")))?;
+	if tag.is_empty() || dir.is_empty() {
+		bail!("invalid --volume {s} (expected <tag>:<dir>[:ro])");
+	}
+	Ok(FsMount { tag: tag.to_string(), dir: PathBuf::from(dir), read_only })
 }
 
 fn is_valid_volume_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= 32
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+	!tag.is_empty()
+		&& tag.len() <= 32
+		&& tag
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 64
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        bail!("--id must be 1..=64 ASCII letters, digits, '-' or '_'");
-    }
-    Ok(())
+	if id.is_empty()
+		|| id.len() > 64
+		|| !id
+			.bytes()
+			.all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+	{
+		bail!("--id must be 1..=64 ASCII letters, digits, '-' or '_'");
+	}
+	Ok(())
 }
 
 fn validate_jail_agent_sock(sock: &Path) -> Result<()> {
-    let root = Path::new("/run/vmon");
-    let escapes = sock
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir));
-    if !sock.is_absolute() || escapes || sock == root || !sock.starts_with(root) {
-        bail!("--agent-sock must be inside /run/vmon when --jail is enabled (got {sock:?})");
-    }
-    Ok(())
+	let root = Path::new("/run/vmon");
+	let escapes = sock
+		.components()
+		.any(|component| matches!(component, std::path::Component::ParentDir));
+	if !sock.is_absolute() || escapes || sock == root || !sock.starts_with(root) {
+		bail!("--agent-sock must be inside /run/vmon when --jail is enabled (got {sock:?})");
+	}
+	Ok(())
 }
 
 fn print_help(prog: &str) {
-    #[cfg(target_arch = "x86_64")]
-    let kfmt = "uncompressed ELF vmlinux or bzImage";
-    #[cfg(target_arch = "aarch64")]
-    let kfmt = "uncompressed arm64 Image";
-    eprintln!(
-        "vmon - a barebones KVM (Linux) / Hypervisor.framework (macOS) monitor for Linux guests\n\
-         \n\
-         USAGE:\n    {prog} (--kernel <image> | --boot-mode uefi --firmware <fd>) [options]\n\
-         \n\
-         OPTIONS:\n\
-         \x20   --kernel <path>     Kernel image ({kfmt}); required for direct boot\n\
-         \x20   --cmdline <string>  Kernel command line (default: console=ttyS0 ...)\n\
-         \x20   --mem <MiB>         Guest RAM in MiB (default: 256)\n\
-         \x20   --mem-target-mib <n> Keep guest host-RAM resident set near <n> MiB (transparent zram+paging)\n\
-         \x20   --zram-store-max-mib <n> Cap the in-RAM compressed store before spilling to swap\n\
-         \x20   --zram-swap-file <path> Swap file for paging overflow (default: anonymous temp in $TMPDIR)\n\
-         \x20   --ksm              madvise(MADV_MERGEABLE) guest RAM for host KSM dedup\n\
-         \x20   --cpus <n>          Number of vCPUs (default: 1)\n\
-         \x20   --rootfs <path>     Disk image exposed as virtio-blk /dev/vda\n\
-         \x20   --rootfs-ro         Open the rootfs read-only\n\
-         \x20   --initrd <path>     initramfs image\n\
-         \x20   --tap <name>        Host TAP/vmnet interface for virtio-net\n\
-         \x20   --net user          Entitlement-free user-mode NAT networking (macOS)\n\
-         \x20   --mac <addr>        Guest MAC (default: 02:00:00:00:00:01)\n\
-         \x20   --transport <kind>  Virtio transport: mmio|pci (default: mmio; pci x86_64 only)\n\
-         \x20   --fs-tag <tag>      virtio-fs mount tag (requires --fs-dir)\n\
-         \x20   --fs-dir <path>     Host directory exposed read-only by virtio-fs\n\
-         \x20   --volume <t:d[:ro]> Writable virtio-fs volume <tag>:<host_dir> (:ro read-only)\n\
-         \x20   --api-sock <path>   Unix control socket (pause/resume/snapshot/quit)\n\
-         \x20   --snapshot-root <dir>  Root for named JSON lifecycle snapshots\n\
-         \x20   --agent-sock <path> Guest-agent socket (under --jail: /run/vmon/*)\n\
-         \x20   --restore <dir>     Restore a snapshot directory instead of booting\n\
-         \x20   --fork-from <dir>   Fork (CoW) from a template snapshot directory\n\
-         \x20   --count <n>         Number of children to spawn with --fork-from (default 1)\n\
-         \x20   --disk-overlay-of <base>  Create a new no-overwrite CoW overlay at --rootfs\n\
-         \x20   --console-agent     Attach a virtio-console agent channel (/dev/hvc0)\n\
-         \x20   --agent-exec <cmd>  Send <cmd> to the guest agent after (warm) boot\n\
-         \x20   --jail              Run inside Linux cgroup/namespace/pivot-root jail\n\
-         \x20   --id <name>         VM/jail id (ASCII alnum, '-' or '_')\n\
-         \x20   --jail-root <dir>   Jail root directory\n\
-         \x20   --cgroup-cpu-max <v> cgroup cpu.max value\n\
-         \x20   --cgroup-mem-max <v> cgroup memory.max value\n\
-         \x20   --cgroup-pids-max <n> cgroup pids.max value\n\
-         \x20   --cgroup-mode <m>   cgroup mode: v2|off (default: v2)\n\
-         \x20   --seccomp-action <a> seccomp action: kill|errno|log (default: errno)\n\
-         \x20   --netns <path>      Operator-created network namespace path\n\
-         \x20   --boot-mode <mode>  Boot mode: direct|uefi (default: direct)\n\
-         \x20   --firmware <path>   UEFI firmware image for --boot-mode uefi\n\
-         \x20   --log-format <fmt>  Log format: text|json (default: text)\n\
-         \x20   --log-level <level> Log level filter (default: info)\n\
-         \x20   --sandbox           Apply the Linux process sandbox (default: on)\n\
-         \x20   --no-sandbox        Disable the default sandbox (not valid with --jail)\n\
-         \x20   --sandbox-uid <uid> UID drop target; required as root unless --no-sandbox\n\
-         \x20   --sandbox-gid <gid> GID drop target; required as root unless --no-sandbox\n\
-         \x20   -h, --help          Show this help"
-    );
+	#[cfg(target_arch = "x86_64")]
+	let kfmt = "uncompressed ELF vmlinux or bzImage";
+	#[cfg(target_arch = "aarch64")]
+	let kfmt = "uncompressed arm64 Image";
+	eprintln!(
+		"vmon - a barebones KVM (Linux) / Hypervisor.framework (macOS) monitor for Linux \
+		 guests\n\nUSAGE:\n    {prog} (--kernel <image> | --boot-mode uefi --firmware <fd>) \
+		 [options]\n\nOPTIONS:\n\x20   --kernel <path>     Kernel image ({kfmt}); required for \
+		 direct boot\n\x20   --cmdline <string>  Kernel command line (default: console=ttyS0 \
+		 ...)\n\x20   --mem <MiB>         Guest RAM in MiB (default: 256)\n\x20   --mem-target-mib \
+		 <n> Keep guest host-RAM resident set near <n> MiB (transparent zram+paging)\n\x20   \
+		 --zram-store-max-mib <n> Cap the in-RAM compressed store before spilling to swap\n\x20   \
+		 --zram-swap-file <path> Swap file for paging overflow (default: anonymous temp in \
+		 $TMPDIR)\n\x20   --ksm              madvise(MADV_MERGEABLE) guest RAM for host KSM \
+		 dedup\n\x20   --cpus <n>          Number of vCPUs (default: 1)\n\x20   --rootfs <path>     \
+		 Disk image exposed as virtio-blk /dev/vda\n\x20   --rootfs-ro         Open the rootfs \
+		 read-only\n\x20   --initrd <path>     initramfs image\n\x20   --tap <name>        Host \
+		 TAP/vmnet interface for virtio-net\n\x20   --net user          Entitlement-free user-mode \
+		 NAT networking (macOS)\n\x20   --mac <addr>        Guest MAC (default: \
+		 02:00:00:00:00:01)\n\x20   --transport <kind>  Virtio transport: mmio|pci (default: mmio; \
+		 pci x86_64 only)\n\x20   --fs-tag <tag>      virtio-fs mount tag (requires --fs-dir)\n\x20   \
+		 --fs-dir <path>     Host directory exposed read-only by virtio-fs\n\x20   --volume \
+		 <t:d[:ro]> Writable virtio-fs volume <tag>:<host_dir> (:ro read-only)\n\x20   --api-sock \
+		 <path>   Unix control socket (pause/resume/snapshot/quit)\n\x20   --snapshot-root <dir>  \
+		 Root for named JSON lifecycle snapshots\n\x20   --agent-sock <path> Guest-agent socket \
+		 (under --jail: /run/vmon/*)\n\x20   --restore <dir>     Restore a snapshot directory \
+		 instead of booting\n\x20   --fork-from <dir>   Fork (CoW) from a template snapshot \
+		 directory\n\x20   --count <n>         Number of children to spawn with --fork-from \
+		 (default 1)\n\x20   --disk-overlay-of <base>  Create a new no-overwrite CoW overlay at \
+		 --rootfs\n\x20   --console-agent     Attach a virtio-console agent channel \
+		 (/dev/hvc0)\n\x20   --agent-exec <cmd>  Send <cmd> to the guest agent after (warm) \
+		 boot\n\x20   --jail              Run inside Linux cgroup/namespace/pivot-root jail\n\x20   \
+		 --id <name>         VM/jail id (ASCII alnum, '-' or '_')\n\x20   --jail-root <dir>   Jail \
+		 root directory\n\x20   --cgroup-cpu-max <v> cgroup cpu.max value\n\x20   --cgroup-mem-max \
+		 <v> cgroup memory.max value\n\x20   --cgroup-pids-max <n> cgroup pids.max value\n\x20   \
+		 --cgroup-mode <m>   cgroup mode: v2|off (default: v2)\n\x20   --seccomp-action <a> seccomp \
+		 action: kill|errno|log (default: errno)\n\x20   --netns <path>      Operator-created \
+		 network namespace path\n\x20   --boot-mode <mode>  Boot mode: direct|uefi (default: \
+		 direct)\n\x20   --firmware <path>   UEFI firmware image for --boot-mode uefi\n\x20   \
+		 --log-format <fmt>  Log format: text|json (default: text)\n\x20   --log-level <level> Log \
+		 level filter (default: info)\n\x20   --sandbox           Apply the Linux process sandbox \
+		 (default: on)\n\x20   --no-sandbox        Disable the default sandbox (not valid with \
+		 --jail)\n\x20   --sandbox-uid <uid> UID drop target; required as root unless \
+		 --no-sandbox\n\x20   --sandbox-gid <gid> GID drop target; required as root unless \
+		 --no-sandbox\n\x20   -h, --help          Show this help"
+	);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+	use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+	use super::*;
 
-    struct TestDir {
-        path: PathBuf,
-    }
+	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
-    impl TestDir {
-        fn new() -> Self {
-            let unique = format!(
-                "vmon-config-test-{}-{}",
-                std::process::id(),
-                NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
-            );
-            let path = std::env::temp_dir().join(unique);
-            std::fs::create_dir(&path).expect("create temp config test dir");
-            Self { path }
-        }
+	struct TestDir {
+		path: PathBuf,
+	}
 
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
+	impl TestDir {
+		fn new() -> Self {
+			let unique = format!(
+				"vmon-config-test-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
+			);
+			let path = std::env::temp_dir().join(unique);
+			std::fs::create_dir(&path).expect("create temp config test dir");
+			Self { path }
+		}
 
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+		fn path(&self) -> &Path {
+			&self.path
+		}
+	}
 
-    fn parse_config(args: &[&str]) -> Result<Config> {
-        Config::from_iter(args.iter().copied())
-    }
+	impl Drop for TestDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.path);
+		}
+	}
 
-    fn config_err(args: &[&str]) -> String {
-        match parse_config(args) {
-            Ok(_) => panic!("expected config parse to fail"),
-            Err(e) => e.to_string(),
-        }
-    }
+	fn parse_config(args: &[&str]) -> Result<Config> {
+		Config::from_iter(args.iter().copied())
+	}
 
-    fn assert_config_err_contains(args: &[&str], expected: &str) {
-        let err = config_err(args);
-        assert!(
-            err.contains(expected),
-            "expected error containing {expected}, got {err}"
-        );
-    }
+	fn config_err(args: &[&str]) -> String {
+		match parse_config(args) {
+			Ok(_) => panic!("expected config parse to fail"),
+			Err(e) => e.to_string(),
+		}
+	}
 
-    #[test]
-    fn parses_arguments_from_iter_without_process_args() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "vmlinux",
-            "--mem",
-            "512",
-            "--cpus",
-            "2",
-            "--fs-tag",
-            "hostshare",
-            "--fs-dir",
-            "/srv/share",
-            "--agent-exec",
-            "id",
-        ])
-        .expect("parse config from iterator");
+	fn assert_config_err_contains(args: &[&str], expected: &str) {
+		let err = config_err(args);
+		assert!(err.contains(expected), "expected error containing {expected}, got {err}");
+	}
 
-        assert_eq!(cfg.mem_mib, 512);
-        assert_eq!(cfg.cpus, 2);
-        assert!(cfg.console_agent);
-        assert!(!cfg.mac_specified);
-        assert_eq!(cfg.fs_tag.as_deref(), Some("hostshare"));
-        assert_eq!(cfg.fs_dir.as_deref(), Some(Path::new("/srv/share")));
-    }
+	#[test]
+	fn parses_arguments_from_iter_without_process_args() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"vmlinux",
+			"--mem",
+			"512",
+			"--cpus",
+			"2",
+			"--fs-tag",
+			"hostshare",
+			"--fs-dir",
+			"/srv/share",
+			"--agent-exec",
+			"id",
+		])
+		.expect("parse config from iterator");
 
-    #[test]
-    fn defaults_platform_registry_fields() {
-        let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("defaults parse");
+		assert_eq!(cfg.mem_mib, 512);
+		assert_eq!(cfg.cpus, 2);
+		assert!(cfg.console_agent);
+		assert!(!cfg.mac_specified);
+		assert_eq!(cfg.fs_tag.as_deref(), Some("hostshare"));
+		assert_eq!(cfg.fs_dir.as_deref(), Some(Path::new("/srv/share")));
+	}
 
-        assert!(cfg.snapshot_root.is_none());
-        assert!(cfg.agent_sock.is_none());
-        assert!(!cfg.jail);
-        assert!(cfg.id.is_none());
-        assert!(cfg.jail_root.is_none());
-        assert!(cfg.cgroup_cpu_max.is_none());
-        assert!(cfg.cgroup_mem_max.is_none());
-        assert!(cfg.cgroup_pids_max.is_none());
-        assert_eq!(cfg.cgroup_mode, CgroupMode::V2);
-        assert_eq!(cfg.seccomp_action, SeccompAction::Errno);
-        assert!(cfg.netns.is_none());
-        assert!(!cfg.user_net);
-        assert_eq!(cfg.boot_mode, BootMode::Direct);
-        assert!(cfg.firmware.is_none());
-        assert_eq!(cfg.log_format, LogFormat::Text);
-        assert_eq!(cfg.log_level, "info");
-        assert!(!cfg.no_sandbox);
-        assert!(cfg.sandbox);
-    }
+	#[test]
+	fn defaults_platform_registry_fields() {
+		let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("defaults parse");
 
-    #[test]
-    fn parses_platform_registry_flags() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--snapshot-root",
-            "/var/lib/vmon/snaps",
-            "--agent-sock",
-            "/run/vmon/agent.sock",
-            "--jail",
-            "--id",
-            "vm-01_alpha",
-            "--jail-root",
-            "/srv/jailer/vm-01",
-            "--cgroup-cpu-max",
-            "100000 100000",
-            "--cgroup-mem-max",
-            "512M",
-            "--cgroup-pids-max",
-            "2048",
-            "--cgroup-mode",
-            "off",
-            "--seccomp-action",
-            "log",
-            "--netns",
-            "/run/netns/vm-01",
-            "--boot-mode",
-            "uefi",
-            "--firmware",
-            "/usr/share/OVMF/OVMF_CODE.fd",
-            "--log-format",
-            "json",
-            "--log-level",
-            "debug",
-        ])
-        .expect("platform registry flags parse");
+		assert!(cfg.snapshot_root.is_none());
+		assert!(cfg.agent_sock.is_none());
+		assert!(!cfg.jail);
+		assert!(cfg.id.is_none());
+		assert!(cfg.jail_root.is_none());
+		assert!(cfg.cgroup_cpu_max.is_none());
+		assert!(cfg.cgroup_mem_max.is_none());
+		assert!(cfg.cgroup_pids_max.is_none());
+		assert_eq!(cfg.cgroup_mode, CgroupMode::V2);
+		assert_eq!(cfg.seccomp_action, SeccompAction::Errno);
+		assert!(cfg.netns.is_none());
+		assert!(!cfg.user_net);
+		assert_eq!(cfg.boot_mode, BootMode::Direct);
+		assert!(cfg.firmware.is_none());
+		assert_eq!(cfg.log_format, LogFormat::Text);
+		assert_eq!(cfg.log_level, "info");
+		assert!(!cfg.no_sandbox);
+		assert!(cfg.sandbox);
+	}
 
-        assert_eq!(
-            cfg.snapshot_root.as_deref(),
-            Some(Path::new("/var/lib/vmon/snaps"))
-        );
-        assert_eq!(
-            cfg.agent_sock.as_deref(),
-            Some(Path::new("/run/vmon/agent.sock"))
-        );
-        assert!(cfg.console_agent);
-        assert!(cfg.jail);
-        assert_eq!(cfg.id.as_deref(), Some("vm-01_alpha"));
-        assert_eq!(
-            cfg.jail_root.as_deref(),
-            Some(Path::new("/srv/jailer/vm-01"))
-        );
-        assert_eq!(cfg.cgroup_cpu_max.as_deref(), Some("100000 100000"));
-        assert_eq!(cfg.cgroup_mem_max.as_deref(), Some("512M"));
-        assert_eq!(cfg.cgroup_pids_max, Some(2048));
-        assert_eq!(cfg.cgroup_mode, CgroupMode::Off);
-        assert_eq!(cfg.seccomp_action, SeccompAction::Log);
-        assert_eq!(cfg.netns.as_deref(), Some(Path::new("/run/netns/vm-01")));
-        assert_eq!(cfg.boot_mode, BootMode::Uefi);
-        assert_eq!(
-            cfg.firmware.as_deref(),
-            Some(Path::new("/usr/share/OVMF/OVMF_CODE.fd"))
-        );
-        assert_eq!(cfg.log_format, LogFormat::Json);
-        assert_eq!(cfg.log_level, "debug");
-        assert!(!cfg.no_sandbox);
+	#[test]
+	fn parses_platform_registry_flags() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--snapshot-root",
+			"/var/lib/vmon/snaps",
+			"--agent-sock",
+			"/run/vmon/agent.sock",
+			"--jail",
+			"--id",
+			"vm-01_alpha",
+			"--jail-root",
+			"/srv/jailer/vm-01",
+			"--cgroup-cpu-max",
+			"100000 100000",
+			"--cgroup-mem-max",
+			"512M",
+			"--cgroup-pids-max",
+			"2048",
+			"--cgroup-mode",
+			"off",
+			"--seccomp-action",
+			"log",
+			"--netns",
+			"/run/netns/vm-01",
+			"--boot-mode",
+			"uefi",
+			"--firmware",
+			"/usr/share/OVMF/OVMF_CODE.fd",
+			"--log-format",
+			"json",
+			"--log-level",
+			"debug",
+		])
+		.expect("platform registry flags parse");
 
-        // The sandbox is default-on; --no-sandbox opts out. The explicit
-        // --sandbox stays accepted (redundant) for back-compat.
-        let opt_out = parse_config(&["vmon", "--kernel", "k", "--no-sandbox"])
-            .expect("--no-sandbox opts out of the default sandbox");
-        assert!(opt_out.sandbox);
-        assert!(opt_out.no_sandbox);
-    }
+		assert_eq!(cfg.snapshot_root.as_deref(), Some(Path::new("/var/lib/vmon/snaps")));
+		assert_eq!(cfg.agent_sock.as_deref(), Some(Path::new("/run/vmon/agent.sock")));
+		assert!(cfg.console_agent);
+		assert!(cfg.jail);
+		assert_eq!(cfg.id.as_deref(), Some("vm-01_alpha"));
+		assert_eq!(cfg.jail_root.as_deref(), Some(Path::new("/srv/jailer/vm-01")));
+		assert_eq!(cfg.cgroup_cpu_max.as_deref(), Some("100000 100000"));
+		assert_eq!(cfg.cgroup_mem_max.as_deref(), Some("512M"));
+		assert_eq!(cfg.cgroup_pids_max, Some(2048));
+		assert_eq!(cfg.cgroup_mode, CgroupMode::Off);
+		assert_eq!(cfg.seccomp_action, SeccompAction::Log);
+		assert_eq!(cfg.netns.as_deref(), Some(Path::new("/run/netns/vm-01")));
+		assert_eq!(cfg.boot_mode, BootMode::Uefi);
+		assert_eq!(cfg.firmware.as_deref(), Some(Path::new("/usr/share/OVMF/OVMF_CODE.fd")));
+		assert_eq!(cfg.log_format, LogFormat::Json);
+		assert_eq!(cfg.log_level, "debug");
+		assert!(!cfg.no_sandbox);
 
-    #[test]
-    fn rejects_invalid_platform_enum_values() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--cgroup-mode", "v1"],
-            "invalid --cgroup-mode",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--seccomp-action", "trace"],
-            "invalid --seccomp-action",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--boot-mode", "bios"],
-            "invalid --boot-mode",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--log-format", "yaml"],
-            "invalid --log-format",
-        );
-    }
+		// The sandbox is default-on; --no-sandbox opts out. The explicit
+		// --sandbox stays accepted (redundant) for back-compat.
+		let opt_out = parse_config(&["vmon", "--kernel", "k", "--no-sandbox"])
+			.expect("--no-sandbox opts out of the default sandbox");
+		assert!(opt_out.sandbox);
+		assert!(opt_out.no_sandbox);
+	}
 
-    #[test]
-    fn validates_platform_boot_and_id_flags() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--boot-mode", "uefi"],
-            "requires --firmware",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--firmware", "OVMF.fd"],
-            "--firmware requires --boot-mode uefi",
-        );
-        let cfg = parse_config(&["vmon", "--boot-mode", "uefi", "--firmware", "OVMF.fd"])
-            .expect("UEFI boot does not require --kernel");
-        assert_eq!(cfg.boot_mode, BootMode::Uefi);
-        assert_eq!(cfg.firmware.as_deref(), Some(Path::new("OVMF.fd")));
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--id", ""], "--id");
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--id", "bad.name"], "--id");
-        let long_id = "a".repeat(65);
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--id", long_id.as_str()], "--id");
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--jail",
-                "--agent-sock",
-                "/tmp/agent.sock",
-            ],
-            "--agent-sock must be inside /run/vmon",
-        );
-    }
+	#[test]
+	fn rejects_invalid_platform_enum_values() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--cgroup-mode", "v1"],
+			"invalid --cgroup-mode",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--seccomp-action", "trace"],
+			"invalid --seccomp-action",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--boot-mode", "bios"],
+			"invalid --boot-mode",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--log-format", "yaml"],
+			"invalid --log-format",
+		);
+	}
 
-    #[test]
-    fn enforces_resource_bounds() {
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--count", "0"], "--count");
-        let too_many_count = (MAX_COUNT + 1).to_string();
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--count", too_many_count.as_str()],
-            "--count",
-        );
+	#[test]
+	fn validates_platform_boot_and_id_flags() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--boot-mode", "uefi"],
+			"requires --firmware",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--firmware", "OVMF.fd"],
+			"--firmware requires --boot-mode uefi",
+		);
+		let cfg = parse_config(&["vmon", "--boot-mode", "uefi", "--firmware", "OVMF.fd"])
+			.expect("UEFI boot does not require --kernel");
+		assert_eq!(cfg.boot_mode, BootMode::Uefi);
+		assert_eq!(cfg.firmware.as_deref(), Some(Path::new("OVMF.fd")));
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--id", ""], "--id");
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--id", "bad.name"], "--id");
+		let long_id = "a".repeat(65);
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--id", long_id.as_str()], "--id");
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--jail", "--agent-sock", "/tmp/agent.sock"],
+			"--agent-sock must be inside /run/vmon",
+		);
+	}
 
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--cpus", "0"], "--cpus");
-        let too_many_cpus = (u16::from(MAX_CPUS) + 1).to_string();
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--cpus", too_many_cpus.as_str()],
-            "--cpus",
-        );
+	#[test]
+	fn enforces_resource_bounds() {
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--count", "0"], "--count");
+		let too_many_count = (MAX_COUNT + 1).to_string();
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--count", too_many_count.as_str()],
+			"--count",
+		);
 
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--mem", "0"], "--mem");
-        let too_much_mem = (MAX_MEM_MIB + 1).to_string();
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--mem", too_much_mem.as_str()],
-            "--mem",
-        );
-    }
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--cpus", "0"], "--cpus");
+		let too_many_cpus = (u16::from(MAX_CPUS) + 1).to_string();
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--cpus", too_many_cpus.as_str()],
+			"--cpus",
+		);
 
-    #[test]
-    fn requires_fs_tag_and_dir_to_be_paired() {
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-tag", "host"], "--fs-tag");
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-dir", "/srv"], "--fs-tag");
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--mem", "0"], "--mem");
+		let too_much_mem = (MAX_MEM_MIB + 1).to_string();
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--mem", too_much_mem.as_str()],
+			"--mem",
+		);
+	}
 
-        let cfg = parse_config(&[
-            "vmon", "--kernel", "k", "--fs-tag", "host", "--fs-dir", "/srv",
-        ])
-        .expect("paired virtio-fs flags parse");
-        assert_eq!(cfg.fs_tag.as_deref(), Some("host"));
-        assert_eq!(cfg.fs_dir.as_deref(), Some(Path::new("/srv")));
-    }
+	#[test]
+	fn requires_fs_tag_and_dir_to_be_paired() {
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-tag", "host"], "--fs-tag");
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--fs-dir", "/srv"], "--fs-tag");
 
-    #[test]
-    fn rejects_invalid_transport_value() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--transport", "sbus"],
-            "invalid --transport",
-        );
-    }
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--fs-tag", "host", "--fs-dir", "/srv"])
+			.expect("paired virtio-fs flags parse");
+		assert_eq!(cfg.fs_tag.as_deref(), Some("host"));
+		assert_eq!(cfg.fs_dir.as_deref(), Some(Path::new("/srv")));
+	}
 
-    #[test]
-    fn rejects_invalid_net_value() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--net", "bridge"],
-            "invalid --net",
-        );
-    }
+	#[test]
+	fn rejects_invalid_transport_value() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--transport", "sbus"],
+			"invalid --transport",
+		);
+	}
 
-    #[test]
-    fn rejects_user_net_with_tap() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--net", "user", "--tap", "tap0"],
-            "cannot be combined",
-        );
-    }
+	#[test]
+	fn rejects_invalid_net_value() {
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "bridge"], "invalid --net");
+	}
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn accepts_user_net_on_macos() {
-        let cfg = parse_config(&["vmon", "--kernel", "k", "--net", "user"])
-            .expect("--net user parses on macOS");
-        assert!(cfg.user_net);
-        assert!(cfg.tap.is_none());
-    }
+	#[test]
+	fn rejects_user_net_with_tap() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--net", "user", "--tap", "tap0"],
+			"cannot be combined",
+		);
+	}
 
-    #[test]
-    fn marks_explicit_mac_override() {
-        let cfg = parse_config(&["vmon", "--kernel", "k", "--mac", "02:00:00:00:00:2a"])
-            .expect("explicit --mac parses");
-        assert!(cfg.mac_specified);
-        assert_eq!(cfg.mac, [0x02, 0x00, 0x00, 0x00, 0x00, 0x2a]);
-    }
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn accepts_user_net_on_macos() {
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--net", "user"])
+			.expect("--net user parses on macOS");
+		assert!(cfg.user_net);
+		assert!(cfg.tap.is_none());
+	}
 
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn rejects_user_net_off_macos() {
-        assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "user"], "only on macOS");
-    }
+	#[test]
+	fn marks_explicit_mac_override() {
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--mac", "02:00:00:00:00:2a"])
+			.expect("explicit --mac parses");
+		assert!(cfg.mac_specified);
+		assert_eq!(cfg.mac, [0x02, 0x00, 0x00, 0x00, 0x00, 0x2a]);
+	}
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn accepts_pci_transport_on_x86_64() {
-        let cfg = parse_config(&["vmon", "--kernel", "k", "--transport", "pci"])
-            .expect("pci transport parses on x86_64");
-        assert!(matches!(cfg.transport, Transport::Pci));
-    }
+	#[cfg(not(target_os = "macos"))]
+	#[test]
+	fn rejects_user_net_off_macos() {
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "user"], "only on macOS");
+	}
 
-    #[cfg(not(target_arch = "x86_64"))]
-    #[test]
-    fn rejects_pci_transport_off_x86_64() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--transport", "pci"],
-            "only supported on x86_64",
-        );
-    }
+	#[cfg(target_arch = "x86_64")]
+	#[test]
+	fn accepts_pci_transport_on_x86_64() {
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--transport", "pci"])
+			.expect("pci transport parses on x86_64");
+		assert!(matches!(cfg.transport, Transport::Pci));
+	}
 
-    #[test]
-    fn netns_requires_jail_validation() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--netns", "/run/netns/x"],
-            "--netns requires --jail",
-        );
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--netns",
-            "/run/netns/x",
-            "--jail",
-            "--jail-root",
-            "/srv/jailer/vm-01",
-            "--id",
-            "vm-01",
-        ])
-        .expect("netns with jail works");
-        assert_eq!(
-            cfg.netns.as_deref(),
-            Some(std::path::Path::new("/run/netns/x"))
-        );
-        assert!(cfg.jail);
-    }
-    #[test]
-    fn rejects_sandbox_identity_when_disabled() {
-        // The sandbox is default-on, so identity flags only error when the
-        // sandbox is explicitly disabled (--no-sandbox) and --jail is unset.
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--no-sandbox",
-                "--sandbox-uid",
-                "1000",
-            ],
-            "require the sandbox",
-        );
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--no-sandbox",
-                "--sandbox-gid",
-                "1000",
-            ],
-            "require the sandbox",
-        );
-    }
+	#[cfg(not(target_arch = "x86_64"))]
+	#[test]
+	fn rejects_pci_transport_off_x86_64() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--transport", "pci"],
+			"only supported on x86_64",
+		);
+	}
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parses_explicit_sandbox_identity_when_enabled() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--sandbox",
-            "--sandbox-uid",
-            "1000",
-            "--sandbox-gid",
-            "1001",
-        ])
-        .expect("explicit sandbox identity parses on Linux");
+	#[test]
+	fn netns_requires_jail_validation() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--netns", "/run/netns/x"],
+			"--netns requires --jail",
+		);
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--netns",
+			"/run/netns/x",
+			"--jail",
+			"--jail-root",
+			"/srv/jailer/vm-01",
+			"--id",
+			"vm-01",
+		])
+		.expect("netns with jail works");
+		assert_eq!(cfg.netns.as_deref(), Some(std::path::Path::new("/run/netns/x")));
+		assert!(cfg.jail);
+	}
+	#[test]
+	fn rejects_sandbox_identity_when_disabled() {
+		// The sandbox is default-on, so identity flags only error when the
+		// sandbox is explicitly disabled (--no-sandbox) and --jail is unset.
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-uid", "1000"],
+			"require the sandbox",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-gid", "1000"],
+			"require the sandbox",
+		);
+	}
 
-        assert!(cfg.sandbox);
-        assert_eq!(cfg.sandbox_uid, Some(1000));
-        assert_eq!(cfg.sandbox_gid, Some(1001));
-    }
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn parses_explicit_sandbox_identity_when_enabled() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--sandbox",
+			"--sandbox-uid",
+			"1000",
+			"--sandbox-gid",
+			"1001",
+		])
+		.expect("explicit sandbox identity parses on Linux");
 
-    #[test]
-    fn parses_explicit_sandbox_identity_for_jail() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--jail",
-            "--id",
-            "vm1",
-            "--sandbox-uid",
-            "1000",
-            "--sandbox-gid",
-            "1001",
-        ])
-        .expect("explicit jail sandbox identity parses");
+		assert!(cfg.sandbox);
+		assert_eq!(cfg.sandbox_uid, Some(1000));
+		assert_eq!(cfg.sandbox_gid, Some(1001));
+	}
 
-        assert!(cfg.jail);
-        assert_eq!(cfg.sandbox_uid, Some(1000));
-        assert_eq!(cfg.sandbox_gid, Some(1001));
-    }
+	#[test]
+	fn parses_explicit_sandbox_identity_for_jail() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--jail",
+			"--id",
+			"vm1",
+			"--sandbox-uid",
+			"1000",
+			"--sandbox-gid",
+			"1001",
+		])
+		.expect("explicit jail sandbox identity parses");
 
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn sandbox_defaults_on_and_opts_out_on_non_linux() {
-        // Filters are default-on and config parsing is host-agnostic, so a
-        // non-Linux host parses the default and honors the opt-out.
-        let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("default config parses");
-        assert!(cfg.sandbox);
-        assert!(!cfg.no_sandbox);
+		assert!(cfg.jail);
+		assert_eq!(cfg.sandbox_uid, Some(1000));
+		assert_eq!(cfg.sandbox_gid, Some(1001));
+	}
 
-        let opt_out =
-            parse_config(&["vmon", "--kernel", "k", "--no-sandbox"]).expect("--no-sandbox parses");
-        assert!(opt_out.no_sandbox);
-    }
+	#[cfg(not(target_os = "linux"))]
+	#[test]
+	fn sandbox_defaults_on_and_opts_out_on_non_linux() {
+		// Filters are default-on and config parsing is host-agnostic, so a
+		// non-Linux host parses the default and honors the opt-out.
+		let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("default config parses");
+		assert!(cfg.sandbox);
+		assert!(!cfg.no_sandbox);
 
-    #[test]
-    fn rejects_existing_overlay_destination_from_args() {
-        let tmp = TestDir::new();
-        let base = tmp.path().join("base.img");
-        let dest = tmp.path().join("overlay.img");
-        std::fs::write(&base, b"base").expect("write base disk");
-        std::fs::write(&dest, b"existing").expect("write existing overlay");
+		let opt_out =
+			parse_config(&["vmon", "--kernel", "k", "--no-sandbox"]).expect("--no-sandbox parses");
+		assert!(opt_out.no_sandbox);
+	}
 
-        let err = config_err(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--rootfs",
-            dest.to_str().expect("utf-8 temp path"),
-            "--disk-overlay-of",
-            base.to_str().expect("utf-8 temp path"),
-        ]);
-        assert!(err.contains("already exists"), "unexpected error: {err}");
-    }
+	#[test]
+	fn rejects_existing_overlay_destination_from_args() {
+		let tmp = TestDir::new();
+		let base = tmp.path().join("base.img");
+		let dest = tmp.path().join("overlay.img");
+		std::fs::write(&base, b"base").expect("write base disk");
+		std::fs::write(&dest, b"existing").expect("write existing overlay");
 
-    #[cfg(unix)]
-    #[test]
-    fn rejects_overlay_base_symlink_from_args() {
-        use std::os::unix::fs::symlink;
+		let err = config_err(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--rootfs",
+			dest.to_str().expect("utf-8 temp path"),
+			"--disk-overlay-of",
+			base.to_str().expect("utf-8 temp path"),
+		]);
+		assert!(err.contains("already exists"), "unexpected error: {err}");
+	}
 
-        let tmp = TestDir::new();
-        let real_base = tmp.path().join("base.img");
-        let link_base = tmp.path().join("base-link.img");
-        let dest = tmp.path().join("overlay.img");
-        std::fs::write(&real_base, b"base").expect("write base disk");
-        symlink(&real_base, &link_base).expect("create base symlink");
+	#[cfg(unix)]
+	#[test]
+	fn rejects_overlay_base_symlink_from_args() {
+		use std::os::unix::fs::symlink;
 
-        let err = config_err(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--rootfs",
-            dest.to_str().expect("utf-8 temp path"),
-            "--disk-overlay-of",
-            link_base.to_str().expect("utf-8 temp path"),
-        ]);
-        assert!(err.contains("symlink"), "unexpected error: {err}");
-    }
+		let tmp = TestDir::new();
+		let real_base = tmp.path().join("base.img");
+		let link_base = tmp.path().join("base-link.img");
+		let dest = tmp.path().join("overlay.img");
+		std::fs::write(&real_base, b"base").expect("write base disk");
+		symlink(&real_base, &link_base).expect("create base symlink");
 
-    #[test]
-    fn timeout_secs_parses_and_validates_range() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--timeout-secs", "0"],
-            "--timeout-secs must be between 1 and 86400",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--timeout-secs", "86401"],
-            "--timeout-secs must be between 1 and 86400",
-        );
-        let cfg = parse_config(&["vmon", "--kernel", "k", "--timeout-secs", "120"])
-            .expect("valid --timeout-secs parses");
-        assert_eq!(cfg.timeout_secs, Some(120));
-    }
+		let err = config_err(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--rootfs",
+			dest.to_str().expect("utf-8 temp path"),
+			"--disk-overlay-of",
+			link_base.to_str().expect("utf-8 temp path"),
+		]);
+		assert!(err.contains("symlink"), "unexpected error: {err}");
+	}
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pager_flags_parse_and_validate() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--no-sandbox",
-            "--mem",
-            "256",
-            "--mem-target-mib",
-            "128",
-            "--zram-store-max-mib",
-            "32",
-            "--zram-swap-file",
-            "/tmp/vmon.swap",
-            "--ksm",
-        ])
-        .expect("pager flags parse");
-        assert_eq!(cfg.mem_target_mib, Some(128));
-        assert_eq!(cfg.zram_store_max_mib, Some(32));
-        assert_eq!(
-            cfg.zram_swap_file.as_deref(),
-            Some(Path::new("/tmp/vmon.swap"))
-        );
-        assert!(cfg.ksm);
-    }
+	#[test]
+	fn timeout_secs_parses_and_validates_range() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--timeout-secs", "0"],
+			"--timeout-secs must be between 1 and 86400",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--timeout-secs", "86401"],
+			"--timeout-secs must be between 1 and 86400",
+		);
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--timeout-secs", "120"])
+			.expect("valid --timeout-secs parses");
+		assert_eq!(cfg.timeout_secs, Some(120));
+	}
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pager_flags_reject_invalid_combinations() {
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--mem",
-                "256",
-                "--mem-target-mib",
-                "256",
-            ],
-            "--mem-target-mib must be between 1 and 255",
-        );
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--zram-store-max-mib", "64"],
-            "--zram-store-max-mib/--zram-swap-file require --mem-target-mib",
-        );
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--mem-target-mib",
-                "128",
-                "--fork-from",
-                "snapshot",
-            ],
-            "--mem-target-mib is not supported with --fork-from",
-        );
-    }
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn pager_flags_parse_and_validate() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--no-sandbox",
+			"--mem",
+			"256",
+			"--mem-target-mib",
+			"128",
+			"--zram-store-max-mib",
+			"32",
+			"--zram-swap-file",
+			"/tmp/vmon.swap",
+			"--ksm",
+		])
+		.expect("pager flags parse");
+		assert_eq!(cfg.mem_target_mib, Some(128));
+		assert_eq!(cfg.zram_store_max_mib, Some(32));
+		assert_eq!(cfg.zram_swap_file.as_deref(), Some(Path::new("/tmp/vmon.swap")));
+		assert!(cfg.ksm);
+	}
 
-    #[test]
-    fn parses_volume_mounts() {
-        let cfg = parse_config(&[
-            "vmon",
-            "--kernel",
-            "k",
-            "--volume",
-            "data:/srv/d",
-            "--volume",
-            "cache:/srv/c:ro",
-        ])
-        .expect("volume mounts parse");
-        assert_eq!(cfg.volumes.len(), 2);
-        assert_eq!(cfg.volumes[0].tag, "data");
-        assert_eq!(cfg.volumes[0].dir, Path::new("/srv/d"));
-        assert!(!cfg.volumes[0].read_only);
-        assert_eq!(cfg.volumes[1].tag, "cache");
-        assert_eq!(cfg.volumes[1].dir, Path::new("/srv/c"));
-        assert!(cfg.volumes[1].read_only);
-    }
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn pager_flags_reject_invalid_combinations() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--mem", "256", "--mem-target-mib", "256"],
+			"--mem-target-mib must be between 1 and 255",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--zram-store-max-mib", "64"],
+			"--zram-store-max-mib/--zram-swap-file require --mem-target-mib",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--mem-target-mib", "128", "--fork-from", "snapshot"],
+			"--mem-target-mib is not supported with --fork-from",
+		);
+	}
 
-    #[test]
-    fn rejects_too_many_volumes() {
-        let specs: Vec<String> = (0..9).map(|i| format!("v{i}:/srv/{i}")).collect();
-        let mut args = vec!["vmon", "--kernel", "k"];
-        for spec in &specs {
-            args.push("--volume");
-            args.push(spec.as_str());
-        }
-        assert_config_err_contains(&args, "at most 8 --volume mounts");
-    }
+	#[test]
+	fn parses_volume_mounts() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--volume",
+			"data:/srv/d",
+			"--volume",
+			"cache:/srv/c:ro",
+		])
+		.expect("volume mounts parse");
+		assert_eq!(cfg.volumes.len(), 2);
+		assert_eq!(cfg.volumes[0].tag, "data");
+		assert_eq!(cfg.volumes[0].dir, Path::new("/srv/d"));
+		assert!(!cfg.volumes[0].read_only);
+		assert_eq!(cfg.volumes[1].tag, "cache");
+		assert_eq!(cfg.volumes[1].dir, Path::new("/srv/c"));
+		assert!(cfg.volumes[1].read_only);
+	}
 
-    #[test]
-    fn rejects_invalid_volume_tag() {
-        assert_config_err_contains(
-            &["vmon", "--kernel", "k", "--volume", "Bad-Tag:/srv/d"],
-            "must match [a-z0-9_]",
-        );
-    }
+	#[test]
+	fn rejects_too_many_volumes() {
+		let specs: Vec<String> = (0..9).map(|i| format!("v{i}:/srv/{i}")).collect();
+		let mut args = vec!["vmon", "--kernel", "k"];
+		for spec in &specs {
+			args.push("--volume");
+			args.push(spec.as_str());
+		}
+		assert_config_err_contains(&args, "at most 8 --volume mounts");
+	}
 
-    #[test]
-    fn rejects_duplicate_volume_tags() {
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--volume",
-                "data:/srv/a",
-                "--volume",
-                "data:/srv/b",
-            ],
-            "--volume tags must be unique",
-        );
-        assert_config_err_contains(
-            &[
-                "vmon",
-                "--kernel",
-                "k",
-                "--fs-tag",
-                "shared",
-                "--fs-dir",
-                "/srv/s",
-                "--volume",
-                "shared:/srv/d",
-            ],
-            "--volume tags must be unique",
-        );
-    }
+	#[test]
+	fn rejects_invalid_volume_tag() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--volume", "Bad-Tag:/srv/d"],
+			"must match [a-z0-9_]",
+		);
+	}
+
+	#[test]
+	fn rejects_duplicate_volume_tags() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--volume", "data:/srv/a", "--volume", "data:/srv/b"],
+			"--volume tags must be unique",
+		);
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--fs-tag",
+				"shared",
+				"--fs-dir",
+				"/srv/s",
+				"--volume",
+				"shared:/srv/d",
+			],
+			"--volume tags must be unique",
+		);
+	}
 }

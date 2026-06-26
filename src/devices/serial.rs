@@ -6,76 +6,79 @@
 
 use std::io::{self, Write};
 
-use vm_superio::Serial;
-use vm_superio::serial::{NoEvents, SerialState};
+use vm_superio::{
+	Serial,
+	serial::{NoEvents, SerialState},
+};
 
-use crate::devices::BusDevice;
-use crate::hv::IrqLine;
-use crate::result::{Result, err};
+use crate::{
+	devices::BusDevice,
+	hv::IrqLine,
+	result::{Result, err},
+};
 
 /// Unbuffered writer to the host stdout file descriptor.
 struct ConsoleOut;
 
 impl Write for ConsoleOut {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // SAFETY: writing a valid byte slice to a valid fd.
-        let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		// SAFETY: writing a valid byte slice to a valid fd.
+		let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
+		if n < 0 {
+			Err(io::Error::last_os_error())
+		} else {
+			Ok(n as usize)
+		}
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 /// A COM port exposed on the port-IO bus.
 pub struct SerialDevice {
-    inner: Serial<IrqLine, NoEvents, ConsoleOut>,
+	inner: Serial<IrqLine, NoEvents, ConsoleOut>,
 }
 
 impl SerialDevice {
-    /// Create a serial device that raises the supplied guest IRQ line.
-    pub fn new(interrupt: IrqLine) -> Self {
-        Self {
-            inner: Serial::new(interrupt, ConsoleOut),
-        }
-    }
+	/// Create a serial device that raises the supplied guest IRQ line.
+	pub fn new(interrupt: IrqLine) -> Self {
+		Self { inner: Serial::new(interrupt, ConsoleOut) }
+	}
 
-    /// Restore a serial device from state using the supplied guest IRQ line.
-    pub fn from_state(interrupt: IrqLine, state: &SerialState) -> Result<Self> {
-        let inner = Serial::from_state(state, interrupt, NoEvents, ConsoleOut)
-            .map_err(|e| err(format!("restoring serial state: {e}")))?;
-        Ok(Self { inner })
-    }
+	/// Restore a serial device from state using the supplied guest IRQ line.
+	pub fn from_state(interrupt: IrqLine, state: &SerialState) -> Result<Self> {
+		let inner = Serial::from_state(state, interrupt, NoEvents, ConsoleOut)
+			.map_err(|e| err(format!("restoring serial state: {e}")))?;
+		Ok(Self { inner })
+	}
 
-    /// Snapshot the serial device registers and FIFOs.
-    pub fn state(&self) -> SerialState {
-        self.inner.state()
-    }
+	/// Snapshot the serial device registers and FIFOs.
+	pub fn state(&self) -> SerialState {
+		self.inner.state()
+	}
 
-    /// Feed host input bytes into the receive FIFO (raising RX interrupts).
-    pub fn enqueue(&mut self, bytes: &[u8]) {
-        let cap = self.inner.fifo_capacity();
-        let n = bytes.len().min(cap);
-        if n > 0 {
-            let _ = self.inner.enqueue_raw_bytes(&bytes[..n]);
-        }
-    }
+	/// Feed host input bytes into the receive FIFO (raising RX interrupts).
+	pub fn enqueue(&mut self, bytes: &[u8]) {
+		let cap = self.inner.fifo_capacity();
+		let n = bytes.len().min(cap);
+		if n > 0 {
+			let _ = self.inner.enqueue_raw_bytes(&bytes[..n]);
+		}
+	}
 }
 
 impl BusDevice for SerialDevice {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        if let Some(b) = data.first_mut() {
-            *b = self.inner.read(offset as u8);
-        }
-    }
+	fn read(&mut self, offset: u64, data: &mut [u8]) {
+		if let Some(b) = data.first_mut() {
+			*b = self.inner.read(offset as u8);
+		}
+	}
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        if let Some(b) = data.first() {
-            let _ = self.inner.write(offset as u8, *b);
-        }
-    }
+	fn write(&mut self, offset: u64, data: &[u8]) {
+		if let Some(b) = data.first() {
+			let _ = self.inner.write(offset as u8, *b);
+		}
+	}
 }

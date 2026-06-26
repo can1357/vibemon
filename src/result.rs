@@ -13,7 +13,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Build a boxed error from anything that is `Display` (typically a string).
 pub fn err<S: Into<String>>(msg: S) -> Error {
-    Error::from(msg.into())
+	Error::from(msg.into())
 }
 
 /// Convenience: `bail!("something {x}")` returns early with a formatted error.

@@ -542,7 +542,7 @@ fn drain_backend(backend: &mut Backend) {
 	let mut scratch = [0u8; 2048];
 	loop {
 		match backend.read(&mut scratch) {
-			Ok(n) if n > 0 => continue,
+			Ok(n) if n > 0 => {},
 			_ => break,
 		}
 	}

@@ -1,8 +1,6 @@
 //! Guest RAM allocation.
 
-use std::fs::File;
-use std::io;
-use std::os::unix::io::AsRawFd;
+use std::{fs::File, io, os::unix::io::AsRawFd};
 
 use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap as VmGuestMemoryMmap};
 
@@ -15,141 +13,140 @@ pub type GuestMemoryMmap = VmGuestMemoryMmap<()>;
 /// below the 32-bit MMIO gap at GPA 0, the remainder relocated above 4 GiB.
 #[cfg(target_arch = "x86_64")]
 pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
-    use crate::layout::{FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
-    let size = size as u64;
-    if size <= MMIO_MEM_START {
-        vec![(GuestAddress(0), size as usize)]
-    } else {
-        vec![
-            (GuestAddress(0), MMIO_MEM_START as usize),
-            (
-                GuestAddress(FIRST_ADDR_PAST_32BITS),
-                (size - MMIO_MEM_START) as usize,
-            ),
-        ]
-    }
+	use crate::layout::{FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
+	let size = size as u64;
+	if size <= MMIO_MEM_START {
+		vec![(GuestAddress(0), size as usize)]
+	} else {
+		vec![
+			(GuestAddress(0), MMIO_MEM_START as usize),
+			(GuestAddress(FIRST_ADDR_PAST_32BITS), (size - MMIO_MEM_START) as usize),
+		]
+	}
 }
 
 /// On aarch64, guest RAM is a single region at the DRAM base (2 GiB); the MMIO
 /// devices and GIC live below it.
 #[cfg(target_arch = "aarch64")]
 pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
-    vec![(GuestAddress(crate::layout::DRAM_BASE), size)]
+	vec![(GuestAddress(crate::layout::DRAM_BASE), size)]
 }
 
 /// Allocate guest RAM of `size` bytes as file-backed, `MAP_SHARED` regions so
 /// snapshots can copy RAM and `CoW` forks can remap the snapshot privately.
 pub fn create_guest_memory(size: usize) -> Result<GuestMemoryMmap> {
-    let regions = arrange_memory(size);
-    let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
-        Vec::with_capacity(regions.len());
-    for (addr, len) in regions {
-        let file = create_shared_memory_file(len)?;
-        ranges.push((addr, len, Some(FileOffset::new(file, 0))));
-    }
-    Ok(GuestMemoryMmap::from_ranges_with_files(ranges)?)
+	let regions = arrange_memory(size);
+	let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
+		Vec::with_capacity(regions.len());
+	for (addr, len) in regions {
+		let file = create_shared_memory_file(len)?;
+		ranges.push((addr, len, Some(FileOffset::new(file, 0))));
+	}
+	Ok(GuestMemoryMmap::from_ranges_with_files(ranges)?)
 }
 
 /// Create the platform RAM backing file used by the shared guest mappings.
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::*;
-    use std::os::unix::io::FromRawFd;
+	use std::os::unix::io::FromRawFd;
 
-    pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
-        create_memfd(len)
-    }
+	use super::*;
 
-    /// Create an anonymous memfd of exactly `len` bytes, returned as an owned `File`.
-    ///
-    /// The fd is `MFD_CLOEXEC` and sized with `ftruncate`. Mapping it with a
-    /// `FileOffset` (via `from_ranges_with_files`) yields a shared, file-backed
-    /// region, so guest and VMM writes land in the same backing object.
-    fn create_memfd(len: usize) -> Result<File> {
-        // SAFETY: name is a valid NUL-terminated C string; flags are valid.
-        let fd = unsafe { libc::memfd_create(c"vmon-ram".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: fd was just created and is exclusively owned here.
-        let file = unsafe { File::from_raw_fd(fd) };
-        size_file(&file, len)?;
-        Ok(file)
-    }
+	pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
+		create_memfd(len)
+	}
 
-    pub(super) fn private_mmap_flags() -> libc::c_int {
-        libc::MAP_NORESERVE | libc::MAP_PRIVATE
-    }
+	/// Create an anonymous memfd of exactly `len` bytes, returned as an owned
+	/// `File`.
+	///
+	/// The fd is `MFD_CLOEXEC` and sized with `ftruncate`. Mapping it with a
+	/// `FileOffset` (via `from_ranges_with_files`) yields a shared, file-backed
+	/// region, so guest and VMM writes land in the same backing object.
+	fn create_memfd(len: usize) -> Result<File> {
+		// SAFETY: name is a valid NUL-terminated C string; flags are valid.
+		let fd = unsafe { libc::memfd_create(c"vmon-ram".as_ptr(), libc::MFD_CLOEXEC) };
+		if fd < 0 {
+			return Err(io::Error::last_os_error().into());
+		}
+		// SAFETY: fd was just created and is exclusively owned here.
+		let file = unsafe { File::from_raw_fd(fd) };
+		size_file(&file, len)?;
+		Ok(file)
+	}
 
-    /// Hint the host KSM daemon to dedup identical anonymous/COW pages in guest RAM
-    /// across co-resident guests. No-op unless the operator enabled KSM
-    /// (/sys/kernel/mm/ksm/run). Only anonymous pages are scanned, so this is
-    /// effective for MAP_PRIVATE fork clones' COWed pages; harmless on the shared memfd.
-    pub fn advise_mergeable(mem: &GuestMemoryMmap) {
-        use vm_memory::{GuestMemory, GuestMemoryRegion};
+	pub(super) fn private_mmap_flags() -> libc::c_int {
+		libc::MAP_NORESERVE | libc::MAP_PRIVATE
+	}
 
-        for region in mem.iter() {
-            let ptr = region.as_ptr() as *mut libc::c_void;
-            let len = region.len() as usize;
-            // SAFETY: ptr/len name a live mapping owned by `mem`.
-            if unsafe { libc::madvise(ptr, len, libc::MADV_MERGEABLE) } == 0 {
-                crate::metrics::record_ksm_region();
-            }
-        }
-    }
+	/// Hint the host KSM daemon to dedup identical anonymous/COW pages in guest
+	/// RAM across co-resident guests. No-op unless the operator enabled KSM
+	/// (/sys/kernel/mm/ksm/run). Only anonymous pages are scanned, so this is
+	/// effective for MAP_PRIVATE fork clones' COWed pages; harmless on the
+	/// shared memfd.
+	pub fn advise_mergeable(mem: &GuestMemoryMmap) {
+		use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+		for region in mem.iter() {
+			let ptr = region.as_ptr() as *mut libc::c_void;
+			let len = region.len() as usize;
+			// SAFETY: ptr/len name a live mapping owned by `mem`.
+			if unsafe { libc::madvise(ptr, len, libc::MADV_MERGEABLE) } == 0 {
+				crate::metrics::record_ksm_region();
+			}
+		}
+	}
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::*;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
+	use std::{
+		os::unix::fs::OpenOptionsExt,
+		sync::atomic::{AtomicU64, Ordering},
+	};
 
-    /// Create an unlinked temporary file for macOS shared guest RAM mappings.
-    pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
-        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+	use super::*;
 
-        let tmpdir = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
-        for _ in 0..128 {
-            let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-            let path = tmpdir.join(format!("vmon-ram-{}-{id}", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => {
-                    let _ = std::fs::remove_file(&path);
-                    size_file(&file, len)?;
-                    return Ok(file);
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(crate::result::err(format!(
-                        "creating RAM backing {path:?}: {e}"
-                    )));
-                }
-            }
-        }
-        Err(crate::result::err(
-            "creating unique RAM backing file in TMPDIR",
-        ))
-    }
+	/// Create an unlinked temporary file for macOS shared guest RAM mappings.
+	pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
+		static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) const fn private_mmap_flags() -> libc::c_int {
-        libc::MAP_PRIVATE
-    }
+		let tmpdir =
+			std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+		for _ in 0..128 {
+			let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+			let path = tmpdir.join(format!("vmon-ram-{}-{id}", std::process::id()));
+			match std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create_new(true)
+				.mode(0o600)
+				.open(&path)
+			{
+				Ok(file) => {
+					let _ = std::fs::remove_file(&path);
+					size_file(&file, len)?;
+					return Ok(file);
+				},
+				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
+				Err(e) => {
+					return Err(crate::result::err(format!("creating RAM backing {}: {e}", path.display())));
+				},
+			}
+		}
+		Err(crate::result::err("creating unique RAM backing file in TMPDIR"))
+	}
 
-    pub const fn advise_mergeable(_mem: &GuestMemoryMmap) {}
+	pub(super) const fn private_mmap_flags() -> libc::c_int {
+		libc::MAP_PRIVATE
+	}
+
+	pub const fn advise_mergeable(_mem: &GuestMemoryMmap) {}
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::advise_mergeable;
 #[cfg(target_os = "linux")]
 use linux::{create_shared_memory_file, private_mmap_flags};
-
 #[cfg(target_os = "macos")]
 pub use macos::advise_mergeable;
 #[cfg(target_os = "macos")]
@@ -157,87 +154,84 @@ use macos::{create_shared_memory_file, private_mmap_flags};
 
 /// Resize a backing file to exactly `len` bytes.
 fn size_file(file: &File, len: usize) -> Result<()> {
-    // SAFETY: fd is valid; sizing the file to `len` bytes.
-    let ret = unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
+	// SAFETY: fd is valid; sizing the file to `len` bytes.
+	let ret = unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) };
+	if ret < 0 {
+		return Err(io::Error::last_os_error().into());
+	}
+	Ok(())
 }
 
-/// Map a snapshot's `memory.bin` `MAP_PRIVATE` per region for a `CoW` fork: clean
-/// pages are shared via the host page cache across every child process, while a
-/// write faults a private copy. `regions` is `(gpa, len, file_offset)` matching
-/// the snapshot's region table.
+/// Map a snapshot's memory file `MAP_PRIVATE` per region for a `CoW` fork:
+/// clean pages are shared via the host page cache across every child process,
+/// while a write faults a private copy. `regions` is `(gpa, len, file_offset)`
+/// matching the snapshot's region table.
 pub fn create_guest_memory_private(
-    mem_file: &std::path::Path,
-    regions: &[(u64, u64, u64)],
+	mem_file: &std::path::Path,
+	regions: &[(u64, u64, u64)],
 ) -> Result<GuestMemoryMmap> {
-    use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
+	use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 
-    let metadata = std::fs::metadata(mem_file)
-        .map_err(|e| crate::result::err(format!("stat {mem_file:?}: {e}")))?;
-    if !metadata.is_file() {
-        return Err(crate::result::err(format!(
-            "snapshot memory file {mem_file:?} is not a regular file"
-        )));
-    }
-    let file_len = metadata.len();
-    if regions.is_empty() {
-        return Err(crate::result::err("snapshot has no memory regions"));
-    }
-    let mut gregions = Vec::with_capacity(regions.len());
-    for &(gpa, len, file_offset) in regions {
-        if len == 0 {
-            return Err(crate::result::err(format!(
-                "snapshot memory region @ {gpa:#x} is empty"
-            )));
-        }
-        let end = file_offset.checked_add(len).ok_or_else(|| {
-            crate::result::err(format!(
-                "snapshot memory region @ {gpa:#x} file offset overflows"
-            ))
-        })?;
-        if end > file_len {
-            return Err(crate::result::err(format!(
-                "snapshot memory region @ {gpa:#x} exceeds memory.bin length {file_len}"
-            )));
-        }
-        let len = usize::try_from(len).map_err(|_| {
-            crate::result::err(format!("snapshot memory region @ {gpa:#x} is too large"))
-        })?;
-        let file = File::open(mem_file)
-            .map_err(|e| crate::result::err(format!("opening {mem_file:?}: {e}")))?;
-        let fo = FileOffset::new(file, file_offset);
-        let region = MmapRegion::<()>::build(
-            Some(fo),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            private_mmap_flags(),
-        )
-        .map_err(|e| crate::result::err(format!("mmap MAP_PRIVATE region @ {gpa:#x}: {e}")))?;
-        let greg = GuestRegionMmap::new(region, GuestAddress(gpa))
-            .ok_or("guest region address overflow")?;
-        gregions.push(greg);
-    }
-    GuestMemoryMmap::from_regions(gregions)
-        .map_err(|e| crate::result::err(format!("assembling private guest memory: {e}")))
+	let metadata = std::fs::metadata(mem_file)
+		.map_err(|e| crate::result::err(format!("stat {}: {e}", mem_file.display())))?;
+	if !metadata.is_file() {
+		return Err(crate::result::err(format!(
+			"snapshot memory file {} is not a regular file",
+			mem_file.display()
+		)));
+	}
+	let file_len = metadata.len();
+	if regions.is_empty() {
+		return Err(crate::result::err("snapshot has no memory regions"));
+	}
+	let mut gregions = Vec::with_capacity(regions.len());
+	for &(gpa, len, file_offset) in regions {
+		if len == 0 {
+			return Err(crate::result::err(format!("snapshot memory region @ {gpa:#x} is empty")));
+		}
+		let end = file_offset.checked_add(len).ok_or_else(|| {
+			crate::result::err(format!("snapshot memory region @ {gpa:#x} file offset overflows"))
+		})?;
+		if end > file_len {
+			return Err(crate::result::err(format!(
+				"snapshot memory region @ {gpa:#x} exceeds snapshot memory file length {file_len}"
+			)));
+		}
+		let len = usize::try_from(len).map_err(|_| {
+			crate::result::err(format!("snapshot memory region @ {gpa:#x} is too large"))
+		})?;
+		let file = File::open(mem_file)
+			.map_err(|e| crate::result::err(format!("opening {}: {e}", mem_file.display())))?;
+		let fo = FileOffset::new(file, file_offset);
+		let region = MmapRegion::<()>::build(
+			Some(fo),
+			len,
+			libc::PROT_READ | libc::PROT_WRITE,
+			private_mmap_flags(),
+		)
+		.map_err(|e| crate::result::err(format!("mmap MAP_PRIVATE region @ {gpa:#x}: {e}")))?;
+		let greg =
+			GuestRegionMmap::new(region, GuestAddress(gpa)).ok_or("guest region address overflow")?;
+		gregions.push(greg);
+	}
+	GuestMemoryMmap::from_regions(gregions)
+		.map_err(|e| crate::result::err(format!("assembling private guest memory: {e}")))
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn advise_mergeable_smoke() {
-        let mem = create_guest_memory(2 << 20).expect("guest memory");
-        let before = crate::metrics::snapshot_json()["ksm"]["regions_advised"]
-            .as_u64()
-            .expect("ksm counter before");
-        advise_mergeable(&mem);
-        let after = crate::metrics::snapshot_json()["ksm"]["regions_advised"]
-            .as_u64()
-            .expect("ksm counter after");
-        assert!(after >= before);
-    }
+	#[test]
+	fn advise_mergeable_smoke() {
+		let mem = create_guest_memory(2 << 20).expect("guest memory");
+		let before = crate::metrics::snapshot_json()["ksm"]["regions_advised"]
+			.as_u64()
+			.expect("ksm counter before");
+		advise_mergeable(&mem);
+		let after = crate::metrics::snapshot_json()["ksm"]["regions_advised"]
+			.as_u64()
+			.expect("ksm counter after");
+		assert!(after >= before);
+	}
 }
