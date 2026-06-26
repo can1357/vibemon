@@ -1,4 +1,4 @@
-//! Intel MultiProcessor (MP) table generation.
+//! Intel `MultiProcessor` (MP) table generation.
 //!
 //! Without ACPI, this table is how the guest kernel discovers the CPUs, the
 //! IOAPIC, and the ISA-IRQ -> IOAPIC-pin routing. Ported from Firecracker
@@ -127,13 +127,26 @@ struct MpcLintsrc {
 	destapiclint: u8,
 }
 
-// SAFETY: all of these are `#[repr(C, packed)]` plain-old-data structs.
+// SAFETY: `MpfIntel` is `#[repr(C, packed)]`, `Copy`, and contains only integer
+// POD fields.
 unsafe impl ByteValued for MpfIntel {}
+// SAFETY: `MpcTable` is `#[repr(C, packed)]`, `Copy`, and contains only integer
+// POD fields.
 unsafe impl ByteValued for MpcTable {}
+// SAFETY: `MpcCpu` is `#[repr(C, packed)]`, `Copy`, and contains only integer
+// POD fields.
 unsafe impl ByteValued for MpcCpu {}
+// SAFETY: `MpcBus` is `#[repr(C, packed)]`, `Copy`, and contains only integer
+// POD fields.
 unsafe impl ByteValued for MpcBus {}
+// SAFETY: `MpcIoapic` is `#[repr(C, packed)]`, `Copy`, and contains only
+// integer POD fields.
 unsafe impl ByteValued for MpcIoapic {}
+// SAFETY: `MpcIntsrc` is `#[repr(C, packed)]`, `Copy`, and contains only
+// integer POD fields.
 unsafe impl ByteValued for MpcIntsrc {}
+// SAFETY: `MpcLintsrc` is `#[repr(C, packed)]`, `Copy`, and contains only
+// integer POD fields.
 unsafe impl ByteValued for MpcLintsrc {}
 
 fn compute_checksum<T: ByteValued>(v: &T) -> u8 {
@@ -145,7 +158,7 @@ fn mpf_intel_checksum(v: &MpfIntel) -> u8 {
 	(!checksum).wrapping_add(1)
 }
 
-fn mp_size(num_cpus: u8) -> usize {
+const fn mp_size(num_cpus: u8) -> usize {
 	size_of::<MpfIntel>()
 		+ size_of::<MpcTable>()
 		+ size_of::<MpcCpu>() * num_cpus as usize

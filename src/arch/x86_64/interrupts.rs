@@ -1,7 +1,7 @@
 //! Local APIC LVT configuration.
 //!
 //! Ported from Firecracker (Apache-2.0). For the legacy PIC path to deliver
-//! interrupts in the guest, LINT0 must be ExtINT and LINT1 must be NMI.
+//! interrupts in the guest, LINT0 must be `ExtINT` and LINT1 must be NMI.
 
 use kvm_bindings::kvm_lapic_state;
 
@@ -26,11 +26,11 @@ fn set_klapic_reg(klapic: &mut kvm_lapic_state, reg_offset: usize, value: u32) {
 	}
 }
 
-fn set_apic_delivery_mode(reg: u32, mode: u32) -> u32 {
+const fn set_apic_delivery_mode(reg: u32, mode: u32) -> u32 {
 	(reg & !0x700) | (mode << 8)
 }
 
-/// Configure LINT0 = ExtINT and LINT1 = NMI for the given vCPU.
+/// Configure LINT0 = `ExtINT` and LINT1 = NMI for the given vCPU.
 pub fn set_lint(vcpu: &Vcpu) -> Result<()> {
 	let mut klapic = vcpu.fd().get_lapic()?;
 

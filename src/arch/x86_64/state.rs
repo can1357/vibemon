@@ -1,8 +1,8 @@
-//! x86_64 vCPU and machine snapshot state.
+//! `x86_64` vCPU and machine snapshot state.
 //!
 //! Captures the full migratable KVM state of a paused vCPU and of the
 //! VM-global interrupt/timer devices, plus the inverse restore path. We
-//! serialize the dynamically sized `Xsave` wrapper so KVM_XSAVE2 hosts keep
+//! serialize the dynamically sized `Xsave` wrapper so `KVM_XSAVE2` hosts keep
 //! the complete xstate image (legacy FPU/SSE, AVX, PKRU, and larger dynamic
 //! components such as AMX when present), paired with `kvm_xcrs`.
 
@@ -120,7 +120,7 @@ pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 
 /// Restore a vCPU from saved state. Order follows the x86 KVM migration
 /// dependencies used by QEMU/Firecracker: restore register files before
-/// events, LAPIC before TSC-deadline MSRs, and events last because SET_REGS
+/// events, LAPIC before TSC-deadline MSRs, and events last because `SET_REGS`
 /// clears pending exceptions.
 pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 	let vcpu = vcpu.fd();
@@ -132,11 +132,13 @@ pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 	// Restore the extended state before XCR0. This is the ordering used by KVM
 	// migration users: KVM_SET_XSAVE copies the raw xstate image, then
 	// KVM_SET_XCRS restores which components the guest has enabled.
-	// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of this
-	// same host, so its buffer matches this host's XSAVE size.
 	if st.xsave.as_slice().is_empty() {
+		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of this
+		// same host, so its buffer matches this host's legacy XSAVE layout.
 		unsafe { vcpu.set_xsave(&st.xsave.as_fam_struct_ref().xsave)? };
 	} else {
+		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of this
+		// same host, so its buffer matches this host's XSAVE2 layout.
 		unsafe { vcpu.set_xsave2(&st.xsave)? };
 	}
 	vcpu.set_xcrs(&st.xcrs)?;

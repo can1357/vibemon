@@ -1,4 +1,4 @@
-//! Kernel / initrd / command-line loading and zero-page (boot_params) setup.
+//! Kernel / initrd / command-line loading and zero-page (`boot_params`) setup.
 
 use std::{cmp::max, fs::File, io::Read, path::Path};
 
@@ -50,29 +50,29 @@ pub struct LoadedKernel {
 
 /// Load a kernel image (raw ELF `vmlinux` or `bzImage`) into guest memory.
 pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
-	let mut file = File::open(path).map_err(|e| format!("opening kernel {path:?}: {e}"))?;
+	let mut file =
+		File::open(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
 	let himem = Some(GuestAddress(HIMEM_START));
 
 	// Try ELF (uncompressed vmlinux) first; fall back to bzImage.
-	match Elf::load(mem, None, &mut file, himem) {
-		Ok(res) => Ok(LoadedKernel {
+	if let Ok(res) = Elf::load(mem, None, &mut file, himem) {
+		Ok(LoadedKernel {
 			entry:           res.kernel_load,
 			setup_header:    None,
 			firmware_memory: None,
-		}),
-		Err(_) => {
-			file.rewind_to_start()?;
-			let res = BzImage::load(mem, None, &mut file, himem)
-				.map_err(|e| format!("loading bzImage {path:?}: {e}"))?;
-			Ok(LoadedKernel {
-				entry:           res
-					.kernel_load
-					.checked_add(BZIMAGE_64BIT_ENTRY_OFFSET)
-					.ok_or("bzImage entry overflow")?,
-				setup_header:    res.setup_header,
-				firmware_memory: None,
-			})
-		},
+		})
+	} else {
+		file.rewind_to_start()?;
+		let res = BzImage::load(mem, None, &mut file, himem)
+			.map_err(|e| format!("loading bzImage {}: {e}", path.display()))?;
+		Ok(LoadedKernel {
+			entry:           res
+				.kernel_load
+				.checked_add(BZIMAGE_64BIT_ENTRY_OFFSET)
+				.ok_or("bzImage entry overflow")?,
+			setup_header:    res.setup_header,
+			firmware_memory: None,
+		})
 	}
 }
 
@@ -100,17 +100,18 @@ pub fn map_uefi_firmware(
 	ram: &GuestMemoryMmap,
 	vm_fd: &VmFd,
 ) -> Result<GuestMemoryMmap> {
-	let mut file = File::open(path).map_err(|e| format!("opening firmware {path:?}: {e}"))?;
+	let mut file =
+		File::open(path).map_err(|e| format!("opening firmware {}: {e}", path.display()))?;
 	let mut buf = Vec::new();
 	file.read_to_end(&mut buf)?;
 	if buf.is_empty() {
-		bail!("firmware {path:?} is empty");
+		bail!("firmware {} is empty", path.display());
 	}
 	if !(buf.len() as u64).is_multiple_of(GUEST_PAGE_SIZE) {
-		bail!("firmware {path:?} size {} is not {GUEST_PAGE_SIZE}-byte aligned", buf.len());
+		bail!("firmware {} size {} is not {GUEST_PAGE_SIZE}-byte aligned", path.display(), buf.len());
 	}
 	if buf.len() as u64 > crate::layout::MEM_32BIT_GAP_SIZE {
-		bail!("firmware {path:?} size {} exceeds the x86 MMIO gap", buf.len());
+		bail!("firmware {} size {} exceeds the x86 MMIO gap", path.display(), buf.len());
 	}
 
 	let size = buf.len();
@@ -149,7 +150,8 @@ pub fn load_initrd(
 	mem: &GuestMemoryMmap,
 	initrd_addr_max: u64,
 ) -> Result<(GuestAddress, usize)> {
-	let mut file = File::open(path).map_err(|e| format!("opening initrd {path:?}: {e}"))?;
+	let mut file =
+		File::open(path).map_err(|e| format!("opening initrd {}: {e}", path.display()))?;
 	let mut buf = Vec::new();
 	file.read_to_end(&mut buf)?;
 	let size = buf.len();
@@ -457,7 +459,7 @@ fn checksum(bytes: &[u8]) -> u8 {
 	0u8.wrapping_sub(sum)
 }
 
-fn align_up(value: u64, align: u64) -> u64 {
+const fn align_up(value: u64, align: u64) -> u64 {
 	(value + align - 1) & !(align - 1)
 }
 

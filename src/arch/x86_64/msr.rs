@@ -46,7 +46,7 @@ const MSR_IA32_INT_SSP_TAB: u32 = 0x6a8;
 const MSR_IA32_XSS: u32 = 0xda0;
 
 /// MSR indices captured for snapshot/restore (and zeroed/seeded at boot).
-/// Superset; at save time this is filtered through KVM_GET_MSR_INDEX_LIST and
+/// Superset; at save time this is filtered through `KVM_GET_MSR_INDEX_LIST` and
 /// only entries that `get_msrs` actually returns are kept.
 pub const MIGRATION_MSRS: &[u32] = &[
 	MSR_IA32_SYSENTER_CS,

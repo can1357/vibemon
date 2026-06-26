@@ -1,4 +1,4 @@
-//! x86_64 architecture support: boot setup, vCPU registers, MP tables, MSRs.
+//! `x86_64` architecture support: boot setup, vCPU registers, MP tables, MSRs.
 
 pub mod boot;
 mod cpuid;
