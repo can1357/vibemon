@@ -1,0 +1,2006 @@
+//! In-VMM virtio-fs device: a read-only FUSE server over virtqueues.
+//!
+//! This is the self-contained alternative to vhost-user-fs — no external
+//! `virtiofsd`. The device exports one host directory under a mount `tag`; the
+//! guest does `mount -t virtiofs <tag> /mnt` and the common FUSE client in the
+//! guest kernel drives it over the virtio request queue.
+//!
+//! Two virtqueues are configured (`num_request_queues = 1`): queue 0 is the
+//! hiprio queue (FORGET / INTERRUPT — drained, never answered) and queue 1 is
+//! the request queue carrying the FUSE traffic. A FUSE request chain is a run
+//! of device-readable descriptors (the `fuse_in_header` + opcode args) followed
+//! by device-writable descriptors (the `fuse_out_header` + reply); the two are
+//! distinguished by [`Descriptor::is_write_only`](virtio_queue). We concatenate
+//! the readable side into one request buffer and treat the writable side as one
+//! contiguous reply buffer.
+//!
+//! The read path (INIT, GETATTR, LOOKUP, OPEN/OPENDIR, READ, READDIR, plus the
+//! trivial RELEASE/FLUSH/STATFS/ACCESS replies) is always served. When the
+//! device is writable (`read_only == false`) the mutating opcodes are served
+//! too: CREATE, WRITE, SETATTR, MKDIR, UNLINK, RMDIR, RENAME/RENAME2, SYMLINK,
+//! LINK and FALLOCATE. On a read-only device every mutating opcode (and a
+//! write-intent OPEN) is answered `-EROFS`; unknown opcodes are `-ENOSYS`.
+//! Inode numbers (`nodeid`s) are interned lazily on LOOKUP and map back to host
+//! paths confined to the shared directory (every lookup is canonicalized and
+//! checked to stay under the root, so symlinks cannot escape; new children for
+//! the mutating ops confine the parent the same way).
+//!
+//! Endianness: the FUSE wire format is the guest's native byte order; both
+//! supported targets (`x86_64`/`aarch64`-linux) are little-endian and match the
+//! VMM host, so the `#[repr(C)]` POD structs are read/written by raw byte copy.
+
+use std::{
+	collections::HashMap,
+	ffi::{CString, OsStr},
+	fs::{self, File, Metadata},
+	os::unix::{
+		ffi::OsStrExt,
+		fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+	},
+	path::{Path, PathBuf},
+	sync::Arc,
+};
+
+use virtio_bindings::{bindings::virtio_config::VIRTIO_F_VERSION_1, virtio_ids::VIRTIO_ID_FS};
+use virtio_queue::{DescriptorChain, Queue, QueueT};
+use vm_memory::{Bytes, GuestAddress};
+
+use crate::{
+	memory::GuestMemoryMmap,
+	result::{Result, err},
+	snapshot::FsStateSer,
+	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+};
+
+const QUEUE_SIZE: u16 = 64;
+/// hiprio (0) + a single request queue (1).
+const NUM_QUEUES: usize = 2;
+const HIPRIO_QUEUE: usize = 0;
+const REQUEST_QUEUE: usize = 1;
+
+/// `virtio_fs_config`: a 36-byte NUL-padded tag followed by
+/// `num_request_queues`.
+const TAG_LEN: usize = 36;
+const CONFIG_SPACE_SIZE: usize = TAG_LEN + 4;
+const NUM_REQUEST_QUEUES: u32 = 1;
+
+/// FUSE node id of the shared root directory.
+const FUSE_ROOT_ID: u64 = 1;
+/// Highest FUSE minor version whose semantics this server implements. We never
+/// use a feature past 7.31, so we cap the negotiated minor here.
+const FUSE_PROTO_MINOR: u32 = 31;
+/// Cache validity (seconds) handed to the guest for attrs and dir entries.
+/// Small so host-side changes to the read-only tree are noticed reasonably
+/// promptly.
+const TIMEOUT_SEC: u64 = 1;
+/// Max bytes a single `FUSE_READ` reply body may carry, mirrored into
+/// `max_write`.
+const MAX_WRITE: u32 = 1 << 20;
+
+// FUSE opcodes (linux/fuse.h) handled here.
+const FUSE_LOOKUP: u32 = 1;
+const FUSE_FORGET: u32 = 2;
+const FUSE_GETATTR: u32 = 3;
+const FUSE_SETATTR: u32 = 4;
+const FUSE_SYMLINK: u32 = 6;
+const FUSE_MKDIR: u32 = 9;
+const FUSE_UNLINK: u32 = 10;
+const FUSE_RMDIR: u32 = 11;
+const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
+const FUSE_OPEN: u32 = 14;
+const FUSE_READ: u32 = 15;
+const FUSE_WRITE: u32 = 16;
+const FUSE_STATFS: u32 = 17;
+const FUSE_RELEASE: u32 = 18;
+const FUSE_FSYNC: u32 = 20;
+const FUSE_FLUSH: u32 = 25;
+const FUSE_INIT: u32 = 26;
+const FUSE_OPENDIR: u32 = 27;
+const FUSE_READDIR: u32 = 28;
+const FUSE_RELEASEDIR: u32 = 29;
+const FUSE_FSYNCDIR: u32 = 30;
+const FUSE_ACCESS: u32 = 34;
+const FUSE_CREATE: u32 = 35;
+const FUSE_INTERRUPT: u32 = 36;
+const FUSE_BATCH_FORGET: u32 = 42;
+const FUSE_FALLOCATE: u32 = 43;
+const FUSE_RENAME2: u32 = 45;
+
+const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
+const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
+const MAX_REQUEST_SIZE: usize = IN_HEADER_SIZE + MAX_WRITE as usize;
+const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
+
+// ---------------------------------------------------------------------------
+// FUSE wire structures (linux/fuse.h, protocol 7.x). All `#[repr(C)]` POD with
+// no internal padding (asserted below), so a raw byte copy yields the exact
+// little-endian wire layout the guest FUSE client expects.
+// ---------------------------------------------------------------------------
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseInHeader {
+	len:     u32,
+	opcode:  u32,
+	unique:  u64,
+	nodeid:  u64,
+	uid:     u32,
+	gid:     u32,
+	pid:     u32,
+	padding: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseOutHeader {
+	len:    u32,
+	error:  i32,
+	unique: u64,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseAttr {
+	ino:       u64,
+	size:      u64,
+	blocks:    u64,
+	atime:     u64,
+	mtime:     u64,
+	ctime:     u64,
+	atimensec: u32,
+	mtimensec: u32,
+	ctimensec: u32,
+	mode:      u32,
+	nlink:     u32,
+	uid:       u32,
+	gid:       u32,
+	rdev:      u32,
+	blksize:   u32,
+	flags:     u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseAttrOut {
+	attr_valid:      u64,
+	attr_valid_nsec: u32,
+	dummy:           u32,
+	attr:            FuseAttr,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseEntryOut {
+	nodeid:           u64,
+	generation:       u64,
+	entry_valid:      u64,
+	attr_valid:       u64,
+	entry_valid_nsec: u32,
+	attr_valid_nsec:  u32,
+	attr:             FuseAttr,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseInitOut {
+	major:                u32,
+	minor:                u32,
+	max_readahead:        u32,
+	flags:                u32,
+	max_background:       u16,
+	congestion_threshold: u16,
+	max_write:            u32,
+	time_gran:            u32,
+	max_pages:            u16,
+	map_alignment:        u16,
+	flags2:               u32,
+	unused:               [u32; 7],
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseOpenOut {
+	fh:         u64,
+	open_flags: u32,
+	backing_id: i32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseReadIn {
+	fh:         u64,
+	offset:     u64,
+	size:       u32,
+	read_flags: u32,
+	lock_owner: u64,
+	flags:      u32,
+	padding:    u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseDirent {
+	ino:     u64,
+	off:     u64,
+	namelen: u32,
+	type_:   u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseKstatfs {
+	blocks:  u64,
+	bfree:   u64,
+	bavail:  u64,
+	files:   u64,
+	ffree:   u64,
+	bsize:   u32,
+	namelen: u32,
+	frsize:  u32,
+	padding: u32,
+	spare:   [u32; 6],
+}
+
+// Wire sizes must match the kernel structs exactly; a mismatch means a padding
+// surprise that would corrupt every reply, so pin them at compile time.
+const _: () = assert!(IN_HEADER_SIZE == 40);
+const _: () = assert!(OUT_HEADER_SIZE == 16);
+const _: () = assert!(std::mem::size_of::<FuseAttr>() == 88);
+const _: () = assert!(std::mem::size_of::<FuseAttrOut>() == 104);
+const _: () = assert!(std::mem::size_of::<FuseEntryOut>() == 128);
+const _: () = assert!(std::mem::size_of::<FuseInitOut>() == 64);
+const _: () = assert!(std::mem::size_of::<FuseOpenOut>() == 16);
+const _: () = assert!(std::mem::size_of::<FuseReadIn>() == 40);
+const _: () = assert!(DIRENT_HEADER == 24);
+const _: () = assert!(std::mem::size_of::<FuseKstatfs>() == 80);
+
+// Mutating-path request/reply structs (writable FUSE). Same POD/raw-copy rules
+// as the read-path structs above; sizes pinned below.
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseCreateIn {
+	flags:      u32,
+	mode:       u32,
+	umask:      u32,
+	open_flags: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseWriteIn {
+	fh:          u64,
+	offset:      u64,
+	size:        u32,
+	write_flags: u32,
+	lock_owner:  u64,
+	flags:       u32,
+	padding:     u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseWriteOut {
+	size:    u32,
+	padding: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseSetattrIn {
+	valid:      u32,
+	padding:    u32,
+	fh:         u64,
+	size:       u64,
+	lock_owner: u64,
+	atime:      u64,
+	mtime:      u64,
+	ctime:      u64,
+	atimensec:  u32,
+	mtimensec:  u32,
+	ctimensec:  u32,
+	mode:       u32,
+	unused4:    u32,
+	uid:        u32,
+	gid:        u32,
+	unused5:    u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseMkdirIn {
+	mode:  u32,
+	umask: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseRenameIn {
+	newdir: u64,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseRename2In {
+	newdir:  u64,
+	flags:   u32,
+	padding: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseLinkIn {
+	oldnodeid: u64,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FuseFallocateIn {
+	fh:      u64,
+	offset:  u64,
+	length:  u64,
+	mode:    u32,
+	padding: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<FuseCreateIn>() == 16);
+const _: () = assert!(std::mem::size_of::<FuseWriteIn>() == 40);
+const _: () = assert!(std::mem::size_of::<FuseWriteOut>() == 8);
+const _: () = assert!(std::mem::size_of::<FuseSetattrIn>() == 88);
+const _: () = assert!(std::mem::size_of::<FuseMkdirIn>() == 8);
+const _: () = assert!(std::mem::size_of::<FuseRenameIn>() == 8);
+const _: () = assert!(std::mem::size_of::<FuseRename2In>() == 16);
+const _: () = assert!(std::mem::size_of::<FuseLinkIn>() == 8);
+const _: () = assert!(std::mem::size_of::<FuseFallocateIn>() == 32);
+
+// ---------------------------------------------------------------------------
+// POD <-> bytes helpers
+// ---------------------------------------------------------------------------
+
+/// Decode a POD struct from `buf` at byte offset `off`, or `None` if the buffer
+/// is too short.
+fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
+	let size = std::mem::size_of::<T>();
+	if off.checked_add(size)? > buf.len() {
+		return None;
+	}
+	// SAFETY: the bound above guarantees `size` readable bytes at `off`;
+	// `read_unaligned` tolerates any alignment, and `T` is a `#[repr(C)]` POD,
+	// so every byte pattern of the right length is a valid value.
+	Some(unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast::<T>()) })
+}
+
+/// View a POD struct as its raw little-endian bytes.
+const fn struct_bytes<T: Copy>(v: &T) -> &[u8] {
+	// SAFETY: reads exactly `size_of::<T>()` bytes of `v`'s representation; `T`
+	// is a `#[repr(C)]` POD with no padding (asserted), so all bytes are init.
+	unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+}
+
+const fn align8(x: usize) -> usize {
+	(x + 7) & !7
+}
+
+// ---------------------------------------------------------------------------
+// Reply / request marshalling
+// ---------------------------------------------------------------------------
+
+/// Write a FUSE reply (`fuse_out_header` + `body`) across the writable
+/// descriptors in order and return the number of bytes written.
+///
+/// The body is clamped to the writable capacity so a malformed short chain can
+/// never overflow, and `out_header.len` is set to exactly what we wrote — for
+/// variable-length replies (READ/READDIR/INIT) the guest derives the payload
+/// size from this field.
+fn write_reply(
+	mem: &GuestMemoryMmap,
+	writable: &[(GuestAddress, u32)],
+	unique: u64,
+	error: i32,
+	body: &[u8],
+) -> u32 {
+	let Some(cap) = writable
+		.iter()
+		.try_fold(0usize, |acc, &(_, l)| acc.checked_add(l as usize))
+	else {
+		return 0;
+	};
+	if cap < OUT_HEADER_SIZE {
+		return 0;
+	}
+	let body_fit = body.len().min(cap - OUT_HEADER_SIZE);
+	let total = OUT_HEADER_SIZE + body_fit;
+
+	let header = FuseOutHeader { len: total as u32, error, unique };
+	let mut reply = Vec::with_capacity(total);
+	reply.extend_from_slice(struct_bytes(&header));
+	reply.extend_from_slice(&body[..body_fit]);
+
+	let mut off = 0usize;
+	for &(addr, dlen) in writable {
+		if off >= reply.len() {
+			break;
+		}
+		let n = (dlen as usize).min(reply.len() - off);
+		if mem.write_slice(&reply[off..off + n], addr).is_err() {
+			return 0;
+		}
+		off += n;
+	}
+	if off == reply.len() { total as u32 } else { 0 }
+}
+
+/// Concatenated readable request bytes plus the ordered writable `(addr, len)`
+/// reply targets carved out of one FUSE descriptor chain.
+type SplitChain = (Vec<u8>, Vec<(GuestAddress, u32)>);
+
+/// Split one FUSE request chain into the concatenated readable bytes (the
+/// request) and the ordered writable `(addr, len)` targets (the reply space).
+fn split_chain(
+	mem: &GuestMemoryMmap,
+	chain: DescriptorChain<&GuestMemoryMmap>,
+) -> Option<SplitChain> {
+	let mut req = Vec::new();
+	let mut writable = Vec::new();
+	let mut seen_writable = false;
+	let mut req_len = 0usize;
+	for d in chain {
+		if !descriptor_range_valid(mem, d.addr(), d.len()) {
+			return None;
+		}
+		if d.is_write_only() {
+			seen_writable = true;
+			writable.push((d.addr(), d.len()));
+		} else {
+			if seen_writable {
+				return None;
+			}
+			let len = d.len() as usize;
+			req_len = req_len.checked_add(len)?;
+			if req_len > MAX_REQUEST_SIZE {
+				return None;
+			}
+			let start = req.len();
+			req.resize(start + len, 0);
+			if mem
+				.read_slice(&mut req[start..start + len], d.addr())
+				.is_err()
+			{
+				return None;
+			}
+		}
+	}
+	Some((req, writable))
+}
+
+/// Fill a `fuse_attr` from host metadata; `ino` is the FUSE nodeid (kept equal
+/// to the reported inode number for consistency).
+fn attr_from(ino: u64, md: &Metadata) -> FuseAttr {
+	FuseAttr {
+		ino,
+		size: md.size(),
+		blocks: md.blocks(),
+		atime: md.atime() as u64,
+		mtime: md.mtime() as u64,
+		ctime: md.ctime() as u64,
+		atimensec: md.atime_nsec() as u32,
+		mtimensec: md.mtime_nsec() as u32,
+		ctimensec: md.ctime_nsec() as u32,
+		mode: md.mode(),
+		nlink: md.nlink() as u32,
+		uid: md.uid(),
+		gid: md.gid(),
+		rdev: md.rdev() as u32,
+		blksize: md.blksize() as u32,
+		flags: 0,
+	}
+}
+
+/// Map a raw `st_mode` to a `readdir` `d_type` value.
+const fn dtype_from_mode(mode: u32) -> u32 {
+	match mode & libc::S_IFMT as u32 {
+		m if m == libc::S_IFDIR as u32 => libc::DT_DIR as u32,
+		m if m == libc::S_IFREG as u32 => libc::DT_REG as u32,
+		m if m == libc::S_IFLNK as u32 => libc::DT_LNK as u32,
+		m if m == libc::S_IFCHR as u32 => libc::DT_CHR as u32,
+		m if m == libc::S_IFBLK as u32 => libc::DT_BLK as u32,
+		m if m == libc::S_IFIFO as u32 => libc::DT_FIFO as u32,
+		m if m == libc::S_IFSOCK as u32 => libc::DT_SOCK as u32,
+		_ => libc::DT_UNKNOWN as u32,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mutating-path helpers (writable FUSE)
+// ---------------------------------------------------------------------------
+
+// `fuse_setattr_in.valid` bits we honor (linux/fuse.h).
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_ATIME: u32 = 1 << 4;
+const FATTR_MTIME: u32 = 1 << 5;
+const FATTR_ATIME_NOW: u32 = 1 << 7;
+const FATTR_MTIME_NOW: u32 = 1 << 8;
+/// `fuse_setattr_in.fh` is valid: prefer the open handle for the size
+/// truncation.
+const FATTR_FH: u32 = 1 << 6;
+
+/// `RENAME_NOREPLACE` (linux/fs.h): fail rather than clobber an existing dest.
+const RENAME_NOREPLACE: u32 = 1;
+
+const fn rename2_flags_supported(flags: u32) -> bool {
+	flags & !RENAME_NOREPLACE == 0
+}
+
+/// Map a host I/O error to the negative FUSE errno the guest expects
+/// (defaulting to `-EIO` when the OS gave no errno, e.g. a Rust-side failure).
+fn neg_errno(e: &std::io::Error) -> i32 {
+	-e.raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// First NUL-terminated name in `buf[off..]` (the single-name request tail).
+fn first_name(buf: &[u8], off: usize) -> &[u8] {
+	buf.get(off..)
+		.unwrap_or(&[])
+		.split(|&b| b == 0)
+		.next()
+		.unwrap_or(&[])
+}
+
+/// The two consecutive NUL-terminated names in `buf[off..]` (rename/symlink).
+fn two_names(buf: &[u8], off: usize) -> Option<(&[u8], &[u8])> {
+	let rest = buf.get(off..)?;
+	let mut parts = rest.split(|&b| b == 0);
+	let first = parts.next()?;
+	let second = parts.next()?;
+	Some((first, second))
+}
+
+/// A NUL-free C string for the libc path calls (`chown`/`utimensat`).
+fn cpath(path: &Path) -> std::io::Result<CString> {
+	CString::new(path.as_os_str().as_bytes())
+		.map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// `chown(2)`; a `u32::MAX` (`-1`) uid/gid leaves that owner unchanged.
+fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+	let c = cpath(path)?;
+	// SAFETY: `c` is a valid NUL-terminated C string live for the whole call.
+	let r = unsafe { libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+	if r != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// Apply the atime/mtime a SETATTR requested via `utimensat(2)`, honoring the
+/// `*_NOW` and omit semantics for whichever time is not selected in `valid`.
+fn set_times(path: &Path, sin: &FuseSetattrIn) -> std::io::Result<()> {
+	const UTIME_NOW: i64 = (1 << 30) - 1;
+	const UTIME_OMIT: i64 = (1 << 30) - 2;
+	let spec = |sel: u32, now: u32, sec: u64, nsec: u32| libc::timespec {
+		tv_sec:  sec as libc::time_t,
+		tv_nsec: if sin.valid & now != 0 {
+			UTIME_NOW
+		} else if sin.valid & sel != 0 {
+			nsec as i64
+		} else {
+			UTIME_OMIT
+		},
+	};
+	let times = [
+		spec(FATTR_ATIME, FATTR_ATIME_NOW, sin.atime, sin.atimensec),
+		spec(FATTR_MTIME, FATTR_MTIME_NOW, sin.mtime, sin.mtimensec),
+	];
+	let c = cpath(path)?;
+	// SAFETY: `c` outlives the call; `times` is the required 2-element array.
+	let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+	if r != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// Apply the subset of attributes selected by `sin.valid`. The size truncation
+/// is a data write, so it goes through the tracked handle `fh` when the guest
+/// supplied one, else a confined `O_NOFOLLOW` reopen of `path`; neither follows
+/// a final-component symlink. The metadata ops (mode/uid/gid/times) act on the
+/// already-confined canonical `path` from the inode table.
+fn apply_setattr(path: &Path, fh: Option<&File>, sin: &FuseSetattrIn) -> std::io::Result<()> {
+	if sin.valid & FATTR_SIZE != 0 {
+		match fh {
+			Some(f) => f.set_len(sin.size)?,
+			None => open_nofollow(path, true)?.set_len(sin.size)?,
+		}
+	}
+	if sin.valid & FATTR_MODE != 0 {
+		fs::set_permissions(path, fs::Permissions::from_mode(sin.mode & 0o7777))?;
+	}
+	if sin.valid & (FATTR_UID | FATTR_GID) != 0 {
+		let uid = if sin.valid & FATTR_UID != 0 {
+			sin.uid
+		} else {
+			u32::MAX
+		};
+		let gid = if sin.valid & FATTR_GID != 0 {
+			sin.gid
+		} else {
+			u32::MAX
+		};
+		chown_path(path, uid, gid)?;
+	}
+	if sin.valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
+		set_times(path, sin)?;
+	}
+	Ok(())
+}
+
+/// Open `path` for reading (and writing when `write`) without following a
+/// final-component symlink (`O_NOFOLLOW`). A symlink as the final element makes
+/// the open fail with `ELOOP`, so a post-LOOKUP swap cannot redirect the I/O
+/// outside the shared root. Used by OPEN/CREATE and the unknown-fh fallbacks.
+fn open_nofollow(path: &Path, write: bool) -> std::io::Result<File> {
+	fs::OpenOptions::new()
+		.read(true)
+		.write(write)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(path)
+}
+
+/// Open the directory at `path` for OPENDIR without following a final-component
+/// symlink (`O_NOFOLLOW | O_DIRECTORY`).
+fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
+	fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+		.open(path)
+}
+
+/// Best-effort grow of `f` to `want` bytes (FALLOCATE). Hole-punch / shrink
+/// modes stay no-ops, matching the prior behavior.
+fn fallocate_grow(f: &File, want: u64) -> std::io::Result<()> {
+	let cur = f.metadata().map_or(0, |m| m.len());
+	if want > cur {
+		f.set_len(want)?;
+	}
+	Ok(())
+}
+
+/// Build a `FUSE_READDIR` reply body: a packed stream of `fuse_dirent` records
+/// for ".", "..", and the directory's entries, resuming at `offset` and not
+/// exceeding `max` bytes.
+///
+/// Entries are sorted by name so the per-entry `off` cookies stay stable across
+/// the several READDIR calls the kernel issues to page a large directory.
+fn build_readdir(dir: &Path, offset: u64, max: usize) -> Vec<u8> {
+	let dir_ino = fs::symlink_metadata(dir).map_or(FUSE_ROOT_ID, |m| m.ino());
+
+	// (name bytes, inode, d_type)
+	let mut entries: Vec<(Vec<u8>, u64, u32)> = vec![
+		(b".".to_vec(), dir_ino, libc::DT_DIR as u32),
+		(b"..".to_vec(), dir_ino, libc::DT_DIR as u32),
+	];
+	if let Ok(rd) = fs::read_dir(dir) {
+		let mut listing: Vec<(Vec<u8>, u64, u32)> = Vec::new();
+		for ent in rd.flatten() {
+			let name = ent.file_name();
+			// `DirEntry::metadata` does not traverse symlinks, so a symlink keeps
+			// its own inode/type here (the guest LOOKUP resolves it later).
+			let (ino, dtype) = match ent.metadata() {
+				Ok(m) => (m.ino(), dtype_from_mode(m.mode())),
+				Err(_) => (0, libc::DT_UNKNOWN as u32),
+			};
+			listing.push((name.as_os_str().as_bytes().to_vec(), ino, dtype));
+		}
+		listing.sort_by(|a, b| a.0.cmp(&b.0));
+		entries.extend(listing);
+	}
+
+	let mut out = Vec::new();
+	for (idx, (name, ino, dtype)) in entries.iter().enumerate() {
+		// Cookie of entry `idx` is `idx + 1`; the kernel resumes by passing the
+		// last consumed cookie as `offset`, so emit entries with `idx >= offset`.
+		if (idx as u64) < offset {
+			continue;
+		}
+		let reclen = align8(DIRENT_HEADER + name.len());
+		if out.len() + reclen > max {
+			break;
+		}
+		let dirent = FuseDirent {
+			ino:     *ino,
+			off:     idx as u64 + 1,
+			namelen: name.len() as u32,
+			type_:   *dtype,
+		};
+		out.extend_from_slice(struct_bytes(&dirent));
+		out.extend_from_slice(name);
+		// Pad the record to the 8-byte boundary the FUSE dirent stream requires.
+		out.resize(out.len() + (reclen - DIRENT_HEADER - name.len()), 0);
+	}
+	out
+}
+
+// ---------------------------------------------------------------------------
+// FUSE server state (inode table + request dispatch)
+// ---------------------------------------------------------------------------
+
+/// The host-facing FUSE state, kept distinct from the virtqueue fields so the
+/// worker can borrow the inode table and the request queue disjointly.
+struct FsState {
+	/// Canonicalized shared directory; every served path must stay under it.
+	root:    PathBuf,
+	/// nodeid -> host path.
+	inodes:  HashMap<u64, PathBuf>,
+	/// host path -> nodeid (dedupe so a path keeps one stable nodeid).
+	by_path: HashMap<PathBuf, u64>,
+	/// Next nodeid to hand out.
+	next:    u64,
+	/// Open file/dir handles keyed by the fh handed back from OPEN/OPENDIR/
+	/// CREATE. Session-local: this map is intentionally NOT serialized into
+	/// `FsStateSer`, so after a memory snapshot+restore it starts empty. A guest
+	/// may still issue READ/WRITE/FALLOCATE/SETATTR-size with a pre-snapshot fh;
+	/// those fall back to reopening the confined nodeid path with `O_NOFOLLOW`
+	/// (see `open_confined`), so a stale fh never errors `EBADF` and never
+	/// follows a final-component symlink.
+	handles: HashMap<u64, File>,
+	/// Next fh to hand out; fh 0 is reserved/invalid.
+	next_fh: u64,
+}
+
+impl FsState {
+	/// Return the existing nodeid for `path`, or assign and record a new one.
+	fn intern(&mut self, path: PathBuf) -> u64 {
+		if let Some(&id) = self.by_path.get(&path) {
+			return id;
+		}
+		let id = self.next;
+		self.next += 1;
+		self.inodes.insert(id, path.clone());
+		self.by_path.insert(path, id);
+		id
+	}
+
+	/// Resolve `<parent>/<name>` to a canonical path confined to the shared
+	/// root, rejecting traversal/symlink escapes and the self/parent entries
+	/// (which the kernel resolves itself without `FUSE_EXPORT_SUPPORT`).
+	fn resolve_child(&self, parent: &Path, name: &[u8]) -> Option<PathBuf> {
+		if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+			return None;
+		}
+		let candidate = parent.join(OsStr::from_bytes(name));
+		let canon = fs::canonicalize(&candidate).ok()?;
+		canon.starts_with(&self.root).then_some(canon)
+	}
+
+	/// Resolve `<parent>/<name>` for a child that need NOT exist yet (CREATE /
+	/// MKDIR / SYMLINK / LINK / RENAME destinations). The parent is
+	/// canonicalized and confined under root; the single slash-free name is
+	/// then appended, so the result stays under root by construction without
+	/// following a final symlink. Rejects empty / `.` / `..` / slash-bearing
+	/// names.
+	fn resolve_new_child(&self, parent: &Path, name: &[u8]) -> Option<PathBuf> {
+		if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+			return None;
+		}
+		let parent_canon = fs::canonicalize(parent).ok()?;
+		if !parent_canon.starts_with(&self.root) {
+			return None;
+		}
+		Some(parent_canon.join(OsStr::from_bytes(name)))
+	}
+
+	/// Store `file` under a fresh handle id and return it (fh 0 is reserved).
+	fn insert_handle(&mut self, file: File) -> u64 {
+		let fh = self.next_fh;
+		self.next_fh = self.next_fh.checked_add(1).unwrap_or(1);
+		self.handles.insert(fh, file);
+		fh
+	}
+
+	/// Reopen the host path for `nodeid` (confined under root) without following
+	/// a final-component symlink. This is the unknown-fh fallback for
+	/// READ/WRITE/FALLOCATE after a snapshot restore, where the session-local
+	/// handle table is empty but the guest still references pre-snapshot fhs.
+	fn open_confined(&self, nodeid: u64, write: bool) -> std::io::Result<File> {
+		let path = self
+			.inodes
+			.get(&nodeid)
+			.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+		open_nofollow(path, write)
+	}
+
+	/// LOOKUP-style reply for a freshly created `child`: lstat it, intern a
+	/// nodeid, and send a `fuse_entry_out` (or the host errno on failure).
+	fn reply_entry(
+		&mut self,
+		mem: &GuestMemoryMmap,
+		writable: &[(GuestAddress, u32)],
+		unique: u64,
+		child: PathBuf,
+	) -> u32 {
+		match fs::symlink_metadata(&child) {
+			Ok(md) => {
+				let id = self.intern(child);
+				let out = FuseEntryOut {
+					nodeid:           id,
+					generation:       0,
+					entry_valid:      TIMEOUT_SEC,
+					attr_valid:       TIMEOUT_SEC,
+					entry_valid_nsec: 0,
+					attr_valid_nsec:  0,
+					attr:             attr_from(id, &md),
+				};
+				write_reply(mem, writable, unique, 0, struct_bytes(&out))
+			},
+			Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+		}
+	}
+
+	fn save(&self) -> FsStateSer {
+		let mut inodes: Vec<(u64, String)> = self
+			.inodes
+			.iter()
+			.filter_map(|(&id, path)| {
+				let rel = path.strip_prefix(&self.root).ok()?;
+				let rel = if rel.as_os_str().is_empty() {
+					".".to_string()
+				} else {
+					rel.to_string_lossy().into_owned()
+				};
+				Some((id, rel))
+			})
+			.collect();
+		inodes.sort_unstable_by_key(|&(id, _)| id);
+		FsStateSer { inodes, next: self.next }
+	}
+
+	fn restore(shared_dir: &Path, state: &FsStateSer) -> Result<Self> {
+		let shared_dir_display = shared_dir.display();
+		let root = fs::canonicalize(shared_dir)
+			.map_err(|e| err(format!("virtio-fs shared dir {shared_dir_display}: {e}")))?;
+		if !root.is_dir() {
+			crate::bail!("virtio-fs shared dir {} is not a directory", root.display());
+		}
+
+		let mut inodes = HashMap::new();
+		inodes.insert(FUSE_ROOT_ID, root.clone());
+		let mut by_path = HashMap::new();
+		by_path.insert(root.clone(), FUSE_ROOT_ID);
+		let mut next = state.next.max(FUSE_ROOT_ID + 1);
+
+		for (id, saved) in &state.inodes {
+			if *id == FUSE_ROOT_ID {
+				continue;
+			}
+			let rel = PathBuf::from(saved);
+			if rel.is_absolute() {
+				continue;
+			}
+			let candidate = if saved == "." {
+				root.clone()
+			} else {
+				root.join(rel)
+			};
+			let Ok(canon) = fs::canonicalize(candidate) else {
+				continue;
+			};
+			if !canon.starts_with(&root) || by_path.contains_key(&canon) {
+				continue;
+			}
+			inodes.insert(*id, canon.clone());
+			by_path.insert(canon, *id);
+			next = next.max(id.saturating_add(1));
+		}
+
+		Ok(Self { root, inodes, by_path, next, handles: HashMap::new(), next_fh: 1 })
+	}
+
+	/// Service one FUSE request and return the number of reply bytes written
+	/// (0 for the no-reply opcodes).
+	fn dispatch(
+		&mut self,
+		mem: &GuestMemoryMmap,
+		req: &[u8],
+		writable: &[(GuestAddress, u32)],
+		read_only: bool,
+	) -> u32 {
+		let Some(h) = read_struct::<FuseInHeader>(req, 0) else {
+			// Can't even read the header (hence no `unique` to answer): just
+			// release the buffer with a zero-length used entry.
+			return 0;
+		};
+		let unique = h.unique;
+		let nodeid = h.nodeid;
+		let req_len = h.len as usize;
+		if req_len < IN_HEADER_SIZE || req_len > req.len() {
+			return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+		}
+		let req = &req[..req_len];
+		// Capacity available for the reply body (after the out-header).
+		let cap = writable
+			.iter()
+			.try_fold(0usize, |acc, &(_, l)| acc.checked_add(l as usize))
+			.unwrap_or(0);
+		let body_cap = cap.saturating_sub(OUT_HEADER_SIZE).min(MAX_WRITE as usize);
+		match h.opcode {
+			FUSE_INIT => {
+				// fuse_init_in: major@40, minor@44, max_readahead@48, flags@52.
+				let client_minor = read_struct::<u32>(req, IN_HEADER_SIZE + 4).unwrap_or(0);
+				let max_readahead = read_struct::<u32>(req, IN_HEADER_SIZE + 8).unwrap_or(0);
+				let out = FuseInitOut {
+					major: 7,
+					minor: client_minor.min(FUSE_PROTO_MINOR),
+					max_readahead,
+					max_write: MAX_WRITE,
+					time_gran: 1,
+					..Default::default()
+				};
+				write_reply(mem, writable, unique, 0, struct_bytes(&out))
+			},
+			FUSE_GETATTR => match self.inodes.get(&nodeid) {
+				Some(p) => match fs::symlink_metadata(p) {
+					Ok(md) => {
+						let out = FuseAttrOut {
+							attr_valid:      TIMEOUT_SEC,
+							attr_valid_nsec: 0,
+							dummy:           0,
+							attr:            attr_from(nodeid, &md),
+						};
+						write_reply(mem, writable, unique, 0, struct_bytes(&out))
+					},
+					Err(_) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+				},
+				None => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+			},
+			FUSE_LOOKUP => {
+				let name = req
+					.get(IN_HEADER_SIZE..)
+					.unwrap_or(&[])
+					.split(|&b| b == 0)
+					.next()
+					.unwrap_or(&[]);
+				let resolved = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_child(&parent, name));
+				match resolved {
+					Some(child) => match fs::symlink_metadata(&child) {
+						Ok(md) => {
+							let id = self.intern(child);
+							let out = FuseEntryOut {
+								nodeid:           id,
+								generation:       0,
+								entry_valid:      TIMEOUT_SEC,
+								attr_valid:       TIMEOUT_SEC,
+								entry_valid_nsec: 0,
+								attr_valid_nsec:  0,
+								attr:             attr_from(id, &md),
+							};
+							write_reply(mem, writable, unique, 0, struct_bytes(&out))
+						},
+						Err(_) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+					},
+					None => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+				}
+			},
+			FUSE_OPEN | FUSE_OPENDIR => {
+				let Some(path) = self.inodes.get(&nodeid).cloned() else {
+					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				};
+				let is_dir = h.opcode == FUSE_OPENDIR;
+				// `fuse_open_in.flags` are the guest's open(2) flags. Any
+				// write/create/truncate intent on a read-only device is -EROFS.
+				let flags = read_struct::<u32>(req, IN_HEADER_SIZE).unwrap_or(0);
+				let accmode = flags & libc::O_ACCMODE as u32;
+				let wants_write = !is_dir
+					&& (accmode == libc::O_WRONLY as u32
+						|| accmode == libc::O_RDWR as u32
+						|| flags & (libc::O_CREAT as u32 | libc::O_TRUNC as u32) != 0);
+				if read_only && wants_write {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				// Open the resolved, root-confined path without following a
+				// final-component symlink, then track the real fd so later
+				// READ/WRITE on this handle can never be redirected by a swap.
+				let opened = if is_dir {
+					open_dir_nofollow(&path)
+				} else {
+					open_nofollow(&path, wants_write)
+				};
+				match opened {
+					Ok(file) => {
+						let fh = self.insert_handle(file);
+						let out = FuseOpenOut { fh, open_flags: 0, backing_id: 0 };
+						write_reply(mem, writable, unique, 0, struct_bytes(&out))
+					},
+					// ELOOP: the final component is a symlink — refuse it.
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_READ => {
+				let Some(rin) = read_struct::<FuseReadIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let want = (rin.size as usize).min(body_cap);
+				let mut buf = vec![0u8; want];
+				// Prefer the tracked handle; fall back to a confined O_NOFOLLOW
+				// reopen by nodeid (covers a stale, post-snapshot fh). pread
+				// clamps to EOF, yielding a short read at the file's end.
+				let res = if let Some(f) = self.handles.get(&rin.fh) {
+					f.read_at(&mut buf, rin.offset)
+				} else {
+					match self.open_confined(nodeid, false) {
+						Ok(f) => f.read_at(&mut buf, rin.offset),
+						Err(e) => Err(e),
+					}
+				};
+				match res {
+					Ok(n) => {
+						buf.truncate(n);
+						write_reply(mem, writable, unique, 0, &buf)
+					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_READDIR => match (
+				read_struct::<FuseReadIn>(req, IN_HEADER_SIZE),
+				self.inodes.get(&nodeid).cloned(),
+			) {
+				(Some(rin), Some(path)) => {
+					let max = (rin.size as usize).min(body_cap);
+					let body = build_readdir(&path, rin.offset, max);
+					write_reply(mem, writable, unique, 0, &body)
+				},
+				(None, _) => write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+				(_, None) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+			},
+			FUSE_STATFS => {
+				let st = FuseKstatfs { bsize: 4096, namelen: 255, frsize: 4096, ..Default::default() };
+				write_reply(mem, writable, unique, 0, struct_bytes(&st))
+			},
+			// Drop the tracked handle (POSIX: an unlinked file's fd stays valid
+			// until release). `fuse_release_in.fh` is the leading u64.
+			FUSE_RELEASE | FUSE_RELEASEDIR => {
+				let fh = read_struct::<u64>(req, IN_HEADER_SIZE).unwrap_or(0);
+				self.handles.remove(&fh);
+				write_reply(mem, writable, unique, 0, &[])
+			},
+			// Flush the tracked handle to disk; a stale/unknown fh (post-restore)
+			// has nothing host-side to sync, so just acknowledge.
+			FUSE_FSYNC | FUSE_FSYNCDIR => {
+				let fh = read_struct::<u64>(req, IN_HEADER_SIZE).unwrap_or(0);
+				if let Some(f) = self.handles.get(&fh)
+					&& let Err(e) = f.sync_all()
+				{
+					return write_reply(mem, writable, unique, neg_errno(&e), &[]);
+				}
+				write_reply(mem, writable, unique, 0, &[])
+			},
+			// No host-side state to tear down: acknowledge.
+			FUSE_FLUSH | FUSE_ACCESS => write_reply(mem, writable, unique, 0, &[]),
+			// No-reply opcodes: the buffer is device-readable only.
+			FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT => 0,
+			FUSE_CREATE => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(cin) = read_struct::<FuseCreateIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseCreateIn>());
+				let Some(child) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				// Create + open the child without following a final-component
+				// symlink: with O_CREAT|O_NOFOLLOW an already-present symlink at
+				// `child` fails ELOOP, so a pre-planted symlink cannot escape.
+				match fs::OpenOptions::new()
+					.read(true)
+					.write(true)
+					.create(true)
+					.truncate(cin.flags & libc::O_TRUNC as u32 != 0)
+					.custom_flags(libc::O_NOFOLLOW)
+					.mode(cin.mode & 0o7777)
+					.open(&child)
+				{
+					Ok(file) => match fs::symlink_metadata(&child) {
+						Ok(md) => {
+							let id = self.intern(child);
+							let fh = self.insert_handle(file);
+							let entry = FuseEntryOut {
+								nodeid:           id,
+								generation:       0,
+								entry_valid:      TIMEOUT_SEC,
+								attr_valid:       TIMEOUT_SEC,
+								entry_valid_nsec: 0,
+								attr_valid_nsec:  0,
+								attr:             attr_from(id, &md),
+							};
+							let open = FuseOpenOut { fh, open_flags: 0, backing_id: 0 };
+							let mut body = Vec::with_capacity(
+								std::mem::size_of::<FuseEntryOut>() + std::mem::size_of::<FuseOpenOut>(),
+							);
+							body.extend_from_slice(struct_bytes(&entry));
+							body.extend_from_slice(struct_bytes(&open));
+							write_reply(mem, writable, unique, 0, &body)
+						},
+						Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_WRITE => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(win) = read_struct::<FuseWriteIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let data_off = IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>();
+				let end = data_off.saturating_add(win.size as usize);
+				let Some(data) = req.get(data_off..end) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				// Write through the tracked handle; fall back to a confined
+				// O_NOFOLLOW reopen by nodeid for a stale/unknown fh (post-
+				// restore) so the fallback can't follow a final symlink either.
+				let res = if let Some(f) = self.handles.get(&win.fh) {
+					f.write_at(data, win.offset)
+				} else {
+					match self.open_confined(nodeid, true) {
+						Ok(f) => f.write_at(data, win.offset),
+						Err(e) => Err(e),
+					}
+				};
+				match res {
+					Ok(n) => {
+						let out = FuseWriteOut { size: n as u32, padding: 0 };
+						write_reply(mem, writable, unique, 0, struct_bytes(&out))
+					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_SETATTR => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(sin) = read_struct::<FuseSetattrIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let Some(path) = self.inodes.get(&nodeid).cloned() else {
+					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				};
+				// Truncation prefers the tracked handle (FATTR_FH); without one
+				// apply_setattr reopens the confined path with O_NOFOLLOW.
+				let fh = if sin.valid & FATTR_FH != 0 {
+					self.handles.get(&sin.fh)
+				} else {
+					None
+				};
+				if let Err(e) = apply_setattr(&path, fh, &sin) {
+					return write_reply(mem, writable, unique, neg_errno(&e), &[]);
+				}
+				match fs::symlink_metadata(&path) {
+					Ok(md) => {
+						let out = FuseAttrOut {
+							attr_valid:      TIMEOUT_SEC,
+							attr_valid_nsec: 0,
+							dummy:           0,
+							attr:            attr_from(nodeid, &md),
+						};
+						write_reply(mem, writable, unique, 0, struct_bytes(&out))
+					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_MKDIR => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(min) = read_struct::<FuseMkdirIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMkdirIn>());
+				let Some(child) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				match fs::DirBuilder::new()
+					.mode(min.mode & !min.umask & 0o7777)
+					.create(&child)
+				{
+					Ok(()) => self.reply_entry(mem, writable, unique, child),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_UNLINK => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let name = first_name(req, IN_HEADER_SIZE);
+				let Some(child) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				match fs::remove_file(&child) {
+					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_RMDIR => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let name = first_name(req, IN_HEADER_SIZE);
+				let Some(child) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				match fs::remove_dir(&child) {
+					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_RENAME | FUSE_RENAME2 => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				// v1 carries `fuse_rename_in { newdir }`; v2 `fuse_rename2_in {
+				// newdir, flags, padding }`, both followed by the two names.
+				let (newdir, flags, names_off) = if h.opcode == FUSE_RENAME2 {
+					match read_struct::<FuseRename2In>(req, IN_HEADER_SIZE) {
+						Some(r) => {
+							(r.newdir, r.flags, IN_HEADER_SIZE + std::mem::size_of::<FuseRename2In>())
+						},
+						None => return write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+					}
+				} else {
+					match read_struct::<FuseRenameIn>(req, IN_HEADER_SIZE) {
+						Some(r) => (r.newdir, 0, IN_HEADER_SIZE + std::mem::size_of::<FuseRenameIn>()),
+						None => return write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+					}
+				};
+				let Some((oldname, newname)) = two_names(req, names_off) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let (Some(op), Some(np)) =
+					(self.inodes.get(&nodeid).cloned(), self.inodes.get(&newdir).cloned())
+				else {
+					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				};
+				let (Some(src), Some(dst)) =
+					(self.resolve_new_child(&op, oldname), self.resolve_new_child(&np, newname))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				if !rename2_flags_supported(flags) {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				}
+				if flags & RENAME_NOREPLACE != 0 && dst.exists() {
+					return write_reply(mem, writable, unique, -libc::EEXIST, &[]);
+				}
+				match fs::rename(&src, &dst) {
+					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_SYMLINK => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some((name, target)) = two_names(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let Some(link) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				let target = PathBuf::from(OsStr::from_bytes(target));
+				match std::os::unix::fs::symlink(&target, &link) {
+					Ok(()) => self.reply_entry(mem, writable, unique, link),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_LINK => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(lin) = read_struct::<FuseLinkIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseLinkIn>());
+				let Some(src) = self.inodes.get(&lin.oldnodeid).cloned() else {
+					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				};
+				let Some(dst) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				match fs::hard_link(&src, &dst) {
+					Ok(()) => self.reply_entry(mem, writable, unique, dst),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_FALLOCATE => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(fin) = read_struct::<FuseFallocateIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let want = fin.offset.saturating_add(fin.length);
+				// Operate on the tracked handle; fall back to a confined
+				// O_NOFOLLOW reopen by nodeid for a stale/unknown fh.
+				let res = if let Some(f) = self.handles.get(&fin.fh) {
+					fallocate_grow(f, want)
+				} else {
+					match self.open_confined(nodeid, true) {
+						Ok(f) => fallocate_grow(&f, want),
+						Err(e) => Err(e),
+					}
+				};
+				match res {
+					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			// Unknown / still-unsupported opcodes (xattrs, readdirplus, ioctl,
+			// ...): -ENOSYS makes the guest stop asking and fall back where it can.
+			_ => write_reply(mem, writable, unique, -libc::ENOSYS, &[]),
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// virtio device
+// ---------------------------------------------------------------------------
+
+pub struct Fs {
+	/// `virtio_fs_config` bytes (tag + `num_request_queues`).
+	config:         Vec<u8>,
+	features:       u64,
+	acked_features: u64,
+	queue_sizes:    Vec<u16>,
+
+	/// When set, every mutating FUSE opcode is rejected with `-EROFS`.
+	read_only: bool,
+	state:     FsState,
+
+	mem:          Option<GuestMemoryMmap>,
+	interrupt:    Option<Arc<Interrupt>>,
+	hiprio_queue: Option<Queue>,
+	req_queue:    Option<Queue>,
+}
+
+impl Fs {
+	/// Build a virtio-fs device exporting `shared_dir` under `tag`. When
+	/// `read_only`, every mutating FUSE opcode is rejected with `-EROFS`.
+	pub fn new(tag: String, shared_dir: PathBuf, read_only: bool) -> Result<Self> {
+		let shared_dir_display = shared_dir.display();
+		let root = fs::canonicalize(&shared_dir)
+			.map_err(|e| err(format!("virtio-fs shared dir {shared_dir_display}: {e}")))?;
+		if !root.is_dir() {
+			crate::bail!("virtio-fs shared dir {} is not a directory", root.display());
+		}
+
+		let mut inodes = HashMap::new();
+		inodes.insert(FUSE_ROOT_ID, root.clone());
+		let mut by_path = HashMap::new();
+		by_path.insert(root.clone(), FUSE_ROOT_ID);
+
+		Ok(Self::with_state(
+			tag,
+			FsState {
+				root,
+				inodes,
+				by_path,
+				next: FUSE_ROOT_ID + 1,
+				handles: HashMap::new(),
+				next_fh: 1,
+			},
+			read_only,
+		))
+	}
+
+	pub fn restore(
+		tag: String,
+		shared_dir: PathBuf,
+		state: &FsStateSer,
+		read_only: bool,
+	) -> Result<Self> {
+		Ok(Self::with_state(tag, FsState::restore(&shared_dir, state)?, read_only))
+	}
+
+	pub fn save(&self) -> FsStateSer {
+		self.state.save()
+	}
+
+	fn with_state(tag: String, state: FsState, read_only: bool) -> Self {
+		let mut config = vec![0u8; CONFIG_SPACE_SIZE];
+		let tag_bytes = tag.as_bytes();
+		let n = tag_bytes.len().min(TAG_LEN);
+		config[..n].copy_from_slice(&tag_bytes[..n]);
+		config[TAG_LEN..TAG_LEN + 4].copy_from_slice(&NUM_REQUEST_QUEUES.to_le_bytes());
+
+		Self {
+			config,
+			features: 1u64 << VIRTIO_F_VERSION_1,
+			acked_features: 0,
+			queue_sizes: vec![QUEUE_SIZE; NUM_QUEUES],
+			read_only,
+			state,
+			mem: None,
+			interrupt: None,
+			hiprio_queue: None,
+			req_queue: None,
+		}
+	}
+}
+
+impl VirtioDevice for Fs {
+	fn device_type(&self) -> u32 {
+		VIRTIO_ID_FS
+	}
+
+	fn queue_max_sizes(&self) -> &[u16] {
+		&self.queue_sizes
+	}
+
+	fn features(&self) -> u64 {
+		self.features
+	}
+
+	fn ack_features(&mut self, value: u64) {
+		self.acked_features = value & self.features;
+	}
+
+	fn read_config(&self, offset: u64, data: &mut [u8]) {
+		let offset = offset as usize;
+		for (i, b) in data.iter_mut().enumerate() {
+			*b = self.config.get(offset + i).copied().unwrap_or(0);
+		}
+	}
+
+	fn write_config(&mut self, _offset: u64, _data: &[u8]) {
+		// virtio-fs config space is read-only for the driver.
+	}
+
+	fn activate(
+		&mut self,
+		mem: GuestMemoryMmap,
+		interrupt: Arc<Interrupt>,
+		queues: Vec<Queue>,
+	) -> Result<()> {
+		// Queue order matches `queue_max_sizes`: 0 = hiprio, 1 = request.
+		let _ = (HIPRIO_QUEUE, REQUEST_QUEUE);
+		let mut queues = queues.into_iter();
+		self.hiprio_queue = queues.next();
+		self.req_queue = queues.next();
+		self.mem = Some(mem);
+		self.interrupt = Some(interrupt);
+		Ok(())
+	}
+
+	fn reset(&mut self) -> Result<()> {
+		self.acked_features = 0;
+		self.mem = None;
+		self.interrupt = None;
+		self.hiprio_queue = None;
+		self.req_queue = None;
+		Ok(())
+	}
+
+	fn process_queue_notify(&mut self) -> Result<()> {
+		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
+			return Ok(());
+		};
+		let mut used = false;
+
+		// hiprio (queue 0): FORGET/INTERRUPT only — release each buffer without
+		// a reply.
+		if let Some(hq) = self.hiprio_queue.as_mut() {
+			while let Some(chain) = hq.pop_descriptor_chain(&mem) {
+				let head = chain.head_index();
+				hq.add_used(&mem, head, 0)
+					.map_err(|e| err(format!("virtio-fs hiprio used-ring update failed: {e}")))?;
+				used = true;
+			}
+		}
+
+		// request queue (queue 1): service FUSE. Disjoint borrows — the inode
+		// table (`state`) and the queue are separate fields of `self`.
+		let read_only = self.read_only;
+		let state = &mut self.state;
+		if let Some(rq) = self.req_queue.as_mut() {
+			while let Some(chain) = rq.pop_descriptor_chain(&mem) {
+				let head = chain.head_index();
+				let written = match split_chain(&mem, chain) {
+					Some((req, writable)) => state.dispatch(&mem, &req, &writable, read_only),
+					None => 0,
+				};
+				rq.add_used(&mem, head, written)
+					.map_err(|e| err(format!("virtio-fs request used-ring update failed: {e}")))?;
+				used = true;
+			}
+		}
+
+		if used {
+			interrupt.signal_used_queue()?;
+		}
+		Ok(())
+	}
+
+	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {
+		// Order must mirror the transport's queue vec: hiprio (0) then request (1).
+		let mut v = Vec::new();
+		if let Some(q) = &self.hiprio_queue {
+			v.push(q.state());
+		}
+		if let Some(q) = &self.req_queue {
+			v.push(q.state());
+		}
+		v
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn temp_dir(prefix: &str) -> PathBuf {
+		let path = std::env::temp_dir().join(format!(
+			"{prefix}-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		fs::create_dir(&path).unwrap();
+		path
+	}
+
+	#[test]
+	fn fs_state_restore_drops_stale_paths() {
+		let root = temp_dir("vmon-fs-state");
+		fs::write(root.join("kept"), b"ok").unwrap();
+		let state = FsStateSer {
+			inodes: vec![
+				(FUSE_ROOT_ID, ".".to_string()),
+				(2, "kept".to_string()),
+				(3, "missing".to_string()),
+			],
+			next:   4,
+		};
+
+		let fs = Fs::restore("host".to_string(), root.clone(), &state, true).unwrap();
+		let saved = fs.save();
+
+		assert!(
+			saved
+				.inodes
+				.iter()
+				.any(|(id, path)| *id == 2 && path == "kept")
+		);
+		assert!(!saved.inodes.iter().any(|(id, _)| *id == 3));
+		assert_eq!(saved.next, 4);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	fn guest_mem() -> GuestMemoryMmap {
+		GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).expect("guest memory")
+	}
+
+	/// Build a FUSE request chain: `fuse_in_header` followed by `payload`.
+	fn fuse_request(opcode: u32, nodeid: u64, payload: &[u8]) -> Vec<u8> {
+		let len = IN_HEADER_SIZE + payload.len();
+		let header =
+			FuseInHeader { len: len as u32, opcode, unique: 1, nodeid, ..Default::default() };
+		let mut buf = Vec::with_capacity(len);
+		buf.extend_from_slice(struct_bytes(&header));
+		buf.extend_from_slice(payload);
+		buf
+	}
+
+	/// Dispatch one request against `fs` into a fresh guest memory and return
+	/// the reply `(error, body_bytes)`.
+	fn run_op(fs: &mut Fs, req: &[u8]) -> (i32, Vec<u8>) {
+		let mem = guest_mem();
+		let reply_at = GuestAddress(0x4000);
+		let writable = vec![(reply_at, 0x1000u32)];
+		let read_only = fs.read_only;
+		let n = fs.state.dispatch(&mem, req, &writable, read_only);
+
+		let mut hdr = [0u8; OUT_HEADER_SIZE];
+		mem.read_slice(&mut hdr, reply_at).unwrap();
+		let out: FuseOutHeader = read_struct(&hdr, 0).unwrap();
+		let total = out.len as usize;
+		assert_eq!(n, total as u32, "reply len {total} != written {n}");
+		let body_len = total.saturating_sub(OUT_HEADER_SIZE);
+		let mut body = vec![0u8; body_len];
+		if body_len > 0 {
+			mem.read_slice(&mut body, GuestAddress(reply_at.0 + OUT_HEADER_SIZE as u64))
+				.unwrap();
+		}
+		(out.error, body)
+	}
+
+	#[test]
+	fn writable_create_and_write_persist_to_host() {
+		let root = temp_dir("vmon-fs-write");
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		let cin = FuseCreateIn {
+			flags:      libc::O_RDWR as u32,
+			mode:       0o644,
+			umask:      0,
+			open_flags: 0,
+		};
+		let mut payload = struct_bytes(&cin).to_vec();
+		payload.extend_from_slice(b"f\0");
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_CREATE, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, 0, "create succeeds on a writable share");
+		assert_eq!(
+			body.len(),
+			std::mem::size_of::<FuseEntryOut>() + std::mem::size_of::<FuseOpenOut>(),
+			"CREATE reply is entry_out ++ open_out"
+		);
+		assert!(root.join("f").exists(), "file materialized on host");
+		let entry: FuseEntryOut = read_struct(&body, 0).unwrap();
+		let open: FuseOpenOut = read_struct(&body, std::mem::size_of::<FuseEntryOut>()).unwrap();
+		assert_ne!(open.fh, 0, "CREATE hands back a real (non-zero) file handle");
+
+		// WRITE through the returned fh (the handle table), not by reopening.
+		let win = FuseWriteIn { fh: open.fh, offset: 0, size: 5, ..Default::default() };
+		let mut payload = struct_bytes(&win).to_vec();
+		payload.extend_from_slice(b"hello");
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_WRITE, entry.nodeid, &payload));
+		assert_eq!(err, 0, "write through the returned fh succeeds");
+		let wout: FuseWriteOut = read_struct(&body, 0).unwrap();
+		assert_eq!(wout.size, 5, "all 5 bytes accounted for");
+		assert_eq!(fs::read(root.join("f")).unwrap(), b"hello");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn writable_mkdir_and_unlink() {
+		let root = temp_dir("vmon-fs-mkdir");
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		let min = FuseMkdirIn { mode: 0o755, umask: 0 };
+		let mut payload = struct_bytes(&min).to_vec();
+		payload.extend_from_slice(b"d\0");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_MKDIR, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, 0, "mkdir succeeds");
+		assert!(root.join("d").is_dir(), "directory created on host");
+
+		fs::write(root.join("victim"), b"x").unwrap();
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_UNLINK, FUSE_ROOT_ID, b"victim\0"));
+		assert_eq!(err, 0, "unlink succeeds");
+		assert!(!root.join("victim").exists(), "file removed from host");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn rename2_rejects_unsupported_flags_without_plain_rename() {
+		const RENAME_EXCHANGE: u32 = 1 << 1;
+		const RENAME_WHITEOUT: u32 = 1 << 2;
+
+		let root = temp_dir("vmon-fs-rename2-flags");
+		fs::write(root.join("old"), b"old").unwrap();
+		fs::write(root.join("dst"), b"dst").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		let rename2_payload = |flags: u32, old: &[u8], new: &[u8]| {
+			let rin = FuseRename2In { newdir: FUSE_ROOT_ID, flags, padding: 0 };
+			let mut payload = struct_bytes(&rin).to_vec();
+			payload.extend_from_slice(old);
+			payload.push(0);
+			payload.extend_from_slice(new);
+			payload.push(0);
+			payload
+		};
+
+		for flags in [RENAME_EXCHANGE, RENAME_WHITEOUT] {
+			let (err, _) = run_op(
+				&mut fs,
+				&fuse_request(FUSE_RENAME2, FUSE_ROOT_ID, &rename2_payload(flags, b"old", b"dst")),
+			);
+			assert_eq!(err, -libc::EINVAL, "unsupported rename2 flag rejected");
+			assert_eq!(
+				fs::read(root.join("old")).unwrap(),
+				b"old",
+				"source must not be moved by an unsupported rename2 flag"
+			);
+			assert_eq!(
+				fs::read(root.join("dst")).unwrap(),
+				b"dst",
+				"destination must not be clobbered by an unsupported rename2 flag"
+			);
+		}
+
+		let (err, _) = run_op(
+			&mut fs,
+			&fuse_request(FUSE_RENAME2, FUSE_ROOT_ID, &rename2_payload(0, b"old", b"plain")),
+		);
+		assert_eq!(err, 0, "plain rename2 still succeeds");
+		assert!(!root.join("old").exists());
+		assert_eq!(fs::read(root.join("plain")).unwrap(), b"old");
+
+		fs::write(root.join("noreplace-src"), b"src").unwrap();
+		fs::write(root.join("noreplace-dst"), b"dst").unwrap();
+		let (err, _) = run_op(
+			&mut fs,
+			&fuse_request(
+				FUSE_RENAME2,
+				FUSE_ROOT_ID,
+				&rename2_payload(RENAME_NOREPLACE, b"noreplace-src", b"noreplace-dst"),
+			),
+		);
+		assert_eq!(err, -libc::EEXIST, "RENAME_NOREPLACE still rejects existing dst");
+		assert_eq!(fs::read(root.join("noreplace-src")).unwrap(), b"src");
+		assert_eq!(fs::read(root.join("noreplace-dst")).unwrap(), b"dst");
+
+		let (err, _) = run_op(
+			&mut fs,
+			&fuse_request(
+				FUSE_RENAME2,
+				FUSE_ROOT_ID,
+				&rename2_payload(RENAME_NOREPLACE, b"noreplace-src", b"noreplace-new"),
+			),
+		);
+		assert_eq!(err, 0, "RENAME_NOREPLACE still permits a missing dst");
+		assert_eq!(fs::read(root.join("noreplace-new")).unwrap(), b"src");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn read_only_rejects_mutations_with_erofs() {
+		let root = temp_dir("vmon-fs-rofs");
+		fs::write(root.join("existing"), b"x").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), true).unwrap();
+
+		let cin = FuseCreateIn {
+			flags:      libc::O_RDWR as u32,
+			mode:       0o644,
+			umask:      0,
+			open_flags: 0,
+		};
+		let mut payload = struct_bytes(&cin).to_vec();
+		payload.extend_from_slice(b"new\0");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_CREATE, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, -libc::EROFS, "CREATE rejected read-only");
+
+		let win = FuseWriteIn {
+			fh:          FUSE_ROOT_ID,
+			offset:      0,
+			size:        1,
+			write_flags: 0,
+			lock_owner:  0,
+			flags:       0,
+			padding:     0,
+		};
+		let mut payload = struct_bytes(&win).to_vec();
+		payload.extend_from_slice(b"y");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, -libc::EROFS, "WRITE rejected read-only");
+
+		let min = FuseMkdirIn { mode: 0o755, umask: 0 };
+		let mut payload = struct_bytes(&min).to_vec();
+		payload.extend_from_slice(b"d\0");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_MKDIR, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, -libc::EROFS, "MKDIR rejected read-only");
+
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_UNLINK, FUSE_ROOT_ID, b"existing\0"));
+		assert_eq!(err, -libc::EROFS, "UNLINK rejected read-only");
+		assert!(root.join("existing").exists(), "read-only UNLINK must not delete");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn read_only_open_rejects_write_flags_but_allows_read() {
+		let root = temp_dir("vmon-fs-open");
+		fs::write(root.join("f"), b"data").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), true).unwrap();
+
+		// fuse_open_in is { flags: u32, unused: u32 }.
+		let mut ro = (libc::O_RDONLY as u32).to_le_bytes().to_vec();
+		ro.extend_from_slice(&0u32.to_le_bytes());
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_OPEN, FUSE_ROOT_ID, &ro));
+		assert_eq!(err, 0, "read-only open of a read-only share is allowed");
+
+		let mut wo = (libc::O_WRONLY as u32).to_le_bytes().to_vec();
+		wo.extend_from_slice(&0u32.to_le_bytes());
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_OPEN, FUSE_ROOT_ID, &wo));
+		assert_eq!(err, -libc::EROFS, "write-open of a read-only share is rejected");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn writable_open_fh_write_then_read_roundtrip() {
+		let root = temp_dir("vmon-fs-openfh");
+		fs::write(root.join("f"), b"0000000000").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		// LOOKUP "f" to intern its nodeid.
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_LOOKUP, FUSE_ROOT_ID, b"f\0"));
+		assert_eq!(err, 0, "lookup of an existing file");
+		let ent: FuseEntryOut = read_struct(&body, 0).unwrap();
+
+		// OPEN RDWR -> a real, non-zero fh.
+		let mut flags = (libc::O_RDWR as u32).to_le_bytes().to_vec();
+		flags.extend_from_slice(&0u32.to_le_bytes());
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_OPEN, ent.nodeid, &flags));
+		assert_eq!(err, 0, "open of an existing file on a writable share");
+		let open: FuseOpenOut = read_struct(&body, 0).unwrap();
+		assert_ne!(open.fh, 0, "OPEN returns a real fh");
+
+		// WRITE "abc" at offset 2 through the fh.
+		let win = FuseWriteIn { fh: open.fh, offset: 2, size: 3, ..Default::default() };
+		let mut payload = struct_bytes(&win).to_vec();
+		payload.extend_from_slice(b"abc");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, ent.nodeid, &payload));
+		assert_eq!(err, 0, "write via the fh");
+		assert_eq!(fs::read(root.join("f")).unwrap(), b"00abc00000");
+
+		// READ 3 bytes at offset 2 through the fh.
+		let rin = FuseReadIn { fh: open.fh, offset: 2, size: 3, ..Default::default() };
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_READ, ent.nodeid, struct_bytes(&rin)));
+		assert_eq!(err, 0, "read via the fh");
+		assert_eq!(body, b"abc", "read returns exactly what the fh wrote");
+
+		// RELEASE drops the handle; a now-stale fh falls back to the confined
+		// path reopen (still O_NOFOLLOW), so the write still lands.
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_RELEASE, ent.nodeid, struct_bytes(&open)));
+		assert_eq!(err, 0, "release the handle");
+		let win = FuseWriteIn { fh: open.fh, offset: 0, size: 2, ..Default::default() };
+		let mut payload = struct_bytes(&win).to_vec();
+		payload.extend_from_slice(b"ZZ");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, ent.nodeid, &payload));
+		assert_eq!(err, 0, "write after release falls back to a confined reopen");
+		assert_eq!(fs::read(root.join("f")).unwrap(), b"ZZabc00000");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn open_rejects_final_component_symlink() {
+		let root = temp_dir("vmon-fs-symlink");
+		fs::write(root.join("f"), b"inside").unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		// Intern "f" via LOOKUP while it is still a real file.
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_LOOKUP, FUSE_ROOT_ID, b"f\0"));
+		assert_eq!(err, 0, "lookup of the real file");
+		let ent: FuseEntryOut = read_struct(&body, 0).unwrap();
+
+		// TOCTOU: swap the final component for a symlink pointing outside root.
+		fs::remove_file(root.join("f")).unwrap();
+		std::os::unix::fs::symlink("/etc/passwd", root.join("f")).unwrap();
+
+		// OPEN must refuse to traverse the final-component symlink (O_NOFOLLOW).
+		let mut flags = (libc::O_RDONLY as u32).to_le_bytes().to_vec();
+		flags.extend_from_slice(&0u32.to_le_bytes());
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_OPEN, ent.nodeid, &flags));
+		assert_eq!(err, -libc::ELOOP, "OPEN refuses a final-component symlink");
+
+		// A fallback WRITE by nodeid (unknown fh) is likewise refused.
+		let win = FuseWriteIn { fh: 0, offset: 0, size: 1, ..Default::default() };
+		let mut payload = struct_bytes(&win).to_vec();
+		payload.extend_from_slice(b"x");
+		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, ent.nodeid, &payload));
+		assert_eq!(err, -libc::ELOOP, "fallback WRITE refuses a final-component symlink");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+}

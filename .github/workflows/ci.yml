@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: AArch64 check
+        run: cargo check --workspace --all-targets --locked --target aarch64-unknown-linux-gnu
+
+      - name: AArch64 clippy
+        run: cargo clippy --workspace --all-targets --locked --target aarch64-unknown-linux-gnu -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
+
+  macos:
+    name: macOS aarch64 HVF
+    runs-on: macos-15-xlarge
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Install macOS native dependencies
+        run: brew install libslirp pkg-config
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Codesign HVF binary
+        run: just codesign
+
+      - name: Compile tests
+        run: cargo test --locked --no-run

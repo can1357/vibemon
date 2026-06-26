@@ -1,0 +1,211 @@
+# Vibemon — a friendly microVM CLI & SDK
+
+Run containers as hardware-isolated microVMs, suspend/resume them, snapshot a
+booted container into a template, then **warm-boot** (restore) or **fork** that
+template in milliseconds. Built on the [`vmon`](../) KVM VMM.
+
+```
+                    docker image / Dockerfile
+                              │  vmon run
+                              ▼
+   ┌──────────┐  snapshot  ┌────────────┐  restore (~120ms)  ┌──────────┐
+   │ microVM  │ ─────────▶ │  template  │ ─────────────────▶ │ warm VM  │
+   │ (booted) │            │ (on disk)  │  fork  (~3ms, CoW) │ clones   │
+   └──────────┘            └────────────┘ ─────────────────▶ └──────────┘
+```
+
+## Requirements
+
+Runs on a Linux host with **KVM** (`/dev/kvm`), a container engine
+(`docker` or `podman`), and the `vmon` binary built (`cargo build --release`).
+A guest kernel is auto-detected from `/boot/vmlinuz-$(uname -r)` (override with
+`VMON_KERNEL`).
+
+`run` boots an agent-enabled microVM by default: a small, statically linked guest
+agent (`vmon-agent`) is injected into the image rootfs. Release wheels ship it; in
+a source checkout, build and bundle it once with `just agent-musl` (or point
+`VMON_AGENT` at a static build). Pass `--no-agent` to use the legacy initramfs
+console path instead, which needs no agent or guest block device.
+
+## Install
+
+```sh
+pip install -e python/        # provides the `vmon` command
+# or run without installing:
+PYTHONPATH=python python3 -m vmon --help
+```
+
+## CLI
+
+`vmon` is a thin Docker-like client. It talks to a **zero-config local daemon**
+(`vmond`) over a Unix socket at `$VMON_HOME/vmond.sock` (default `~/.vmon/vmond.sock`);
+the first command auto-starts the daemon if it is not already running. The daemon
+is the single owner of `~/.vmon`: it holds the VM registry, rehydrates VMs from
+disk on restart, and spawns one `vmon` VMM process per microVM. You never invoke
+the VMM's flags by hand — `run`/`ps`/`logs`/`exec`/`stop` all route through the
+daemon, exactly like `docker` ↔ `dockerd` ↔ `runc`.
+
+```sh
+# Drop into an ephemeral interactive shell (fresh Debian sandbox, removed on exit)
+vmon shell
+
+# ...or a shell in a specific image / an attached running VM / a one-off command
+vmon shell --image alpine
+vmon shell web                 # attach to a running microVM (instant)
+vmon shell --image alpine -c 'cat /etc/os-release'
+
+# Boot a container image (runs the entrypoint, streams the console, exits when done)
+vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
+
+# Build & boot a Dockerfile
+vmon run -f ./Dockerfile --context .
+
+# Long-running service, detached
+vmon run -d --name web nginx
+
+# Suspend / resume a running microVM
+vmon pause web
+vmon resume web
+
+# Snapshot a booted container into a reusable template
+vmon snapshot web webtemplate
+
+# Warm-boot a fresh instance from the template (~120ms for a 256 MiB VM)
+vmon restore webtemplate --name web2
+
+# Fork N copy-on-write clones (shared clean RAM pages; ~3ms, ~22 MiB each)
+vmon fork webtemplate --count 5
+
+vmon ps          # list microVMs
+vmon logs web    # show a microVM's console
+vmon exec web -- sh -lc 'echo hi'   # run a command in an agent-enabled VM (-t for a PTY)
+vmon stop web    # quit a microVM
+vmon rm web      # remove it
+
+# Daemon control (auto-started on first use; rarely needed by hand)
+vmon daemon status   # running pid + socket path
+vmon daemon stop     # stop the local daemon and remove its socket
+vmon daemon start    # explicitly start it
+```
+
+## SDK
+
+```python
+from vmon import MicroVM
+
+# Boot a container
+vm = MicroVM.run(image="alpine", cmd=["sh", "-c", "echo hi"], mem=256)
+
+# ...or from a Dockerfile
+vm = MicroVM.run(dockerfile="Dockerfile", context=".")
+
+vm.pause(); vm.resume()                 # suspend / resume
+
+vm.snapshot("template", keep_running=False)   # pause + snapshot a template
+
+warm = MicroVM.restore("template")            # warm-boot (~120ms)
+print(warm.meta["reconstruct_ms"])            # vmon-reported reconstruct time
+
+clones = warm.fork("template", count=3)        # CoW clones (shared pages)
+for c in clones:
+    print(c.name, c.meta["reconstruct_ms"])    # ~3ms each
+```
+
+## Sandbox SDK
+
+`Sandbox` is the higher-level API for agent-style jobs. It restores from templates, attaches the guest agent, and exposes exec, files, networking, volumes, secrets, snapshots, and tunnels.
+
+```python
+from vmon.sandbox import Sandbox
+from vmon.secret import Secret
+from vmon.volume import Volume
+
+sb = Sandbox.create(
+    image="alpine",
+    timeout_secs=300,
+    volumes={"/data": Volume("agent_data")},
+    secrets=[Secret.from_dict({"TOKEN": "sekret"}), Secret.from_env("API_KEY")],
+    tags={"job": "oneshot"},
+)
+
+p = sb.exec("bash", pty=True)
+p.resize(40, 120)
+p.write_stdin("echo hello >/data/out\nexit\n")
+code = p.wait()
+```
+
+Volumes are named host directories under `VMON_HOME`, mounted into the guest with writable virtio-fs by default. They persist across sandbox restores and are excluded from filesystem snapshots; `Sandbox.create(volumes={"/data": Volume("agent_data")})` re-attaches the same volume by name. Each volume has a single-writer lock so two live VMs cannot write it at once.
+
+Secrets are injected into exec environments and are never written to `meta.json`. Use `Secret.from_dict({...})` for explicit values or `Secret.from_env("TOKEN")` to copy selected host variables.
+
+### Networking and tunnels
+
+`Sandbox.create` accepts `block_network=True`, CIDR `egress_allow=[...]`, DNS-pinned `egress_allow_domains=[...]`, `ports=[...]`, and `inbound_cidr_allowlist=[...]`. Domain allowlists are resolved to IP firewall rules and refreshed during the sandbox lifetime; they are not live TLS-SNI filtering.
+
+```python
+web = Sandbox.create(
+    template="web",
+    ports=[8080],
+    egress_allow=["10.0.0.0/8"],
+    egress_allow_domains=["api.github.com"],
+    inbound_cidr_allowlist=["203.0.113.0/24"],
+)
+
+token = web.create_connect_token()
+print(web.tunnels())  # {8080: ("127.0.0.1", 49152)}
+```
+
+The REST server exposes the authenticated proxy at `/v1/sandboxes/{id}/ports/{port}/...`; pass the token as `Authorization: Bearer <token>` or `?token=...`.
+
+### Snapshots, timeouts, warm pools, and async
+
+```python
+img = sb.snapshot_filesystem("img1")          # default TTL: 30 days
+again = Sandbox.create(template=img)
+
+fast = Sandbox.create(template="base", pool_size=4)
+same = Sandbox.from_id(fast.name)
+```
+
+`Sandbox.create(timeout_secs=...)` passes a hard deadline to the VMM. If it expires, `status.json` records `reason:"timeout"` and return code `124`; explicit termination records `137`. Use `Sandbox.extend(secs)` or `POST /v1/sandboxes/{id}/extend` to move the deadline.
+
+Warm pools keep pre-forked copy-on-write clones for a template and fall back to cold restore on a miss. Tags are stored with the sandbox (`Sandbox.create(tags={"team": "ci"})`) and the REST API can filter them with `GET /v1/sandboxes?tag=team:ci`.
+
+`Sandbox.aio.*` mirrors the synchronous SDK using `asyncio.to_thread`, so async callers do not need a second API.
+
+### REST API
+
+Install the server extra, then run `vmon serve` — the same single-owner process as
+the daemon, plus a FastAPI HTTP/web gateway over the same engine, so the local
+`vmon` CLI and the REST API share one VM registry:
+
+```sh
+pip install -e 'python[server]'
+VMON_API_TOKEN=secret vmon serve --host 0.0.0.0 --port 8000
+```
+
+The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, snapshots, network policy, tunnels, authenticated port proxying, deadline extension, metrics, and lifecycle events. `GET /v1/events` streams lifecycle events as SSE, and FastAPI serves OpenAPI docs at `/docs`. A bearer token (`--token` or `VMON_API_TOKEN`) is required; the `core.Engine` underneath is dependency-free (the `[server]` extra only adds FastAPI/uvicorn for this gateway).
+
+
+## How it works
+
+- **run** — `docker/podman` builds/exports the image filesystem; `vmon` injects a
+  tiny PID-1 that mounts `/proc /sys /dev`, restores the image's env/workdir, and
+  runs its entrypoint, then packs it as an initramfs and boots it under vmon.
+- **pause/resume** — vmon parks the vCPUs at a safe point and quiesces device
+  workers over its Unix control socket.
+- **snapshot** — serializes the full machine state (vCPU regs/MSRs/xstate, the
+  interrupt controllers/timers, device + queue state), guest RAM, and virtio-fs inode/mode metadata.
+- **restore** — reconstructs that state into a fresh VM (no kernel boot); a 256
+  MiB Alpine template warm-boots in ~120 ms on x86 KVM.
+- **fork** — maps the template's RAM `MAP_PRIVATE`, so every clone shares clean
+  pages through the host page cache and only pays copy-on-write for what it
+  touches (~22 MiB RSS per clone vs ~256 MiB for a full VM).
+- **volumes** — attaches named virtio-fs host directories, writable by default. Volume data is not included in snapshots; restores re-attach the named host directory.
+
+## Notes / limits
+
+- The static guest agent is injected into built images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
+- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmon` VMM and its many flags are an internal runtime detail spawned by the daemon. Set `VMON_REMOTE=host:port` (with `VMON_API_TOKEN`) to drive a remote daemon that listens on TCP — i.e. one started with `VMON_DAEMON_TCP=host:port` (via `python -m vmon.daemon` or `vmon serve`).
+- `VMON_BIN` / `VMON_KERNEL` / `VMON_HOME` override the binary, kernel, and
+  state directory (`~/.vmon`).

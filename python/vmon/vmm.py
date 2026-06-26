@@ -1,0 +1,574 @@
+"""The MicroVM SDK: boot containers, suspend/resume, snapshot/restore, fork."""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from .agent import AgentConn
+from .control import Control
+from .image import build_rootfs
+
+STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+
+
+def _arch() -> str:
+    m = platform.machine()
+    return "aarch64" if m in ("aarch64", "arm64") else "x86_64"
+
+
+def _is_python_console_script(path: str) -> bool:
+    """True if *path* is a ``#!...python`` text wrapper (the ``vmon`` CLI), not the VMM.
+
+    Post-rebrand the Rust VMM and the Python console script are both named
+    ``vmon``; a PATH lookup must skip the CLI wrapper to avoid the daemon
+    spawning the CLI as the per-VM runtime (infinite self-recursion).
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.readline(256)
+    except OSError:
+        return False
+    return head.startswith(b"#!") and b"python" in head
+
+
+def _which_all(name: str):
+    """Yield every executable named *name* on ``PATH``, in lookup order."""
+    seen: set[str] = set()
+    for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not directory or directory in seen:
+            continue
+        seen.add(directory)
+        candidate = shutil.which(name, path=directory)
+        if candidate:
+            yield candidate
+
+
+def find_binary() -> str:
+    """Locate the vmon VMM binary (env override, repo target dirs, or PATH).
+
+    The PATH fallback skips the ``vmon`` Python console script so the daemon never
+    re-execs the CLI as the per-VM runtime.
+    """
+    if env := os.environ.get("VMON_BIN"):
+        return env
+    triple = f"{_arch()}-unknown-linux-gnu"
+    here = Path(__file__).resolve()
+    repo = here.parents[2]
+    candidates = [
+        repo / "target" / triple / "release" / "vmon",
+        repo / "target" / "release" / "vmon",
+    ]
+    if target_dir := os.environ.get("CARGO_TARGET_DIR"):
+        candidates.append(Path(target_dir) / triple / "release" / "vmon")
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    for found in _which_all("vmon"):
+        if not _is_python_console_script(found):
+            return found
+    raise RuntimeError(
+        "vmon binary not found. Build it (cargo build --release) or set VMON_BIN."
+    )
+
+
+def default_kernel() -> str:
+    if env := os.environ.get("VMON_KERNEL"):
+        return env
+    k = Path(f"/boot/vmlinuz-{platform.release()}")
+    if k.is_file():
+        return str(k)
+    raise RuntimeError("no kernel found; set VMON_KERNEL=/path/to/Image-or-bzImage")
+
+
+def _cmdline() -> str:
+    base = "console=ttyS0 reboot=t panic=-1 rdinit=/init"
+    if _arch() == "aarch64":
+        base += " earlycon=uart8250,mmio,0x9000000"
+    return base
+
+
+def _agent_cmdline() -> str:
+    base = "console=ttyS0 reboot=t panic=-1 root=/dev/vda init=/.vmon/agent vmon.agent=serve"
+    if _arch() == "aarch64":
+        base += " earlycon=uart8250,mmio,0x9000000"
+    return base
+
+
+def _valid_snapshot_name(name: str) -> str:
+    if not name or name in {".", ".."} or name.startswith("."):
+        raise ValueError("snapshot name must be a non-hidden relative name")
+    if "\x00" in name or "/" in name or "\\" in name or ".." in name:
+        raise ValueError("snapshot name must not contain path separators or '..'")
+    return name
+
+
+def _snapshot_state_present(snap_dir: Path) -> bool:
+    """True if *snap_dir* holds restorable snapshot state.
+
+    Mirrors vmon's ``selected_layout``: a snapshot is either a manifest-published
+    generation (``current-generation`` + ``vmstate.<gen>.bin``) or the legacy
+    ``vmstate.bin`` pair. Gating on ``vmstate.bin`` alone rejects every snapshot the
+    current VMM writes, since the writer only emits generation files.
+    """
+    return (snap_dir / "current-generation").is_file() or (snap_dir / "vmstate.bin").is_file()
+
+
+def copy_reflink(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> Path:
+    """Copy ``src`` to ``dst`` using CoW reflinks when the host supports them."""
+    src_p = Path(src)
+    dst_p = Path(dst)
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst_p.with_name(dst_p.name + f".tmp-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    try:
+        subprocess.run(["cp", "--reflink=auto", str(src_p), str(tmp)],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        shutil.copy2(src_p, tmp)
+    os.replace(tmp, dst_p)
+    return dst_p
+
+
+def _volume_args(volumes) -> list[str]:
+    """Format ``(tag, host_dir, read_only)`` tuples as repeatable ``--volume`` CLI args (the VMM validates; this only formats)."""
+    args: list[str] = []
+    for tag, host_dir, read_only in (volumes or []):
+        args.extend(["--volume", f"{tag}:{host_dir}" + (":ro" if read_only else "")])
+    return args
+
+
+class MicroVM:
+    """A microVM instance, addressed by a stable ``name``."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.dir = STATE / "vms" / name
+        self.sock = self.dir / "api.sock"
+        self.log = self.dir / "console.log"
+        self.meta_path = self.dir / "meta.json"
+        self._agent_conn: AgentConn | None = None
+        self._agent_lock = threading.Lock()
+
+    @property
+    def meta(self) -> dict:
+        try:
+            return json.loads(self.meta_path.read_text())
+        except FileNotFoundError:
+            return {}
+
+    def _save_meta(self, **kw) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        m = self.meta
+        m.update(kw)
+        self.meta_path.write_text(json.dumps(m, indent=2, sort_keys=True))
+
+    @property
+    def control_sock(self) -> Path:
+        m = self.meta
+        if jail_root := m.get("jail_root"):
+            return Path(jail_root) / "root" / "run" / "vmon" / "control.sock"
+        return Path(m.get("sock") or self.sock)
+
+    @property
+    def agent_sock(self) -> Path:
+        m = self.meta
+        if jail_root := m.get("jail_root"):
+            return Path(jail_root) / "root" / "run" / "vmon" / "agent.sock"
+        return Path(m.get("agent_sock") or (self.dir / "agent.sock"))
+
+    @property
+    def rootfs_img(self) -> Path:
+        return Path(self.meta.get("rootfs") or (self.dir / "rootfs.img"))
+
+    @property
+    def control(self) -> Control:
+        return Control(str(self.control_sock))
+
+    def agent(self, connect_timeout: float | None = None) -> AgentConn:
+        """Return a cached :class:`AgentConn`, reconnecting if it closed or the socket moved."""
+        sock = str(self.agent_sock)
+        with self._agent_lock:
+            cached = self._agent_conn
+            if cached is not None and cached.sock_path == sock and not cached.closed:
+                return cached
+        # Connect outside the lock so a slow/retrying connect never stalls other callers.
+        conn = self._connect_agent(sock, connect_timeout)
+        with self._agent_lock:
+            current = self._agent_conn
+            if current is not None and current.sock_path == sock and not current.closed:
+                self._close_conn(conn)  # lost the race; reuse the connection another caller cached
+                return current
+            if current is not None and current is not conn:
+                self._close_conn(current)  # drop a stale conn (closed or pointing at an old socket)
+            self._agent_conn = conn
+            return conn
+
+    def _connect_agent(self, sock: str, connect_timeout: float | None) -> AgentConn:
+        deadline = None if connect_timeout is None else time.time() + connect_timeout
+        last: BaseException | None = None
+        while True:
+            try:
+                return AgentConn(sock, connect_timeout=min(connect_timeout or 1.0, 1.0))
+            except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
+                last = e
+                if deadline is None or time.time() >= deadline:
+                    raise TimeoutError(f"agent socket {sock} not ready: {last}") from e
+                time.sleep(0.01)
+
+    def _close_agent(self) -> None:
+        with self._agent_lock:
+            conn, self._agent_conn = self._agent_conn, None
+        self._close_conn(conn)
+
+    @staticmethod
+    def _close_conn(conn: AgentConn | None) -> None:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def is_running(self) -> bool:
+        pid = self.meta.get("pid")
+        if not pid:
+            return False
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if proc_stat.exists():
+            try:
+                state = proc_stat.read_text().split(") ", 1)[1].split(" ", 1)[0]
+            except (FileNotFoundError, ProcessLookupError, IndexError):
+                return False
+            if state in ("Z", "X", "x"):
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except OSError:
+                    pass
+                return False
+            return True
+        # No /proc (e.g. macOS/HVF): a dead child VMM lingers as a zombie that
+        # still answers kill(0), so reap it first when it is our child. A reaped
+        # pid means it exited; ChildProcessError means it is not our child (a
+        # rehydrated VMM after a daemon restart), so fall back to a liveness probe.
+        try:
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            return reaped != pid
+        except OSError:
+            pass  # not our child (rehydrated VMM) or unwaitable -> probe below
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def logs(self) -> str:
+        try:
+            return self.log.read_text(errors="replace")
+        except FileNotFoundError:
+            return ""
+
+    @classmethod
+    def run(cls, image: str | None = None, dockerfile: str | None = None, context: str = ".",
+            name: str | None = None, mem: int = 256, cpus: int = 1,
+            cmd: list[str] | None = None, console_agent: bool = False,
+            agent: bool = False) -> "MicroVM":
+        """Legacy initramfs boot path; the higher-level Sandbox API is agent-first."""
+        if agent:
+            from .sandbox import Sandbox
+            sb = Sandbox.create(image=image, dockerfile=dockerfile, context=context,
+                                name=name, cpus=cpus, memory=mem)
+            return sb.vm
+        name = name or _instance_name("vm")
+        vm = cls(name)
+        vm.dir.mkdir(parents=True, exist_ok=True)
+        initramfs, spec = build_rootfs(image, dockerfile, context, cmd, out_dir=str(vm.dir))
+        args = [
+            "--kernel", default_kernel(), "--initrd", str(initramfs),
+            "--mem", str(mem), "--cpus", str(cpus),
+            "--api-sock", str(vm.sock), "--cmdline", _cmdline(),
+        ]
+        if console_agent:
+            args.append("--console-agent")
+        vm._launch(args, control_sock=vm.sock, image=spec.reference, mem=mem, cpus=cpus,
+                   initramfs=str(initramfs), snapshot_root=None)
+        return vm
+
+    @classmethod
+    def boot_rootfs(cls, rootfs: str | os.PathLike[str], *, name: str | None = None,
+                    mem: int = 512, cpus: int = 1,
+                    snapshot_root: str | os.PathLike[str] | None = None,
+                    image: str | None = None, read_only: bool = False,
+                    agent: bool = True, overlay: bool = False,
+                    tap: str | None = None,
+                    fs_dir: str | os.PathLike[str] | None = None,
+                    volumes: list[tuple[str, str, bool]] | None = None,
+                    timeout_secs: int | None = None) -> "MicroVM":
+        """Fresh direct-kernel boot from an ext4 rootfs.
+
+        With ``overlay`` the rootfs is exposed as a copy-on-write overlay so the
+        backing image is never mutated. ``tap`` attaches a virtio-net device bound
+        to a pre-created host TAP (the restore path cannot synthesize a NIC the
+        snapshot lacks, so networked sandboxes fresh-boot through here).
+        ``fs_dir``/``volumes`` add virtio-fs shares and ``timeout_secs`` arms the
+        VMM wall-clock deadline.
+        """
+        name = name or _instance_name("vm")
+        vm = cls(name)
+        vm.dir.mkdir(parents=True, exist_ok=True)
+        rootfs_p = Path(rootfs)
+        args = [
+            "--kernel", default_kernel(), "--mem", str(mem), "--cpus", str(cpus),
+            "--api-sock", str(vm.sock), "--cmdline", _agent_cmdline() if agent else _cmdline(),
+        ]
+        if overlay:
+            disk = vm.dir / "rootfs.img"
+            args.extend(["--disk-overlay-of", str(rootfs_p), "--rootfs", str(disk)])
+        else:
+            disk = rootfs_p
+            args.extend(["--rootfs", str(rootfs_p)])
+            if read_only:
+                args.append("--rootfs-ro")
+        agent_sock = vm.dir / "agent.sock" if agent else None
+        if agent_sock is not None:
+            args.extend(["--agent-sock", str(agent_sock)])
+        if tap is not None:
+            args.extend(["--tap", str(tap)])
+        if fs_dir is not None:
+            args.extend(["--fs-tag", "host", "--fs-dir", str(fs_dir)])
+        vols = list(volumes or [])
+        args.extend(_volume_args(vols))
+        if timeout_secs is not None:
+            args.extend(["--timeout-secs", str(int(timeout_secs))])
+        if snapshot_root is not None:
+            args.extend(["--snapshot-root", str(snapshot_root)])
+        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock, image=image,
+                   mem=mem, cpus=cpus, rootfs=str(disk), tap=tap,
+                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
+                   snapshot_root=str(snapshot_root) if snapshot_root else None)
+        return vm
+
+    @classmethod
+    def restore(cls, snapshot: str | os.PathLike[str], name: str | None = None,
+                *, agent: bool = False, fs_dir: str | os.PathLike[str] | None = None,
+                mem: int | None = None, cpus: int | None = None,
+                volumes: list[tuple[str, str, bool]] | None = None,
+                timeout_secs: int | None = None) -> "MicroVM":
+        """Warm-boot a microVM from a snapshot directory or named snapshot."""
+        snap_dir = cls._snapshot_dir(snapshot)
+        if not _snapshot_state_present(snap_dir):
+            raise FileNotFoundError(f"no snapshot {snapshot!r} at {snap_dir}")
+        base_name = Path(snapshot).name if not isinstance(snapshot, Path) else snapshot.name
+        name = name or _instance_name(base_name or "restore")
+        vm = cls(name)
+        vm.dir.mkdir(parents=True, exist_ok=True)
+        args = ["--restore", str(snap_dir), "--api-sock", str(vm.sock)]
+        if mem is not None:
+            args.extend(["--mem", str(mem)])
+        if cpus is not None:
+            args.extend(["--cpus", str(cpus)])
+        rootfs = None
+        snap_rootfs = snap_dir / "rootfs.img"
+        if snap_rootfs.is_file():
+            rootfs = vm.dir / "rootfs.img"
+            args.extend(["--disk-overlay-of", str(snap_rootfs), "--rootfs", str(rootfs)])
+        agent_sock = vm.dir / "agent.sock" if agent else None
+        if agent_sock is not None:
+            args.extend(["--agent-sock", str(agent_sock)])
+        if fs_dir is not None:
+            args.extend(["--fs-tag", "host", "--fs-dir", str(fs_dir)])
+        vols = list(volumes or [])
+        args.extend(_volume_args(vols))
+        if timeout_secs is not None:
+            args.extend(["--timeout-secs", str(int(timeout_secs))])
+        args.extend(["--snapshot-root", str(STATE / "snapshots")])
+        t0 = time.time()
+        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock,
+                   restored_from=str(snapshot), rootfs=str(rootfs) if rootfs else None,
+                   snapshot_root=str(STATE / "snapshots"),
+                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols])
+        vm._record_reconstruct(t0)
+        return vm
+
+    @classmethod
+    def fork_snapshot(cls, snapshot: str | os.PathLike[str], name: str | None = None,
+                      *, agent: bool = False,
+                      volumes: list[tuple[str, str, bool]] | None = None,
+                      timeout_secs: int | None = None) -> "MicroVM":
+        snap_dir = cls._snapshot_dir(snapshot)
+        if not _snapshot_state_present(snap_dir):
+            raise FileNotFoundError(f"no snapshot {snapshot!r} at {snap_dir}")
+        base_name = Path(snapshot).name if not isinstance(snapshot, Path) else snapshot.name
+        name = name or _instance_name(f"{base_name or 'snapshot'}-fork")
+        vm = cls(name)
+        vm.dir.mkdir(parents=True, exist_ok=True)
+        args = ["--fork-from", str(snap_dir), "--api-sock", str(vm.sock)]
+        rootfs = None
+        snap_rootfs = snap_dir / "rootfs.img"
+        if snap_rootfs.is_file():
+            rootfs = vm.dir / "rootfs.img"
+            args.extend(["--disk-overlay-of", str(snap_rootfs), "--rootfs", str(rootfs)])
+        agent_sock = vm.dir / "agent.sock" if agent else None
+        if agent_sock is not None:
+            args.extend(["--agent-sock", str(agent_sock)])
+        vols = list(volumes or [])
+        args.extend(_volume_args(vols))
+        if timeout_secs is not None:
+            args.extend(["--timeout-secs", str(int(timeout_secs))])
+        args.extend(["--snapshot-root", str(STATE / "snapshots")])
+        t0 = time.time()
+        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock,
+                   forked_from=str(snapshot), rootfs=str(rootfs) if rootfs else None,
+                   snapshot_root=str(STATE / "snapshots"),
+                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols])
+        vm._record_reconstruct(t0)
+        return vm
+
+    def fork(self, snapshot: str | os.PathLike[str], count: int = 1,
+             names: list[str] | None = None) -> list["MicroVM"]:
+        clones = []
+        for i in range(count):
+            cname = names[i] if names and i < len(names) else None
+            clones.append(self.fork_snapshot(snapshot, name=cname, agent=bool(self.meta.get("agent_sock"))))
+        return clones
+
+    def _launch(self, extra_args: list[str], *, control_sock: Path | None = None,
+                agent_sock: Path | None = None, launch_timeout: float = 15.0, **meta) -> None:
+        control_sock = control_sock or self.sock
+        snapshot_root = Path(meta.pop("snapshot_root", None) or (STATE / "snapshots"))
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        for sock in (control_sock, agent_sock):
+            if sock is not None:
+                Path(sock).unlink(missing_ok=True)
+        binary = find_binary()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        # vmon rejects a control/agent socket whose immediate parent dir is
+        # group- or world-accessible; the process umask can leave it 0775, so
+        # force each socket parent to 0700 before launch.
+        for sock in (control_sock, agent_sock):
+            if sock is not None:
+                Path(sock).parent.chmod(0o700)
+        logf = open(self.log, "wb")
+        launch_args = list(extra_args)
+        if "--snapshot-root" not in launch_args:
+            launch_args.extend(["--snapshot-root", str(snapshot_root)])
+        # Local-dev escape hatch: disable vmon's Stage-B process filters
+        # (seccomp/Landlock). Use only on a trusted host (e.g. a dev VM); never
+        # for untrusted guests. See vmon's `--no-sandbox`.
+        if os.environ.get("VMON_NO_SANDBOX") not in (None, "", "0") and "--no-sandbox" not in launch_args:
+            launch_args.append("--no-sandbox")
+        proc = subprocess.Popen([binary, *launch_args], stdout=logf, stderr=logf,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        self._save_meta(pid=proc.pid, sock=str(control_sock),
+                        agent_sock=str(agent_sock) if agent_sock else None,
+                        binary=binary, snapshot_root=str(snapshot_root),
+                        started=time.time(), status="running", **meta)
+        deadline = time.time() + launch_timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                tail = "\n".join(self.logs().splitlines()[-15:])
+                raise RuntimeError(
+                    f"vmon exited (code {proc.returncode}) before the VM came up:\n{tail}"
+                )
+            try:
+                self.control.wait_ready(timeout=0.05)
+                return
+            except (TimeoutError, OSError, RuntimeError):
+                time.sleep(0.002)
+        raise TimeoutError(f"VM '{self.name}' control socket never came up; see {self.log}")
+
+    def _record_reconstruct(self, started: float) -> None:
+        reconstruct_ms = None
+        m = re.search(r"reconstruct took ([0-9.]+)ms", self.logs())
+        if m:
+            reconstruct_ms = float(m.group(1))
+        self._save_meta(restore_ms=round((time.time() - started) * 1000, 1),
+                        reconstruct_ms=reconstruct_ms)
+
+    def pause(self):
+        return self.control.pause()
+
+    def resume(self):
+        return self.control.resume()
+
+    def snapshot(self, snapshot: str, keep_running: bool = True,
+                 *, disk_src: str | os.PathLike[str] | None = None,
+                 snapshot_root: str | os.PathLike[str] | None = None,
+                 base: str | None = None) -> Path:
+        """Pause, optionally capture rootfs.img, snapshot VM state, then resume or stop.
+
+        When ``base`` names a sibling snapshot (same launch ``--snapshot-root``), the
+        VMM stores only the guest-RAM pages that differ from it, producing a delta
+        (incremental) snapshot. Restore reconstructs the base+delta chain.
+
+        ``snapshot_root`` only redirects the host-side ``rootfs.img`` copy and the
+        returned directory; the VMM always writes state under its launch
+        ``--snapshot-root`` joined with ``name``, so pass a root that matches it.
+        """
+        name = _valid_snapshot_name(str(snapshot))
+        root = Path(snapshot_root or self.meta.get("snapshot_root") or (STATE / "snapshots"))
+        snap_dir = self._snapshot_dir(name, root=root)
+        paused = False
+        try:
+            self.control.pause()
+            paused = True
+            if disk_src is not None:
+                copy_reflink(disk_src, snap_dir / "rootfs.img")
+            self.control.snapshot(name, base=base)
+        except BaseException:
+            if paused and keep_running:
+                try:
+                    self.control.resume()
+                except BaseException:
+                    pass
+            raise
+        if keep_running:
+            self.control.resume()
+        else:
+            self.stop()
+        return snap_dir
+
+    def stop(self) -> None:
+        self._close_agent()
+        try:
+            self.control.quit()
+        except (OSError, RuntimeError):
+            pid = self.meta.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        self._save_meta(status="stopped")
+
+    def remove(self) -> None:
+        self._close_agent()
+        if self.is_running():
+            self.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    @staticmethod
+    def _snapshot_dir(snapshot: str | os.PathLike[str], root: str | os.PathLike[str] | None = None) -> Path:
+        p = Path(snapshot)
+        if p.is_absolute() or len(p.parts) > 1:
+            return p
+        return Path(root or (STATE / "snapshots")) / str(snapshot)
+
+    @classmethod
+    def list(cls) -> list["MicroVM"]:
+        vms_dir = STATE / "vms"
+        if not vms_dir.is_dir():
+            return []
+        return [cls(p.name) for p in sorted(vms_dir.iterdir()) if p.is_dir()]
+
+
+def _instance_name(prefix: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "-", prefix).strip(".-") or "vm"
+    return f"{clean}-{int(time.time() * 1000) % 1_000_000:06d}"

@@ -1,0 +1,2 @@
+# Keep cargo host-native by default. Cross-target checks/builds pass
+# `--target ...` explicitly so both x86_64 and aarch64 paths are exercised.

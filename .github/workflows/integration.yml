@@ -1,0 +1,71 @@
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: KVM integration
+    runs-on: [self-hosted, kvm, x64]
+    env:
+      VMON_TAP: vmon0
+      VMON_HOST_IP: 192.168.249.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Fetch test assets
+        run: just fetch-assets
+
+      - name: Prepare host tap
+        run: |
+          sudo ip link delete vmon0 2>/dev/null || true
+          sudo ip tuntap add dev vmon0 mode tap
+          sudo ip addr add 192.168.249.1/24 dev vmon0
+          sudo ip link set dev vmon0 up
+
+      - name: Run integration tests
+        run: just integration
+
+      - name: Run soak tests
+        if: github.event_name == 'schedule'
+        run: just soak
+
+  hvf-integration:
+    name: HVF integration
+    # Needs a bare-metal Apple Silicon self-hosted runner: GitHub-hosted macOS
+    # runners are themselves VMs and cannot create an HVF guest (HV_DENIED).
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Install native dependencies
+        run: brew install libslirp pkg-config e2fsprogs cpio
+
+      - name: Run HVF integration tests
+        run: just integration
+
+      - name: Run soak tests
+        if: github.event_name == 'schedule'
+        run: just soak

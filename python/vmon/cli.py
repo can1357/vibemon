@@ -1,0 +1,400 @@
+"""`vmon` — a Modal-style CLI that drives microVMs through the ``vmond`` daemon.
+
+Every command is a request to a local daemon (auto-started on first use); the
+daemon owns the registry and spawns the per-VM ``vmon`` VMM processes. The CLI
+speaks to :class:`vmon.client.DaemonClient` and renders everything through
+:mod:`vmon.console` (the only place :mod:`click`/:mod:`rich` are imported), so the
+SDK and daemon stay dependency-light.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import click
+
+from . import __version__
+from . import console as ui
+from .client import DaemonClient, DaemonError
+from .console import RichGroup
+
+# ``-h`` as well as ``--help``; PTY/REMAINDER commands stop option parsing at the
+# first positional so a trailing command keeps its own flags (Docker-style).
+_CTX = {"help_option_names": ["-h", "--help"]}
+_REMAINDER = {**_CTX, "ignore_unknown_options": True, "allow_interspersed_args": False}
+
+# click ≥8.2 reports an empty group invocation (``no_args_is_help``) as a
+# ``NoArgsIsHelpError`` whose message *is* the rendered help. Empty on click 8.1,
+# where the same case echoes help and exits 0 (an ``isinstance`` no-op).
+_NO_ARGS_HELP = getattr(click.exceptions, "NoArgsIsHelpError", ())
+
+
+def _write_event(stream: str, data: bytes) -> None:
+    """Write a streamed daemon frame to stdout/stderr (bytes-faithful)."""
+    target = sys.stderr if stream == "stderr" else sys.stdout
+    buffer = getattr(target, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+    else:
+        target.write(data.decode("utf-8", "replace"))
+        target.flush()
+
+
+def _strip_dashdash(cmd: tuple[str, ...]) -> list[str]:
+    """Drop a leading ``--`` separator click may leave in REMAINDER args."""
+    argv = list(cmd)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    return argv
+
+
+def _parse_env(pairs: tuple[str, ...]) -> dict[str, str]:
+    """``KEY=VALUE`` injects a value; bare ``KEY`` copies it from the host env."""
+    import os
+
+    env: dict[str, str] = {}
+    for item in pairs:
+        key, sep, value = item.partition("=")
+        if not key:
+            raise click.BadParameter(f"invalid --env {item!r}; expected KEY=VALUE")
+        env[key] = value if sep else os.environ.get(key, "")
+    return env
+
+
+def _parse_remote(spec: str) -> tuple[str, str] | None:
+    if ":" not in spec:
+        return None
+    name, path = spec.split(":", 1)
+    if not name or not path:
+        return None
+    return name, path
+
+
+@click.group(cls=RichGroup, context_settings=_CTX,
+             help="Hardware-isolated microVMs: boot containers, drop into a shell, "
+                  "snapshot, and fork — all through a zero-config local daemon.")
+@click.version_option(__version__, "-v", "--version", message="vmon %(version)s")
+def cli() -> None:
+    pass
+
+
+# -- core commands ---------------------------------------------------------
+
+@cli.command(panel="Commands", context_settings=_REMAINDER,
+             help="Boot a container image or Dockerfile as an agent sandbox and "
+                  "stream its output (use -d to leave it running in the background).")
+@click.argument("image", required=False)
+@click.argument("cmd", nargs=-1, type=click.UNPROCESSED, metavar="[-- CMD ...]")
+@click.option("-f", "--dockerfile", help="build & run this Dockerfile instead of an image")
+@click.option("--context", default=".", show_default=True, help="Docker build context")
+@click.option("--name", help="microVM name (default: auto)")
+@click.option("--mem", type=int, default=512, show_default=True, help="guest RAM in MiB")
+@click.option("--cpus", type=int, default=1, show_default=True, help="vCPUs")
+@click.option("--disk-mb", type=int, default=1024, show_default=True, help="sandbox disk size in MiB")
+@click.option("--timeout", type=float, default=300.0, show_default=True, help="create timeout in seconds")
+@click.option("--no-agent", is_flag=True, help="use the legacy initramfs console path")
+@click.option("-d", "--detach", is_flag=True, help="run in background")
+def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, no_agent, detach):
+    if not image and not dockerfile:
+        raise click.UsageError("provide an image (vmon run alpine) or -f Dockerfile")
+    client = DaemonClient()
+    params = dict(
+        image=image, dockerfile=dockerfile, context=context, name=name,
+        mem=mem, cpus=cpus, disk_mb=disk_mb, timeout=timeout,
+        cmd=_strip_dashdash(cmd) or None, no_agent=no_agent, detach=detach)
+    if detach:
+        r = client.call("run", **params)
+        vm = r.get("name")
+        ui.success(f"started [vmon.command]{vm}[/] (pid {r.get('pid')})  image={r.get('image')}")
+        verb = "logs" if no_agent else "exec"
+        ui.hint(f"vmon {verb} {vm} … │ vmon snapshot {vm} <tpl> │ vmon stop {vm}")
+        return 0
+    r = client.stream("run", _write_event, **params)
+    return int(r.get("returncode") or 0)
+
+
+@cli.command(panel="Commands", context_settings=_CTX,
+             help="Run a command or an interactive ephemeral shell inside a microVM.\n\n"
+                  "REF attaches to a running VM (instant) or warm-boots a snapshot; "
+                  "otherwise a fresh sandbox is booted from --image (or REF as an image, "
+                  "default debian) and removed on exit. A PTY is used automatically when "
+                  "attached to a terminal.")
+@click.argument("ref", required=False)
+@click.option("-c", "--cmd", "command", help="command to run (default: an interactive shell)")
+@click.option("--image", help="container image for a fresh shell (if REF is not given)")
+@click.option("-e", "--env", "env", multiple=True, metavar="KEY=VALUE",
+              help="set an env var (repeatable; bare KEY copies from the host)")
+@click.option("--mem", type=int, default=512, show_default=True, help="guest RAM in MiB")
+@click.option("--cpus", type=int, default=1, show_default=True, help="vCPUs")
+@click.option("--disk-mb", type=int, default=1024, show_default=True, help="sandbox disk size in MiB")
+@click.option("--timeout", type=float, default=300.0, show_default=True, help="create timeout in seconds")
+@click.option("--pty/--no-pty", default=None, help="force a PTY on/off (default: auto by TTY)")
+def shell(ref, command, image, env, mem, cpus, disk_mb, timeout, pty):
+    interactive = command is None  # no -c -> an interactive REPL
+    if pty is None:
+        tty = sys.stdin.isatty() and sys.stdout.isatty()
+        if interactive and not tty:
+            # A bare `vmon shell` is a REPL; without a terminal the guest shell
+            # would read EOF and exit at once. Fail loudly instead of silently.
+            ui.error("vmon shell needs a terminal for an interactive shell")
+            ui.hint("run it in a TTY, pass -c '<cmd>' for a one-off, or --no-pty")
+            return 2
+    else:
+        tty = pty
+    argv = ["/bin/sh", "-c", command] if command else None
+    params = dict(ref=ref, image=image, cmd=argv, env=_parse_env(env) or None,
+                  mem=mem, cpus=cpus, disk_mb=disk_mb, timeout=timeout)
+    client = DaemonClient()
+    spinner = (ui.console.status("[vmon.accent]Booting microVM…[/]", spinner="dots")
+               if ui.console.is_terminal else None)
+    state = {"ready": False}
+
+    def on_ready(name: str) -> None:
+        if spinner is not None and not state["ready"]:
+            spinner.stop()
+        state["ready"] = True
+
+    if spinner is not None:
+        spinner.start()
+    try:
+        r = client.interactive("shell", _write_event, tty=tty, on_ready=on_ready, **params)
+    finally:
+        if spinner is not None and not state["ready"]:
+            spinner.stop()
+    return int(r.get("returncode") or 0)
+
+
+@cli.command(panel="Commands", context_settings=_REMAINDER,
+             help="Run a command inside an agent-enabled microVM (use -t for a PTY).")
+@click.argument("name")
+@click.argument("cmd", nargs=-1, type=click.UNPROCESSED, metavar="-- CMD ...")
+@click.option("-t", "--tty", is_flag=True, help="allocate a PTY (interactive)")
+def exec(name, cmd, tty):
+    argv = _strip_dashdash(cmd)
+    if not argv:
+        raise click.UsageError("exec requires a command (vmon exec NAME -- <cmd>)")
+    client = DaemonClient()
+    if tty:
+        r = client.interactive("exec", _write_event, tty=True, name=name, cmd=argv)
+        return int(r.get("returncode") or 0)
+    r = client.stream("exec", _write_event, stdin=sys.stdin.buffer, name=name, cmd=argv)
+    return int(r.get("returncode") or 0)
+
+
+@cli.command(panel="Commands", context_settings=_CTX,
+             help="Copy a file between host and guest: <name>:<path> <local> or reverse.")
+@click.argument("src")
+@click.argument("dst")
+def cp(src, dst):
+    import base64
+
+    client = DaemonClient()
+    src_remote = _parse_remote(src)
+    dst_remote = _parse_remote(dst)
+    if bool(src_remote) == bool(dst_remote):
+        raise click.UsageError("cp requires exactly one remote operand of the form <name>:<path>")
+    if src_remote:
+        name, remote_path = src_remote
+        data = base64.b64decode(client.call("cp_read", name=name, path=remote_path)["data"])
+        out = Path(dst)
+        if out.is_dir():
+            out = out / Path(remote_path).name
+        out.write_bytes(data)
+    else:
+        name, remote_path = dst_remote  # type: ignore[misc]
+        data = Path(src).read_bytes()
+        client.call("cp_write", name=name, path=remote_path,
+                    data=base64.b64encode(data).decode("ascii"))
+    return 0
+
+
+@cli.command(panel="Commands", context_settings=_CTX, help="List microVMs.")
+def ps():
+    vms = DaemonClient().call("ps").get("vms") or []
+    if not vms:
+        ui.console.print("[vmon.muted]no microVMs[/] — boot one with [vmon.command]vmon run <image>[/]")
+        return 0
+    ui.vm_table(vms)
+    return 0
+
+
+@cli.command(panel="Commands", context_settings=_CTX, help="Show a microVM's console.")
+@click.argument("name")
+@click.option("-f", "--follow", is_flag=True, help="follow output")
+def logs(name, follow):
+    DaemonClient().stream("logs", _write_event, name=name, follow=follow)
+    return 0
+
+
+# -- lifecycle -------------------------------------------------------------
+
+@cli.command(panel="Lifecycle", context_settings=_CTX, help="Suspend a running microVM.")
+@click.argument("name")
+def pause(name):
+    DaemonClient().call("pause", name=name)
+    ui.success(f"paused [vmon.command]{name}[/]")
+    return 0
+
+
+@cli.command(panel="Lifecycle", context_settings=_CTX, help="Resume a suspended microVM.")
+@click.argument("name")
+def resume(name):
+    DaemonClient().call("resume", name=name)
+    ui.success(f"resumed [vmon.command]{name}[/]")
+    return 0
+
+
+@cli.command(panel="Lifecycle", context_settings=_CTX, help="Stop a running microVM.")
+@click.argument("name")
+def stop(name):
+    DaemonClient().call("stop", name=name)
+    ui.success(f"stopped [vmon.command]{name}[/]")
+    return 0
+
+
+@cli.command(panel="Lifecycle", context_settings=_CTX, help="Remove a microVM.")
+@click.argument("name")
+def rm(name):
+    DaemonClient().call("rm", name=name)
+    ui.success(f"removed [vmon.command]{name}[/]")
+    return 0
+
+
+# -- snapshots -------------------------------------------------------------
+
+@cli.command(panel="Snapshots", context_settings=_CTX,
+             help="Snapshot a microVM's machine state into a named template.")
+@click.argument("name")
+@click.argument("snapshot")
+@click.option("--stop", is_flag=True, help="stop the VM after snapshotting")
+def snapshot(name, snapshot, stop):
+    r = DaemonClient().call("snapshot", name=name, snapshot=snapshot, stop=stop)
+    ui.success(f"snapshot [vmon.command]{snapshot}[/] → {r.get('dir')}")
+    return 0
+
+
+@cli.command(panel="Snapshots", context_settings=_CTX,
+             help="Warm-boot a microVM from a snapshot (<200ms).")
+@click.argument("snapshot")
+@click.option("--name", help="new VM name")
+@click.option("--agent", is_flag=True, help="attach an agent socket")
+@click.option("-d", "--detach", is_flag=True, help="run in background")
+def restore(snapshot, name, agent, detach):
+    client = DaemonClient()
+    params = dict(snapshot=snapshot, name=name, agent=agent, detach=detach)
+    r = client.call("restore", **params) if detach else client.stream("restore", _write_event, **params)
+    rec = r.get("reconstruct_ms")
+    rec_str = f"{rec}ms" if rec is not None else "n/a"
+    ui.success(f"warm-booted [vmon.command]{r.get('name')}[/] from {snapshot}  "
+               f"(reconstruct={rec_str}, end-to-end={r.get('restore_ms')}ms)")
+    return 0 if detach else int(r.get("returncode") or 0)
+
+
+@cli.command(panel="Snapshots", context_settings=_CTX,
+             help="Fork N copy-on-write clones from a snapshot.")
+@click.argument("snapshot")
+@click.option("--count", type=int, default=2, show_default=True, help="number of clones")
+def fork(snapshot, count):
+    clones = DaemonClient().call("fork", snapshot=snapshot, count=count).get("clones") or []
+    ui.info(f"forked {len(clones)} CoW clone(s) from [vmon.command]{snapshot}[/]:")
+    for c in clones:
+        # Name first so scripts can ``line.split()[0]``; keep the ``(pid`` marker.
+        ui.console.print(f"[vmon.command]{c['name']}[/]  "
+                         f"(pid {c.get('pid')}, CoW reconstruct={c.get('reconstruct_ms')}ms)")
+    return 0
+
+
+# -- daemon ----------------------------------------------------------------
+
+@cli.command(panel="Daemon", context_settings=_CTX, help="Manage the local vmond daemon.")
+@click.argument("action", type=click.Choice(["start", "stop", "status"]))
+def daemon(action):
+    if action == "status":
+        try:
+            info = DaemonClient(autostart=False).call("info")
+        except DaemonError as e:
+            if e.code in ("unreachable", "closed"):
+                ui.console.print("[vmon.warn]vmond[/]: not running")
+                return 1
+            raise
+        ui.console.print(f"[vmon.success]vmond[/]: running (pid {info.get('pid')})  "
+                         f"socket={info.get('socket')} version={info.get('version')}")
+        return 0
+    if action == "stop":
+        try:
+            info = DaemonClient(autostart=False).stop_daemon()
+        except DaemonError as e:
+            if e.code in ("unreachable", "closed"):
+                ui.console.print("[vmon.warn]vmond[/]: not running")
+                return 0
+            raise
+        ui.success(f"vmond stopped (pid {info.get('pid')})")
+        return 0
+    info = DaemonClient().ensure_running()
+    ui.success(f"vmond running (pid {info.get('pid')})  socket={info.get('socket')}")
+    return 0
+
+
+@cli.command(panel="Daemon", context_settings=_CTX,
+             help="Serve the HTTP sandbox API (requires vmon[server]).")
+@click.option("--host", default="127.0.0.1", show_default=True, help="bind host")
+@click.option("--port", type=int, default=8000, show_default=True, help="bind port")
+@click.option("--token", help="bearer token (or VMON_API_TOKEN)")
+@click.option("--idle-timeout", type=float, default=300.0, show_default=True,
+              help="terminate idle sandboxes after this many seconds")
+def serve(host, port, token, idle_timeout):
+    try:
+        from .server import serve as serve_http
+    except ModuleNotFoundError as e:
+        if e.name in {"fastapi", "uvicorn"}:
+            ui.error("vmon serve requires the server extra: pip install 'vmon[server]'")
+            return 1
+        raise
+    serve_http(host=host, port=port, token=token, idle_timeout=idle_timeout)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for the ``vmon`` command and ``python -m vmon``.
+
+    Runs the click CLI in non-standalone mode so command return values become
+    the process exit code and daemon/usage errors render through
+    :mod:`vmon.console` instead of click's defaults.
+    """
+    try:
+        return cli.main(args=argv, prog_name="vmon", standalone_mode=False) or 0
+    except SystemExit as e:  # --help / --version call ctx.exit()
+        code = e.code
+        return code if isinstance(code, int) else (0 if code is None else 1)
+    except click.UsageError as e:
+        # ``vmon`` with no command: print the help verbatim (it is the error's
+        # message) instead of dressing it up with a ✗ and re-rendering it through
+        # a Rich console, which mangles the box borders. Exit 0, matching click 8.1.
+        if isinstance(e, _NO_ARGS_HELP):
+            print(e.format_message())
+            return 0
+        ui.error(e.format_message())
+        if e.ctx is not None:
+            ui.hint(f"try 'vmon {e.ctx.command_path.removeprefix('vmon ')} --help'"
+                    if e.ctx.command_path != "vmon" else "try 'vmon --help'")
+        return e.exit_code
+    except click.ClickException as e:
+        ui.error(e.format_message())
+        return e.exit_code
+    except click.exceptions.Abort:
+        ui.error("aborted")
+        return 130
+    except KeyboardInterrupt:
+        return 130
+    except DaemonError as e:
+        ui.error(str(e))
+        return 1
+    except (RuntimeError, FileNotFoundError, TimeoutError, ValueError) as e:
+        ui.error(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

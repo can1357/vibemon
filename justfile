@@ -1,0 +1,226 @@
+# vmon — build, sign, run, and test across the three supported environments:
+#
+#   * macOS host        Hypervisor.framework (HVF). The binary must be ad-hoc
+#                       codesigned with `hvf.entitlements` before it can run.
+#   * Lima (Linux/KVM)  A Linux guest with nested KVM, driven from macOS via
+#                       `limactl shell`; the `lima-*` recipes relay into it.
+#   * Linux host        KVM directly. Integration/soak/seccomp tests run here.
+#
+# Host recipes (`build`, `run`, `test`, `integration`, ...) auto-pick the right
+# implementation for the current OS: Linux runs KVM directly; macOS runs HVF
+# natively, ad-hoc codesigning the spawned binary via demo/hvf-test-runner.sh.
+# The `lima-*` recipes additionally drive the Linux/KVM path from a Mac.
+# Override behaviour with variables, e.g. `just profile=release run --restore D`.
+
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+# Build profile: debug | release.
+profile := env_var_or_default("PROFILE", "debug")
+# macOS HVF entitlements file used for ad-hoc codesigning.
+entitlements := "hvf.entitlements"
+# Lima instance name for the Linux-in-macOS path.
+lima_vm := env_var_or_default("VMON_LIMA_VM", "kvm")
+# vmon checkout inside the Lima guest (the macOS checkout is not mounted there).
+lima_repo := env_var_or_default("LIMA_REPO", "~/vmon")
+
+# `--release` when profile is release, empty otherwise.
+_prof_flag := if profile == "release" { "--release" } else { "" }
+# Guest bash preamble: $1 = repo dir -> cd into it (expanding a leading ~),
+# drop it from $@, and put a rustup-installed cargo on PATH.
+lima_sh := 'cd "${1/#\~/$HOME}" 2>/dev/null || { echo "guest: vmon not found at $1 (clone it there or set LIMA_REPO)" >&2; exit 1; }; shift; . ~/.cargo/env 2>/dev/null || true; '
+
+# List available recipes.
+default:
+    @{{just_executable()}} --list
+
+# ---------------------------------------------------------------- build / sign
+
+_compile:
+    cargo build {{_prof_flag}}
+
+# Debug build; ad-hoc HVF-codesigned on macOS, plain on Linux.
+[macos]
+build: _compile codesign
+
+[linux]
+build: _compile
+
+# Release build (+ codesign on macOS).
+release:
+    @{{just_executable()}} profile=release build
+
+# Resolve the host path to the vmon binary for a profile (debug|release).
+_bin prof:
+    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
+
+# Print the path to the built vmon binary (honors `profile`).
+bin:
+    @{{just_executable()}} _bin {{profile}}
+
+# Ad-hoc codesign the built binary with HVF entitlements (macOS only).
+[macos]
+codesign:
+    codesign --sign - --entitlements {{entitlements}} --force "$({{just_executable()}} _bin {{profile}})"
+
+[linux]
+codesign:
+    @echo "codesign: not required on Linux (KVM)"
+
+# ------------------------------------------------------------------------- run
+
+# macOS HVF needs no root for the hypervisor itself; vmnet networking does
+# (run the whole command under sudo).
+# Build, sign, then run vmon, e.g. `just run --restore /tmp/snaps/snap1`.
+[macos]
+[positional-arguments]
+run *args: build
+    exec "$({{just_executable()}} _bin {{profile}})" "$@"
+
+# Linux/KVM needs root for /dev/kvm + TAP networking.
+[linux]
+[positional-arguments]
+run *args: build
+    exec sudo "$({{just_executable()}} _bin {{profile}})" "$@"
+
+# ----------------------------------------------------------------------- tests
+
+# Host unit + integration tests (KVM-gated cases auto-skip off Linux/KVM).
+[positional-arguments]
+test *args:
+    cargo test "$@"
+
+# e2e suite on Linux/KVM (TAP/PCI/pager cases run; macOS-only ones auto-skip).
+[linux]
+integration: fetch-assets
+    VMON_E2E=1 cargo test --tests -- --test-threads=1
+
+# e2e suite on macOS/HVF (user-net runs; TAP/PCI/pager auto-skip). The runner
+# ad-hoc signs the spawned vmon with the hypervisor entitlement per test.
+[macos]
+integration: fetch-assets
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
+    VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
+    VMON_E2E=1 cargo test --tests -- --test-threads=1
+
+# Long-running soak test on Linux/KVM.
+[linux]
+soak: fetch-assets
+    VMON_E2E=1 VMON_SOAK=1 cargo test --test soak -- --test-threads=1
+
+# Long-running soak test on macOS/HVF.
+[macos]
+soak: fetch-assets
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
+    VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
+    VMON_E2E=1 VMON_SOAK=1 cargo test --test soak -- --test-threads=1
+
+# Run the integration suite with seccomp in log mode to audit the syscall allowlist.
+[linux]
+seccomp-audit: fetch-assets
+    VMON_E2E=1 VMON_SECCOMP_ACTION=log cargo test --tests -- --test-threads=1
+    @echo
+    @echo "seccomp-audit: scan kernel audit records for denied syscalls, e.g.:"
+    @echo "  journalctl -k | grep -i SECCOMP   # or: dmesg | grep -i seccomp"
+
+# Seccomp allowlist audit, relayed into the Lima guest.
+[macos]
+seccomp-audit:
+    @{{just_executable()}} lima-seccomp-audit
+
+# --------------------------------------------------------------- checks / misc
+
+# Type-check the workspace for the host target.
+check:
+    cargo check --workspace --all-targets
+
+# Clippy with warnings denied.
+clippy:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Format the workspace.
+fmt:
+    cargo fmt --all
+
+# Verify formatting without writing.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Download pinned UEFI firmware + guest images used by the integration suite.
+fetch-assets:
+    ./demo/fetch-test-assets.sh
+
+# Compatibility alias for the old asset-fetch command name.
+fetch-test-assets: fetch-assets
+
+# Build the React/Vite web UI into python/vmon/web.
+ui:
+    cd ui && npm install && npm run build
+
+# Build the statically linked (musl) guest agent for the host arch and bundle it
+# into the Python package (python/vmon/_agent) so `vmon run` finds it unflagged.
+agent-musl:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    arch="$(uname -m | sed 's/arm64/aarch64/')"
+    triple="${arch}-unknown-linux-musl"
+    rustup target add "$triple"
+    if command -v cargo-zigbuild >/dev/null 2>&1; then
+        cargo zigbuild --release -p vmon-agent --target "$triple"
+    else
+        cargo build --release -p vmon-agent --target "$triple"
+    fi
+    target_dir="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}"
+    dest="{{justfile_directory()}}/python/vmon/_agent"
+    mkdir -p "$dest"
+    cp "$target_dir/$triple/release/vmon-agent" "$dest/vmon-agent-$arch"
+    echo "bundled guest agent -> $dest/vmon-agent-$arch"
+
+# Remove build artifacts.
+clean:
+    cargo clean
+
+# ----------------------------------------------- Lima (Linux/KVM inside macOS)
+
+# Fail early unless limactl is installed and the VM exists.
+_lima-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v limactl >/dev/null 2>&1 || { echo "error: limactl not found — install Lima with 'brew install lima'" >&2; exit 1; }
+    limactl list -q 2>/dev/null | grep -qx '{{lima_vm}}' || {
+        echo "error: lima VM '{{lima_vm}}' not found. Create one with nested KVM:" >&2
+        echo "  limactl start --vm-type=vz --set='.nestedVirtualization=true' --name={{lima_vm}} template:default" >&2
+        exit 1
+    }
+
+# Relay a fixed shell snippet into the guest (cwd = lima_repo, cargo on PATH).
+_lima cmd: _lima-check
+    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}{{cmd}}' lima '{{lima_repo}}'
+
+# Build the release binary inside the Lima guest.
+lima-build: _lima-check
+    @{{just_executable()}} _lima 'cargo build --release'
+
+# Run vmon inside the guest (sudo for /dev/kvm + TAP); forwards args verbatim.
+[positional-arguments]
+lima-run *args: lima-build
+    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}exec sudo target/release/vmon "$@"' lima '{{lima_repo}}' "$@"
+
+# Cargo tests inside the guest.
+lima-test:
+    @{{just_executable()}} _lima 'cargo test'
+
+# KVM integration suite inside the guest (fetches assets first).
+lima-integration:
+    @{{just_executable()}} _lima './demo/fetch-test-assets.sh && VMON_E2E=1 cargo test --tests -- --test-threads=1'
+
+# Soak test inside the guest.
+lima-soak:
+    @{{just_executable()}} _lima './demo/fetch-test-assets.sh && VMON_E2E=1 VMON_SOAK=1 cargo test --test soak -- --test-threads=1'
+
+# Seccomp allowlist audit inside the guest.
+lima-seccomp-audit:
+    @{{just_executable()}} _lima './demo/fetch-test-assets.sh && VMON_E2E=1 VMON_SECCOMP_ACTION=log cargo test --tests -- --test-threads=1'
+
+# Open an interactive shell in the Lima guest.
+lima-shell: _lima-check
+    @exec limactl shell '{{lima_vm}}'
