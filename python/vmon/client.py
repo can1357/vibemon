@@ -192,8 +192,8 @@ class DaemonClient:
                         raw = self._enter_raw()
                         self._send_winsize(conn)
                         winch = self._install_winch(conn)
-                        target = self._forward_raw_stdin
-                        args = (conn, stop)
+                        target: Callable[..., None] = self._forward_raw_stdin
+                        args: tuple[Any, ...] = (conn, stop)
                     else:
                         stdin = getattr(sys.stdin, "buffer", sys.stdin)
                         target = self._forward_stdin
@@ -252,13 +252,15 @@ class DaemonClient:
 
     @staticmethod
     def _send_winsize(conn: _Conn) -> None:
-        try:
-            size = os.get_terminal_size(sys.stdout.fileno())
-        except OSError, ValueError, AttributeError:
-            import shutil
+        import shutil
 
-            size = shutil.get_terminal_size((80, 24))
-        conn.send_resize(size.lines, size.columns)
+        try:
+            cols, lines = os.get_terminal_size(sys.stdout.fileno())
+        except OSError, ValueError, AttributeError:
+            cols, lines = 0, 0
+        if cols <= 0 or lines <= 0:
+            cols, lines = shutil.get_terminal_size((80, 24))
+        conn.send_resize(lines, cols)
 
     def _install_winch(self, conn: _Conn) -> Any:
         def handler(_signum: int, _frame: Any) -> None:

@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
-from collections.abc import AsyncIterator, MutableMapping
 import contextlib
 import hashlib
 import ipaddress
@@ -20,6 +19,7 @@ import queue
 import secrets
 import threading
 import time
+from collections.abc import AsyncIterator, MutableMapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode

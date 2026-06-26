@@ -52,6 +52,7 @@ mod linux_agent {
 	const STREAM_CHUNK: usize = 64 * 1024;
 
 	#[repr(C)]
+	#[allow(clippy::struct_field_names, reason = "netlink kernel ABI field names")]
 	struct IfInfoMsg {
 		ifi_family: u8,
 		ifi_pad:    u8,
@@ -62,6 +63,7 @@ mod linux_agent {
 	}
 
 	#[repr(C)]
+	#[allow(clippy::struct_field_names, reason = "netlink kernel ABI field names")]
 	struct IfAddrMsg {
 		ifa_family:    u8,
 		ifa_prefixlen: u8,
@@ -71,6 +73,7 @@ mod linux_agent {
 	}
 
 	#[repr(C)]
+	#[allow(clippy::struct_field_names, reason = "netlink kernel ABI field names")]
 	struct RtMsg {
 		rtm_family:   u8,
 		rtm_dst_len:  u8,
@@ -447,14 +450,14 @@ mod linux_agent {
 				// instead of dropping the master fd (the reader clone would keep
 				// the pty open and leave shells waiting forever).
 				let input: &[u8] = if payload.is_empty() { b"\x04" } else { payload };
-				if let Some(master) = session.tty_master.as_mut() {
-					if let Err(err) = master.write_all(input) {
-						if payload.is_empty() {
-							return;
-						}
-						drop(sessions);
-						self.send_error(id, format!("tty stdin write: {err}"));
+				if let Some(master) = session.tty_master.as_mut()
+					&& let Err(err) = master.write_all(input)
+				{
+					if payload.is_empty() {
+						return;
 					}
+					drop(sessions);
+					self.send_error(id, format!("tty stdin write: {err}"));
 				}
 				return;
 			}
@@ -483,11 +486,10 @@ mod linux_agent {
 			};
 
 			if payload.is_empty() {
-				let mut finished = match writes.remove(&id) {
-					Some(write) => write,
-					None => return true,
+				let Some(mut finished) = writes.remove(&id) else {
+					return true;
 				};
-				let result = finished.file.flush().map(|_| finished.bytes);
+				let result = finished.file.flush().map(|()| finished.bytes);
 				drop(writes);
 				match result {
 					Ok(bytes) => self.send_resp(id, json!({"ok": true, "size": bytes})),
@@ -520,12 +522,10 @@ mod linux_agent {
 				}
 			};
 
-			let pid = match lock(&self.sessions).get(&id).map(|session| session.pid) {
-				Some(pid) => pid,
-				None => {
-					self.send_error(id, "unknown kill session");
-					return;
-				},
+			let pid = { lock(&self.sessions).get(&id).map(|session| session.pid) };
+			let Some(pid) = pid else {
+				self.send_error(id, "unknown kill session");
+				return;
 			};
 
 			if let Err(err) = signal_process_group(pid, signal) {
@@ -764,14 +764,14 @@ mod linux_agent {
 
 		fn resize(&self, id: u32, request: &Value) {
 			let rows = match request.get("rows").and_then(Value::as_u64) {
-				Some(rows) if rows > 0 && rows <= u16::MAX as u64 => rows as u16,
+				Some(rows) if rows > 0 && u16::try_from(rows).is_ok() => rows as u16,
 				_ => {
 					self.send_error(id, "rows must be 1..=u16::MAX");
 					return;
 				},
 			};
 			let cols = match request.get("cols").and_then(Value::as_u64) {
-				Some(cols) if cols > 0 && cols <= u16::MAX as u64 => cols as u16,
+				Some(cols) if cols > 0 && u16::try_from(cols).is_ok() => cols as u16,
 				_ => {
 					self.send_error(id, "cols must be 1..=u16::MAX");
 					return;
@@ -804,7 +804,7 @@ mod linux_agent {
 
 		fn tcp_probe(&self, id: u32, request: &Value) {
 			let port = match request.get("port").and_then(Value::as_u64) {
-				Some(port) if port >= 1 && port <= u16::MAX as u64 => port as u16,
+				Some(port) if port >= 1 && u16::try_from(port).is_ok() => port as u16,
 				_ => {
 					self.send_error(id, "port must be 1..=65535");
 					return;
@@ -816,12 +816,13 @@ mod linux_agent {
 				.unwrap_or("127.0.0.1");
 
 			let addr = match format!("{host}:{port}").to_socket_addrs() {
-				Ok(mut addrs) => match addrs.next() {
-					Some(addr) => addr,
-					None => {
+				Ok(mut addrs) => {
+					if let Some(addr) = addrs.next() {
+						addr
+					} else {
 						self.send_error(id, format!("tcp_probe: cannot resolve {host}:{port}"));
 						return;
-					},
+					}
 				},
 				Err(err) => {
 					self.send_error(id, format!("tcp_probe resolve {host}:{port}: {err}"));
@@ -861,26 +862,17 @@ mod linux_agent {
 				return;
 			}
 
-			let source = match CString::new(tag.as_str()) {
-				Ok(source) => source,
-				Err(_) => {
-					self.send_error(id, "tag contains an interior nul byte");
-					return;
-				},
+			let Ok(source) = CString::new(tag.as_str()) else {
+				self.send_error(id, "tag contains an interior nul byte");
+				return;
 			};
-			let target = match CString::new(path.as_str()) {
-				Ok(target) => target,
-				Err(_) => {
-					self.send_error(id, "path contains an interior nul byte");
-					return;
-				},
+			let Ok(target) = CString::new(path.as_str()) else {
+				self.send_error(id, "path contains an interior nul byte");
+				return;
 			};
-			let fs_type = match CString::new(fstype) {
-				Ok(fs_type) => fs_type,
-				Err(_) => {
-					self.send_error(id, "fstype contains an interior nul byte");
-					return;
-				},
+			let Ok(fs_type) = CString::new(fstype) else {
+				self.send_error(id, "fstype contains an interior nul byte");
+				return;
 			};
 			let flags = if ro { libc::MS_RDONLY } else { 0 };
 
@@ -1309,12 +1301,8 @@ mod linux_agent {
 			ifi_change: libc::IFF_UP as u32,
 		};
 		push_struct(&mut payload, &msg);
-		netlink_request(
-			libc::RTM_NEWLINK as u16,
-			(libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-			&payload,
-		)
-		.map_err(|err| format!("link up: {err}"))
+		netlink_request(libc::RTM_NEWLINK, (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16, &payload)
+			.map_err(|err| format!("link up: {err}"))
 	}
 
 	fn add_ipv4_addr(ifindex: u32, ip: Ipv4Addr, prefix: u8) -> Result<(), String> {
@@ -1323,14 +1311,14 @@ mod linux_agent {
 			ifa_family:    libc::AF_INET as u8,
 			ifa_prefixlen: prefix,
 			ifa_flags:     0,
-			ifa_scope:     libc::RT_SCOPE_UNIVERSE as u8,
+			ifa_scope:     libc::RT_SCOPE_UNIVERSE,
 			ifa_index:     ifindex,
 		};
 		push_struct(&mut payload, &msg);
-		push_attr(&mut payload, libc::IFA_LOCAL as u16, &ip.octets());
-		push_attr(&mut payload, libc::IFA_ADDRESS as u16, &ip.octets());
+		push_attr(&mut payload, libc::IFA_LOCAL, &ip.octets());
+		push_attr(&mut payload, libc::IFA_ADDRESS, &ip.octets());
 		netlink_request(
-			libc::RTM_NEWADDR as u16,
+			libc::RTM_NEWADDR,
 			(libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE) as u16,
 			&payload,
 		)
@@ -1344,17 +1332,17 @@ mod linux_agent {
 			rtm_dst_len:  0,
 			rtm_src_len:  0,
 			rtm_tos:      0,
-			rtm_table:    libc::RT_TABLE_MAIN as u8,
-			rtm_protocol: libc::RTPROT_BOOT as u8,
-			rtm_scope:    libc::RT_SCOPE_UNIVERSE as u8,
-			rtm_type:     libc::RTN_UNICAST as u8,
+			rtm_table:    libc::RT_TABLE_MAIN,
+			rtm_protocol: libc::RTPROT_BOOT,
+			rtm_scope:    libc::RT_SCOPE_UNIVERSE,
+			rtm_type:     libc::RTN_UNICAST,
 			rtm_flags:    0,
 		};
 		push_struct(&mut payload, &msg);
-		push_attr(&mut payload, libc::RTA_GATEWAY as u16, &gw.octets());
-		push_attr(&mut payload, libc::RTA_OIF as u16, &ifindex.to_ne_bytes());
+		push_attr(&mut payload, libc::RTA_GATEWAY, &gw.octets());
+		push_attr(&mut payload, libc::RTA_OIF, &ifindex.to_ne_bytes());
 		match netlink_request(
-			libc::RTM_NEWROUTE as u16,
+			libc::RTM_NEWROUTE,
 			(libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE) as u16,
 			&payload,
 		) {
@@ -1465,7 +1453,7 @@ mod linux_agent {
 		let attr = RtAttr { rta_len: len as u16, rta_type: attr_type };
 		push_struct(buf, &attr);
 		buf.extend_from_slice(data);
-		while buf.len() % 4 != 0 {
+		while !buf.len().is_multiple_of(4) {
 			buf.push(0);
 		}
 	}

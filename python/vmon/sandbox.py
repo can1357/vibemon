@@ -159,7 +159,9 @@ class Sandbox:
         self.name = vm.name
         self.image_spec = image_spec
         self.workdir = workdir or (image_spec.workdir if image_spec else None) or "/"
-        self.env = dict(env or {})
+        base: dict[str, str] = image_spec.env_dict() if image_spec else {}
+        base.update(env or {})
+        self.env = base
         self.tags: dict[str, str] = dict(tags or {})
         self.filesystem = Filesystem(self)
         self._agent: AgentConn | None = None
