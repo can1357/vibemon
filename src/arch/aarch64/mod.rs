@@ -2,7 +2,6 @@
 
 pub mod boot;
 pub mod fdt;
-pub mod gic;
 pub mod regs;
 pub mod state;
 
