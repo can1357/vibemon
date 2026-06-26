@@ -147,7 +147,7 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 
 const SECTOR_SIZE: u64 = 512;
 const QUEUE_SIZE: u16 = 256;
-/// io_uring ring depth. The single virtqueue holds at most `QUEUE_SIZE`
+/// `io_uring` ring depth. The single virtqueue holds at most `QUEUE_SIZE`
 /// descriptors and every request consumes at least three (header + data +
 /// status), so this comfortably covers a full queue-notify batch.
 #[cfg(target_os = "linux")]
@@ -158,7 +158,7 @@ const DEVICE_ID: &[u8] = b"vmon-blk";
 /// Max bytes of the device-id string virtio-blk `GET_ID` may return.
 const DEVICE_ID_LEN: usize = 20;
 
-/// One in-flight io_uring request, parked until its completion is reaped.
+/// One in-flight `io_uring` request, parked until its completion is reaped.
 ///
 /// `iovecs` hold raw host pointers into guest memory and back the `readv`/
 /// `writev` submitted for this request; the kernel dereferences them after we
@@ -180,6 +180,13 @@ struct PendingReq {
 // of the `Arc<Mutex<dyn VirtioDevice>>` into that thread). The raw pointers are
 // thus never dereferenced from two threads at once.
 #[cfg(target_os = "linux")]
+#[allow(
+	clippy::non_send_fields_in_send_ty,
+	reason = "PendingReq iovecs point into VM-owned guest memory moved only with the device worker"
+)]
+// SAFETY: PendingReq's raw iovec pointers reference VM-owned guest memory that
+// outlives the in-flight request; only the single device worker thread accesses
+// them, so moving ownership to that worker is sound.
 unsafe impl Send for PendingReq {}
 
 /// What happened to one processed descriptor chain.
@@ -282,7 +289,7 @@ impl Block {
 
 #[cfg(target_os = "linux")]
 impl Block {
-	/// Reap all currently-available io_uring completions, posting used-ring
+	/// Reap all currently-available `io_uring` completions, posting used-ring
 	/// entries. Shared by the worker-fd path and `drain`.
 	fn reap(&mut self, context: &str) -> Result<()> {
 		let pending_len = self.pending.len();
@@ -368,6 +375,10 @@ impl Block {
 		Ok(())
 	}
 
+	#[allow(
+		clippy::needless_pass_by_ref_mut,
+		reason = "io_uring submission waits are cfg-gated behind the mutable ring API"
+	)]
 	fn wait_for_pending_completion(&mut self, context: &str) -> Result<()> {
 		loop {
 			match self.ring.submit_and_wait(1) {
@@ -774,6 +785,9 @@ pub(super) mod linux {
 					ring
 						.submit()
 						.map_err(|e| err(format!("virtio-blk retry submit failed: {e}")))?;
+					// SAFETY: identical to the first push: `entry` references request
+					// buffers kept alive in `pending[token]`, and `submit()` above only
+					// makes room in the SQ without invalidating them.
 					pushed = unsafe { ring.submission().push(&entry) }.is_ok();
 				}
 				if !pushed {

@@ -82,6 +82,7 @@ const MAX_WRITE: u32 = 1 << 20;
 const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
+const FUSE_SETATTR: u32 = 4;
 const FUSE_READLINK: u32 = 5;
 const FUSE_SYMLINK: u32 = 6;
 const FUSE_MKDIR: u32 = 9;
@@ -575,6 +576,10 @@ fn attr_from(ino: u64, md: &Metadata) -> FuseAttr {
 }
 
 /// Map a raw `st_mode` to a `readdir` `d_type` value.
+#[allow(
+	clippy::unnecessary_cast,
+	reason = "libc S_*/DT_* constants are u16/u8 on macOS but u32 on Linux"
+)]
 const fn dtype_from_mode(mode: u32) -> u32 {
 	match mode & libc::S_IFMT as u32 {
 		m if m == libc::S_IFDIR as u32 => libc::DT_DIR as u32,
@@ -692,15 +697,14 @@ fn apply_setattr(path: &Path, fh: Option<&File>, sin: &FuseSetattrIn) -> std::io
 	let mut reopened = None;
 
 	if sin.valid & FATTR_SIZE != 0 {
-		match fh {
-			Some(f) => f.set_len(sin.size)?,
-			None => {
-				let f = open_nofollow(path, true)?;
-				f.set_len(sin.size)?;
-				if needs_attr_fd {
-					reopened = Some(f);
-				}
-			},
+		if let Some(f) = fh {
+			f.set_len(sin.size)?;
+		} else {
+			let f = open_nofollow(path, true)?;
+			f.set_len(sin.size)?;
+			if needs_attr_fd {
+				reopened = Some(f);
+			}
 		}
 	}
 
@@ -763,7 +767,7 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
 		.open(path)
 }
 
-/// Best-effort grow of `f` to `want` bytes (FALLOCATE mode 0). KEEP_SIZE is a
+/// Best-effort grow of `f` to `want` bytes (FALLOCATE mode 0). `KEEP_SIZE` is a
 /// visible no-op; other modes are rejected before this helper is called.
 fn fallocate_grow(f: &File, want: u64) -> std::io::Result<()> {
 	let cur = f.metadata().map_or(0, |m| m.len());
@@ -907,8 +911,8 @@ impl FsState {
 		loop {
 			let fh = self.next_fh.max(1);
 			self.next_fh = fh.checked_add(1).unwrap_or(1);
-			if !self.handles.contains_key(&fh) {
-				self.handles.insert(fh, file);
+			if let std::collections::hash_map::Entry::Vacant(e) = self.handles.entry(fh) {
+				e.insert(file);
 				return fh;
 			}
 		}
@@ -1417,7 +1421,7 @@ impl FsState {
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
-			FUSE_GETATTR => {
+			FUSE_SETATTR => {
 				if read_only {
 					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
 				}

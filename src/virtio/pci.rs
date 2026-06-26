@@ -1,4 +1,4 @@
-//! x86_64 virtio-pci transport and legacy PCI config mechanism.
+//! `x86_64` virtio-pci transport and legacy PCI config mechanism.
 //!
 //! This is intentionally separate from `virtio::mmio`: the device backends stay
 //! transport-neutral and are activated with the same queues, interrupt object,
@@ -113,8 +113,8 @@ struct PciFunction {
 }
 
 impl PciRoot {
-	pub fn new() -> Self {
-		PciRoot { config_address: 0, functions: Vec::new() }
+	pub const fn new() -> Self {
+		Self { config_address: 0, functions: Vec::new() }
 	}
 
 	/// Register a single-function device on bus 0 at `device`.
@@ -150,6 +150,10 @@ impl PciRoot {
 			.read_config(reg + byte_offset, data);
 	}
 
+	#[allow(
+		clippy::needless_pass_by_ref_mut,
+		reason = "PCI config write path keeps &mut self for transport API symmetry"
+	)]
 	fn write_config_data(&mut self, byte_offset: usize, data: &[u8]) {
 		let Some((reg, function)) = self.selected() else {
 			return;
@@ -183,6 +187,10 @@ impl PciRoot {
 		function.transport.lock().read_config(reg, data);
 	}
 
+	#[allow(
+		clippy::needless_pass_by_ref_mut,
+		reason = "ECAM config write path keeps &mut self for transport API symmetry"
+	)]
 	pub fn write_ecam(&mut self, offset: u64, data: &[u8]) {
 		let Some((reg, function)) = self.ecam_selected(offset) else {
 			return;
@@ -194,14 +202,14 @@ impl PciRoot {
 	}
 }
 
-/// PCIe ECAM/MMCONFIG view of [`PciRoot`].
+/// `PCIe` ECAM/MMCONFIG view of [`PciRoot`].
 pub struct PciEcam {
 	root: Arc<Mutex<PciRoot>>,
 }
 
 impl PciEcam {
-	pub fn new(root: Arc<Mutex<PciRoot>>) -> Self {
-		PciEcam { root }
+	pub const fn new(root: Arc<Mutex<PciRoot>>) -> Self {
+		Self { root }
 	}
 }
 
@@ -245,8 +253,8 @@ pub struct PciMmioDispatcher {
 }
 
 impl PciMmioDispatcher {
-	pub fn new(aperture_base: u64) -> Self {
-		PciMmioDispatcher { aperture_base, functions: Vec::new() }
+	pub const fn new(aperture_base: u64) -> Self {
+		Self { aperture_base, functions: Vec::new() }
 	}
 
 	pub fn register(&mut self, transport: Arc<Mutex<PciTransport>>) {
@@ -293,12 +301,12 @@ struct MsixEntry {
 
 impl Default for MsixEntry {
 	fn default() -> Self {
-		MsixEntry { msg_addr: 0, msg_data: 0, vector_ctrl: MSIX_VECTOR_MASKED }
+		Self { msg_addr: 0, msg_data: 0, vector_ctrl: MSIX_VECTOR_MASKED }
 	}
 }
 
 impl MsixEntry {
-	fn masked(self) -> bool {
+	const fn masked(self) -> bool {
 		self.vector_ctrl & MSIX_VECTOR_MASKED != 0
 	}
 
@@ -311,7 +319,7 @@ impl MsixEntry {
 	}
 
 	fn from_bytes(bytes: [u8; MSIX_TABLE_ENTRY_SIZE]) -> Self {
-		MsixEntry {
+		Self {
 			msg_addr:    u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
 			msg_data:    u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
 			vector_ctrl: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
@@ -321,7 +329,7 @@ impl MsixEntry {
 
 impl From<MsixEntry> for MsixEntrySer {
 	fn from(entry: MsixEntry) -> Self {
-		MsixEntrySer {
+		Self {
 			msg_addr:    entry.msg_addr,
 			msg_data:    entry.msg_data,
 			vector_ctrl: entry.vector_ctrl,
@@ -331,7 +339,7 @@ impl From<MsixEntry> for MsixEntrySer {
 
 impl From<&MsixEntrySer> for MsixEntry {
 	fn from(entry: &MsixEntrySer) -> Self {
-		MsixEntry {
+		Self {
 			msg_addr:    entry.msg_addr,
 			msg_data:    entry.msg_data,
 			vector_ctrl: entry.vector_ctrl,
@@ -352,7 +360,7 @@ struct MsixState {
 impl MsixState {
 	fn new(vm_fd: Arc<VmFd>) -> Self {
 		const VECTOR_COUNT: usize = 1;
-		MsixState {
+		Self {
 			vm_fd,
 			shared_vector: VIRTIO_MSI_NO_VECTOR,
 			control: (VECTOR_COUNT as u16 - 1) & MSIX_TABLE_SIZE_MASK,
@@ -367,7 +375,7 @@ impl MsixState {
 		} else {
 			state.table.iter().map(MsixEntry::from).collect()
 		};
-		MsixState {
+		Self {
 			vm_fd,
 			shared_vector: state.shared_vector,
 			control: state.control,
@@ -385,15 +393,15 @@ impl MsixState {
 		}
 	}
 
-	fn control(&self) -> u16 {
+	const fn control(&self) -> u16 {
 		self.control
 	}
 
-	fn config_vector(&self) -> u16 {
+	const fn config_vector(&self) -> u16 {
 		self.shared_vector
 	}
 
-	fn queue_vector(&self, _queue_select: usize) -> u16 {
+	const fn queue_vector(&self, _queue_select: usize) -> u16 {
 		self.shared_vector
 	}
 
@@ -412,7 +420,7 @@ impl MsixState {
 		self.control
 	}
 
-	fn reset_vectors(&mut self) {
+	const fn reset_vectors(&mut self) {
 		self.shared_vector = VIRTIO_MSI_NO_VECTOR;
 		self.pending = 0;
 	}
@@ -476,12 +484,10 @@ impl MsixState {
 			self.pending |= 1u64 << vector;
 			return Ok(true);
 		}
-		if self.inject(vector)? {
-			Ok(true)
-		} else {
+		if !self.inject(vector)? {
 			self.pending |= 1u64 << vector;
-			Ok(true)
 		}
+		Ok(true)
 	}
 
 	fn flush_pending(&mut self) {
@@ -510,11 +516,11 @@ impl MsixState {
 		Ok(self.vm_fd.signal_msi(msi)? > 0)
 	}
 
-	fn enabled(&self) -> bool {
+	const fn enabled(&self) -> bool {
 		self.control & MSIX_ENABLE != 0
 	}
 
-	fn function_masked(&self) -> bool {
+	const fn function_masked(&self) -> bool {
 		self.control & MSIX_FUNCTION_MASK != 0
 	}
 
@@ -590,7 +596,7 @@ impl PciTransport {
 
 		let msix_state = MsixState::new(vm_fd);
 		let msix_control = msix_state.control();
-		Ok(PciTransport {
+		Ok(Self {
 			device,
 			mem,
 			interrupt,
@@ -613,10 +619,7 @@ impl PciTransport {
 		})
 	}
 
-	pub fn attach_interrupt_notifier(
-		transport: &Arc<Mutex<PciTransport>>,
-		interrupt: &Arc<Interrupt>,
-	) {
+	pub fn attach_interrupt_notifier(transport: &Arc<Mutex<Self>>, interrupt: &Arc<Interrupt>) {
 		let msix = transport.lock().msix.clone();
 		let weak: Weak<Mutex<MsixState>> = Arc::downgrade(&msix);
 		interrupt.set_notifier(move || {
@@ -688,7 +691,7 @@ impl PciTransport {
 			.collect::<std::result::Result<Vec<_>, _>>()?;
 		let mut config_space = [0u8; 256];
 		config_space.copy_from_slice(&pci.config_space);
-		Ok(PciTransport {
+		Ok(Self {
 			device,
 			mem,
 			interrupt,
@@ -719,10 +722,14 @@ impl PciTransport {
 		(addr >= self.bar_base && addr < end).then_some(addr - self.bar_base)
 	}
 
-	fn memory_enabled(&self) -> bool {
+	const fn memory_enabled(&self) -> bool {
 		self.command & PCI_COMMAND_MEMORY != 0
 	}
 
+	#[allow(
+		clippy::needless_pass_by_ref_mut,
+		reason = "BAR read path keeps &mut self for transport read/write API symmetry"
+	)]
 	fn read_bar(&mut self, offset: u64, data: &mut [u8]) {
 		match offset {
 			COMMON_CFG_OFFSET..=COMMON_CFG_END => self.read_common(offset - COMMON_CFG_OFFSET, data),
@@ -733,7 +740,7 @@ impl PciTransport {
 				.lock()
 				.read_config(offset - DEVICE_CFG_OFFSET, data),
 			MSIX_TABLE_OFFSET..=MSIX_TABLE_END => {
-				self.read_msix_table(offset - MSIX_TABLE_OFFSET, data)
+				self.read_msix_table(offset - MSIX_TABLE_OFFSET, data);
 			},
 			MSIX_PBA_OFFSET..=MSIX_PBA_END => self.read_msix_pba(offset - MSIX_PBA_OFFSET, data),
 			_ => data.fill(0),
@@ -752,7 +759,7 @@ impl PciTransport {
 				.lock()
 				.write_config(offset - DEVICE_CFG_OFFSET, data),
 			MSIX_TABLE_OFFSET..=MSIX_TABLE_END => {
-				self.write_msix_table(offset - MSIX_TABLE_OFFSET, data)
+				self.write_msix_table(offset - MSIX_TABLE_OFFSET, data);
 			},
 			MSIX_PBA_OFFSET..=MSIX_PBA_END => {},
 			_ => {},
@@ -861,19 +868,19 @@ impl PciTransport {
 		if touches(offset, data.len(), COMMON_QUEUE_DESC, 8) {
 			let addr = read_u64(&common, COMMON_QUEUE_DESC);
 			self.with_queue_mut(|q| {
-				q.set_desc_table_address(Some(addr as u32), Some((addr >> 32) as u32))
+				q.set_desc_table_address(Some(addr as u32), Some((addr >> 32) as u32));
 			});
 		}
 		if touches(offset, data.len(), COMMON_QUEUE_DRIVER, 8) {
 			let addr = read_u64(&common, COMMON_QUEUE_DRIVER);
 			self.with_queue_mut(|q| {
-				q.set_avail_ring_address(Some(addr as u32), Some((addr >> 32) as u32))
+				q.set_avail_ring_address(Some(addr as u32), Some((addr >> 32) as u32));
 			});
 		}
 		if touches(offset, data.len(), COMMON_QUEUE_DEVICE, 8) {
 			let addr = read_u64(&common, COMMON_QUEUE_DEVICE);
 			self.with_queue_mut(|q| {
-				q.set_used_ring_address(Some(addr as u32), Some((addr >> 32) as u32))
+				q.set_used_ring_address(Some(addr as u32), Some((addr >> 32) as u32));
 			});
 		}
 		if touches(offset, data.len(), COMMON_DEVICE_STATUS, 1) {
@@ -933,6 +940,10 @@ impl PciTransport {
 		self.msix.lock().read_table(offset, data);
 	}
 
+	#[allow(
+		clippy::needless_pass_by_ref_mut,
+		reason = "MSI-X table write path keeps &mut self for transport API symmetry"
+	)]
 	fn write_msix_table(&mut self, offset: u64, data: &[u8]) {
 		self.msix.lock().write_table(offset, data);
 	}
@@ -1165,7 +1176,12 @@ fn overlay(dst: &mut [u8], offset: usize, data: &[u8]) {
 	dst[offset..offset + n].copy_from_slice(&data[..n]);
 }
 
-fn touches(write_offset: usize, write_len: usize, field_offset: usize, field_len: usize) -> bool {
+const fn touches(
+	write_offset: usize,
+	write_len: usize,
+	field_offset: usize,
+	field_len: usize,
+) -> bool {
 	let write_end = write_offset.saturating_add(write_len);
 	let field_end = field_offset.saturating_add(field_len);
 	write_offset < field_end && field_offset < write_end
