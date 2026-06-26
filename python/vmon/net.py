@@ -108,6 +108,7 @@ class _TunnelSet:
         self._servers: dict[int, asyncio.AbstractServer] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
         ports = tuple(dict.fromkeys(int(p) for p in ports))
         for port in ports:
             if port <= 0 or port > 65535:
@@ -134,7 +135,14 @@ class _TunnelSet:
 
     async def _start_server(self, guest_port: int) -> asyncio.AbstractServer:
         async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            await _proxy_tcp(reader, writer, self._guest_ip, guest_port, self._allowed_nets)
+            task = asyncio.current_task()
+            if task is not None:
+                self._tasks.add(task)
+            try:
+                await _proxy_tcp(reader, writer, self._guest_ip, guest_port, self._allowed_nets)
+            finally:
+                if task is not None:
+                    self._tasks.discard(task)
 
         return await asyncio.start_server(handler, "127.0.0.1", 0)
 
@@ -160,6 +168,11 @@ class _TunnelSet:
             with contextlib.suppress(Exception):
                 fut.result(timeout=5)
             self._servers.clear()
+        if self._tasks:
+            fut = asyncio.run_coroutine_threadsafe(_cancel_tasks(set(self._tasks)), self._loop)
+            with contextlib.suppress(Exception):
+                fut.result(timeout=5)
+            self._tasks.clear()
         self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -310,6 +323,11 @@ async def _close_servers(servers: Sequence[asyncio.AbstractServer]) -> None:
     for server in servers:
         server.close()
     await asyncio.gather(*(server.wait_closed() for server in servers), return_exceptions=True)
+
+async def _cancel_tasks(tasks: set[asyncio.Task[None]]) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _parse_cidr_allowlist(
