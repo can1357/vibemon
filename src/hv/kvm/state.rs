@@ -28,6 +28,10 @@ use crate::{
 /// First SPI INTID (SGIs 0-15 and PPIs 16-31 are private / per-redistributor).
 const IRQ_BASE: u32 = 32;
 
+fn reg_size(id: u64) -> usize {
+	1usize << (((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT) as u32)
+}
+
 /// Capture all migratable KVM arm64 vCPU state.
 pub fn save_vcpu(vcpu: &VcpuFd, _xsave_size: usize) -> Result<VcpuState> {
 	let mut reg_list = RegList::new(500).map_err(|e| err(format!("RegList alloc: {e:?}")))?;
@@ -44,7 +48,7 @@ pub fn save_vcpu(vcpu: &VcpuFd, _xsave_size: usize) -> Result<VcpuState> {
 	let ids = reg_list.as_slice();
 	let mut regs = Vec::with_capacity(ids.len());
 	for &id in ids {
-		let size = 1usize << (((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT) as u32);
+		let size = reg_size(id);
 		let mut buf = vec![0u8; size];
 		vcpu.get_one_reg(id, &mut buf)?;
 		regs.push((id, buf));
@@ -85,6 +89,9 @@ pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
 	};
 
 	for (id, val) in regs {
+		if val.len() != reg_size(*id) {
+			bail!("invalid KVM register {id:#x} length {}", val.len());
+		}
 		if let Err(e) = vcpu.set_one_reg(*id, val) {
 			bail!("set_one_reg failed for reg {id:#x}: {e:?}");
 		}
@@ -134,6 +141,7 @@ pub fn restore_vcpu(vcpu: &VcpuFd, st: &VcpuState) -> Result<()> {
 /// `(mmio_offset, bits_per_irq)`; `bits_per_irq == 0` marks a simple 32-bit
 /// register (one u32 access at `mmio_offset`).
 const DIST_REGS: &[(u64, u32)] = &[
+	(0x0008, 0),  // GICD_IIDR must be restored before other distributor regs.
 	(0x0000, 0),  // GICD_CTLR
 	(0x0010, 0),  // GICD_STATUSR
 	(0x0180, 1),  // GICD_ICENABLER

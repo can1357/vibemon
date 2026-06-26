@@ -442,8 +442,7 @@ fn publish_generation(dir: &Path, generation: u64) -> Result<()> {
 	let publish = (|| -> Result<()> {
 		let mut file =
 			File::create(&tmp).map_err(|e| err(format!("creating {}: {e}", tmp.display())))?;
-		writeln!(file, "{generation}")
-			.map_err(|e| err(format!("writing {}: {e}", tmp.display())))?;
+		writeln!(file, "{generation}").map_err(|e| err(format!("writing {}: {e}", tmp.display())))?;
 		file
 			.sync_all()
 			.map_err(|e| err(format!("syncing {}: {e}", tmp.display())))?;
@@ -882,7 +881,11 @@ fn validate_ready_queue_ram(
 	regions: &[MemRegion],
 ) -> Result<()> {
 	let queue_size = u64::from(queue.size);
-	let event_len = if queue.event_idx_enabled { VIRTQ_EVENT_ELEMENT_SIZE } else { 0 };
+	let event_len = if queue.event_idx_enabled {
+		VIRTQ_EVENT_ELEMENT_SIZE
+	} else {
+		0
+	};
 	let desc_len = VIRTQ_DESC_ELEMENT_SIZE
 		.checked_mul(queue_size)
 		.ok_or_else(|| err("virtqueue descriptor table size overflows"))?;

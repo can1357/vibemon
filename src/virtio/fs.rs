@@ -14,16 +14,16 @@
 //! the readable side into one request buffer and treat the writable side as one
 //! contiguous reply buffer.
 //!
-//! The read path (INIT, GETATTR, LOOKUP, OPEN/OPENDIR, READ, READDIR, plus the
-//! trivial RELEASE/FLUSH/STATFS/ACCESS replies) is always served. When the
-//! device is writable (`read_only == false`) the mutating opcodes are served
-//! too: CREATE, WRITE, SETATTR, MKDIR, UNLINK, RMDIR, RENAME/RENAME2, SYMLINK,
-//! LINK and FALLOCATE. On a read-only device every mutating opcode (and a
-//! write-intent OPEN) is answered `-EROFS`; unknown opcodes are `-ENOSYS`.
-//! Inode numbers (`nodeid`s) are interned lazily on LOOKUP and map back to host
-//! paths confined to the shared directory (every lookup is canonicalized and
-//! checked to stay under the root, so symlinks cannot escape; new children for
-//! the mutating ops confine the parent the same way).
+//! The read path (INIT, GETATTR, LOOKUP, READLINK, OPEN/OPENDIR, READ, READDIR,
+//! plus the trivial RELEASE/FLUSH/STATFS/ACCESS replies) is always served. When
+//! the device is writable (`read_only == false`) the mutating opcodes are
+//! served too: CREATE, WRITE, SETATTR, MKDIR, UNLINK, RMDIR, RENAME/RENAME2,
+//! SYMLINK, LINK and FALLOCATE. On a read-only device every mutating opcode
+//! (and a write-intent OPEN) is answered `-EROFS`; unknown opcodes are
+//! `-ENOSYS`. Inode numbers (`nodeid`s) are interned lazily on LOOKUP and map
+//! back to host paths confined to the shared directory (parent directories are
+//! canonicalized and checked to stay under the root; final symlink components
+//! are exposed as symlink inodes and never followed for host I/O).
 //!
 //! Endianness: the FUSE wire format is the guest's native byte order; both
 //! supported targets (`x86_64`/`aarch64`-linux) are little-endian and match the
@@ -110,7 +110,8 @@ const FUSE_RENAME2: u32 = 45;
 
 const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
 const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
-const MAX_REQUEST_SIZE: usize = IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>() + MAX_WRITE as usize;
+const MAX_REQUEST_SIZE: usize =
+	IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>() + MAX_WRITE as usize;
 const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
 
 // ---------------------------------------------------------------------------
@@ -606,6 +607,8 @@ const FATTR_FH: u32 = 1 << 6;
 
 /// `RENAME_NOREPLACE` (linux/fs.h): fail rather than clobber an existing dest.
 const RENAME_NOREPLACE: u32 = 1;
+/// `FALLOC_FL_KEEP_SIZE` (linux/falloc.h): allocation must not extend EOF.
+const FALLOC_FL_KEEP_SIZE: u32 = 1;
 
 const fn rename2_flags_supported(flags: u32) -> bool {
 	flags & !RENAME_NOREPLACE == 0
@@ -632,7 +635,6 @@ fn two_names(buf: &[u8], off: usize) -> Option<(&[u8], &[u8])> {
 	let second_end = second.iter().position(|&b| b == 0)?;
 	Some((&rest[..first_end], &second[..second_end]))
 }
-
 
 /// `fchown(2)`; a `u32::MAX` (`-1`) uid/gid leaves that owner unchanged.
 fn chown_fd(file: &File, uid: u32, gid: u32) -> std::io::Result<()> {
@@ -761,8 +763,8 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
 		.open(path)
 }
 
-/// Best-effort grow of `f` to `want` bytes (FALLOCATE). Hole-punch / shrink
-/// modes stay no-ops, matching the prior behavior.
+/// Best-effort grow of `f` to `want` bytes (FALLOCATE mode 0). KEEP_SIZE is a
+/// visible no-op; other modes are rejected before this helper is called.
 fn fallocate_grow(f: &File, want: u64) -> std::io::Result<()> {
 	let cur = f.metadata().map_or(0, |m| m.len());
 	if want > cur {
@@ -1079,14 +1081,34 @@ impl FsState {
 			} else {
 				root.join(rel)
 			};
-			let Ok(canon) = fs::canonicalize(candidate) else {
+			let Some(parent) = candidate.parent() else {
 				continue;
 			};
-			if !canon.starts_with(&root) || by_path.contains_key(&canon) {
+			let Ok(parent_canon) = fs::canonicalize(parent) else {
+				continue;
+			};
+			if !parent_canon.starts_with(&root) {
 				continue;
 			}
-			inodes.insert(*id, canon.clone());
-			by_path.insert(canon, *id);
+			let Ok(md) = fs::symlink_metadata(&candidate) else {
+				continue;
+			};
+			let restored = if md.file_type().is_symlink() {
+				candidate
+			} else {
+				let Ok(canon) = fs::canonicalize(&candidate) else {
+					continue;
+				};
+				if !canon.starts_with(&root) {
+					continue;
+				}
+				canon
+			};
+			if by_path.contains_key(&restored) {
+				continue;
+			}
+			inodes.insert(*id, restored.clone());
+			by_path.insert(restored, *id);
 			next = next.max(id.saturating_add(1));
 		}
 
@@ -1335,8 +1357,7 @@ impl FsState {
 				} else {
 					create.create(true);
 				}
-				match create.open(&child)
-				{
+				match create.open(&child) {
 					Ok(file) => match fs::symlink_metadata(&child) {
 						Ok(md) => {
 							let id = self.intern(child);
@@ -1371,7 +1392,9 @@ impl FsState {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
 				let data_off = IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>();
-				let end = data_off.saturating_add(win.size as usize);
+				let Some(end) = data_off.checked_add(win.size as usize) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let Some(data) = req.get(data_off..end) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
@@ -1394,7 +1417,7 @@ impl FsState {
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
-			FUSE_SETATTR => {
+			FUSE_GETATTR => {
 				if read_only {
 					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
 				}
@@ -1603,9 +1626,15 @@ impl FsState {
 				let Some(fin) = read_struct::<FuseFallocateIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
+				if fin.mode & !FALLOC_FL_KEEP_SIZE != 0 {
+					return write_reply(mem, writable, unique, -libc::EOPNOTSUPP, &[]);
+				}
 				let Some(want) = fin.offset.checked_add(fin.length) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
+				if fin.mode & FALLOC_FL_KEEP_SIZE != 0 {
+					return write_reply(mem, writable, unique, 0, &[]);
+				}
 				// Operate on the tracked handle; fall back to a confined
 				// O_NOFOLLOW reopen by nodeid for a stale/unknown fh.
 				let res = if let Some(f) = self.handles.get(&fin.fh) {
@@ -1732,9 +1761,16 @@ impl VirtioDevice for Fs {
 	}
 
 	fn read_config(&self, offset: u64, data: &mut [u8]) {
-		let offset = offset as usize;
+		let Ok(offset) = usize::try_from(offset) else {
+			data.fill(0);
+			return;
+		};
 		for (i, b) in data.iter_mut().enumerate() {
-			*b = self.config.get(offset + i).copied().unwrap_or(0);
+			*b = offset
+				.checked_add(i)
+				.and_then(|idx| self.config.get(idx))
+				.copied()
+				.unwrap_or(0);
 		}
 	}
 
@@ -1772,12 +1808,17 @@ impl VirtioDevice for Fs {
 			return Ok(());
 		};
 		let mut used = false;
+		let read_only = self.read_only;
+		let state = &mut self.state;
 
-		// hiprio (queue 0): FORGET/INTERRUPT only — release each buffer without
-		// a reply.
+		// hiprio (queue 0): FORGET/BATCH_FORGET/INTERRUPT. They never produce a
+		// reply, but FORGET still needs to age inode-table entries out.
 		if let Some(hq) = self.hiprio_queue.as_mut() {
 			while let Some(chain) = hq.pop_descriptor_chain(&mem) {
 				let head = chain.head_index();
+				if let Some((req, _)) = split_chain(&mem, chain) {
+					state.dispatch(&mem, &req, &[], read_only);
+				}
 				hq.add_used(&mem, head, 0)
 					.map_err(|e| err(format!("virtio-fs hiprio used-ring update failed: {e}")))?;
 				used = true;
@@ -1786,8 +1827,6 @@ impl VirtioDevice for Fs {
 
 		// request queue (queue 1): service FUSE. Disjoint borrows — the inode
 		// table (`state`) and the queue are separate fields of `self`.
-		let read_only = self.read_only;
-		let state = &mut self.state;
 		if let Some(rq) = self.req_queue.as_mut() {
 			while let Some(chain) = rq.pop_descriptor_chain(&mem) {
 				let head = chain.head_index();

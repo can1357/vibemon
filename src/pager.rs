@@ -597,9 +597,9 @@ mod linux {
 
 		pub fn request_stop(&self) {
 			let one = 1u64.to_ne_bytes();
-			while eventfd_write(self.stop_evt.as_raw_fd(), &one).is_err_and(|e| {
-				e.raw_os_error() == Some(libc::EINTR)
-			}) {}
+			while eventfd_write(self.stop_evt.as_raw_fd(), &one)
+				.is_err_and(|e| e.raw_os_error() == Some(libc::EINTR))
+			{}
 		}
 
 		fn next_victim(&self) -> Option<usize> {
@@ -708,9 +708,19 @@ mod linux {
 			crate::metrics::record_pager_eviction();
 		}
 
+		fn try_reserve_store(&self, len: usize) -> bool {
+			self
+				.store_bytes
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+					current
+						.checked_add(len)
+						.filter(|next| *next <= self.store_max_bytes)
+				})
+				.is_ok()
+		}
+
 		fn place_encoded(&self, buf: Vec<u8>) -> Loc {
-			if self.store_bytes.load(Ordering::SeqCst) + buf.len() <= self.store_max_bytes {
-				self.store_bytes.fetch_add(buf.len(), Ordering::SeqCst);
+			if self.try_reserve_store(buf.len()) {
 				return Loc::Ram(buf.into_boxed_slice());
 			}
 

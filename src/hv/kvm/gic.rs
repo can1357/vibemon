@@ -14,7 +14,8 @@ use crate::{
 	result::{Result, err},
 };
 
-/// Number of interrupt IDs the GIC supports (SGIs + PPIs + SPIs, multiple of 32).
+/// Number of interrupt IDs the GIC supports (SGIs + PPIs + SPIs, multiple of
+/// 32).
 const GIC_NR_IRQS: u32 = 32 + GIC_SPI_COUNT;
 /// GICv3 maintenance interrupt (PPI 9).
 const GIC_MAINT_IRQ: u32 = 9;

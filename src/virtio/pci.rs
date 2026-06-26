@@ -650,9 +650,9 @@ impl PciTransport {
 		PciCommonState {
 			device_features_select: self.device_features_select,
 			driver_features_select: self.driver_features_select,
-			acked_features:         self.acked_features,
-			status:                 self.status,
-			activated:              self.activated,
+			acked_features: self.acked_features,
+			status: self.status,
+			activated: self.activated,
 			queues,
 		}
 	}
@@ -826,9 +826,7 @@ impl PciTransport {
 		if touches(offset, data.len(), COMMON_DRIVER_FEATURE_SELECT, 4) {
 			self.driver_features_select = read_u32(&common, COMMON_DRIVER_FEATURE_SELECT);
 		}
-		if touches(offset, data.len(), COMMON_DRIVER_FEATURE, 4)
-			&& self.driver_features_select < 2
-		{
+		if touches(offset, data.len(), COMMON_DRIVER_FEATURE, 4) && self.driver_features_select < 2 {
 			let shift = 32 * self.driver_features_select;
 			let mask = 0xffff_ffffu64 << shift;
 			let selected = (u64::from(read_u32(&common, COMMON_DRIVER_FEATURE)) << shift)
