@@ -90,12 +90,12 @@ class NodeState:
     @classmethod
     def from_wire(cls, data: dict[str, Any]) -> NodeState:
         """Deserialize a gossiped node state from JSON-compatible data."""
-        caps_raw = data.get("caps") if isinstance(data.get("caps"), dict) else {}
+        caps_raw: dict[str, Any] = data["caps"] if isinstance(data.get("caps"), dict) else {}
         caps = NodeCaps(
             vcpus=int(data.get("vcpus") or caps_raw.get("vcpus") or 1),
             mem_mib=int(data.get("mem_mib") or caps_raw.get("mem_mib") or 2048),
         )
-        pools_raw = data.get("pools") if isinstance(data.get("pools"), dict) else {}
+        pools_raw: dict[str, Any] = data["pools"] if isinstance(data.get("pools"), dict) else {}
         return cls(
             node_id=str(data.get("node_id") or ""),
             advertise=str(data.get("advertise") or ""),

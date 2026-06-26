@@ -279,16 +279,23 @@ def _panel(body: RenderableType, title: str) -> Panel:
     )
 
 
-class RichCommand(click.Command):
-    """A click command whose ``--help`` renders Modal-style rich panels.
+class _Paneled:
+    """Mixin storing the panel a command/group appears under in its parent's help.
 
-    ``panel`` names the group panel this command appears under in its parent's
-    help (see :class:`RichGroup`); it has no effect on the command's own help.
+    ``panel`` names the titled panel its parent :class:`RichGroup` lists it in; it
+    has no effect on the command's own ``--help``. Mixed in left of the click base
+    so its ``__init__`` runs first and forwards the rest cooperatively.
     """
+
+    panel: str
 
     def __init__(self, *args: Any, panel: str = "Commands", **kwargs: Any) -> None:
         self.panel = panel
         super().__init__(*args, **kwargs)
+
+
+class RichCommand(_Paneled, click.Command):
+    """A click command whose ``--help`` renders Modal-style rich panels."""
 
     def get_help(self, ctx: click.Context) -> str:
         parts: list[RenderableType] = [_usage_text(ctx, self), ""]
@@ -305,7 +312,7 @@ class RichCommand(click.Command):
         return _capture(Renderables(*parts))
 
 
-class RichGroup(click.Group):
+class RichGroup(_Paneled, click.Group):
     """A click group with Modal-style grouped command panels in ``--help``.
 
     Subcommands default to :class:`RichCommand`; each command's ``panel`` puts it

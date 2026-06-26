@@ -31,8 +31,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.concurrency import run_in_threadpool
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .core import Engine, EngineError, VMRecord
 from .mesh import HttpxTransport, Mesh, MeshError, NodeCaps, NodeState, default_advertise
@@ -637,7 +637,7 @@ async def _creator_sse(supervisor: Supervisor, verb: str, params: dict[str, Any]
 
 
 def _query_shell_params(websocket: WebSocket) -> dict[str, Any]:
-    params = dict(websocket.query_params)
+    params: dict[str, Any] = dict(websocket.query_params)
     if "command" in params and "cmd" not in params:
         params["cmd"] = ["/bin/sh", "-c", params.pop("command")]
     if isinstance(params.get("cmd"), str):
@@ -757,6 +757,13 @@ def _ws_bearer_token(websocket: WebSocket) -> str | None:
             return value.strip()
     params = websocket.query_params
     return params.get("token") or params.get("access_token")
+
+def _request_bearer_token(request: Request) -> str | None:
+    header = request.headers.get("authorization")
+    if not header:
+        return None
+    scheme, _, value = header.partition(" ")
+    return value.strip() if scheme.lower() == "bearer" and value else None
 
 
 def _request_connect_token(request: Request) -> str | None:
@@ -1684,7 +1691,7 @@ def create_app(
     @app.get("/v1/sandboxes/{sandbox_id}/logs", dependencies=[Depends(require_auth)])
     async def logs_sandbox(
         request: Request, sandbox_id: str, follow: bool = False
-    ) -> PlainTextResponse | StreamingResponse:
+    ) -> Response:
         if follow:
             return StreamingResponse(
                 _logs_sse(supervisor, sandbox_id, request), media_type="text/event-stream"

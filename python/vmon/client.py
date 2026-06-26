@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import fcntl
 import itertools
 import json
@@ -29,7 +30,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 from .daemon import API_VERSION, daemon_paths
 
@@ -520,8 +521,8 @@ class GatewayClient:
             return self._json("POST", "/v1/fork", params)
         if method == "cp_read":
             path = self._urlencode({"path": params["path"]})
-            data = self._bytes("GET", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}")
-            return {"data": base64.b64encode(data).decode("ascii")}
+            file_data = self._bytes("GET", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}")
+            return {"data": base64.b64encode(file_data).decode("ascii")}
         if method == "cp_write":
             path = self._urlencode({"path": params["path"]})
             raw = base64.b64decode(str(params["data"]))
@@ -677,7 +678,9 @@ class GatewayClient:
             "workdir": params.get("workdir"),
             "timeout": params.get("timeout"),
         }
-        return self._ws_session(sock, request, on_event, tty=tty, stdin=stdin, on_ready=on_ready)
+        return self._ws_session(
+            sock, request, on_event, tty=tty, stdin=stdin, on_ready=on_ready, wait_ready=False
+        )
 
     def _ws_shell(
         self,
@@ -700,7 +703,9 @@ class GatewayClient:
                 query[key] = str(value)
         path = "/v1/shell/ws?" + urllib.parse.urlencode(query)
         sock = self._open_ws(path)
-        return self._ws_session(sock, request, on_event, tty=tty, on_ready=on_ready)
+        return self._ws_session(
+            sock, request, on_event, tty=tty, on_ready=on_ready, wait_ready=True
+        )
 
     def _ws_session(
         self,
@@ -711,6 +716,7 @@ class GatewayClient:
         tty: bool,
         stdin: BinaryIO | None = None,
         on_ready: Callable[[str], None] | None = None,
+        wait_ready: bool = True,
     ) -> dict[str, Any]:
         from .wsframe import encode_frame, read_frame_sync
 
@@ -735,8 +741,23 @@ class GatewayClient:
             except Exception:
                 pass
 
+        def start_input() -> None:
+            nonlocal raw, stdin_thread
+            if stdin_thread is not None:
+                return
+            src = stdin
+            if src is None and tty and sys.stdin.isatty() and sys.stdout.isatty():
+                raw = DaemonClient._enter_raw()
+                src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
+            elif src is None:
+                src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
+            stdin_thread = threading.Thread(target=forward, args=(src,), daemon=True)
+            stdin_thread.start()
+
         stdin_thread: threading.Thread | None = None
         try:
+            if not wait_ready:
+                start_input()
             while True:
                 opcode, payload = read_frame_sync(sock)
                 if opcode == 8:
@@ -747,14 +768,7 @@ class GatewayClient:
                 if "ready" in frame:
                     if on_ready is not None:
                         on_ready(str(frame.get("ready") or ""))
-                    src = stdin
-                    if src is None and tty and sys.stdin.isatty() and sys.stdout.isatty():
-                        raw = DaemonClient._enter_raw()
-                        src = getattr(sys.stdin, "buffer", sys.stdin)
-                    elif src is None:
-                        src = getattr(sys.stdin, "buffer", sys.stdin)
-                    stdin_thread = threading.Thread(target=forward, args=(src,), daemon=True)
-                    stdin_thread.start()
+                    start_input()
                     continue
                 if "stream" in frame:
                     on_event(str(frame["stream"]), str(frame.get("data") or "").encode())

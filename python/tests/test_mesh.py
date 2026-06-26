@@ -70,7 +70,7 @@ class FakeSandbox:
 
 def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
     mesh = Mesh(
-        FakeEngine(),
+        FakeEngine(committed=(1, 0)),
         advertise="http://self",
         token="t",
         transport=FakeTransport(),
@@ -84,8 +84,8 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
         "warm",
         "http://warm",
         caps=NodeCaps(2, 1024),
-        committed_vcpus=2,
-        committed_mem_mib=900,
+        committed_vcpus=1,
+        committed_mem_mib=512,
         pools={"img:x": 2},
         last_seen=now,
     )
@@ -150,6 +150,8 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
     app_b.state.mesh.transport = transport
     app_a.state.mesh.node_id = "A"
     app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
+    app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
     app_a.state.mesh.setup("http://a")
     app_b.state.mesh.setup("http://b")
 
@@ -160,7 +162,11 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
             request.method,
             path,
             content=body,
-            headers={"Authorization": f"Bearer {token}", "X-Vmon-Mesh-Hop": "1"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Vmon-Mesh-Hop": "1",
+                "Content-Type": request.headers.get("content-type", "application/json"),
+            },
         )
         return Response(response.content, status_code=response.status_code)
 
@@ -219,6 +225,8 @@ class RecordingGatewayClient:
     def __init__(self):
         self.calls = []
 
+    _q = staticmethod(lambda value: str(value))
+
     def _json(self, method, path, payload=None):
         self.calls.append((method, path, payload))
         if path == "/v1/sandboxes":
@@ -236,4 +244,8 @@ def test_gateway_call_mapping():
     GatewayClient.call(client, "rm", name="sb")
     GatewayClient.call(client, "snapshot", name="sb", snapshot="snap", stop=True)
     assert ("DELETE", "/v1/sandboxes/sb/remove", None) in client.calls
-    assert ("POST", "/v1/sandboxes/sb/snapshot_template", {"snapshot": "snap", "stop": True}) in client.calls
+    assert (
+        "POST",
+        "/v1/sandboxes/sb/snapshot_template",
+        {"snapshot": "snap", "stop": True},
+    ) in client.calls
