@@ -1,10 +1,12 @@
+from pathlib import Path
+
 import pytest
 
 
-def _snapshot(mvm_home, name):
+def _snapshot(mvm_home: Path, name: str) -> Path:
     snap = mvm_home / "snapshots" / name
     snap.mkdir(parents=True)
-    (snap / "current-generation").write_text("1\n")
+    (snap / "current-generation").write_text("1\n", encoding="utf-8")
     (snap / "vmstate.1.bin").touch()
     return snap
 
@@ -71,7 +73,7 @@ def test_restore_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     _snapshot(mvm_home, "snap")
     holder = {}
 
-    def fake_launch(self, args, **meta):
+    def fake_launch(self: object, args: list[str], **meta: object) -> None:
         holder["args"] = list(args)
         holder["meta"] = dict(meta)
 
@@ -92,7 +94,7 @@ def test_fork_snapshot_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     _snapshot(mvm_home, "base")
     holder = {}
 
-    def fake_launch(self, args, **meta):
+    def fake_launch(self: object, args: list[str], **meta: object) -> None:
         holder["args"] = list(args)
         holder["meta"] = dict(meta)
 

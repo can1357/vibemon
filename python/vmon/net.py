@@ -20,7 +20,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import cast
 
 CAP_NET_ADMIN = 12
 IP_FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
@@ -31,8 +31,7 @@ STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 LEASE_DIR = STATE / "network"
 LEASE_FILE = LEASE_DIR / "leases.json"
 
-LeaseState = dict[str, dict[str, str]]
-LeaseUpdateResult = TypeVar("LeaseUpdateResult")
+type LeaseState = dict[str, dict[str, str]]
 
 
 @dataclass(frozen=True)
@@ -134,9 +133,7 @@ class _TunnelSet:
         self._loop.run_forever()
 
     async def _start_server(self, guest_port: int) -> asyncio.AbstractServer:
-        async def handler(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-        ) -> None:
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             await _proxy_tcp(reader, writer, self._guest_ip, guest_port, self._allowed_nets)
 
         return await asyncio.start_server(handler, "127.0.0.1", 0)
@@ -240,7 +237,7 @@ def release_guest_config(name: str) -> None:
     _update_leases(update)
 
 
-def lease_for(name: str) -> dict | None:
+def lease_for(name: str) -> dict[str, object] | None:
     """Return the persisted /30 lease for *name* (tap + addresses), or ``None``.
 
     Read-only: unlike :func:`allocate_guest_config` this never allocates a new
@@ -249,7 +246,7 @@ def lease_for(name: str) -> dict | None:
     """
     try:
         leases = cast(dict[str, object], json.loads(LEASE_FILE.read_text()))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError, json.JSONDecodeError:
         return None
     entry = leases.get(name)
     if not isinstance(entry, dict) or "network" not in entry:
@@ -336,7 +333,9 @@ def _ip_allowed(
     return any(addr in net for net in nets)
 
 
-def _update_leases(callback: Callable[[LeaseState], LeaseUpdateResult]) -> LeaseUpdateResult:
+def _update_leases[LeaseUpdateResult](
+    callback: Callable[[LeaseState], LeaseUpdateResult],
+) -> LeaseUpdateResult:
     LEASE_DIR.mkdir(parents=True, exist_ok=True)
     with LEASE_FILE.open("a+", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -368,7 +367,7 @@ def has_net_admin() -> bool:
         if line.startswith("CapEff:"):
             try:
                 return bool(int(line.split()[1], 16) & (1 << CAP_NET_ADMIN))
-            except (IndexError, ValueError):
+            except IndexError, ValueError:
                 return False
     return False
 
@@ -393,7 +392,7 @@ def _resolve_domain_ips(domains: Sequence[str]) -> list[str]:
             continue
         try:
             infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
-        except (socket.gaierror, OSError):
+        except socket.gaierror, OSError:
             continue
         for info in infos:
             addr = info[4][0]

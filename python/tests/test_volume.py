@@ -73,14 +73,14 @@ def test_warm_pool_teardown_does_not_remove_unowned_vm_dir(tmp_path):
     class FakeVM:
         dir = outside
 
-        def __init__(self):
+        def __init__(self) -> None:
             self.stopped = False
             self.removed = False
 
-        def stop(self):
+        def stop(self) -> None:
             self.stopped = True
 
-        def remove(self):
+        def remove(self) -> None:
             self.removed = True
 
     vm = FakeVM()

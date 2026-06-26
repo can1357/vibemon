@@ -27,9 +27,10 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .vmm import MicroVM, _snapshot_state_present
 from .volume import Volume
@@ -102,7 +103,6 @@ def state_dir() -> Path:
     Equivalent to :data:`vmon.vmm.STATE`; centralized here so the daemon and
     client derive socket/lock paths from a single source.
     """
-    import os
 
     return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 
@@ -228,11 +228,11 @@ class Engine:
                 id=vm.name,
                 name=vm.name,
                 status=status,
-                pid=meta.get("pid"),
+                pid=self._pid_of(meta),
                 source=self._source_of(meta),
                 detail=dict(meta),
-                tags=dict(meta.get("tags") or {}),
-                timeout=meta.get("timeout_secs"),
+                tags=self._tags_of(meta),
+                timeout=self._timeout_of(meta),
             )
             if running:
                 for vol_name in self._volume_names(meta):
@@ -240,7 +240,7 @@ class Engine:
                         volume = Volume(vol_name)
                         volume.acquire()
                         record.volumes.append(volume)
-                    except (RuntimeError, ValueError):
+                    except RuntimeError, ValueError:
                         # Lock held by a live VM, or an invalid name: leave it be.
                         continue
                 if meta.get("tap"):
@@ -252,16 +252,40 @@ class Engine:
             self._records = records
 
     @staticmethod
-    def _source_of(meta: dict[str, Any]) -> str | None:
-        return (
-            meta.get("image")
-            or meta.get("restored_from")
-            or meta.get("forked_from")
-            or meta.get("restored_snapshot")
-        )
+    def _pid_of(meta: Mapping[str, object]) -> int | None:
+        pid = meta.get("pid")
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
 
     @staticmethod
-    def _volume_names(meta: dict[str, Any]) -> builtins.list[str]:
+    def _timeout_of(meta: Mapping[str, object]) -> float | None:
+        timeout = meta.get("timeout_secs")
+        if isinstance(timeout, bool):
+            return None
+        if isinstance(timeout, (int, float)):
+            return float(timeout)
+        return None
+
+    @staticmethod
+    def _tags_of(meta: Mapping[str, object]) -> dict[str, str]:
+        tags = meta.get("tags")
+        if not isinstance(tags, dict):
+            return {}
+        return {
+            key: value
+            for key, value in tags.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+
+    @staticmethod
+    def _source_of(meta: Mapping[str, object]) -> str | None:
+        for key in ("image", "restored_from", "forked_from", "restored_snapshot"):
+            source = meta.get(key)
+            if isinstance(source, str) and source:
+                return source
+        return None
+
+    @staticmethod
+    def _volume_names(meta: Mapping[str, object]) -> builtins.list[str]:
         """Volume names from a sandbox meta dict (``{mp: {name,...}}``).
 
         ``Sandbox.create`` records volumes keyed by mountpoint with a ``name``;
@@ -390,11 +414,11 @@ class Engine:
             name=vm.name,
             status="running",
             sandbox=sandbox,
-            pid=meta.get("pid"),
+            pid=self._pid_of(meta),
             source=source or self._source_of(meta),
             detail=dict(meta),
-            tags=dict(meta.get("tags") or {}),
-            timeout=meta.get("timeout_secs"),
+            tags=self._tags_of(meta),
+            timeout=self._timeout_of(meta),
         )
         with self._lock:
             self._records[vm.name] = record
@@ -429,7 +453,7 @@ class Engine:
                 cpus=int(params.get("cpus", 1)),
                 cmd=cmd,
             )
-            record = self._record_vm(vm, source=vm.meta.get("image"))
+            record = self._record_vm(vm, source=self._source_of(vm.meta))
             result = {"name": vm.name, "pid": vm.meta.get("pid"), "image": vm.meta.get("image")}
             if detach:
                 return {**result, "detached": True}
@@ -449,7 +473,11 @@ class Engine:
             disk_mb=int(params.get("disk_mb", 1024)),
             timeout=float(params.get("timeout", 300.0)),
         )
-        record = self._record_vm(sandbox.vm, source=sandbox.vm.meta.get("image"), sandbox=sandbox)
+        record = self._record_vm(
+            sandbox.vm,
+            source=self._source_of(sandbox.vm.meta),
+            sandbox=sandbox,
+        )
         argv = default_command(sandbox.image_spec, cmd)
         proc = sandbox.exec(argv)
         result = {
@@ -546,6 +574,7 @@ class Engine:
             "memory": int(params.get("mem", 512)),
             "disk_mb": int(params.get("disk_mb", 1024)),
             "timeout": float(params.get("timeout", 300.0)),
+            "block_network": True,
         }
         name: str | None = None
         sandbox: Any = None
@@ -572,7 +601,7 @@ class Engine:
                     )
                 name = sandbox.name
                 self._record_vm(
-                    sandbox.vm, source=sandbox.vm.meta.get("image") or "shell", sandbox=sandbox
+                    sandbox.vm, source=self._source_of(sandbox.vm.meta) or "shell", sandbox=sandbox
                 )
                 proc = sandbox.exec(*argv, env=env, tty=tty, _track_entry=False)
         except BaseException:
@@ -786,9 +815,21 @@ class Engine:
         if lease is None:
             return
         try:
-            net.teardown_tap(
-                lease["tap"], lease["guest_ip"], lease["host_ip"], int(lease["prefix"])
-            )
+            tap = lease.get("tap")
+            guest_ip_raw = lease.get("guest_ip")
+            host_ip_raw = lease.get("host_ip")
+            prefix_raw = lease.get("prefix")
+            guest_ip = guest_ip_raw if isinstance(guest_ip_raw, str) else None
+            host_ip = host_ip_raw if isinstance(host_ip_raw, str) else None
+            if isinstance(prefix_raw, int) and not isinstance(prefix_raw, bool):
+                prefix = prefix_raw
+            elif isinstance(prefix_raw, str):
+                prefix = int(prefix_raw)
+            else:
+                prefix = 30
+            if not isinstance(tap, str):
+                return
+            net.teardown_tap(tap, guest_ip, host_ip, prefix)
         except Exception:
             pass
         try:

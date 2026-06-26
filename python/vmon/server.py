@@ -239,7 +239,7 @@ class Supervisor:
         payload = {"event": event, "ts": time.time(), **data}
         with self._lock:
             subscribers = list(self._event_subscribers)
-        stale: builtins.list[asyncio.Queue[dict[str, Any]]] = []
+        stale: list[asyncio.Queue[dict[str, Any]]] = []
         for loop, queue_ in subscribers:
             if loop.is_closed():
                 stale.append(queue_)
@@ -1014,7 +1014,7 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
                     return
                 try:
                     payload = await asyncio.wait_for(subscriber.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
                 yield _sse(payload)

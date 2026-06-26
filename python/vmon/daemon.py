@@ -33,8 +33,9 @@ import os
 import signal
 import socket
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import __version__
 from .core import Engine, EngineError, state_dir
@@ -451,7 +452,7 @@ def acquire_owner_lock(lock_path: Path) -> int | None:
     a given ``$VMON_HOME`` at a time.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:

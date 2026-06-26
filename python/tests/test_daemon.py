@@ -14,6 +14,8 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import suppress
+from pathlib import Path
 
 import pytest
 
@@ -67,7 +69,8 @@ class FakeProc:
 class FakeSandbox:
     """Fake backend that persists meta (with a real dummy PID) like the real one."""
 
-    instances: dict[str, "FakeSandbox"] = {}
+    instances: dict[str, FakeSandbox] = {}
+    last_create_kwargs: dict | None = None
 
     def __init__(self, name):
         self.name = name
@@ -80,6 +83,7 @@ class FakeSandbox:
 
     @classmethod
     def create(cls, **kwargs):
+        cls.last_create_kwargs = dict(kwargs)
         name = kwargs.get("name") or "sb-fake"
         sb = cls(name)
         sb._child = subprocess.Popen(["sleep", "300"])
@@ -100,10 +104,8 @@ class FakeSandbox:
         self.terminated = True
         if self._child is not None:
             self._child.terminate()
-            try:
+            with suppress(Exception):
                 self._child.wait(timeout=2)
-            except Exception:
-                pass
 
 
 @pytest.fixture
@@ -118,9 +120,9 @@ def short_home(monkeypatch):
     import vmon.vmm as vmm_mod
     import vmon.volume as volume_mod
 
-    monkeypatch.setattr(vmm_mod, "STATE", __import__("pathlib").Path(home))
-    monkeypatch.setattr(volume_mod, "STATE", __import__("pathlib").Path(home))
-    monkeypatch.setattr(volume_mod, "VOLUME_DIR", __import__("pathlib").Path(home) / "volumes")
+    monkeypatch.setattr(vmm_mod, "STATE", Path(home))
+    monkeypatch.setattr(volume_mod, "STATE", Path(home))
+    monkeypatch.setattr(volume_mod, "VOLUME_DIR", Path(home) / "volumes")
     try:
         yield home
     finally:
@@ -237,10 +239,8 @@ def test_terminate_preserves_status_returncode_across_ps_and_rehydrate(fake_engi
         assert revived.view()["status"] == "terminated"
         assert revived.view()["returncode"] == 23
     finally:
-        try:
+        with suppress(core.EngineError):
             fake_engine.remove("api-dead")
-        except core.EngineError:
-            pass
 
 
 def test_shell_boots_ephemeral_streams_and_cleans_up(client):
@@ -282,6 +282,15 @@ def test_start_shell_image_path_records_then_cleanup_removes(fake_engine):
     assert name in [r["name"] for r in fake_engine.ps()]
     cleanup()
     assert name not in [r["name"] for r in fake_engine.ps()]
+
+
+def test_start_shell_uses_block_network_for_fresh_sandbox(fake_engine):
+    _proc, _name, cleanup = fake_engine.start_shell({"image": "alpine"})
+    try:
+        assert FakeSandbox.last_create_kwargs is not None
+        assert FakeSandbox.last_create_kwargs["block_network"] is True
+    finally:
+        cleanup()
 
 
 class _PtyStream:
@@ -423,10 +432,8 @@ def test_autostart_spawns_daemon(short_home):
         # A second client reuses the same daemon (no double-spawn / rebind error).
         assert client.call("ping") == {"pong": True}
     finally:
-        try:
+        with suppress(DaemonError):
             client.stop_daemon()
-        except DaemonError:
-            pass
 
 
 def test_single_owner_second_daemon_exits_without_rebinding(short_home):
@@ -472,7 +479,5 @@ def test_rehydrate_lists_disk_vms_and_reacquires_volume_locks(monkeypatch):
             Volume("vol_r").acquire()
     finally:
         child.terminate()
-        try:
+        with suppress(Exception):
             child.wait(timeout=2)
-        except Exception:
-            pass

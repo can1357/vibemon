@@ -66,10 +66,10 @@ def test_block_network_blocks_egress():
 
     sb = Sandbox.create(image=_image(), block_network=True, timeout=300)
     try:
-        start = time.time()
+        start = time.monotonic()
         proc = sb.exec("sh", "-lc", "wget -T 3 -q -O- https://example.com", timeout=10)
         rc = proc.wait(timeout=15)
         assert rc != 0
-        assert time.time() - start < 15
+        assert time.monotonic() - start < 15
     finally:
         sb.terminate()

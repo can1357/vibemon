@@ -7,8 +7,6 @@ speaks to :class:`vmon.client.DaemonClient` and renders everything through
 SDK and daemon stay dependency-light.
 """
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 

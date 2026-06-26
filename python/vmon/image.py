@@ -227,8 +227,11 @@ def cached_template(
     template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb)
     from .vmm import _snapshot_state_present
 
-    if _snapshot_state_present(tpl_dir) and (tpl_dir / "rootfs.img").is_file():
+    marker = tpl_dir / "agent-ready.json"
+    if _snapshot_state_present(tpl_dir) and (tpl_dir / "rootfs.img").is_file() and marker.is_file():
         return template
+    if tpl_dir.exists():
+        shutil.rmtree(tpl_dir)
 
     from .vmm import MicroVM
 
@@ -247,9 +250,12 @@ def cached_template(
         image=spec.reference,
     )
     try:
-        vm.agent(connect_timeout=timeout).ping(timeout=timeout)
+        vm.wait_for_agent(timeout=timeout)
         vm.snapshot(
             tpl_name, keep_running=False, disk_src=rootfs_ext4, snapshot_root=_state() / "templates"
+        )
+        marker.write_text(
+            json.dumps({"image": spec.reference, "digest": digest, "disk_mb": disk_mb}, indent=2)
         )
     finally:
         if vm.is_running():
@@ -266,7 +272,7 @@ def _is_static_elf(path: Path) -> bool:
     distroless guest rootfs. A fully static or static-PIE binary has none.
     """
     PT_INTERP = 3
-    with open(path, "rb") as fh:
+    with path.open("rb") as fh:
         header = fh.read(64)
         if len(header) < 16 or header[:4] != b"\x7fELF":
             return False
@@ -377,7 +383,7 @@ def _export_image(engine: str, reference: str, rootfs: Path, work: Path) -> None
     cid = _run([engine, "create", reference]).strip()
     try:
         tar = work / "rootfs.tar"
-        with open(tar, "wb") as fh:
+        with tar.open("wb") as fh:
             subprocess.run([engine, "export", cid], check=True, stdout=fh)
     finally:
         subprocess.run([engine, "rm", "-f", cid], capture_output=True)
@@ -429,7 +435,7 @@ def _mkfs_ext4(rootfs: Path, out: Path, disk_mb: int) -> None:
         raise RuntimeError(
             "mkfs.ext4 not found (install e2fsprogs; on macOS: `brew install e2fsprogs`)"
         )
-    with open(out, "wb") as fh:
+    with out.open("wb") as fh:
         fh.truncate(disk_mb * 1024 * 1024)
     cmd = [mkfs, "-q", "-F", "-d", str(rootfs), str(out)]
     # `mke2fs` defaults to ext2; force ext4 when we fell back to it.
@@ -447,7 +453,7 @@ def _pack_cpio(rootfs: Path, out: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
-    with open(out, "wb") as fh:
+    with out.open("wb") as fh:
         gzip = subprocess.Popen(["gzip", "-1"], stdin=cpio.stdout, stdout=fh)
     if find.stdout is not None:
         find.stdout.close()

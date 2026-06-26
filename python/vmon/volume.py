@@ -14,6 +14,7 @@ import os
 import re
 import threading
 from pathlib import Path
+from types import TracebackType
 
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 VOLUME_DIR = STATE / "volumes"
@@ -31,7 +32,7 @@ def _ensure_private_dir(path: Path, *, parents: bool) -> None:
     except FileExistsError as exc:
         raise ValueError(f"unsafe volume path {path!s}: not a directory") from exc
     try:
-        fd = os.open(str(path), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
     except OSError as exc:
         raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
     try:
@@ -43,7 +44,7 @@ def _ensure_private_dir(path: Path, *, parents: bool) -> None:
 def _open_volume_dir(path: Path) -> int:
     """Open an existing volume directory without following a final symlink."""
     try:
-        return os.open(str(path), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
     except OSError as exc:
         raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
 
@@ -116,7 +117,12 @@ class Volume:
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.release()
 
     @property

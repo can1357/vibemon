@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import deque
+from os import PathLike
 from pathlib import Path
+from typing import Protocol, cast
 
 from . import vmm as _vmm_mod
 from .vmm import MicroVM
+
+
+class _AgentPing(Protocol):
+    def ping(self, timeout: float | None = None) -> object: ...
+
+
+class _AgentBackedVM(Protocol):
+    def agent(self, connect_timeout: float | None = None) -> _AgentPing: ...
+
+
+def wait_for_agent_ready(vm: object, timeout: float | None = None) -> None:
+    """Wait for a VM guest agent, with compatibility for test/custom VM fakes."""
+    wait_for_agent = getattr(vm, "wait_for_agent", None)
+    if callable(wait_for_agent):
+        wait_for_agent(timeout=timeout)
+        return
+    cast(_AgentBackedVM, vm).agent(connect_timeout=timeout).ping(timeout=timeout)
 
 
 class WarmPool:
@@ -22,13 +40,13 @@ class WarmPool:
 
     def __init__(
         self,
-        template: str | os.PathLike[str],
+        template: str | PathLike[str],
         size: int,
         *,
         fork: bool = True,
         agent: bool = True,
         ping_timeout: float = 30.0,
-    ):
+    ) -> None:
         size = int(size)
         if size < 0:
             raise ValueError("pool size must be >= 0")
@@ -62,7 +80,7 @@ class WarmPool:
             if self.agent:
                 # Drive the clone all the way to a live, parked guest agent so a
                 # claimer inherits a warm VM rather than one still coming up.
-                vm.agent(connect_timeout=self.ping_timeout).ping(timeout=self.ping_timeout)
+                wait_for_agent_ready(vm, timeout=self.ping_timeout)
             return vm
         except Exception:
             if vm is not None:

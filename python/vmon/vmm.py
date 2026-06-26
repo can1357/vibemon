@@ -11,7 +11,9 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import cast
 
 from .agent import AgentClosed, AgentConn
 from .control import Control
@@ -66,7 +68,7 @@ def _is_python_console_script(path: str) -> bool:
     return head.startswith(b"#!") and b"python" in head
 
 
-def _which_all(name: str):
+def _which_all(name: str) -> Iterator[str]:
     """Yield every executable named *name* on ``PATH``, in lookup order."""
     seen: set[str] = set()
     for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
@@ -95,7 +97,7 @@ def _cargo_target_dir(repo: Path) -> Path | None:
             check=True,
         ).stdout
         return Path(json.loads(out)["target_directory"])
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+    except OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError:
         return None
 
 
@@ -201,13 +203,13 @@ def copy_reflink(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> Pa
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         shutil.copy2(src_p, tmp)
     os.replace(tmp, dst_p)
     return dst_p
 
 
-def _volume_args(volumes) -> list[str]:
+def _volume_args(volumes: Iterable[tuple[str, str | os.PathLike[str], bool]] | None) -> list[str]:
     """Format ``(tag, host_dir, read_only)`` tuples as repeatable ``--volume`` CLI args."""
     args: list[str] = []
     for tag, host_dir, read_only in volumes or []:
@@ -228,7 +230,7 @@ def _volume_args(volumes) -> list[str]:
 class MicroVM:
     """A microVM instance, addressed by a stable ``name``."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         self.name = name
         self.dir = STATE / "vms" / name
         self.sock = self.dir / "api.sock"
@@ -238,35 +240,57 @@ class MicroVM:
         self._agent_lock = threading.Lock()
 
     @property
-    def meta(self) -> dict:
+    def meta(self) -> dict[str, object]:
         try:
             return json.loads(self.meta_path.read_text())
         except FileNotFoundError:
             return {}
 
-    def _save_meta(self, **kw) -> None:
+    def _save_meta(self, **kw: object) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         m = self.meta
         m.update(kw)
         self.meta_path.write_text(json.dumps(m, indent=2, sort_keys=True))
 
+    @staticmethod
+    def _meta_optional_path(value: object) -> Path | None:
+        if not value:
+            return None
+        if isinstance(value, str):
+            return Path(value)
+        if isinstance(value, os.PathLike):
+            return Path(cast(os.PathLike[str], value))
+        raise TypeError("metadata path must be str or os.PathLike")
+
+    @classmethod
+    def _meta_path(cls, value: object, fallback: str | os.PathLike[str]) -> Path:
+        return cls._meta_optional_path(value) or Path(fallback)
+
+    @staticmethod
+    def _meta_pid(value: object) -> int | None:
+        if not value:
+            return None
+        if isinstance(value, int):
+            return value
+        raise TypeError("metadata pid must be int")
+
     @property
     def control_sock(self) -> Path:
         m = self.meta
-        if jail_root := m.get("jail_root"):
-            return Path(jail_root) / "root" / "run" / "vmon" / "control.sock"
-        return Path(m.get("sock") or self.sock)
+        if (jail_root := self._meta_optional_path(m.get("jail_root"))) is not None:
+            return jail_root / "root" / "run" / "vmon" / "control.sock"
+        return self._meta_path(m.get("sock"), self.sock)
 
     @property
     def agent_sock(self) -> Path:
         m = self.meta
-        if jail_root := m.get("jail_root"):
-            return Path(jail_root) / "root" / "run" / "vmon" / "agent.sock"
-        return Path(m.get("agent_sock") or (self.dir / "agent.sock"))
+        if (jail_root := self._meta_optional_path(m.get("jail_root"))) is not None:
+            return jail_root / "root" / "run" / "vmon" / "agent.sock"
+        return self._meta_path(m.get("agent_sock"), self.dir / "agent.sock")
 
     @property
     def rootfs_img(self) -> Path:
-        return Path(self.meta.get("rootfs") or (self.dir / "rootfs.img"))
+        return self._meta_path(self.meta.get("rootfs"), self.dir / "rootfs.img")
 
     @property
     def control(self) -> Control:
@@ -292,6 +316,61 @@ class MicroVM:
                 self._close_conn(current)  # drop a stale conn (closed or pointing at an old socket)
             self._agent_conn = conn
             return conn
+
+    def wait_for_agent(self, timeout: float = 300.0) -> AgentConn:
+        """Wait for the guest agent and fail early when the transport cannot appear."""
+        deadline = time.time() + max(0.0, float(timeout))
+        last: BaseException | None = None
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(self._agent_timeout_message(timeout, last)) from last
+            slice_timeout = min(1.0, max(0.001, remaining))
+            try:
+                conn = self.agent(connect_timeout=slice_timeout)
+                conn.ping(timeout=slice_timeout)
+                return conn
+            except (AgentClosed, OSError, TimeoutError) as exc:
+                last = exc
+                self._close_agent()
+                if message := self._agent_channel_failure():
+                    raise TimeoutError(message) from exc
+                time.sleep(min(0.05, max(0.0, remaining)))
+
+    def _agent_channel_failure(self) -> str | None:
+        log = self.logs()
+        if "Run /.vmon/agent as init process" not in log:
+            return None
+        if "virtio_console" in log or "hvc0" in log:
+            return None
+        started = self.meta.get("started")
+        try:
+            started_at = (
+                float(started) if started and isinstance(started, (int, float, str)) else 0.0
+            )
+        except ValueError:
+            started_at = 0.0
+        age = time.time() - started_at
+        if age < 3.0:
+            return None
+        tail = self._console_tail(log)
+        return (
+            "guest agent channel did not come up: the kernel reached /.vmon/agent, "
+            "but the console log shows no virtio-console/hvc0 device. Use a guest "
+            "kernel with CONFIG_VIRTIO_CONSOLE or set VMON_KERNEL to one that "
+            f"provides it; see {self.log}.\n{tail}"
+        )
+
+    def _agent_timeout_message(self, timeout: float, last: BaseException | None) -> str:
+        if message := self._agent_channel_failure():
+            return message
+        detail = f": {last}" if last is not None else ""
+        return f"agent did not answer within {timeout:g}s{detail}; see {self.log}"
+
+    @staticmethod
+    def _console_tail(log: str, lines: int = 12) -> str:
+        tail = "\n".join(log.splitlines()[-lines:])
+        return f"last console lines:\n{tail}" if tail else "console log is empty"
 
     def _connect_agent(self, sock: str, connect_timeout: float | None) -> AgentConn:
         deadline = None if connect_timeout is None else time.time() + connect_timeout
@@ -319,7 +398,7 @@ class MicroVM:
                 pass
 
     def is_running(self) -> bool:
-        pid = self.meta.get("pid")
+        pid = self._meta_pid(self.meta.get("pid"))
         if not pid:
             return False
         proc_stat = Path(f"/proc/{pid}/stat")
@@ -430,7 +509,7 @@ class MicroVM:
         overlay: bool = False,
         tap: str | None = None,
         fs_dir: str | os.PathLike[str] | None = None,
-        volumes: list[tuple[str, str, bool]] | None = None,
+        volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
         timeout_secs: int | None = None,
     ) -> MicroVM:
         """Fresh direct-kernel boot from an ext4 rootfs.
@@ -479,7 +558,7 @@ class MicroVM:
         vols = list(volumes or [])
         args.extend(_volume_args(vols))
         if timeout_secs is not None:
-            args.extend(["--timeout-secs", str(int(timeout_secs))])
+            args.extend(["--timeout-secs", str(timeout_secs)])
         if snapshot_root is not None:
             args.extend(["--snapshot-root", str(snapshot_root)])
         vm._launch(
@@ -506,7 +585,7 @@ class MicroVM:
         fs_dir: str | os.PathLike[str] | None = None,
         mem: int | None = None,
         cpus: int | None = None,
-        volumes: list[tuple[str, str, bool]] | None = None,
+        volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
         timeout_secs: int | None = None,
     ) -> MicroVM:
         """Warm-boot a microVM from a snapshot directory or named snapshot."""
@@ -560,7 +639,7 @@ class MicroVM:
         name: str | None = None,
         *,
         agent: bool = False,
-        volumes: list[tuple[str, str, bool]] | None = None,
+        volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
         timeout_secs: int | None = None,
     ) -> MicroVM:
         snap_dir = cls._snapshot_dir(snapshot)
@@ -643,8 +722,7 @@ class MicroVM:
             and "--no-sandbox" not in launch_args
         ):
             launch_args.append("--no-sandbox")
-        logf = open(self.log, "wb")
-        try:
+        with self.log.open("wb") as logf:
             proc = subprocess.Popen(
                 [binary, *launch_args],
                 stdout=logf,
@@ -652,8 +730,6 @@ class MicroVM:
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        finally:
-            logf.close()
         self._save_meta(
             pid=proc.pid,
             sock=str(control_sock),
@@ -675,11 +751,14 @@ class MicroVM:
                 try:
                     self.control.wait_ready(timeout=0.05)
                     return
-                except (TimeoutError, OSError, RuntimeError):
+                except TimeoutError, OSError, RuntimeError:
                     time.sleep(0.002)
             raise TimeoutError(f"VM '{self.name}' control socket never came up; see {self.log}")
         except BaseException:
-            self._cleanup_failed_launch(proc, control_sock, agent_sock)
+            try:
+                self._cleanup_failed_launch(proc, control_sock, agent_sock)
+            except Exception:
+                pass
             raise
 
     def _cleanup_failed_launch(self, proc: subprocess.Popen, *socks: Path | None) -> None:
@@ -745,7 +824,11 @@ class MicroVM:
         ``--snapshot-root`` joined with ``name``, so pass a root that matches it.
         """
         name = _valid_snapshot_name(str(snapshot))
-        root = Path(snapshot_root or self.meta.get("snapshot_root") or (STATE / "snapshots"))
+        root = (
+            Path(snapshot_root)
+            if snapshot_root
+            else self._meta_path(self.meta.get("snapshot_root"), STATE / "snapshots")
+        )
         snap_dir = self._snapshot_dir(name, root=root)
         paused = False
         try:
@@ -772,7 +855,7 @@ class MicroVM:
         try:
             self.control.quit()
         except (OSError, RuntimeError):
-            pid = self.meta.get("pid")
+            pid = self._meta_pid(self.meta.get("pid"))
             if pid:
                 try:
                     os.kill(pid, signal.SIGTERM)

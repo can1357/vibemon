@@ -24,12 +24,13 @@ import io
 import os
 import shutil
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import click
 from rich.box import ROUNDED
-from rich.console import Console, Group as Renderables, RenderableType
+from rich.console import Console, RenderableType
+from rich.console import Group as Renderables
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -85,7 +86,7 @@ def hint(message: str) -> None:
     console.print(f"  [vmon.muted]{message}[/]")
 
 
-def vm_table(rows: list[dict]) -> None:
+def vm_table(rows: Sequence[Mapping[str, Any]]) -> None:
     """Render ``vmon ps`` as a borderless, pipe-parseable table.
 
     ``box=None`` keeps each row's first whitespace-delimited token equal to the
@@ -125,7 +126,7 @@ def _stdout_isatty() -> bool:
     """Whether the *current* stdout is a terminal (help is echoed to stdout)."""
     try:
         return bool(sys.stdout.isatty())
-    except (AttributeError, ValueError):
+    except AttributeError, ValueError:
         return False
 
 
@@ -141,7 +142,7 @@ def _term_size() -> tuple[int, int]:
         try:
             size = os.get_terminal_size(sys.stdout.fileno())
             return size.columns, size.lines
-        except (OSError, ValueError, AttributeError):
+        except OSError, ValueError, AttributeError:
             pass
     fallback = shutil.get_terminal_size((80, 24))
     return fallback.columns, fallback.lines

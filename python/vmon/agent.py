@@ -8,8 +8,9 @@ import signal as _signal
 import socket
 import struct
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from itertools import count
+from os import PathLike
 from typing import Any
 
 MAX_PAYLOAD = 1 << 20
@@ -24,6 +25,7 @@ TYPE_KILL = 7
 
 _HEADER = struct.Struct("<IBI")
 _EOF = object()
+type _BytesLike = bytes | bytearray | memoryview
 
 
 class AgentClosed(RuntimeError):
@@ -143,7 +145,7 @@ class ExecSession:
     def signal(self) -> int | None:
         return self._signal
 
-    def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
+    def write_stdin(self, data: _BytesLike | str) -> None:
         if isinstance(data, str):
             raw = data.encode()
         else:
@@ -200,7 +202,9 @@ class ExecSession:
 class AgentConn:
     """Client for the GC4 guest-agent framed protocol over a Unix socket."""
 
-    def __init__(self, sock_path: str, connect_timeout: float | None = None) -> None:
+    def __init__(
+        self, sock_path: str | PathLike[str], connect_timeout: float | None = None
+    ) -> None:
         self.sock_path = str(sock_path)
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if connect_timeout is not None:
@@ -256,7 +260,7 @@ class AgentConn:
         ip: str,
         prefix: int,
         gw: str,
-        dns: list[str] | None = None,
+        dns: Sequence[str] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
         return self.request(
@@ -266,7 +270,7 @@ class AgentConn:
     def mount(
         self,
         tag: str,
-        path: str,
+        path: str | PathLike[str],
         ro: bool = False,
         fstype: str = "virtiofs",
         timeout: float | None = None,
@@ -281,9 +285,9 @@ class AgentConn:
 
     def exec(
         self,
-        cmd: list[str],
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
+        cmd: Sequence[str | PathLike[str]],
+        cwd: str | PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
         timeout: float | None = None,
         tty: bool = False,
     ) -> ExecSession:
@@ -308,7 +312,7 @@ class AgentConn:
             raise
         return session
 
-    def fs_read(self, path: str, timeout: float | None = None) -> bytes:
+    def fs_read(self, path: str | PathLike[str], timeout: float | None = None) -> bytes:
         req_id = self._new_id()
         pending = _Pending()
         stream = ByteStream()
@@ -334,8 +338,8 @@ class AgentConn:
 
     def fs_write(
         self,
-        path: str,
-        data: bytes | bytearray | memoryview | str,
+        path: str | PathLike[str],
+        data: _BytesLike | str,
         mode: int = 0o644,
         timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -363,20 +367,22 @@ class AgentConn:
             raise OSError(str(result.get("error") or "fs_write failed"))
         return result
 
-    def fs_list(self, path: str, timeout: float | None = None) -> list[dict[str, Any]]:
+    def fs_list(
+        self, path: str | PathLike[str], timeout: float | None = None
+    ) -> list[dict[str, Any]]:
         result = self.request("fs_list", timeout=timeout, path=str(path))
         return list(result.get("entries") or [])
 
-    def fs_stat(self, path: str, timeout: float | None = None) -> dict[str, Any]:
+    def fs_stat(self, path: str | PathLike[str], timeout: float | None = None) -> dict[str, Any]:
         return self.request("fs_stat", timeout=timeout, path=str(path))
 
     def fs_mkdir(
-        self, path: str, parents: bool = True, timeout: float | None = None
+        self, path: str | PathLike[str], parents: bool = True, timeout: float | None = None
     ) -> dict[str, Any]:
         return self.request("fs_mkdir", timeout=timeout, path=str(path), parents=bool(parents))
 
     def fs_remove(
-        self, path: str, recursive: bool = False, timeout: float | None = None
+        self, path: str | PathLike[str], recursive: bool = False, timeout: float | None = None
     ) -> dict[str, Any]:
         return self.request("fs_remove", timeout=timeout, path=str(path), recursive=bool(recursive))
 

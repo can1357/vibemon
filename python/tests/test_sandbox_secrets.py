@@ -1,68 +1,78 @@
 import io
 import json
+from pathlib import Path
 
 import pytest
 
 
 class FakeSession:
-    def __init__(self):
+    def __init__(self) -> None:
         self.stdout = io.BytesIO(b"")
         self.stderr = io.BytesIO(b"")
         self.stdin = io.BytesIO()
         self.returncode = 0
 
-    def write_stdin(self, data):
+    def write_stdin(self, data: bytes | bytearray | memoryview) -> None:
         self.stdin.write(bytes(data))
 
-    def close_stdin(self):
+    def close_stdin(self) -> None:
         pass
 
-    def kill(self):
+    def kill(self) -> None:
         self.returncode = -9
 
-    def wait(self, timeout=None):
+    def wait(self, timeout: float | None = None) -> int:
         return self.returncode
 
-    def resize(self, rows, cols):
+    def resize(self, rows: int, cols: int) -> None:
         self.rows = rows
         self.cols = cols
 
 
 class FakeAgentConn:
-    def __init__(self):
+    def __init__(self) -> None:
         self.closed = False
-        self.exec_envs = []
-        self.mounts = []
-        self.net_configs = []
+        self.exec_envs: list[dict[str, str]] = []
+        self.mounts: list[tuple[str, str, bool]] = []
+        self.net_configs: list[dict[str, object]] = []
+        self.ping_timeouts: list[float | None] = []
 
-    def ping(self, timeout=None):
+    def ping(self, timeout: float | None = None) -> dict[str, bool]:
+        self.ping_timeouts.append(timeout)
         return {"ok": True}
 
-    def mount(self, tag, path, ro=False):
+    def mount(self, tag: str, path: str, ro: bool = False) -> dict[str, bool]:
         self.mounts.append((tag, path, ro))
         return {"ok": True}
 
-    def net_config(self, **kwargs):
+    def net_config(self, **kwargs: object) -> dict[str, bool]:
         self.net_configs.append(kwargs)
         return {"ok": True}
 
-    def exec(self, argv, cwd=None, env=None, timeout=None, tty=False):
+    def exec(
+        self,
+        argv: object,
+        cwd: object = None,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        tty: bool = False,
+    ) -> FakeSession:
         self.exec_envs.append(dict(env or {}))
         return FakeSession()
 
-    def close(self):
+    def close(self) -> None:
         self.closed = True
 
 
 class FakeControl:
-    def extend(self, secs):
+    def extend(self, secs: int) -> dict[str, int]:
         return {"deadline_unix": secs}
 
 
 class FakeMicroVM:
-    restored = []
+    restored: list[tuple[object, str | None, dict[str, object], object]] = []
 
-    def __init__(self, name, root):
+    def __init__(self, name: str, root: Path) -> None:
         self.name = name
         self.dir = root / "vms" / name
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -72,25 +82,28 @@ class FakeMicroVM:
         self.stopped = False
 
     @classmethod
-    def restore(cls, template, name=None, **kwargs):
+    def restore(cls, template: object, name: str | None = None, **kwargs: object):
         import vmon.sandbox as sandbox_mod
 
         vm = cls(name or "sb", sandbox_mod.STATE)
         cls.restored.append((template, name, dict(kwargs), vm))
         return vm
 
-    def agent(self, connect_timeout=None):
+    def agent(self, connect_timeout: float | None = None) -> FakeAgentConn:
         return self._agent
 
-    def _save_meta(self, **kw):
+    def _save_meta(self, **kw: object) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "meta.json").write_text(json.dumps(kw, indent=2, sort_keys=True))
+        (self.dir / "meta.json").write_text(
+            json.dumps(kw, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
-    def stop(self):
+    def stop(self) -> None:
         self.stopped = True
 
 
-def _install_fakes(monkeypatch, mvm_home):
+def _install_fakes(monkeypatch, mvm_home: Path):
     import vmon.sandbox as sandbox_mod
 
     FakeMicroVM.restored = []
@@ -115,12 +128,13 @@ def test_create_never_persists_secret_values_and_exec_merges_env(monkeypatch, mv
         block_network=True,
     )
     vm = FakeMicroVM.restored[-1][3]
+    assert vm._agent.ping_timeouts == [300]
 
     for path in vm.dir.rglob("*"):
         if path.is_file():
-            assert "sekret-value" not in path.read_text(errors="ignore")
+            assert "sekret-value" not in path.read_text(encoding="utf-8", errors="ignore")
 
-    meta = json.loads((vm.dir / "meta.json").read_text())
+    meta = json.loads((vm.dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["secret_names"] == ["FOO"]
     assert meta["env_names"] == ["PLAIN"]
     assert "env" not in meta
@@ -143,6 +157,7 @@ def test_volume_tag_collisions_get_unique_restore_tags(monkeypatch, mvm_home):
         block_network=True,
     )
     restore_kwargs = FakeMicroVM.restored[-1][2]
+    assert FakeMicroVM.restored[-1][3]._agent.ping_timeouts == [300]
     tags = [tag for tag, _host_dir, _read_only in restore_kwargs["volumes"]]
 
     assert tags == ["a_b", "a_b_2"]

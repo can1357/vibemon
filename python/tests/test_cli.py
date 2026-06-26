@@ -13,7 +13,7 @@ import vmon.cli as cli
 class RecordingClient:
     """Stand-in for ``DaemonClient`` that records the last request it received."""
 
-    last: dict = {}
+    last: dict[str, object] = {}
     returncode = 0
 
     def __init__(self, *args, **kwargs):

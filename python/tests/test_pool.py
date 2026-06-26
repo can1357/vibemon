@@ -5,7 +5,11 @@ def test_warm_pool_refills_claims_and_shutdown_tears_down(monkeypatch):
     import vmon.pool as pool_mod
 
     class FakeAgent:
+        def __init__(self, vm):
+            self.vm = vm
+
         def ping(self, timeout=None):
+            self.vm.ping_timeout = timeout
             return {"ok": True}
 
     class FakeVM:
@@ -15,6 +19,8 @@ def test_warm_pool_refills_claims_and_shutdown_tears_down(monkeypatch):
             self.name = name
             self.stopped = False
             self.removed = False
+            self.connect_timeout = None
+            self.ping_timeout = None
             FakeVM.made.append(self)
 
         @classmethod
@@ -27,7 +33,7 @@ def test_warm_pool_refills_claims_and_shutdown_tears_down(monkeypatch):
 
         def agent(self, connect_timeout=None):
             self.connect_timeout = connect_timeout
-            return FakeAgent()
+            return FakeAgent(self)
 
         def stop(self):
             self.stopped = True
@@ -39,13 +45,15 @@ def test_warm_pool_refills_claims_and_shutdown_tears_down(monkeypatch):
 
     pool = pool_mod.WarmPool(template="x", size=2, ping_timeout=0.2)
     try:
-        deadline = time.time() + 3.0
-        while time.time() < deadline and pool.stats()["ready_count"] < 2:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and pool.stats()["ready_count"] < 2:
             time.sleep(0.02)
         assert pool.stats()["ready_count"] == 2
 
         claimed = pool.claim()
         assert isinstance(claimed, FakeVM)
+        assert claimed.connect_timeout == 0.2
+        assert claimed.ping_timeout == 0.2
         assert pool.stats()["hits"] == 1
     finally:
         pool.shutdown()

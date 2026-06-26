@@ -89,18 +89,15 @@ def ensure_kernel(arch: str | None = None) -> Path:
 
 
 def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    with path.open("rb") as fh:
+        return hashlib.file_digest(fh, "sha256").hexdigest()
 
 
 def _download_verified(url: str, dest: Path, sha256: str) -> None:
     tmp = dest.with_name(f"{dest.name}.part.{os.getpid()}")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "vmon"})
-        with urllib.request.urlopen(req) as resp, open(tmp, "wb") as fh:
+        with urllib.request.urlopen(req) as resp, tmp.open("wb") as fh:
             while chunk := resp.read(1 << 20):
                 fh.write(chunk)
         got = _sha256(tmp)
@@ -110,4 +107,4 @@ def _download_verified(url: str, dest: Path, sha256: str) -> None:
     except OSError as e:
         raise RuntimeError(f"failed to download guest kernel from {url}: {e}") from e
     finally:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)

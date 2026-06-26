@@ -26,8 +26,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO
 
 from .daemon import API_VERSION, daemon_paths
 
@@ -252,14 +253,14 @@ class DaemonClient:
 
         try:
             return signal.signal(signal.SIGWINCH, handler)
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return None  # not the main thread, or no SIGWINCH on this platform
 
     @staticmethod
     def _restore_winch(old: Any) -> None:
         try:
             signal.signal(signal.SIGWINCH, old)
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             pass
 
     @staticmethod
@@ -276,7 +277,7 @@ class DaemonClient:
                     conn.send_eof()
                     return
                 conn.send_stdin(chunk)
-        except (OSError, ValueError):
+        except OSError, ValueError:
             pass
 
     def ensure_running(self) -> dict[str, Any]:
@@ -296,7 +297,7 @@ class DaemonClient:
         if pid:
             try:
                 os.kill(int(pid), signal.SIGTERM)
-            except (ProcessLookupError, ValueError):
+            except ProcessLookupError, ValueError:
                 pass
         return info
 
@@ -373,7 +374,7 @@ class DaemonClient:
                 ) from exc
         try:
             return self._connect_uds()
-        except (FileNotFoundError, ConnectionRefusedError):
+        except FileNotFoundError, ConnectionRefusedError:
             if not self._autostart:
                 raise DaemonError(
                     f"vmond not running at {self._sock_path} (vmon daemon start)",
@@ -400,13 +401,12 @@ class DaemonClient:
         """
         paths = daemon_paths()
         paths["home"].mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(str(paths["home"] / "vmond.start.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(paths["home"] / "vmond.start.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if self._ping_ok():
                 return
-            log = open(paths["log"], "ab")
-            try:
+            with paths["log"].open("ab") as log:
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "vmon.daemon"],
                     stdin=subprocess.DEVNULL,
@@ -414,8 +414,6 @@ class DaemonClient:
                     stderr=log,
                     start_new_session=True,
                 )
-            finally:
-                log.close()
             deadline = time.time() + _AUTOSTART_TIMEOUT
             while time.time() < deadline:
                 if proc.poll() is not None:

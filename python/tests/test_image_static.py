@@ -1,10 +1,11 @@
 import hashlib
 import struct
+from pathlib import Path
 
 import pytest
 
 
-def _write_elf64(path, p_type):
+def _write_elf64(path: Path, p_type: int) -> Path:
     ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\x00" * 9
     header = struct.pack(
         "<16sHHIQQQIHHHHHH",
@@ -34,7 +35,7 @@ def test_is_static_elf_detects_pt_interp(tmp_path):
     dynamic = _write_elf64(tmp_path / "dynamic-agent", 3)
     static = _write_elf64(tmp_path / "static-agent", 1)
     text = tmp_path / "not-elf"
-    text.write_text("hello")
+    text.write_text("hello", encoding="utf-8")
 
     assert _is_static_elf(dynamic) is False
     assert _is_static_elf(static) is True
@@ -63,7 +64,7 @@ def test_first_static_skips_dynamic_and_non_elf(tmp_path):
     dynamic = _write_elf64(tmp_path / "dynamic-agent", 3)
     static = _write_elf64(tmp_path / "static-agent", 1)
     text = tmp_path / "not-elf"
-    text.write_text("hello")
+    text.write_text("hello", encoding="utf-8")
     for p in (dynamic, static, text):
         p.chmod(0o755)
 
@@ -115,12 +116,12 @@ def test_find_agent_binary_reports_missing_arch_and_checked_asset(monkeypatch, t
 def test_build_or_pull_normalizes_and_rejects_image_refs(monkeypatch):
     import vmon.image as image
 
-    calls = []
+    calls: list[tuple[list[str], dict[str, object]]] = []
 
     class Result:
         returncode = 0
 
-    def fake_run(cmd, **kwargs):
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
         calls.append((cmd, kwargs))
         return Result()
 

@@ -9,13 +9,13 @@ import secrets as _secrets
 import shutil
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .agent import AgentClosed, AgentConn, ByteStream, ExecSession
 from .image import ImageSpec, cached_template
-from .pool import WarmPool
+from .pool import WarmPool, wait_for_agent_ready
 from .secret import Secret, merge_secrets
 from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_timeout_secs
 from .volume import Volume
@@ -26,11 +26,11 @@ _POOLS: dict[str, WarmPool] = {}
 def _setup_sandbox_network(
     name: str,
     *,
-    ports=None,
-    egress_allow=None,
-    egress_allow_domains=None,
-    inbound_cidr_allowlist=None,
-):
+    ports: Sequence[int] | None = None,
+    egress_allow: Sequence[str] | None = None,
+    egress_allow_domains: Sequence[str] | None = None,
+    inbound_cidr_allowlist: Sequence[str] | None = None,
+) -> Any:
     """Create the host TAP + port tunnels for a networked sandbox before launch.
 
     Returns a :class:`vmon.net.SandboxNetwork`; raises ``PermissionError`` without
@@ -183,10 +183,10 @@ class Sandbox:
         tags: dict[str, str] | None = None,
         fs_dir: str | None = None,
         block_network: bool = False,
-        ports: list[int] | tuple[int, ...] | None = None,
-        egress_allow: list[str] | tuple[str, ...] | None = None,
-        egress_allow_domains: list[str] | tuple[str, ...] | None = None,
-        inbound_cidr_allowlist: list[str] | tuple[str, ...] | None = None,
+        ports: Sequence[int] | None = None,
+        egress_allow: Sequence[str] | None = None,
+        egress_allow_domains: Sequence[str] | None = None,
+        inbound_cidr_allowlist: Sequence[str] | None = None,
         readiness_probe: Any = None,
         pool_size: int = 0,
     ) -> Sandbox:
@@ -308,7 +308,7 @@ class Sandbox:
             sb._timeout_secs = eff_timeout_secs
             if sb._timeout_secs is not None:
                 sb._start_timeout_watchdog(sb._timeout_secs)
-            sb.agent(connect_timeout=timeout).ping(timeout=timeout)
+            wait_for_agent_ready(sb.vm, timeout=timeout)
             if from_pool and sb._timeout_secs is not None:
                 # Pool clones launch without --timeout-secs; arm the VMM-enforced
                 # deadline via the extend control op (the host watchdog is a backstop).
@@ -384,8 +384,8 @@ class Sandbox:
         workdir: str | None = None,
         env: dict[str, str] | None = None,
         block_network: bool = False,
-        ports: list[int] | tuple[int, ...] | None = None,
-        egress_allow: list[str] | tuple[str, ...] | None = None,
+        ports: Sequence[int] | None = None,
+        egress_allow: Sequence[str] | None = None,
     ) -> Sandbox:
         if block_network and ports:
             raise ValueError("ports cannot be exposed when block_network=True")
@@ -399,7 +399,7 @@ class Sandbox:
                     else MicroVM.restore(name, name=sandbox_name, agent=True)
                 )
                 sb = cls(vm, workdir=workdir, env=env)
-                sb.agent(connect_timeout=timeout).ping(timeout=timeout)
+                wait_for_agent_ready(sb.vm, timeout=timeout)
             else:
                 if fork:
                     raise ValueError(
@@ -424,7 +424,7 @@ class Sandbox:
                 )
                 sb = cls(vm, workdir=workdir, env=env)
                 sb._network = net_handle
-                sb.agent(connect_timeout=timeout).ping(timeout=timeout)
+                wait_for_agent_ready(sb.vm, timeout=timeout)
                 gc = net_handle.guest_config
                 sb.agent().net_config(gc["ip"], int(gc["prefix"]), gc["gw"], gc.get("dns") or [])
             vm._save_meta(
@@ -456,9 +456,13 @@ class Sandbox:
     def attach(cls, name: str) -> Sandbox:
         vm = MicroVM(name)
         meta = vm.meta
-        return cls(
-            vm, workdir=meta.get("workdir"), env=meta.get("env") or {}, tags=meta.get("tags") or {}
-        )
+        workdir_value = meta.get("workdir")
+        workdir = workdir_value if isinstance(workdir_value, str) else None
+        env_value = meta.get("env")
+        env = cast(dict[str, str], env_value) if isinstance(env_value, dict) else {}
+        tags_value = meta.get("tags")
+        tags = cast(dict[str, str], tags_value) if isinstance(tags_value, dict) else {}
+        return cls(vm, workdir=workdir, env=env, tags=tags)
 
     @staticmethod
     def _resolve_template(
@@ -578,7 +582,7 @@ class Sandbox:
         deadline = time.time() + timeout
         last: BaseException | None = None
         if probe is None:
-            self.agent(connect_timeout=timeout).ping(timeout=timeout)
+            wait_for_agent_ready(self.vm, timeout=timeout)
             return
         while time.time() < deadline:
             remaining = max(0.0, deadline - time.time())
@@ -617,7 +621,7 @@ class Sandbox:
             seen.add(path)
             try:
                 data = json.loads(path.read_text())
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
+            except FileNotFoundError, json.JSONDecodeError, OSError:
                 continue
             return data if isinstance(data, dict) else None
         return None
@@ -717,8 +721,8 @@ class Sandbox:
     def set_network_policy(
         self,
         block_network: bool | None = None,
-        cidr_allow: list[str] | tuple[str, ...] | None = None,
-        domain_allow: list[str] | tuple[str, ...] | None = None,
+        cidr_allow: Sequence[str] | None = None,
+        domain_allow: Sequence[str] | None = None,
     ) -> None:
         if self._network is None:
             return
