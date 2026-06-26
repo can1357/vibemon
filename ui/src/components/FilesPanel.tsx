@@ -15,26 +15,35 @@ export function FilesPanel({
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<{ path: string; text: string; binary: boolean } | null>(null);
+  const [preview, setPreview] = useState<{ path: string; text: string; binary: boolean } | null>(
+    null,
+  );
 
-  const load = useCallback(async (dir: string) => {
-    setLoading(true);
-    setError(null);
-    setPreview(null);
-    try {
-      const list = await api.fsList(sandboxId, dir);
-      list.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
-      setEntries(list);
-      setCwd(dir);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [sandboxId]);
+  const load = useCallback(
+    async (dir: string) => {
+      setLoading(true);
+      setError(null);
+      setPreview(null);
+      try {
+        const list = await api.fsList(sandboxId, dir);
+        list.sort((a, b) =>
+          a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1,
+        );
+        setEntries(list);
+        setCwd(dir);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        setEntries([]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [sandboxId],
+  );
 
-  useEffect(() => { void load(ROOT); }, [load]);
+  useEffect(() => {
+    void load(ROOT);
+  }, [load]);
 
   function joinPath(base: string, name: string): string {
     if (base === ROOT) return ROOT + name;
@@ -48,13 +57,21 @@ export function FilesPanel({
 
   async function openEntry(e: FsEntry): Promise<void> {
     const p = joinPath(cwd, e.name);
-    if (e.type === "dir") { void load(p); return; }
+    if (e.type === "dir") {
+      void load(p);
+      return;
+    }
     if (e.type === "symlink") {
       // resolve via stat: if it's a dir, descend; else read.
       try {
         const st = await api.fsStat(sandboxId, p);
-        if (st.type === "dir") { void load(p); return; }
-      } catch { /* fall through to read */ }
+        if (st.type === "dir") {
+          void load(p);
+          return;
+        }
+      } catch {
+        /* fall through to read */
+      }
     }
     try {
       const blob = await api.readFile(sandboxId, p);
@@ -94,56 +111,111 @@ export function FilesPanel({
   return (
     <div className="panel">
       <div className="fs-toolbar">
-        <button className="btn btn--sm" onClick={() => void load(parentOf(cwd))} disabled={cwd === ROOT}>↑ Up</button>
+        <button
+          className="btn btn--sm"
+          onClick={() => void load(parentOf(cwd))}
+          disabled={cwd === ROOT}
+        >
+          ↑ Up
+        </button>
         <span className="fs-path muted">{cwd}</span>
         <label className="btn btn--sm" style={{ cursor: "pointer" }}>
           ↑ Upload
-          <input type="file" multiple hidden onChange={(e) => void onUpload(e.currentTarget.files)} />
+          <input
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => void onUpload(e.currentTarget.files)}
+          />
         </label>
-        <button className="btn btn--sm" onClick={() => void load(cwd)}>↻</button>
+        <button className="btn btn--sm" onClick={() => void load(cwd)}>
+          ↻
+        </button>
       </div>
 
-      {error && <p className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>{error}</p>}
+      {error && (
+        <p className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>
+          {error}
+        </p>
+      )}
 
       <table className="fs-table">
         <thead>
-          <tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th><th></th></tr>
+          <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Size</th>
+            <th>Modified</th>
+            <th></th>
+          </tr>
         </thead>
         <tbody>
           {loading ? (
-            <tr><td colSpan={5} className="muted">loading…</td></tr>
-          ) : entries.length === 0 ? (
-            <tr><td colSpan={5} className="faint">empty directory</td></tr>
-          ) : entries.map((e) => (
-            <tr key={e.name} className="fs-row" onClick={() => void openEntry(e)}>
-              <td className={`fs-row__name${e.type === "dir" ? " fs-row__name--dir" : ""}`}>
-                {e.type === "dir" ? "▸ " : e.type === "symlink" ? "↪ " : ""}{e.name}
-              </td>
-              <td className="muted">{e.type}</td>
-              <td className="mono muted">{e.type === "dir" ? "—" : fmtBytes(e.size)}</td>
-              <td className="mono muted">{fmtTime(e.mtime)}</td>
-              <td>
-                <button
-                  className="btn btn--ghost btn--sm fs-row__del"
-                  onClick={(ev) => { ev.stopPropagation(); void delEntry(e, e.type === "dir"); }}
-                  aria-label={`delete ${e.name}`}
-                >✕</button>
+            <tr>
+              <td colSpan={5} className="muted">
+                loading…
               </td>
             </tr>
-          ))}
+          ) : entries.length === 0 ? (
+            <tr>
+              <td colSpan={5} className="faint">
+                empty directory
+              </td>
+            </tr>
+          ) : (
+            entries.map((e) => (
+              <tr key={e.name} className="fs-row" onClick={() => void openEntry(e)}>
+                <td className={`fs-row__name${e.type === "dir" ? " fs-row__name--dir" : ""}`}>
+                  {e.type === "dir" ? "▸ " : e.type === "symlink" ? "↪ " : ""}
+                  {e.name}
+                </td>
+                <td className="muted">{e.type}</td>
+                <td className="mono muted">{e.type === "dir" ? "—" : fmtBytes(e.size)}</td>
+                <td className="mono muted">{fmtTime(e.mtime)}</td>
+                <td>
+                  <button
+                    className="btn btn--ghost btn--sm fs-row__del"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      void delEntry(e, e.type === "dir");
+                    }}
+                    aria-label={`delete ${e.name}`}
+                  >
+                    ✕
+                  </button>
+                </td>
+              </tr>
+            ))
+          )}
         </tbody>
       </table>
 
       {preview && (
         <div className="card" style={{ marginTop: "var(--gap)" }}>
           <div className="modal__head">
-            <h3 className="mono" style={{ fontSize: "var(--fs-sm)" }}>{preview.path}</h3>
-            <button className="btn btn--ghost btn--sm" onClick={() => setPreview(null)}>✕</button>
+            <h3 className="mono" style={{ fontSize: "var(--fs-sm)" }}>
+              {preview.path}
+            </h3>
+            <button className="btn btn--ghost btn--sm" onClick={() => setPreview(null)}>
+              ✕
+            </button>
           </div>
           {preview.binary ? (
-            <p className="muted" style={{ padding: "var(--pad)" }}>Binary file — download not supported in this view.</p>
+            <p className="muted" style={{ padding: "var(--pad)" }}>
+              Binary file — download not supported in this view.
+            </p>
           ) : (
-            <pre className="mono" style={{ margin: 0, padding: "var(--pad)", maxHeight: 360, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+            <pre
+              className="mono"
+              style={{
+                margin: 0,
+                padding: "var(--pad)",
+                maxHeight: 360,
+                overflow: "auto",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-all",
+              }}
+            >
               {preview.text}
             </pre>
           )}

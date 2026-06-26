@@ -15,13 +15,22 @@ function trimOrNull(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-function requiredInt(value: number | null | undefined, label: string, min: number, max?: number): number {
+function requiredInt(
+  value: number | null | undefined,
+  label: string,
+  min: number,
+  max?: number,
+): number {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     throw new Error(`${label} must be a whole number.`);
   }
   const n = Number(value);
   if (n < min || (max !== undefined && n > max)) {
-    throw new Error(max === undefined ? `${label} must be at least ${min}.` : `${label} must be between ${min} and ${max}.`);
+    throw new Error(
+      max === undefined
+        ? `${label} must be at least ${min}.`
+        : `${label} must be between ${min} and ${max}.`,
+    );
   }
   return n;
 }
@@ -57,7 +66,12 @@ export function CreateModal({
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
 
-  useEffect(() => () => { mounted.current = false; }, []);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
 
   const set = <K extends keyof SandboxCreate>(k: K, v: SandboxCreate[K]) => {
     setForm((f) => ({ ...f, [k]: v }));
@@ -95,7 +109,14 @@ export function CreateModal({
       <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal__head">
           <h3>New sandbox</h3>
-          <button className="btn btn--ghost btn--sm" onClick={requestClose} disabled={busy} aria-label="Close">✕</button>
+          <button
+            className="btn btn--ghost btn--sm"
+            onClick={requestClose}
+            disabled={busy}
+            aria-label="Close"
+          >
+            ✕
+          </button>
         </div>
         <div className="modal__body">
           <label className="field">
@@ -112,7 +133,9 @@ export function CreateModal({
               <span className="label">vCPUs</span>
               <input
                 className="input mono"
-                type="number" min={1} max={64}
+                type="number"
+                min={1}
+                max={64}
                 value={form.cpus ?? 1}
                 onChange={(e) => set("cpus", Number(e.currentTarget.value))}
               />
@@ -121,7 +144,8 @@ export function CreateModal({
               <span className="label">Memory (MiB)</span>
               <input
                 className="input mono"
-                type="number" min={32}
+                type="number"
+                min={32}
                 value={form.memory ?? 512}
                 onChange={(e) => set("memory", Number(e.currentTarget.value))}
               />
@@ -130,7 +154,8 @@ export function CreateModal({
               <span className="label">Disk (MiB)</span>
               <input
                 className="input mono"
-                type="number" min={256}
+                type="number"
+                min={256}
                 value={form.disk_mb ?? 1024}
                 onChange={(e) => set("disk_mb", Number(e.currentTarget.value))}
               />
@@ -149,7 +174,8 @@ export function CreateModal({
             <span className="label">Timeout (s, 0 = never)</span>
             <input
               className="input mono"
-              type="number" min={0}
+              type="number"
+              min={0}
               value={form.timeout ?? 0}
               onChange={(e) => set("timeout", Number(e.currentTarget.value))}
             />
@@ -162,11 +188,21 @@ export function CreateModal({
             />
             Block network (no TAP)
           </label>
-          {error && <p className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>{error}</p>}
+          {error && (
+            <p className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>
+              {error}
+            </p>
+          )}
         </div>
         <div className="modal__foot">
-          <button className="btn btn--ghost" onClick={requestClose} disabled={busy}>Cancel</button>
-          <button className="btn btn--primary" onClick={submit} disabled={busy || !trimOrNull(form.image)}>
+          <button className="btn btn--ghost" onClick={requestClose} disabled={busy}>
+            Cancel
+          </button>
+          <button
+            className="btn btn--primary"
+            onClick={submit}
+            disabled={busy || !trimOrNull(form.image)}
+          >
             {busy ? <span className="spinner" /> : "Create"}
           </button>
         </div>

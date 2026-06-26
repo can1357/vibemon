@@ -121,8 +121,7 @@ export const api = {
   health: () => req<{ ok: boolean }>("/healthz"),
   metrics: () => req<string>("/metrics"),
 
-  listSandboxes: () =>
-    req<{ sandboxes: SandboxView[] }>("/v1/sandboxes").then((r) => r.sandboxes),
+  listSandboxes: () => req<{ sandboxes: SandboxView[] }>("/v1/sandboxes").then((r) => r.sandboxes),
   getSandbox: (id: string) => req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}`),
   createSandbox: (body: SandboxCreate) =>
     req<SandboxView>("/v1/sandboxes", {

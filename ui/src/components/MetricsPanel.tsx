@@ -43,18 +43,34 @@ export function MetricsPanel(): React.ReactElement {
     async function pull(): Promise<void> {
       try {
         const t = await api.metrics();
-        if (!stop) { setText(t); setError(null); }
+        if (!stop) {
+          setText(t);
+          setError(null);
+        }
       } catch (e) {
         if (!stop) setError(e instanceof Error ? e.message : String(e));
       }
     }
     void pull();
     const t = setInterval(pull, 5000);
-    return () => { stop = true; clearInterval(t); };
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
   }, []);
 
-  if (error) return <p className="mono" style={{ color: "var(--err)", padding: "var(--pad)" }}>{error}</p>;
-  if (!text) return <p className="muted" style={{ padding: "var(--pad)" }}>loading…</p>;
+  if (error)
+    return (
+      <p className="mono" style={{ color: "var(--err)", padding: "var(--pad)" }}>
+        {error}
+      </p>
+    );
+  if (!text)
+    return (
+      <p className="muted" style={{ padding: "var(--pad)" }}>
+        loading…
+      </p>
+    );
 
   const { help, lines } = parseMetrics(text);
 
@@ -66,17 +82,25 @@ export function MetricsPanel(): React.ReactElement {
         return (
           <div key={family} className="card" style={{ marginBottom: "var(--gap)" }}>
             <div className="modal__head" style={{ padding: "var(--pad-sm) var(--pad)" }}>
-              <h3 className="mono" style={{ fontSize: "var(--fs-sm)", margin: 0 }}>{family}</h3>
-              <span className="muted" style={{ fontSize: "var(--fs-xs)" }}>{help[family]}</span>
+              <h3 className="mono" style={{ fontSize: "var(--fs-sm)", margin: 0 }}>
+                {family}
+              </h3>
+              <span className="muted" style={{ fontSize: "var(--fs-xs)" }}>
+                {help[family]}
+              </span>
             </div>
             <table className="fs-table">
               <tbody>
                 {rows.map((r, i) => (
                   <tr key={i}>
                     <td className="mono muted" style={{ fontSize: "var(--fs-xs)" }}>
-                      {Object.entries(r.labels).map(([k, v]) => `${k}="${v}"`).join(" ") || "—"}
+                      {Object.entries(r.labels)
+                        .map(([k, v]) => `${k}="${v}"`)
+                        .join(" ") || "—"}
                     </td>
-                    <td className="mono" style={{ textAlign: "right" }}>{r.value}</td>
+                    <td className="mono" style={{ textAlign: "right" }}>
+                      {r.value}
+                    </td>
                   </tr>
                 ))}
               </tbody>

@@ -73,7 +73,11 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
       ws.onerror = null;
       ws.onclose = null;
       if (sendCloseStdin && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ close_stdin: true })); } catch { /* closing */ }
+        try {
+          ws.send(JSON.stringify({ close_stdin: true }));
+        } catch {
+          /* closing */
+        }
       }
       if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
         ws.close();
@@ -83,7 +87,8 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
   }
 
   function writeStdin(ws: WebSocket, data: string): void {
-    if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ stdin: data }));
+    if (wsRef.current === ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ stdin: data }));
   }
 
   function sendResize(term: Terminal, ws = wsRef.current): void {
@@ -131,7 +136,11 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
         return;
       }
       let payload: Record<string, unknown>;
-      try { payload = JSON.parse(ev.data as string); } catch { return; }
+      try {
+        payload = JSON.parse(ev.data as string);
+      } catch {
+        return;
+      }
       if (typeof payload.stream === "string") term.write(String(payload.data ?? ""));
       else if (typeof payload.exit === "number") {
         term.writeln(`\x1b[36m[vmon] process exited with code ${payload.exit}\x1b[0m`);
@@ -185,11 +194,19 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
           aria-label="command to exec"
         />
         {connected ? (
-          <button className="btn btn--danger" onClick={disconnect}>Disconnect</button>
+          <button className="btn btn--danger" onClick={disconnect}>
+            Disconnect
+          </button>
         ) : (
-          <button className="btn btn--primary" onClick={connect}>Connect</button>
+          <button className="btn btn--primary" onClick={connect}>
+            Connect
+          </button>
         )}
-        {error && <span className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>{error}</span>}
+        {error && (
+          <span className="mono" style={{ color: "var(--err)", fontSize: "var(--fs-sm)" }}>
+            {error}
+          </span>
+        )}
       </div>
     </div>
   );

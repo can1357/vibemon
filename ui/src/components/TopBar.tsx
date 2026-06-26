@@ -5,7 +5,9 @@ export function TopBar(): React.ReactElement {
   return (
     <header className="topbar">
       <span className="topbar__brand">Vibemon</span>
-      <span className="faint" style={{ fontSize: "var(--fs-sm)" }}>microVM console</span>
+      <span className="faint" style={{ fontSize: "var(--fs-sm)" }}>
+        microVM console
+      </span>
       <span className="topbar__spacer" />
       <input
         className="input topbar__token"

@@ -181,7 +181,8 @@ pub struct Config {
 	              compile time."
 )]
 struct CliArgs {
-	/// Kernel image (vmlinux/bzImage on x86_64, arm64 Image on aarch64); required for direct boot
+	/// Kernel image (vmlinux/bzImage on x86_64, arm64 Image on aarch64);
+	/// required for direct boot
 	#[arg(long, value_name = "PATH")]
 	kernel: Option<PathBuf>,
 
@@ -566,8 +567,7 @@ impl Config {
 			}
 		}
 
-		let console_agent =
-			cli.console_agent || cli.agent_exec.is_some() || cli.agent_sock.is_some();
+		let console_agent = cli.console_agent || cli.agent_exec.is_some() || cli.agent_sock.is_some();
 
 		Ok(Self {
 			kernel: cli.kernel,

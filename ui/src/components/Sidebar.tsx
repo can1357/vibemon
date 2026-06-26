@@ -16,7 +16,9 @@ export function Sidebar({
     <aside className="sidebar">
       <div className="sidebar__head">
         <h2>Sandboxes</h2>
-        <button className="btn btn--primary btn--sm" onClick={onNew}>+ New</button>
+        <button className="btn btn--primary btn--sm" onClick={onNew}>
+          + New
+        </button>
       </div>
       <div className="sidebar__list">
         {sandboxes.length === 0 ? (

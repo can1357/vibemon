@@ -31,24 +31,42 @@ export function App(): React.ReactElement {
             authError ? (
               <div className="main__empty">
                 <div style={{ textAlign: "center", maxWidth: 360 }}>
-                  <p className="muted" style={{ marginBottom: "var(--pad-sm)" }}>Authentication required.</p>
-                  <p className="faint" style={{ fontSize: "var(--fs-sm)", marginBottom: "var(--pad)" }}>
-                    Enter the <code className="mono">vmon serve</code> bearer token in the top-right token field.
-                    Set it with <code className="mono">--token</code> or <code className="mono">VMON_API_TOKEN</code>.
+                  <p className="muted" style={{ marginBottom: "var(--pad-sm)" }}>
+                    Authentication required.
+                  </p>
+                  <p
+                    className="faint"
+                    style={{ fontSize: "var(--fs-sm)", marginBottom: "var(--pad)" }}
+                  >
+                    Enter the <code className="mono">vmon serve</code> bearer token in the top-right
+                    token field. Set it with <code className="mono">--token</code> or{" "}
+                    <code className="mono">VMON_API_TOKEN</code>.
                   </p>
                 </div>
               </div>
             ) : (
               <div className="main__empty">
                 <div style={{ textAlign: "center" }}>
-                  <p className="mono" style={{ color: "var(--err)" }}>{error}</p>
-                  <button className="btn" onClick={() => void refresh()} style={{ marginTop: "var(--pad)" }}>Retry</button>
+                  <p className="mono" style={{ color: "var(--err)" }}>
+                    {error}
+                  </p>
+                  <button
+                    className="btn"
+                    onClick={() => void refresh()}
+                    style={{ marginTop: "var(--pad)" }}
+                  >
+                    Retry
+                  </button>
                 </div>
               </div>
             )
           ) : !selected ? (
             <div className="main__empty">
-              {loading ? <span className="spinner" /> : <span className="faint">Select a sandbox, or create a new one.</span>}
+              {loading ? (
+                <span className="spinner" />
+              ) : (
+                <span className="faint">Select a sandbox, or create a new one.</span>
+              )}
             </div>
           ) : (
             <DetailView sandbox={selected} notify={push} />
@@ -74,7 +92,9 @@ export function App(): React.ReactElement {
             className={`toast${t.kind === "err" ? " toast--err" : ""}`}
             onClick={() => dismiss(t.id)}
             role="alert"
-          >{t.message}</div>
+          >
+            {t.message}
+          </div>
         ))}
       </div>
     </div>

@@ -63,7 +63,13 @@ export function useSandboxes(selectedId: string | null): {
 
   // Re-fetch immediately when the token changes (e.g. the user pastes it into
   // the top bar after a 401), instead of waiting up to LIST_INTERVAL_MS.
-  useEffect(() => subscribeToken(() => { void refresh(); }), [refresh]);
+  useEffect(
+    () =>
+      subscribeToken(() => {
+        void refresh();
+      }),
+    [refresh],
+  );
 
   // Keep the selected view fresh between list polls.
   useEffect(() => {
