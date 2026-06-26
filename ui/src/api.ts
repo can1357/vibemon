@@ -29,6 +29,8 @@ export interface SandboxCreate {
   memory?: number;
   disk_mb?: number;
   timeout?: number | null;
+  /** Wall-clock sandbox lifetime; 0 disables the deadline. */
+  timeout_secs?: number | null;
   workdir?: string | null;
   env?: Record<string, string> | null;
   fs_dir?: string | null;
@@ -84,21 +86,31 @@ function authHeaders(): Record<string, string> {
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
+async function responseErrorDetail(res: Response): Promise<string> {
+  const fallback = res.statusText || "request failed";
+  const ct = res.headers.get("content-type") ?? "";
+  try {
+    if (ct.includes("application/json")) {
+      const body = await res.json();
+      return typeof body?.detail === "string" ? body.detail : JSON.stringify(body);
+    }
+    const text = await res.text();
+    return text || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function throwApiError(res: Response): Promise<never> {
+  throw new ApiError(res.status, `${res.status} ${await responseErrorDetail(res)}`);
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers: { ...authHeaders(), ...(init?.headers ?? {}) },
   });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      detail = typeof body?.detail === "string" ? body.detail : JSON.stringify(body);
-    } catch {
-      /* keep statusText */
-    }
-    throw new ApiError(res.status, `${res.status} ${detail}`);
-  }
+  if (!res.ok) await throwApiError(res);
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get("content-type") ?? "";
   if (ct.includes("application/json")) return res.json() as Promise<T>;
@@ -140,7 +152,7 @@ export const api = {
       `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
       { headers: authHeaders() },
     );
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) await throwApiError(res);
     return res.blob();
   },
   writeFile: async (id: string, path: string, data: Blob): Promise<void> => {
@@ -148,14 +160,14 @@ export const api = {
       `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
       { method: "PUT", headers: authHeaders(), body: data },
     );
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) await throwApiError(res);
   },
   deleteFile: async (id: string, path: string, recursive = false): Promise<void> => {
     const res = await fetch(
       `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}&recursive=${recursive}`,
       { method: "DELETE", headers: authHeaders() },
     );
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) await throwApiError(res);
   },
 };
 

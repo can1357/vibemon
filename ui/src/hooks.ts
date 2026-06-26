@@ -5,6 +5,17 @@ import { api, subscribeToken, type SandboxView } from "./api.ts";
 // without hammering a local dev VMM.
 const LIST_INTERVAL_MS = 3000;
 
+const SELECTED_INTERVAL_MS = 2000;
+
+function errorStatus(e: unknown): number | null {
+  if (typeof e !== "object" || e === null || !("status" in e)) return null;
+  return typeof e.status === "number" ? e.status : null;
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function useSandboxes(selectedId: string | null): {
   sandboxes: SandboxView[];
   loading: boolean;
@@ -27,9 +38,8 @@ export function useSandboxes(selectedId: string | null): {
       setAuthError(false);
     } catch (e) {
       if (!alive.current) return;
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      setAuthError(typeof (e as { status?: number }).status === "number" && (e as { status: number }).status === 401);
+      setError(errorMessage(e));
+      setAuthError(errorStatus(e) === 401);
     } finally {
       if (alive.current) setLoading(false);
     }
@@ -37,11 +47,17 @@ export function useSandboxes(selectedId: string | null): {
 
   useEffect(() => {
     alive.current = true;
-    void refresh();
-    const t = setInterval(refresh, LIST_INTERVAL_MS);
+    let stop = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      await refresh();
+      if (!stop) timer = window.setTimeout(poll, LIST_INTERVAL_MS);
+    };
+    void poll();
     return () => {
+      stop = true;
       alive.current = false;
-      clearInterval(t);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [refresh]);
 
@@ -53,15 +69,29 @@ export function useSandboxes(selectedId: string | null): {
   useEffect(() => {
     if (!selectedId) return;
     let stop = false;
-    const t = setInterval(async () => {
+    let timer: number | undefined;
+    const pollSelected = async () => {
       try {
         const v = await api.getSandbox(selectedId);
-        if (!stop) setSandboxes((prev) => prev.map((s) => (s.id === selectedId ? v : s)));
-      } catch {
-        /* 404 means terminated; the next list poll reconciles. */
+        if (!stop) {
+          setSandboxes((prev) => prev.map((s) => (s.id === selectedId ? v : s)));
+          setError(null);
+          setAuthError(false);
+        }
+      } catch (e) {
+        if (!stop && errorStatus(e) !== 404) {
+          setError(errorMessage(e));
+          setAuthError(errorStatus(e) === 401);
+        }
+      } finally {
+        if (!stop) timer = window.setTimeout(pollSelected, SELECTED_INTERVAL_MS);
       }
-    }, 2000);
-    return () => { stop = true; clearInterval(t); };
+    };
+    void pollSelected();
+    return () => {
+      stop = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [selectedId]);
 
   return { sandboxes, loading, error, authError, refresh };
