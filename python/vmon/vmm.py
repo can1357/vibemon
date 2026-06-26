@@ -11,11 +11,11 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from pathlib import Path
 from typing import cast
 
-from .agent import AgentClosed, AgentConn
+from .agent_client import AgentClosed, AgentConn
 from .control import Control
 
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
@@ -52,33 +52,6 @@ def _arch() -> str:
     return "aarch64" if m in ("aarch64", "arm64") else "x86_64"
 
 
-def _is_python_console_script(path: str) -> bool:
-    """True if *path* is a ``#!...python`` text wrapper (the ``vmon`` CLI), not the VMM.
-
-    Post-rebrand the Rust VMM and the Python console script are both named
-    ``vmon``; a PATH lookup must skip the CLI wrapper to avoid the daemon
-    spawning the CLI as the per-VM runtime (infinite self-recursion).
-    """
-    try:
-        with open(path, "rb") as f:
-            head = f.readline(256)
-    except OSError:
-        return False
-    return head.startswith(b"#!") and b"python" in head
-
-
-def _which_all(name: str) -> Iterator[str]:
-    """Yield every executable named *name* on ``PATH``, in lookup order."""
-    seen: set[str] = set()
-    for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
-        if not directory or directory in seen:
-            continue
-        seen.add(directory)
-        candidate = shutil.which(name, path=directory)
-        if candidate:
-            yield candidate
-
-
 def _cargo_target_dir(repo: Path) -> Path | None:
     """The cargo target directory for *repo* (``$CARGO_TARGET_DIR`` or ``cargo metadata``).
 
@@ -101,14 +74,12 @@ def _cargo_target_dir(repo: Path) -> Path | None:
 
 
 def find_binary() -> str:
-    """Locate the vmon VMM binary (env override, cargo target dirs, or PATH).
+    """Locate the vmm VMM binary (env override, cargo target dirs, or PATH).
 
     Searches ``$VMON_BIN``, then the repo's cargo target directory across native
-    and cross ``release``/``debug`` layouts, then ``PATH``. The PATH fallback
-    skips the ``vmon`` Python console script so the daemon never re-execs the CLI
-    as the per-VM runtime. On macOS a plain ``cargo build`` of the repo produces a
-    binary ad-hoc codesigned with ``com.apple.security.hypervisor``, which this
-    resolver finds without any flags.
+    and cross ``release``/``debug`` layouts, then ``PATH``. On macOS a plain
+    ``cargo build`` of the repo produces a binary ad-hoc codesigned with
+    ``com.apple.security.hypervisor``, which this resolver finds without any flags.
     """
     if env := os.environ.get("VMON_BIN"):
         return env
@@ -124,7 +95,7 @@ def find_binary() -> str:
     def probe(root: Path) -> str | None:
         for triple in triples:
             for profile in ("release", "debug"):
-                c = root / triple / profile / "vmon"
+                c = root / triple / profile / "vmm"
                 if c.is_file() and os.access(c, os.X_OK):
                     return str(c)
         return None
@@ -133,10 +104,9 @@ def find_binary() -> str:
         return found
     if (target_dir := _cargo_target_dir(repo)) is not None and (found := probe(target_dir)):
         return found
-    for found in _which_all("vmon"):
-        if not _is_python_console_script(found):
-            return found
-    raise RuntimeError("vmon binary not found. Build it (cargo build) or set VMON_BIN.")
+    if found := shutil.which("vmm"):
+        return found
+    raise RuntimeError("vmm binary not found. Build it (cargo build) or set VMON_BIN.")
 
 
 def default_kernel() -> str:

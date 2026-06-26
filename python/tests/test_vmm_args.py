@@ -58,7 +58,7 @@ def test_restore_rejects_invalid_resource_args_before_launch(monkeypatch, mvm_ho
 
 
 def test_agent_call_without_guest_socket_fails_without_socket_connect(mvm_home):
-    from vmon.agent import AgentClosed
+    from vmon.agent_client import AgentClosed
     from vmon.vmm import MicroVM
 
     vm = MicroVM("without-agent-socket")

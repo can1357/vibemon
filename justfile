@@ -49,11 +49,11 @@ build: _compile
 release:
     @{{just_executable()}} profile=release build
 
-# Resolve the host path to the vmon binary for a profile (debug|release).
+# Resolve the host path to the vmm binary for a profile (debug|release).
 _bin prof:
-    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
+    @printf '%s/%s/vmm\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
 
-# Print the path to the built vmon binary (honors `profile`).
+# Print the path to the built vmm binary (honors `profile`).
 bin:
     @{{just_executable()}} _bin {{profile}}
 
@@ -245,7 +245,7 @@ lima-build: _lima-check
 # Run vmon inside the guest (sudo for /dev/kvm + TAP); forwards args verbatim.
 [positional-arguments]
 lima-run *args: lima-build
-    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}exec sudo target/release/vmon "$@"' lima '{{lima_repo}}' "$@"
+    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}exec sudo target/release/vmm "$@"' lima '{{lima_repo}}' "$@"
 
 # Cargo tests inside the guest.
 lima-test:

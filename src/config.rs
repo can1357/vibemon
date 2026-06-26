@@ -170,11 +170,11 @@ pub struct Config {
 #[allow(clippy::doc_markdown, reason = "field docs are CLI help, not rustdoc")]
 #[derive(Parser)]
 #[command(
-	name = "vmon",
+	name = "vmm",
 	version,
 	about = "a barebones KVM (Linux) / Hypervisor.framework (macOS) monitor for Linux guests",
-	override_usage = "vmon (--kernel <image> | --boot-mode uefi --firmware <fd>) [options]",
-	long_about = "vmon boots a Linux guest with a serial console and virtio IO on KVM (Linux) or \
+	override_usage = "vmm (--kernel <image> | --boot-mode uefi --firmware <fd>) [options]",
+	long_about = "vmm boots a Linux guest with a serial console and virtio IO on KVM (Linux) or \
 	              Apple Hypervisor.framework (macOS, Apple Silicon); the backend is selected at \
 	              compile time."
 )]

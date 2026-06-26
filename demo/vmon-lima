@@ -9,15 +9,15 @@
 #   ./demo/vmon-lima run alpine -- sh -c 'uname -a'
 #
 # Assumes the repo is checked out at ~/vmon in the guest with a venv at
-# python/.venv and a built binary at target/{debug,release}/vmon.
+# python/.venv and a built binary at target/{debug,release}/vmm.
 # Override the VM name with VMON_LIMA_VM (default: kvm).
 set -eu
 VM="${VMON_LIMA_VM:-kvm}"
 exec limactl shell "$VM" -- bash -lc '
   cd "$HOME/vmon/python" || exit 1
   . .venv/bin/activate 2>/dev/null || true
-  bin="$HOME/vmon/target/release/vmon"
-  [ -x "$bin" ] || bin="$HOME/vmon/target/debug/vmon"
+  bin="$HOME/vmon/target/release/vmm"
+  [ -x "$bin" ] || bin="$HOME/vmon/target/debug/vmm"
   export VMON_BIN="$bin" PYTHONPATH=.
   exec python3 -m vmon "$@"
 ' vmon "$@"

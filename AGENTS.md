@@ -9,7 +9,7 @@ Vibemon (`vmon`) is a small KVM/HVF-based Linux microVM monitor. It pairs a Rust
 
 ## Architecture & Data Flow
 
-Three layers. The Python daemon spawns one Rust `vmon` process per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
+Three layers. The Python daemon spawns one Rust `vmm` process per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
 
 ```
 Web UI (React SPA)
@@ -18,7 +18,7 @@ vmon serve (FastAPI, server.py)
    │ Unix socket  $VMON_HOME/vmond.sock
 vmond (daemon.py) ──> Engine (core.py, single registry owner)
    │ spawns subprocess per VM, --api-sock JSON control socket
-vmon binary (Rust VMM)
+vmm binary (Rust VMM)
    │ virtio-console, length-prefixed binary frames (GC4 / proto.rs)
 vmon-agent (guest agent, Linux guest only)
 ```
@@ -29,7 +29,7 @@ vmon-agent (guest agent, Linux guest only)
 
 ## Key Directories
 
-- `src/` — Rust VMM core (the `vmon` binary).
+- `src/` — Rust VMM core (the `vmm` binary).
   - `src/hv/` — hypervisor seam; `kvm/` and `hvf/` backends selected by `#[cfg(target_os)]`.
   - `src/arch/` — architecture-specific boot/setup (`x86_64/`: MP table, GDT, MSR; `aarch64/`: FDT, GIC).
   - `src/virtio/` — virtio device model: `mod.rs` (trait + worker loop), `mmio.rs`, `pci.rs` (x86_64-only), `net.rs`, `block.rs`, `fs.rs`, `console.rs`.
@@ -61,7 +61,7 @@ just ui              # cd ui && bun install && bun run build  → python/vmon/we
 just agent-musl      # build static vmon-agent → python/vmon/_agent/vmon-agent-<arch>
 ```
 
-macOS HVF requires the `vmon` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
+macOS HVF requires the `vmm` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
 
 Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` live there): `cd python && uv run vmon ...`, `cd python && uv run pytest`, `cd python && uv run ruff check`, `cd python && uv run mypy`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`).
 
@@ -132,7 +132,7 @@ Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` liv
 - `boot.rs`, `blk.rs`, `lifecycle.rs`, `net.rs`, `pager.rs`, `snapshot.rs`, `timeout.rs`, `uefi.rs`, `soak.rs` — one concern each (boot markers, block I/O, control protocol, networking, pager eviction, snapshot/fork, timeout self-kill, UEFI boot, stability).
 - Integration runs single-threaded (`--test-threads=1`). Boot tests require assets from `just fetch-assets` (cached in `target/test-assets/`). macOS uses `demo/hvf-test-runner.sh` to codesign spawned test binaries.
 
-**Python** — `pytest` (`testpaths = ["tests"]`). Unit tests use fake backends / `FastAPI TestClient` and need **no** KVM (`test_cli.py`, `test_daemon.py`, `test_server.py`, `test_volume.py`, `test_secret.py`, `test_vmm_args.py`). `test_e2e.py` and the `python/e2e.py` / `python/cli_e2e.py` drivers exercise real VMs and require a Linux KVM host, a built `vmon` binary + static agent + guest kernel, and docker/podman — gated by `VMON_KVM_E2E=1`.
+**Python** — `pytest` (`testpaths = ["tests"]`). Unit tests use fake backends / `FastAPI TestClient` and need **no** KVM (`test_cli.py`, `test_daemon.py`, `test_server.py`, `test_volume.py`, `test_secret.py`, `test_vmm_args.py`). `test_e2e.py` and the `python/e2e.py` / `python/cli_e2e.py` drivers exercise real VMs and require a Linux KVM host, a built `vmm` binary + static agent + guest kernel, and docker/podman — gated by `VMON_KVM_E2E=1`.
 
 **CI** — `ci.yml` (ubuntu): fmt-check, check, clippy `-D warnings`, AArch64 check/clippy, `cargo test`, cargo-audit; macOS job builds + codesigns + `cargo test --no-run`. `integration.yml` runs the KVM (self-hosted x64) and HVF (self-hosted arm64) e2e + scheduled soak suites. `release.yml` builds musl binaries (`cargo-zigbuild`) and the Python wheel/sdist with bundled agents on `v*` tags.
 

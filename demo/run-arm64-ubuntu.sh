@@ -1,10 +1,10 @@
 #!/bin/bash
-# Boot a real Ubuntu 24.04 arm64 root filesystem under vmon on virtio-blk,
+# Boot a real Ubuntu 24.04 arm64 root filesystem under vmm on virtio-blk,
 # proving a full distro userspace (not just the kernel). Run INSIDE an arm64
 # Linux host with /dev/kvm.
 #
 # Usage:  run-arm64-ubuntu.sh [arm64-Image]
-#   - binary:  $VMON, else auto-detected (cargo target dirs / PATH)
+#   - binary:  $VMON_BIN, else auto-detected (cargo target dirs / PATH)
 #   - kernel:  arg 1, else auto-extracted from /boot/vmlinuz-$(uname -r)
 # Needs:  curl, mkfs.ext4, sudo.
 set -euo pipefail
@@ -12,27 +12,27 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-/tmp/vmon-demo}
 mkdir -p "$WORK"; cd "$WORK"
 
-find_vmon() {
-  if [ -n "${VMON:-}" ] && [ -x "${VMON:-}" ]; then echo "$VMON"; return 0; fi
+find_vmm() {
+  if [ -n "${VMON_BIN:-}" ] && [ -x "${VMON_BIN:-}" ]; then echo "$VMON_BIN"; return 0; fi
   local proj base
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
   for c in \
-    "$proj/target/aarch64-unknown-linux-gnu/release/vmon" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmon" \
-    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
-    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
-    "$(command -v vmon 2>/dev/null || true)"; do
+    "$proj/target/aarch64-unknown-linux-gnu/release/vmm" \
+    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmm" \
+    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
+    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
+    "$(command -v vmm 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
-BIN=$(find_vmon) || {
-  echo "error: vmon binary not found. Build it with:" >&2
+BIN=$(find_vmm) || {
+  echo "error: vmm binary not found. Build it with:" >&2
   echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
-  echo "or set VMON=/path/to/vmon" >&2; exit 1
+  echo "or set VMON_BIN=/path/to/vmm" >&2; exit 1
 }
-echo "[demo] vmon: $BIN"
+echo "[demo] vmm: $BIN"
 
 KERNEL=${1:-}
 if [ -z "$KERNEL" ]; then
@@ -99,7 +99,7 @@ EOF
 sudo chmod +x uroot/vmon-init.sh
 sudo rm -f ubuntu.img; sudo mkfs.ext4 -F -q -d uroot ubuntu.img 2G; sudo chmod a+rw ubuntu.img
 
-echo "[demo] launching vmon with Ubuntu 24.04 root on virtio-blk"
+echo "[demo] launching vmm with Ubuntu 24.04 root on virtio-blk"
 LOG="$WORK/arm64-ubuntu.log"
 rm -f "$LOG"
 set +e
@@ -109,7 +109,7 @@ sudo timeout 90 "$BIN" \
 status=${PIPESTATUS[0]}
 set -e
 if [ "$status" -ne 0 ]; then
-  echo "[demo] timeout/vmon exited with status $status" >&2
+  echo "[demo] timeout/vmm exited with status $status" >&2
   exit "$status"
 fi
 if grep -q 'vmon-ubuntu: FAIL:' "$LOG"; then

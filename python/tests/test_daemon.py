@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 import vmon.core as core
-from vmon.agent import ByteStream
+from vmon.agent_client import ByteStream
 from vmon.client import DaemonClient, DaemonError
 from vmon.daemon import Daemon, acquire_owner_lock, daemon_paths, release_owner_lock
 from vmon.vmm import MicroVM

@@ -14,7 +14,7 @@
 
 ```sh
 # Build the Rust VMM binary
-just release                      # target/release/vmon
+just release                      # target/release/vmm
 
 # Install the Python CLI + SDK
 pip install -e python/
@@ -81,11 +81,11 @@ Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo 
 just release
 ```
 
-The resulting binary is `target/release/vmon` unless `CARGO_TARGET_DIR` or Cargo `build.target-dir` redirects the target directory. On macOS 15+ Apple Silicon, `just build` and `just release` automatically ad-hoc codesign the binary with `hvf.entitlements`, which grants `com.apple.security.hypervisor` (the only entitlement ad-hoc signing can carry; restricted entitlements such as `com.apple.vm.networking` cause the kernel to refuse to launch an ad-hoc-signed binary). The entitlement-free `--net user` backend also needs native `libslirp` + `pkg-config` installed locally, for example `brew install libslirp pkg-config`. If building by hand on macOS, run:
+The resulting binary is `target/release/vmm` unless `CARGO_TARGET_DIR` or Cargo `build.target-dir` redirects the target directory. On macOS 15+ Apple Silicon, `just build` and `just release` automatically ad-hoc codesign the binary with `hvf.entitlements`, which grants `com.apple.security.hypervisor` (the only entitlement ad-hoc signing can carry; restricted entitlements such as `com.apple.vm.networking` cause the kernel to refuse to launch an ad-hoc-signed binary). The entitlement-free `--net user` backend also needs native `libslirp` + `pkg-config` installed locally, for example `brew install libslirp pkg-config`. If building by hand on macOS, run:
 
 ```sh
 cargo build --release
-codesign --sign - --entitlements hvf.entitlements --force target/release/vmon
+codesign --sign - --entitlements hvf.entitlements --force target/release/vmm
 ```
 
 `--net user` works on macOS/HVF without `com.apple.vm.networking`; `--tap` still requires host vmnet-style networking support and fails clearly on the ad-hoc-signed binary.
@@ -95,7 +95,7 @@ codesign --sign - --entitlements hvf.entitlements --force target/release/vmon
 Boot a Linux kernel with an initramfs:
 
 ```sh
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
@@ -104,7 +104,7 @@ sudo ./target/release/vmon \
 Boot with a virtio-blk root disk:
 
 ```sh
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --rootfs <disk.img> \
   --cmdline "console=ttyS0 root=/dev/vda rw"
@@ -113,7 +113,7 @@ sudo ./target/release/vmon \
 Add a virtio-net device after creating a Linux TAP interface (Linux/KVM only for `--tap`):
 
 ```sh
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --tap tap0 \
@@ -123,7 +123,7 @@ sudo ./target/release/vmon \
 On macOS/HVF without `com.apple.vm.networking`, use entitlement-free user-mode NAT instead:
 
 ```sh
-./target/release/vmon \
+./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --net user \
@@ -133,7 +133,7 @@ On macOS/HVF without `com.apple.vm.networking`, use entitlement-free user-mode N
 Use the JSON control socket for pause/resume/snapshot/quit:
 
 ```sh
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --api-sock /tmp/vmon/control.sock \
@@ -141,7 +141,7 @@ sudo ./target/release/vmon \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 
 # The server writes one banner line first:
-# {"vmon":"0.1.0","api":1}
+# {"vmm":"0.1.0","api":1}
 printf '%s\n' \
   '{"id":1,"method":"pause","params":{}}' \
   '{"id":2,"method":"snapshot","params":{"name":"demo"}}' \
@@ -153,14 +153,14 @@ printf '%s\n' \
 Restore or fork a snapshot:
 
 ```sh
-sudo ./target/release/vmon --restore /tmp/vmon-snapshots/demo
-sudo ./target/release/vmon --fork-from /tmp/vmon-snapshots/demo --count 4
+sudo ./target/release/vmm --restore /tmp/vmon-snapshots/demo
+sudo ./target/release/vmm --fork-from /tmp/vmon-snapshots/demo --count 4
 ```
 
 Use PCI virtio transport on x86_64 only:
 
 ```sh
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --transport pci \
@@ -176,7 +176,7 @@ VMON_AARCH64_UEFI=/path/to/QEMU_EFI.fd
 # x86_64: point this at an OVMF_CODE.fd/EDK2 firmware image.
 VMON_X86_UEFI=/path/to/OVMF_CODE.fd
 
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --boot-mode uefi \
   --firmware "$VMON_X86_UEFI" \
   --rootfs <uefi-bootable-disk.img> \
@@ -191,14 +191,14 @@ Expose host directories with virtio-fs:
 
 ```sh
 # Read-only shared directory.
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --fs-tag shared --fs-dir /path/to/share \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 
 # Named volume, writable by default. Add :ro for a read-only volume.
-sudo ./target/release/vmon \
+sudo ./target/release/vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --volume data:/var/lib/vmon-volumes/data \
@@ -214,7 +214,7 @@ The CLI accepts the production lifecycle, agent, jail, networking, and logging f
 
 - `--snapshot-root <dir>`: root for named JSON lifecycle snapshots.
 - `--timeout-secs <n>`: VMM-enforced wall-clock deadline, from 1 second to 24 hours. On timeout the VMM writes `status.json` with `reason:"timeout"` and return code `124`.
-- `--mem-target-mib <n>`: Linux-only transparent guest-RAM paging target. vmon needs root/CAP_SYS_PTRACE or `vm.unprivileged_userfaultfd=1` so userfaultfd can handle KVM faults.
+- `--mem-target-mib <n>`: Linux-only transparent guest-RAM paging target. vmm needs root/CAP_SYS_PTRACE or `vm.unprivileged_userfaultfd=1` so userfaultfd can handle KVM faults.
 - `--zram-store-max-mib <n>`: cap for the in-process compressed page store before pager overflow spills to swap.
 - `--zram-swap-file <path>`: operator-provided pager overflow file; default is an anonymous temporary file in `$TMPDIR`.
 - `--ksm`: mark guest RAM `MADV_MERGEABLE` so host KSM can merge identical pages across co-resident guests. The operator must enable `/sys/kernel/mm/ksm/run`; metrics report advised regions, not per-process byte savings.
@@ -282,7 +282,7 @@ The same Rust integration suite under `tests/` runs end-to-end against each supp
 | macOS host | HVF, aarch64 (Apple Silicon) | `just integration` | user-mode NAT (`--net user`) |
 | Lima on macOS | KVM, aarch64 (nested) | `just lima-integration` | TAP (`--tap`) |
 
-Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The recipes set it for you, fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `vmlinux` or aarch64 `Image` for the host), and on macOS route each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmon` with the hypervisor entitlement immediately before it runs (Cargo re-copies the unsigned binary on every invocation, so signing earlier is lost). Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
+Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The recipes set it for you, fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `vmlinux` or aarch64 `Image` for the host), and on macOS route each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmm` with the hypervisor entitlement immediately before it runs (Cargo re-copies the unsigned binary on every invocation, so signing earlier is lost). Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
 
 What each environment exercises:
 
@@ -300,7 +300,7 @@ The checked-in demos are host-side scripts. They expect Linux tooling listed in 
 
 ```sh
 # On an arm64 Linux host with /dev/kvm: boot a busybox initramfs with virtio-blk and virtio-net.
-VMON=./target/release/vmon demo/run-arm64-demo.sh [arm64-Image]
+VMON_BIN=./target/release/vmm demo/run-arm64-demo.sh [arm64-Image]
 
 # From macOS/Apple silicon: run the arm64 demo inside a Lima VM with nested KVM enabled.
 limactl start --vm-type=vz --set='.nestedVirtualization=true' --name=kvm template:default

@@ -757,7 +757,7 @@ fn verify_peer_credentials(_: &UnixStream, _: u32) -> io::Result<()> {
 
 #[derive(Serialize)]
 struct Banner<'a> {
-	vmon: &'a str,
+	vmm:  &'a str,
 	api:  u8,
 }
 
@@ -791,7 +791,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 	let Ok(mut writer) = stream.try_clone() else {
 		return;
 	};
-	if write_json_line(&mut writer, &Banner { vmon: env!("CARGO_PKG_VERSION"), api: 1 }).is_err() {
+	if write_json_line(&mut writer, &Banner { vmm: env!("CARGO_PKG_VERSION"), api: 1 }).is_err() {
 		return;
 	}
 

@@ -4,7 +4,7 @@ A practical, copy-paste guide to building, launching, and testing this project.
 
 There are two layers:
 
-- **`vmon`** — the low-level KVM microVM monitor (Rust binary).
+- **`vmm`** — the low-level KVM microVM monitor (Rust binary).
 - **`vmon`** — a friendly Python layer on top: a CLI, an SDK, a REST API server,
   and a React **web panel**.
 
@@ -20,7 +20,7 @@ There are two layers:
 | REST API / `vmon serve` | ✅ runs | ✅ |
 | Python SDK logic + unit tests | ✅ | ✅ |
 | **Booting an actual microVM** (`vmon run`, exec, snapshot, fork) | ❌ | ✅ |
-| Building the Rust `vmon` binary | ❌ (KVM crates are Linux-only) | ✅ |
+| Building the Rust `vmm` binary | ❌ (KVM crates are Linux-only) | ✅ |
 | Demos (`demo/*.sh`) | ❌ | ✅ |
 
 So on a Mac you can launch the panel + API and click around, read the API
@@ -162,7 +162,7 @@ On real Linux with `/dev/kvm`:
 
 ```sh
 # 1. Build the VMM binary
-cargo build --release            # produces target/release/vmon
+cargo build --release            # produces target/release/vmm
 
 # 2. Install the vmon CLI/SDK
 pip install -e python/
@@ -190,7 +190,7 @@ your Mac.
 
 The `vmon` CLI is a thin client. By default it drives a **local** daemon (`vmond`)
 that:
-- spawns the `vmon` VMM as a **child process** on the same host,
+- spawns the `vmm` VMM as a **child process** on the same host,
 - talks to it over **Unix domain sockets** (`control.sock`, `agent.sock`),
 - builds container rootfs with a **local** docker/podman.
 
@@ -223,7 +223,7 @@ limactl shell kvm           # drop into the guest
   # --- base: hypervisor + REST control plane ---
   sudo apt-get update && sudo apt-get install -y python3-venv python3-pip curl build-essential pkg-config
   command -v cargo || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; . "$HOME/.cargo/env"; }
-  cd ~/vmon && cargo build --release          # builds the vmon binary (Linux-only)
+  cd ~/vmon && cargo build --release          # builds the vmm binary (Linux-only)
   cd python && python3 -m venv .venv && . .venv/bin/activate
   pip install -e '.[server]'
 
@@ -437,7 +437,7 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 | `VMON_HOME` | vmon | state dir for VMs/snapshots/volumes + daemon socket/lock (default `~/.vmon`) |
 | `VMON_REMOTE` | `vmon` CLI | `host:port` of a remote daemon to drive over TCP (no auto-start) |
 | `VMON_DAEMON_TCP` | `vmond` | `host:port` for the daemon to also listen on for `VMON_REMOTE` clients |
-| `VMON_BIN` | vmon | path to the `vmon` binary (else auto-detected) |
+| `VMON_BIN` | vmon | path to the `vmm` binary (else auto-detected) |
 | `VMON_KERNEL` | vmon | guest kernel (else `/boot/vmlinuz-$(uname -r)`) |
 | `VMON_KVM_E2E` | tests | set to `1` to enable the KVM end-to-end tests |
 | `VMON_E2E_IMAGE` | tests | image for e2e tests (default `alpine:latest`) |
@@ -452,7 +452,7 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 | `vmon serve requires --token or VMON_API_TOKEN` | Pass `--token X` or set `VMON_API_TOKEN`. |
 | Panel shows "Authentication required" | Paste your token into the API-token box (top-right). |
 | `uvicorn vmon.server:app` fails | No module-level `app`; use `vmon serve` instead. |
-| `vmon binary not found` | `cargo build --release`, or set `VMON_BIN`. Build needs Linux. |
+| `vmm binary not found` | `cargo build --release`, or set `VMON_BIN`. Build needs Linux. |
 | `no kernel found` | Set `VMON_KERNEL=/path/to/Image-or-bzImage`. |
 | `pip ... externally-managed-environment` (macOS) | Use a venv (see §3, Step 2). |
 | `cargo build` errors about `vmm_sys_util::ioctl` | You're on macOS; the VMM only builds on Linux. |

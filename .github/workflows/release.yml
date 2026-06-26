@@ -34,8 +34,8 @@ jobs:
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
 
-      - name: Build vmon
-        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p vmon
+      - name: Build vmm
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p vmm
 
       - name: Build vmon-agent
         run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p vmon-agent
@@ -43,14 +43,14 @@ jobs:
       - name: Package binaries
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/vmon dist/vmon-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/vmm dist/vmm-${{ matrix.target }}
           cp target/${{ matrix.target }}/release/vmon-agent dist/vmon-agent-${{ matrix.target }}
           sha256sum dist/* > dist/SHA256SUMS-${{ matrix.target }}.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vmon-${{ matrix.target }}
+          name: vmm-${{ matrix.target }}
           path: dist/*
 
   python:

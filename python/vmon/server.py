@@ -758,6 +758,7 @@ def _ws_bearer_token(websocket: WebSocket) -> str | None:
     params = websocket.query_params
     return params.get("token") or params.get("access_token")
 
+
 def _request_bearer_token(request: Request) -> str | None:
     header = request.headers.get("authorization")
     if not header:
@@ -1689,9 +1690,7 @@ def create_app(
         return result
 
     @app.get("/v1/sandboxes/{sandbox_id}/logs", dependencies=[Depends(require_auth)])
-    async def logs_sandbox(
-        request: Request, sandbox_id: str, follow: bool = False
-    ) -> Response:
+    async def logs_sandbox(request: Request, sandbox_id: str, follow: bool = False) -> Response:
         if follow:
             return StreamingResponse(
                 _logs_sse(supervisor, sandbox_id, request), media_type="text/event-stream"

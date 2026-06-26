@@ -1,4 +1,4 @@
-//! vmon — a barebones VM monitor that boots a Linux guest with a serial
+//! vmm — a barebones VM monitor that boots a Linux guest with a serial
 //! console and virtio IO. The hypervisor backend is selected at compile time:
 //! KVM on Linux (`x86_64/aarch64`), Apple Hypervisor.framework on macOS
 //! (aarch64 / Apple Silicon).
@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 
 fn main() {
 	if let Err(e) = run() {
-		eprintln!("vmon: error: {e}");
+		eprintln!("vmm: error: {e}");
 		std::process::exit(1);
 	}
 }

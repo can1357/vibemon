@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Boot a real Ubuntu 24.04 cloud image under vmon through operator-supplied
+# Boot a real Ubuntu 24.04 cloud image under vmm through operator-supplied
 # UEFI firmware (OVMF on x86_64, QEMU_EFI.fd on aarch64) to a serial login,
 # proving the full firmware -> bootloader -> kernel -> userspace chain rather
-# than vmon's direct-kernel path. Run INSIDE a Linux host with /dev/kvm.
+# rather than vmm's direct-kernel path. Run INSIDE a Linux host with /dev/kvm.
 #
 # Usage:  run-uefi-ubuntu.sh
-#   - binary:    $VMON, else auto-detected (cargo target dirs / PATH)
+#   - binary:    $VMON_BIN, else auto-detected (cargo target dirs / PATH)
 #   - firmware:  $VMON_X86_UEFI / $VMON_AARCH64_UEFI, else a distro path,
 #                else downloaded from the EDK2 nightly (see "firmware" below)
 #   - image:     pinned Ubuntu 24.04 cloud image for the host architecture
@@ -76,34 +76,34 @@ fetch_verified() {  # fetch_verified <label> <url> <path> <sha256>
   mv "$tmp" "$path"
 }
 
-# --- locate the vmon binary for the host architecture --------------------
+# --- locate the vmm binary for the host architecture --------------------
 case "$(uname -m)" in
   x86_64|amd64) ARCH=x86_64; TRIPLE=x86_64-unknown-linux-gnu ;;
   aarch64|arm64) ARCH=aarch64; TRIPLE=aarch64-unknown-linux-gnu ;;
   *) echo "error: unsupported host architecture $(uname -m)" >&2; exit 1 ;;
 esac
 
-find_vmon() {
-  if [ -n "${VMON:-}" ] && [ -x "${VMON:-}" ]; then echo "$VMON"; return 0; fi
+find_vmm() {
+  if [ -n "${VMON_BIN:-}" ] && [ -x "${VMON_BIN:-}" ]; then echo "$VMON_BIN"; return 0; fi
   local proj base
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
   for c in \
-    "$proj/target/$TRIPLE/release/vmon" \
-    "$proj/target/release/vmon" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/$TRIPLE/release/vmon" \
-    "$base/.cache/cargo-target/$TRIPLE/release/vmon" \
-    "$HOME/.cache/cargo-target/$TRIPLE/release/vmon" \
-    "$(command -v vmon 2>/dev/null || true)"; do
+    "$proj/target/$TRIPLE/release/vmm" \
+    "$proj/target/release/vmm" \
+    "${CARGO_TARGET_DIR:-/nonexistent}/$TRIPLE/release/vmm" \
+    "$base/.cache/cargo-target/$TRIPLE/release/vmm" \
+    "$HOME/.cache/cargo-target/$TRIPLE/release/vmm" \
+    "$(command -v vmm 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
-BIN=$(find_vmon) || {
-  echo "error: vmon binary not found. Build it for $TRIPLE or set VMON=/path/to/vmon" >&2
+BIN=$(find_vmm) || {
+  echo "error: vmm binary not found. Build it for $TRIPLE or set VMON_BIN=/path/to/vmm" >&2
   exit 1
 }
-echo "[uefi] vmon: $BIN  (arch: $ARCH)"
+echo "[uefi] vmm: $BIN  (arch: $ARCH)"
 
 # --- per-architecture image + firmware selection ----------------------------
 # Ubuntu 24.04 "Noble" cloud images. These are qcow2 (despite the .img name)
@@ -226,7 +226,7 @@ EOF
 fi
 
 # --- boot through UEFI firmware ---------------------------------------------
-echo "[uefi] launching vmon: --boot-mode uefi --firmware <fw> --rootfs <img>${TRANSPORT_ARGS:+ ${TRANSPORT_ARGS[*]}}"
+echo "[uefi] launching vmm: --boot-mode uefi --firmware <fw> --rootfs <img>${TRANSPORT_ARGS:+ ${TRANSPORT_ARGS[*]}}"
 LOG="$WORK/uefi-ubuntu-$ARCH.log"
 rm -f "$LOG"
 set +e
@@ -239,11 +239,11 @@ sudo timeout "$TIMEOUT" "$BIN" \
 status=${PIPESTATUS[0]}
 set -e
 
-# timeout(1) exits 124 when it had to kill vmon; that is expected here
+# timeout(1) exits 124 when it had to kill vmm; that is expected here
 # because a cloud image boots to an interactive login and never powers off,
 # so we judge success by what reached the serial console, not the exit code.
 if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
-  echo "[uefi] vmon exited with status $status before reaching login" >&2
+  echo "[uefi] vmm exited with status $status before reaching login" >&2
   exit "$status"
 fi
 

@@ -3,9 +3,11 @@
 All notable changes to this project are recorded here.
 
 ## Unreleased
-
 ### Breaking Changes
 
+- Renamed Rust hypervisor binary/crate from `vmon` to `vmm`, mapping the user-facing self-identification and binary name in build and CI scripts, and resolved naming collision between the Rust binary and Python CLI.
+- Renamed Python guest-agent host client from `vmon/agent.py` to `vmon/agent_client.py` and updated all importers (`sandbox.py`, `vmm.py`, test suite) to resolve "agent" naming collision.
+- Removed the collision-only helper functions (`_is_python_console_script` and `_which_all`) from python binary locator in `vmm.py`.
 - Dropped all support for legacy snapshots; previous snapshots must be recaptured
 
 ### Added
@@ -15,6 +17,7 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Renamed the hypervisor binary from `vmon` to `vmm` to resolve naming collisions
 - Renamed the project from VibeVMM to Vibemon, and the `VVM`/`vvm` brand prefix to `VMON`/`vmon` throughout. The binary, Python package, CLI, and daemon are now `vmon`/`vmond` (`python -m vmon`); environment variables are `VMON_*` (e.g. `VMON_HOME`, `VMON_API_TOKEN`, `VMON_E2E`); the state directory is `~/.vmon` with the daemon socket at `~/.vmon/vmond.sock`; guest kernel-cmdline keys, serial markers (`VMON_OK`), the bundled `vmon-agent`, the served web UI title, and the Rich console theme keys all follow suit. The generic term "virtual machine monitor" (`vmm`/`VMM`) is unchanged.
 - Switched the snapshot on-disk format from bincode to postcard and reset it to format version 1, dropping every legacy snapshot format: the v3–v6 bincode migration paths and the pre-manifest `vmstate.bin`/`memory.bin` file pair. Snapshots captured by earlier builds are unsupported and must be recaptured.
 

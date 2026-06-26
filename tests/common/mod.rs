@@ -19,7 +19,7 @@ const TEST_RUNS: &str = "target/test-runs";
 const DEFAULT_MEM_MIB: &str = "256";
 
 pub fn vmm() -> Command {
-	let mut cmd = Command::new(env!("CARGO_BIN_EXE_vmon"));
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_vmm"));
 	if let Ok(action) = std::env::var("VMON_SECCOMP_ACTION") {
 		cmd.arg("--seccomp-action").arg(action);
 	}
@@ -500,8 +500,8 @@ impl ControlClient {
 			"bad control banner: {banner}"
 		);
 		assert!(
-			banner.get("vmon").and_then(Value::as_str).is_some(),
-			"missing vmon banner version: {banner}"
+			banner.get("vmm").and_then(Value::as_str).is_some(),
+			"missing vmm banner version: {banner}"
 		);
 	}
 

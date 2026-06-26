@@ -14,7 +14,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from .agent import AgentClosed, AgentConn, ByteStream, ExecSession
+from .agent_client import AgentClosed, AgentConn, ByteStream, ExecSession
 from .image import ImageSpec, cached_template
 from .pool import WarmPool, wait_for_agent_ready
 from .secret import Secret, merge_secrets

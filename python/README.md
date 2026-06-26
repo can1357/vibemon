@@ -2,7 +2,7 @@
 
 Run containers as hardware-isolated microVMs, suspend/resume them, snapshot a
 booted container into a template, then **warm-boot** (restore) or **fork** that
-template in milliseconds. Built on the [`vmon`](../) KVM VMM.
+template in milliseconds. Built on the [`vmm`](../) KVM VMM.
 
 ```
                     docker image / Dockerfile
@@ -17,7 +17,7 @@ template in milliseconds. Built on the [`vmon`](../) KVM VMM.
 ## Requirements
 
 Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`), a container
-engine (`docker` or `podman`), and the `vmon` binary built (`cargo build --release`).
+engine (`docker` or `podman`), and the `vmm` binary built (`cargo build --release`).
 A guest kernel is auto-detected from `/boot/vmlinuz-$(uname -r)` (override with
 `VMON_KERNEL`).
 
@@ -40,7 +40,7 @@ PYTHONPATH=python python3 -m vmon --help
 (`vmond`) over a Unix socket at `$VMON_HOME/vmond.sock` (default `~/.vmon/vmond.sock`);
 the first command auto-starts the daemon if it is not already running. The daemon
 is the single owner of `~/.vmon`: it holds the VM registry, rehydrates VMs from
-disk on restart, and spawns one `vmon` VMM process per microVM. You never invoke
+disk on restart, and spawns one `vmm` VMM process per microVM. You never invoke
 the VMM's flags by hand — `run`/`ps`/`logs`/`exec`/`stop` all route through the
 daemon, exactly like `docker` ↔ `dockerd` ↔ `runc`.
 
@@ -182,8 +182,8 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 
 ## How it works
 
-- **run** — `docker/podman` builds/exports the image filesystem; `vmon` injects
-  the static guest agent, boots an ext4 rootfs under vmon, and execs the image's
+- **run** — `docker/podman` builds/exports the image filesystem; `vmm` injects
+  the static guest agent, boots an ext4 rootfs under vmm, and execs the image's
   entrypoint through the agent-backed sandbox API.
 - **pause/resume** — vmon parks the vCPUs at a safe point and quiesces device
   workers over its Unix control socket.
@@ -199,6 +199,6 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 ## Notes / limits
 
 - The static guest agent is injected into built images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
-- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmon` VMM and its many flags are an internal runtime detail spawned by the daemon. Set `VMON_REMOTE=host:port` (with `VMON_API_TOKEN`) to drive a remote daemon that listens on TCP — i.e. one started with `VMON_DAEMON_TCP=host:port` (via `python -m vmon.daemon` or `vmon serve`).
+- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Set `VMON_REMOTE=host:port` (with `VMON_API_TOKEN`) to drive a remote daemon that listens on TCP — i.e. one started with `VMON_DAEMON_TCP=host:port` (via `python -m vmon.daemon` or `vmon serve`).
 - `VMON_BIN` / `VMON_KERNEL` / `VMON_HOME` override the binary, kernel, and
   state directory (`~/.vmon`).

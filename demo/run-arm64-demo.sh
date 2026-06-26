@@ -1,10 +1,10 @@
 #!/bin/bash
-# Boot Linux under vmon (aarch64) with a virtio-blk ext4 disk and a
+# Boot Linux under vmm (aarch64) with a virtio-blk ext4 disk and a
 # virtio-net tap, exercising filesystem + network IO with a busybox initramfs.
 # Run this INSIDE an arm64 Linux host that has /dev/kvm.
 #
 # Usage:  run-arm64-demo.sh [arm64-Image]
-#   - binary:  $VMON, else auto-detected (cargo target dirs / PATH)
+#   - binary:  $VMON_BIN, else auto-detected (cargo target dirs / PATH)
 #   - kernel:  arg 1, else auto-extracted from /boot/vmlinuz-$(uname -r)
 # Needs:  busybox, mkfs.ext4, cpio, iproute2, sudo (for /dev/kvm + tap).
 set -euo pipefail
@@ -13,29 +13,29 @@ WORK=${WORK:-/tmp/vmon-demo}
 TAP=${TAP:-tap0}
 mkdir -p "$WORK"; cd "$WORK"
 
-find_vmon() {
-  if [ -n "${VMON:-}" ] && [ -x "${VMON:-}" ]; then echo "$VMON"; return 0; fi
+find_vmm() {
+  if [ -n "${VMON_BIN:-}" ] && [ -x "${VMON_BIN:-}" ]; then echo "$VMON_BIN"; return 0; fi
   local proj base
   proj=$(cd "$HERE/.." && pwd)
   # If the project lives under a mounted host home, the cargo target dir may be
   # redirected to <home>/.cache/cargo-target; derive that home prefix.
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
   for c in \
-    "$proj/target/aarch64-unknown-linux-gnu/release/vmon" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmon" \
-    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
-    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
-    "$(command -v vmon 2>/dev/null || true)"; do
+    "$proj/target/aarch64-unknown-linux-gnu/release/vmm" \
+    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmm" \
+    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
+    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
+    "$(command -v vmm 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
-BIN=$(find_vmon) || {
-  echo "error: vmon binary not found. Build it with:" >&2
+BIN=$(find_vmm) || {
+  echo "error: vmm binary not found. Build it with:" >&2
   echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
-  echo "or set VMON=/path/to/vmon" >&2; exit 1
+  echo "or set VMON_BIN=/path/to/vmm" >&2; exit 1
 }
-echo "[demo] vmon: $BIN"
+echo "[demo] vmm: $BIN"
 
 KERNEL=${1:-}
 if [ -z "$KERNEL" ]; then
@@ -121,7 +121,7 @@ sudo ip tuntap add "$TAP" mode tap
 sudo ip addr add 172.16.0.1/24 dev "$TAP"
 sudo ip link set "$TAP" up
 
-echo "[demo] launching vmon (4 vCPUs, 1 GiB, virtio-blk + virtio-net)"
+echo "[demo] launching vmm (4 vCPUs, 1 GiB, virtio-blk + virtio-net)"
 LOG="$WORK/arm64-demo.log"
 rm -f "$LOG"
 set +e
@@ -132,7 +132,7 @@ sudo timeout 60 "$BIN" \
 status=${PIPESTATUS[0]}
 set -e
 if [ "$status" -ne 0 ]; then
-  echo "[demo] timeout/vmon exited with status $status" >&2
+  echo "[demo] timeout/vmm exited with status $status" >&2
   exit "$status"
 fi
 if grep -q 'vmon-demo: FAIL:' "$LOG"; then

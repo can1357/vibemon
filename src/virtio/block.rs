@@ -298,7 +298,7 @@ impl Block {
 				return Ok(());
 			}
 			return Err(err(format!(
-				"vmon: virtio-blk {context} missing active state while reaping {pending_len} \
+				"vmm: virtio-blk {context} missing active state while reaping {pending_len} \
 				 in-flight io_uring request(s)"
 			)));
 		};
@@ -307,7 +307,7 @@ impl Block {
 				return Ok(());
 			}
 			return Err(err(format!(
-				"vmon: virtio-blk {context} missing queue while reaping {pending_len} in-flight \
+				"vmm: virtio-blk {context} missing queue while reaping {pending_len} in-flight \
 				 io_uring request(s)"
 			)));
 		};
@@ -335,7 +335,7 @@ impl Block {
 				VIRTIO_BLK_S_IOERR
 			};
 			mem.write_slice(&[status as u8], status_addr).map_err(|e| {
-				err(format!("vmon: virtio-blk {context} failed writing completion status: {e}"))
+				err(format!("vmm: virtio-blk {context} failed writing completion status: {e}"))
 			})?;
 			let data_written = if ok && req_type == VIRTIO_BLK_T_IN {
 				data_len
@@ -343,14 +343,14 @@ impl Block {
 				0
 			};
 			queue.add_used(&mem, head, data_written + 1).map_err(|e| {
-				err(format!("vmon: virtio-blk {context} failed adding used descriptor: {e}"))
+				err(format!("vmm: virtio-blk {context} failed adding used descriptor: {e}"))
 			})?;
 			pending.remove(&token);
 			completed = true;
 		}
 		if completed {
 			interrupt.signal_used_queue().map_err(|e| {
-				err(format!("vmon: virtio-blk {context} failed signalling used queue: {e}"))
+				err(format!("vmm: virtio-blk {context} failed signalling used queue: {e}"))
 			})?;
 		}
 		Ok(())
@@ -386,7 +386,7 @@ impl Block {
 				Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
 				Err(e) => {
 					return Err(err(format!(
-						"vmon: virtio-blk {context} failed while waiting for {} in-flight io_uring \
+						"vmm: virtio-blk {context} failed while waiting for {} in-flight io_uring \
 						 request(s): {e}",
 						self.pending.len()
 					)));
