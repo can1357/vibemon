@@ -255,9 +255,10 @@ impl PciMmioDispatcher {
 }
 
 impl BusDevice for PciMmioDispatcher {
-	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		let addr = self.aperture_base + offset;
-		for transport in &self.functions {
+		let Some(addr) = self.aperture_base.checked_add(offset) else {
+			data.fill(0xff);
+			return;
+		};
 			let mut transport = transport.lock();
 			if let Some(bar_offset) = transport.bar_offset(addr) {
 				transport.read_bar(bar_offset, data);
@@ -267,9 +268,9 @@ impl BusDevice for PciMmioDispatcher {
 		data.fill(0xff);
 	}
 
-	fn write(&mut self, offset: u64, data: &[u8]) {
-		let addr = self.aperture_base + offset;
-		for transport in &self.functions {
+		let Some(addr) = self.aperture_base.checked_add(offset) else {
+			return;
+		};
 			let mut transport = transport.lock();
 			if let Some(bar_offset) = transport.bar_offset(addr) {
 				transport.write_bar(bar_offset, data);
@@ -567,7 +568,7 @@ pub struct PciCommonState {
 }
 
 impl PciTransport {
-	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments, reason = "constructor wires transport-owned device state")]
 	pub fn new(
 		device: Arc<Mutex<dyn VirtioDevice>>,
 		mem: GuestMemoryMmap,
@@ -635,18 +636,23 @@ impl PciTransport {
 
 	/// Snapshot the virtio common control-plane registers shared with MMIO
 	/// state.
-	pub fn common_state(&self) -> PciCommonState {
+		let live_queues = self.device.lock().queue_states();
+		let queues = if live_queues.is_empty() {
+			self.queues.iter().map(|q| q.state()).collect()
+		} else {
+			live_queues
+		};
 		PciCommonState {
 			device_features_select: self.device_features_select,
 			driver_features_select: self.driver_features_select,
 			acked_features:         self.acked_features,
 			status:                 self.status,
 			activated:              self.activated,
-			queues:                 self.queues.iter().map(|q| q.state()).collect(),
+			queues,
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments, reason = "restore path supplies serialized transport state")]
 	pub fn from_state(
 		device: Arc<Mutex<dyn VirtioDevice>>,
 		mem: GuestMemoryMmap,
@@ -815,12 +821,15 @@ impl PciTransport {
 		if touches(offset, data.len(), COMMON_DRIVER_FEATURE_SELECT, 4) {
 			self.driver_features_select = read_u32(&common, COMMON_DRIVER_FEATURE_SELECT);
 		}
-		if touches(offset, data.len(), COMMON_DRIVER_FEATURE, 4) {
-			let sel = self.driver_features_select.min(1);
-			let shift = 32 * sel;
+		if touches(offset, data.len(), COMMON_DRIVER_FEATURE, 4)
+			&& self.driver_features_select < 2
+		{
+			let shift = 32 * self.driver_features_select;
 			let mask = 0xffff_ffffu64 << shift;
-			self.acked_features = (self.acked_features & !mask)
-				| (u64::from(read_u32(&common, COMMON_DRIVER_FEATURE)) << shift);
+			let selected = (u64::from(read_u32(&common, COMMON_DRIVER_FEATURE)) << shift)
+				& self.device_features
+				& mask;
+			self.acked_features = (self.acked_features & !mask) | selected;
 		}
 		if touches(offset, data.len(), COMMON_MSIX_CONFIG, 2) {
 			self
@@ -875,12 +884,20 @@ impl PciTransport {
 			let msix = self.msix.lock();
 			(msix.config_vector(), msix.queue_vector(self.queue_select))
 		};
-		let feature_shift = 32 * self.device_features_select.min(1);
+		let feature_value = match self.device_features_select {
+			0 => self.device_features as u32,
+			1 => (self.device_features >> 32) as u32,
+			_ => 0,
+		};
+		let driver_value = match self.driver_features_select {
+			0 => self.acked_features as u32,
+			1 => (self.acked_features >> 32) as u32,
+			_ => 0,
+		};
 		write_u32(&mut bytes, COMMON_DEVICE_FEATURE_SELECT, self.device_features_select);
-		write_u32(&mut bytes, COMMON_DEVICE_FEATURE, (self.device_features >> feature_shift) as u32);
-		let driver_shift = 32 * self.driver_features_select.min(1);
+		write_u32(&mut bytes, COMMON_DEVICE_FEATURE, feature_value);
 		write_u32(&mut bytes, COMMON_DRIVER_FEATURE_SELECT, self.driver_features_select);
-		write_u32(&mut bytes, COMMON_DRIVER_FEATURE, (self.acked_features >> driver_shift) as u32);
+		write_u32(&mut bytes, COMMON_DRIVER_FEATURE, driver_value);
 		write_u16(&mut bytes, COMMON_MSIX_CONFIG, config_msix_vector);
 		write_u16(&mut bytes, COMMON_NUM_QUEUES, self.queue_count as u16);
 		bytes[COMMON_DEVICE_STATUS] = self.status as u8;
@@ -976,6 +993,13 @@ impl PciTransport {
 	}
 
 	fn activate(&mut self) {
+		if !self.queues.iter().all(|q| q.is_valid(&self.mem)) {
+			error!("virtio-pci device activation refused invalid queue configuration");
+			crate::metrics::record_device_worker_error();
+			self.status |= VIRTIO_CONFIG_S_FAILED;
+			return;
+		}
+
 		let queues = std::mem::take(&mut self.queues);
 		let mut device = self.device.lock();
 		device.ack_features(self.acked_features);
@@ -992,6 +1016,9 @@ impl PciTransport {
 	/// Restore-path counterpart to [`activate`](Self::activate): hand restored
 	/// queues to the backend and surface activation errors to the caller.
 	pub fn reactivate(&mut self) -> Result<()> {
+		if !self.queues.iter().all(|q| q.is_valid(&self.mem)) {
+			return Err(err("virtio-pci device restore refused invalid queue configuration"));
+		}
 		let queues = std::mem::take(&mut self.queues);
 		let mut device = self.device.lock();
 		device.ack_features(self.acked_features);

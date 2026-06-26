@@ -103,7 +103,8 @@ impl UserNet {
 	/// Read one vnet-header-prefixed Ethernet frame produced by libslirp.
 	pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 		let _ = self.packet_evt.read();
-		let Some(packet) = self.packets.lock().pop_front() else {
+		let mut packets = self.packets.lock();
+		let Some(packet) = packets.front() else {
 			return Err(io::Error::from(io::ErrorKind::WouldBlock));
 		};
 		let len = VNET_HDR_SIZE + packet.len();
@@ -114,7 +115,8 @@ impl UserNet {
 			));
 		}
 		buf[..VNET_HDR_SIZE].fill(0);
-		buf[VNET_HDR_SIZE..len].copy_from_slice(&packet);
+		buf[VNET_HDR_SIZE..len].copy_from_slice(packet);
+		packets.pop_front();
 		Ok(len)
 	}
 
@@ -246,7 +248,14 @@ impl Handler for SlirpHandler {
 		timer.expires_at = if expire_time < 0 {
 			None
 		} else {
-			Some(Instant::now() + Duration::from_millis(expire_time as u64))
+			// libslirp passes an absolute deadline in milliseconds on the same
+			// timebase as clock_get_ns(), not a relative delay.
+			Some(
+				self
+					.start
+					.checked_add(Duration::from_millis(expire_time as u64))
+					.unwrap_or_else(Instant::now),
+			)
 		};
 		let _ = self.loop_evt.write(1);
 	}

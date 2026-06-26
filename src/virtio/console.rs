@@ -270,29 +270,47 @@ impl Console {
 				break;
 			};
 			let head = chain.head_index();
-			let mut written = 0u32;
+			let mut descs = Vec::new();
+			let mut valid = true;
+			let mut capacity = 0u32;
 			for d in chain {
-				if inp.is_empty() {
+				let Some(next_capacity) = capacity.checked_add(d.len()) else {
+					valid = false;
 					break;
-				}
+				};
 				if !d.is_write_only() || !descriptor_range_valid(&mem, d.addr(), d.len()) {
+					valid = false;
 					break;
 				}
-				let take = (d.len() as usize).min(inp.len());
-				let Some(next_written) = written.checked_add(take as u32) else {
-					break;
-				};
-				// Peek the front bytes, write them, and only drain on success so
-				// a transient guest-memory fault never silently eats input.
-				let ok = {
-					let front = inp.make_contiguous();
-					mem.write_slice(&front[..take], d.addr()).is_ok()
-				};
-				if !ok {
-					break;
+				capacity = next_capacity;
+				descs.push((d.addr(), d.len() as usize));
+			}
+
+			let mut written = 0u32;
+			if valid {
+				for (addr, len) in descs {
+					if inp.is_empty() {
+						break;
+					}
+					let take = len.min(inp.len());
+					let Some(next_written) = written.checked_add(take as u32) else {
+						break;
+					};
+					if take == 0 {
+						continue;
+					}
+					// Peek the front bytes, write them, and only drain on success so
+					// a transient guest-memory fault never silently eats input.
+					let ok = {
+						let front = inp.make_contiguous();
+						mem.write_slice(&front[..take], addr).is_ok()
+					};
+					if !ok {
+						break;
+					}
+					inp.drain(..take);
+					written = next_written;
 				}
-				inp.drain(..take);
-				written = next_written;
 			}
 			rx_queue
 				.add_used(&mem, head, written)

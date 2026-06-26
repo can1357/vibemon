@@ -618,13 +618,30 @@ pub(super) mod linux {
 		}
 	}
 
+	fn next_unused_token(pending: &HashMap<u64, PendingReq>, next_token: &mut u64) -> Result<u64> {
+		let start = *next_token;
+		loop {
+			let token = *next_token;
+			*next_token = next_token.wrapping_add(1);
+			if !pending.contains_key(&token) {
+				return Ok(token);
+			}
+			if *next_token == start {
+				return Err(err("virtio-blk io_uring token space exhausted"));
+			}
+		}
+	}
+
 	/// Process one virtio-blk request chain.
 	///
 	/// IN/OUT requests are submitted to `ring` zero-copy (iovecs reference guest
 	/// memory) and reaped later; every other result (errors, flush, get-id,
 	/// unsupported, malformed) is finished inline with its used-ring entry added
 	/// here. The returned [`Outcome`] tells the caller which path was taken.
-	#[allow(clippy::too_many_arguments)]
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "virtio-blk request submission touches split device state"
+	)]
 	pub(super) fn process_chain(
 		disk: &File,
 		capacity_sectors: u64,
@@ -708,8 +725,7 @@ pub(super) mod linux {
 				}
 
 				let file_offset = sector * SECTOR_SIZE;
-				let token = *next_token;
-				*next_token = next_token.wrapping_add(1);
+				let token = next_unused_token(pending, next_token)?;
 				pending.insert(token, PendingReq {
 					head,
 					status_addr,
@@ -875,6 +891,9 @@ pub(super) mod macos {
 						continue;
 					}
 					let len = d.len() as usize;
+					if mem.get_slice(d.addr(), len).is_err() {
+						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
+					}
 					let Ok(ptr) = mem.get_host_address(d.addr()) else {
 						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 					};

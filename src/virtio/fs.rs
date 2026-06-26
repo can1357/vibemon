@@ -31,11 +31,12 @@
 
 use std::{
 	collections::HashMap,
-	ffi::{CString, OsStr},
+	ffi::OsStr,
 	fs::{self, File, Metadata},
 	os::unix::{
 		ffi::OsStrExt,
 		fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+		io::AsRawFd,
 	},
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -81,7 +82,7 @@ const MAX_WRITE: u32 = 1 << 20;
 const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
-const FUSE_SETATTR: u32 = 4;
+const FUSE_READLINK: u32 = 5;
 const FUSE_SYMLINK: u32 = 6;
 const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
@@ -109,7 +110,7 @@ const FUSE_RENAME2: u32 = 45;
 
 const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
 const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
-const MAX_REQUEST_SIZE: usize = IN_HEADER_SIZE + MAX_WRITE as usize;
+const MAX_REQUEST_SIZE: usize = IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>() + MAX_WRITE as usize;
 const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
 
 // ---------------------------------------------------------------------------
@@ -617,43 +618,36 @@ fn neg_errno(e: &std::io::Error) -> i32 {
 }
 
 /// First NUL-terminated name in `buf[off..]` (the single-name request tail).
-fn first_name(buf: &[u8], off: usize) -> &[u8] {
-	buf.get(off..)
-		.unwrap_or(&[])
-		.split(|&b| b == 0)
-		.next()
-		.unwrap_or(&[])
+fn first_name(buf: &[u8], off: usize) -> Option<&[u8]> {
+	let rest = buf.get(off..)?;
+	let end = rest.iter().position(|&b| b == 0)?;
+	Some(&rest[..end])
 }
 
 /// The two consecutive NUL-terminated names in `buf[off..]` (rename/symlink).
 fn two_names(buf: &[u8], off: usize) -> Option<(&[u8], &[u8])> {
 	let rest = buf.get(off..)?;
-	let mut parts = rest.split(|&b| b == 0);
-	let first = parts.next()?;
-	let second = parts.next()?;
-	Some((first, second))
+	let first_end = rest.iter().position(|&b| b == 0)?;
+	let second = &rest[first_end + 1..];
+	let second_end = second.iter().position(|&b| b == 0)?;
+	Some((&rest[..first_end], &second[..second_end]))
 }
 
-/// A NUL-free C string for the libc path calls (`chown`/`utimensat`).
-fn cpath(path: &Path) -> std::io::Result<CString> {
-	CString::new(path.as_os_str().as_bytes())
-		.map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
-}
 
-/// `chown(2)`; a `u32::MAX` (`-1`) uid/gid leaves that owner unchanged.
-fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-	let c = cpath(path)?;
-	// SAFETY: `c` is a valid NUL-terminated C string live for the whole call.
-	let r = unsafe { libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+/// `fchown(2)`; a `u32::MAX` (`-1`) uid/gid leaves that owner unchanged.
+fn chown_fd(file: &File, uid: u32, gid: u32) -> std::io::Result<()> {
+	// SAFETY: `file.as_raw_fd()` is a valid open file descriptor for the
+	// duration of the call; uid/gid are passed exactly as kernel uid_t/gid_t.
+	let r = unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
 	if r != 0 {
 		return Err(std::io::Error::last_os_error());
 	}
 	Ok(())
 }
 
-/// Apply the atime/mtime a SETATTR requested via `utimensat(2)`, honoring the
+/// Apply the atime/mtime a SETATTR requested via `futimens(2)`, honoring the
 /// `*_NOW` and omit semantics for whichever time is not selected in `valid`.
-fn set_times(path: &Path, sin: &FuseSetattrIn) -> std::io::Result<()> {
+fn set_times_fd(file: &File, sin: &FuseSetattrIn) -> std::io::Result<()> {
 	const UTIME_NOW: i64 = (1 << 30) - 1;
 	const UTIME_OMIT: i64 = (1 << 30) - 2;
 	let spec = |sel: u32, now: u32, sec: u64, nsec: u32| libc::timespec {
@@ -670,46 +664,74 @@ fn set_times(path: &Path, sin: &FuseSetattrIn) -> std::io::Result<()> {
 		spec(FATTR_ATIME, FATTR_ATIME_NOW, sin.atime, sin.atimensec),
 		spec(FATTR_MTIME, FATTR_MTIME_NOW, sin.mtime, sin.mtimensec),
 	];
-	let c = cpath(path)?;
-	// SAFETY: `c` outlives the call; `times` is the required 2-element array.
-	let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+	// SAFETY: `file.as_raw_fd()` is a valid open file descriptor, and `times`
+	// points to the required two-element timespec array for the duration of the
+	// call.
+	let r = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
 	if r != 0 {
 		return Err(std::io::Error::last_os_error());
 	}
 	Ok(())
 }
 
-/// Apply the subset of attributes selected by `sin.valid`. The size truncation
-/// is a data write, so it goes through the tracked handle `fh` when the guest
-/// supplied one, else a confined `O_NOFOLLOW` reopen of `path`; neither follows
-/// a final-component symlink. The metadata ops (mode/uid/gid/times) act on the
-/// already-confined canonical `path` from the inode table.
+/// Apply the subset of attributes selected by `sin.valid`. Every mutating
+/// operation is fd-based, so a post-check symlink swap cannot redirect chmod /
+/// chown / utimens or truncation outside the shared root.
 fn apply_setattr(path: &Path, fh: Option<&File>, sin: &FuseSetattrIn) -> std::io::Result<()> {
+	let needs_attr_fd = sin.valid
+		& (FATTR_MODE
+			| FATTR_UID
+			| FATTR_GID
+			| FATTR_ATIME
+			| FATTR_MTIME
+			| FATTR_ATIME_NOW
+			| FATTR_MTIME_NOW)
+		!= 0;
+	let mut reopened = None;
+
 	if sin.valid & FATTR_SIZE != 0 {
 		match fh {
 			Some(f) => f.set_len(sin.size)?,
-			None => open_nofollow(path, true)?.set_len(sin.size)?,
+			None => {
+				let f = open_nofollow(path, true)?;
+				f.set_len(sin.size)?;
+				if needs_attr_fd {
+					reopened = Some(f);
+				}
+			},
 		}
 	}
-	if sin.valid & FATTR_MODE != 0 {
-		fs::set_permissions(path, fs::Permissions::from_mode(sin.mode & 0o7777))?;
-	}
-	if sin.valid & (FATTR_UID | FATTR_GID) != 0 {
-		let uid = if sin.valid & FATTR_UID != 0 {
-			sin.uid
+
+	if needs_attr_fd {
+		let file = if let Some(f) = fh {
+			f
 		} else {
-			u32::MAX
+			if reopened.is_none() {
+				reopened = Some(open_nofollow(path, false)?);
+			}
+			reopened.as_ref().expect("reopened fd is populated")
 		};
-		let gid = if sin.valid & FATTR_GID != 0 {
-			sin.gid
-		} else {
-			u32::MAX
-		};
-		chown_path(path, uid, gid)?;
+		if sin.valid & FATTR_MODE != 0 {
+			file.set_permissions(fs::Permissions::from_mode(sin.mode & 0o7777))?;
+		}
+		if sin.valid & (FATTR_UID | FATTR_GID) != 0 {
+			let uid = if sin.valid & FATTR_UID != 0 {
+				sin.uid
+			} else {
+				u32::MAX
+			};
+			let gid = if sin.valid & FATTR_GID != 0 {
+				sin.gid
+			} else {
+				u32::MAX
+			};
+			chown_fd(file, uid, gid)?;
+		}
+		if sin.valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
+			set_times_fd(file, sin)?;
+		}
 	}
-	if sin.valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
-		set_times(path, sin)?;
-	}
+
 	Ok(())
 }
 
@@ -717,12 +739,17 @@ fn apply_setattr(path: &Path, fh: Option<&File>, sin: &FuseSetattrIn) -> std::io
 /// final-component symlink (`O_NOFOLLOW`). A symlink as the final element makes
 /// the open fail with `ELOOP`, so a post-LOOKUP swap cannot redirect the I/O
 /// outside the shared root. Used by OPEN/CREATE and the unknown-fh fallbacks.
-fn open_nofollow(path: &Path, write: bool) -> std::io::Result<File> {
+fn open_file_nofollow(path: &Path, write: bool, truncate: bool) -> std::io::Result<File> {
 	fs::OpenOptions::new()
 		.read(true)
 		.write(write)
+		.truncate(truncate)
 		.custom_flags(libc::O_NOFOLLOW)
 		.open(path)
+}
+
+fn open_nofollow(path: &Path, write: bool) -> std::io::Result<File> {
+	open_file_nofollow(path, write, false)
 }
 
 /// Open the directory at `path` for OPENDIR without following a final-component
@@ -839,16 +866,21 @@ impl FsState {
 		id
 	}
 
-	/// Resolve `<parent>/<name>` to a canonical path confined to the shared
-	/// root, rejecting traversal/symlink escapes and the self/parent entries
-	/// (which the kernel resolves itself without `FUSE_EXPORT_SUPPORT`).
+	/// Resolve `<parent>/<name>` to an existing path whose parent is confined to
+	/// the shared root. The final component is deliberately not canonicalized:
+	/// LOOKUP must report symlink inodes themselves, and READLINK returns their
+	/// stored target later without ever touching host paths outside the share.
 	fn resolve_child(&self, parent: &Path, name: &[u8]) -> Option<PathBuf> {
 		if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
 			return None;
 		}
-		let candidate = parent.join(OsStr::from_bytes(name));
-		let canon = fs::canonicalize(&candidate).ok()?;
-		canon.starts_with(&self.root).then_some(canon)
+		let parent_canon = fs::canonicalize(parent).ok()?;
+		if !parent_canon.starts_with(&self.root) {
+			return None;
+		}
+		let child = parent_canon.join(OsStr::from_bytes(name));
+		fs::symlink_metadata(&child).ok()?;
+		Some(child)
 	}
 
 	/// Resolve `<parent>/<name>` for a child that need NOT exist yet (CREATE /
@@ -870,10 +902,64 @@ impl FsState {
 
 	/// Store `file` under a fresh handle id and return it (fh 0 is reserved).
 	fn insert_handle(&mut self, file: File) -> u64 {
-		let fh = self.next_fh;
-		self.next_fh = self.next_fh.checked_add(1).unwrap_or(1);
-		self.handles.insert(fh, file);
-		fh
+		loop {
+			let fh = self.next_fh.max(1);
+			self.next_fh = fh.checked_add(1).unwrap_or(1);
+			if !self.handles.contains_key(&fh) {
+				self.handles.insert(fh, file);
+				return fh;
+			}
+		}
+	}
+
+	fn forget_node(&mut self, nodeid: u64) {
+		if nodeid == FUSE_ROOT_ID {
+			return;
+		}
+		if let Some(path) = self.inodes.remove(&nodeid) {
+			self.by_path.remove(&path);
+		}
+	}
+
+	fn remove_inode_subtree(&mut self, root: &Path) {
+		let ids: Vec<u64> = self
+			.inodes
+			.iter()
+			.filter_map(|(&id, path)| {
+				(id != FUSE_ROOT_ID && (path == root || path.starts_with(root))).then_some(id)
+			})
+			.collect();
+		for id in ids {
+			self.forget_node(id);
+		}
+	}
+
+	fn rename_inode_subtree(&mut self, src: &Path, dst: &Path) {
+		let moved: Vec<(u64, PathBuf)> = self
+			.inodes
+			.iter()
+			.filter_map(|(&id, path)| {
+				if id == FUSE_ROOT_ID || !(path == src || path.starts_with(src)) {
+					return None;
+				}
+				let rel = path.strip_prefix(src).ok()?;
+				let new_path = if rel.as_os_str().is_empty() {
+					dst.to_path_buf()
+				} else {
+					dst.join(rel)
+				};
+				Some((id, new_path))
+			})
+			.collect();
+
+		self.remove_inode_subtree(dst);
+		for (id, new_path) in moved {
+			if let Some(path) = self.inodes.get_mut(&id) {
+				let old_path = std::mem::replace(path, new_path.clone());
+				self.by_path.remove(&old_path);
+				self.by_path.insert(new_path, id);
+			}
+		}
 	}
 
 	/// Return the current host path for `nodeid` after proving its parent still
@@ -1064,13 +1150,9 @@ impl FsState {
 				},
 				Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 			},
-			FUSE_LOOKUP => {
-				let name = req
-					.get(IN_HEADER_SIZE..)
-					.unwrap_or(&[])
-					.split(|&b| b == 0)
-					.next()
-					.unwrap_or(&[]);
+				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let resolved = self
 					.inodes
 					.get(&nodeid)
@@ -1096,6 +1178,13 @@ impl FsState {
 					None => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
 				}
 			},
+			FUSE_READLINK => match self.confined_lstat_path(nodeid) {
+				Ok(path) => match fs::read_link(&path) {
+					Ok(target) => write_reply(mem, writable, unique, 0, target.as_os_str().as_bytes()),
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				},
+				Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+			},
 			FUSE_OPEN | FUSE_OPENDIR => {
 				let path = match self.confined_existing_path(nodeid) {
 					Ok(path) => path,
@@ -1119,7 +1208,7 @@ impl FsState {
 				let opened = if is_dir {
 					open_dir_nofollow(&path)
 				} else {
-					open_nofollow(&path, wants_write)
+					open_file_nofollow(&path, wants_write, flags & libc::O_TRUNC as u32 != 0)
 				};
 				match opened {
 					Ok(file) => {
@@ -1192,7 +1281,25 @@ impl FsState {
 			// No host-side state to tear down: acknowledge.
 			FUSE_FLUSH | FUSE_ACCESS => write_reply(mem, writable, unique, 0, &[]),
 			// No-reply opcodes: the buffer is device-readable only.
-			FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT => 0,
+			FUSE_FORGET => {
+				self.forget_node(nodeid);
+				0
+			},
+			FUSE_BATCH_FORGET => {
+				let count = read_struct::<u32>(req, IN_HEADER_SIZE).unwrap_or(0) as usize;
+				let entries_off = IN_HEADER_SIZE + 8;
+				for i in 0..count {
+					let Some(off) = entries_off.checked_add(i.saturating_mul(16)) else {
+						break;
+					};
+					let Some(id) = read_struct::<u64>(req, off) else {
+						break;
+					};
+					self.forget_node(id);
+				}
+				0
+			},
+			FUSE_INTERRUPT => 0,
 			FUSE_CREATE => {
 				if read_only {
 					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
@@ -1200,7 +1307,10 @@ impl FsState {
 				let Some(cin) = read_struct::<FuseCreateIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
-				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseCreateIn>());
+				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseCreateIn>())
+				else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let Some(child) = self
 					.inodes
 					.get(&nodeid)
@@ -1212,14 +1322,19 @@ impl FsState {
 				// Create + open the child without following a final-component
 				// symlink: with O_CREAT|O_NOFOLLOW an already-present symlink at
 				// `child` fails ELOOP, so a pre-planted symlink cannot escape.
-				match fs::OpenOptions::new()
+				let mut create = fs::OpenOptions::new();
+				create
 					.read(true)
 					.write(true)
-					.create(true)
 					.truncate(cin.flags & libc::O_TRUNC as u32 != 0)
 					.custom_flags(libc::O_NOFOLLOW)
-					.mode(cin.mode & 0o7777)
-					.open(&child)
+					.mode(cin.mode & 0o7777);
+				if cin.flags & libc::O_EXCL as u32 != 0 {
+					create.create_new(true);
+				} else {
+					create.create(true);
+				}
+				match create.open(&child)
 				{
 					Ok(file) => match fs::symlink_metadata(&child) {
 						Ok(md) => {
@@ -1319,7 +1434,10 @@ impl FsState {
 				let Some(min) = read_struct::<FuseMkdirIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
-				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMkdirIn>());
+				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMkdirIn>())
+				else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let Some(child) = self
 					.inodes
 					.get(&nodeid)
@@ -1340,7 +1458,9 @@ impl FsState {
 				if read_only {
 					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
 				}
-				let name = first_name(req, IN_HEADER_SIZE);
+				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let Some(child) = self
 					.inodes
 					.get(&nodeid)
@@ -1350,7 +1470,10 @@ impl FsState {
 					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
 				};
 				match fs::remove_file(&child) {
-					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Ok(()) => {
+						self.remove_inode_subtree(&child);
+						write_reply(mem, writable, unique, 0, &[])
+					},
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
@@ -1358,7 +1481,9 @@ impl FsState {
 				if read_only {
 					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
 				}
-				let name = first_name(req, IN_HEADER_SIZE);
+				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				let Some(child) = self
 					.inodes
 					.get(&nodeid)
@@ -1368,7 +1493,10 @@ impl FsState {
 					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
 				};
 				match fs::remove_dir(&child) {
-					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Ok(()) => {
+						self.remove_inode_subtree(&child);
+						write_reply(mem, writable, unique, 0, &[])
+					},
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
@@ -1411,7 +1539,10 @@ impl FsState {
 					return write_reply(mem, writable, unique, -libc::EEXIST, &[]);
 				}
 				match fs::rename(&src, &dst) {
-					Ok(()) => write_reply(mem, writable, unique, 0, &[]),
+					Ok(()) => {
+						self.rename_inode_subtree(&src, &dst);
+						write_reply(mem, writable, unique, 0, &[])
+					},
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
@@ -1443,9 +1574,13 @@ impl FsState {
 				let Some(lin) = read_struct::<FuseLinkIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
-				let name = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseLinkIn>());
-				let Some(src) = self.inodes.get(&lin.oldnodeid).cloned() else {
-					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseLinkIn>())
+				else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let src = match self.confined_existing_path(lin.oldnodeid) {
+					Ok(src) => src,
+					Err(e) => return write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				};
 				let Some(dst) = self
 					.inodes
@@ -1467,7 +1602,9 @@ impl FsState {
 				let Some(fin) = read_struct::<FuseFallocateIn>(req, IN_HEADER_SIZE) else {
 					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
 				};
-				let want = fin.offset.saturating_add(fin.length);
+				let Some(want) = fin.offset.checked_add(fin.length) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
 				// Operate on the tracked handle; fall back to a confined
 				// O_NOFOLLOW reopen by nodeid for a stale/unknown fh.
 				let res = if let Some(f) = self.handles.get(&fin.fh) {
