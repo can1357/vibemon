@@ -192,7 +192,10 @@ pub fn create_guest_memory_private(
 ) -> Result<GuestMemoryMmap> {
 	use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 
-	let metadata = std::fs::metadata(mem_file)
+	let mem = File::open(mem_file)
+		.map_err(|e| crate::result::err(format!("opening {}: {e}", mem_file.display())))?;
+	let metadata = mem
+		.metadata()
 		.map_err(|e| crate::result::err(format!("stat {}: {e}", mem_file.display())))?;
 	if !metadata.is_file() {
 		return Err(crate::result::err(format!(
@@ -243,8 +246,9 @@ pub fn create_guest_memory_private(
 		let len = usize::try_from(len).map_err(|_| {
 			crate::result::err(format!("snapshot memory region @ {gpa:#x} is too large"))
 		})?;
-		let file = File::open(mem_file)
-			.map_err(|e| crate::result::err(format!("opening {}: {e}", mem_file.display())))?;
+		let file = mem
+			.try_clone()
+			.map_err(|e| crate::result::err(format!("cloning {}: {e}", mem_file.display())))?;
 		let fo = FileOffset::new(file, file_offset);
 		let region = MmapRegion::<()>::build(
 			Some(fo),
