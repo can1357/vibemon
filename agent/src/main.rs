@@ -405,8 +405,11 @@ mod linux_agent {
 				let payload = match status {
 					Ok(status) => {
 						let signal = status.signal();
+						let code = status
+							.code()
+							.unwrap_or_else(|| signal.map_or(-1, |sig| -sig));
 						json!({
-							 "code": status.code().unwrap_or_else(|| signal.map_or(-1, |sig| -sig)),
+							 "code": code,
 							 "signal": signal,
 						})
 					},
@@ -921,7 +924,7 @@ mod linux_agent {
 							return;
 						}
 					},
-					Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+					Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
 					Err(_) => break,
 				}
 			}
