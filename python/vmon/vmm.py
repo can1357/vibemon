@@ -319,10 +319,10 @@ class MicroVM:
 
     def wait_for_agent(self, timeout: float = 300.0) -> AgentConn:
         """Wait for the guest agent and fail early when the transport cannot appear."""
-        deadline = time.time() + max(0.0, float(timeout))
+        deadline = time.monotonic() + max(0.0, float(timeout))
         last: BaseException | None = None
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(self._agent_timeout_message(timeout, last)) from last
             slice_timeout = min(1.0, max(0.001, remaining))
@@ -373,16 +373,18 @@ class MicroVM:
         return f"last console lines:\n{tail}" if tail else "console log is empty"
 
     def _connect_agent(self, sock: str, connect_timeout: float | None) -> AgentConn:
-        deadline = None if connect_timeout is None else time.time() + connect_timeout
+        deadline = None if connect_timeout is None else time.monotonic() + max(0.0, connect_timeout)
         last: BaseException | None = None
         while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
-                return AgentConn(sock, connect_timeout=min(connect_timeout or 1.0, 1.0))
+                connect_slice = min(remaining if remaining is not None else 1.0, 1.0)
+                return AgentConn(sock, connect_timeout=connect_slice)
             except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
                 last = e
-                if deadline is None or time.time() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(f"agent socket {sock} not ready: {last}") from e
-                time.sleep(0.01)
+                time.sleep(min(0.01, remaining if remaining is not None else 0.01))
 
     def _close_agent(self) -> None:
         with self._agent_lock:
@@ -741,8 +743,8 @@ class MicroVM:
             **meta,
         )
         try:
-            deadline = time.time() + launch_timeout
-            while time.time() < deadline:
+            deadline = time.monotonic() + launch_timeout
+            while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     tail = "\n".join(self.logs().splitlines()[-15:])
                     raise RuntimeError(
@@ -850,18 +852,51 @@ class MicroVM:
             self.stop()
         return snap_dir
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
         self._close_agent()
+        pid = self._meta_pid(self.meta.get("pid"))
         try:
             self.control.quit()
         except OSError, RuntimeError:
-            pid = self._meta_pid(self.meta.get("pid"))
             if pid:
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
+        if wait and pid and not self._wait_pid_exit(pid, timeout=2.0):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            if not self._wait_pid_exit(pid, timeout=1.0):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                self._wait_pid_exit(pid, timeout=1.0)
         self._save_meta(status="stopped")
+
+    @staticmethod
+    def _wait_pid_exit(pid: int, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                reaped, _ = os.waitpid(pid, os.WNOHANG)
+                if reaped == pid:
+                    return True
+            except ChildProcessError:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True
+            except OSError:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def remove(self) -> None:
         self._close_agent()

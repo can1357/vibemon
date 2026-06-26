@@ -158,7 +158,7 @@ def _capture(*renderables: RenderableType) -> str:
     colored, terminal-width boxes interactively; plain text when piped.
     """
     width, height = _term_size()
-    width = min(width - 4, MAX_WIDTH)
+    width = min(max(1, width - 4), MAX_WIDTH)
     is_tty = _stdout_isatty()
     recorder = Console(
         theme=_THEME,

@@ -12,6 +12,7 @@ import errno
 import fcntl
 import os
 import re
+import stat
 import threading
 from pathlib import Path
 from types import TracebackType
@@ -77,10 +78,12 @@ class Volume:
             try:
                 fd = os.open(
                     ".lock",
-                    os.O_RDWR | os.O_CREAT | _O_NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                     0o600,
                     dir_fd=dir_fd,
                 )
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(errno.EINVAL, "not a regular file", ".lock")
                 os.fchmod(fd, 0o600)
             except OSError as exc:
                 if fd is not None:

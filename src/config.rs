@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 
 use crate::{
 	bail,
@@ -364,11 +364,17 @@ struct CliArgs {
 }
 
 impl Config {
-	/// Parse `std::env::args`, letting clap handle `--help`/`--version` and
-	/// malformed flags (it prints to the right stream and exits), then run
-	/// cross-flag validation.
+	/// Parse `std::env::args`, preserving clap's `--help`/`--version` exits while
+	/// returning malformed flags as [`Error`] for the crate-level error path, then
+	/// run cross-flag validation.
 	pub fn from_args() -> Result<Self> {
-		Self::from_cli(CliArgs::parse())
+		match CliArgs::try_parse() {
+			Ok(cli) => Self::from_cli(cli),
+			Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+				e.exit()
+			},
+			Err(e) => Err(err(e.to_string())),
+		}
 	}
 
 	/// Parse `args` without exiting the process. clap failures — including the
@@ -418,6 +424,9 @@ impl Config {
 		if mem_mib == 0 || mem_mib > MAX_MEM_MIB as u64 {
 			bail!("--mem must be between 1 and {MAX_MEM_MIB} MiB (got {mem_mib})");
 		}
+		if cli.rootfs_ro && cli.rootfs.is_none() {
+			bail!("--rootfs-ro requires --rootfs");
+		}
 		if let Some(target) = mem_target_mib
 			&& (target == 0 || target >= mem_mib)
 		{
@@ -447,6 +456,15 @@ impl Config {
 		}
 		if cli.cgroup_pids_max == Some(0) {
 			bail!("--cgroup-pids-max must be greater than 0");
+		}
+		if cli.cgroup_cpu_max.as_deref() == Some("") {
+			bail!("--cgroup-cpu-max must not be empty");
+		}
+		if cli.cgroup_mem_max.as_deref() == Some("") {
+			bail!("--cgroup-mem-max must not be empty");
+		}
+		if cli.tap.as_deref() == Some("") {
+			bail!("--tap must not be empty");
 		}
 
 		if cli.fs_tag.is_some() != cli.fs_dir.is_some() {
@@ -491,6 +509,14 @@ impl Config {
 			(BootMode::Direct, true) => bail!("--firmware requires --boot-mode uefi"),
 			(BootMode::Uefi, true) | (BootMode::Direct, false) => {},
 		}
+		if boot_mode == BootMode::Uefi {
+			if cli.kernel.is_some() {
+				bail!("--kernel is only supported with --boot-mode direct");
+			}
+			if cli.initrd.is_some() {
+				bail!("--initrd is only supported with --boot-mode direct");
+			}
+		}
 		if let Some(id) = &cli.id {
 			validate_id(id)?;
 		}
@@ -512,8 +538,22 @@ impl Config {
 		if no_sandbox && jail {
 			bail!("--no-sandbox cannot be combined with --jail");
 		}
+		if no_sandbox && cli.seccomp_action != SeccompAction::Errno {
+			bail!("--seccomp-action requires the sandbox or --jail");
+		}
 		if cli.netns.is_some() && !jail {
 			bail!("--netns requires --jail");
+		}
+		if !jail {
+			if cli.cgroup_cpu_max.is_some()
+				|| cli.cgroup_mem_max.is_some()
+				|| cli.cgroup_pids_max.is_some()
+			{
+				bail!("--cgroup-cpu-max/--cgroup-mem-max/--cgroup-pids-max require --jail");
+			}
+			if cli.cgroup_mode == CgroupMode::Off {
+				bail!("--cgroup-mode off requires --jail");
+			}
 		}
 		// A fresh direct boot needs a kernel. UEFI boots enter firmware instead;
 		// restore/fork reconstruct state from a snapshot.
@@ -556,8 +596,13 @@ impl Config {
 		// uid/gid — the drop is a no-op when not root.
 		#[cfg(target_os = "linux")]
 		{
+			let running_as_root = {
+				// SAFETY: `getuid` is thread-safe and has no preconditions.
+				unsafe { libc::getuid() } == 0
+			};
 			if filters_enabled
-				&& !jail && unsafe { libc::getuid() } == 0
+				&& !jail
+				&& running_as_root
 				&& (sandbox_uid.is_none() || sandbox_gid.is_none())
 			{
 				bail!(
@@ -610,7 +655,7 @@ impl Config {
 			firmware: cli.firmware,
 			log_format: cli.log_format,
 			log_level: cli.log_level,
-			sandbox: true,
+			sandbox: !no_sandbox,
 			no_sandbox,
 			sandbox_uid,
 			sandbox_gid,

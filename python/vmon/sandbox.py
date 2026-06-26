@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets as _secrets
@@ -21,6 +22,7 @@ from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_
 from .volume import Volume
 
 _POOLS: dict[str, WarmPool] = {}
+_POOLS_LOCK = threading.Lock()
 
 
 def _setup_sandbox_network(
@@ -64,8 +66,10 @@ class _ProcessStdin:
 
     def close(self) -> None:
         if not self._closed:
-            self._session.close_stdin()
-            self._closed = True
+            try:
+                self._session.close_stdin()
+            finally:
+                self._closed = True
 
 
 class Process:
@@ -94,7 +98,16 @@ class Process:
         self._session.resize(int(rows), int(cols))
 
     def wait(self, timeout: float | None = None) -> int:
-        return self._session.wait(timeout)
+        try:
+            return self._session.wait(timeout)
+        finally:
+            self._close_streams()
+
+    def _close_streams(self) -> None:
+        with contextlib.suppress(Exception):
+            self.stdout.close()
+        with contextlib.suppress(Exception):
+            self.stderr.close()
 
 
 class Filesystem:
@@ -252,10 +265,15 @@ class Sandbox:
                 and fs_dir is None
             ):
                 key = str(template_dir)
-                pool = _POOLS.get(key)
-                if pool is None or pool.size != int(pool_size):
-                    pool = WarmPool(template_dir, int(pool_size))
-                    _POOLS[key] = pool
+                old_pool: WarmPool | None = None
+                with _POOLS_LOCK:
+                    pool = _POOLS.get(key)
+                    if pool is None or pool.size != int(pool_size):
+                        old_pool = pool
+                        pool = WarmPool(template_dir, int(pool_size))
+                        _POOLS[key] = pool
+                if old_pool is not None:
+                    old_pool.shutdown()
                 vm = pool.claim()
                 from_pool = vm is not None
             if vm is None and block_network:
@@ -579,13 +597,15 @@ class Sandbox:
         return proc
 
     def wait_until_ready(self, probe: Any = None, timeout: float = 300) -> None:
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + max(0.0, float(timeout))
         last: BaseException | None = None
         if probe is None:
             wait_for_agent_ready(self.vm, timeout=timeout)
             return
-        while time.time() < deadline:
-            remaining = max(0.0, deadline - time.time())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
                 if isinstance(probe, int):
                     if self.agent().tcp_probe(int(probe)):
@@ -606,10 +626,12 @@ class Sandbox:
                             return
                     except TimeoutError:
                         proc.kill()
-                time.sleep(0.1)
+                        with contextlib.suppress(Exception):
+                            proc.wait(timeout=1.0)
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             except BaseException as exc:
                 last = exc
-                time.sleep(0.1)
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         raise TimeoutError(f"sandbox readiness probe timed out after {timeout}s") from last
 
     def _status(self) -> dict[str, Any] | None:
@@ -678,12 +700,12 @@ class Sandbox:
         if self._terminated:
             return
         self._terminated = True
-        self._stop_timeout_watchdog()
         try:
             if self._agent is not None:
-                self._agent.close()
+                with contextlib.suppress(Exception):
+                    self._agent.close()
             self._teardown_network()
-            self.vm.stop()
+            self.vm.stop(wait=wait)
         finally:
             for vol in self._volumes:
                 vol.release()

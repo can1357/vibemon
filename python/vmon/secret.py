@@ -27,7 +27,7 @@ def _coerce_env_value(value: object) -> str:
     return text
 
 
-@dataclass
+@dataclass(repr=False)
 class Secret:
     """A bundle of environment variables injected into the guest at exec time."""
 
@@ -35,6 +35,10 @@ class Secret:
 
     def __post_init__(self) -> None:
         self.env = {_coerce_env_name(k): _coerce_env_value(v) for k, v in self.env.items()}
+
+    def __repr__(self) -> str:
+        names = ", ".join(self.names())
+        return f"Secret(names=[{names}])"
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Secret:

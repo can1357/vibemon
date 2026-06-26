@@ -65,6 +65,16 @@ def _parse_env(pairs: tuple[str, ...]) -> dict[str, str]:
         env[key] = os.environ[key]
     return env
 
+def _exit_code(result: dict[str, object]) -> int:
+    """Translate daemon ``returncode`` into a valid process exit status."""
+    try:
+        code = int(result["returncode"])
+    except (KeyError, TypeError, ValueError):
+        return 1
+    if code < 0:
+        return min(255, 128 + abs(code))
+    return min(255, code)
+
 
 def _parse_remote(spec: str) -> tuple[str, str] | None:
     if ":" not in spec:
@@ -135,7 +145,7 @@ def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, no_a
         ui.hint(f"vmon {verb} {vm} … │ vmon snapshot {vm} <tpl> │ vmon stop {vm}")
         return 0
     r = client.stream("run", _write_event, **params)
-    return int(r.get("returncode") or 0)
+    return _exit_code(r)
 
 
 @cli.command(
@@ -210,7 +220,7 @@ def shell(ref, command, image, env, mem, cpus, disk_mb, timeout, pty):
     finally:
         if spinner is not None and not state["ready"]:
             spinner.stop()
-    return int(r.get("returncode") or 0)
+    return _exit_code(r)
 
 
 @cli.command(
@@ -228,9 +238,9 @@ def exec(name, cmd, tty):
     client = DaemonClient()
     if tty:
         r = client.interactive("exec", _write_event, tty=True, name=name, cmd=argv)
-        return int(r.get("returncode") or 0)
+        return _exit_code(r)
     r = client.stream("exec", _write_event, stdin=sys.stdin.buffer, name=name, cmd=argv)
-    return int(r.get("returncode") or 0)
+    return _exit_code(r)
 
 
 @cli.command(
@@ -358,7 +368,7 @@ def restore(snapshot, name, agent, detach):
         f"warm-booted [vmon.command]{r.get('name')}[/] from {snapshot}  "
         f"(reconstruct={rec_str}, end-to-end={r.get('restore_ms')}ms)"
     )
-    return 0 if detach else int(r.get("returncode") or 0)
+    return 0 if detach else _exit_code(r)
 
 
 @cli.command(
