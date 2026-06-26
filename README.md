@@ -141,7 +141,7 @@ Named volumes persist outside snapshots under a single-writer host lock; secrets
 | --- | --- | --- |
 | Hypervisor | KVM | Hypervisor.framework (HVF), ad-hoc codesigned |
 | Host arch | `x86_64`, `aarch64` | `aarch64` |
-| Guest | Linux (`x86_64`/`aarch64`) | Linux `aarch64` only |
+| Guest | Linux, same arch as host | Linux `aarch64` only |
 | Networking | TAP (`--tap`) | user-mode NAT (`--net user`); `--tap` unavailable |
 | Boot | direct kernel + UEFI | direct kernel `Image` + UEFI |
 | Snapshot / restore / fork | MMIO + PCI virtio, virtio-fs | MMIO virtio |
@@ -152,9 +152,9 @@ The backend is selected at compile time; there is no runtime switch, and `x86_64
 
 ```sh
 just release        # release build (+ codesign on macOS)
-just check          # cargo check --workspace --all-targets
-just clippy         # clippy -D warnings
-just fmt            # cargo fmt --all
+just check          # check + typecheck across Rust, Python, and the UI
+just lint           # clippy -D warnings, ruff, biome
+just format         # format Rust, Python, and the UI in place
 just test           # unit + integration (KVM-gated cases auto-skip)
 ```
 
