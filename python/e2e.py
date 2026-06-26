@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """End-to-end smoke test for the vmon / vmon sandbox stack.
 
 Boots real microVMs on a Linux host with ``/dev/kvm`` and exercises every
@@ -37,14 +37,12 @@ fresh-boots a virtio-net device bound to a host TAP and therefore needs root /
 ``CAP_NET_ADMIN`` -- they SKIP otherwise.
 
 Usage:
-  python3 python/e2e.py                 # run everything
-  python3 python/e2e.py exec snapshot   # run a subset (substring match)
-  python3 python/e2e.py --list          # list test names
-  python3 python/e2e.py --keep          # leave volumes/snapshots in place
-  VMON_E2E_IMAGE=alpine:latest python3 python/e2e.py
+  python3.14 python/e2e.py                 # run everything
+  python3.14 python/e2e.py exec snapshot   # run a subset (substring match)
+  python3.14 python/e2e.py --list          # list test names
+  python3.14 python/e2e.py --keep          # leave volumes/snapshots in place
+  VMON_E2E_IMAGE=alpine:latest python3.14 python/e2e.py
 """
-
-from __future__ import annotations
 
 import argparse
 import asyncio
@@ -57,6 +55,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -84,11 +83,11 @@ class Skip(Exception):
     """Raised by a test to report it cannot run in this environment."""
 
 
-TESTS: list = []
+TESTS: list[Callable[[object], None]] = []
 VOLUMES: set[str] = set()
 
 
-def e2e(fn):
+def e2e(fn: Callable[[object], None]) -> Callable[[object], None]:
     """Register a test, preserving definition order."""
     TESTS.append(fn)
     return fn
@@ -109,7 +108,7 @@ def template_dir() -> Path:
     return _template
 
 
-def make_sandbox(**kw) -> Sandbox:
+def make_sandbox(**kw: object) -> Sandbox:
     """Create a sandbox, defaulting to no network.
 
     Feature tests boot with ``block_network=True`` since they don't need
@@ -119,7 +118,14 @@ def make_sandbox(**kw) -> Sandbox:
     return Sandbox.create(image=IMAGE, **kw)
 
 
-def run(sb: Sandbox, *argv, timeout: float = 30, pty: bool = False, env=None, workdir=None):
+def run(
+    sb: Sandbox,
+    *argv: str,
+    timeout: float = 30,
+    pty: bool = False,
+    env: dict[str, str] | None = None,
+    workdir: str | None = None,
+) -> tuple[int | None, str, str]:
     """Exec ``argv`` in ``sb``; return ``(returncode, stdout, stderr)`` as text."""
     proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir, _track_entry=False)
     try:
@@ -144,17 +150,17 @@ def snapshot_memory_bytes(snap_dir: Path) -> int:
     return (snap_dir / f"memory.{gen}.bin").stat().st_size
 
 
-def read_status(vm: MicroVM):
+def read_status(vm: MicroVM) -> dict[str, object] | None:
     """The VMM's exit ``status.json`` (beside the control socket), or None."""
     for p in (Path(vm.control_sock).parent / "status.json", vm.dir / "status.json"):
         try:
             return json.loads(p.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except FileNotFoundError, json.JSONDecodeError, OSError:
             continue
     return None
 
 
-def wait_status(vm: MicroVM, deadline: float):
+def wait_status(vm: MicroVM, deadline: float) -> dict[str, object] | None:
     """Poll for a finished ``status.json`` (one with a ``reason``) until deadline."""
     end = time.time() + deadline
     while time.time() < end:
@@ -512,7 +518,7 @@ def t_ports_tunnels(_):
                     if not chunk:
                         break
                     body += chunk
-            except socket.timeout:
+            except TimeoutError:
                 pass
         assert b"hi" in body, f"tunnel did not deliver the guest response: {body!r}"
     finally:
@@ -642,11 +648,11 @@ def preflight() -> str | None:
     return None
 
 
-def display_name(fn) -> str:
+def display_name(fn: Callable[[object], None]) -> str:
     return fn.__name__[2:] if fn.__name__.startswith("t_") else fn.__name__
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     global IMAGE
     ap = argparse.ArgumentParser(description="vmon / vmon end-to-end smoke test")
     ap.add_argument("tests", nargs="*", help="substring filters (default: run all)")

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """End-to-end smoke test for the ``vmon`` **CLI** (client -> vmond -> engine -> VMM).
 
 Where ``e2e.py`` drives the Python SDK in-process, this driver shells out to the
@@ -23,15 +23,13 @@ Prerequisites (same as ``e2e.py``): a Linux + KVM host with a built ``vmon``
 binary, a static guest agent, a guest kernel, and ``docker``/``podman``.
 
 Usage:
-  python3 python/cli_e2e.py                  # run everything
-  python3 python/cli_e2e.py run exec         # subset (substring match)
-  python3 python/cli_e2e.py --list           # list test names
-  python3 python/cli_e2e.py --keep           # leave $VMON_HOME in place
-  python3 python/cli_e2e.py --home ~/.vmon    # reuse a home (skip template rebuild)
-  VMON_E2E_IMAGE=alpine:latest python3 python/cli_e2e.py
+  python3.14 python/cli_e2e.py                  # run everything
+  python3.14 python/cli_e2e.py run exec         # subset (substring match)
+  python3.14 python/cli_e2e.py --list           # list test names
+  python3.14 python/cli_e2e.py --keep           # leave $VMON_HOME in place
+  python3.14 python/cli_e2e.py --home ~/.vmon    # reuse a home (skip template rebuild)
+  VMON_E2E_IMAGE=alpine:latest python3.14 python/cli_e2e.py
 """
-
-from __future__ import annotations
 
 import argparse
 import os
@@ -42,6 +40,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -71,10 +70,10 @@ class Skip(Exception):
     """Raised by a test to report it cannot run in this environment."""
 
 
-TESTS: list = []
+TESTS: list[Callable[[object], None]] = []
 
 
-def e2e(fn):
+def e2e(fn: Callable[[object], None]) -> Callable[[object], None]:
     """Register a test, preserving definition order."""
     TESTS.append(fn)
     return fn
@@ -414,7 +413,7 @@ def preflight() -> str | None:
     return None
 
 
-def display_name(fn) -> str:
+def display_name(fn: Callable[[object], None]) -> str:
     return fn.__name__[2:] if fn.__name__.startswith("t_") else fn.__name__
 
 
@@ -432,7 +431,7 @@ def cleanup() -> None:
         pass
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     global IMAGE, HOME, ENV
     ap = argparse.ArgumentParser(description="vmon CLI end-to-end smoke test")
     ap.add_argument("tests", nargs="*", help="substring filters (default: run all)")

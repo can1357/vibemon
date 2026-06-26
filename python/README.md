@@ -16,8 +16,8 @@ template in milliseconds. Built on the [`vmon`](../) KVM VMM.
 
 ## Requirements
 
-Runs on a Linux host with **KVM** (`/dev/kvm`), a container engine
-(`docker` or `podman`), and the `vmon` binary built (`cargo build --release`).
+Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`), a container
+engine (`docker` or `podman`), and the `vmon` binary built (`cargo build --release`).
 A guest kernel is auto-detected from `/boot/vmlinuz-$(uname -r)` (override with
 `VMON_KERNEL`).
 
