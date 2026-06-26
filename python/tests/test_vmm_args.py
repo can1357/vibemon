@@ -57,11 +57,11 @@ def test_restore_rejects_invalid_resource_args_before_launch(monkeypatch, mvm_ho
         MicroVM.restore("snap", timeout_secs=86_401)
 
 
-def test_agent_call_on_no_agent_vm_fails_without_socket_connect(mvm_home):
+def test_agent_call_without_guest_socket_fails_without_socket_connect(mvm_home):
     from vmon.agent import AgentClosed
     from vmon.vmm import MicroVM
 
-    vm = MicroVM("no-agent")
+    vm = MicroVM("without-agent-socket")
     vm._save_meta(agent_sock=None)
     with pytest.raises(AgentClosed, match="without a guest agent"):
         vm.agent()

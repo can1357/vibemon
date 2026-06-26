@@ -398,6 +398,7 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
     # initial resize forwards a non-zero terminal size like a real TTY.
     import fcntl
     import struct
+
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     proc = _RecordingProc()
     monkeypatch.setattr(FakeSandbox, "exec", lambda self, *c, **k: proc)
