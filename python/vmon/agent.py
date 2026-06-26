@@ -8,8 +8,9 @@ import signal as _signal
 import socket
 import struct
 import threading
+from collections.abc import Iterator
 from itertools import count
-from typing import Any, Iterator
+from typing import Any
 
 MAX_PAYLOAD = 1 << 20
 
@@ -77,7 +78,7 @@ class ByteStream(Iterator[bytes]):
             self._closed = True
             self._q.put(_EOF)
 
-    def __iter__(self) -> "ByteStream":
+    def __iter__(self) -> ByteStream:
         return self
 
     def __next__(self) -> bytes:
@@ -123,7 +124,7 @@ class ByteStream(Iterator[bytes]):
 class ExecSession:
     """A live guest exec session."""
 
-    def __init__(self, conn: "AgentConn", session_id: int, timeout: float | None = None) -> None:
+    def __init__(self, conn: AgentConn, session_id: int, timeout: float | None = None) -> None:
         self._conn = conn
         self.id = session_id
         self.stdout = ByteStream()
@@ -148,7 +149,7 @@ class ExecSession:
         else:
             raw = bytes(data)
         for off in range(0, len(raw), MAX_PAYLOAD):
-            self._conn._send_frame(TYPE_STDIN, self.id, raw[off:off + MAX_PAYLOAD])
+            self._conn._send_frame(TYPE_STDIN, self.id, raw[off : off + MAX_PAYLOAD])
 
     def close_stdin(self) -> None:
         self._conn._send_frame(TYPE_STDIN, self.id, b"")
@@ -160,7 +161,9 @@ class ExecSession:
         which the reader tolerates without a pending entry, so nothing waits on
         it. Only meaningful for tty sessions (``exec(..., tty=True)``).
         """
-        self._conn._send_json(TYPE_REQ, self.id, {"op": "resize", "rows": int(rows), "cols": int(cols)})
+        self._conn._send_json(
+            TYPE_REQ, self.id, {"op": "resize", "rows": int(rows), "cols": int(cols)}
+        )
 
     def kill(self, sig: int = _signal.SIGTERM) -> None:
         self._conn._send_json(TYPE_KILL, self.id, {"signal": int(sig)})
@@ -213,7 +216,9 @@ class AgentConn:
         self._sessions: dict[int, ExecSession] = {}
         self._downloads: dict[int, ByteStream] = {}
 
-        self._reader_thread = threading.Thread(target=self._reader, name="vmon-agent-reader", daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader, name="vmon-agent-reader", daemon=True
+        )
         self._reader_thread.start()
 
     @property
@@ -246,22 +251,42 @@ class AgentConn:
     def ping(self, timeout: float | None = None) -> dict[str, Any]:
         return self.request("ping", timeout=timeout)
 
-    def net_config(self, ip: str, prefix: int, gw: str, dns: list[str] | None = None,
-                   timeout: float | None = None) -> dict[str, Any]:
-        return self.request("net_config", timeout=timeout, ip=ip, prefix=prefix, gw=gw, dns=dns or [])
+    def net_config(
+        self,
+        ip: str,
+        prefix: int,
+        gw: str,
+        dns: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self.request(
+            "net_config", timeout=timeout, ip=ip, prefix=prefix, gw=gw, dns=dns or []
+        )
 
-    def mount(self, tag: str, path: str, ro: bool = False, fstype: str = "virtiofs",
-              timeout: float | None = None) -> dict[str, Any]:
-        return self.request("mount", timeout=timeout, tag=str(tag), path=str(path),
-                            fstype=str(fstype), ro=bool(ro))
+    def mount(
+        self,
+        tag: str,
+        path: str,
+        ro: bool = False,
+        fstype: str = "virtiofs",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self.request(
+            "mount", timeout=timeout, tag=str(tag), path=str(path), fstype=str(fstype), ro=bool(ro)
+        )
 
-    def tcp_probe(self, port: int, host: str = "127.0.0.1",
-                  timeout: float | None = None) -> bool:
+    def tcp_probe(self, port: int, host: str = "127.0.0.1", timeout: float | None = None) -> bool:
         r = self.request("tcp_probe", timeout=timeout, port=int(port), host=str(host))
         return bool(r.get("connected"))
 
-    def exec(self, cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None,
-             timeout: float | None = None, tty: bool = False) -> ExecSession:
+    def exec(
+        self,
+        cmd: list[str],
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        tty: bool = False,
+    ) -> ExecSession:
         if not cmd:
             raise ValueError("exec command must not be empty")
         req_id = self._new_id()
@@ -307,8 +332,13 @@ class AgentConn:
             raise OSError(str(result.get("error") or "fs_read failed"))
         return data
 
-    def fs_write(self, path: str, data: bytes | bytearray | memoryview | str, mode: int = 0o644,
-                 timeout: float | None = None) -> dict[str, Any]:
+    def fs_write(
+        self,
+        path: str,
+        data: bytes | bytearray | memoryview | str,
+        mode: int = 0o644,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         raw = data.encode() if isinstance(data, str) else bytes(data)
         req_id = self._new_id()
         pending = _Pending()
@@ -316,9 +346,11 @@ class AgentConn:
             self._ensure_open_locked()
             self._pending[req_id] = pending
         try:
-            self._send_json(TYPE_REQ, req_id, {"op": "fs_write", "path": str(path), "mode": int(mode)})
+            self._send_json(
+                TYPE_REQ, req_id, {"op": "fs_write", "path": str(path), "mode": int(mode)}
+            )
             for off in range(0, len(raw), MAX_PAYLOAD):
-                self._send_frame(TYPE_STDIN, req_id, raw[off:off + MAX_PAYLOAD])
+                self._send_frame(TYPE_STDIN, req_id, raw[off : off + MAX_PAYLOAD])
             self._send_frame(TYPE_STDIN, req_id, b"")
             result = pending.wait(timeout)
         except BaseException:
@@ -338,11 +370,14 @@ class AgentConn:
     def fs_stat(self, path: str, timeout: float | None = None) -> dict[str, Any]:
         return self.request("fs_stat", timeout=timeout, path=str(path))
 
-    def fs_mkdir(self, path: str, parents: bool = True, timeout: float | None = None) -> dict[str, Any]:
+    def fs_mkdir(
+        self, path: str, parents: bool = True, timeout: float | None = None
+    ) -> dict[str, Any]:
         return self.request("fs_mkdir", timeout=timeout, path=str(path), parents=bool(parents))
 
-    def fs_remove(self, path: str, recursive: bool = False,
-                  timeout: float | None = None) -> dict[str, Any]:
+    def fs_remove(
+        self, path: str, recursive: bool = False, timeout: float | None = None
+    ) -> dict[str, Any]:
         return self.request("fs_remove", timeout=timeout, path=str(path), recursive=bool(recursive))
 
     def _new_id(self) -> int:
@@ -373,7 +408,7 @@ class AgentConn:
         except OSError as e:
             closed = AgentClosed(f"agent connection write failed: {e}")
             self._abort(closed)
-            raise closed
+            raise closed from e
 
     def _reader(self) -> None:
         try:

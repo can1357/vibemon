@@ -39,7 +39,7 @@ _KERNELS: dict[str, tuple[str, str, str]] = {
 
 def _home() -> Path:
     """The Vibemon home directory (``$VMON_HOME`` or ``~/.vmon``)."""
-    return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+    return Path(os.environ.get("VMON_HOME") or str(Path.home() / ".vmon")).expanduser()
 
 
 def assets_dir() -> Path:
@@ -49,8 +49,17 @@ def assets_dir() -> Path:
     return d
 
 
+def _normalize_arch(arch: str) -> str:
+    normalized = arch.lower().replace("-", "_")
+    return {
+        "arm64": "aarch64",
+        "amd64": "x86_64",
+        "x64": "x86_64",
+    }.get(normalized, normalized)
+
+
 def _host_arch() -> str:
-    return "aarch64" if platform.machine() in ("aarch64", "arm64") else "x86_64"
+    return _normalize_arch(platform.machine())
 
 
 def ensure_kernel(arch: str | None = None) -> Path:
@@ -64,13 +73,13 @@ def ensure_kernel(arch: str | None = None) -> Path:
     Raises ``RuntimeError`` if *arch* has no pinned kernel, the download fails,
     or the downloaded bytes do not match the pinned checksum.
     """
-    arch = arch or _host_arch()
+    arch = _normalize_arch(arch) if arch else _host_arch()
     try:
         name, url, sha256 = _KERNELS[arch]
     except KeyError:
         raise RuntimeError(
             f"no pinned guest kernel for arch {arch!r}; set VMON_KERNEL=/path/to/Image-or-bzImage"
-        )
+        ) from None
     dest = assets_dir() / name
     if dest.is_file() and _sha256(dest) == sha256:
         return dest
@@ -96,9 +105,7 @@ def _download_verified(url: str, dest: Path, sha256: str) -> None:
                 fh.write(chunk)
         got = _sha256(tmp)
         if got != sha256:
-            raise RuntimeError(
-                f"checksum mismatch for {url}: expected {sha256}, got {got}"
-            )
+            raise RuntimeError(f"checksum mismatch for {url}: expected {sha256}, got {got}")
         os.replace(tmp, dest)
     except OSError as e:
         raise RuntimeError(f"failed to download guest kernel from {url}: {e}") from e

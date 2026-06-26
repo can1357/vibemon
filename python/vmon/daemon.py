@@ -96,11 +96,9 @@ def _emitter(conn: _Conn, rid: Any) -> Callable[[str, bytes], None]:
 
     def on_output(stream: str, data: bytes) -> None:
         if stream == "console":
-            conn.send({"id": rid, "event": "console",
-                       "data": data.decode("utf-8", "replace")})
+            conn.send({"id": rid, "event": "console", "data": data.decode("utf-8", "replace")})
         else:
-            conn.send({"id": rid, "event": stream,
-                       "data": base64.b64encode(data).decode("ascii")})
+            conn.send({"id": rid, "event": stream, "data": base64.b64encode(data).decode("ascii")})
 
     return on_output
 
@@ -113,9 +111,14 @@ class Daemon:
     an error frame and never take down the daemon.
     """
 
-    def __init__(self, engine: Engine, *, sock_path: str | os.PathLike[str],
-                 tcp_addr: tuple[str, int] | None = None,
-                 token: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        sock_path: str | os.PathLike[str],
+        tcp_addr: tuple[str, int] | None = None,
+        token: str | None = None,
+    ) -> None:
         self._engine = engine
         self._sock_path = Path(sock_path)
         self._tcp_addr = tcp_addr
@@ -146,8 +149,9 @@ class Daemon:
     def serve_forever(self, ready: threading.Event | None = None) -> None:
         self._open_listeners()
         threads = [
-            threading.Thread(target=self._accept_loop, args=(sock, is_tcp),
-                             name="vmond-accept", daemon=True)
+            threading.Thread(
+                target=self._accept_loop, args=(sock, is_tcp), name="vmond-accept", daemon=True
+            )
             for sock, is_tcp in self._listeners
         ]
         for thread in threads:
@@ -204,8 +208,9 @@ class Daemon:
                 client, _ = listener.accept()
             except OSError:
                 return
-            threading.Thread(target=self._handle, args=(client, is_tcp),
-                             name="vmond-conn", daemon=True).start()
+            threading.Thread(
+                target=self._handle, args=(client, is_tcp), name="vmond-conn", daemon=True
+            ).start()
 
     # -- connection handling ------------------------------------------------
 
@@ -220,8 +225,13 @@ class Daemon:
                 # TCP connections always lead with an auth frame so a tokenless
                 # daemon and a token-protected one share one wire shape.
                 if self._token is not None and req.get("auth") != self._token:
-                    conn.send({"id": req.get("id"), "ok": False,
-                               "error": {"code": "unauthorized", "message": "invalid token"}})
+                    conn.send(
+                        {
+                            "id": req.get("id"),
+                            "ok": False,
+                            "error": {"code": "unauthorized", "message": "invalid token"},
+                        }
+                    )
                     return
                 req = conn.read_obj()
                 if req is None:
@@ -242,11 +252,9 @@ class Daemon:
                 raise EngineError(f"unknown method {method!r}", code="invalid")
             handler(conn, rid, params)
         except EngineError as exc:
-            conn.send({"id": rid, "ok": False,
-                       "error": {"code": exc.code, "message": exc.message}})
+            conn.send({"id": rid, "ok": False, "error": {"code": exc.code, "message": exc.message}})
         except Exception as exc:
-            conn.send({"id": rid, "ok": False,
-                       "error": {"code": "internal", "message": str(exc)}})
+            conn.send({"id": rid, "ok": False, "error": {"code": "internal", "message": str(exc)}})
 
     @staticmethod
     def _name(params: dict[str, Any]) -> str:
@@ -261,9 +269,18 @@ class Daemon:
         conn.send({"id": rid, "ok": True, "result": {"pong": True}})
 
     def _h_info(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
-        conn.send({"id": rid, "ok": True, "result": {
-            "pid": os.getpid(), "version": __version__, "api": API_VERSION,
-            "socket": str(self._sock_path)}})
+        conn.send(
+            {
+                "id": rid,
+                "ok": True,
+                "result": {
+                    "pid": os.getpid(),
+                    "version": __version__,
+                    "api": API_VERSION,
+                    "socket": str(self._sock_path),
+                },
+            }
+        )
 
     def _h_ps(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         conn.send({"id": rid, "ok": True, "result": {"vms": self._engine.ps()}})
@@ -279,9 +296,9 @@ class Daemon:
         if not snapshot:
             raise EngineError("snapshot name is required", code="invalid")
         snap_dir = self._engine.snapshot_template(
-            self._name(params), str(snapshot), stop=bool(params.get("stop")))
-        conn.send({"id": rid, "ok": True, "result": {"snapshot": str(snapshot),
-                                                     "dir": snap_dir}})
+            self._name(params), str(snapshot), stop=bool(params.get("stop"))
+        )
+        conn.send({"id": rid, "ok": True, "result": {"snapshot": str(snapshot), "dir": snap_dir}})
 
     def _h_fork(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         conn.send({"id": rid, "ok": True, "result": {"clones": self._engine.fork(params)}})
@@ -294,8 +311,9 @@ class Daemon:
 
     def _h_cp_read(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         data = self._engine.cp_read(self._name(params), str(params["path"]))
-        conn.send({"id": rid, "ok": True,
-                   "result": {"data": base64.b64encode(data).decode("ascii")}})
+        conn.send(
+            {"id": rid, "ok": True, "result": {"data": base64.b64encode(data).decode("ascii")}}
+        )
 
     def _h_cp_write(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         data = base64.b64decode(params.get("data") or "")
@@ -310,12 +328,14 @@ class Daemon:
     def _h_restore(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         self._streamed(conn, rid, self._engine.restore, params)
 
-    def _streamed(self, conn: _Conn, rid: Any,
-                  call: Callable[..., dict[str, Any]], params: dict[str, Any]) -> None:
+    def _streamed(
+        self, conn: _Conn, rid: Any, call: Callable[..., dict[str, Any]], params: dict[str, Any]
+    ) -> None:
         """Run a foreground console/process stream bound to the client connection."""
         cancel = threading.Event()
-        watcher = threading.Thread(target=self._watch_disconnect, args=(conn, cancel),
-                                   name="vmond-watch", daemon=True)
+        watcher = threading.Thread(
+            target=self._watch_disconnect, args=(conn, cancel), name="vmond-watch", daemon=True
+        )
         watcher.start()
         try:
             result = call(params, on_output=_emitter(conn, rid), cancel=cancel)
@@ -327,12 +347,14 @@ class Daemon:
         follow = bool(params.get("follow"))
         cancel = threading.Event()
         if follow:
-            watcher = threading.Thread(target=self._watch_disconnect, args=(conn, cancel),
-                                       name="vmond-watch", daemon=True)
+            watcher = threading.Thread(
+                target=self._watch_disconnect, args=(conn, cancel), name="vmond-watch", daemon=True
+            )
             watcher.start()
         try:
-            self._engine.logs(self._name(params), follow=follow,
-                              on_line=_emitter(conn, rid), cancel=cancel)
+            self._engine.logs(
+                self._name(params), follow=follow, on_line=_emitter(conn, rid), cancel=cancel
+            )
         finally:
             cancel.set()
         conn.send({"id": rid, "ok": True, "result": {"done": True}})
@@ -340,20 +362,29 @@ class Daemon:
     def _h_exec(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         name = self._name(params)
         proc = self._engine.start_exec(
-            name, list(params.get("cmd") or []),
-            env=params.get("env"), workdir=params.get("workdir"),
-            tty=bool(params.get("tty")))
+            name,
+            list(params.get("cmd") or []),
+            env=params.get("env"),
+            workdir=params.get("workdir"),
+            tty=bool(params.get("tty")),
+        )
         self._pump_interactive(conn, rid, proc, name)
 
     def _h_shell(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         """Boot/attach an ephemeral shell, emit ``ready``, then pump it like exec."""
         proc, name, cleanup = self._engine.start_shell(params)
-        self._pump_interactive(conn, rid, proc, name, cleanup=cleanup,
-                               result_extra={"name": name})
+        self._pump_interactive(conn, rid, proc, name, cleanup=cleanup, result_extra={"name": name})
 
-    def _pump_interactive(self, conn: _Conn, rid: Any, proc: Any, name: str,
-                          *, cleanup: Callable[[], None] | None = None,
-                          result_extra: dict[str, Any] | None = None) -> None:
+    def _pump_interactive(
+        self,
+        conn: _Conn,
+        rid: Any,
+        proc: Any,
+        name: str,
+        *,
+        cleanup: Callable[[], None] | None = None,
+        result_extra: dict[str, Any] | None = None,
+    ) -> None:
         """Emit ``ready``, pump a PTY process, and never leak it.
 
         ``proc`` is killed on any error before the stdin reader is live (e.g. the
@@ -365,8 +396,9 @@ class Daemon:
         rc = -1
         try:
             conn.send({"id": rid, "event": "ready", "data": name})
-            reader = threading.Thread(target=self._exec_input, args=(conn, proc, stop),
-                                      name="vmond-stdin", daemon=True)
+            reader = threading.Thread(
+                target=self._exec_input, args=(conn, proc, stop), name="vmond-stdin", daemon=True
+            )
             reader.start()
             rc = self._engine.pump_process(proc, _emitter(conn, rid), cancel=None)
         except Exception:
@@ -378,14 +410,10 @@ class Daemon:
         finally:
             stop.set()
             if cleanup is not None:
-                try:
-                    cleanup()
-                except Exception:
-                    pass
+                cleanup()
         # Result is sent only after ephemeral teardown, so a client that polls
         # ``ps`` right after the shell exits never sees the removed VM.
-        conn.send({"id": rid, "ok": True,
-                   "result": {"returncode": rc, **(result_extra or {})}})
+        conn.send({"id": rid, "ok": True, "result": {"returncode": rc, **(result_extra or {})}})
 
     @staticmethod
     def _exec_input(conn: _Conn, proc: Any, stop: threading.Event) -> None:

@@ -13,11 +13,37 @@ import threading
 import time
 from pathlib import Path
 
-from .agent import AgentConn
+from .agent import AgentClosed, AgentConn
 from .control import Control
 from .image import build_rootfs
 
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+_MAX_CPUS = 64
+_MAX_MEM_MIB = 64 * 1024
+_MAX_TIMEOUT_SECS = 86_400
+
+
+def _validate_int_range(
+    value, flag: str, *, minimum: int = 1, maximum: int | None = None, unit: str = ""
+) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{flag} must be an integer")
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{flag} must be an integer") from exc
+    if isinstance(value, float) and ivalue != value:
+        raise ValueError(f"{flag} must be an integer")
+    if ivalue < minimum or (maximum is not None and ivalue > maximum):
+        upper = f" and {maximum}{unit}" if maximum is not None else ""
+        raise ValueError(f"{flag} must be between {minimum}{unit}{upper} (got {ivalue})")
+    return ivalue
+
+
+def _validate_timeout_secs(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return _validate_int_range(value, "timeout_secs", maximum=_MAX_TIMEOUT_SECS)
 
 
 def _arch() -> str:
@@ -63,7 +89,10 @@ def _cargo_target_dir(repo: Path) -> Path | None:
     try:
         out = subprocess.run(
             ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-            cwd=repo, capture_output=True, text=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
         return Path(json.loads(out)["target_directory"])
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
@@ -84,8 +113,12 @@ def find_binary() -> str:
         return env
     arch = _arch()
     repo = Path(__file__).resolve().parents[2]
-    triples = ["", f"{arch}-unknown-linux-gnu", f"{arch}-unknown-linux-musl",
-               f"{arch}-apple-darwin"]
+    triples = [
+        "",
+        f"{arch}-unknown-linux-gnu",
+        f"{arch}-unknown-linux-musl",
+        f"{arch}-apple-darwin",
+    ]
 
     def probe(root: Path) -> str | None:
         for triple in triples:
@@ -102,9 +135,7 @@ def find_binary() -> str:
     for found in _which_all("vmon"):
         if not _is_python_console_script(found):
             return found
-    raise RuntimeError(
-        "vmon binary not found. Build it (cargo build) or set VMON_BIN."
-    )
+    raise RuntimeError("vmon binary not found. Build it (cargo build) or set VMON_BIN.")
 
 
 def default_kernel() -> str:
@@ -120,6 +151,7 @@ def default_kernel() -> str:
     if k.is_file():
         return str(k)
     from .assets import ensure_kernel
+
     return str(ensure_kernel())
 
 
@@ -163,8 +195,12 @@ def copy_reflink(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> Pa
     tmp = dst_p.with_name(dst_p.name + f".tmp-{os.getpid()}")
     tmp.unlink(missing_ok=True)
     try:
-        subprocess.run(["cp", "--reflink=auto", str(src_p), str(tmp)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["cp", "--reflink=auto", str(src_p), str(tmp)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except (OSError, subprocess.CalledProcessError):
         shutil.copy2(src_p, tmp)
     os.replace(tmp, dst_p)
@@ -172,10 +208,20 @@ def copy_reflink(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> Pa
 
 
 def _volume_args(volumes) -> list[str]:
-    """Format ``(tag, host_dir, read_only)`` tuples as repeatable ``--volume`` CLI args (the VMM validates; this only formats)."""
+    """Format ``(tag, host_dir, read_only)`` tuples as repeatable ``--volume`` CLI args."""
     args: list[str] = []
-    for tag, host_dir, read_only in (volumes or []):
-        args.extend(["--volume", f"{tag}:{host_dir}" + (":ro" if read_only else "")])
+    for tag, host_dir, read_only in volumes or []:
+        tag_s = str(tag)
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", tag_s):
+            raise ValueError(f"volume tag {tag_s!r} must match [a-z0-9_]{{1,32}}")
+        host_s = os.fspath(host_dir)
+        if not host_s:
+            raise ValueError("volume host directory must not be empty")
+        if "\0" in host_s:
+            raise ValueError("volume host directory must not contain NUL bytes")
+        if not read_only and host_s.endswith(":ro"):
+            raise ValueError("read-write volume host directory must not end with ':ro'")
+        args.extend(["--volume", f"{tag_s}:{host_s}" + (":ro" if read_only else "")])
     return args
 
 
@@ -228,6 +274,8 @@ class MicroVM:
 
     def agent(self, connect_timeout: float | None = None) -> AgentConn:
         """Return a cached :class:`AgentConn`, reconnecting if it closed or the socket moved."""
+        if self.meta.get("agent_sock") is None and "agent_sock" in self.meta:
+            raise AgentClosed(f"VM '{self.name}' was launched without a guest agent")
         sock = str(self.agent_sock)
         with self._agent_lock:
             cached = self._agent_conn
@@ -309,41 +357,82 @@ class MicroVM:
             return ""
 
     @classmethod
-    def run(cls, image: str | None = None, dockerfile: str | None = None, context: str = ".",
-            name: str | None = None, mem: int = 256, cpus: int = 1,
-            cmd: list[str] | None = None, console_agent: bool = False,
-            agent: bool = False) -> "MicroVM":
+    def run(
+        cls,
+        image: str | None = None,
+        dockerfile: str | None = None,
+        context: str = ".",
+        name: str | None = None,
+        mem: int = 256,
+        cpus: int = 1,
+        cmd: list[str] | None = None,
+        console_agent: bool = False,
+        agent: bool = False,
+    ) -> MicroVM:
         """Legacy initramfs boot path; the higher-level Sandbox API is agent-first."""
         if agent:
             from .sandbox import Sandbox
-            sb = Sandbox.create(image=image, dockerfile=dockerfile, context=context,
-                                name=name, cpus=cpus, memory=mem)
+
+            sb = Sandbox.create(
+                image=image,
+                dockerfile=dockerfile,
+                context=context,
+                name=name,
+                cpus=cpus,
+                memory=mem,
+            )
             return sb.vm
+        mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
+        cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
         name = name or _instance_name("vm")
         vm = cls(name)
         vm.dir.mkdir(parents=True, exist_ok=True)
         initramfs, spec = build_rootfs(image, dockerfile, context, cmd, out_dir=str(vm.dir))
         args = [
-            "--kernel", default_kernel(), "--initrd", str(initramfs),
-            "--mem", str(mem), "--cpus", str(cpus),
-            "--api-sock", str(vm.sock), "--cmdline", _cmdline(),
+            "--kernel",
+            default_kernel(),
+            "--initrd",
+            str(initramfs),
+            "--mem",
+            str(mem),
+            "--cpus",
+            str(cpus),
+            "--api-sock",
+            str(vm.sock),
+            "--cmdline",
+            _cmdline(),
         ]
         if console_agent:
             args.append("--console-agent")
-        vm._launch(args, control_sock=vm.sock, image=spec.reference, mem=mem, cpus=cpus,
-                   initramfs=str(initramfs), snapshot_root=None)
+        vm._launch(
+            args,
+            control_sock=vm.sock,
+            image=spec.reference,
+            mem=mem,
+            cpus=cpus,
+            initramfs=str(initramfs),
+            snapshot_root=None,
+        )
         return vm
 
     @classmethod
-    def boot_rootfs(cls, rootfs: str | os.PathLike[str], *, name: str | None = None,
-                    mem: int = 512, cpus: int = 1,
-                    snapshot_root: str | os.PathLike[str] | None = None,
-                    image: str | None = None, read_only: bool = False,
-                    agent: bool = True, overlay: bool = False,
-                    tap: str | None = None,
-                    fs_dir: str | os.PathLike[str] | None = None,
-                    volumes: list[tuple[str, str, bool]] | None = None,
-                    timeout_secs: int | None = None) -> "MicroVM":
+    def boot_rootfs(
+        cls,
+        rootfs: str | os.PathLike[str],
+        *,
+        name: str | None = None,
+        mem: int = 512,
+        cpus: int = 1,
+        snapshot_root: str | os.PathLike[str] | None = None,
+        image: str | None = None,
+        read_only: bool = False,
+        agent: bool = True,
+        overlay: bool = False,
+        tap: str | None = None,
+        fs_dir: str | os.PathLike[str] | None = None,
+        volumes: list[tuple[str, str, bool]] | None = None,
+        timeout_secs: int | None = None,
+    ) -> MicroVM:
         """Fresh direct-kernel boot from an ext4 rootfs.
 
         With ``overlay`` the rootfs is exposed as a copy-on-write overlay so the
@@ -353,13 +442,24 @@ class MicroVM:
         ``fs_dir``/``volumes`` add virtio-fs shares and ``timeout_secs`` arms the
         VMM wall-clock deadline.
         """
+        mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
+        cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
+        timeout_secs = _validate_timeout_secs(timeout_secs)
         name = name or _instance_name("vm")
         vm = cls(name)
         vm.dir.mkdir(parents=True, exist_ok=True)
         rootfs_p = Path(rootfs)
         args = [
-            "--kernel", default_kernel(), "--mem", str(mem), "--cpus", str(cpus),
-            "--api-sock", str(vm.sock), "--cmdline", _agent_cmdline() if agent else _cmdline(),
+            "--kernel",
+            default_kernel(),
+            "--mem",
+            str(mem),
+            "--cpus",
+            str(cpus),
+            "--api-sock",
+            str(vm.sock),
+            "--cmdline",
+            _agent_cmdline() if agent else _cmdline(),
         ]
         if overlay:
             disk = vm.dir / "rootfs.img"
@@ -382,18 +482,33 @@ class MicroVM:
             args.extend(["--timeout-secs", str(int(timeout_secs))])
         if snapshot_root is not None:
             args.extend(["--snapshot-root", str(snapshot_root)])
-        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock, image=image,
-                   mem=mem, cpus=cpus, rootfs=str(disk), tap=tap,
-                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
-                   snapshot_root=str(snapshot_root) if snapshot_root else None)
+        vm._launch(
+            args,
+            control_sock=vm.sock,
+            agent_sock=agent_sock,
+            image=image,
+            mem=mem,
+            cpus=cpus,
+            rootfs=str(disk),
+            tap=tap,
+            volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
+            snapshot_root=str(snapshot_root) if snapshot_root else None,
+        )
         return vm
 
     @classmethod
-    def restore(cls, snapshot: str | os.PathLike[str], name: str | None = None,
-                *, agent: bool = False, fs_dir: str | os.PathLike[str] | None = None,
-                mem: int | None = None, cpus: int | None = None,
-                volumes: list[tuple[str, str, bool]] | None = None,
-                timeout_secs: int | None = None) -> "MicroVM":
+    def restore(
+        cls,
+        snapshot: str | os.PathLike[str],
+        name: str | None = None,
+        *,
+        agent: bool = False,
+        fs_dir: str | os.PathLike[str] | None = None,
+        mem: int | None = None,
+        cpus: int | None = None,
+        volumes: list[tuple[str, str, bool]] | None = None,
+        timeout_secs: int | None = None,
+    ) -> MicroVM:
         """Warm-boot a microVM from a snapshot directory or named snapshot."""
         snap_dir = cls._snapshot_dir(snapshot)
         if not _snapshot_state_present(snap_dir):
@@ -404,8 +519,10 @@ class MicroVM:
         vm.dir.mkdir(parents=True, exist_ok=True)
         args = ["--restore", str(snap_dir), "--api-sock", str(vm.sock)]
         if mem is not None:
+            mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
             args.extend(["--mem", str(mem)])
         if cpus is not None:
+            cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
             args.extend(["--cpus", str(cpus)])
         rootfs = None
         snap_rootfs = snap_dir / "rootfs.img"
@@ -419,22 +536,33 @@ class MicroVM:
             args.extend(["--fs-tag", "host", "--fs-dir", str(fs_dir)])
         vols = list(volumes or [])
         args.extend(_volume_args(vols))
+        timeout_secs = _validate_timeout_secs(timeout_secs)
         if timeout_secs is not None:
-            args.extend(["--timeout-secs", str(int(timeout_secs))])
+            args.extend(["--timeout-secs", str(timeout_secs)])
         args.extend(["--snapshot-root", str(STATE / "snapshots")])
         t0 = time.time()
-        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock,
-                   restored_from=str(snapshot), rootfs=str(rootfs) if rootfs else None,
-                   snapshot_root=str(STATE / "snapshots"),
-                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols])
+        vm._launch(
+            args,
+            control_sock=vm.sock,
+            agent_sock=agent_sock,
+            restored_from=str(snapshot),
+            rootfs=str(rootfs) if rootfs else None,
+            snapshot_root=str(STATE / "snapshots"),
+            volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
+        )
         vm._record_reconstruct(t0)
         return vm
 
     @classmethod
-    def fork_snapshot(cls, snapshot: str | os.PathLike[str], name: str | None = None,
-                      *, agent: bool = False,
-                      volumes: list[tuple[str, str, bool]] | None = None,
-                      timeout_secs: int | None = None) -> "MicroVM":
+    def fork_snapshot(
+        cls,
+        snapshot: str | os.PathLike[str],
+        name: str | None = None,
+        *,
+        agent: bool = False,
+        volumes: list[tuple[str, str, bool]] | None = None,
+        timeout_secs: int | None = None,
+    ) -> MicroVM:
         snap_dir = cls._snapshot_dir(snapshot)
         if not _snapshot_state_present(snap_dir):
             raise FileNotFoundError(f"no snapshot {snapshot!r} at {snap_dir}")
@@ -453,27 +581,43 @@ class MicroVM:
             args.extend(["--agent-sock", str(agent_sock)])
         vols = list(volumes or [])
         args.extend(_volume_args(vols))
+        timeout_secs = _validate_timeout_secs(timeout_secs)
         if timeout_secs is not None:
-            args.extend(["--timeout-secs", str(int(timeout_secs))])
+            args.extend(["--timeout-secs", str(timeout_secs)])
         args.extend(["--snapshot-root", str(STATE / "snapshots")])
         t0 = time.time()
-        vm._launch(args, control_sock=vm.sock, agent_sock=agent_sock,
-                   forked_from=str(snapshot), rootfs=str(rootfs) if rootfs else None,
-                   snapshot_root=str(STATE / "snapshots"),
-                   volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols])
+        vm._launch(
+            args,
+            control_sock=vm.sock,
+            agent_sock=agent_sock,
+            forked_from=str(snapshot),
+            rootfs=str(rootfs) if rootfs else None,
+            snapshot_root=str(STATE / "snapshots"),
+            volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
+        )
         vm._record_reconstruct(t0)
         return vm
 
-    def fork(self, snapshot: str | os.PathLike[str], count: int = 1,
-             names: list[str] | None = None) -> list["MicroVM"]:
+    def fork(
+        self, snapshot: str | os.PathLike[str], count: int = 1, names: list[str] | None = None
+    ) -> list[MicroVM]:
         clones = []
         for i in range(count):
             cname = names[i] if names and i < len(names) else None
-            clones.append(self.fork_snapshot(snapshot, name=cname, agent=bool(self.meta.get("agent_sock"))))
+            clones.append(
+                self.fork_snapshot(snapshot, name=cname, agent=bool(self.meta.get("agent_sock")))
+            )
         return clones
 
-    def _launch(self, extra_args: list[str], *, control_sock: Path | None = None,
-                agent_sock: Path | None = None, launch_timeout: float = 15.0, **meta) -> None:
+    def _launch(
+        self,
+        extra_args: list[str],
+        *,
+        control_sock: Path | None = None,
+        agent_sock: Path | None = None,
+        launch_timeout: float = 15.0,
+        **meta,
+    ) -> None:
         control_sock = control_sock or self.sock
         snapshot_root = Path(meta.pop("snapshot_root", None) or (STATE / "snapshots"))
         snapshot_root.mkdir(parents=True, exist_ok=True)
@@ -488,42 +632,92 @@ class MicroVM:
         for sock in (control_sock, agent_sock):
             if sock is not None:
                 Path(sock).parent.chmod(0o700)
-        logf = open(self.log, "wb")
         launch_args = list(extra_args)
         if "--snapshot-root" not in launch_args:
             launch_args.extend(["--snapshot-root", str(snapshot_root)])
         # Local-dev escape hatch: disable vmon's Stage-B process filters
         # (seccomp/Landlock). Use only on a trusted host (e.g. a dev VM); never
         # for untrusted guests. See vmon's `--no-sandbox`.
-        if os.environ.get("VMON_NO_SANDBOX") not in (None, "", "0") and "--no-sandbox" not in launch_args:
+        if (
+            os.environ.get("VMON_NO_SANDBOX") not in (None, "", "0")
+            and "--no-sandbox" not in launch_args
+        ):
             launch_args.append("--no-sandbox")
-        proc = subprocess.Popen([binary, *launch_args], stdout=logf, stderr=logf,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-        self._save_meta(pid=proc.pid, sock=str(control_sock),
-                        agent_sock=str(agent_sock) if agent_sock else None,
-                        binary=binary, snapshot_root=str(snapshot_root),
-                        started=time.time(), status="running", **meta)
-        deadline = time.time() + launch_timeout
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                tail = "\n".join(self.logs().splitlines()[-15:])
-                raise RuntimeError(
-                    f"vmon exited (code {proc.returncode}) before the VM came up:\n{tail}"
-                )
+        logf = open(self.log, "wb")
+        try:
+            proc = subprocess.Popen(
+                [binary, *launch_args],
+                stdout=logf,
+                stderr=logf,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        finally:
+            logf.close()
+        self._save_meta(
+            pid=proc.pid,
+            sock=str(control_sock),
+            agent_sock=str(agent_sock) if agent_sock else None,
+            binary=binary,
+            snapshot_root=str(snapshot_root),
+            started=time.time(),
+            status="running",
+            **meta,
+        )
+        try:
+            deadline = time.time() + launch_timeout
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    tail = "\n".join(self.logs().splitlines()[-15:])
+                    raise RuntimeError(
+                        f"vmon exited (code {proc.returncode}) before the VM came up:\n{tail}"
+                    )
+                try:
+                    self.control.wait_ready(timeout=0.05)
+                    return
+                except (TimeoutError, OSError, RuntimeError):
+                    time.sleep(0.002)
+            raise TimeoutError(f"VM '{self.name}' control socket never came up; see {self.log}")
+        except BaseException:
+            self._cleanup_failed_launch(proc, control_sock, agent_sock)
+            raise
+
+    def _cleanup_failed_launch(self, proc: subprocess.Popen, *socks: Path | None) -> None:
+        if proc.poll() is None:
             try:
-                self.control.wait_ready(timeout=0.05)
-                return
-            except (TimeoutError, OSError, RuntimeError):
-                time.sleep(0.002)
-        raise TimeoutError(f"VM '{self.name}' control socket never came up; see {self.log}")
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        for sock in socks:
+            if sock is not None:
+                Path(sock).unlink(missing_ok=True)
+        self._save_meta(status="failed", returncode=proc.poll())
 
     def _record_reconstruct(self, started: float) -> None:
         reconstruct_ms = None
         m = re.search(r"reconstruct took ([0-9.]+)ms", self.logs())
         if m:
             reconstruct_ms = float(m.group(1))
-        self._save_meta(restore_ms=round((time.time() - started) * 1000, 1),
-                        reconstruct_ms=reconstruct_ms)
+        self._save_meta(
+            restore_ms=round((time.time() - started) * 1000, 1), reconstruct_ms=reconstruct_ms
+        )
 
     def pause(self):
         return self.control.pause()
@@ -531,10 +725,15 @@ class MicroVM:
     def resume(self):
         return self.control.resume()
 
-    def snapshot(self, snapshot: str, keep_running: bool = True,
-                 *, disk_src: str | os.PathLike[str] | None = None,
-                 snapshot_root: str | os.PathLike[str] | None = None,
-                 base: str | None = None) -> Path:
+    def snapshot(
+        self,
+        snapshot: str,
+        keep_running: bool = True,
+        *,
+        disk_src: str | os.PathLike[str] | None = None,
+        snapshot_root: str | os.PathLike[str] | None = None,
+        base: str | None = None,
+    ) -> Path:
         """Pause, optionally capture rootfs.img, snapshot VM state, then resume or stop.
 
         When ``base`` names a sibling snapshot (same launch ``--snapshot-root``), the
@@ -588,14 +787,16 @@ class MicroVM:
         shutil.rmtree(self.dir, ignore_errors=True)
 
     @staticmethod
-    def _snapshot_dir(snapshot: str | os.PathLike[str], root: str | os.PathLike[str] | None = None) -> Path:
+    def _snapshot_dir(
+        snapshot: str | os.PathLike[str], root: str | os.PathLike[str] | None = None
+    ) -> Path:
         p = Path(snapshot)
         if p.is_absolute() or len(p.parts) > 1:
             return p
         return Path(root or (STATE / "snapshots")) / str(snapshot)
 
     @classmethod
-    def list(cls) -> list["MicroVM"]:
+    def list(cls) -> list[MicroVM]:
         vms_dir = STATE / "vms"
         if not vms_dir.is_dir():
             return []

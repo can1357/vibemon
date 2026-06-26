@@ -19,14 +19,17 @@ output (tests, ``vmon ps | grep``) stays plain text.
 
 from __future__ import annotations
 
+import inspect
 import io
 import os
 import shutil
 import sys
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import click
 from rich.box import ROUNDED
-from rich.console import Console, Group as Renderables
+from rich.console import Console, Group as Renderables, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -61,6 +64,7 @@ err_console = Console(theme=_THEME, highlight=False, stderr=True)
 
 # -- status output ---------------------------------------------------------
 
+
 def error(message: str) -> None:
     """Print a red ``✗`` error line to stderr."""
     err_console.print(f"[vmon.error]✗[/] {message}")
@@ -88,8 +92,7 @@ def vm_table(rows: list[dict]) -> None:
     VM name so scripts (and the e2e driver) can ``line.split()`` it; color is
     dropped automatically when stdout is not a terminal.
     """
-    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0),
-                  header_style="vmon.title")
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
     table.add_column("NAME", style="vmon.command", no_wrap=True)
     table.add_column("STATUS", no_wrap=True)
     table.add_column("PID", no_wrap=True)
@@ -117,6 +120,7 @@ def _status_text(status: str) -> Text:
 
 # -- Modal-style help ------------------------------------------------------
 
+
 def _stdout_isatty() -> bool:
     """Whether the *current* stdout is a terminal (help is echoed to stdout)."""
     try:
@@ -143,7 +147,7 @@ def _term_size() -> tuple[int, int]:
     return fallback.columns, fallback.lines
 
 
-def _capture(*renderables: object) -> str:
+def _capture(*renderables: RenderableType) -> str:
     """Render *renderables* to a string sized to the real terminal.
 
     Rich only honors an explicit width when height is *also* pinned, and a plain
@@ -156,8 +160,12 @@ def _capture(*renderables: object) -> str:
     width = min(width - 4, MAX_WIDTH)
     is_tty = _stdout_isatty()
     recorder = Console(
-        theme=_THEME, highlight=False, width=width, height=height,
-        record=True, file=io.StringIO(),
+        theme=_THEME,
+        highlight=False,
+        width=width,
+        height=height,
+        record=True,
+        file=io.StringIO(),
         force_terminal=is_tty or None,
         color_system="auto" if is_tty else None,
     )
@@ -177,7 +185,7 @@ def _usage_text(ctx: click.Context, command: click.Command) -> Text:
     return text
 
 
-def _option_names(param: click.Parameter, ctx: click.Context) -> Text:
+def _option_names(param: click.Option, ctx: click.Context) -> Text:
     """``-f, --flag`` (+ ``/--no-flag`` secondary opts) styled like Modal."""
     text = Text()
     for i, opt in enumerate(param.opts):
@@ -188,32 +196,25 @@ def _option_names(param: click.Parameter, ctx: click.Context) -> Text:
         text.append(" / ")
         text.append(opt, style="vmon.option")
     metavar = _metavar(param, ctx)
-    if metavar and not getattr(param, "is_flag", False):
+    if metavar and not param.is_flag:
         text.append(" ")
         text.append(metavar, style="vmon.metavar")
     return text
 
 
-def _argument_label(param: click.Parameter, ctx: click.Context) -> Text:
-    """A positional argument's metavar (e.g. ``IMAGE``, ``[CMD]...``)."""
+def _argument_label(param: click.Argument, ctx: click.Context) -> Text:
     return Text(_metavar(param, ctx), style="vmon.option")
 
 
 def _metavar(param: click.Parameter, ctx: click.Context) -> str:
-    try:
-        return param.make_metavar()  # click 8.1
-    except TypeError:
-        return param.make_metavar(ctx)  # click >= 8.2
+    make_metavar: Callable[..., str] = param.make_metavar
+    if inspect.signature(make_metavar).parameters:
+        return make_metavar(ctx)  # click >= 8.2
+    return make_metavar()  # click 8.1
 
 
-def _help_text(param: click.Parameter, ctx: click.Context) -> Text:
-    """An option's help, with click's trailing ``[default: …]``/``[required]`` dimmed.
-
-    Arguments carry no help record (their required-ness is shown by the metavar
-    bracket convention, e.g. ``NAME`` vs ``[REF]``), so they render blank.
-    """
-    if param.param_type_name != "option":
-        return Text("")
+def _help_text(param: click.Option, ctx: click.Context) -> Text:
+    """An option's help, with click's trailing ``[default: …]``/``[required]`` dimmed."""
     record = param.get_help_record(ctx)
     help_str = record[1] if record else ""
     head, sep, tail = help_str.partition("  [")
@@ -223,20 +224,27 @@ def _help_text(param: click.Parameter, ctx: click.Context) -> Text:
     return text
 
 
-def _param_table(params: list[click.Parameter], ctx: click.Context) -> Table:
+def _param_table(params: Sequence[click.Parameter], ctx: click.Context) -> Table:
     table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), show_header=False)
     table.add_column(no_wrap=True)
     table.add_column(overflow="fold")
     for param in params:
-        label = (_argument_label(param, ctx) if param.param_type_name == "argument"
-                 else _option_names(param, ctx))
-        table.add_row(label, _help_text(param, ctx))
+        if isinstance(param, click.Argument):
+            table.add_row(_argument_label(param, ctx), Text(""))
+        elif isinstance(param, click.Option):
+            table.add_row(_option_names(param, ctx), _help_text(param, ctx))
     return table
 
 
-def _panel(body: object, title: str) -> Panel:
-    return Panel(body, title=f"[vmon.title]{title}[/]", title_align="left",
-                 box=ROUNDED, border_style="vmon.muted", padding=(0, 1))
+def _panel(body: RenderableType, title: str) -> Panel:
+    return Panel(
+        body,
+        title=f"[vmon.title]{title}[/]",
+        title_align="left",
+        box=ROUNDED,
+        border_style="vmon.muted",
+        padding=(0, 1),
+    )
 
 
 class RichCommand(click.Command):
@@ -246,18 +254,18 @@ class RichCommand(click.Command):
     help (see :class:`RichGroup`); it has no effect on the command's own help.
     """
 
-    def __init__(self, *args: object, panel: str = "Commands", **kwargs: object) -> None:
+    def __init__(self, *args: Any, panel: str = "Commands", **kwargs: Any) -> None:
         self.panel = panel
         super().__init__(*args, **kwargs)
 
     def get_help(self, ctx: click.Context) -> str:
-        parts: list[object] = [_usage_text(ctx, self), ""]
+        parts: list[RenderableType] = [_usage_text(ctx, self), ""]
         if self.help:
             parts.append(Text(self.help.strip(), style="default"))
             parts.append("")
-        args = [p for p in self.get_params(ctx) if p.param_type_name == "argument"]
-        opts = [p for p in self.get_params(ctx)
-                if p.param_type_name == "option" and not p.hidden]
+        params = self.get_params(ctx)
+        args = [p for p in params if isinstance(p, click.Argument)]
+        opts = [p for p in params if isinstance(p, click.Option) and not p.hidden]
         if args:
             parts.append(_panel(_param_table(args, ctx), "Arguments"))
         if opts:
@@ -280,17 +288,15 @@ class RichGroup(click.Group):
         return list(self.commands)
 
     def get_help(self, ctx: click.Context) -> str:
-        parts: list[object] = [_usage_text(ctx, self), ""]
+        parts: list[RenderableType] = [_usage_text(ctx, self), ""]
         if self.help:
             parts.append(Text(self.help.strip(), style="default"))
             parts.append("")
-        opts = [p for p in self.get_params(ctx)
-                if p.param_type_name == "option" and not p.hidden]
+        opts = [p for p in self.get_params(ctx) if isinstance(p, click.Option) and not p.hidden]
         if opts:
             parts.append(_panel(_param_table(opts, ctx), "Options"))
         for title, commands in self._panels(ctx).items():
-            table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0),
-                          show_header=False)
+            table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), show_header=False)
             table.add_column(style="vmon.command", no_wrap=True)
             table.add_column(overflow="fold")
             for name, cmd in commands:

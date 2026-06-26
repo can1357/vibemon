@@ -17,9 +17,10 @@ import os
 import socket
 import subprocess
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import TypeVar, cast
 
 CAP_NET_ADMIN = 12
 IP_FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
@@ -29,6 +30,9 @@ DEFAULT_DNS = ("1.1.1.1", "8.8.8.8")
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 LEASE_DIR = STATE / "network"
 LEASE_FILE = LEASE_DIR / "leases.json"
+
+LeaseState = dict[str, dict[str, str]]
+LeaseUpdateResult = TypeVar("LeaseUpdateResult")
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class SandboxNetwork:
         name: str,
         config: dict[str, object],
         tap: TapLease,
-        tunnels: "_TunnelSet",
+        tunnels: _TunnelSet,
         egress_allow: Sequence[str] | None,
         egress_allow_domains: Sequence[str] | None = None,
     ) -> None:
@@ -74,7 +78,7 @@ class SandboxNetwork:
             "prefix": config["prefix"],
             "gw": config["host_ip"],
             "host_ip": config["host_ip"],
-            "dns": list(config["dns"]),
+            "dns": list(cast(Sequence[str], config["dns"])),
         }
 
     def tunnels(self) -> dict[int, tuple[str, int]]:
@@ -130,21 +134,23 @@ class _TunnelSet:
         self._loop.run_forever()
 
     async def _start_server(self, guest_port: int) -> asyncio.AbstractServer:
-        return await asyncio.start_server(
-            lambda reader, writer, port=guest_port: _proxy_tcp(
-                reader, writer, self._guest_ip, port, self._allowed_nets
-            ),
-            "127.0.0.1",
-            0,
-        )
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            await _proxy_tcp(reader, writer, self._guest_ip, guest_port, self._allowed_nets)
+
+        return await asyncio.start_server(handler, "127.0.0.1", 0)
 
     def mapping(self) -> dict[int, tuple[str, int]]:
         out: dict[int, tuple[str, int]] = {}
         for guest_port, server in self._servers.items():
-            sock = server.sockets[0] if server.sockets else None
+            sockets = cast(Sequence[socket.socket] | None, getattr(server, "sockets", None))
+            sock = sockets[0] if sockets else None
             if sock is not None:
-                host, port = sock.getsockname()[:2]
-                out[guest_port] = (host, int(port))
+                sockaddr = cast(tuple[object, ...], sock.getsockname())
+                host = cast(str, sockaddr[0])
+                port = int(cast(int | str, sockaddr[1]))
+                out[guest_port] = (host, port)
         return out
 
     def close(self) -> None:
@@ -179,16 +185,12 @@ def setup_sandbox_network(
             str(config["tap"]),
             str(config["guest_ip"]),
             str(config["host_ip"]),
-            int(config["prefix"]),
+            int(cast(int | str, config["prefix"])),
             egress_allow,
             egress_allow_domains,
         )
-        tunnels = _TunnelSet(
-            str(config["guest_ip"]), ports or (), inbound_cidr_allowlist
-        )
-        return SandboxNetwork(
-            name, config, tap, tunnels, egress_allow, egress_allow_domains
-        )
+        tunnels = _TunnelSet(str(config["guest_ip"]), ports or (), inbound_cidr_allowlist)
+        return SandboxNetwork(name, config, tap, tunnels, egress_allow, egress_allow_domains)
     except Exception:
         if tunnels is not None:
             tunnels.close()
@@ -196,7 +198,7 @@ def setup_sandbox_network(
             str(config["tap"]),
             str(config["guest_ip"]),
             str(config["host_ip"]),
-            int(config["prefix"]),
+            int(cast(int | str, config["prefix"])),
             egress_allow,
             egress_allow_domains,
         )
@@ -205,7 +207,7 @@ def setup_sandbox_network(
 
 
 def allocate_guest_config(name: str, dns: Sequence[str] = DEFAULT_DNS) -> dict[str, object]:
-    def update(leases: dict[str, dict[str, str]]) -> dict[str, object]:
+    def update(leases: LeaseState) -> dict[str, object]:
         entry = leases.get(name)
         if entry is None:
             used = {item["network"] for item in leases.values() if "network" in item}
@@ -232,7 +234,7 @@ def allocate_guest_config(name: str, dns: Sequence[str] = DEFAULT_DNS) -> dict[s
 
 
 def release_guest_config(name: str) -> None:
-    def update(leases: dict[str, dict[str, str]]) -> None:
+    def update(leases: LeaseState) -> None:
         leases.pop(name, None)
 
     _update_leases(update)
@@ -246,16 +248,19 @@ def lease_for(name: str) -> dict | None:
     up the TAP name and point-to-point addresses without creating fresh state.
     """
     try:
-        leases = json.loads(LEASE_FILE.read_text())
+        leases = cast(dict[str, object], json.loads(LEASE_FILE.read_text()))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     entry = leases.get(name)
     if not isinstance(entry, dict) or "network" not in entry:
         return None
-    network = ipaddress.ip_network(entry["network"])
+    network_value = entry.get("network")
+    if not isinstance(network_value, str):
+        return None
+    network = ipaddress.ip_network(network_value)
     hosts = list(network.hosts())
     return {
-        "tap": entry.get("tap") or _tap_name(name),
+        "tap": cast(str, entry.get("tap")) or _tap_name(name),
         "host_ip": str(hosts[0]),
         "guest_ip": str(hosts[1]),
         "prefix": network.prefixlen,
@@ -331,13 +336,13 @@ def _ip_allowed(
     return any(addr in net for net in nets)
 
 
-def _update_leases(callback):
+def _update_leases(callback: Callable[[LeaseState], LeaseUpdateResult]) -> LeaseUpdateResult:
     LEASE_DIR.mkdir(parents=True, exist_ok=True)
     with LEASE_FILE.open("a+", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
         raw = f.read()
-        leases = json.loads(raw) if raw.strip() else {}
+        leases: LeaseState = cast(LeaseState, json.loads(raw)) if raw.strip() else {}
         result = callback(leases)
         f.seek(0)
         f.truncate()
@@ -350,7 +355,6 @@ def _update_leases(callback):
 def _tap_name(name: str) -> str:
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
     return f"tv{digest}"
-
 
 
 def has_net_admin() -> bool:
@@ -374,7 +378,7 @@ def require_net_admin() -> None:
         raise PermissionError("network setup needs root or CAP_NET_ADMIN")
 
 
-_REFRESHERS: dict[str, "_DomainRefresher"] = {}
+_REFRESHERS: dict[str, _DomainRefresher] = {}
 _REFRESHERS_LOCK = threading.Lock()
 
 
@@ -392,13 +396,29 @@ def _resolve_domain_ips(domains: Sequence[str]) -> list[str]:
         except (socket.gaierror, OSError):
             continue
         for info in infos:
-            ips.add(info[4][0])
+            addr = info[4][0]
+            if isinstance(addr, str):
+                ips.add(addr)
     return sorted(ips, key=lambda value: ipaddress.ip_address(value))
 
 
 def _domain_rule(action: str, name: str, guest_cidr: str, ip: str, idx: int) -> list[str]:
-    return [action, "FORWARD", "-i", name, "-s", guest_cidr, "-d", f"{ip}/32",
-            "-m", "comment", "--comment", _comment(name, f"domain-{idx}"), "-j", "ACCEPT"]
+    return [
+        action,
+        "FORWARD",
+        "-i",
+        name,
+        "-s",
+        guest_cidr,
+        "-d",
+        f"{ip}/32",
+        "-m",
+        "comment",
+        "--comment",
+        _comment(name, f"domain-{idx}"),
+        "-j",
+        "ACCEPT",
+    ]
 
 
 class _DomainRefresher:
@@ -412,8 +432,9 @@ class _DomainRefresher:
 
     INTERVAL = 60.0
 
-    def __init__(self, name: str, guest_cidr: str, domains: Sequence[str],
-                 initial_ips: Sequence[str]) -> None:
+    def __init__(
+        self, name: str, guest_cidr: str, domains: Sequence[str], initial_ips: Sequence[str]
+    ) -> None:
         self._name = name
         self._guest_cidr = guest_cidr
         self._domains = tuple(domains)
@@ -448,8 +469,9 @@ class _DomainRefresher:
                 self._next_idx += 1
 
 
-def _start_domain_refresher(name: str, guest_cidr: str, domains: Sequence[str],
-                            initial_ips: Sequence[str]) -> None:
+def _start_domain_refresher(
+    name: str, guest_cidr: str, domains: Sequence[str], initial_ips: Sequence[str]
+) -> None:
     _stop_domain_refresher(name)
     refresher = _DomainRefresher(name, guest_cidr, domains, initial_ips)
     with _REFRESHERS_LOCK:
@@ -497,13 +519,45 @@ def setup_tap(
     _run(["ip", "link", "set", "dev", name, "up"])
     _enable_ip_forward()
 
-    _iptables_ensure(["-t", "nat", "-A", "POSTROUTING", "-s", lease.network,
-                      "!", "-d", lease.network, "-m", "comment", "--comment",
-                      _comment(name, "masq"), "-j", "MASQUERADE"])
-    _iptables_ensure(["-A", "FORWARD", "-o", name, "-d", lease.guest_cidr,
-                      "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-                      "-m", "comment", "--comment", _comment(name, "return"),
-                      "-j", "ACCEPT"])
+    _iptables_ensure(
+        [
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            lease.network,
+            "!",
+            "-d",
+            lease.network,
+            "-m",
+            "comment",
+            "--comment",
+            _comment(name, "masq"),
+            "-j",
+            "MASQUERADE",
+        ]
+    )
+    _iptables_ensure(
+        [
+            "-A",
+            "FORWARD",
+            "-o",
+            name,
+            "-d",
+            lease.guest_cidr,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-m",
+            "comment",
+            "--comment",
+            _comment(name, "return"),
+            "-j",
+            "ACCEPT",
+        ]
+    )
 
     domains = tuple(d.strip() for d in (egress_allow_domains or ()) if d and d.strip())
     restricted = egress_allow is not None or bool(domains)
@@ -511,28 +565,95 @@ def setup_tap(
     # Avoid stale broad/reject rules when a caller repeats setup with a changed
     # egress policy for the same tap, and stop any prior DNS refresher.
     _stop_domain_refresher(name)
-    _iptables_delete(["-D", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                      "-m", "comment", "--comment", _comment(name, "egress"),
-                      "-j", "ACCEPT"])
-    _iptables_delete(["-D", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                      "-m", "comment", "--comment", _comment(name, "egress-deny"),
-                      "-j", "REJECT"])
+    _iptables_delete(
+        [
+            "-D",
+            "FORWARD",
+            "-i",
+            name,
+            "-s",
+            lease.guest_cidr,
+            "-m",
+            "comment",
+            "--comment",
+            _comment(name, "egress"),
+            "-j",
+            "ACCEPT",
+        ]
+    )
+    _iptables_delete(
+        [
+            "-D",
+            "FORWARD",
+            "-i",
+            name,
+            "-s",
+            lease.guest_cidr,
+            "-m",
+            "comment",
+            "--comment",
+            _comment(name, "egress-deny"),
+            "-j",
+            "REJECT",
+        ]
+    )
 
     if not restricted:
-        _iptables_ensure(["-A", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                          "-m", "comment", "--comment", _comment(name, "egress"),
-                          "-j", "ACCEPT"])
+        _iptables_ensure(
+            [
+                "-A",
+                "FORWARD",
+                "-i",
+                name,
+                "-s",
+                lease.guest_cidr,
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "egress"),
+                "-j",
+                "ACCEPT",
+            ]
+        )
     else:
         for idx, cidr in enumerate(lease.egress_allow):
-            _iptables_ensure(["-A", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                              "-d", cidr, "-m", "comment", "--comment",
-                              _comment(name, f"egress-{idx}"), "-j", "ACCEPT"])
+            _iptables_ensure(
+                [
+                    "-A",
+                    "FORWARD",
+                    "-i",
+                    name,
+                    "-s",
+                    lease.guest_cidr,
+                    "-d",
+                    cidr,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    _comment(name, f"egress-{idx}"),
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
         domain_ips = _resolve_domain_ips(domains)
         for idx, ip in enumerate(domain_ips):
             _iptables_ensure(_domain_rule("-I", name, lease.guest_cidr, ip, idx))
-        _iptables_ensure(["-A", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                          "-m", "comment", "--comment", _comment(name, "egress-deny"),
-                          "-j", "REJECT"])
+        _iptables_ensure(
+            [
+                "-A",
+                "FORWARD",
+                "-i",
+                name,
+                "-s",
+                lease.guest_cidr,
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "egress-deny"),
+                "-j",
+                "REJECT",
+            ]
+        )
         if domains:
             _start_domain_refresher(name, lease.guest_cidr, domains, domain_ips)
 
@@ -560,25 +681,97 @@ def teardown_tap(
     lease = None
     if guest_ip and host_ip:
         lease = _lease(name, guest_ip, host_ip, prefix, egress_allow)
-        _iptables_delete(["-t", "nat", "-D", "POSTROUTING", "-s", lease.network,
-                          "!", "-d", lease.network, "-m", "comment", "--comment",
-                          _comment(name, "masq"), "-j", "MASQUERADE"])
-        _iptables_delete(["-D", "FORWARD", "-o", name, "-d", lease.guest_cidr,
-                          "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-                          "-m", "comment", "--comment", _comment(name, "return"),
-                          "-j", "ACCEPT"])
-        _iptables_delete(["-D", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                          "-m", "comment", "--comment", _comment(name, "egress"),
-                          "-j", "ACCEPT"])
+        _iptables_delete(
+            [
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                lease.network,
+                "!",
+                "-d",
+                lease.network,
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "masq"),
+                "-j",
+                "MASQUERADE",
+            ]
+        )
+        _iptables_delete(
+            [
+                "-D",
+                "FORWARD",
+                "-o",
+                name,
+                "-d",
+                lease.guest_cidr,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "return"),
+                "-j",
+                "ACCEPT",
+            ]
+        )
+        _iptables_delete(
+            [
+                "-D",
+                "FORWARD",
+                "-i",
+                name,
+                "-s",
+                lease.guest_cidr,
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "egress"),
+                "-j",
+                "ACCEPT",
+            ]
+        )
         for idx, cidr in enumerate(lease.egress_allow):
-            _iptables_delete(["-D", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                              "-d", cidr, "-m", "comment", "--comment",
-                              _comment(name, f"egress-{idx}"), "-j", "ACCEPT"])
-        _iptables_delete(["-D", "FORWARD", "-i", name, "-s", lease.guest_cidr,
-                          "-m", "comment", "--comment", _comment(name, "egress-deny"),
-                          "-j", "REJECT"])
-        for idx, ip in enumerate(
-                _resolve_domain_ips(tuple(egress_allow_domains or ()))):
+            _iptables_delete(
+                [
+                    "-D",
+                    "FORWARD",
+                    "-i",
+                    name,
+                    "-s",
+                    lease.guest_cidr,
+                    "-d",
+                    cidr,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    _comment(name, f"egress-{idx}"),
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
+        _iptables_delete(
+            [
+                "-D",
+                "FORWARD",
+                "-i",
+                name,
+                "-s",
+                lease.guest_cidr,
+                "-m",
+                "comment",
+                "--comment",
+                _comment(name, "egress-deny"),
+                "-j",
+                "REJECT",
+            ]
+        )
+        for idx, ip in enumerate(_resolve_domain_ips(tuple(egress_allow_domains or ()))):
             _iptables_delete(_domain_rule("-D", name, lease.guest_cidr, ip, idx))
 
     if _ip_link_exists(name):
@@ -648,8 +841,7 @@ def _comment(name: str, tag: str) -> str:
 
 def _run(args: Sequence[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     try:
-        proc = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, check=False)
+        proc = subprocess.run(args, text=True, capture_output=True, check=False)
     except FileNotFoundError as exc:
         raise RuntimeError(f"required command not found: {args[0]}") from exc
     if check and proc.returncode != 0:

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vmon"
 version = "0.2.0"
 description = "Vibemon — friendly Python SDK + CLI for microVMs (run containers, suspend/resume, snapshot, fork)"
-requires-python = ">=3.9"
+requires-python = ">=3.14"
 dependencies = [
     "click~=8.1",
     "rich>=12.0.0",
@@ -16,9 +16,6 @@ dependencies = [
 server = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    # pydantic v2 evaluates `X | Y` model annotations at import time; on Python
-    # <3.10 that PEP 604 syntax needs this backport to resolve.
-    "eval-type-backport>=0.2; python_version < '3.10'",
 ]
 test = [
     "pytest",
@@ -44,7 +41,7 @@ vmon = ["web/**/*", "_agent/*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py314"
 
 [tool.ruff.lint]
 # pyflakes (F) + pycodestyle (E/W) + isort (I) + pyupgrade (UP) + bugbear (B)
@@ -62,7 +59,7 @@ ignore = [
 "vmon/server.py" = ["B008"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.14"
 files = ["vmon"]
 ignore_missing_imports = true
 warn_redundant_casts = true

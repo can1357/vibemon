@@ -16,9 +16,13 @@ class Control:
     def __init__(self, sock_path: str):
         self.sock_path = str(sock_path)
 
-    def _request(self, method: str, params: dict | None = None) -> dict:
+    def _request(
+        self, method: str, params: dict | None = None, timeout: float | None = 10.0
+    ) -> dict:
         request_id = next(self._ids)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            if timeout is not None:
+                s.settimeout(timeout)
             s.connect(self.sock_path)
             f = s.makefile("rwb", buffering=0)
             banner_line = f.readline()
@@ -41,7 +45,9 @@ class Control:
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             raise RuntimeError(f"invalid control reply: {e}") from e
         if reply.get("id") != request_id:
-            raise RuntimeError(f"control reply id mismatch: expected {request_id}, got {reply.get('id')!r}")
+            raise RuntimeError(
+                f"control reply id mismatch: expected {request_id}, got {reply.get('id')!r}"
+            )
         if not reply.get("ok", False):
             error = reply.get("error") or {}
             code = error.get("code", "internal")
@@ -56,15 +62,17 @@ class Control:
         last = None
         while time.time() < deadline:
             try:
-                self.ping()
+                remaining = max(0.001, deadline - time.time())
+                self.ping(timeout=min(0.25, remaining))
                 return
-            except (OSError, RuntimeError) as e:
+            except (OSError, RuntimeError, TimeoutError) as e:
                 last = e
                 time.sleep(0.005)
         raise TimeoutError(f"control socket {self.sock_path} not ready: {last}")
 
-    def ping(self) -> dict:
-        return self._request("ping")
+    def ping(self, timeout: float | None = 10.0) -> dict:
+        """Round-trip a ping request, bounded by *timeout* seconds by default."""
+        return self._request("ping", timeout=timeout)
 
     def info(self) -> dict:
         return self._request("info")

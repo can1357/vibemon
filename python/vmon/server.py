@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
 import contextlib
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import queue
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -20,11 +24,13 @@ from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+
 from .core import Engine, EngineError, VMRecord
 
 
@@ -53,6 +59,7 @@ class SandboxCreate(BaseModel):
     readiness_probe: Any | None = None
     pool_size: int = 0
 
+
 class ExecRequest(BaseModel):
     cmd: list[str] = Field(default_factory=list)
     workdir: str | None = None
@@ -66,7 +73,6 @@ class SnapshotRequest(BaseModel):
     name: str | None = None
 
 
-
 class ExtendRequest(BaseModel):
     secs: int
 
@@ -76,6 +82,83 @@ class NetworkRequest(BaseModel):
     cidr_allow: list[str] | None = None
     domain_allow: list[str] | None = None
 
+
+def _bad_request(message: str) -> HTTPException:
+    return HTTPException(status.HTTP_400_BAD_REQUEST, detail=message)
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if value <= 0:
+        raise _bad_request(f"{name} must be positive")
+
+
+def _require_non_negative_int(name: str, value: int) -> None:
+    if value < 0:
+        raise _bad_request(f"{name} must be non-negative")
+
+
+def _require_non_negative_float(name: str, value: float | None) -> None:
+    if value is not None and (not math.isfinite(float(value)) or value < 0):
+        raise _bad_request(f"{name} must be non-negative")
+
+
+def _validate_ports(ports: list[int] | None) -> None:
+    for port in ports or ():
+        if port <= 0 or port > 65535:
+            raise _bad_request("ports must be TCP port numbers from 1 to 65535")
+
+
+def _validate_cidrs(name: str, cidrs: list[str] | None) -> None:
+    for cidr in cidrs or ():
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise _bad_request(f"{name} entries must be valid CIDR networks") from exc
+
+
+def _validate_domains(name: str, domains: list[str] | None) -> None:
+    for domain in domains or ():
+        if not domain.strip():
+            raise _bad_request(f"{name} entries must be non-empty")
+
+
+def _validate_create_request(request: SandboxCreate) -> None:
+    _require_positive_int("cpus", request.cpus)
+    _require_positive_int("memory", request.memory)
+    _require_positive_int("disk_mb", request.disk_mb)
+    _require_non_negative_int("pool_size", request.pool_size)
+    _require_non_negative_float("timeout", request.timeout)
+    if request.timeout_secs is not None:
+        _require_non_negative_int("timeout_secs", request.timeout_secs)
+    if request.block_network and request.ports:
+        raise _bad_request("ports cannot be exposed when block_network=True")
+    _validate_ports(request.ports)
+    _validate_cidrs("egress_allow", request.egress_allow)
+    _validate_cidrs("inbound_cidr_allowlist", request.inbound_cidr_allowlist)
+    _validate_domains("egress_allow_domains", request.egress_allow_domains)
+
+
+def _validate_exec_request(request: ExecRequest) -> None:
+    if not request.cmd:
+        raise _bad_request("exec cmd must not be empty")
+    if not request.cmd[0]:
+        raise _bad_request("exec cmd[0] must not be empty")
+    _require_non_negative_float("timeout", request.timeout)
+
+
+def _validate_extend_request(request: ExtendRequest) -> None:
+    _require_positive_int("secs", request.secs)
+
+
+def _validate_network_request(request: NetworkRequest) -> None:
+    if (
+        request.block_network is None
+        and request.cidr_allow is None
+        and request.domain_allow is None
+    ):
+        raise _bad_request("network request must set at least one field")
+    _validate_cidrs("cidr_allow", request.cidr_allow)
+    _validate_domains("domain_allow", request.domain_allow)
 
 
 class Supervisor:
@@ -114,7 +197,9 @@ class Supervisor:
         self.idle_poll = idle_poll
         self._latency_sum_ms = 0.0
         self._latency_count = 0
-        self._event_subscribers: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]] = set()
+        self._event_subscribers: set[
+            tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]
+        ] = set()
 
     def _http_error(self, exc: EngineError) -> HTTPException:
         code = self._STATUS.get(exc.code, status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -125,7 +210,7 @@ class Supervisor:
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
         except EngineError as exc:
-            raise self._http_error(exc)
+            raise self._http_error(exc) from exc
 
     def count(self, name: str, by: int = 1) -> None:
         with self._lock:
@@ -154,7 +239,7 @@ class Supervisor:
         payload = {"event": event, "ts": time.time(), **data}
         with self._lock:
             subscribers = list(self._event_subscribers)
-        stale: list[asyncio.Queue[dict[str, Any]]] = []
+        stale: builtins.list[asyncio.Queue[dict[str, Any]]] = []
         for loop, queue_ in subscribers:
             if loop.is_closed():
                 stale.append(queue_)
@@ -176,14 +261,14 @@ class Supervisor:
         self.emit("ready", id=record.id, name=record.name)
         return record
 
-    def list(self, tags: dict[str, str] | None = None) -> list[VMRecord]:
+    def list(self, tags: dict[str, str] | None = None) -> builtins.list[VMRecord]:
         return self._engine.list(tags)
 
     def get(self, sid: str, *, require_running: bool = False) -> VMRecord:
         try:
             return self._engine.get(sid, require_running=require_running)
         except EngineError as exc:
-            raise self._http_error(exc)
+            raise self._http_error(exc) from exc
 
     async def terminate(self, sid: str, *, reason: str = "api") -> VMRecord:
         record = await self._run(self._engine.terminate, sid, reason=reason)
@@ -191,14 +276,23 @@ class Supervisor:
         returncode = record.detail.get("returncode")
         with self._lock:
             self._counters["terminated"] += 1
-        self.emit("finished", id=record.id, name=record.name, reason=actual_reason, returncode=returncode)
-        self.emit("terminated", id=record.id, name=record.name, reason=actual_reason, returncode=returncode)
+        self.emit(
+            "finished", id=record.id, name=record.name, reason=actual_reason, returncode=returncode
+        )
+        self.emit(
+            "terminated",
+            id=record.id,
+            name=record.name,
+            reason=actual_reason,
+            returncode=returncode,
+        )
         return record
 
     async def reap_expired(self) -> None:
         now = time.time()
         expired = [
-            r for r in self._engine.list()
+            r
+            for r in self._engine.list()
             if r.status == "running" and r.expires_at is not None and r.expires_at <= now
         ]
         for record in expired:
@@ -220,9 +314,15 @@ class Supervisor:
     async def start_exec(self, record: VMRecord, request: ExecRequest) -> Any:
         self.count("exec")
         workdir = request.workdir if request.workdir is not None else request.cwd
-        return await self._run(self._engine.start_exec, record.name, request.cmd,
-                               env=request.env, workdir=workdir, tty=request.tty,
-                               timeout=request.timeout)
+        return await self._run(
+            self._engine.start_exec,
+            record.name,
+            request.cmd,
+            env=request.env,
+            workdir=workdir,
+            tty=request.tty,
+            timeout=request.timeout,
+        )
 
     async def read_file(self, record: VMRecord, path: str) -> bytes:
         self.count("file_read")
@@ -236,7 +336,7 @@ class Supervisor:
         self.count("file_delete")
         await self._run(self._engine.delete_file, record.name, path, recursive)
 
-    async def list_files(self, record: VMRecord, path: str) -> list[dict[str, Any]]:
+    async def list_files(self, record: VMRecord, path: str) -> builtins.list[dict[str, Any]]:
         return await self._run(self._engine.list_files, record.name, path)
 
     async def stat_file(self, record: VMRecord, path: str) -> dict[str, Any]:
@@ -254,9 +354,12 @@ class Supervisor:
 
     async def set_network_policy(self, record: VMRecord, request: NetworkRequest) -> dict[str, Any]:
         result = await self._run(
-            self._engine.set_network_policy, record.name,
-            block_network=request.block_network, cidr_allow=request.cidr_allow,
-            domain_allow=request.domain_allow)
+            self._engine.set_network_policy,
+            record.name,
+            block_network=request.block_network,
+            cidr_allow=request.cidr_allow,
+            domain_allow=request.domain_allow,
+        )
         if request.block_network is not None:
             record.detail["block_network"] = request.block_network
         if request.cidr_allow is not None:
@@ -287,7 +390,7 @@ class Supervisor:
         try:
             return self._engine.tunnels(record.name)
         except EngineError as exc:
-            raise self._http_error(exc)
+            raise self._http_error(exc) from exc
 
     def tunnel_target(self, record: VMRecord, port: int) -> tuple[str, int]:
         target = self.tunnels(record).get(int(port))
@@ -321,26 +424,31 @@ class Supervisor:
         ]
         for status_name, value in sorted(statuses.items()):
             lines.append(f'vmon_server_sandboxes{{status="{status_name}"}} {value}')
-        lines.extend([
-            "# HELP vmon_server_events_total Server supervisor events.",
-            "# TYPE vmon_server_events_total counter",
-        ])
+        lines.extend(
+            [
+                "# HELP vmon_server_events_total Server supervisor events.",
+                "# TYPE vmon_server_events_total counter",
+            ]
+        )
         for name, value in sorted(counters.items()):
             lines.append(f'vmon_server_events_total{{event="{name}"}} {value}')
-        lines.extend([
-            "# HELP vmon_server_create_latency_ms_sum Total sandbox create latency in milliseconds.",
-            "# TYPE vmon_server_create_latency_ms_sum counter",
-            f"vmon_server_create_latency_ms_sum {latency_sum}",
-            "# HELP vmon_server_create_latency_ms_count Count of observed sandbox creates.",
-            "# TYPE vmon_server_create_latency_ms_count counter",
-            f"vmon_server_create_latency_ms_count {latency_count}",
-            "# HELP vmon_server_pool_hits Warm-pool claim hits observed by the server.",
-            "# TYPE vmon_server_pool_hits counter",
-            f"vmon_server_pool_hits {pool_hits}",
-            "# HELP vmon_server_pool_misses Warm-pool claim misses observed by the server.",
-            "# TYPE vmon_server_pool_misses counter",
-            f"vmon_server_pool_misses {pool_misses}",
-        ])
+        lines.extend(
+            [
+                "# HELP vmon_server_create_latency_ms_sum Total sandbox create latency"
+                " in milliseconds.",
+                "# TYPE vmon_server_create_latency_ms_sum counter",
+                f"vmon_server_create_latency_ms_sum {latency_sum}",
+                "# HELP vmon_server_create_latency_ms_count Count of observed sandbox creates.",
+                "# TYPE vmon_server_create_latency_ms_count counter",
+                f"vmon_server_create_latency_ms_count {latency_count}",
+                "# HELP vmon_server_pool_hits Warm-pool claim hits observed by the server.",
+                "# TYPE vmon_server_pool_hits counter",
+                f"vmon_server_pool_hits {pool_hits}",
+                "# HELP vmon_server_pool_misses Warm-pool claim misses observed by the server.",
+                "# TYPE vmon_server_pool_misses counter",
+                f"vmon_server_pool_misses {pool_misses}",
+            ]
+        )
         return "\n".join(lines) + "\n"
 
 
@@ -415,6 +523,10 @@ async def _exec_sse(supervisor: Supervisor, record: VMRecord, request: ExecReque
             return
 
 
+def _tokens_match(supplied: str | None, expected: str) -> bool:
+    return supplied is not None and secrets.compare_digest(supplied, expected)
+
+
 def _ws_bearer_token(websocket: WebSocket) -> str | None:
     """Extract a bearer token from the Authorization header or a token query param."""
     header = websocket.headers.get("authorization")
@@ -463,7 +575,7 @@ def _decode_chunked_http_body(body: bytes) -> bytes:
         if size == 0:
             return b"".join(chunks)
         chunks.append(rest[:size])
-        rest = rest[size + 2:]
+        rest = rest[size + 2 :]
     return b"".join(chunks)
 
 
@@ -474,7 +586,9 @@ async def _proxy_http_request(request: Request, target: tuple[str, int], rest: s
     try:
         reader, writer = await asyncio.open_connection(host, port)
     except OSError as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=f"tunnel connect failed: {exc}") from exc
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail=f"tunnel connect failed: {exc}"
+        ) from exc
     path = "/" + rest.lstrip("/")
     query = _target_query(list(request.query_params.multi_items()))
     if query:
@@ -504,7 +618,9 @@ async def _proxy_http_request(request: Request, target: tuple[str, int], rest: s
     try:
         status_code = int(lines[0].split(" ", 2)[1])
     except Exception as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail="invalid tunnel HTTP status") from exc
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail="invalid tunnel HTTP status"
+        ) from exc
     response_headers: dict[str, str] = {}
     chunked = False
     for line in lines[1:]:
@@ -585,7 +701,9 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
     writer.write(request.encode("latin-1"))
     await writer.drain()
     response = await reader.readuntil(b"\r\n\r\n")
-    expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    expected = base64.b64encode(
+        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+    ).decode()
     if b" 101 " not in response.split(b"\r\n", 1)[0]:
         writer.close()
         with contextlib.suppress(Exception):
@@ -596,7 +714,9 @@ async def _proxy_websocket(websocket: WebSocket, target: tuple[str, int], rest: 
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="websocket accept mismatch")
+        await websocket.close(
+            code=status.WS_1011_INTERNAL_ERROR, reason="websocket accept mismatch"
+        )
         return
     await websocket.accept()
 
@@ -648,6 +768,7 @@ def _coerce_stdin(value: Any) -> bytes:
         return value.encode()
     return str(value).encode()
 
+
 def _ws_stdin_action(message: dict[str, Any]) -> tuple[str, Any] | None:
     """Translate a client websocket frame into a stdin/resize action.
 
@@ -668,7 +789,11 @@ def _ws_stdin_action(message: dict[str, Any]) -> tuple[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     kind = payload.get("type")
-    if payload.get("close_stdin") or payload.get("eof") or kind in {"close_stdin", "stdin_close", "eof"}:
+    if (
+        payload.get("close_stdin")
+        or payload.get("eof")
+        or kind in {"close_stdin", "stdin_close", "eof"}
+    ):
         return ("close", None)
     if "resize" in payload and isinstance(payload["resize"], dict):
         r, c = payload["resize"].get("rows"), payload["resize"].get("cols")
@@ -712,8 +837,9 @@ async def _ws_exec_request(websocket: WebSocket) -> ExecRequest | None:
     return ExecRequest(**payload)
 
 
-async def _exec_ws(supervisor: Supervisor, record: VMRecord, request: ExecRequest,
-                   websocket: WebSocket) -> None:
+async def _exec_ws(
+    supervisor: Supervisor, record: VMRecord, request: ExecRequest, websocket: WebSocket
+) -> None:
     try:
         process = await supervisor.start_exec(record, request)
     except HTTPException as exc:
@@ -764,7 +890,7 @@ async def _exec_ws(supervisor: Supervisor, record: VMRecord, request: ExecReques
                     await run_in_threadpool(close_stdin)
             elif verb == "resize":
                 if resize is not None:
-                    rows, cols = data  # type: ignore[misc]
+                    rows, cols = data
                     with contextlib.suppress(Exception):
                         await run_in_threadpool(resize, rows, cols)
             elif write_stdin is not None:
@@ -823,29 +949,41 @@ def _mount_web_ui(app: FastAPI) -> None:
         try:
             candidate.relative_to(web)
         except ValueError:
-            raise HTTPException(status.HTTP_404_NOT_FOUND)
+            raise HTTPException(status.HTTP_404_NOT_FOUND) from None
         if candidate.is_file():
             return FileResponse(str(candidate))
         return FileResponse(str(index))
 
+
 def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> FastAPI:
     supervisor = Supervisor(Engine(), idle_poll=max(1.0, min(float(idle_timeout), 30.0)))
-    expected_token = token or os.environ.get("VMON_API_TOKEN")
+    expected_token = token if token is not None else os.environ.get("VMON_API_TOKEN")
     bearer = HTTPBearer(auto_error=False)
     app = FastAPI(title="vmon sandbox server", version="1")
     app.state.supervisor = supervisor
 
-    async def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(
+        _request: Request, _exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse({"detail": "invalid request"}, status_code=status.HTTP_400_BAD_REQUEST)
+
+    async def require_auth(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ) -> None:
         if expected_token is None:
             return
-        if credentials is None or credentials.scheme.lower() != "bearer" or credentials.credentials != expected_token:
+        if (
+            credentials is None
+            or credentials.scheme.lower() != "bearer"
+            or not _tokens_match(credentials.credentials, expected_token)
+        ):
             supervisor.count("auth_failed")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
                 detail="unauthorized",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-
 
     def parse_tag_filters(values: list[str] | None) -> dict[str, str] | None:
         if not values:
@@ -860,7 +998,7 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     def require_connect_token(record: VMRecord, supplied: str | None) -> None:
         expected = supervisor.connect_token(record, create=False)
-        if expected is None or supplied != expected:
+        if expected is None or not _tokens_match(supplied, expected):
             supervisor.count("auth_failed")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
@@ -882,6 +1020,7 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
                 yield _sse(payload)
         finally:
             supervisor.unsubscribe_events(subscriber)
+
     @app.on_event("startup")
     async def _startup() -> None:
         app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
@@ -906,17 +1045,22 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
     async def create_sandbox(body: SandboxCreate) -> JSONResponse:
+        _validate_create_request(body)
         record = await supervisor.create(body)
         return JSONResponse(record.view(), status_code=status.HTTP_201_CREATED)
 
     @app.get("/v1/sandboxes", dependencies=[Depends(require_auth)])
-    async def list_sandboxes(tag: list[str] | None = Query(None)) -> dict[str, list[dict[str, Any]]]:
-        return {"sandboxes": [record.view() for record in supervisor.list(tags=parse_tag_filters(tag))]}
-
+    async def list_sandboxes(
+        tag: list[str] | None = Query(None),
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "sandboxes": [record.view() for record in supervisor.list(tags=parse_tag_filters(tag))]
+        }
 
     @app.get("/v1/sandboxes/from_id/{sandbox_id}", dependencies=[Depends(require_auth)])
     async def get_sandbox_from_id(sandbox_id: str) -> dict[str, Any]:
         return supervisor.get(sandbox_id).view()
+
     @app.get("/v1/sandboxes/{sandbox_id}", dependencies=[Depends(require_auth)])
     async def get_sandbox(sandbox_id: str) -> dict[str, Any]:
         return supervisor.get(sandbox_id).view()
@@ -928,18 +1072,24 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     @app.post("/v1/sandboxes/{sandbox_id}/extend", dependencies=[Depends(require_auth)])
     async def extend_sandbox(sandbox_id: str, body: ExtendRequest) -> dict[str, Any]:
+        _validate_extend_request(body)
         record = supervisor.get(sandbox_id, require_running=True)
         return await supervisor.extend(record, body.secs)
 
     @app.post("/v1/sandboxes/{sandbox_id}/exec", dependencies=[Depends(require_auth)])
     async def exec_sandbox(sandbox_id: str, body: ExecRequest) -> StreamingResponse:
+        _validate_exec_request(body)
         record = supervisor.get(sandbox_id, require_running=True)
-        return StreamingResponse(_exec_sse(supervisor, record, body), media_type="text/event-stream")
+        return StreamingResponse(
+            _exec_sse(supervisor, record, body), media_type="text/event-stream"
+        )
 
     @app.websocket("/v1/sandboxes/{sandbox_id}/exec/ws")
     async def exec_sandbox_ws(websocket: WebSocket, sandbox_id: str) -> None:
         await websocket.accept()
-        if expected_token is not None and _ws_bearer_token(websocket) != expected_token:
+        if expected_token is not None and not _tokens_match(
+            _ws_bearer_token(websocket), expected_token
+        ):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
@@ -960,8 +1110,10 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
         if request is None:
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
             return
-        if not request.cmd:
-            await websocket.send_json({"error": "exec cmd must not be empty"})
+        try:
+            _validate_exec_request(request)
+        except HTTPException as exc:
+            await websocket.send_json({"error": exc.detail})
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await _exec_ws(supervisor, record, request, websocket)
@@ -1002,6 +1154,7 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     @app.put("/v1/sandboxes/{sandbox_id}/network", dependencies=[Depends(require_auth)])
     async def put_network(sandbox_id: str, body: NetworkRequest) -> dict[str, Any]:
+        _validate_network_request(body)
         record = supervisor.get(sandbox_id, require_running=True)
         return await supervisor.set_network_policy(record, body)
 
@@ -1009,7 +1162,10 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
     async def get_tunnels(sandbox_id: str) -> dict[str, Any]:
         record = supervisor.get(sandbox_id, require_running=True)
         token = supervisor.connect_token(record)
-        tunnels = {str(port): [host, target_port] for port, (host, target_port) in supervisor.tunnels(record).items()}
+        tunnels = {
+            str(port): [host, target_port]
+            for port, (host, target_port) in supervisor.tunnels(record).items()
+        }
         return {"tunnels": tunnels, "connect_token": token}
 
     @app.api_route(
@@ -1025,7 +1181,9 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
 
     @app.websocket("/v1/sandboxes/{sandbox_id}/ports/{port:int}/ws/{rest:path}")
     async def proxy_ws_port(websocket: WebSocket, sandbox_id: str, port: int, rest: str) -> None:
-        if expected_token is not None and _ws_bearer_token(websocket) != expected_token:
+        if expected_token is not None and not _tokens_match(
+            _ws_bearer_token(websocket), expected_token
+        ):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
@@ -1053,8 +1211,13 @@ def create_app(*, token: str | None = None, idle_timeout: float = 300.0) -> Fast
     return app
 
 
-def serve(*, host: str = "127.0.0.1", port: int = 8000,
-          token: str | None = None, idle_timeout: float = 300.0) -> None:
+def serve(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    token: str | None = None,
+    idle_timeout: float = 300.0,
+) -> None:
     """Run the daemon **and** the HTTP/web gateway over a single shared engine.
 
     ``vmon serve`` is the same single-owner process as ``vmond``: it takes the
@@ -1066,7 +1229,9 @@ def serve(*, host: str = "127.0.0.1", port: int = 8000,
         import uvicorn
     except ModuleNotFoundError as exc:
         if exc.name == "uvicorn":
-            raise RuntimeError("vmon serve requires the server extra: pip install 'vmon[server]'") from exc
+            raise RuntimeError(
+                "vmon serve requires the server extra: pip install 'vmon[server]'"
+            ) from exc
         raise
 
     resolved_token = token or os.environ.get("VMON_API_TOKEN")
@@ -1074,27 +1239,28 @@ def serve(*, host: str = "127.0.0.1", port: int = 8000,
         raise RuntimeError("vmon serve requires --token or VMON_API_TOKEN")
     app = create_app(token=resolved_token, idle_timeout=idle_timeout)
 
-    from .daemon import (Daemon, acquire_owner_lock, daemon_paths, parse_tcp_addr,
-                         release_owner_lock)
+    from .daemon import Daemon, acquire_owner_lock, daemon_paths, parse_tcp_addr, release_owner_lock
 
     paths = daemon_paths()
     paths["home"].mkdir(parents=True, exist_ok=True)
     lock_fd = acquire_owner_lock(paths["lock"])
     if lock_fd is None:
-        raise RuntimeError(
-            "a local vmond daemon is already running; run `vmon daemon stop` first")
+        raise RuntimeError("a local vmond daemon is already running; run `vmon daemon stop` first")
     engine = app.state.supervisor._engine
-    daemon = Daemon(engine, sock_path=paths["sock"],
-                    tcp_addr=parse_tcp_addr(os.environ.get("VMON_DAEMON_TCP")),
-                    token=resolved_token)
+    daemon = Daemon(
+        engine,
+        sock_path=paths["sock"],
+        tcp_addr=parse_tcp_addr(os.environ.get("VMON_DAEMON_TCP")),
+        token=resolved_token,
+    )
     ready = threading.Event()
-    threading.Thread(target=daemon.serve_forever, kwargs={"ready": ready},
-                     name="vmond-serve", daemon=True).start()
+    threading.Thread(
+        target=daemon.serve_forever, kwargs={"ready": ready}, name="vmond-serve", daemon=True
+    ).start()
     if not ready.wait(5) or not paths["sock"].exists():
         daemon.shutdown()
         release_owner_lock(lock_fd)
-        raise RuntimeError(
-            f"failed to bind the local vmond socket at {paths['sock']}")
+        raise RuntimeError(f"failed to bind the local vmond socket at {paths['sock']}")
     paths["pid"].write_text(f"{os.getpid()}\n")
     try:
         uvicorn.run(app, host=host, port=port)

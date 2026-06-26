@@ -9,21 +9,28 @@ import secrets as _secrets
 import shutil
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .agent import AgentClosed, AgentConn, ByteStream, ExecSession
 from .image import ImageSpec, cached_template
 from .pool import WarmPool
 from .secret import Secret, merge_secrets
-from .vmm import STATE, MicroVM, _instance_name
+from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_timeout_secs
 from .volume import Volume
 
 _POOLS: dict[str, WarmPool] = {}
 
 
-def _setup_sandbox_network(name: str, *, ports=None, egress_allow=None,
-                           egress_allow_domains=None, inbound_cidr_allowlist=None):
+def _setup_sandbox_network(
+    name: str,
+    *,
+    ports=None,
+    egress_allow=None,
+    egress_allow_domains=None,
+    inbound_cidr_allowlist=None,
+):
     """Create the host TAP + port tunnels for a networked sandbox before launch.
 
     Returns a :class:`vmon.net.SandboxNetwork`; raises ``PermissionError`` without
@@ -31,12 +38,17 @@ def _setup_sandbox_network(name: str, *, ports=None, egress_allow=None,
     the guest side is configured (``net_config``) once the agent answers.
     """
     from . import net
+
     return net.setup_sandbox_network(
         name,
         ports=list(ports) if ports is not None else None,
         egress_allow=list(egress_allow) if egress_allow is not None else None,
-        egress_allow_domains=list(egress_allow_domains) if egress_allow_domains is not None else None,
-        inbound_cidr_allowlist=list(inbound_cidr_allowlist) if inbound_cidr_allowlist is not None else None,
+        egress_allow_domains=list(egress_allow_domains)
+        if egress_allow_domains is not None
+        else None,
+        inbound_cidr_allowlist=list(inbound_cidr_allowlist)
+        if inbound_cidr_allowlist is not None
+        else None,
     )
 
 
@@ -88,7 +100,7 @@ class Process:
 class Filesystem:
     """Filesystem RPC facade for a Sandbox."""
 
-    def __init__(self, sandbox: "Sandbox") -> None:
+    def __init__(self, sandbox: Sandbox) -> None:
         self._sandbox = sandbox
 
     def read_bytes(self, path: str) -> bytes:
@@ -97,7 +109,9 @@ class Filesystem:
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         return self.read_bytes(path).decode(encoding)
 
-    def write_bytes(self, path: str, data: bytes | bytearray | memoryview, mode: int = 0o644) -> None:
+    def write_bytes(
+        self, path: str, data: bytes | bytearray | memoryview, mode: int = 0o644
+    ) -> None:
         self._sandbox.agent().fs_write(path, data, mode=mode)
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8", mode: int = 0o644) -> None:
@@ -119,9 +133,15 @@ class Filesystem:
 class Sandbox:
     """A warm-restored microVM with Modal-compatible exec and filesystem methods."""
 
-    def __init__(self, vm: MicroVM, image_spec: ImageSpec | None = None,
-                 workdir: str | None = None, env: dict[str, str] | None = None,
-                 network: Any = None, tags: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        vm: MicroVM,
+        image_spec: ImageSpec | None = None,
+        workdir: str | None = None,
+        env: dict[str, str] | None = None,
+        network: Any = None,
+        tags: dict[str, str] | None = None,
+    ) -> None:
         self.vm = vm
         self.name = vm.name
         self.image_spec = image_spec
@@ -143,29 +163,56 @@ class Sandbox:
         self._entry_process: Process | None = None
 
     @classmethod
-    def create(cls, image: str | None = None, *, template: str | os.PathLike[str] | None = None,
-               dockerfile: str | None = None, context: str = ".", name: str | None = None,
-               cpus: int = 1, memory: int = 512, disk_mb: int = 1024,
-               timeout: float = 300, timeout_secs: int | None = None,
-               workdir: str | None = None, env: dict[str, str] | None = None,
-               secrets: Iterable[Secret | dict[str, str]] | None = None,
-               volumes: dict[str, Volume | tuple[Volume, bool]] | None = None,
-               tags: dict[str, str] | None = None, fs_dir: str | None = None,
-               block_network: bool = False,
-               ports: list[int] | tuple[int, ...] | None = None,
-               egress_allow: list[str] | tuple[str, ...] | None = None,
-               egress_allow_domains: list[str] | tuple[str, ...] | None = None,
-               inbound_cidr_allowlist: list[str] | tuple[str, ...] | None = None,
-               readiness_probe: Any = None, pool_size: int = 0) -> "Sandbox":
+    def create(
+        cls,
+        image: str | None = None,
+        *,
+        template: str | os.PathLike[str] | None = None,
+        dockerfile: str | None = None,
+        context: str = ".",
+        name: str | None = None,
+        cpus: int = 1,
+        memory: int = 512,
+        disk_mb: int = 1024,
+        timeout: float = 300,
+        timeout_secs: int | None = None,
+        workdir: str | None = None,
+        env: dict[str, str] | None = None,
+        secrets: Iterable[Secret | dict[str, str]] | None = None,
+        volumes: dict[str, Volume | tuple[Volume, bool]] | None = None,
+        tags: dict[str, str] | None = None,
+        fs_dir: str | None = None,
+        block_network: bool = False,
+        ports: list[int] | tuple[int, ...] | None = None,
+        egress_allow: list[str] | tuple[str, ...] | None = None,
+        egress_allow_domains: list[str] | tuple[str, ...] | None = None,
+        inbound_cidr_allowlist: list[str] | tuple[str, ...] | None = None,
+        readiness_probe: Any = None,
+        pool_size: int = 0,
+    ) -> Sandbox:
         if block_network and ports:
             raise ValueError("ports cannot be exposed when block_network=True")
+        cpus = _validate_int_range(cpus, "cpus", maximum=64)
+        memory = _validate_int_range(memory, "memory", maximum=64 * 1024, unit=" MiB")
+        disk_mb = _validate_int_range(disk_mb, "disk_mb")
+        if timeout_secs == 0:
+            eff_timeout_secs = None
+        else:
+            eff_timeout_secs = (
+                _validate_timeout_secs(timeout_secs) if timeout_secs is not None else 300
+            )
         template_dir, image_spec, image_ref = cls._resolve_template(
-            image=image, template=template, dockerfile=dockerfile, context=context,
-            disk_mb=disk_mb, timeout=timeout, memory=memory, cpus=cpus)
+            image=image,
+            template=template,
+            dockerfile=dockerfile,
+            context=context,
+            disk_mb=disk_mb,
+            timeout=timeout,
+            memory=memory,
+            cpus=cpus,
+        )
         # Modal-parity default: a 5-minute VMM-enforced wall-clock deadline unless
-        # the caller sets timeout_secs (0 disables; the VMM caps at 86400).
-        eff_timeout_secs = None if timeout_secs == 0 else (
-            int(timeout_secs) if timeout_secs is not None else 300)
+        # the caller sets timeout_secs (0 disables).
         acquired: list[Volume] = []
         volume_specs: list[dict[str, Any]] = []
         vm: MicroVM | None = None
@@ -180,24 +227,30 @@ class Sandbox:
                 acquired.append(vol)
                 host_dir = vol.ensure()
                 tag = cls._unique_volume_tag(vol.tag, used_tags)
-                volume_specs.append({
-                    "mountpoint": str(mountpoint),
-                    "volume": vol,
-                    "tag": tag,
-                    "host_dir": str(host_dir),
-                    "read_only": read_only,
-                })
+                volume_specs.append(
+                    {
+                        "mountpoint": str(mountpoint),
+                        "volume": vol,
+                        "tag": tag,
+                        "host_dir": str(host_dir),
+                        "read_only": read_only,
+                    }
+                )
 
             vol_tuples = [
-                (spec["tag"], spec["host_dir"], bool(spec["read_only"]))
-                for spec in volume_specs
+                (spec["tag"], spec["host_dir"], bool(spec["read_only"])) for spec in volume_specs
             ]
             pool: WarmPool | None = None
             # The warm pool only serves auto-named sandboxes: a pooled clone keeps
             # its pre-assigned name, so a caller-requested `name` (and SDK-level
             # from_id / named uniqueness) must take the cold-restore path instead.
-            if (pool_size > 0 and block_network and not volume_specs
-                    and name is None and fs_dir is None):
+            if (
+                pool_size > 0
+                and block_network
+                and not volume_specs
+                and name is None
+                and fs_dir is None
+            ):
                 key = str(template_dir)
                 pool = _POOLS.get(key)
                 if pool is None or pool.size != int(pool_size):
@@ -206,9 +259,16 @@ class Sandbox:
                 vm = pool.claim()
                 from_pool = vm is not None
             if vm is None and block_network:
-                vm = MicroVM.restore(template_dir, name=name, agent=True, fs_dir=fs_dir,
-                                     mem=memory, cpus=cpus, volumes=vol_tuples,
-                                     timeout_secs=eff_timeout_secs)
+                vm = MicroVM.restore(
+                    template_dir,
+                    name=name,
+                    agent=True,
+                    fs_dir=fs_dir,
+                    mem=memory,
+                    cpus=cpus,
+                    volumes=vol_tuples,
+                    timeout_secs=eff_timeout_secs,
+                )
             elif vm is None:
                 # vmon restore cannot synthesize a NIC the template snapshot
                 # lacks, so a networked sandbox fresh-boots from the template disk
@@ -218,16 +278,28 @@ class Sandbox:
                 if not base_disk.is_file():
                     raise RuntimeError(
                         f"template {template_dir} has no rootfs.img; networked "
-                        "sandboxes require a disk-backed template")
+                        "sandboxes require a disk-backed template"
+                    )
                 net_handle = _setup_sandbox_network(
-                    name, ports=ports, egress_allow=egress_allow,
+                    name,
+                    ports=ports,
+                    egress_allow=egress_allow,
                     egress_allow_domains=egress_allow_domains,
-                    inbound_cidr_allowlist=inbound_cidr_allowlist)
+                    inbound_cidr_allowlist=inbound_cidr_allowlist,
+                )
                 vm = MicroVM.boot_rootfs(
-                    base_disk, name=name, mem=memory, cpus=cpus, overlay=True,
-                    agent=True, tap=str(net_handle.guest_config["tap"]),
-                    fs_dir=fs_dir, volumes=vol_tuples,
-                    timeout_secs=eff_timeout_secs, snapshot_root=STATE / "snapshots")
+                    base_disk,
+                    name=name,
+                    mem=memory,
+                    cpus=cpus,
+                    overlay=True,
+                    agent=True,
+                    tap=str(net_handle.guest_config["tap"]),
+                    fs_dir=fs_dir,
+                    volumes=vol_tuples,
+                    timeout_secs=eff_timeout_secs,
+                    snapshot_root=STATE / "snapshots",
+                )
 
             sb = cls(vm, image_spec=image_spec, workdir=workdir, env=env, tags=tags)
             sb._network = net_handle
@@ -251,8 +323,12 @@ class Sandbox:
                 sb.agent().net_config(gc["ip"], int(gc["prefix"]), gc["gw"], gc.get("dns") or [])
                 sb._network_policy = {
                     "egress_allow": list(egress_allow) if egress_allow is not None else None,
-                    "egress_allow_domains": list(egress_allow_domains) if egress_allow_domains is not None else None,
-                    "inbound_cidr_allowlist": list(inbound_cidr_allowlist) if inbound_cidr_allowlist is not None else None,
+                    "egress_allow_domains": list(egress_allow_domains)
+                    if egress_allow_domains is not None
+                    else None,
+                    "inbound_cidr_allowlist": list(inbound_cidr_allowlist)
+                    if inbound_cidr_allowlist is not None
+                    else None,
                 }
             volumes_meta = {
                 spec["mountpoint"]: {
@@ -298,45 +374,69 @@ class Sandbox:
             raise
 
     @classmethod
-    def from_snapshot(cls, name: str | os.PathLike[str], *, fork: bool = False,
-                      sandbox_name: str | None = None, timeout: float = 60,
-                      workdir: str | None = None, env: dict[str, str] | None = None,
-                      block_network: bool = False,
-                      ports: list[int] | tuple[int, ...] | None = None,
-                      egress_allow: list[str] | tuple[str, ...] | None = None) -> "Sandbox":
+    def from_snapshot(
+        cls,
+        name: str | os.PathLike[str],
+        *,
+        fork: bool = False,
+        sandbox_name: str | None = None,
+        timeout: float = 60,
+        workdir: str | None = None,
+        env: dict[str, str] | None = None,
+        block_network: bool = False,
+        ports: list[int] | tuple[int, ...] | None = None,
+        egress_allow: list[str] | tuple[str, ...] | None = None,
+    ) -> Sandbox:
         if block_network and ports:
             raise ValueError("ports cannot be exposed when block_network=True")
         net_handle = None
         sb: Sandbox | None = None
         try:
             if block_network:
-                vm = MicroVM.fork_snapshot(name, name=sandbox_name, agent=True) if fork else \
-                    MicroVM.restore(name, name=sandbox_name, agent=True)
+                vm = (
+                    MicroVM.fork_snapshot(name, name=sandbox_name, agent=True)
+                    if fork
+                    else MicroVM.restore(name, name=sandbox_name, agent=True)
+                )
                 sb = cls(vm, workdir=workdir, env=env)
                 sb.agent(connect_timeout=timeout).ping(timeout=timeout)
             else:
                 if fork:
                     raise ValueError(
                         "networked from_snapshot fork is unsupported; use "
-                        "block_network=True or Sandbox.create()")
+                        "block_network=True or Sandbox.create()"
+                    )
                 snap_dir = MicroVM._snapshot_dir(name)
                 base_disk = snap_dir / "rootfs.img"
                 if not base_disk.is_file():
-                    raise RuntimeError(
-                        f"snapshot {name} has no rootfs.img for a networked boot")
+                    raise RuntimeError(f"snapshot {name} has no rootfs.img for a networked boot")
                 sandbox_name = sandbox_name or _instance_name(Path(str(name)).name or "snapshot")
-                net_handle = _setup_sandbox_network(sandbox_name, ports=ports, egress_allow=egress_allow)
+                net_handle = _setup_sandbox_network(
+                    sandbox_name, ports=ports, egress_allow=egress_allow
+                )
                 vm = MicroVM.boot_rootfs(
-                    base_disk, name=sandbox_name, overlay=True, agent=True,
-                    tap=str(net_handle.guest_config["tap"]), snapshot_root=STATE / "snapshots")
+                    base_disk,
+                    name=sandbox_name,
+                    overlay=True,
+                    agent=True,
+                    tap=str(net_handle.guest_config["tap"]),
+                    snapshot_root=STATE / "snapshots",
+                )
                 sb = cls(vm, workdir=workdir, env=env)
                 sb._network = net_handle
                 sb.agent(connect_timeout=timeout).ping(timeout=timeout)
                 gc = net_handle.guest_config
                 sb.agent().net_config(gc["ip"], int(gc["prefix"]), gc["gw"], gc.get("dns") or [])
-            vm._save_meta(sandbox=True, restored_snapshot=str(name), workdir=sb.workdir,
-                          env_names=sorted(sb.env), tags=sb.tags, secret_names=[],
-                          volumes={}, block_network=block_network)
+            vm._save_meta(
+                sandbox=True,
+                restored_snapshot=str(name),
+                workdir=sb.workdir,
+                env_names=sorted(sb.env),
+                tags=sb.tags,
+                secret_names=[],
+                volumes={},
+                block_network=block_network,
+            )
             return sb
         except BaseException:
             if sb is not None:
@@ -349,26 +449,44 @@ class Sandbox:
             raise
 
     @classmethod
-    def from_id(cls, id: str) -> "Sandbox":
+    def from_id(cls, id: str) -> Sandbox:
         return cls.attach(id)
 
     @classmethod
-    def attach(cls, name: str) -> "Sandbox":
+    def attach(cls, name: str) -> Sandbox:
         vm = MicroVM(name)
         meta = vm.meta
-        return cls(vm, workdir=meta.get("workdir"), env=meta.get("env") or {},
-                   tags=meta.get("tags") or {})
+        return cls(
+            vm, workdir=meta.get("workdir"), env=meta.get("env") or {}, tags=meta.get("tags") or {}
+        )
 
     @staticmethod
-    def _resolve_template(*, image: str | None, template: str | os.PathLike[str] | None,
-                          dockerfile: str | None, context: str, disk_mb: int,
-                          timeout: float, memory: int, cpus: int) -> tuple[Path, ImageSpec | None, str | None]:
+    def _resolve_template(
+        *,
+        image: str | None,
+        template: str | os.PathLike[str] | None,
+        dockerfile: str | None,
+        context: str,
+        disk_mb: int,
+        timeout: float,
+        memory: int,
+        cpus: int,
+    ) -> tuple[Path, ImageSpec | None, str | None]:
         if template is not None:
             path = Path(template)
-            template_dir = path if path.exists() or path.is_absolute() else STATE / "templates" / str(template)
+            template_dir = (
+                path if path.exists() or path.is_absolute() else STATE / "templates" / str(template)
+            )
             return template_dir, None, str(template)
-        cached = cached_template(image=image, dockerfile=dockerfile, context=context,
-                                 disk_mb=disk_mb, timeout=timeout, memory=memory, cpus=cpus)
+        cached = cached_template(
+            image=image,
+            dockerfile=dockerfile,
+            context=context,
+            disk_mb=disk_mb,
+            timeout=timeout,
+            memory=memory,
+            cpus=cpus,
+        )
         return cached.snapshot_dir, cached.spec, cached.spec.reference
 
     @staticmethod
@@ -384,13 +502,16 @@ class Sandbox:
 
     @staticmethod
     def _unique_volume_tag(base: str, used: set[str]) -> str:
-        stem = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9" or ch == "_") else "_" for ch in base.lower())
+        stem = "".join(
+            ch if ("a" <= ch <= "z" or "0" <= ch <= "9" or ch == "_") else "_"
+            for ch in base.lower()
+        )
         stem = (stem or "vol")[:32]
         candidate = stem
         suffix = 2
         while candidate in used:
             tail = f"_{suffix}"
-            candidate = f"{stem[:32 - len(tail)]}{tail}"
+            candidate = f"{stem[: 32 - len(tail)]}{tail}"
             suffix += 1
         used.add(candidate)
         return candidate
@@ -424,9 +545,16 @@ class Sandbox:
             self._agent = self.vm.agent(connect_timeout=connect_timeout)
         return self._agent
 
-    def exec(self, *cmd: str | Iterable[str], workdir: str | None = None,
-             env: dict[str, str] | None = None, timeout: float | None = None,
-             pty: bool = False, tty: bool = False, _track_entry: bool = True) -> Process:
+    def exec(
+        self,
+        *cmd: str | Iterable[str],
+        workdir: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        pty: bool = False,
+        tty: bool = False,
+        _track_entry: bool = True,
+    ) -> Process:
         if len(cmd) == 1 and not isinstance(cmd[0], str):
             argv = [str(c) for c in cmd[0]]
         else:
@@ -436,11 +564,14 @@ class Sandbox:
         merged_env = {**self.env, **self._secret_env}
         if env:
             merged_env.update({str(k): str(v) for k, v in env.items()})
-        session = self.agent().exec(argv, cwd=workdir or self.workdir, env=merged_env,
-                                     timeout=timeout, tty=bool(pty or tty))
+        session = self.agent().exec(
+            argv, cwd=workdir or self.workdir, env=merged_env, timeout=timeout, tty=bool(pty or tty)
+        )
         proc = Process(session)
         if _track_entry and self._entry_process is None:
-            self._entry_process = proc  # first user exec is the sandbox "entry" for poll()/returncode
+            self._entry_process = (
+                proc  # first user exec is the sandbox "entry" for poll()/returncode
+            )
         return proc
 
     def wait_until_ready(self, probe: Any = None, timeout: float = 300) -> None:
@@ -457,11 +588,14 @@ class Sandbox:
                         return
                 elif isinstance(probe, dict) and "port" in probe:
                     host = str(probe.get("host") or "127.0.0.1")
-                    if self.agent().tcp_probe(int(probe["port"]), host=host,
-                                              timeout=min(1.0, remaining)):
+                    if self.agent().tcp_probe(
+                        int(probe["port"]), host=host, timeout=min(1.0, remaining)
+                    ):
                         return
                 else:
-                    argv = ["sh", "-lc", probe] if isinstance(probe, str) else [str(p) for p in probe]
+                    argv = (
+                        ["sh", "-lc", probe] if isinstance(probe, str) else [str(p) for p in probe]
+                    )
                     proc = self.exec(argv, timeout=min(5.0, remaining), _track_entry=False)
                     try:
                         if proc.wait(timeout=min(5.0, remaining)) == 0:
@@ -502,7 +636,9 @@ class Sandbox:
         if isinstance(code, int):
             return code
         reason = status.get("reason")
-        return {"timeout": 124, "quit": 137, "killed": 137, "shutdown": 0}.get(reason)
+        if isinstance(reason, str):
+            return {"timeout": 124, "quit": 137, "killed": 137, "shutdown": 0}.get(reason)
+        return None
 
     @property
     def returncode(self) -> int | None:
@@ -578,13 +714,16 @@ class Sandbox:
         self._start_timeout_watchdog(int(secs))
         return result if isinstance(result, dict) else {}
 
-    def set_network_policy(self, block_network: bool | None = None,
-                           cidr_allow: list[str] | tuple[str, ...] | None = None,
-                           domain_allow: list[str] | tuple[str, ...] | None = None) -> None:
+    def set_network_policy(
+        self,
+        block_network: bool | None = None,
+        cidr_allow: list[str] | tuple[str, ...] | None = None,
+        domain_allow: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         if self._network is None:
             return
         try:
-            from . import net  # type: ignore[attr-defined]
+            from . import net
         except ImportError:
             return
         cfg = getattr(self._network, "guest_config", None) or getattr(self._network, "config", None)
@@ -606,21 +745,32 @@ class Sandbox:
             allow_list = list(cidr_allow)
         else:
             allow_list = self._network_policy.get("egress_allow")
-        domain_list = list(domain_allow) if domain_allow is not None else self._network_policy.get("egress_allow_domains")
-        net.setup_tap(tap, guest_ip, host_ip, prefix,
-                      egress_allow=allow_list,
-                      egress_allow_domains=domain_list)
-        self._network_policy.update({
-            "block_network": bool(block_network) if block_network is not None else False,
-            "egress_allow": allow_list,
-            "egress_allow_domains": domain_list,
-        })
+        domain_list = (
+            list(domain_allow)
+            if domain_allow is not None
+            else self._network_policy.get("egress_allow_domains")
+        )
+        net.setup_tap(
+            tap,
+            guest_ip,
+            host_ip,
+            prefix,
+            egress_allow=allow_list,
+            egress_allow_domains=domain_list,
+        )
+        self._network_policy.update(
+            {
+                "block_network": bool(block_network) if block_network is not None else False,
+                "egress_allow": allow_list,
+                "egress_allow_domains": domain_list,
+            }
+        )
 
     @property
-    def aio(self) -> "_AsyncSandbox":
+    def aio(self) -> _AsyncSandbox:
         return _AsyncSandbox(self)
 
-    def __enter__(self) -> "Sandbox":
+    def __enter__(self) -> Sandbox:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import threading
 from collections import deque
+from pathlib import Path
 
+from . import vmm as _vmm_mod
 from .vmm import MicroVM
 
 
@@ -18,9 +20,20 @@ class WarmPool:
     never blocks on a spawn -- the refiller absorbs all the latency offline.
     """
 
-    def __init__(self, template: str | os.PathLike[str], size: int, *,
-                 fork: bool = True, agent: bool = True,
-                 ping_timeout: float = 30.0):
+    def __init__(
+        self,
+        template: str | os.PathLike[str],
+        size: int,
+        *,
+        fork: bool = True,
+        agent: bool = True,
+        ping_timeout: float = 30.0,
+    ):
+        size = int(size)
+        if size < 0:
+            raise ValueError("pool size must be >= 0")
+        if ping_timeout < 0:
+            raise ValueError("pool ping_timeout must be >= 0")
         self.template = template
         self.size = size
         self.fork = fork
@@ -32,7 +45,8 @@ class WarmPool:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._refiller = threading.Thread(
-            target=self._refill_loop, name="warmpool-refiller", daemon=True)
+            target=self._refill_loop, name="warmpool-refiller", daemon=True
+        )
         self._refiller.start()
 
     # -- spawning -----------------------------------------------------------
@@ -56,16 +70,33 @@ class WarmPool:
             return None
 
     @staticmethod
+    def _owns_vm_dir(vm: MicroVM) -> bool:
+        """Whether ``vm.remove()`` would target the vmon-managed VM directory."""
+        vm_dir = getattr(vm, "dir", None)
+        if vm_dir is None:
+            return True
+        try:
+            root = (_vmm_mod.STATE / "vms").resolve(strict=False)
+            path = Path(vm_dir).resolve(strict=False)
+            if path == root:
+                return False
+            path.relative_to(root)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _teardown(vm: MicroVM) -> None:
         """Best-effort stop + remove; never raises."""
         try:
             vm.stop()
         except Exception:
             pass
-        try:
-            vm.remove()
-        except Exception:
-            pass
+        if WarmPool._owns_vm_dir(vm):
+            try:
+                vm.remove()
+            except Exception:
+                pass
 
     def _refill_loop(self) -> None:
         """Top ``_ready`` back to ``size`` until stopped; spawn outside the lock."""
@@ -104,8 +135,7 @@ class WarmPool:
     def stats(self) -> dict[str, int]:
         """Snapshot of hit/miss counters and the current ready depth."""
         with self._lock:
-            return {"hits": self.hits, "misses": self.misses,
-                    "ready_count": len(self._ready)}
+            return {"hits": self.hits, "misses": self.misses, "ready_count": len(self._ready)}
 
     def shutdown(self) -> None:
         """Stop the refiller and tear down every parked clone (best-effort)."""

@@ -35,7 +35,7 @@ To get the *full* thing on a Mac, run it inside a Linux VM with nested KVM
 ## 2. Prerequisites
 
 **For the macOS path (panel + API only):**
-- Python 3.9+ (`python3 --version`)
+- Python 3.14+ (`python3 --version`)
 - Node.js 18+ and npm (`node --version`)
 
 **For the full path (real microVMs), additionally:**

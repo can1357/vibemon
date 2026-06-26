@@ -22,6 +22,7 @@ data: bytes)`` callbacks and a ``cancel`` :class:`threading.Event`; when
 
 from __future__ import annotations
 
+import builtins
 import os
 import threading
 import time
@@ -35,13 +36,16 @@ from .volume import Volume
 
 OnOutput = Callable[[str, bytes], None]
 
+_RETURNCODE_UNSET = object()
+
 #: Default image for a fresh ``vmon shell`` with no ref/snapshot/template.
 DEFAULT_SHELL_IMAGE = os.environ.get("VMON_SHELL_IMAGE", "debian:stable-slim")
 
 #: Default interactive shell command: prefer ``bash``, fall back to ``sh``.
 #: ``exec`` replaces the launcher so the shell owns the PTY and its exit code.
 _DEFAULT_SHELL_ARGV = [
-    "/bin/sh", "-c",
+    "/bin/sh",
+    "-c",
     "command -v bash >/dev/null 2>&1 && exec bash -i || exec sh -i",
 ]
 
@@ -156,8 +160,7 @@ class VMRecord:
             "terminated_at": self.terminated_at,
             "error": self.error,
             "tags": dict(self.tags),
-            "returncode": self.detail.get(
-                "returncode", getattr(self.sandbox, "returncode", None)),
+            "returncode": self.detail.get("returncode", getattr(self.sandbox, "returncode", None)),
         }
 
 
@@ -169,8 +172,7 @@ def _coerce_create_params(params: dict[str, Any]) -> dict[str, Any]:
         params["secrets"] = [Secret.from_dict(s) for s in params.get("secrets") or []]
     if "volumes" in params:
         params["volumes"] = {
-            mountpoint: Volume(name)
-            for mountpoint, name in (params.get("volumes") or {}).items()
+            mountpoint: Volume(name) for mountpoint, name in (params.get("volumes") or {}).items()
         }
     return params
 
@@ -216,10 +218,16 @@ class Engine:
         for vm in MicroVM.list():
             meta = vm.meta
             running = vm.is_running()
+            saved_status = str(meta.get("status") or "")
+            status = (
+                "running"
+                if running
+                else (saved_status if saved_status in {"stopped", "terminated"} else "stopped")
+            )
             record = VMRecord(
                 id=vm.name,
                 name=vm.name,
-                status="running" if running else "stopped",
+                status=status,
                 pid=meta.get("pid"),
                 source=self._source_of(meta),
                 detail=dict(meta),
@@ -237,6 +245,8 @@ class Engine:
                         continue
                 if meta.get("tap"):
                     record.detail["tunnels_lost"] = True
+            elif saved_status != status:
+                self._persist_record_status(record, status)
             records[vm.name] = record
         with self._lock:
             self._records = records
@@ -251,7 +261,7 @@ class Engine:
         )
 
     @staticmethod
-    def _volume_names(meta: dict[str, Any]) -> list[str]:
+    def _volume_names(meta: dict[str, Any]) -> builtins.list[str]:
         """Volume names from a sandbox meta dict (``{mp: {name,...}}``).
 
         ``Sandbox.create`` records volumes keyed by mountpoint with a ``name``;
@@ -261,7 +271,7 @@ class Engine:
         vols = meta.get("volumes")
         if not isinstance(vols, dict):
             return []
-        names: list[str] = []
+        names: builtins.list[str] = []
         for info in vols.values():
             if isinstance(info, dict) and info.get("name"):
                 names.append(str(info["name"]))
@@ -277,20 +287,19 @@ class Engine:
         # Refresh a real VM's liveness (its VMM may have died/timed out) before
         # trusting the cached status. Records without a pid (e.g. fakes) stay
         # status-based. The pid-check runs outside the lock (disk/proc read).
-        if require_running and record.status == "running" and record.pid is not None:
-            if not MicroVM(name).is_running():
-                record.status = "stopped"
-        if require_running and record.status != "running":
-            raise NotRunning(f"sandbox {name!r} is not running")
+        if require_running:
+            self._refresh_record_status(record)
+            if record.status != "running":
+                raise NotRunning(f"sandbox {name!r} is not running")
         record.touch()
         return record
 
-    def list(self, tags: dict[str, str] | None = None) -> list[VMRecord]:
+    def list(self, tags: dict[str, str] | None = None) -> builtins.list[VMRecord]:
         with self._lock:
             records = list(self._records.values())
         if not tags:
             return records
-        out: list[VMRecord] = []
+        out: builtins.list[VMRecord] = []
         for record in records:
             available = dict(record.detail.get("tags") or record.tags or {})
             sandbox_tags = getattr(record.sandbox, "tags", None)
@@ -300,21 +309,59 @@ class Engine:
                 out.append(record)
         return out
 
-    def ps(self) -> list[dict[str, Any]]:
-        """``[{name, status, pid, source}]`` with status refreshed by pid liveness."""
-        rows: list[dict[str, Any]] = []
+    def ps(self) -> builtins.list[dict[str, Any]]:
+        """``[{name, status, pid, source}]`` with live records refreshed."""
+        rows: builtins.list[dict[str, Any]] = []
         for record in self.list():
             vm = MicroVM(record.name)
             meta = vm.meta
-            status = "running" if vm.is_running() else "stopped"
-            record.status = status
-            rows.append({
-                "name": record.name,
-                "status": status,
-                "pid": meta.get("pid"),
-                "source": record.source or self._source_of(meta) or "-",
-            })
+            status = self._refresh_record_status(record, meta=meta)
+            rows.append(
+                {
+                    "name": record.name,
+                    "status": status,
+                    "pid": meta.get("pid") or record.pid,
+                    "source": record.source or self._source_of(meta) or "-",
+                }
+            )
         return rows
+
+    def _refresh_record_status(self, record: VMRecord, meta: dict[str, Any] | None = None) -> str:
+        """Refresh liveness without overwriting terminal registry states."""
+        if record.status != "running":
+            return record.status
+        meta = MicroVM(record.name).meta if meta is None else meta
+        pid = meta.get("pid") or record.pid
+        if pid is None:
+            return record.status
+        if not MicroVM(record.name).is_running():
+            self._persist_record_status(record, "stopped")
+        return record.status
+
+    def _persist_record_status(
+        self,
+        record: VMRecord,
+        status: str,
+        *,
+        returncode: Any = _RETURNCODE_UNSET,
+        terminated_at: float | None = None,
+    ) -> None:
+        """Update the in-memory record and persist terminal state best-effort."""
+        record.status = status
+        record.detail["status"] = status
+        if terminated_at is not None:
+            record.terminated_at = terminated_at
+            record.detail["terminated_at"] = terminated_at
+        meta_update: dict[str, Any] = {"status": status}
+        if returncode is not _RETURNCODE_UNSET and returncode is not None:
+            record.detail["returncode"] = int(returncode)
+            meta_update["returncode"] = int(returncode)
+        if terminated_at is not None:
+            meta_update["terminated_at"] = terminated_at
+        try:
+            MicroVM(record.name)._save_meta(**meta_update)
+        except Exception:
+            pass
 
     # -- sandbox resolution -------------------------------------------------
 
@@ -326,8 +373,17 @@ class Engine:
             return record.sandbox
         return self._sandbox_class().attach(name)
 
-    def _record_vm(self, vm: MicroVM, *, source: str | None,
-                   sandbox: Any = None) -> VMRecord:
+    @staticmethod
+    def _create_sandbox(sandbox_cls: type[Any], **params: Any) -> Any:
+        """Create a sandbox and surface backend failures as engine errors."""
+        try:
+            return sandbox_cls.create(**params)
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise EngineError(f"sandbox create failed: {exc}") from exc
+
+    def _record_vm(self, vm: MicroVM, *, source: str | None, sandbox: Any = None) -> VMRecord:
         meta = vm.meta
         record = VMRecord(
             id=vm.name,
@@ -346,8 +402,12 @@ class Engine:
 
     # -- run / restore / fork ----------------------------------------------
 
-    def run(self, params: dict[str, Any], on_output: OnOutput | None = None,
-            cancel: threading.Event | None = None) -> dict[str, Any]:
+    def run(
+        self,
+        params: dict[str, Any],
+        on_output: OnOutput | None = None,
+        cancel: threading.Event | None = None,
+    ) -> dict[str, Any]:
         """Boot a container image (agent sandbox by default), Docker ``run`` style.
 
         Agent mode creates a :class:`Sandbox` and execs the image entrypoint;
@@ -361,72 +421,95 @@ class Engine:
         cmd = params.get("cmd") or None
         if params.get("no_agent"):
             vm = MicroVM.run(
-                image=params.get("image"), dockerfile=params.get("dockerfile"),
-                context=params.get("context") or ".", name=params.get("name"),
-                mem=int(params.get("mem", 512)), cpus=int(params.get("cpus", 1)),
-                cmd=cmd)
+                image=params.get("image"),
+                dockerfile=params.get("dockerfile"),
+                context=params.get("context") or ".",
+                name=params.get("name"),
+                mem=int(params.get("mem", 512)),
+                cpus=int(params.get("cpus", 1)),
+                cmd=cmd,
+            )
             record = self._record_vm(vm, source=vm.meta.get("image"))
-            result = {"name": vm.name, "pid": vm.meta.get("pid"),
-                      "image": vm.meta.get("image")}
+            result = {"name": vm.name, "pid": vm.meta.get("pid"), "image": vm.meta.get("image")}
             if detach:
                 return {**result, "detached": True}
-            rc = self._stream_console(vm, on_output, cancel, terminate_on_cancel=True)
-            record.status = "stopped"
-            return {**result, "returncode": rc}
+            console_rc = self._stream_console(vm, on_output, cancel, terminate_on_cancel=True)
+            self._persist_record_status(record, "stopped", returncode=console_rc)
+            return {**result, "returncode": console_rc}
 
         sandbox_cls = self._sandbox_class()
-        sandbox = sandbox_cls.create(
-            image=params.get("image"), dockerfile=params.get("dockerfile"),
-            context=params.get("context") or ".", name=params.get("name"),
-            cpus=int(params.get("cpus", 1)), memory=int(params.get("mem", 512)),
+        sandbox = self._create_sandbox(
+            sandbox_cls,
+            image=params.get("image"),
+            dockerfile=params.get("dockerfile"),
+            context=params.get("context") or ".",
+            name=params.get("name"),
+            cpus=int(params.get("cpus", 1)),
+            memory=int(params.get("mem", 512)),
             disk_mb=int(params.get("disk_mb", 1024)),
-            timeout=float(params.get("timeout", 300.0)))
-        record = self._record_vm(sandbox.vm, source=sandbox.vm.meta.get("image"),
-                                 sandbox=sandbox)
+            timeout=float(params.get("timeout", 300.0)),
+        )
+        record = self._record_vm(sandbox.vm, source=sandbox.vm.meta.get("image"), sandbox=sandbox)
         argv = default_command(sandbox.image_spec, cmd)
         proc = sandbox.exec(argv)
-        result = {"name": sandbox.name, "pid": sandbox.vm.meta.get("pid"),
-                  "image": sandbox.vm.meta.get("image")}
+        result = {
+            "name": sandbox.name,
+            "pid": sandbox.vm.meta.get("pid"),
+            "image": sandbox.vm.meta.get("image"),
+        }
         if detach:
             return {**result, "detached": True}
+        rc: int | None = None
         try:
             rc = self.pump_process(proc, on_output, cancel)
         finally:
-            try:
-                sandbox.terminate()
-            finally:
-                record.sandbox = None
-                record.status = "stopped"
-        return {**result, "returncode": rc}
+            teardown_rc = self._teardown(record)
+            self._persist_record_status(
+                record, "stopped", returncode=rc if rc is not None else teardown_rc
+            )
+        return {**result, "returncode": int(rc if rc is not None else -1)}
 
-    def restore(self, params: dict[str, Any], on_output: OnOutput | None = None,
-                cancel: threading.Event | None = None) -> dict[str, Any]:
+    def restore(
+        self,
+        params: dict[str, Any],
+        on_output: OnOutput | None = None,
+        cancel: threading.Event | None = None,
+    ) -> dict[str, Any]:
         """Warm-boot a VM from a snapshot; stream its console unless detached."""
         snapshot = params.get("snapshot")
         if not snapshot:
             raise Invalid("restore requires a snapshot name")
-        vm = MicroVM.restore(snapshot, name=params.get("name"),
-                             agent=bool(params.get("agent")))
+        vm = MicroVM.restore(snapshot, name=params.get("name"), agent=bool(params.get("agent")))
         self._record_vm(vm, source=f"restore:{snapshot}")
         meta = vm.meta
-        result = {"name": vm.name, "reconstruct_ms": meta.get("reconstruct_ms"),
-                  "restore_ms": meta.get("restore_ms")}
+        result = {
+            "name": vm.name,
+            "reconstruct_ms": meta.get("reconstruct_ms"),
+            "restore_ms": meta.get("restore_ms"),
+        }
         if params.get("detach"):
             return {**result, "detached": True}
         rc = self._stream_console(vm, on_output, cancel, terminate_on_cancel=True)
+        record = self.get(vm.name)
+        self._persist_record_status(record, "stopped", returncode=rc)
         return {**result, "returncode": rc}
 
-    def fork(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def fork(self, params: dict[str, Any]) -> builtins.list[dict[str, Any]]:
         """Fork ``count`` copy-on-write clones from a snapshot."""
         snapshot = params.get("snapshot")
         if not snapshot:
             raise Invalid("fork requires a snapshot name")
         clones = MicroVM("_forker").fork(snapshot, count=int(params.get("count", 2)))
-        out: list[dict[str, Any]] = []
+        out: builtins.list[dict[str, Any]] = []
         for clone in clones:
             self._record_vm(clone, source=f"fork:{snapshot}")
-            out.append({"name": clone.name, "pid": clone.meta.get("pid"),
-                        "reconstruct_ms": clone.meta.get("reconstruct_ms")})
+            out.append(
+                {
+                    "name": clone.name,
+                    "pid": clone.meta.get("pid"),
+                    "reconstruct_ms": clone.meta.get("reconstruct_ms"),
+                }
+            )
         return out
 
     def start_shell(self, params: dict[str, Any]) -> tuple[Any, str, Callable[[], None]]:
@@ -455,14 +538,15 @@ class Engine:
                 except NotRunning:
                     pass  # a stopped record: fall through to snapshot/template/image
                 else:
-                    proc = self._sandbox_for(ref).exec(*argv, env=env, tty=tty,
-                                                       _track_entry=False)
+                    proc = self._sandbox_for(ref).exec(*argv, env=env, tty=tty, _track_entry=False)
                     return proc, ref, (lambda: None)
 
-        create = dict(
-            cpus=int(params.get("cpus", 1)), memory=int(params.get("mem", 512)),
-            disk_mb=int(params.get("disk_mb", 1024)),
-            timeout=float(params.get("timeout", 300.0)))
+        create = {
+            "cpus": int(params.get("cpus", 1)),
+            "memory": int(params.get("mem", 512)),
+            "disk_mb": int(params.get("disk_mb", 1024)),
+            "timeout": float(params.get("timeout", 300.0)),
+        }
         name: str | None = None
         sandbox: Any = None
         try:
@@ -481,13 +565,15 @@ class Engine:
             else:
                 sandbox_cls = self._sandbox_class()
                 if ref and self._template_exists(ref):
-                    sandbox = sandbox_cls.create(template=ref, **create)
+                    sandbox = self._create_sandbox(sandbox_cls, template=ref, **create)
                 else:
-                    sandbox = sandbox_cls.create(image=image or ref or DEFAULT_SHELL_IMAGE,
-                                                 **create)
+                    sandbox = self._create_sandbox(
+                        sandbox_cls, image=image or ref or DEFAULT_SHELL_IMAGE, **create
+                    )
                 name = sandbox.name
-                self._record_vm(sandbox.vm, source=sandbox.vm.meta.get("image") or "shell",
-                                sandbox=sandbox)
+                self._record_vm(
+                    sandbox.vm, source=sandbox.vm.meta.get("image") or "shell", sandbox=sandbox
+                )
                 proc = sandbox.exec(*argv, env=env, tty=tty, _track_entry=False)
         except BaseException:
             if name is not None:
@@ -502,11 +588,11 @@ class Engine:
                     pass
             raise
 
+        if name is None:
+            raise EngineError("shell setup did not return a VM name")
+
         def cleanup() -> None:
-            try:
-                self.remove(name)
-            except Exception:
-                pass
+            self.remove(name)
 
         return proc, name, cleanup
 
@@ -525,9 +611,16 @@ class Engine:
 
     # -- exec / logs / cp ---------------------------------------------------
 
-    def start_exec(self, name: str, cmd: list[str], *, env: dict[str, str] | None = None,
-                   workdir: str | None = None, tty: bool = False,
-                   timeout: float | None = None) -> Any:
+    def start_exec(
+        self,
+        name: str,
+        cmd: builtins.list[str],
+        *,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+        tty: bool = False,
+        timeout: float | None = None,
+    ) -> Any:
         """Start an exec session inside a running VM; returns the live ``Process``.
 
         The caller (daemon or HTTP adapter) pumps ``proc.stdout``/``stderr``,
@@ -539,8 +632,14 @@ class Engine:
         sandbox = self._sandbox_for(name)
         return sandbox.exec(*cmd, workdir=workdir, env=env, tty=tty, timeout=timeout)
 
-    def logs(self, name: str, *, follow: bool = False, on_line: OnOutput | None = None,
-             cancel: threading.Event | None = None) -> str | None:
+    def logs(
+        self,
+        name: str,
+        *,
+        follow: bool = False,
+        on_line: OnOutput | None = None,
+        cancel: threading.Event | None = None,
+    ) -> str | None:
         """Return or stream a VM's console. Read-only: never affects the VM."""
         self.get(name)
         vm = MicroVM(name)
@@ -572,7 +671,7 @@ class Engine:
     def delete_file(self, name: str, path: str, recursive: bool = False) -> None:
         self._sandbox_for(name).filesystem.remove(path, recursive=recursive)
 
-    def list_files(self, name: str, path: str) -> list[dict[str, Any]]:
+    def list_files(self, name: str, path: str) -> builtins.list[dict[str, Any]]:
         return list(self._sandbox_for(name).filesystem.list_files(path))
 
     def stat_file(self, name: str, path: str) -> dict[str, Any]:
@@ -585,7 +684,7 @@ class Engine:
         return dict(MicroVM(name).pause() or {})
 
     def resume(self, name: str) -> dict[str, Any]:
-        self.get(name)
+        self.get(name, require_running=True)
         return dict(MicroVM(name).resume() or {})
 
     def snapshot_template(self, name: str, snapshot: str, stop: bool = False) -> str:
@@ -594,20 +693,24 @@ class Engine:
         record = self.get(name, require_running=True)
         vm = MicroVM(name)
         snap_dir = vm.snapshot(
-            snapshot, keep_running=not stop,
-            disk_src=vm.rootfs_img if vm.rootfs_img.exists() else None)
+            snapshot,
+            keep_running=not stop,
+            disk_src=vm.rootfs_img if vm.rootfs_img.exists() else None,
+        )
         if stop:
             # Route the stop through engine teardown so a sandbox VM's TAP/lease
             # and rehydrated volume locks are released, not just the VMM process.
-            self._teardown(record)
-            record.status = "stopped"
+            rc = self._teardown(record)
+            self._persist_record_status(record, "stopped", returncode=rc)
         return str(snap_dir)
 
     def stop(self, name: str) -> dict[str, Any]:
         """Stop a VM and release its process-bound resources (idempotent)."""
         record = self.get(name)
-        self._teardown(record)
-        record.status = "stopped"
+        if record.status == "terminated":
+            return {"name": name, "status": record.status}
+        rc = self._teardown(record)
+        self._persist_record_status(record, "stopped", returncode=rc)
         return {"name": name, "status": "stopped"}
 
     def remove(self, name: str) -> dict[str, Any]:
@@ -619,15 +722,18 @@ class Engine:
             self._records.pop(name, None)
         return {"name": name, "removed": True}
 
-    def _teardown(self, record: VMRecord) -> None:
+    def _teardown(self, record: VMRecord) -> int | None:
         """Release every host resource a VM holds (idempotent, best-effort).
 
         A live sandbox owns the full teardown (agent, network, volumes, VM); a
         rehydrated/attached record falls back to stopping the VM, tearing down
         network state from the on-disk lease, and releasing re-acquired volumes.
+        The best return code observed before or after teardown is returned so
+        callers can preserve final status in the registry.
         """
         name = record.name
         sandbox = record.sandbox
+        returncode = self._sandbox_returncode(sandbox)
         if sandbox is not None:
             try:
                 term = getattr(sandbox, "terminate", None) or getattr(sandbox, "stop", None)
@@ -636,8 +742,10 @@ class Engine:
             except Exception:
                 pass
             finally:
+                if returncode is None:
+                    returncode = self._sandbox_returncode(sandbox)
                 record.sandbox = None
-            return
+            return returncode
         vm = MicroVM(name)
         try:
             if vm.is_running():
@@ -650,6 +758,17 @@ class Engine:
                 except Exception:
                     pass
             record.volumes = []
+        return returncode
+
+    @staticmethod
+    def _sandbox_returncode(sandbox: Any) -> int | None:
+        if sandbox is None:
+            return None
+        try:
+            rc = getattr(sandbox, "returncode", None)
+        except Exception:
+            return None
+        return int(rc) if rc is not None else None
 
     @staticmethod
     def _teardown_network(name: str) -> None:
@@ -667,8 +786,9 @@ class Engine:
         if lease is None:
             return
         try:
-            net.teardown_tap(lease["tap"], lease["guest_ip"], lease["host_ip"],
-                             int(lease["prefix"]))
+            net.teardown_tap(
+                lease["tap"], lease["guest_ip"], lease["host_ip"], int(lease["prefix"])
+            )
         except Exception:
             pass
         try:
@@ -682,15 +802,10 @@ class Engine:
         """Create a Modal-style sandbox and register it (used by the web gateway)."""
         request_time = time.time()
         params = _coerce_create_params(dict(params))
-        sid = params.get("name") or f"sb-{uuid.uuid4().hex[:12]}"
-        params.setdefault("name", sid)
+        sid = str(params.get("name") or f"sb-{uuid.uuid4().hex[:12]}")
+        params["name"] = sid
         sandbox_cls = self._sandbox_class()
-        try:
-            sandbox = sandbox_cls.create(**params)
-        except EngineError:
-            raise
-        except Exception as exc:  # SDK errors surface as a create failure.
-            raise EngineError(f"sandbox create failed: {exc}") from exc
+        sandbox = self._create_sandbox(sandbox_cls, **params)
         now = time.time()
         tags = dict(params.get("tags") or getattr(sandbox, "tags", {}) or {})
         detail = {
@@ -708,11 +823,19 @@ class Engine:
             "create_latency_ms": (now - request_time) * 1000.0,
         }
         record = VMRecord(
-            id=sid, name=str(params["name"]), status="running", sandbox=sandbox,
+            id=sid,
+            name=str(params["name"]),
+            status="running",
+            sandbox=sandbox,
             pid=getattr(getattr(sandbox, "vm", None), "meta", {}).get("pid")
-            if hasattr(sandbox, "vm") else None,
+            if hasattr(sandbox, "vm")
+            else None,
             source=params.get("image") or params.get("template"),
-            created_at=now, timeout=params.get("timeout"), tags=tags, detail=detail)
+            created_at=now,
+            timeout=params.get("timeout"),
+            tags=tags,
+            detail=detail,
+        )
         with self._lock:
             self._records[sid] = record
         return record
@@ -720,17 +843,19 @@ class Engine:
     def terminate(self, name: str, *, reason: str = "api") -> VMRecord:
         """Terminate a running sandbox (web semantics: status -> ``terminated``)."""
         record = self.get(name, require_running=True)
-        sandbox = record.sandbox
-        self._teardown(record)
-        returncode = getattr(sandbox, "returncode", None) if sandbox is not None else None
+        returncode = self._teardown(record)
         if self._detect_oom(name):
             reason = "oom"
             record.detail["oom"] = True
-        record.status = "terminated"
-        record.terminated_at = time.time()
+        terminated_at = time.time()
+        self._persist_record_status(
+            record, "terminated", returncode=returncode, terminated_at=terminated_at
+        )
         record.detail["terminated_reason"] = reason
-        if returncode is not None:
-            record.detail["returncode"] = returncode
+        try:
+            MicroVM(name)._save_meta(terminated_reason=reason, oom=bool(record.detail.get("oom")))
+        except Exception:
+            pass
         return record
 
     def snapshot_filesystem(self, name: str, snapshot: str | None = None) -> str:
@@ -748,15 +873,21 @@ class Engine:
             raise Unsupported("sandbox extend API unavailable")
         return dict(fn(secs) or {})
 
-    def set_network_policy(self, name: str, *, block_network: bool | None = None,
-                           cidr_allow: list[str] | None = None,
-                           domain_allow: list[str] | None = None) -> dict[str, Any]:
+    def set_network_policy(
+        self,
+        name: str,
+        *,
+        block_network: bool | None = None,
+        cidr_allow: builtins.list[str] | None = None,
+        domain_allow: builtins.list[str] | None = None,
+    ) -> dict[str, Any]:
         sandbox = self._sandbox_for(name)
         setter = getattr(sandbox, "set_network_policy", None)
         if setter is None:
             raise Unsupported("sandbox network policy API unavailable")
-        result = setter(block_network=block_network, cidr_allow=cidr_allow,
-                        domain_allow=domain_allow)
+        result = setter(
+            block_network=block_network, cidr_allow=cidr_allow, domain_allow=domain_allow
+        )
         return dict(result or {})
 
     def tunnels(self, name: str) -> dict[int, tuple[str, int]]:
@@ -777,7 +908,7 @@ class Engine:
         meta = MicroVM(name).meta
         if not isinstance(meta, dict):
             return False
-        candidates: list[Path] = []
+        candidates: builtins.list[Path] = []
         for key in ("memory_events", "memory_events_path"):
             if meta.get(key):
                 candidates.append(Path(str(meta[key])))
@@ -801,9 +932,13 @@ class Engine:
 
     # -- streaming helpers --------------------------------------------------
 
-    def _stream_console(self, vm: MicroVM, on_output: OnOutput | None,
-                        cancel: threading.Event | None,
-                        terminate_on_cancel: bool) -> int:
+    def _stream_console(
+        self,
+        vm: MicroVM,
+        on_output: OnOutput | None,
+        cancel: threading.Event | None,
+        terminate_on_cancel: bool,
+    ) -> int:
         """Tail a VM's console until it exits. ``cancel`` stops streaming; when
         ``terminate_on_cancel`` it also stops the VM (foreground ``run``)."""
         printed = 0
@@ -827,21 +962,23 @@ class Engine:
                 return -1
             time.sleep(0.1)
 
-    def pump_process(self, proc: Any, on_output: OnOutput | None = None,
-                     cancel: threading.Event | None = None) -> int:
+    def pump_process(
+        self, proc: Any, on_output: OnOutput | None = None, cancel: threading.Event | None = None
+    ) -> int:
         """Stream a process's stdout/stderr via ``on_output`` and return its code.
 
         Reader threads drain each stream; the wait is cancel-aware so a client
         disconnect kills the entry exec (the foreground ``run`` is bound to the
         connection).
         """
-        threads: list[threading.Thread] = []
+        threads: builtins.list[threading.Thread] = []
         for stream_name in ("stdout", "stderr"):
             stream = getattr(proc, stream_name, None)
             if stream is None:
                 continue
-            thread = threading.Thread(target=self._drain_stream,
-                                      args=(stream_name, stream, on_output), daemon=True)
+            thread = threading.Thread(
+                target=self._drain_stream, args=(stream_name, stream, on_output), daemon=True
+            )
             thread.start()
             threads.append(thread)
         rc = self._wait_cancellable(proc, cancel)

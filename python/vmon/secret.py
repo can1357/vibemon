@@ -13,32 +13,50 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 
+def _coerce_env_name(name: object) -> str:
+    text = str(name)
+    if not text or "=" in text or "\x00" in text:
+        raise ValueError("secret environment names must be non-empty and contain no '=' or NUL")
+    return text
+
+
+def _coerce_env_value(value: object) -> str:
+    text = str(value)
+    if "\x00" in text:
+        raise ValueError("secret environment values must contain no NUL bytes")
+    return text
+
+
 @dataclass
 class Secret:
     """A bundle of environment variables injected into the guest at exec time."""
 
     env: dict[str, str] = field(default_factory=dict)
 
-    @classmethod
-    def from_dict(cls, values: Mapping[str, object]) -> "Secret":
-        """Build a Secret from an explicit name->value mapping."""
-        return cls({str(k): str(v) for k, v in values.items()})
+    def __post_init__(self) -> None:
+        self.env = {_coerce_env_name(k): _coerce_env_value(v) for k, v in self.env.items()}
 
     @classmethod
-    def from_env(cls, *names: str) -> "Secret":
+    def from_dict(cls, values: Mapping[str, object]) -> Secret:
+        """Build a Secret from an explicit name->value mapping."""
+        return cls({_coerce_env_name(k): _coerce_env_value(v) for k, v in values.items()})
+
+    @classmethod
+    def from_env(cls, *names: str) -> Secret:
         """Capture the named variables from the host process environment.
 
         Missing names are skipped; the host value is never echoed elsewhere.
         """
-        return cls({name: os.environ[name] for name in names if name in os.environ})
+        wanted = [_coerce_env_name(name) for name in names]
+        return cls({name: os.environ[name] for name in wanted if name in os.environ})
 
     def names(self) -> list[str]:
         """Sorted variable names (safe to persist; values are not)."""
-        return sorted(self.env)
+        return sorted(self.as_env())
 
     def as_env(self) -> dict[str, str]:
         """A copy of the variable map for injection into an exec env."""
-        return dict(self.env)
+        return {_coerce_env_name(k): _coerce_env_value(v) for k, v in self.env.items()}
 
 
 def merge_secrets(secrets: Iterable[object] | None) -> dict[str, str]:
@@ -50,9 +68,9 @@ def merge_secrets(secrets: Iterable[object] | None) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in secrets or ():
         if isinstance(item, Secret):
-            out.update(item.env)
+            out.update(item.as_env())
         elif isinstance(item, Mapping):
-            out.update({str(k): str(v) for k, v in item.items()})
+            out.update(Secret.from_dict(item).env)
         else:
             raise TypeError(f"expected Secret or mapping, got {type(item).__name__}")
     return out

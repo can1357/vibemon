@@ -32,7 +32,7 @@ class ImageSpec:
         return [*self.entrypoint, *self.cmd]
 
     def env_dict(self) -> dict[str, str]:
-        return {k: v for k, v in (e.split("=", 1) for e in self.env if "=" in e)}
+        return dict(e.split("=", 1) for e in self.env if "=" in e)
 
 
 @dataclass
@@ -48,7 +48,7 @@ class CachedTemplate:
 
 
 def _state() -> Path:
-    return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+    return Path(os.environ.get("VMON_HOME") or str(Path.home() / ".vmon")).expanduser()
 
 
 def detect_engine() -> str:
@@ -62,15 +62,32 @@ def _run(cmd: list[str], **kw) -> str:
     return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw).stdout
 
 
-def build_or_pull(reference: str | None, dockerfile: str | None,
-                  context: str = ".", engine: str | None = None) -> tuple[str, str]:
+def _normalize_reference(reference: str | None) -> str | None:
+    if reference is None:
+        return None
+    ref = str(reference).strip()
+    if not ref:
+        return None
+    if any(ch.isspace() for ch in ref):
+        raise ValueError(f"image reference must not contain whitespace: {reference!r}")
+    return ref
+
+
+def build_or_pull(
+    reference: str | None, dockerfile: str | None, context: str = ".", engine: str | None = None
+) -> tuple[str, str]:
     """Return (engine, image_reference), building the Dockerfile or pulling the ref."""
     engine = engine or detect_engine()
     if dockerfile:
-        h = hashlib.sha1((os.path.abspath(dockerfile) + "\0" + os.path.abspath(context)).encode()).hexdigest()
+        dockerfile_s = os.fspath(dockerfile)
+        context_s = os.fspath(context)
+        h = hashlib.sha1(
+            (os.path.abspath(dockerfile_s) + "\0" + os.path.abspath(context_s)).encode()
+        ).hexdigest()
         tag = "vmon-" + h[:12]
-        subprocess.run([engine, "build", "-f", dockerfile, "-t", tag, context], check=True)
+        subprocess.run([engine, "build", "-f", dockerfile_s, "-t", tag, context_s], check=True)
         return engine, tag
+    reference = _normalize_reference(reference)
     if not reference:
         raise ValueError("provide an image reference or a --dockerfile")
     if subprocess.run([engine, "image", "inspect", reference], capture_output=True).returncode != 0:
@@ -114,9 +131,7 @@ def _sh_quote(arg: str) -> str:
 
 def _init_script(spec: ImageSpec, argv: list[str]) -> str:
     exports = "\n".join(
-        f"export {e.split('=', 1)[0]}={_sh_quote(e.split('=', 1)[1])}"
-        for e in spec.env
-        if "=" in e
+        f"export {e.split('=', 1)[0]}={_sh_quote(e.split('=', 1)[1])}" for e in spec.env if "=" in e
     )
     run_line = " ".join(_sh_quote(a) for a in argv) if argv else "/bin/sh"
     workdir = spec.workdir or "/"
@@ -135,9 +150,14 @@ reboot -f 2>/dev/null || poweroff -f 2>/dev/null || while true; do sleep 3600; d
 """
 
 
-def build_rootfs(reference: str | None = None, dockerfile: str | None = None,
-                 context: str = ".", cmd_override: list[str] | None = None,
-                 out_dir: str | None = None, engine: str | None = None) -> tuple[Path, ImageSpec]:
+def build_rootfs(
+    reference: str | None = None,
+    dockerfile: str | None = None,
+    context: str = ".",
+    cmd_override: list[str] | None = None,
+    out_dir: str | None = None,
+    engine: str | None = None,
+) -> tuple[Path, ImageSpec]:
     """Build a legacy initramfs cpio.gz for the image/Dockerfile."""
     engine, reference = build_or_pull(reference, dockerfile, context, engine)
     spec = _inspect(engine, reference)
@@ -158,9 +178,17 @@ def build_rootfs(reference: str | None = None, dockerfile: str | None = None,
     return initramfs, spec
 
 
-def cached_template(image: str | None = None, *, dockerfile: str | None = None,
-                    context: str = ".", disk_mb: int = 1024, engine: str | None = None,
-                    timeout: float = 300, memory: int = 512, cpus: int = 1) -> CachedTemplate:
+def cached_template(
+    image: str | None = None,
+    *,
+    dockerfile: str | None = None,
+    context: str = ".",
+    disk_mb: int = 1024,
+    engine: str | None = None,
+    timeout: float = 300,
+    memory: int = 512,
+    cpus: int = 1,
+) -> CachedTemplate:
     """Build/cache an agent-capable ext4 rootfs and a ping-verified VM snapshot."""
     if disk_mb <= 0:
         raise ValueError("disk_mb must be positive")
@@ -198,6 +226,7 @@ def cached_template(image: str | None = None, *, dockerfile: str | None = None,
     tpl_dir = _state() / "templates" / tpl_name
     template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb)
     from .vmm import _snapshot_state_present
+
     if _snapshot_state_present(tpl_dir) and (tpl_dir / "rootfs.img").is_file():
         return template
 
@@ -209,12 +238,19 @@ def cached_template(image: str | None = None, *, dockerfile: str | None = None,
         old.stop()
     old.remove()
 
-    vm = MicroVM.boot_rootfs(rootfs_ext4, name=vm_name, mem=memory, cpus=cpus,
-                             snapshot_root=_state() / "templates", image=spec.reference)
+    vm = MicroVM.boot_rootfs(
+        rootfs_ext4,
+        name=vm_name,
+        mem=memory,
+        cpus=cpus,
+        snapshot_root=_state() / "templates",
+        image=spec.reference,
+    )
     try:
         vm.agent(connect_timeout=timeout).ping(timeout=timeout)
-        vm.snapshot(tpl_name, keep_running=False, disk_src=rootfs_ext4,
-                    snapshot_root=_state() / "templates")
+        vm.snapshot(
+            tpl_name, keep_running=False, disk_src=rootfs_ext4, snapshot_root=_state() / "templates"
+        )
     finally:
         if vm.is_running():
             vm.stop()
@@ -235,7 +271,7 @@ def _is_static_elf(path: Path) -> bool:
         if len(header) < 16 or header[:4] != b"\x7fELF":
             return False
         ei_class = header[4]  # 1 = ELFCLASS32, 2 = ELFCLASS64
-        ei_data = header[5]   # 1 = little-endian, 2 = big-endian
+        ei_data = header[5]  # 1 = little-endian, 2 = big-endian
         endian = "<" if ei_data == 1 else ">"
         if ei_class == 1:
             if len(header) < 48:
@@ -298,12 +334,13 @@ def find_agent_binary() -> Path:
     """
     arch = _agent_arch()
     if env := os.environ.get("VMON_AGENT"):
-        p = Path(env)
+        p = Path(env).expanduser()
         if not p.is_file():
             raise FileNotFoundError(f"VMON_AGENT points to missing file: {p}")
         if not _is_static_elf(p):
             raise RuntimeError(
-                f"vmon-agent must be a static (musl) binary for arbitrary guest rootfs. {_STATIC_AGENT_HINT}"
+                "vmon-agent must be a static (musl) binary for arbitrary guest rootfs. "
+                f"{_STATIC_AGENT_HINT}"
             )
         return p
 
@@ -316,19 +353,24 @@ def find_agent_binary() -> Path:
         repo / "target" / f"{arch}-unknown-linux-gnu" / "release" / "vmon-agent",
     ]
     if target_dir := os.environ.get("CARGO_TARGET_DIR"):
-        candidates.append(Path(target_dir) / f"{arch}-unknown-linux-musl" / "release" / "vmon-agent")
+        candidates.append(
+            Path(target_dir) / f"{arch}-unknown-linux-musl" / "release" / "vmon-agent"
+        )
         candidates.append(Path(target_dir) / "release" / "vmon-agent")
     if found := shutil.which("vmon-agent"):
         candidates.append(Path(found))
 
+    checked = ", ".join(str(p) for p in candidates)
     if selected := _first_static(candidates):
         return selected
     if any(p.is_file() for p in candidates):
         raise RuntimeError(
-            f"a vmon-agent was found but is not a static (musl) binary required for "
-            f"arbitrary guest rootfs. {_STATIC_AGENT_HINT}"
+            f"a vmon-agent for {arch} was found but is not a static (musl) binary "
+            f"required for arbitrary guest rootfs; checked: {checked}. {_STATIC_AGENT_HINT}"
         )
-    raise RuntimeError(f"vmon-agent binary not found. {_STATIC_AGENT_HINT}")
+    raise RuntimeError(
+        f"vmon-agent binary for {arch} not found; checked: {checked}. {_STATIC_AGENT_HINT}"
+    )
 
 
 def _export_image(engine: str, reference: str, rootfs: Path, work: Path) -> None:
@@ -398,9 +440,13 @@ def _mkfs_ext4(rootfs: Path, out: Path, disk_mb: int) -> None:
 
 def _pack_cpio(rootfs: Path, out: Path) -> None:
     find = subprocess.Popen(["find", ".", "-print0"], cwd=rootfs, stdout=subprocess.PIPE)
-    cpio = subprocess.Popen(["cpio", "--null", "-o", "-H", "newc"],
-                            cwd=rootfs, stdin=find.stdout, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
+    cpio = subprocess.Popen(
+        ["cpio", "--null", "-o", "-H", "newc"],
+        cwd=rootfs,
+        stdin=find.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
     with open(out, "wb") as fh:
         gzip = subprocess.Popen(["gzip", "-1"], stdin=cpio.stdout, stdout=fh)
     if find.stdout is not None:

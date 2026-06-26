@@ -100,8 +100,9 @@ class _Conn:
 class DaemonClient:
     """Connects to the ``vmond`` daemon, auto-starting a local one on demand."""
 
-    def __init__(self, sock_path: str | os.PathLike[str] | None = None, *,
-                 autostart: bool = True) -> None:
+    def __init__(
+        self, sock_path: str | os.PathLike[str] | None = None, *, autostart: bool = True
+    ) -> None:
         self._token = os.environ.get("VMON_API_TOKEN")
         self._remote = self._parse_remote(os.environ.get("VMON_REMOTE"))
         self._sock_path = Path(sock_path) if sock_path is not None else daemon_paths()["sock"]
@@ -113,8 +114,7 @@ class DaemonClient:
             return None
         host, _, port = value.rpartition(":")
         if not host or not port.isdigit():
-            raise DaemonError(f"invalid VMON_REMOTE {value!r}; expected host:port",
-                              code="invalid")
+            raise DaemonError(f"invalid VMON_REMOTE {value!r}; expected host:port", code="invalid")
         return (host, int(port))
 
     # -- public API ---------------------------------------------------------
@@ -128,8 +128,9 @@ class DaemonClient:
         finally:
             conn.close()
 
-    def stream(self, method: str, on_event: OnEvent,
-               stdin: BinaryIO | None = None, **params: Any) -> dict[str, Any]:
+    def stream(
+        self, method: str, on_event: OnEvent, stdin: BinaryIO | None = None, **params: Any
+    ) -> dict[str, Any]:
         """Send a streaming request, dispatching event frames to *on_event*.
 
         When *stdin* is a readable binary stream its bytes are forwarded as
@@ -140,16 +141,26 @@ class DaemonClient:
         try:
             conn.send_request(method, params)
             if stdin is not None:
-                threading.Thread(target=self._forward_stdin, args=(conn, stdin, stop),
-                                 name="vmon-stdin", daemon=True).start()
+                threading.Thread(
+                    target=self._forward_stdin,
+                    args=(conn, stdin, stop),
+                    name="vmon-stdin",
+                    daemon=True,
+                ).start()
             return self._await_result(conn, on_event=on_event)
         finally:
             stop.set()
             conn.close()
 
-    def interactive(self, method: str, on_event: OnEvent, *, tty: bool = True,
-                    on_ready: Callable[[str], None] | None = None,
-                    **params: Any) -> dict[str, Any]:
+    def interactive(
+        self,
+        method: str,
+        on_event: OnEvent,
+        *,
+        tty: bool = True,
+        on_ready: Callable[[str], None] | None = None,
+        **params: Any,
+    ) -> dict[str, Any]:
         """Run a PTY-style streaming method (``shell`` / interactive ``exec``).
 
         Waits for the daemon's ``ready`` event (so a caller can stop a boot
@@ -176,9 +187,12 @@ class DaemonClient:
                         raw = self._enter_raw()
                         self._send_winsize(conn)
                         winch = self._install_winch(conn)
-                    threading.Thread(target=self._forward_raw_stdin,
-                                     args=(conn, stop), name="vmon-stdin",
-                                     daemon=True).start()
+                    threading.Thread(
+                        target=self._forward_raw_stdin,
+                        args=(conn, stop),
+                        name="vmon-stdin",
+                        daemon=True,
+                    ).start()
                     # After raw mode + stdin forwarding are live: input typed from
                     # here on is preserved (raw mode's TCSAFLUSH has already run).
                     if on_ready is not None:
@@ -191,8 +205,9 @@ class DaemonClient:
                     result = frame.get("result")
                     return result if isinstance(result, dict) else {}
                 error = frame.get("error") or {}
-                raise DaemonError(error.get("message", "request failed"),
-                                  code=error.get("code", "internal"))
+                raise DaemonError(
+                    error.get("message", "request failed"), code=error.get("code", "internal")
+                )
         finally:
             stop.set()
             if winch is not None:
@@ -205,6 +220,7 @@ class DaemonClient:
     def _enter_raw() -> tuple[int, Any]:
         import termios
         import tty as _tty
+
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         _tty.setraw(fd)
@@ -213,6 +229,7 @@ class DaemonClient:
     @staticmethod
     def _exit_raw(raw: tuple[int, Any]) -> None:
         import termios
+
         fd, old = raw
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -222,6 +239,7 @@ class DaemonClient:
     @staticmethod
     def _send_winsize(conn: _Conn) -> None:
         import shutil
+
         size = shutil.get_terminal_size((80, 24))
         conn.send_resize(size.lines, size.columns)
 
@@ -231,6 +249,7 @@ class DaemonClient:
                 self._send_winsize(conn)
             except OSError:
                 pass
+
         try:
             return signal.signal(signal.SIGWINCH, handler)
         except (ValueError, AttributeError):
@@ -271,8 +290,7 @@ class DaemonClient:
         so a local ``os.kill`` would hit an unrelated process.
         """
         if self._remote is not None:
-            raise DaemonError("cannot stop a remote daemon over VMON_REMOTE",
-                              code="invalid")
+            raise DaemonError("cannot stop a remote daemon over VMON_REMOTE", code="invalid")
         info = self.call("info")
         pid = info.get("pid")
         if pid:
@@ -297,8 +315,9 @@ class DaemonClient:
                 result = frame.get("result")
                 return result if isinstance(result, dict) else {}
             error = frame.get("error") or {}
-            raise DaemonError(error.get("message", "request failed"),
-                              code=error.get("code", "internal"))
+            raise DaemonError(
+                error.get("message", "request failed"), code=error.get("code", "internal")
+            )
 
     @staticmethod
     def _dispatch_event(frame: dict[str, Any], on_event: OnEvent) -> None:
@@ -327,15 +346,21 @@ class DaemonClient:
 
     def _open(self) -> _Conn:
         sock = self._connect()
-        conn = _Conn(sock)
-        banner = conn.read_obj()
-        if not banner or banner.get("api") != API_VERSION:
-            conn.close()
-            raise DaemonError(f"unsupported daemon banner: {banner!r}", code="protocol")
-        if self._remote is not None:
-            # TCP always leads with an auth frame (empty when no token is set).
-            conn.send_auth(self._token or "")
-        return conn
+        try:
+            sock.settimeout(10.0)
+            conn = _Conn(sock)
+            banner = conn.read_obj()
+            if not banner or banner.get("api") != API_VERSION:
+                conn.close()
+                raise DaemonError(f"unsupported daemon banner: {banner!r}", code="protocol")
+            sock.settimeout(None)
+            if self._remote is not None:
+                # TCP always leads with an auth frame (empty when no token is set).
+                conn.send_auth(self._token or "")
+            return conn
+        except Exception:
+            sock.close()
+            raise
 
     def _connect(self) -> socket.socket:
         if self._remote is not None:
@@ -343,15 +368,17 @@ class DaemonClient:
             try:
                 return socket.create_connection((host, port), timeout=10.0)
             except OSError as exc:
-                raise DaemonError(f"cannot reach remote daemon {host}:{port}: {exc}",
-                                  code="unreachable") from exc
+                raise DaemonError(
+                    f"cannot reach remote daemon {host}:{port}: {exc}", code="unreachable"
+                ) from exc
         try:
             return self._connect_uds()
         except (FileNotFoundError, ConnectionRefusedError):
             if not self._autostart:
                 raise DaemonError(
                     f"vmond not running at {self._sock_path} (vmon daemon start)",
-                    code="unreachable")
+                    code="unreachable",
+                ) from None
             self._autostart_daemon()
             return self._connect_uds()
 
@@ -373,8 +400,7 @@ class DaemonClient:
         """
         paths = daemon_paths()
         paths["home"].mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(str(paths["home"] / "vmond.start.lock"),
-                          os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(str(paths["home"] / "vmond.start.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if self._ping_ok():
@@ -383,8 +409,11 @@ class DaemonClient:
             try:
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "vmon.daemon"],
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                    start_new_session=True)
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
             finally:
                 log.close()
             deadline = time.time() + _AUTOSTART_TIMEOUT
@@ -392,12 +421,15 @@ class DaemonClient:
                 if proc.poll() is not None:
                     raise DaemonError(
                         f"vmond exited (code {proc.returncode}) on startup; see {paths['log']}",
-                        code="start_failed")
+                        code="start_failed",
+                    )
                 if self._ping_ok():
                     return
                 time.sleep(0.05)
-            raise DaemonError(f"vmond did not become ready in {_AUTOSTART_TIMEOUT:.0f}s; "
-                              f"see {paths['log']}", code="start_failed")
+            raise DaemonError(
+                f"vmond did not become ready in {_AUTOSTART_TIMEOUT:.0f}s; see {paths['log']}",
+                code="start_failed",
+            )
         finally:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -409,8 +441,10 @@ class DaemonClient:
             sock = self._connect_uds()
         except OSError:
             return False
-        conn = _Conn(sock)
+        conn: _Conn | None = None
         try:
+            sock.settimeout(1.0)
+            conn = _Conn(sock)
             banner = conn.read_obj()
             if not banner or banner.get("api") != API_VERSION:
                 return False
@@ -420,4 +454,7 @@ class DaemonClient:
         except OSError:
             return False
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
+            else:
+                sock.close()

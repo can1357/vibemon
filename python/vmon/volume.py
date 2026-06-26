@@ -20,15 +20,40 @@ VOLUME_DIR = STATE / "volumes"
 
 _NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
 
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _ensure_private_dir(path: Path, *, parents: bool) -> None:
+    """Create/open ``path`` as a real private directory, rejecting symlinks."""
+    try:
+        path.mkdir(mode=0o700, parents=parents, exist_ok=True)
+    except FileExistsError as exc:
+        raise ValueError(f"unsafe volume path {path!s}: not a directory") from exc
+    try:
+        fd = os.open(str(path), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
+    try:
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _open_volume_dir(path: Path) -> int:
+    """Open an existing volume directory without following a final symlink."""
+    try:
+        return os.open(str(path), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
+
 
 class Volume:
     """A persistent, single-writer named host directory shared into a guest."""
 
     def __init__(self, name: str) -> None:
-        if not _NAME_RE.match(name):
-            raise ValueError(
-                f"invalid volume name {name!r}: must match {_NAME_RE.pattern}"
-            )
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid volume name {name!r}: must match {_NAME_RE.pattern}")
         self.name = name
         self.host_dir = VOLUME_DIR / name
         self._lock_fd: int | None = None
@@ -36,7 +61,8 @@ class Volume:
 
     def ensure(self) -> Path:
         """Create the host directory (idempotent) and return it."""
-        self.host_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(VOLUME_DIR, parents=True)
+        _ensure_private_dir(self.host_dir, parents=False)
         return self.host_dir
 
     def acquire(self) -> None:
@@ -45,7 +71,24 @@ class Volume:
             if self._lock_fd is not None:
                 return
             self.ensure()
-            fd = os.open(str(self.host_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+            dir_fd = _open_volume_dir(self.host_dir)
+            fd = None
+            try:
+                fd = os.open(
+                    ".lock",
+                    os.O_RDWR | os.O_CREAT | _O_NOFOLLOW,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                if fd is not None:
+                    os.close(fd)
+                raise ValueError(
+                    f"unsafe volume lock for {self.name!r}: not a regular file"
+                ) from exc
+            finally:
+                os.close(dir_fd)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
@@ -84,6 +127,10 @@ class Volume:
     @classmethod
     def list(cls) -> list[str]:
         """Names of existing volumes under :data:`VOLUME_DIR` (``[]`` if none)."""
-        if not VOLUME_DIR.is_dir():
+        if not VOLUME_DIR.is_dir() or VOLUME_DIR.is_symlink():
             return []
-        return sorted(p.name for p in VOLUME_DIR.iterdir() if p.is_dir())
+        return sorted(
+            p.name
+            for p in VOLUME_DIR.iterdir()
+            if not p.is_symlink() and p.is_dir() and _NAME_RE.fullmatch(p.name)
+        )
