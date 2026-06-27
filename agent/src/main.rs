@@ -138,6 +138,14 @@ mod linux_agent {
 			if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
 				return Err(format!("tcsetattr {HVC0}: {}", io::Error::last_os_error()));
 			}
+			// Discard anything the tty buffered (and line-discipline-mangled) before
+			// raw mode took effect — kernel/boot console noise on hvc0, or canonical
+			// CR/LF rewrites — so the first `read_frame` starts on a clean boundary.
+			// The host only sends real frames in response to later client actions,
+			// so flushing the startup buffer never drops a genuine request.
+			if libc::tcflush(fd, libc::TCIFLUSH) != 0 {
+				return Err(format!("tcflush {HVC0}: {}", io::Error::last_os_error()));
+			}
 		}
 		Ok(())
 	}
@@ -158,6 +166,12 @@ mod linux_agent {
 		spawn_orphan_reaper(sessions.clone());
 
 		let agent = Agent { writer, sessions, pending_writes };
+
+		// Discard pre-protocol bytes (guest-kernel console noise on hvc0) up to the
+		// host's SYNC marker so the frame loop starts on a clean boundary.
+		if !proto::resync_to_marker(&mut reader).map_err(|err| format!("resync {HVC0}: {err}"))? {
+			return Ok(());
+		}
 
 		loop {
 			match proto::read_frame(&mut reader) {
