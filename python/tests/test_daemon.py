@@ -8,14 +8,11 @@ ever signalling the test process.
 """
 
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from contextlib import suppress
-from pathlib import Path
 
 import pytest
 
@@ -113,28 +110,7 @@ class FakeSandbox:
 
 
 @pytest.fixture
-def short_home(monkeypatch):
-    """A short ``$VMON_HOME`` so the daemon's Unix socket fits AF_UNIX path limits.
-
-    pytest's ``tmp_path`` is too deep for ``sun_path`` (~104 bytes) on macOS, so
-    point VMON_HOME at a short ``/tmp`` dir and repoint the cached module STATEs.
-    """
-    home = tempfile.mkdtemp(prefix="vmont", dir="/tmp")
-    monkeypatch.setenv("VMON_HOME", home)
-    import vmon.vmm as vmm_mod
-    import vmon.volume as volume_mod
-
-    monkeypatch.setattr(vmm_mod, "STATE", Path(home))
-    monkeypatch.setattr(volume_mod, "STATE", Path(home))
-    monkeypatch.setattr(volume_mod, "VOLUME_DIR", Path(home) / "volumes")
-    try:
-        yield home
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-@pytest.fixture
-def fake_engine(monkeypatch, short_home):
+def fake_engine(monkeypatch):
     monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
     FakeSandbox.instances = {}
     return core.Engine()
@@ -446,7 +422,7 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
     assert b"vm$ " in bytes(seen) and b"ok" in bytes(seen)  # output reached the TTY
 
 
-def test_autostart_spawns_daemon(short_home):
+def test_autostart_spawns_daemon():
     """A bare client with no running daemon spawns one and binds the socket."""
     client = DaemonClient()
     try:
@@ -459,7 +435,7 @@ def test_autostart_spawns_daemon(short_home):
             client.stop_daemon()
 
 
-def test_single_owner_second_daemon_exits_without_rebinding(short_home):
+def test_single_owner_second_daemon_exits_without_rebinding():
     paths = daemon_paths()
     paths["home"].mkdir(parents=True, exist_ok=True)
     lock_fd = acquire_owner_lock(paths["lock"])
