@@ -19,7 +19,7 @@ just release                      # target/release/vmm
 # Install the Python CLI + SDK
 pip install -e python/
 
-# Run a container as a microVM (Linux + /dev/kvm)
+# Run a container as a microVM (Linux/KVM, or Apple-silicon macOS/HVF)
 vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
 # Snapshot, warm-boot, and fork
@@ -28,7 +28,7 @@ vmon restore tpl --name warm      # ~120 ms
 vmon fork tpl --count 5           # ~3 ms per CoW clone
 ```
 
-On macOS without KVM, you can still launch the web panel and REST API:
+The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch just the web panel + REST API (any platform):
 
 ```sh
 cd ui && bun install && bun run build

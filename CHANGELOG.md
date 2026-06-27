@@ -3,6 +3,7 @@
 All notable changes to this project are recorded here.
 
 ## Unreleased
+
 ### Breaking Changes
 
 - Renamed Rust hypervisor binary/crate from `vmon` to `vmm`, mapping the user-facing self-identification and binary name in build and CI scripts, and resolved naming collision between the Rust binary and Python CLI.
@@ -12,10 +13,14 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added outbound networking support via user-mode NAT for microVMs on macOS (HVF)
+
 - Added automatic guest kernel provisioning for environments without a local kernel (e.g., macOS/HVF)
 - Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g., macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmm` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
+
+- Updated `vmon run` to enable networking by default on macOS, removing the requirement for `--block-network`
 
 - Renamed the hypervisor binary from `vmon` to `vmm` to resolve naming collisions
 - Renamed the project from VibeVMM to Vibemon, and the `VVM`/`vvm` brand prefix to `VMON`/`vmon` throughout. The binary, Python package, CLI, and daemon are now `vmon`/`vmond` (`python -m vmon`); environment variables are `VMON_*` (e.g. `VMON_HOME`, `VMON_API_TOKEN`, `VMON_E2E`); the state directory is `~/.vmon` with the daemon socket at `~/.vmon/vmond.sock`; guest kernel-cmdline keys, serial markers (`VMON_OK`), the bundled `vmon-agent`, the served web UI title, and the Rich console theme keys all follow suit. The generic term "virtual machine monitor" (`vmm`/`VMM`) is unchanged.

@@ -22,16 +22,17 @@ else.
 | REST API / `vmon serve` | ✅ runs | ✅ |
 | Python SDK logic + unit tests | ✅ | ✅ |
 | Building the Rust `vmm` binary | ✅ (HVF backend, auto-codesigned) | ✅ |
-| **Booting a microVM** (`vmon run`, exec, snapshot, fork) | ✅ (HVF; `run` needs `--block-network`) | ✅ |
+| **Booting a microVM** (`vmon run`, exec, snapshot, fork) | ✅ (HVF) | ✅ |
 | virtio-fs volumes / host shares | ✅ (default aarch64 kernel has it) | ✅ |
-| Host TAP networking / port tunnels | ❌ Linux-only (use `--block-network`, or Lima) | ✅ |
+| Outbound networking (egress) | ✅ (HVF user-mode NAT) | ✅ (TAP) |
+| Port tunnels / host egress policy | ❌ Linux-only (TAP) | ✅ |
 | Demos (`demo/*.sh`) | ⚠️ Linux-oriented; some need Lima | ✅ |
 
 So on an Apple-silicon Mac you get the full thing — panel, API, and real
 microVMs — natively. Caveats: **aarch64 guests only**; the `vmm` binary must be
 ad-hoc codesigned with the hypervisor entitlement (`just build` / `just codesign`
-handle this); host TAP networking is Linux-only (sandboxes still run with
-`--block-network`). virtio-fs volumes/shares work out of the box (the default
+handle this); networked sandboxes get outbound egress via macOS user-mode NAT,
+but inbound port tunnels and host egress allowlists are Linux-only. virtio-fs volumes/shares work out of the box (the default
 aarch64 kernel has `CONFIG_VIRTIO_FS`; a custom `VMON_KERNEL` must too). Intel
 Macs and x86_64 guests still need
 Linux/KVM — run those in a Linux VM with nested KVM (see [§6, Lima](#6-run-the-hypervisor-in-lima-control-it-from-macos)).
@@ -118,11 +119,11 @@ background:
 lsof -ti tcp:8000 | xargs kill
 ```
 
-> On an Apple-silicon Mac, the panel's "+ New" boots a real microVM via HVF once
-> the `vmm` binary is built (`just build`) — it defaults to a no-NIC sandbox, so
-> it works natively. On the CLI, host TAP networking is Linux-only, so pass
-> `vmon run --block-network` (a bare `vmon run` uses the networked default). Intel
-> Macs have no aarch64-guest HVF support — use Linux or Lima (§5 / §6).
+> On an Apple-silicon Mac, `vmon run` and the panel's "+ New" boot real microVMs
+> via HVF once the `vmm` binary is built (`just build`). Networking works out of
+> the box (outbound egress via user-mode NAT); only exposed ports (`-p` / tunnels)
+> and host egress allowlists need Linux. Intel Macs have no aarch64-guest HVF
+> support — use Linux or Lima (§5 / §6).
 
 ---
 
@@ -153,8 +154,9 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
 `--disk-mb` (default 1024), `--timeout <s>` (default 300), and `--block-network`
-(boot with no NIC — **required on macOS**, where host TAP networking is not yet
-wired up; it also lets `vmon run` work without root on Linux).
+(boot with no NIC; optional — a networked sandbox otherwise gets outbound egress
+via TAP on Linux or user-mode NAT on macOS, and `--block-network` also lets
+`vmon run` skip the root-only TAP setup on Linux).
 
 `vmon shell` drops you into an ephemeral Linux shell. With no argument (or
 `--image <ref>`) it boots a fresh sandbox (default `debian:stable-slim`, override
@@ -178,9 +180,9 @@ cargo build --release            # produces target/release/vmm
 # 2. Install the vmon CLI/SDK
 pip install -e python/
 
-# 3. Run a container as a microVM. Pass --block-network on macOS (host TAP
-#    networking is Linux-only); on Linux it also avoids the root-only TAP path.
-vmon run --block-network alpine -- sh -c 'echo hello from a microVM; uname -a'
+# 3. Run a container as a microVM (networked by default: TAP on Linux, user-mode
+#    NAT on macOS). Add --block-network for a no-NIC sandbox.
+vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
 # 4. Snapshot / restore / fork
 vmon snapshot myvm tpl --stop
@@ -469,4 +471,4 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 | `vmm binary not found` | `cargo build --release` (or `just build` on macOS), or set `VMON_BIN`. |
 | `no kernel found` | Set `VMON_KERNEL=/path/to/Image-or-bzImage`. |
 | `pip ... externally-managed-environment` (macOS) | Use a venv (see §3, Step 2). |
-| `vmon run` fails on macOS | Pass `--block-network` (host TAP networking is Linux-only); ensure `vmm` is built (`just build`). The panel's "+ New" already defaults to this. Intel Macs are unsupported — use Linux or Lima (§5/§6). |
+| `vmon run` fails on macOS | Build `vmm` first (`just build`). Networking works via user-mode NAT; only `-p`/port tunnels and egress allowlists need Linux. Intel Macs are unsupported — use Linux or Lima (§5/§6). |
