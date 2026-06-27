@@ -411,6 +411,7 @@ class Engine:
                     fs_slots=int(data["fs_slots"]),
                     host_slot=bool(data["host_slot"]),
                     nic_slot=bool(data["nic_slot"]),
+                    tap_slot=bool(data.get("tap_slot", False)),
                 )
             except KeyError, TypeError, ValueError:
                 continue

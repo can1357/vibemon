@@ -575,6 +575,8 @@ class MicroVM:
         mem: int | None = None,
         cpus: int | None = None,
         volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
+        tap: str | None = None,
+        user_net: bool = False,
         timeout_secs: int | None = None,
     ) -> MicroVM:
         """Warm-boot a microVM from a snapshot directory or named snapshot."""
@@ -586,6 +588,12 @@ class MicroVM:
         vm = cls(name)
         vm.dir.mkdir(parents=True, exist_ok=True)
         args = ["--restore", str(snap_dir), "--api-sock", str(vm.sock)]
+        if user_net and tap is not None:
+            raise ValueError("user_net and tap are mutually exclusive")
+        if user_net:
+            args.extend(["--net", "user"])
+        elif tap is not None:
+            args.extend(["--tap", str(tap)])
         if mem is not None:
             mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
             args.extend(["--mem", str(mem)])
@@ -614,6 +622,8 @@ class MicroVM:
             control_sock=vm.sock,
             agent_sock=agent_sock,
             restored_from=str(snapshot),
+            tap=tap,
+            user_net=user_net,
             rootfs=str(rootfs) if rootfs else None,
             snapshot_root=str(STATE / "snapshots"),
             volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],

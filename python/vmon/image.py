@@ -55,6 +55,9 @@ class CachedTemplate:
     host_slot: bool = False
     # Whether the snapshot includes a user-mode NAT NIC for warm networked macOS sandboxes.
     nic_slot: bool = False
+    # Whether the snapshot includes a host-TAP virtio-net NIC for warm networked
+    # Linux sandboxes (rebound to a per-sandbox TAP on restore).
+    tap_slot: bool = False
     # Stable content-addressed digest over the template snapshot, rootfs, and marker.
     digest: str = ""
 
@@ -236,12 +239,17 @@ def cached_template(
     fs_slots: int = 0,
     host_slot: bool = False,
     nic_slot: bool = False,
+    tap_slot: bool = False,
 ) -> CachedTemplate:
     """Build/cache an agent-capable ext4 rootfs and a ping-verified VM snapshot."""
     if disk_mb <= 0:
         raise ValueError("disk_mb must be positive")
-    if nic_slot and (fs_slots > 0 or host_slot):
-        raise ValueError("nic_slot cannot be combined with fs_slots or host_slot")
+    if (nic_slot or tap_slot) and (fs_slots > 0 or host_slot):
+        raise ValueError("a NIC slot cannot be combined with fs_slots or host_slot")
+    if nic_slot and tap_slot:
+        raise ValueError(
+            "nic_slot (macOS user-net) and tap_slot (Linux TAP) are mutually exclusive"
+        )
     engine, reference = build_or_pull(image, dockerfile, context, engine)
     spec = _inspect(engine, reference)
     digest = _image_digest(engine, reference)
@@ -282,6 +290,7 @@ def cached_template(
         + (f"-s{fs_slots}" if fs_slots else "")
         + ("-h" if host_slot else "")
         + ("-n" if nic_slot else "")
+        + ("-t" if tap_slot else "")
     )
     tpl_name = f"tpl-{digest[:12]}-{disk_mb}-a{agent_digest[:12]}{suffix}"
     tpl_dir = _state() / "templates" / tpl_name
@@ -297,6 +306,7 @@ def cached_template(
         fs_slots=fs_slots,
         host_slot=host_slot,
         nic_slot=nic_slot,
+        tap_slot=tap_slot,
     )
     from .vmm import _snapshot_state_present, default_kernel
 
@@ -330,18 +340,37 @@ def cached_template(
         (slot_tag(i), str(slot_void), True) for i in range(fs_slots)
     ]
     host_fs_dir = str(slot_void) if host_slot else None
-    vm = MicroVM.boot_rootfs(
-        rootfs_ext4,
-        name=vm_name,
-        mem=memory,
-        cpus=cpus,
-        volumes=slot_vols,
-        fs_dir=host_fs_dir,
-        user_net=nic_slot,
-        snapshot_root=_state() / "templates",
-        image=spec.reference,
-    )
+    build_net: dict[str, object] | None = None
+    build_tap: str | None = None
+    if tap_slot:
+        from . import net
+
+        build_net = net.allocate_guest_config(vm_name)
+        build_tap = str(build_net["tap"])
+        try:
+            net.setup_tap(
+                build_tap,
+                str(build_net["guest_ip"]),
+                str(build_net["host_ip"]),
+                int(str(build_net["prefix"])),
+            )
+        except BaseException:
+            net.release_guest_config(vm_name)
+            raise
+    vm: MicroVM | None = None
     try:
+        vm = MicroVM.boot_rootfs(
+            rootfs_ext4,
+            name=vm_name,
+            mem=memory,
+            cpus=cpus,
+            volumes=slot_vols,
+            fs_dir=host_fs_dir,
+            tap=build_tap,
+            user_net=nic_slot,
+            snapshot_root=_state() / "templates",
+            image=spec.reference,
+        )
         vm.wait_for_agent(timeout=timeout)
         vm.snapshot(
             tpl_name,
@@ -364,15 +393,27 @@ def cached_template(
                     "cpus": cpus,
                     "host_slot": host_slot,
                     "nic_slot": nic_slot,
+                    "tap_slot": tap_slot,
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
     finally:
-        if vm.is_running():
-            vm.stop()
-        vm.remove()
+        if vm is not None:
+            if vm.is_running():
+                vm.stop()
+            vm.remove()
+        if tap_slot and build_net is not None:
+            from . import net
+
+            net.teardown_tap(
+                str(build_net["tap"]),
+                str(build_net["guest_ip"]),
+                str(build_net["host_ip"]),
+                int(str(build_net["prefix"])),
+            )
+            net.release_guest_config(vm_name)
     _index_cached_template(template, marker)
     return template
 
