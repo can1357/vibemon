@@ -12,39 +12,45 @@ There are two layers:
 
 ## 1. Does it run on macOS?
 
-**Partly.** Read this before anything else.
+**Yes** on Apple-silicon Macs (macOS 15+) via Apple's Hypervisor.framework
+(HVF) — booting microVMs needs no Linux and no KVM. Read this before anything
+else.
 
-| What | macOS | Linux + `/dev/kvm` |
+| What | macOS (Apple silicon) | Linux + `/dev/kvm` |
 | --- | --- | --- |
 | Web panel (UI) | ✅ builds & runs | ✅ |
 | REST API / `vmon serve` | ✅ runs | ✅ |
 | Python SDK logic + unit tests | ✅ | ✅ |
-| **Booting an actual microVM** (`vmon run`, exec, snapshot, fork) | ❌ | ✅ |
-| Building the Rust `vmm` binary | ❌ (KVM crates are Linux-only) | ✅ |
-| Demos (`demo/*.sh`) | ❌ | ✅ |
+| Building the Rust `vmm` binary | ✅ (HVF backend, auto-codesigned) | ✅ |
+| **Booting a microVM** (`vmon run`, exec, snapshot, fork) | ✅ (HVF; `run` needs `--block-network`) | ✅ |
+| virtio-fs volumes / host shares | ✅ (default aarch64 kernel has it) | ✅ |
+| Host TAP networking / port tunnels | ❌ Linux-only (use `--block-network`, or Lima) | ✅ |
+| Demos (`demo/*.sh`) | ⚠️ Linux-oriented; some need Lima | ✅ |
 
-So on a Mac you can launch the panel + API and click around, read the API
-docs, and run the Python test suite — but **creating a sandbox / running a
-container will fail**, because that needs a real Linux kernel with KVM.
-
-To get the *full* thing on a Mac, run it inside a Linux VM with nested KVM
-(see [§6, Lima](#6-run-the-hypervisor-in-lima-control-it-from-macos)).
+So on an Apple-silicon Mac you get the full thing — panel, API, and real
+microVMs — natively. Caveats: **aarch64 guests only**; the `vmm` binary must be
+ad-hoc codesigned with the hypervisor entitlement (`just build` / `just codesign`
+handle this); host TAP networking is Linux-only (sandboxes still run with
+`--block-network`). virtio-fs volumes/shares work out of the box (the default
+aarch64 kernel has `CONFIG_VIRTIO_FS`; a custom `VMON_KERNEL` must too). Intel
+Macs and x86_64 guests still need
+Linux/KVM — run those in a Linux VM with nested KVM (see [§6, Lima](#6-run-the-hypervisor-in-lima-control-it-from-macos)).
 
 ---
 
 ## 2. Prerequisites
 
-**For the macOS path (panel + API only):**
+**For the panel + API only:**
 - Python 3.14+ (`python3 --version`)
 - Bun (`bun --version`) — builds the web panel
 
 **For the full path (real microVMs), additionally:**
-- A Linux host with `/dev/kvm` (bare metal, a Linux box, or a Lima VM)
+- A hypervisor host: Apple-silicon Mac (macOS 15+, HVF) **or** Linux with `/dev/kvm`
 - A Rust toolchain (`rustup`)
-- `docker` **or** `podman`
+- `docker` **or** `podman`, plus `e2fsprogs` (`brew install e2fsprogs` on macOS)
 
-This repo already has Python, Node, and the Rust toolchain available; only KVM
-is missing on macOS.
+On macOS the `vmm` binary must be codesigned with the hypervisor entitlement;
+`just build` / `just release` do this automatically, and HVF itself needs no root.
 
 ---
 
@@ -112,8 +118,11 @@ background:
 lsof -ti tcp:8000 | xargs kill
 ```
 
-> **On macOS, clicking "+ New" in the panel (or `vmon run`) will fail** — there
-> is no KVM to boot a VM. That is expected. For real VMs see §5 / §6.
+> On an Apple-silicon Mac, the panel's "+ New" boots a real microVM via HVF once
+> the `vmm` binary is built (`just build`) — it defaults to a no-NIC sandbox, so
+> it works natively. On the CLI, host TAP networking is Linux-only, so pass
+> `vmon run --block-network` (a bare `vmon run` uses the networked default). Intel
+> Macs have no aarch64-guest HVF support — use Linux or Lima (§5 / §6).
 
 ---
 
@@ -121,12 +130,12 @@ lsof -ti tcp:8000 | xargs kill
 
 `vmon` is a thin client for a local daemon (`vmond`) that owns the VM registry and
 spawns one VMM per microVM; the first command auto-starts it. Run
-`vmon <command> --help` for details. Commands that boot or touch a VM only work on
-a KVM host.
+`vmon <command> --help` for details. Commands that boot or touch a VM need a
+hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 
 | Command | What it does | Example |
 | --- | --- | --- |
-| `run` | boot a container image / Dockerfile as a microVM | `vmon run alpine -- sh -c 'uname -a'` |
+| `run` | boot a container image / Dockerfile as a microVM | `vmon run --block-network alpine -- sh -c 'uname -a'` |
 | `run -f` | build & boot a Dockerfile | `vmon run -f ./Dockerfile --context .` |
 | `run -d` | run detached (background) | `vmon run -d --name web nginx` |
 | `shell` | drop into an ephemeral interactive shell (attach a running VM, warm-boot a snapshot, or boot a fresh image) | `vmon shell` · `vmon shell web` · `vmon shell --image alpine` |
@@ -143,7 +152,9 @@ a KVM host.
 | `serve` | run the daemon **and** the REST API + web panel (one owner) | `vmon serve --token secret` |
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
-`--disk-mb` (default 1024), `--timeout <s>` (default 300).
+`--disk-mb` (default 1024), `--timeout <s>` (default 300), and `--block-network`
+(boot with no NIC — **required on macOS**, where host TAP networking is not yet
+wired up; it also lets `vmon run` work without root on Linux).
 
 `vmon shell` drops you into an ephemeral Linux shell. With no argument (or
 `--image <ref>`) it boots a fresh sandbox (default `debian:stable-slim`, override
@@ -156,19 +167,20 @@ grouped; color is dropped automatically when output is piped.
 
 ---
 
-## 5. Full microVMs on a native Linux host
+## 5. Full microVMs on a native host (Linux/KVM or macOS/HVF)
 
-On real Linux with `/dev/kvm`:
+On Linux with `/dev/kvm`, or an Apple-silicon Mac (macOS 15+, no KVM needed):
 
 ```sh
-# 1. Build the VMM binary
+# 1. Build the VMM binary  (on macOS `just build` auto-codesigns it for HVF)
 cargo build --release            # produces target/release/vmm
 
 # 2. Install the vmon CLI/SDK
 pip install -e python/
 
-# 3. Run a container as a microVM (auto-detects /boot/vmlinuz-$(uname -r))
-vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
+# 3. Run a container as a microVM. Pass --block-network on macOS (host TAP
+#    networking is Linux-only); on Linux it also avoids the root-only TAP path.
+vmon run --block-network alpine -- sh -c 'echo hello from a microVM; uname -a'
 
 # 4. Snapshot / restore / fork
 vmon snapshot myvm tpl --stop
@@ -223,7 +235,7 @@ limactl shell kvm           # drop into the guest
   # --- base: hypervisor + REST control plane ---
   sudo apt-get update && sudo apt-get install -y python3-venv python3-pip curl build-essential pkg-config
   command -v cargo || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; . "$HOME/.cargo/env"; }
-  cd ~/vmon && cargo build --release          # builds the vmm binary (Linux-only)
+  cd ~/vmon && cargo build --release          # builds the vmm binary in the guest
   cd python && python3 -m venv .venv && . .venv/bin/activate
   pip install -e '.[server]'
 
@@ -352,23 +364,24 @@ def call(method, path, body=None):
 call("GET", "/healthz")        # {'ok': True}
 call("GET", "/v1/sandboxes")   # list (auth required)
 
-# create a sandbox — only succeeds against a KVM-backed server (e.g. in Lima):
-call("POST", "/v1/sandboxes", {"image": "alpine", "timeout_secs": 300})
+# create a sandbox — needs a hypervisor-backed server (macOS/HVF or Linux/KVM):
+call("POST", "/v1/sandboxes", {"image": "alpine", "block_network": True, "timeout_secs": 300})
 ```
 
 Prefer `curl`? `curl -s -H 'Authorization: Bearer secret' http://127.0.0.1:8137/v1/sandboxes`.
 The full surface (create / list / exec / files / snapshots / network / tunnels /
 events) is documented live at `http://127.0.0.1:8137/docs`.
 
-### On a KVM host — the in-process SDK
+### On a hypervisor host — the in-process SDK
 
-The `Sandbox` / `MicroVM` SDK drives the hypervisor directly and is **KVM-only**
-(import works anywhere, but `create`/`run` need `/dev/kvm`):
+The `Sandbox` / `MicroVM` SDK drives the hypervisor directly and needs one
+(import works anywhere, but `create`/`run` need macOS/HVF or Linux `/dev/kvm`):
 
 ```python
 from vmon.sandbox import Sandbox
 
-sb = Sandbox.create(image="alpine", timeout_secs=300)
+# block_network=True is required on macOS today (host TAP networking is Linux-only):
+sb = Sandbox.create(image="alpine", block_network=True, timeout_secs=300)
 try:
     proc = sb.exec("sh", "-lc", "echo hi")
     print(proc.stdout.read())        # b'hi\n'
@@ -383,14 +396,14 @@ primitives; `python/README.md` has the full SDK reference.
 
 ## 8. Smoke-testing every part
 
-### On macOS (no KVM) — these all pass here
+### Anywhere (macOS or Linux) — panel, CLI, API, and unit tests
 
 ```sh
 # Web panel: typecheck + production build
 cd ui && bun install && bun run typecheck && bun run build
 
 # Python SDK / CLI / server unit + integration tests
-#   (the 4 KVM end-to-end tests auto-skip without KVM)
+#   (the 4 real-VM e2e tests auto-skip unless VMON_KVM_E2E=1)
 cd ../python && python3 -m pytest -q          # -> passed, with a few skipped
 
 # CLI is wired up
@@ -404,7 +417,7 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/v1/sandboxes            
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer secret' localhost:8000/v1/sandboxes  # 200
 ```
 
-### On Linux + `/dev/kvm` — the real VM behaviour
+### On a hypervisor host (macOS/HVF or Linux/KVM) — the real VM behaviour
 
 ```sh
 # Rust: same gates as CI
@@ -413,7 +426,8 @@ cargo check --locked
 cargo clippy --locked -- -D warnings
 cargo test --locked
 
-# Rust KVM integration suite (boots real guests; needs root for TAP networking)
+# Rust integration suite — boots real guests (KVM on Linux, HVF on macOS;
+#   TAP-networking cases need root and run on Linux only)
 just integration
 
 # Python end-to-end against real VMs
@@ -438,8 +452,8 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 | `VMON_REMOTE` | `vmon` CLI | `host:port` of a remote daemon to drive over TCP (no auto-start) |
 | `VMON_DAEMON_TCP` | `vmond` | `host:port` for the daemon to also listen on for `VMON_REMOTE` clients |
 | `VMON_BIN` | vmon | path to the `vmm` binary (else auto-detected) |
-| `VMON_KERNEL` | vmon | guest kernel (else `/boot/vmlinuz-$(uname -r)`) |
-| `VMON_KVM_E2E` | tests | set to `1` to enable the KVM end-to-end tests |
+| `VMON_KERNEL` | vmon | guest kernel (else `/boot/vmlinuz-$(uname -r)` on Linux, or auto-downloaded on macOS) |
+| `VMON_KVM_E2E` | tests | set to `1` to enable the real-VM e2e tests (Linux/KVM or macOS/HVF) |
 | `VMON_E2E_IMAGE` | tests | image for e2e tests (default `alpine:latest`) |
 | `VMON_KVM` | Rust tests | set to `1` to run KVM integration tests |
 
@@ -452,8 +466,7 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 | `vmon serve requires --token or VMON_API_TOKEN` | Pass `--token X` or set `VMON_API_TOKEN`. |
 | Panel shows "Authentication required" | Paste your token into the API-token box (top-right). |
 | `uvicorn vmon.server:app` fails | No module-level `app`; use `vmon serve` instead. |
-| `vmm binary not found` | `cargo build --release`, or set `VMON_BIN`. Build needs Linux. |
+| `vmm binary not found` | `cargo build --release` (or `just build` on macOS), or set `VMON_BIN`. |
 | `no kernel found` | Set `VMON_KERNEL=/path/to/Image-or-bzImage`. |
 | `pip ... externally-managed-environment` (macOS) | Use a venv (see §3, Step 2). |
-| `cargo build` errors about `vmm_sys_util::ioctl` | You're on macOS; the VMM only builds on Linux. |
-| "+ New" / `vmon run` fails on macOS | Expected — no KVM. Use Linux or Lima (§5/§6). |
+| `vmon run` fails on macOS | Pass `--block-network` (host TAP networking is Linux-only); ensure `vmm` is built (`just build`). The panel's "+ New" already defaults to this. Intel Macs are unsupported — use Linux or Lima (§5/§6). |
