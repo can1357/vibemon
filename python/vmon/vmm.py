@@ -126,6 +126,33 @@ def default_kernel() -> str:
     return str(ensure_kernel())
 
 
+def hypervisor_present() -> bool:
+    """True if the host can run a VM with vmon's compiled-in hypervisor backend.
+
+    Mirrors vmon's compile-time backend selection: ``/dev/kvm`` on Linux and
+    Apple Hypervisor.framework on macOS. macOS support is Apple-silicon only
+    (aarch64 guests), so an Intel Mac is rejected even though it may report
+    ``kern.hv_support == 1``. Any other host has no supported backend.
+    """
+    system = platform.system()
+    if system == "Linux":
+        return Path("/dev/kvm").exists()
+    if system == "Darwin":
+        if platform.machine() not in ("arm64", "aarch64"):
+            return False
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.hv_support"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+        except OSError:
+            return False
+        return out.startswith("1")
+    return False
+
+
 def _cmdline() -> str:
     base = "console=ttyS0 reboot=t panic=-1 rdinit=/init"
     if _arch() == "aarch64":

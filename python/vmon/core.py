@@ -479,6 +479,7 @@ class Engine:
             memory=int(params.get("mem", 512)),
             disk_mb=int(params.get("disk_mb", 1024)),
             timeout=float(params.get("timeout", 300.0)),
+            block_network=bool(params.get("block_network")),
         )
         record = self._record_vm(
             sandbox.vm,

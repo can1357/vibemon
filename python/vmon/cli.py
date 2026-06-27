@@ -178,7 +178,12 @@ def cli() -> None:
     "--timeout", type=float, default=300.0, show_default=True, help="create timeout in seconds"
 )
 @click.option("-d", "--detach", is_flag=True, help="run in background")
-def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, detach):
+@click.option(
+    "--block-network",
+    is_flag=True,
+    help="boot without networking (no NIC; needs no root and works on macOS)",
+)
+def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, detach, block_network):
     if not image and not dockerfile:
         raise click.UsageError("provide an image (vmon run alpine) or -f Dockerfile")
     client = _client()
@@ -193,6 +198,7 @@ def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, deta
         "timeout": timeout,
         "cmd": _strip_dashdash(cmd) or None,
         "detach": detach,
+        "block_network": block_network,
     }
     if detach:
         r = client.call("run", **params)

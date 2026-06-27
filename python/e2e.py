@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.14
 """End-to-end smoke test for the vmon / vmon sandbox stack.
 
-Boots real microVMs on a Linux host with ``/dev/kvm`` and exercises every
+Boots real microVMs on a Linux/KVM or macOS/HVF host and exercises every
 user-facing feature in a single run:
 
   * exec (argv / env / workdir) and the filesystem RPC facade
@@ -24,17 +24,20 @@ This complements the pytest suite in ``tests/test_e2e.py`` with a single
 self-contained driver that prints a PASS/FAIL/SKIP table and returns a
 non-zero exit code if anything fails.
 
-Prerequisites (a Linux + KVM host, e.g. bare metal or a nested-KVM Lima VM):
-  * ``/dev/kvm`` present and accessible
-  * a built vmm binary        (``cargo build --release`` or ``VMON_BIN``)
+Prerequisites (a Linux/KVM or macOS/HVF host; e.g. bare metal, an Apple-silicon
+Mac, or a nested-KVM Lima VM):
+  * a usable hypervisor          (Linux ``/dev/kvm`` or macOS Hypervisor.framework)
+  * a built vmm binary           (``cargo build --release`` or ``VMON_BIN``)
   * a static guest agent         (``just agent-musl`` or ``VMON_AGENT``)
-  * a guest kernel               (``/boot/vmlinuz-$(uname -r)`` or ``VMON_KERNEL``)
+  * a guest kernel               (``/boot/vmlinuz-$(uname -r)``, ``VMON_KERNEL``,
+                                  or auto-downloaded into ``$VMON_HOME`` on macOS)
   * ``docker`` or ``podman``     (to build the image rootfs)
+  * ``mkfs.ext4`` / ``mke2fs``   (e2fsprogs; ``brew install e2fsprogs`` on macOS)
 
 Note: feature sandboxes below boot with ``block_network=True`` (no NIC, no root).
-The dedicated networking + tunnel tests opt into a networked sandbox, which
-fresh-boots a virtio-net device bound to a host TAP and therefore needs root /
-``CAP_NET_ADMIN`` -- they SKIP otherwise.
+The dedicated networking + tunnel tests opt into a networked sandbox bound to a
+host TAP, which is Linux-only and needs root / ``CAP_NET_ADMIN`` -- they SKIP on
+macOS or without that capability.
 
 Usage:
   python3.14 python/e2e.py                 # run everything
@@ -60,11 +63,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon.image import cached_template, detect_engine, find_agent_binary
+from vmon.image import _find_mkfs_ext4, cached_template, detect_engine, find_agent_binary
 from vmon.pool import WarmPool
 from vmon.sandbox import Sandbox
 from vmon.secret import Secret
-from vmon.vmm import STATE, MicroVM, default_kernel, find_binary
+from vmon.vmm import STATE, MicroVM, default_kernel, find_binary, hypervisor_present
 from vmon.volume import Volume
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
@@ -177,7 +180,14 @@ def rm_snapshot(name: str) -> None:
 
 
 def net_admin() -> bool:
-    """True if the host can create TAP devices (root or CAP_NET_ADMIN)."""
+    """True if the host can create TAP devices (Linux + root/CAP_NET_ADMIN).
+
+    Host-side TAP/iptables networking is Linux-only; macOS sandboxes would use
+    the VMM's user-mode NAT, which the Python SDK does not drive, so the
+    networking tests SKIP there.
+    """
+    if platform.system() != "Linux":
+        return False
     try:
         from vmon import net
 
@@ -623,16 +633,16 @@ def t_async(_):
 
 def preflight() -> str | None:
     """Return a human-readable reason the e2e cannot run, or None when ready."""
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system not in ("Linux", "Darwin"):
+        return f"needs Linux + /dev/kvm or macOS + Hypervisor.framework; this is {system}"
+    if not hypervisor_present():
         return (
-            "the Python SDK e2e builds a Linux container rootfs (docker + "
-            "mke2fs) and is Linux-only; on macOS/HVF run the Rust e2e instead: "
-            "`just integration`."
+            "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
+            if system == "Linux"
+            else "no usable hypervisor; needs an Apple-silicon Mac with "
+            "Hypervisor.framework (kern.hv_support=1)"
         )
-    if platform.system() != "Linux":
-        return f"needs a Linux + /dev/kvm host; this is {platform.system()}"
-    if not Path("/dev/kvm").exists():
-        return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
@@ -643,8 +653,8 @@ def preflight() -> str | None:
             probe()
         except RuntimeError as exc:
             return f"{hint}: {exc}"
-    if shutil.which("mkfs.ext4") is None and shutil.which("mke2fs") is None:
-        return "mke2fs (e2fsprogs) not found; required to build the guest rootfs"
+    if _find_mkfs_ext4() is None:
+        return "mkfs.ext4/mke2fs not found (install e2fsprogs; on macOS: `brew install e2fsprogs`)"
     return None
 
 

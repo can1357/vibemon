@@ -19,8 +19,9 @@ It runs in an isolated ``$VMON_HOME`` (a short ``/tmp`` dir so the daemon's Unix
 socket fits the ``AF_UNIX`` path limit) and prints a PASS/FAIL/SKIP table,
 returning non-zero if anything fails.
 
-Prerequisites (same as ``e2e.py``): a Linux + KVM host with a built ``vmon``
-binary, a static guest agent, a guest kernel, and ``docker``/``podman``.
+Prerequisites (same as ``e2e.py``): a Linux/KVM or macOS/HVF host with a built
+``vmon`` binary, a static guest agent, a guest kernel, ``docker``/``podman``,
+and ``mkfs.ext4``/``mke2fs`` (e2fsprogs).
 
 Usage:
   python3.14 python/cli_e2e.py                  # run everything
@@ -45,8 +46,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon.image import detect_engine, find_agent_binary
-from vmon.vmm import default_kernel, find_binary
+from vmon.image import _find_mkfs_ext4, detect_engine, find_agent_binary
+from vmon.vmm import default_kernel, find_binary, hypervisor_present
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
 RUN = f"clie2e{os.getpid()}"
@@ -127,7 +128,7 @@ def ps_status(name: str) -> str | None:
 
 def start_detached(name: str) -> None:
     """Boot a long-lived detached VM that idles, so later commands can target it."""
-    args = ["run", "-d", "--name", name]
+    args = ["run", "-d", "--block-network", "--name", name]
     args += [IMAGE, "--", "sh", "-c", "echo ready-" + RUN + "; sleep 300"]
     cli(*args, timeout=BOOT_TIMEOUT, check=True)
     track(name)
@@ -189,7 +190,14 @@ def t_daemon_lifecycle(_):
 def t_run_foreground(_):
     """run streams the entry command's stdout and exits 0."""
     rc, out, err = cli(
-        "run", IMAGE, "--", "sh", "-c", "echo hello-" + RUN + "; uname -s", timeout=BOOT_TIMEOUT
+        "run",
+        "--block-network",
+        IMAGE,
+        "--",
+        "sh",
+        "-c",
+        "echo hello-" + RUN + "; uname -s",
+        timeout=BOOT_TIMEOUT,
     )
     assert rc == 0, f"rc={rc} err={err}"
     assert ("hello-" + RUN) in out, f"streamed stdout missing marker: {out!r}"
@@ -199,7 +207,9 @@ def t_run_foreground(_):
 @e2e
 def t_run_exit_code(_):
     """A foreground run returns the entry process's exit code (here 7)."""
-    rc, _, err = cli("run", IMAGE, "--", "sh", "-c", "exit 7", timeout=BOOT_TIMEOUT)
+    rc, _, err = cli(
+        "run", "--block-network", IMAGE, "--", "sh", "-c", "exit 7", timeout=BOOT_TIMEOUT
+    )
     assert rc == 7, f"expected entry exit code 7 through the daemon, got {rc} (err={err})"
 
 
@@ -368,16 +378,16 @@ def t_daemon_stop(_):
 
 def preflight() -> str | None:
     """Return a human-readable reason the e2e cannot run, or None when ready."""
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system not in ("Linux", "Darwin"):
+        return f"needs Linux + /dev/kvm or macOS + Hypervisor.framework; this is {system}"
+    if not hypervisor_present():
         return (
-            "the vmon CLI e2e builds a Linux container rootfs (docker + mke2fs) "
-            "and is Linux-only; on macOS/HVF run the Rust e2e instead: "
-            "`just integration`."
+            "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
+            if system == "Linux"
+            else "no usable hypervisor; needs an Apple-silicon Mac with "
+            "Hypervisor.framework (kern.hv_support=1)"
         )
-    if platform.system() != "Linux":
-        return f"needs a Linux + /dev/kvm host; this is {platform.system()}"
-    if not Path("/dev/kvm").exists():
-        return "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
@@ -388,6 +398,8 @@ def preflight() -> str | None:
             probe()
         except RuntimeError as exc:
             return f"{hint}: {exc}"
+    if _find_mkfs_ext4() is None:
+        return "mkfs.ext4/mke2fs not found (install e2fsprogs; on macOS: `brew install e2fsprogs`)"
     return None
 
 
@@ -430,17 +442,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         fn for fn in TESTS if not args.tests or any(f in display_name(fn) for f in args.tests)
     ]
 
-    reason = preflight()
-    if reason:
-        print(f"SKIP: {reason}")
-        return 0
-
     owns_home = args.home is None
-    HOME = args.home or tempfile.mkdtemp(prefix="vmon-cli-e2e-")
+    # Root the temp home at /tmp, not $TMPDIR: macOS $TMPDIR (/var/folders/.../T)
+    # is long enough that a per-VM Unix socket path under it
+    # (<home>/vms/<name>/agent.sock) would overflow the 104-byte sun_path limit.
+    HOME = args.home or tempfile.mkdtemp(prefix="vmon-e2e-", dir="/tmp")
+    # Install the isolated home before any probe runs: default_kernel() may
+    # auto-download a guest kernel into $VMON_HOME/assets on macOS, and the
+    # daemon the CLI spawns must resolve the very same home.
+    os.environ["VMON_HOME"] = HOME
     ENV = dict(os.environ)
-    ENV["VMON_HOME"] = HOME
     py_dir = str(Path(__file__).resolve().parent)
     ENV["PYTHONPATH"] = py_dir + (os.pathsep + ENV["PYTHONPATH"] if ENV.get("PYTHONPATH") else "")
+    # A stable, wide width keeps rich from soft-wrapping long values (e.g. the
+    # socket path under a long macOS $TMPDIR) mid-token in scraped CLI output.
+    ENV["COLUMNS"] = "200"
+
+    reason = preflight()
+    if reason:
+        if owns_home and not args.keep:
+            shutil.rmtree(HOME, ignore_errors=True)
+        print(f"SKIP: {reason}")
+        return 0
 
     print(f"cli-e2e: image={IMAGE} home={HOME} tests={len(selected)}")
 
