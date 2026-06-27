@@ -28,6 +28,18 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@just
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python 3.14
+        run: uv python install 3.14
+
+      - name: Build vmm
+        run: cargo build --locked
+
+      - name: Build static guest agent
+        run: just agent-musl
+
       - name: Fetch test assets
         run: just fetch-assets
 
@@ -37,6 +49,16 @@ jobs:
           sudo ip tuntap add dev vmon0 mode tap
           sudo ip addr add 192.168.249.1/24 dev vmon0
           sudo ip link set dev vmon0 up
+
+      - name: Run Python real-VM e2e
+        working-directory: python
+        run: |
+          if ! docker info >/dev/null 2>&1 && ! podman info >/dev/null 2>&1; then
+            echo "no working container engine (docker/podman daemon); skipping Python real-VM e2e"; exit 0
+          fi
+          uv run e2e.py
+          uv run cli_e2e.py
+          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
 
       - name: Run integration tests
         run: just integration
@@ -60,8 +82,39 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@just
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python 3.14
+        run: uv python install 3.14
+
       - name: Install native dependencies
         run: brew install libslirp pkg-config e2fsprogs cpio
+
+      - name: Install Zig linker
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build vmm
+        run: cargo build --locked
+
+      - name: Build static guest agent
+        run: just agent-musl
+
+      - name: Fetch test assets
+        run: just fetch-assets
+
+      - name: Run Python real-VM e2e
+        working-directory: python
+        run: |
+          if ! docker info >/dev/null 2>&1 && ! podman info >/dev/null 2>&1; then
+            echo "no working container engine (docker/podman daemon); skipping Python real-VM e2e"; exit 0
+          fi
+          uv run e2e.py
+          uv run cli_e2e.py
+          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
 
       - name: Run HVF integration tests
         run: just integration
