@@ -451,6 +451,7 @@ class MicroVM:
         agent: bool = True,
         overlay: bool = False,
         tap: str | None = None,
+        user_net: bool = False,
         fs_dir: str | os.PathLike[str] | None = None,
         volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
         timeout_secs: int | None = None,
@@ -459,14 +460,16 @@ class MicroVM:
 
         With ``overlay`` the rootfs is exposed as a copy-on-write overlay so the
         backing image is never mutated. ``tap`` attaches a virtio-net device bound
-        to a pre-created host TAP (the restore path cannot synthesize a NIC the
-        snapshot lacks, so networked sandboxes fresh-boot through here).
-        ``fs_dir``/``volumes`` add virtio-fs shares and ``timeout_secs`` arms the
-        VMM wall-clock deadline.
+        to a pre-created host TAP; ``user_net`` attaches the VMM's user-mode NAT
+        device. The restore path cannot synthesize a NIC the snapshot lacks, so
+        networked sandboxes fresh-boot through here. ``fs_dir``/``volumes`` add
+        virtio-fs shares and ``timeout_secs`` arms the VMM wall-clock deadline.
         """
         mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
         cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
         timeout_secs = _validate_timeout_secs(timeout_secs)
+        if user_net and tap is not None:
+            raise ValueError("user_net and tap are mutually exclusive")
         name = name or _instance_name("vm")
         vm = cls(name)
         vm.dir.mkdir(parents=True, exist_ok=True)
@@ -494,7 +497,9 @@ class MicroVM:
         agent_sock = vm.dir / "agent.sock" if agent else None
         if agent_sock is not None:
             args.extend(["--agent-sock", str(agent_sock)])
-        if tap is not None:
+        if user_net:
+            args.extend(["--net", "user"])
+        elif tap is not None:
             args.extend(["--tap", str(tap)])
         if fs_dir is not None:
             args.extend(["--fs-tag", "host", "--fs-dir", str(fs_dir)])
@@ -513,6 +518,7 @@ class MicroVM:
             cpus=cpus,
             rootfs=str(disk),
             tap=tap,
+            user_net=user_net,
             volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
             snapshot_root=str(snapshot_root) if snapshot_root else None,
         )

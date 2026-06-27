@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import platform
 import secrets as _secrets
 import shutil
 import threading
@@ -247,6 +248,7 @@ class Sandbox:
         from_pool = False
         sb: Sandbox | None = None
         net_handle: Any = None
+        user_net_sandbox = False
         try:
             used_tags: set[str] = set()
             for mountpoint, value in (volumes or {}).items():
@@ -320,14 +322,28 @@ class Sandbox:
                     )
                 tap: str | None = None
                 if not block_network:
-                    net_handle = _setup_sandbox_network(
-                        name,
-                        ports=ports,
-                        egress_allow=egress_allow,
-                        egress_allow_domains=egress_allow_domains,
-                        inbound_cidr_allowlist=inbound_cidr_allowlist,
-                    )
-                    tap = str(net_handle.guest_config["tap"])
+                    if platform.system() == "Darwin":
+                        for feature, requested in (
+                            ("ports", ports),
+                            ("egress_allow", egress_allow),
+                            ("egress_allow_domains", egress_allow_domains),
+                            ("inbound_cidr_allowlist", inbound_cidr_allowlist),
+                        ):
+                            if requested:
+                                raise ValueError(
+                                    f"{feature} requires Linux host networking (TAP); "
+                                    "macOS user-mode NAT is outbound-egress only"
+                                )
+                        user_net_sandbox = True
+                    else:
+                        net_handle = _setup_sandbox_network(
+                            name,
+                            ports=ports,
+                            egress_allow=egress_allow,
+                            egress_allow_domains=egress_allow_domains,
+                            inbound_cidr_allowlist=inbound_cidr_allowlist,
+                        )
+                        tap = str(net_handle.guest_config["tap"])
                 vm = MicroVM.boot_rootfs(
                     base_disk,
                     name=name,
@@ -336,6 +352,7 @@ class Sandbox:
                     overlay=True,
                     agent=True,
                     tap=tap,
+                    user_net=user_net_sandbox,
                     fs_dir=fs_dir,
                     volumes=vol_tuples,
                     timeout_secs=eff_timeout_secs,
@@ -376,6 +393,15 @@ class Sandbox:
                     if inbound_cidr_allowlist is not None
                     else None,
                 }
+            elif user_net_sandbox:
+                from . import net
+
+                sb.agent().net_config(
+                    net.USER_NET_GUEST_IP,
+                    net.USER_NET_PREFIX,
+                    net.USER_NET_GATEWAY,
+                    list(net.USER_NET_DNS),
+                )
             volumes_meta = {
                 spec["mountpoint"]: {
                     "name": spec["volume"].name,

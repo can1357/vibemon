@@ -27,6 +27,11 @@ IP_FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
 RULE_PREFIX = "vmon"
 POOL = ipaddress.ip_network("172.20.0.0/16")
 DEFAULT_DNS = ("1.1.1.1", "8.8.8.8")
+# Mirrors libslirp's fixed user-mode NAT layout.
+USER_NET_GUEST_IP = "10.0.2.15"
+USER_NET_PREFIX = 24
+USER_NET_GATEWAY = "10.0.2.2"
+USER_NET_DNS = ("10.0.2.3",)
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 LEASE_DIR = STATE / "network"
 LEASE_FILE = LEASE_DIR / "leases.json"
