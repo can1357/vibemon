@@ -287,6 +287,56 @@ def test_macos_networked_create_warm_restores_and_replays_net_config(monkeypatch
         sb.terminate()
 
 
+def test_linux_networked_create_warm_restores_and_replays_net_config(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+
+    # Force the Linux TAP path regardless of the test host OS.
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Linux")
+
+    tap_slots: list[bool] = []
+    real_resolve = sandbox_mod.Sandbox._resolve_template
+
+    def spy_resolve(**kwargs):
+        tap_slots.append(bool(kwargs.get("tap_slot")))
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "_resolve_template", staticmethod(spy_resolve))
+
+    guest_config = {
+        "tap": "vmon0",
+        "guest_ip": "10.42.0.2",
+        "host_ip": "10.42.0.1",
+        "prefix": 30,
+        "dns": ["1.1.1.1"],
+    }
+
+    class _FakeNet:
+        def __init__(self) -> None:
+            self.guest_config = guest_config
+            self.torn = False
+
+        def teardown(self) -> None:
+            self.torn = True
+
+    fake_net = _FakeNet()
+    monkeypatch.setattr(sandbox_mod, "_setup_sandbox_network", lambda name, **kwargs: fake_net)
+
+    sb = sandbox_mod.Sandbox.create(image="img", block_network=False)
+    try:
+        # A default (networked) Linux create resolves the tap-slot template and
+        # warm-restores it onto a per-sandbox TAP instead of cold fresh-booting.
+        assert tap_slots == [True]
+        assert FakeMicroVM.booted == []
+        assert FakeMicroVM.restored, "networked create should warm-restore the tap-slot template"
+        assert FakeMicroVM.restored[-1][2].get("tap") == "vmon0"
+        # The per-sandbox guest network config is replayed on the warm sandbox.
+        cfg = FakeMicroVM.restored[-1][3]._agent.net_configs
+        assert cfg, "net_config was not replayed on the warm networked sandbox"
+        assert cfg[-1]["args"] == ("10.42.0.2", 30, "10.42.0.1", ["1.1.1.1"])
+    finally:
+        sb.terminate()
+
+
 class _FakePool:
     size = 1
 

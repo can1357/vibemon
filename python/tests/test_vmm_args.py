@@ -88,6 +88,32 @@ def test_restore_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     assert holder["meta"]["volumes"] == [{"tag": "t", "dir": "/d", "ro": False}]
 
 
+def test_restore_emits_tap_and_user_net_args(monkeypatch, mvm_home):
+    from vmon.vmm import MicroVM
+
+    _snapshot(mvm_home, "snap")
+    holder = {}
+
+    def fake_launch(self: object, args: list[str], **meta: object) -> None:
+        holder["args"] = list(args)
+        holder["meta"] = dict(meta)
+
+    monkeypatch.setattr(MicroVM, "_launch", fake_launch)
+
+    MicroVM.restore("snap", tap="tap7", agent=False)
+    args = holder["args"]
+    assert args[args.index("--tap") + 1] == "tap7"
+    assert holder["meta"]["tap"] == "tap7"
+
+    MicroVM.restore("snap", user_net=True, agent=False)
+    args = holder["args"]
+    assert ["--net", "user"] == args[args.index("--net") : args.index("--net") + 2]
+    assert holder["meta"]["user_net"] is True
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MicroVM.restore("snap", tap="tap7", user_net=True, agent=False)
+
+
 def test_fork_snapshot_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     from vmon.vmm import MicroVM
 

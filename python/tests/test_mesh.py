@@ -177,8 +177,41 @@ def test_template_key_canonicalizes_shape_and_reference():
             host_slot=True,
             nic_slot=False,
         )
-        == "ubuntu:latest|d1024|m2048|c2|s3|h1|n0"
+        == "ubuntu:latest|d1024|m2048|c2|s3|h1|n0|t0"
     )
+    # The Linux TAP NIC flavor keys distinctly from the macOS user-net flavor.
+    tap = template_key(
+        "ubuntu:latest",
+        disk_mb=1024,
+        memory=512,
+        cpus=1,
+        fs_slots=0,
+        host_slot=False,
+        nic_slot=False,
+        tap_slot=True,
+    )
+    assert tap.endswith("|n0|t1")
+
+
+def test_request_template_key_distinguishes_networked_and_block_network(monkeypatch):
+    import vmon.mesh as mesh_mod
+    from vmon.mesh import pool_eligible, request_template_key
+
+    # block-network is cross-node pull-warm on any platform (plain template).
+    block = request_template_key({"image": "img", "block_network": True})
+    assert block is not None and block.endswith("|n0|t0")
+    # A networked request is pull-warm only via the Linux TAP flavor...
+    monkeypatch.setattr(mesh_mod.platform, "system", lambda: "Linux")
+    networked = request_template_key({"image": "img", "block_network": False})
+    assert networked is not None and networked.endswith("|n0|t1")
+    # ...while macOS user-net networked warm stays single-node (not pull-warm).
+    monkeypatch.setattr(mesh_mod.platform, "system", lambda: "Darwin")
+    assert request_template_key({"image": "img", "block_network": False}) is None
+    # Networked requests are not pool-claim eligible (no per-clone TAP yet), and
+    # volume / fs_dir requests still need a local image and are not pull-warm.
+    assert pool_eligible({"image": "img", "block_network": False}) is False
+    assert request_template_key({"image": "img", "fs_dir": "/x"}) is None
+    assert request_template_key({"image": "img", "volumes": {"/a": "v"}}) is None
 
 
 def test_find_template_provider_skips_incompatible_unhealthy_and_missing(tmp_path):
@@ -460,9 +493,7 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
             captured.update(kwargs)
             return super().create(**kwargs)
 
-    monkeypatch.setattr(
-        "vmon.core.Engine._sandbox_class", staticmethod(lambda: RecordingSandbox)
-    )
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: RecordingSandbox))
     digest, key = _write_indexed_template(tmp_path / "peer-template", image="ubuntu:latest")
     app_a = server_mod.create_app(token="secret")
     app_b = server_mod.create_app(token="secret")
