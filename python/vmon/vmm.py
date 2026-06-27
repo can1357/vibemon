@@ -161,7 +161,11 @@ def _cmdline() -> str:
 
 
 def _agent_cmdline() -> str:
-    base = "console=ttyS0 reboot=t panic=-1 root=/dev/vda init=/.vmon/agent vmon.agent=serve"
+    # Omit `root=` so the VMM appends `root=/dev/vda rw` (or `ro` under
+    # --rootfs-ro). Hardcoding `root=/dev/vda` without `rw` here would make the
+    # guest mount the rootfs read-only: the VMM only fills in the rw/ro flag
+    # when the cmdline has no `root` key of its own.
+    base = "console=ttyS0 reboot=t panic=-1 init=/.vmon/agent vmon.agent=serve"
     if _arch() == "aarch64":
         base += " earlycon=uart8250,mmio,0x9000000"
     return base

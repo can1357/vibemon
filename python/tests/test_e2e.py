@@ -5,7 +5,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("VMON_KVM_E2E"),
-    reason="needs KVM e2e host",
+    reason="needs a real-VM e2e host (Linux/KVM or macOS/HVF)",
 )
 
 
@@ -22,7 +22,7 @@ def _read_stdout(process):
 def test_real_sandbox_create_and_exec_roundtrip():
     from vmon.sandbox import Sandbox
 
-    sb = Sandbox.create(image=_image(), timeout=300)
+    sb = Sandbox.create(image=_image(), block_network=True, timeout=300)
     try:
         proc = sb.exec("sh", "-lc", "printf ok")
         assert _read_stdout(proc) == "ok"
@@ -32,17 +32,29 @@ def test_real_sandbox_create_and_exec_roundtrip():
 
 
 def test_writable_volume_persists_across_sandboxes():
+    from vmon.agent_client import AgentError
     from vmon.sandbox import Sandbox
     from vmon.volume import Volume
 
     volume = Volume("pytest-persist")
-    sb = Sandbox.create(image=_image(), volumes={"/data": volume}, timeout=300)
+    try:
+        sb = Sandbox.create(
+            image=_image(), volumes={"/data": volume}, block_network=True, timeout=300
+        )
+    except AgentError as exc:
+        # ENODEV == the guest kernel registers no virtiofs filesystem type (the
+        # auto-provisioned macOS kernel); skip rather than fail.
+        if "os error 19" in str(exc).lower() or "no such device" in str(exc).lower():
+            pytest.skip(
+                "guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel"
+            )
+        raise
     try:
         assert sb.exec("sh", "-lc", "echo hi >/data/x").wait(timeout=30) == 0
     finally:
         sb.terminate()
 
-    sb2 = Sandbox.create(image=_image(), volumes={"/data": volume}, timeout=300)
+    sb2 = Sandbox.create(image=_image(), volumes={"/data": volume}, block_network=True, timeout=300)
     try:
         proc = sb2.exec("cat", "/data/x")
         assert _read_stdout(proc).strip() == "hi"
@@ -53,7 +65,7 @@ def test_writable_volume_persists_across_sandboxes():
 def test_pty_exec_reports_isatty_true():
     from vmon.sandbox import Sandbox
 
-    sb = Sandbox.create(image=_image(), timeout=300)
+    sb = Sandbox.create(image=_image(), block_network=True, timeout=300)
     try:
         # A PTY exec must allocate a real /dev/pts slave. This regressed when the
         # guest agent did not mount devpts, so assert the mount and the slave tty

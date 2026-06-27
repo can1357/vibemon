@@ -3,7 +3,7 @@
 
 Where ``e2e.py`` drives the Python SDK in-process, this driver shells out to the
 ``vmon`` command and asserts on its stdout / exit codes, exercising the full
-Docker-like control plane on a Linux + KVM host:
+Docker-like control plane on a Linux/KVM or macOS/HVF host:
 
   * the auto-started local daemon (``vmon daemon status``, first-call auto-start)
   * ``vmon run`` foreground (streamed entry output + propagated exit code)
