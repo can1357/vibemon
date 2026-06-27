@@ -23,6 +23,7 @@ data: bytes)`` callbacks and a ``cancel`` :class:`threading.Event`; when
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import threading
 import time
@@ -105,6 +106,14 @@ def state_dir() -> Path:
     """
 
     return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
+
+
+def _dockerfile_template_ref(ref: str) -> bool:
+    return (
+        len(ref) == 17
+        and ref.startswith("vmon-")
+        and all(ch in "0123456789abcdef" for ch in ref[5:])
+    )
 
 
 @dataclass
@@ -357,6 +366,56 @@ class Engine:
             except OSError:
                 continue
         return sorted(names)
+
+    def template_index(self) -> builtins.dict[str, str]:
+        """Return request-derivable template keys mapped to local content digests."""
+        from .mesh import template_key
+
+        templates = state_dir() / "templates"
+        if not templates.is_dir():
+            return {}
+        out: builtins.dict[str, str] = {}
+        try:
+            children = list(templates.iterdir())
+        except OSError:
+            return {}
+        for child in children:
+            if not child.is_dir():
+                continue
+            marker = child / "agent-ready.json"
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            ref = data.get("image")
+            digest = data.get("content_digest")
+            if (
+                not isinstance(ref, str)
+                or not ref
+                or _dockerfile_template_ref(ref)
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+            ):
+                continue
+            try:
+                key = template_key(
+                    ref,
+                    disk_mb=int(data["disk_mb"]),
+                    memory=int(data["memory"]),
+                    cpus=int(data["cpus"]),
+                    fs_slots=int(data["fs_slots"]),
+                    host_slot=bool(data["host_slot"]),
+                    nic_slot=bool(data["nic_slot"]),
+                )
+            except KeyError, TypeError, ValueError:
+                continue
+            out[key] = digest
+        return out
 
     def ps(self) -> builtins.list[dict[str, Any]]:
         """``[{name, status, pid, source}]`` with live records refreshed."""

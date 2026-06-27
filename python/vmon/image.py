@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -43,11 +44,19 @@ class CachedTemplate:
     snapshot_dir: Path
     rootfs: Path
     spec: ImageSpec
-    digest: str
+    image_digest: str
     disk_mb: int
     # Count of pre-provisioned virtio-fs slots (`vmon.slot0..`) baked into the
     # snapshot for warm volume rebinding on restore; 0 is a plain (no-slot) template.
+    memory: int = 512
+    cpus: int = 1
     fs_slots: int = 0
+    # Whether the snapshot includes the reserved "host" virtio-fs device used by fs_dir.
+    host_slot: bool = False
+    # Whether the snapshot includes a user-mode NAT NIC for warm networked macOS sandboxes.
+    nic_slot: bool = False
+    # Stable content-addressed digest over the template snapshot, rootfs, and marker.
+    digest: str = ""
 
 
 def _state() -> Path:
@@ -131,11 +140,21 @@ def _image_digest(engine: str, reference: str) -> str:
 # Bumped when a template's *booted* state changes incompatibly (e.g. the guest
 # agent boot cmdline), so an upgraded vmon rebuilds snapshots an older one took
 # instead of silently reusing them. v2: rootfs mounted rw (older builds were ro).
-# v3: virtio-fs-capable aarch64 kernel.
-_TEMPLATE_BOOT_VERSION = 3
+# v3: virtio-fs-capable aarch64 kernel. v4: template identity records resource
+# shape and reserved virtio-fs host slots. v5: networked templates can bake a
+# user-mode NAT NIC for warm macOS sandboxes.
+_TEMPLATE_BOOT_VERSION = 5
 
 
-def _template_marker_current(marker: Path, kernel_sha: str, fs_slots: int) -> bool:
+def _template_marker_current(
+    marker: Path,
+    kernel_sha: str,
+    memory: int,
+    cpus: int,
+    fs_slots: int,
+    host_slot: bool,
+    nic_slot: bool,
+) -> bool:
     """True if *marker* records a template booted by the current vmon and kernel.
 
     Guards against reusing a snapshot whose baked-in boot state predates a
@@ -150,8 +169,48 @@ def _template_marker_current(marker: Path, kernel_sha: str, fs_slots: int) -> bo
     return (
         data.get("boot_version") == _TEMPLATE_BOOT_VERSION
         and data.get("kernel_sha") == kernel_sha
+        and data.get("memory") == memory
+        and data.get("cpus") == cpus
         and data.get("fs_slots", 0) == fs_slots
+        and data.get("host_slot", False) == host_slot
+        and data.get("nic_slot", False) == nic_slot
     )
+
+
+def _marker_content_digest(marker: Path) -> str | None:
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return None
+    value = data.get("content_digest")
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+        return value
+    return None
+
+
+def _store_marker_content_digest(marker: Path, content_digest: str) -> None:
+    data = json.loads(marker.read_text(encoding="utf-8"))
+    data["content_digest"] = content_digest
+    marker.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _index_cached_template(template: CachedTemplate, marker: Path) -> None:
+    # The content digest is authoritative when computed from freshly-built content;
+    # templates are immutable after build, so on a cache hit we reuse the stored
+    # digest only when its CAS pointer is still live and points here. Otherwise we
+    # recompute from content rather than blindly re-index an unverified digest.
+    # (Cross-node pulls verify received content against the requested digest.)
+    with contextlib.suppress(Exception):
+        from . import cas
+
+        cached_digest = _marker_content_digest(marker)
+        if cached_digest and cas.resolve_digest(cached_digest) == template.snapshot_dir:
+            template.digest = cached_digest
+            return
+        content_digest = cas.index_template(template.snapshot_dir)
+        template.digest = content_digest
+        if content_digest != cached_digest:
+            _store_marker_content_digest(marker, content_digest)
 
 
 def slot_tag(i: int) -> str:
@@ -175,10 +234,14 @@ def cached_template(
     memory: int = 512,
     cpus: int = 1,
     fs_slots: int = 0,
+    host_slot: bool = False,
+    nic_slot: bool = False,
 ) -> CachedTemplate:
     """Build/cache an agent-capable ext4 rootfs and a ping-verified VM snapshot."""
     if disk_mb <= 0:
         raise ValueError("disk_mb must be positive")
+    if nic_slot and (fs_slots > 0 or host_slot):
+        raise ValueError("nic_slot cannot be combined with fs_slots or host_slot")
     engine, reference = build_or_pull(image, dockerfile, context, engine)
     spec = _inspect(engine, reference)
     digest = _image_digest(engine, reference)
@@ -209,9 +272,27 @@ def cached_template(
                 tmp_ext4.unlink(missing_ok=True)
     spec_path.write_text(json.dumps(asdict(spec), indent=2), encoding="utf-8")
 
-    tpl_name = f"tpl-{digest[:12]}-{disk_mb}" + (f"-s{fs_slots}" if fs_slots else "")
+    suffix = (
+        f"-m{memory}-c{cpus}"
+        + (f"-s{fs_slots}" if fs_slots else "")
+        + ("-h" if host_slot else "")
+        + ("-n" if nic_slot else "")
+    )
+    tpl_name = f"tpl-{digest[:12]}-{disk_mb}{suffix}"
     tpl_dir = _state() / "templates" / tpl_name
-    template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb, fs_slots)
+    template = CachedTemplate(
+        name=tpl_name,
+        snapshot_dir=tpl_dir,
+        rootfs=rootfs_ext4,
+        spec=spec,
+        image_digest=digest,
+        disk_mb=disk_mb,
+        memory=memory,
+        cpus=cpus,
+        fs_slots=fs_slots,
+        host_slot=host_slot,
+        nic_slot=nic_slot,
+    )
     from .vmm import _snapshot_state_present, default_kernel
 
     kernel_path = default_kernel()
@@ -221,15 +302,18 @@ def cached_template(
     if (
         _snapshot_state_present(tpl_dir)
         and (tpl_dir / "rootfs.img").is_file()
-        and _template_marker_current(marker, kernel_sha, fs_slots)
+        and _template_marker_current(
+            marker, kernel_sha, memory, cpus, fs_slots, host_slot, nic_slot
+        )
     ):
+        _index_cached_template(template, marker)
         return template
     if tpl_dir.exists():
         shutil.rmtree(tpl_dir)
 
     from .vmm import MicroVM
 
-    vm_name = f"_template-{digest[:12]}-{disk_mb}" + (f"-s{fs_slots}" if fs_slots else "")
+    vm_name = f"_template-{digest[:12]}-{disk_mb}{suffix}"
     old = MicroVM(vm_name)
     if old.is_running():
         old.stop()
@@ -240,19 +324,26 @@ def cached_template(
     slot_vols: list[tuple[str, str | os.PathLike[str], bool]] = [
         (slot_tag(i), str(slot_void), True) for i in range(fs_slots)
     ]
+    host_fs_dir = str(slot_void) if host_slot else None
     vm = MicroVM.boot_rootfs(
         rootfs_ext4,
         name=vm_name,
         mem=memory,
         cpus=cpus,
         volumes=slot_vols,
+        fs_dir=host_fs_dir,
+        user_net=nic_slot,
         snapshot_root=_state() / "templates",
         image=spec.reference,
     )
     try:
         vm.wait_for_agent(timeout=timeout)
         vm.snapshot(
-            tpl_name, keep_running=False, disk_src=rootfs_ext4, snapshot_root=_state() / "templates"
+            tpl_name,
+            keep_running=False,
+            disk_src=rootfs_ext4,
+            snapshot_root=_state() / "templates",
+            allow_user_net=nic_slot,
         )
         marker.write_text(
             json.dumps(
@@ -263,6 +354,10 @@ def cached_template(
                     "boot_version": _TEMPLATE_BOOT_VERSION,
                     "kernel_sha": kernel_sha,
                     "fs_slots": fs_slots,
+                    "memory": memory,
+                    "cpus": cpus,
+                    "host_slot": host_slot,
+                    "nic_slot": nic_slot,
                 },
                 indent=2,
             ),
@@ -272,6 +367,7 @@ def cached_template(
         if vm.is_running():
             vm.stop()
         vm.remove()
+    _index_cached_template(template, marker)
     return template
 
 
@@ -317,8 +413,9 @@ def _is_static_elf(path: Path) -> bool:
     return True
 
 
-def _agent_arch() -> str:
-    return "aarch64" if platform.machine() in ("aarch64", "arm64") else "x86_64"
+def _agent_arch(arch: str | None = None) -> str:
+    machine = arch or platform.machine()
+    return "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
 
 
 def _first_static(paths: list[Path]) -> Path | None:
@@ -340,8 +437,10 @@ _STATIC_AGENT_HINT = (
     "Build and bundle it with `just agent-musl`, or set VMON_AGENT=/path/to/static-agent."
 )
 
+_AGENT_BUILD_TIMEOUT_SECS = 120
 
-def find_agent_binary() -> Path:
+
+def find_agent_binary(arch: str | None = None) -> Path:
     """Locate the static (musl) guest agent injected into every rootfs.
 
     Resolution order: the ``$VMON_AGENT`` override, the copy bundled in this
@@ -350,7 +449,7 @@ def find_agent_binary() -> Path:
     checkout, then ``PATH``. Non-static candidates are skipped so a stray
     dynamically linked build never masks a usable static one.
     """
-    arch = _agent_arch()
+    arch = _agent_arch(arch)
     if env := os.environ.get("VMON_AGENT"):
         p = Path(env).expanduser()
         if not p.is_file():
@@ -391,6 +490,65 @@ def find_agent_binary() -> Path:
     )
 
 
+def _musl_target_installed(target: str) -> bool:
+    rustup = shutil.which("rustup")
+    if not rustup:
+        return False
+    try:
+        result = subprocess.run(
+            [rustup, "target", "list", "--installed"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except OSError, subprocess.SubprocessError:
+        return False
+    return target in result.stdout.splitlines()
+
+
+def _build_static_agent(arch: str) -> bool:
+    cargo = shutil.which("cargo")
+    if not cargo:
+        return False
+    target = f"{arch}-unknown-linux-musl"
+    if not _musl_target_installed(target):
+        return False
+
+    repo = Path(__file__).resolve().parents[2]
+    if not (repo / "Cargo.toml").is_file():
+        return False
+
+    just = shutil.which("just")
+    if just and arch == _agent_arch():
+        cmd = [just, "agent-musl"]
+    else:
+        cmd = [cargo, "build", "-p", "vmon-agent", "--target", target, "--release"]
+    try:
+        subprocess.run(
+            cmd,
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=_AGENT_BUILD_TIMEOUT_SECS,
+        )
+    except OSError, subprocess.SubprocessError:
+        return False
+    return True
+
+
+def ensure_agent(arch: str | None = None) -> Path:
+    """Return a usable static guest agent, building it from a checkout if needed."""
+    try:
+        return find_agent_binary(arch)
+    except FileNotFoundError, RuntimeError:
+        agent_arch = _agent_arch(arch)
+        if not _build_static_agent(agent_arch):
+            raise
+    return find_agent_binary(arch)
+
+
 def _export_image(engine: str, reference: str, rootfs: Path, work: Path) -> None:
     cid = _run([engine, "create", reference]).strip()
     try:
@@ -407,7 +565,7 @@ def _inject_agent(rootfs: Path) -> None:
     dst_dir = rootfs / ".vmon"
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / "agent"
-    shutil.copy2(find_agent_binary(), dst)
+    shutil.copy2(ensure_agent(), dst)
     dst.chmod(0o755)
 
 
