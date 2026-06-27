@@ -34,7 +34,7 @@ class RecordingClient:
         }
 
     def stream(self, method, on_event, stdin=None, **params):
-        RecordingClient.last = {"method": method, "params": params, "stream": True}
+        RecordingClient.last = {"method": method, "params": params, "stream": True, "stdin": stdin}
         return {"returncode": RecordingClient.returncode}
 
     def interactive(self, method, on_event, *, tty=True, on_ready=None, **params):
@@ -127,11 +127,35 @@ def test_run_without_image_or_dockerfile_is_usage_error(rec, capsys):
 # -- exec: tty routing -----------------------------------------------------
 
 
-def test_exec_without_tty_streams_and_forwards_stdin(rec):
+def test_exec_without_tty_forwards_real_stdin(rec, monkeypatch):
+    import io
+    import sys
+    import types
+
+    # A non-interactive stdin (pipe/redirect) must be forwarded to the guest.
+    buf = io.BytesIO(b"piped-input")
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False, buffer=buf))
     assert cli.main(["exec", "vm1", "--", "sh", "-lc", "echo hi"]) == 0
     assert rec.last["method"] == "exec"
     assert rec.last.get("stream") is True
     assert rec.last["params"]["cmd"] == ["sh", "-lc", "echo hi"]
+    assert rec.last["stdin"] is buf
+
+
+def test_exec_tty_terminal_sends_immediate_eof_stdin(rec, monkeypatch):
+    import sys
+    import types
+
+    # A non-`-t` exec from an interactive terminal must NOT forward the TTY (the
+    # reader thread would block at interpreter shutdown -> SIGABRT). Instead an
+    # empty, immediate-EOF stream is sent so the guest's stdin is closed and
+    # readers like `cat` exit rather than hang.
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    assert cli.main(["exec", "vm1", "--", "sh", "-lc", "echo hi"]) == 0
+    assert rec.last.get("stream") is True
+    stdin = rec.last["stdin"]
+    assert stdin is not None
+    assert stdin.read() == b""
 
 
 def test_exec_tty_routes_to_interactive(rec):

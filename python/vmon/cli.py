@@ -7,8 +7,10 @@ speaks to :class:`vmon.client.DaemonClient` and renders everything through
 SDK and daemon stay dependency-light.
 """
 
+import io
 import sys
 from pathlib import Path
+from typing import BinaryIO, cast
 
 import click
 
@@ -301,11 +303,18 @@ def exec(name, cmd, tty):
     if tty:
         r = client.interactive("exec", _write_event, tty=True, name=name, cmd=argv)
         return _exit_code(r)
-    # Forward stdin only when it is piped/redirected. Forwarding an interactive
-    # terminal would leave the daemon stdin-reader thread blocked on a TTY read
-    # at interpreter shutdown, holding the buffer lock -> fatal
-    # `_enter_buffered_busy` / SIGABRT (rc=-6). Matches `docker exec` (need `-i`).
-    stdin = None if sys.stdin.isatty() else sys.stdin.buffer
+    # Pick the stdin source forwarded to the guest. A piped/redirected stdin is
+    # forwarded as-is. An interactive terminal must NOT be: the daemon
+    # stdin-reader thread would block on the TTY read at interpreter shutdown,
+    # holding the buffer lock -> fatal `_enter_buffered_busy` / SIGABRT (rc=-6).
+    # Use an empty stream so it forwards an immediate `eof` (closing the guest's
+    # stdin so readers like `cat` don't hang) and the reader thread exits at
+    # once. Matches `docker exec` without `-i`: stdin is closed, not interactive.
+    stdin = (
+        cast(BinaryIO, io.BytesIO(b""))
+        if sys.stdin.isatty()
+        else cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
+    )
     r = client.stream("exec", _write_event, stdin=stdin, name=name, cmd=argv)
     return _exit_code(r)
 

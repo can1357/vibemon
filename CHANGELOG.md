@@ -26,6 +26,8 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed hanging `vmon exec` commands by correctly closing stdin when run from a TTY
+
 - Fixed TTY stdin forwarding to prevent daemon crashes during shell execution
 - Prevented premature stdin-EOF teardown during non-interactive shell commands
 
