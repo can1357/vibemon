@@ -1,7 +1,12 @@
 #!/bin/bash
-# Host-side (macOS) launcher: runs a vmon demo INSIDE the Lima arm64 KVM VM
+# Host-side (macOS) launcher: runs a vmon demo INSIDE a Lima Linux/KVM VM
 # via `limactl shell`. The project dir is visible at the same path in the guest
 # (Lima home mount), so the in-guest scripts auto-locate the binary and kernel.
+#
+# Native macOS/HVF support is now available on Apple silicon for aarch64 guests:
+# build the local `vmm` with `just build`, then prefer the native demo scripts
+# when you do not need Lima. Keep this wrapper for x86_64 guests, nested Linux
+# KVM coverage, or Linux-only features such as TAP networking.
 #
 # Usage:  run-on-lima.sh [demo|ubuntu] [vm-name] [extra args -> guest script]
 #   demo    virtio-blk + virtio-net busybox demo (default)

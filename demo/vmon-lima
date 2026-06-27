@@ -1,9 +1,14 @@
 #!/bin/sh
 # vmon-lima — drive the vmon CLI inside a Lima KVM VM from macOS.
 #
-# The hypervisor (vmon), its Unix sockets, the Python venv, and (for
-# `vmon run`) docker/podman all live INSIDE the guest. This wrapper just relays
-# your command there via `limactl shell`, so on the Mac you can type:
+# Native macOS/HVF support is now available on Apple silicon for aarch64 guests:
+# build the local `vmm` with `just build`, then run the normal `vmon` CLI
+# natively when you do not need Lima. Keep this wrapper for x86_64 guests,
+# nested Linux/KVM coverage, or Linux-only features such as TAP networking.
+#
+# When using Lima, the hypervisor (vmon), its Unix sockets, the Python venv, and
+# (for `vmon run`) docker/podman all live INSIDE the guest. This wrapper just
+# relays your command there via `limactl shell`, so on the Mac you can type:
 #
 #   ./demo/vmon-lima ps
 #   ./demo/vmon-lima run alpine -- sh -c 'uname -a'

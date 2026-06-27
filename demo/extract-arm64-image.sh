@@ -3,23 +3,40 @@
 # distro EFI-zboot `vmlinuz`. Modern Ubuntu/Alpine arm64 kernels ship as a PE
 # EFI app whose payload is a gzip/zstd-compressed Image; this unwraps it.
 #
+# Linux hosts default to /boot/vmlinuz-$(uname -r). macOS hosts have no /boot,
+# so pass an explicit vmlinuz path there.
+#
 # Usage: extract-arm64-image.sh [vmlinuz] [out-Image]
-#   defaults: vmlinuz = /boot/vmlinuz-$(uname -r), out = /tmp/vmon-demo/Image
+#   defaults: vmlinuz = /boot/vmlinuz-$(uname -r) when present, out = /tmp/vmon-demo/Image
 set -euo pipefail
 IN=${1:-/boot/vmlinuz-$(uname -r)}
+HOST_OS="$(uname -s)"
+DEFAULT_IN="/boot/vmlinuz-$(uname -r)"
+if [ "$#" -eq 0 ] && [ ! -e "$DEFAULT_IN" ]; then
+  if [ "$HOST_OS" = "Darwin" ]; then
+    echo "[extract] macOS has no default /boot kernel; pass an explicit EFI-zboot vmlinuz path." >&2
+    echo "[extract] usage: $0 /path/to/vmlinuz [out-Image]" >&2
+    exit 1
+  fi
+fi
 OUT=${2:-/tmp/vmon-demo/Image}
 mkdir -p "$(dirname "$OUT")"
 
-# /boot kernels are often root-only; copy to a readable temp if needed.
+# /boot kernels are often root-only on Linux; copy to a readable temp if needed.
 if [ ! -r "$IN" ]; then
-  echo "[extract] $IN not readable, copying with sudo" >&2
-  sudo cp "$IN" "$(dirname "$OUT")/vmlinuz.src"
-  sudo chmod a+r "$(dirname "$OUT")/vmlinuz.src"
-  IN="$(dirname "$OUT")/vmlinuz.src"
+  if [ "$HOST_OS" = "Linux" ] && command -v sudo >/dev/null 2>&1; then
+    echo "[extract] $IN not readable, copying with sudo" >&2
+    sudo cp "$IN" "$(dirname "$OUT")/vmlinuz.src"
+    sudo chmod a+r "$(dirname "$OUT")/vmlinuz.src"
+    IN="$(dirname "$OUT")/vmlinuz.src"
+  else
+    echo "[extract] $IN is not readable; pass a readable vmlinuz path or adjust permissions." >&2
+    exit 1
+  fi
 fi
 
 python3 - "$IN" "$OUT" <<'PY'
-import sys, struct, gzip, subprocess, os
+import sys, struct, gzip, subprocess, os, shutil, platform
 data = open(sys.argv[1], "rb").read()
 # Already a raw arm64 Image?
 if data[56:60] == b"ARM\x64":
@@ -37,6 +54,9 @@ print(f"[extract] zboot payload off={hex(base+poff)} size={hex(psize)} comp={com
 if comp == "gzip":
     open(sys.argv[2], "wb").write(gzip.decompress(payload))
 elif comp == "zstd":
+    if shutil.which("unzstd") is None:
+        hint = "install zstd (macOS: brew install zstd)" if platform.system() == "Darwin" else "install zstd/unzstd"
+        sys.exit(f"unzstd not found; {hint}")
     open("/tmp/.zb.payload", "wb").write(payload)
     subprocess.run(["unzstd", "-f", "-q", "-o", sys.argv[2], "/tmp/.zb.payload"], check=True)
     os.remove("/tmp/.zb.payload")

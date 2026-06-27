@@ -2,14 +2,16 @@
 # Boot a real Ubuntu 24.04 cloud image under vmm through operator-supplied
 # UEFI firmware (OVMF on x86_64, QEMU_EFI.fd on aarch64) to a serial login,
 # proving the full firmware -> bootloader -> kernel -> userspace chain rather
-# rather than vmm's direct-kernel path. Run INSIDE a Linux host with /dev/kvm.
+# than vmm's direct-kernel path. Use Linux/KVM on x86_64/aarch64, or
+# Apple-silicon macOS/HVF for the aarch64 guest path.
 #
 # Usage:  run-uefi-ubuntu.sh
 #   - binary:    $VMON_BIN, else auto-detected (cargo target dirs / PATH)
-#   - firmware:  $VMON_X86_UEFI / $VMON_AARCH64_UEFI, else a distro path,
-#                else downloaded from the EDK2 nightly (see "firmware" below)
+#   - firmware:  $VMON_X86_UEFI / $VMON_AARCH64_UEFI, else a distro/Homebrew
+#                path, else downloaded from the EDK2 nightly (see "firmware" below)
 #   - image:     pinned Ubuntu 24.04 cloud image for the host architecture
-# Needs:  curl, qemu-img (qemu-utils), sha256sum|shasum, sudo (for /dev/kvm).
+# Needs:  curl, qemu-img (qemu-utils; on macOS: brew install qemu),
+#         sha256sum|shasum, timeout|gtimeout, and sudo only on Linux for /dev/kvm.
 # Optional:  virt-customize (libguestfs-tools) to set a root password and a
 #            serial autologin so you land in a shell instead of a login prompt;
 #            enable with VMON_UEFI_CUSTOMIZE=1.
@@ -19,9 +21,25 @@ WORK=${WORK:-/tmp/vmon-uefi}
 MEM=${MEM:-2048}
 CPUS=${CPUS:-2}
 TIMEOUT=${TIMEOUT:-240}
+HOST_OS=$(uname -s)
+HOST_MACHINE=$(uname -m)
+case "$HOST_OS" in
+  Linux)
+    SUDO=(sudo)
+    TIMEOUT_CANDIDATES=(timeout)
+    ;;
+  Darwin)
+    SUDO=()
+    TIMEOUT_CANDIDATES=(gtimeout timeout)
+    # Homebrew installs qemu-img/coreutils outside the system PATH in some shells.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    ;;
+  *) echo "error: unsupported host OS $HOST_OS (use Linux/KVM or Apple-silicon macOS/HVF)" >&2; exit 1 ;;
+esac
+
 mkdir -p "$WORK"; cd "$WORK"
 
-# mkfs/qemu helpers commonly live in /sbin or /usr/sbin on Linux hosts.
+# qemu helpers commonly live in /sbin or /usr/sbin on Linux hosts.
 export PATH="$PATH:/usr/sbin:/sbin"
 
 # --- preconditions ----------------------------------------------------------
@@ -33,15 +51,45 @@ need() {  # need <command> <install-hint>
     missing=1
   fi
 }
-need curl "apt-get install curl  |  dnf install curl"
-need qemu-img "apt-get install qemu-utils  |  dnf install qemu-img"
-need sudo "run as a user that can sudo for /dev/kvm access"
+if [ "$HOST_OS" = Darwin ]; then
+  need curl "curl is included with macOS; install Command Line Tools or run: brew install curl"
+  need qemu-img "brew install qemu"
+else
+  need curl "apt-get install curl  |  dnf install curl"
+  need qemu-img "apt-get install qemu-utils  |  dnf install qemu-img"
+  need sudo "run as a user that can sudo for /dev/kvm access"
+fi
+find_timeout() {
+  local c
+  for c in "${TIMEOUT_CANDIDATES[@]}"; do
+    if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+  done
+  return 1
+}
+TIMEOUT_BIN=$(find_timeout) || {
+  if [ "$HOST_OS" = Darwin ]; then
+    echo "error: required tool 'gtimeout' not found on PATH" >&2
+    echo "       hint: brew install coreutils" >&2
+  else
+    echo "error: required tool 'timeout' not found on PATH" >&2
+    echo "       hint: install GNU coreutils" >&2
+  fi
+  missing=1
+  TIMEOUT_BIN=timeout
+}
 if command -v sha256sum >/dev/null 2>&1; then
   SHA256_TOOL=sha256sum
 elif command -v shasum >/dev/null 2>&1; then
   SHA256_TOOL="shasum -a 256"
 else
-  echo "error: need 'sha256sum' or 'shasum' on PATH" >&2; missing=1; SHA256_TOOL=
+  echo "error: need 'sha256sum' or 'shasum' on PATH" >&2
+  if [ "$HOST_OS" = Darwin ]; then
+    echo "       hint: shasum ships with macOS; alternatively run: brew install coreutils" >&2
+  else
+    echo "       hint: install coreutils or perl-Digest-SHA" >&2
+  fi
+  missing=1
+  SHA256_TOOL=
 fi
 [ "$missing" -eq 0 ] || { echo "error: install the missing tool(s) above, then re-run" >&2; exit 1; }
 
@@ -77,21 +125,41 @@ fetch_verified() {  # fetch_verified <label> <url> <path> <sha256>
 }
 
 # --- locate the vmm binary for the host architecture --------------------
-case "$(uname -m)" in
-  x86_64|amd64) ARCH=x86_64; TRIPLE=x86_64-unknown-linux-gnu ;;
-  aarch64|arm64) ARCH=aarch64; TRIPLE=aarch64-unknown-linux-gnu ;;
-  *) echo "error: unsupported host architecture $(uname -m)" >&2; exit 1 ;;
+case "$HOST_MACHINE" in
+  x86_64|amd64)
+    if [ "$HOST_OS" = Darwin ]; then
+      echo "error: Intel macOS is unsupported; use Linux/KVM or Apple-silicon macOS/HVF" >&2
+      exit 1
+    fi
+    ARCH=x86_64; TRIPLE=x86_64-unknown-linux-gnu
+    ;;
+  aarch64|arm64)
+    ARCH=aarch64
+    if [ "$HOST_OS" = Darwin ]; then
+      TRIPLE=aarch64-apple-darwin
+    else
+      TRIPLE=aarch64-unknown-linux-gnu
+    fi
+    ;;
+  *) echo "error: unsupported host architecture $HOST_MACHINE" >&2; exit 1 ;;
 esac
 
 find_vmm() {
   if [ -n "${VMON_BIN:-}" ] && [ -x "${VMON_BIN:-}" ]; then echo "$VMON_BIN"; return 0; fi
-  local proj base
+  local proj base td
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
+  # Resolve cargo's target dir (honors .cargo/config build.target-dir and
+  # $CARGO_TARGET_DIR), mirroring python/vmon/vmm.py::_cargo_target_dir.
+  td="${CARGO_TARGET_DIR:-}"
+  [ -n "$td" ] || td=$(cd "$proj" && cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null || true)
+  [ -n "$td" ] || td="$proj/target"
   for c in \
-    "$proj/target/$TRIPLE/release/vmm" \
-    "$proj/target/release/vmm" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/$TRIPLE/release/vmm" \
+    "$td/$TRIPLE/release/vmm" "$td/$TRIPLE/debug/vmm" \
+    "$td/release/vmm" "$td/debug/vmm" \
+    "$proj/target/$TRIPLE/release/vmm" "$proj/target/release/vmm" \
+    "$proj/target/$TRIPLE/debug/vmm" "$proj/target/debug/vmm" \
     "$base/.cache/cargo-target/$TRIPLE/release/vmm" \
     "$HOME/.cache/cargo-target/$TRIPLE/release/vmm" \
     "$(command -v vmm 2>/dev/null || true)"; do
@@ -100,7 +168,7 @@ find_vmm() {
   return 1
 }
 BIN=$(find_vmm) || {
-  echo "error: vmm binary not found. Build it for $TRIPLE or set VMON_BIN=/path/to/vmm" >&2
+  echo "error: vmm binary not found. Build it for $TRIPLE (on macOS: just build) or set VMON_BIN=/path/to/vmm" >&2
   exit 1
 }
 echo "[uefi] vmm: $BIN  (arch: $ARCH)"
@@ -147,6 +215,8 @@ else
     /usr/share/edk2/aarch64/QEMU_EFI.fd
     /usr/share/edk2/arm/QEMU_EFI.fd
     /usr/share/AAVMF/QEMU_EFI.fd
+    /opt/homebrew/share/qemu/QEMU_EFI.fd
+    /usr/local/share/qemu/QEMU_EFI.fd
   )
   FW_URL=https://retrage.github.io/edk2-nightly/bin/RELEASEAARCH64_QEMU_EFI.fd
   FW_LOCAL="$WORK/RELEASEAARCH64_QEMU_EFI.fd"
@@ -164,7 +234,7 @@ if [ ! -f "$RAW" ] || [ "$QCOW" -nt "$RAW" ]; then
 else
   echo "[uefi] raw image: using existing $RAW"
 fi
-sudo chmod a+rw "$RAW" 2>/dev/null || chmod a+rw "$RAW" 2>/dev/null || true
+"${SUDO[@]}" chmod a+rw "$RAW" 2>/dev/null || chmod a+rw "$RAW" 2>/dev/null || true
 
 # --- resolve UEFI firmware --------------------------------------------------
 # Resolution order: explicit env var -> installed distro firmware -> download
@@ -184,8 +254,12 @@ resolve_firmware() {
   done
   echo "[uefi] no installed firmware found; fetching EDK2 nightly (UNPINNED)" >&2
   echo "       to use a packaged firmware instead, install one of:" >&2
-  echo "         x86_64:  apt-get install ovmf   | dnf install edk2-ovmf" >&2
-  echo "         aarch64: apt-get install qemu-efi-aarch64 | dnf install edk2-aarch64" >&2
+  if [ "$HOST_OS" = Darwin ]; then
+    echo "         macOS: set VMON_AARCH64_UEFI to QEMU_EFI.fd, or let this script fetch EDK2" >&2
+  else
+    echo "         x86_64:  apt-get install ovmf   | dnf install edk2-ovmf" >&2
+    echo "         aarch64: apt-get install qemu-efi-aarch64 | dnf install edk2-aarch64" >&2
+  fi
   echo "       or set VMON_X86_UEFI / VMON_AARCH64_UEFI to a firmware path." >&2
   fetch_verified "firmware" "$FW_URL" "$FW_LOCAL" "$FW_SHA256"
   FIRMWARE=$FW_LOCAL
@@ -212,7 +286,7 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %I \$TERM
 EOF
     printf '%s\n' 'echo VMON_UEFI_LOGIN_OK' > "$WORK/cust/zz-vmon.sh"
-    sudo virt-customize -a "$RAW" \
+    "${SUDO[@]}" virt-customize -a "$RAW" \
       --root-password password:ubuntu \
       --mkdir "/etc/systemd/system/serial-getty@${SERIAL}.service.d" \
       --upload "$WORK/cust/override.conf:/etc/systemd/system/serial-getty@${SERIAL}.service.d/override.conf" \
@@ -230,7 +304,7 @@ echo "[uefi] launching vmm: --boot-mode uefi --firmware <fw> --rootfs <img>${TRA
 LOG="$WORK/uefi-ubuntu-$ARCH.log"
 rm -f "$LOG"
 set +e
-sudo timeout "$TIMEOUT" "$BIN" \
+"${SUDO[@]}" "$TIMEOUT_BIN" "$TIMEOUT" "$BIN" \
   --boot-mode uefi \
   --firmware "$FIRMWARE" \
   --rootfs "$RAW" \

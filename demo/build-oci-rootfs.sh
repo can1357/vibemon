@@ -31,15 +31,16 @@
 # the in-guest agent over virtio-console. The /init stub synthesized below is a
 # standalone fallback so the image is also directly bootable WITHOUT the agent.
 #
-# Requires: skopeo, umoci, mkfs.ext4 (e2fsprogs); jq is optional (used only to
-# auto-detect the image entrypoint). This script does NOT run on the vmon dev
-# workstation (which lacks skopeo/umoci) -- run it on a Linux host that has the
-# container tooling installed.
+# Requires: skopeo, umoci, mkfs.ext4/mke2fs (e2fsprogs); jq is optional (used
+# only to auto-detect the image entrypoint). This runs on Linux and macOS hosts
+# with the container tooling installed; on macOS those tools are available via
+# Homebrew.
 set -euo pipefail
 
-# mkfs.ext4 commonly lives in /sbin or /usr/sbin, which are frequently missing
-# from a non-root user's PATH; make sure it is discoverable.
-export PATH="$PATH:/usr/sbin:/sbin"
+# mkfs.ext4/mke2fs commonly live in sbin directories missing from a non-root
+# user's PATH. Homebrew's e2fsprogs is keg-only on macOS, so include its sbin
+# locations as well.
+export PATH="$PATH:/usr/sbin:/sbin:/opt/homebrew/opt/e2fsprogs/sbin:/usr/local/opt/e2fsprogs/sbin:/opt/homebrew/sbin:/usr/local/sbin"
 
 IMAGE_REF=${1:-docker://busybox}
 OUT_IMG=${2:-/tmp/vmon-demo/oci-rootfs.img}
@@ -54,9 +55,17 @@ need() {  # need <command> <install-hint>
     missing=1
   fi
 }
-need skopeo    "apt-get install skopeo  |  dnf install skopeo  |  brew install skopeo"
-need umoci     "apt-get install umoci  |  or fetch a static binary from https://github.com/opencontainers/umoci/releases"
-need mkfs.ext4 "apt-get install e2fsprogs  |  dnf install e2fsprogs"
+need skopeo "apt-get install skopeo  |  dnf install skopeo  |  brew install skopeo"
+need umoci  "apt-get install umoci  |  brew install umoci  |  or fetch a static binary from https://github.com/opencontainers/umoci/releases"
+if command -v mkfs.ext4 >/dev/null 2>&1; then
+  MKFS_EXT4=(mkfs.ext4 -F -q)
+elif command -v mke2fs >/dev/null 2>&1; then
+  MKFS_EXT4=(mke2fs -t ext4 -F -q)
+else
+  echo "error: required tool 'mkfs.ext4' (or 'mke2fs') not found on PATH" >&2
+  echo "       hint: apt-get install e2fsprogs  |  dnf install e2fsprogs  |  brew install e2fsprogs" >&2
+  missing=1
+fi
 if [ "$missing" -ne 0 ]; then
   echo "error: install the missing tool(s) listed above, then re-run" >&2
   exit 1
@@ -73,8 +82,8 @@ echo "[oci] skopeo copy: $IMAGE_REF -> oci:$TMP/oci:latest"
 skopeo copy "$IMAGE_REF" "oci:$TMP/oci:latest"
 
 # 2) flatten all layers into a rootfs at $TMP/bundle/rootfs (+ config.json).
-#    NOTE: run as root, or add `--rootless`, if the image carries device nodes
-#    or ownership umoci cannot reproduce as an unprivileged user.
+#    NOTE: if the image carries device nodes or ownership umoci cannot reproduce
+#    unprivileged, run as root on Linux or add `--rootless`.
 echo "[oci] umoci unpack -> $TMP/bundle/rootfs"
 umoci unpack --image "$TMP/oci:latest" "$TMP/bundle"
 ROOTFS="$TMP/bundle/rootfs"
@@ -118,10 +127,10 @@ EOF
 fi
 
 # 4) build the ext4 image directly from the rootfs directory
-echo "[oci] mkfs.ext4 -d $ROOTFS -> $OUT_IMG ($SIZE)"
+echo "[oci] ${MKFS_EXT4[0]} -d $ROOTFS -> $OUT_IMG ($SIZE)"
 mkdir -p "$(dirname "$OUT_IMG")"
 rm -f "$OUT_IMG"
-mkfs.ext4 -F -q -d "$ROOTFS" "$OUT_IMG" "$SIZE"
+"${MKFS_EXT4[@]}" -d "$ROOTFS" "$OUT_IMG" "$SIZE"
 
 # 5) report the result
 echo "[oci] done:"

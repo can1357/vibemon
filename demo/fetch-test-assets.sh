@@ -36,11 +36,13 @@ if [ "$ARCH" = x86_64 ]; then
   INITRAMFS_PATH=${INITRAMFS_PATH:-"$ASSET_DIR/busybox-initramfs-x86_64.cpio.gz"}
   ROOTFS_PATH=${ROOTFS_PATH:-"$ASSET_DIR/rootfs-x86_64.ext4"}
 else
-  # The quickstart aarch64 kernel hangs under vmon (no 8250/earlycon for our
-  # ns16550a UART); the firecracker-ci kernel boots cleanly under KVM and HVF.
+  # The Cloud Hypervisor release kernel (raw arm64 Image, v6.16.9): boots cleanly
+  # under KVM and HVF with our 8250/earlycon UART and ships CONFIG_VIRTIO_FS=y so
+  # virtio-fs shares/volumes work. (The firecracker-ci kernel lacked virtio-fs;
+  # the quickstart aarch64 kernel hangs for want of an 8250 console.)
   KERNEL_NAME="Image-aarch64"
-  KERNEL_URL=${KERNEL_URL:-"https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/aarch64/vmlinux-6.1.128"}
-  KERNEL_SHA256=${KERNEL_SHA256:-"cb1291c66bca75bc11cb9c8357fcef9965bb1786dffcb42a60923c3e0e49f319"}
+  KERNEL_URL=${KERNEL_URL:-"https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/Image-arm64"}
+  KERNEL_SHA256=${KERNEL_SHA256:-"69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010"}
 
   # busybox.net publishes no aarch64 binary; extract a working busybox + its
   # musl loader from a pinned Alpine aarch64 minirootfs instead.

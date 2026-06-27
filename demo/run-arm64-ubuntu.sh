@@ -1,22 +1,49 @@
 #!/bin/bash
 # Boot a real Ubuntu 24.04 arm64 root filesystem under vmm on virtio-blk,
-# proving a full distro userspace (not just the kernel). Run INSIDE an arm64
-# Linux host with /dev/kvm.
+# proving a full distro userspace (not just the kernel). Runs on arm64 Linux
+# hosts with /dev/kvm and on Apple-silicon macOS hosts with HVF.
 #
 # Usage:  run-arm64-ubuntu.sh [arm64-Image]
 #   - binary:  $VMON_BIN, else auto-detected (cargo target dirs / PATH)
-#   - kernel:  arg 1, else auto-extracted from /boot/vmlinuz-$(uname -r)
-# Needs:  curl, mkfs.ext4, sudo.
+#   - kernel:  arg 1 / $VMON_KERNEL, else host-appropriate arm64 Image
+# Needs:  curl, mkfs.ext4; Linux also needs sudo.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+HOST_OS=$(uname -s)
+HOST_ARCH=$(uname -m)
+if [ "$HOST_OS" = "Darwin" ]; then
+  case "$HOST_ARCH" in
+    arm64 | aarch64) ;;
+    *) echo "error: Intel macOS is unsupported for this arm64/HVF demo; use Linux/KVM or Lima." >&2; exit 1 ;;
+  esac
+  # Homebrew's e2fsprogs is keg-only, so mkfs.ext4 is not on macOS' default PATH.
+  export PATH="/opt/homebrew/opt/e2fsprogs/sbin:/usr/local/opt/e2fsprogs/sbin:/opt/homebrew/sbin:/usr/local/sbin:$PATH"
+fi
 WORK=${WORK:-/tmp/vmon-demo}
 mkdir -p "$WORK"; cd "$WORK"
 
 find_vmm() {
   if [ -n "${VMON_BIN:-}" ] && [ -x "${VMON_BIN:-}" ]; then echo "$VMON_BIN"; return 0; fi
-  local proj base
+  local proj base td
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
+  # Resolve cargo's target dir (honors .cargo/config build.target-dir and
+  # $CARGO_TARGET_DIR), mirroring python/vmon/vmm.py::_cargo_target_dir so the
+  # demo finds the same binary find_binary() does.
+  td="${CARGO_TARGET_DIR:-}"
+  [ -n "$td" ] || td=$(cd "$proj" && cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null || true)
+  [ -n "$td" ] || td="$proj/target"
+  if [ "$HOST_OS" = "Darwin" ]; then
+    for c in \
+      "$td"/release/vmm "$td"/debug/vmm \
+      "$td"/aarch64-apple-darwin/release/vmm "$td"/aarch64-apple-darwin/debug/vmm \
+      "$proj"/target/*/vmm \
+      "$(command -v vmm 2>/dev/null || true)"; do
+      [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+  fi
   for c in \
     "$proj/target/aarch64-unknown-linux-gnu/release/vmm" \
     "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmm" \
@@ -28,17 +55,42 @@ find_vmm() {
   return 1
 }
 BIN=$(find_vmm) || {
-  echo "error: vmm binary not found. Build it with:" >&2
-  echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
+  if [ "$HOST_OS" = "Darwin" ]; then
+    echo "error: vmm binary not found. Build the ad-hoc-signed HVF binary with:" >&2
+    echo "  just build" >&2
+  else
+    echo "error: vmm binary not found. Build it with:" >&2
+    echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
+  fi
   echo "or set VMON_BIN=/path/to/vmm" >&2; exit 1
 }
 echo "[demo] vmm: $BIN"
 
-KERNEL=${1:-}
+KERNEL=${1:-${VMON_KERNEL:-}}
 if [ -z "$KERNEL" ]; then
-  KERNEL="$WORK/Image"
-  [ -f "$KERNEL" ] || bash "$HERE/extract-arm64-image.sh" "/boot/vmlinuz-$(uname -r)" "$KERNEL"
+  if [ "$HOST_OS" = "Darwin" ]; then
+    PROJ=$(cd "$HERE/.." && pwd)
+    TARGET_KERNEL="$PROJ/target/test-assets/Image-aarch64"
+    HOME_KERNEL="$HOME/.vmon/assets/Image-aarch64"
+    if [ -f "$TARGET_KERNEL" ]; then
+      KERNEL="$TARGET_KERNEL"
+    else
+      echo "[demo] fetching pinned arm64 test kernel for macOS/HVF"
+      if VMON_ASSET_ARCH=aarch64 ASSET_DIR="$PROJ/target/test-assets" bash "$HERE/fetch-test-assets.sh"; then
+        KERNEL="$TARGET_KERNEL"
+      elif [ -f "$HOME_KERNEL" ]; then
+        KERNEL="$HOME_KERNEL"
+      else
+        echo "error: arm64 Image kernel not found; set VMON_KERNEL or run demo/fetch-test-assets.sh" >&2
+        exit 1
+      fi
+    fi
+  else
+    KERNEL="$WORK/Image"
+    [ -f "$KERNEL" ] || bash "$HERE/extract-arm64-image.sh" "/boot/vmlinuz-$(uname -r)" "$KERNEL"
+  fi
 fi
+[ -f "$KERNEL" ] || { echo "error: kernel not found: $KERNEL" >&2; exit 1; }
 echo "[demo] kernel: $KERNEL"
 
 if [ ! -f ubuntu-base.tar.gz ]; then
@@ -48,8 +100,17 @@ if [ ! -f ubuntu-base.tar.gz ]; then
 fi
 
 echo "[demo] building Ubuntu rootfs image"
-sudo rm -rf uroot && sudo mkdir uroot && sudo tar -xzf ubuntu-base.tar.gz -C uroot
-sudo tee uroot/vmon-init.sh >/dev/null <<'EOF'
+if [ "$HOST_OS" = "Darwin" ] && ! command -v mkfs.ext4 >/dev/null 2>&1; then
+  echo "error: mkfs.ext4 not found; install it with: brew install e2fsprogs" >&2
+  exit 1
+fi
+if [ "$HOST_OS" = "Darwin" ]; then
+  SUDO=
+else
+  SUDO=sudo
+fi
+$SUDO rm -rf uroot && $SUDO mkdir uroot && $SUDO tar -xzf ubuntu-base.tar.gz -C uroot
+$SUDO tee uroot/vmon-init.sh >/dev/null <<'EOF'
 #!/bin/sh
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -96,17 +157,32 @@ grep ' / ' /proc/mounts
 echo "##### vmon ubuntu PASS #####"
 shutdown_guest
 EOF
-sudo chmod +x uroot/vmon-init.sh
-sudo rm -f ubuntu.img; sudo mkfs.ext4 -F -q -d uroot ubuntu.img 2G; sudo chmod a+rw ubuntu.img
+$SUDO chmod +x uroot/vmon-init.sh
+$SUDO rm -f ubuntu.img; $SUDO mkfs.ext4 -F -q -d uroot ubuntu.img 2G; $SUDO chmod a+rw ubuntu.img
 
 echo "[demo] launching vmm with Ubuntu 24.04 root on virtio-blk"
 LOG="$WORK/arm64-ubuntu.log"
 rm -f "$LOG"
 set +e
-sudo timeout 90 "$BIN" \
-  --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
-  --cmdline "console=ttyS0 root=/dev/vda rw init=/vmon-init.sh reboot=t panic=-1 sysrq_always_enabled=1" 2>&1 | tee "$LOG"
-status=${PIPESTATUS[0]}
+if [ "$HOST_OS" = "Darwin" ]; then
+  CMDLINE="console=ttyS0 earlycon=uart8250,mmio,0x9000000 root=/dev/vda rw init=/vmon-init.sh reboot=t panic=-1 sysrq_always_enabled=1"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 90 "$BIN" \
+      --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
+      --cmdline "$CMDLINE" 2>&1 | tee "$LOG"
+    status=${PIPESTATUS[0]}
+  else
+    "$BIN" \
+      --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
+      --cmdline "$CMDLINE" 2>&1 | tee "$LOG"
+    status=${PIPESTATUS[0]}
+  fi
+else
+  sudo timeout 90 "$BIN" \
+    --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
+    --cmdline "console=ttyS0 root=/dev/vda rw init=/vmon-init.sh reboot=t panic=-1 sysrq_always_enabled=1" 2>&1 | tee "$LOG"
+  status=${PIPESTATUS[0]}
+fi
 set -e
 if [ "$status" -ne 0 ]; then
   echo "[demo] timeout/vmm exited with status $status" >&2
