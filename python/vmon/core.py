@@ -369,6 +369,7 @@ class Engine:
 
     def template_index(self) -> builtins.dict[str, str]:
         """Return request-derivable template keys mapped to local content digests."""
+        from . import cas
         from .mesh import template_key
 
         templates = state_dir() / "templates"
@@ -401,6 +402,8 @@ class Engine:
                 or len(digest) != 64
                 or any(ch not in "0123456789abcdef" for ch in digest)
             ):
+                continue
+            if (child / "remote-page.json").exists() or cas.resolve_digest(digest) != child:
                 continue
             try:
                 key = template_key(

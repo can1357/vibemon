@@ -276,6 +276,9 @@ class Sandbox:
         inbound_cidr_allowlist: Sequence[str] | None = None,
         readiness_probe: Any = None,
         pool_size: int = 0,
+        remote_page_url: str | None = None,
+        remote_page_token: str | None = None,
+        remote_page_digest: str | None = None,
     ) -> Sandbox:
         if block_network and ports:
             raise ValueError("ports cannot be exposed when block_network=True")
@@ -398,6 +401,9 @@ class Sandbox:
                     mem=memory,
                     cpus=cpus,
                     timeout_secs=eff_timeout_secs,
+                    remote_page_url=remote_page_url,
+                    remote_page_token=remote_page_token,
+                    remote_page_digest=remote_page_digest,
                 )
             elif vm is None and warm_volumes:
                 # Warm volume path: restore the slot-provisioned template and rebind
@@ -420,6 +426,9 @@ class Sandbox:
                     cpus=cpus,
                     volumes=slot_vols,
                     timeout_secs=eff_timeout_secs,
+                    remote_page_url=remote_page_url,
+                    remote_page_token=remote_page_token,
+                    remote_page_digest=remote_page_digest,
                 )
             elif vm is None and host_slot:
                 vm = MicroVM.restore(
@@ -430,6 +439,9 @@ class Sandbox:
                     cpus=cpus,
                     fs_dir=fs_dir,
                     timeout_secs=eff_timeout_secs,
+                    remote_page_url=remote_page_url,
+                    remote_page_token=remote_page_token,
+                    remote_page_digest=remote_page_digest,
                 )
             elif vm is None and networked_warm:
                 vm = MicroVM.restore(
@@ -439,6 +451,9 @@ class Sandbox:
                     mem=memory,
                     cpus=cpus,
                     timeout_secs=eff_timeout_secs,
+                    remote_page_url=remote_page_url,
+                    remote_page_token=remote_page_token,
+                    remote_page_digest=remote_page_digest,
                 )
                 user_net_sandbox = True
             elif vm is None and networked_warm_linux:
@@ -461,6 +476,9 @@ class Sandbox:
                     cpus=cpus,
                     tap=str(net_handle.guest_config["tap"]),
                     timeout_secs=eff_timeout_secs,
+                    remote_page_url=remote_page_url,
+                    remote_page_token=remote_page_token,
+                    remote_page_digest=remote_page_digest,
                 )
             elif vm is None:
                 # Fresh copy-on-write overlay boot from the template disk. vmon's

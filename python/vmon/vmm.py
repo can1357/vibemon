@@ -578,6 +578,9 @@ class MicroVM:
         tap: str | None = None,
         user_net: bool = False,
         timeout_secs: int | None = None,
+        remote_page_url: str | None = None,
+        remote_page_token: str | None = None,
+        remote_page_digest: str | None = None,
     ) -> MicroVM:
         """Warm-boot a microVM from a snapshot directory or named snapshot."""
         snap_dir = cls._snapshot_dir(snapshot)
@@ -615,6 +618,10 @@ class MicroVM:
         timeout_secs = _validate_timeout_secs(timeout_secs)
         if timeout_secs is not None:
             args.extend(["--timeout-secs", str(timeout_secs)])
+        launch_env: dict[str, str] | None = None
+        if remote_page_url is not None:
+            args.extend(["--remote-page-url", str(remote_page_url)])
+            launch_env = {"VMON_REMOTE_PAGE_TOKEN": remote_page_token or ""}
         args.extend(["--snapshot-root", str(STATE / "snapshots")])
         t0 = time.time()
         vm._launch(
@@ -627,6 +634,9 @@ class MicroVM:
             rootfs=str(rootfs) if rootfs else None,
             snapshot_root=str(STATE / "snapshots"),
             volumes=[{"tag": t, "dir": str(d), "ro": bool(ro)} for t, d, ro in vols],
+            remote_page_url=remote_page_url,
+            remote_page_digest=remote_page_digest,
+            env=launch_env,
         )
         vm._record_reconstruct(t0)
         return vm
@@ -694,6 +704,7 @@ class MicroVM:
         control_sock: Path | None = None,
         agent_sock: Path | None = None,
         launch_timeout: float = 15.0,
+        env: dict[str, str] | None = None,
         **meta,
     ) -> None:
         control_sock = control_sock or self.sock
@@ -721,6 +732,10 @@ class MicroVM:
             and "--no-sandbox" not in launch_args
         ):
             launch_args.append("--no-sandbox")
+        proc_env = None
+        if env:
+            proc_env = os.environ.copy()
+            proc_env.update(env)
         with self.log.open("wb") as logf:
             proc = subprocess.Popen(
                 [binary, *launch_args],
@@ -728,6 +743,7 @@ class MicroVM:
                 stderr=logf,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
+                env=proc_env,
             )
         self._save_meta(
             pid=proc.pid,
