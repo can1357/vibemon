@@ -406,53 +406,37 @@ def _volume_count(value: Any) -> int:
     return 0
 
 
-def _warm_volume_slots() -> int:
-    try:
-        return min(8, max(0, int(os.environ.get("VMON_WARM_VOLUME_SLOTS", "8"))))
-    except ValueError:
-        return 8
-
-
 def request_template_key(req: dict[str, Any]) -> str | None:
-    """Return the warm-template key a create request would resolve, if derivable."""
+    """Return the cross-node warm-template key for a request, if pull-warm applies.
+
+    Pull-warm currently supports the plain block-network template only: after a
+    pull the create rewrites to ``template=<pulled dir>``, which warm-restores
+    without the image. Requests with ``fs_dir``/volumes or networked (NIC)
+    flavors still need a local image to rebind/enumerate devices on restore, so
+    they are not pull-eligible (they fall back to a local build).
+    """
     ref = req.get("image")
     if (
         not ref
         or req.get("template")
         or req.get("dockerfile")
         or req.get("context") not in (None, ".")
+        or not req.get("block_network")
+        or req.get("fs_dir") is not None
+        or _volume_count(req.get("volumes"))
     ):
         return None
-    n_vols = _volume_count(req.get("volumes"))
-    block_network = bool(req.get("block_network"))
-    fs_dir = req.get("fs_dir")
-    template = req.get("template")
-    warm_volumes = (
-        block_network and fs_dir is None and template is None and 0 < n_vols <= _warm_volume_slots()
-    )
-    host_slot = block_network and fs_dir is not None and template is None and n_vols == 0
-    networked_warm = (
-        not block_network
-        and platform.system() == "Darwin"
-        and template is None
-        and fs_dir is None
-        and n_vols == 0
-        and not req.get("ports")
-        and not req.get("egress_allow")
-        and not req.get("egress_allow_domains")
-        and not req.get("inbound_cidr_allowlist")
-    )
     try:
         return template_key(
             ref,
             disk_mb=int(req.get("disk_mb") or 1024),
             memory=int(req.get("memory") or req.get("mem") or 512),
             cpus=int(req.get("cpus") or 1),
-            fs_slots=n_vols if warm_volumes else 0,
-            host_slot=host_slot,
-            nic_slot=networked_warm,
+            fs_slots=0,
+            host_slot=False,
+            nic_slot=False,
         )
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
 
 

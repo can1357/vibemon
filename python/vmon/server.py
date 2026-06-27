@@ -1742,9 +1742,12 @@ def create_app(
             if provider is not None:
                 peer_url, digest = provider
                 try:
-                    await pull_template(
+                    installed = await pull_template(
                         request.app.state.mesh_http, peer_url, digest, expected_token or ""
                     )
+                    # Warm-restore the pulled snapshot directly: selecting it by path
+                    # skips build_or_pull, so the node needs no local image/engine.
+                    body.template = str(installed)
                 except Exception as exc:
                     LOGGER.warning(
                         "pull-warm template %s from %s failed: %s", digest, peer_url, exc

@@ -248,6 +248,7 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
     )
     mesh.node_id = "self"
     mesh.enabled = True
+    mesh.cpu_baseline = "arch:x86_64"
     now = time.time()
     warm = NodeState(
         "warm",
@@ -306,6 +307,7 @@ def test_zero_config_warm_named_claims_and_backend_filter(tmp_path):
     )
     mesh.node_id = "self"
     mesh.enabled = True
+    mesh.cpu_baseline = "arch:x86_64"
     now = time.time()
     warm = NodeState(
         "warm",
@@ -450,12 +452,18 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
     from vmon import cas
 
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
-    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
-    digest, key = _write_indexed_template(
-        tmp_path / "peer-template",
-        image="ubuntu:latest",
-        host_slot=True,
+    captured: dict[str, object] = {}
+
+    class RecordingSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, **kwargs):
+            captured.update(kwargs)
+            return super().create(**kwargs)
+
+    monkeypatch.setattr(
+        "vmon.core.Engine._sandbox_class", staticmethod(lambda: RecordingSandbox)
     )
+    digest, key = _write_indexed_template(tmp_path / "peer-template", image="ubuntu:latest")
     app_a = server_mod.create_app(token="secret")
     app_b = server_mod.create_app(token="secret")
     transport = FakeTransport()
@@ -463,6 +471,7 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
     app_b.state.mesh.transport = transport
     app_a.state.mesh.node_id = "A"
     app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.cpu_baseline = "arch:x86_64"
     app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
     app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
     app_a.state.mesh.setup("http://a")
@@ -473,17 +482,17 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
         app_a.state.mesh_http = FakeMeshHTTP({"http://b": client_b})
         state_b = app_b.state.mesh.self_state()
         state_b.template_index = {key: digest}
+        state_b.cpu_baseline = "arch:x86_64"
         state_b.last_seen = time.time()
         app_a.state.mesh.register(state_b)
 
+        # The hop header makes A the local owner (as if placement already chose it),
+        # so A's create must pull the plain block-network template from B and
+        # warm-restore it by path instead of building the image locally.
         created = client_a.post(
             "/v1/sandboxes",
-            json={
-                "image": "ubuntu:latest",
-                "block_network": True,
-                "fs_dir": str(tmp_path / "host"),
-            },
-            headers={"Authorization": "Bearer secret"},
+            json={"image": "ubuntu:latest", "block_network": True},
+            headers={"Authorization": "Bearer secret", "X-Vmon-Mesh-Hop": "1"},
         )
         assert created.status_code == 201
         installed = cas.resolve_digest(digest)
@@ -491,6 +500,8 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
         assert installed.parent == tmp_path / "templates"
         assert cas.template_digest(installed) == digest
         assert app_a.state.supervisor._engine.template_index()[key] == digest
+        # The real create path selected the pulled template (no image build).
+        assert captured.get("template") == str(installed)
 
 
 def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
@@ -696,6 +707,7 @@ def test_placement_is_backend_and_arch_compatible(tmp_path):
     )
     mesh.node_id = "self"
     mesh.enabled = True
+    mesh.cpu_baseline = "arch:x86_64"
     now = time.time()
     wrong_backend = NodeState(
         "hvfnode",
