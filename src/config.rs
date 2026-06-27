@@ -77,6 +77,8 @@ pub struct Config {
 	pub zram_store_max_mib: Option<usize>,
 	/// Optional operator-provided swap file for pager overflow.
 	pub zram_swap_file:     Option<PathBuf>,
+	/// HTTP page source for lazy snapshot restore; token comes from process env.
+	pub remote_page_url:    Option<String>,
 	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
 	pub ksm:                bool,
 	pub cpus:               u8,
@@ -203,6 +205,10 @@ struct CliArgs {
 	/// Swap file for paging overflow (default: anonymous temp in $TMPDIR)
 	#[arg(long, value_name = "PATH")]
 	zram_swap_file: Option<PathBuf>,
+
+	/// Fetch guest RAM pages lazily from this mesh HTTP endpoint during restore
+	#[arg(long, value_name = "URL")]
+	remote_page_url: Option<String>,
 
 	/// madvise(MADV_MERGEABLE) guest RAM for host KSM dedup
 	#[arg(long)]
@@ -443,6 +449,16 @@ impl Config {
 		if mem_target_mib.is_some() {
 			bail!("--mem-target-mib (transparent paging) requires a Linux host");
 		}
+		if cli.remote_page_url.as_deref() == Some("") {
+			bail!("--remote-page-url must not be empty");
+		}
+		#[cfg(not(target_os = "linux"))]
+		if cli.remote_page_url.is_some() {
+			bail!("--remote-page-url requires a Linux host");
+		}
+		if cli.remote_page_url.is_some() && mem_target_mib.is_some() {
+			bail!("--remote-page-url cannot be combined with --mem-target-mib");
+		}
 		if let Some(n) = cli.timeout_secs
 			&& !(1..=86_400).contains(&n)
 		{
@@ -563,6 +579,9 @@ impl Config {
 				"--mem-target-mib is not supported with --fork-from; forked clone RAM is copy-on-write"
 			);
 		}
+		if cli.remote_page_url.is_some() && cli.restore.is_none() {
+			bail!("--remote-page-url requires --restore");
+		}
 		if let Some(base) = &cli.disk_overlay_of {
 			validate_overlay_paths(base, cli.rootfs.as_deref())?;
 		}
@@ -609,6 +628,7 @@ impl Config {
 			mem_target_mib: mem_target_mib.map(|v| v as usize),
 			zram_store_max_mib: cli.zram_store_max_mib.map(|v| v as usize),
 			zram_swap_file: cli.zram_swap_file,
+			remote_page_url: cli.remote_page_url,
 			ksm: cli.ksm,
 			cpus: cpus as u8,
 			rootfs: cli.rootfs,
