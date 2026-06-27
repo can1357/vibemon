@@ -165,7 +165,6 @@ def _default_gateway(route: str) -> str | None:
     return None
 
 
-
 def track(name: str) -> None:
     CREATED.add(name)
 
