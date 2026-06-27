@@ -151,7 +151,7 @@ class MeshHTTPStream:
         return False
 
 
-class TestClientMeshHTTP:
+class FakeMeshHTTP:
     def __init__(self, clients):
         self.clients = clients
 
@@ -161,6 +161,9 @@ class TestClientMeshHTTP:
         path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         response = self.clients[base].request(method, path, headers=headers)
         return MeshHTTPStream(response)
+
+    async def aclose(self):
+        return None
 
 
 def test_template_key_canonicalizes_shape_and_reference():
@@ -178,7 +181,7 @@ def test_template_key_canonicalizes_shape_and_reference():
     )
 
 
-def test_find_template_provider_skips_unhealthy_and_missing(tmp_path):
+def test_find_template_provider_skips_incompatible_unhealthy_and_missing(tmp_path):
     key = template_key(
         "ubuntu:latest",
         disk_mb=1024,
@@ -201,33 +204,33 @@ def test_find_template_provider_skips_unhealthy_and_missing(tmp_path):
     )
     mesh.node_id = "self"
     mesh.enabled = True
+    mesh.cpu_baseline = "arch:x86_64"
     now = time.time()
-    mesh.register(
-        NodeState(
-            "missing",
-            "http://missing",
-            template_index={},
-            last_seen=now,
-        )
-    )
-    mesh.register(
-        NodeState(
-            "stale",
-            "http://stale",
-            template_index={key: "b" * 64},
-            last_seen=now,
-        )
-    )
-    mesh.register(
-        NodeState(
-            "provider",
-            "http://provider",
-            template_index={key: digest},
-            last_seen=now,
-        )
-    )
-    mesh.mark_unhealthy("stale")
 
+    def peer(
+        node_id, *, backend="kvm", arch="x86_64", cpu_baseline="arch:x86_64", index=None, ok=True
+    ):
+        mesh.register(
+            NodeState(
+                node_id,
+                f"http://{node_id}",
+                backend=backend,
+                arch=arch,
+                cpu_baseline=cpu_baseline,
+                template_index=index or {},
+                last_seen=now,
+            )
+        )
+        if not ok:
+            mesh.mark_unhealthy(node_id)
+
+    peer("missing", index={})  # advertises no templates
+    peer("stale", index={key: "b" * 64}, ok=False)  # has it but unhealthy
+    peer("wrongbackend", backend="hvf", index={key: "c" * 64})  # snapshot backend differs
+    peer("wrongarch", arch="aarch64", index={key: "d" * 64})  # kernel/agent arch differs
+    peer("provider", index={key: digest})  # compatible
+
+    # Only the healthy, same-backend/arch, CPU-covered peer is a valid provider.
     assert mesh.find_template_provider(key) == ("http://provider", digest)
     assert mesh.find_template_provider("missing-key") is None
 
@@ -467,7 +470,7 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
 
     with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
         transport.clients = {"http://a": client_a, "http://b": client_b}
-        app_a.state.mesh.mesh_http = TestClientMeshHTTP({"http://b": client_b})
+        app_a.state.mesh_http = FakeMeshHTTP({"http://b": client_b})
         state_b = app_b.state.mesh.self_state()
         state_b.template_index = {key: digest}
         state_b.last_seen = time.time()
@@ -508,17 +511,8 @@ def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
             response = type("Response", (), {"status_code": 200, "content": body})()
             return MeshHTTPStream(response)
 
-    mesh = Mesh(
-        FakeEngine(),
-        advertise="http://self",
-        token="secret",
-        transport=FakeTransport(),
-        state_path=tmp_path / "mesh.json",
-    )
-    mesh.mesh_http = StaticMeshHTTP()
-
     with pytest.raises(ValueError):
-        asyncio.run(server_mod.pull_template(mesh, "http://peer", requested, "secret"))
+        asyncio.run(server_mod.pull_template(StaticMeshHTTP(), "http://peer", requested, "secret"))
 
     assert cas.resolve_digest(requested) is None
     templates = tmp_path / "templates"
