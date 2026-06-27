@@ -301,7 +301,12 @@ def exec(name, cmd, tty):
     if tty:
         r = client.interactive("exec", _write_event, tty=True, name=name, cmd=argv)
         return _exit_code(r)
-    r = client.stream("exec", _write_event, stdin=sys.stdin.buffer, name=name, cmd=argv)
+    # Forward stdin only when it is piped/redirected. Forwarding an interactive
+    # terminal would leave the daemon stdin-reader thread blocked on a TTY read
+    # at interpreter shutdown, holding the buffer lock -> fatal
+    # `_enter_buffered_busy` / SIGABRT (rc=-6). Matches `docker exec` (need `-i`).
+    stdin = None if sys.stdin.isatty() else sys.stdin.buffer
+    r = client.stream("exec", _write_event, stdin=stdin, name=name, cmd=argv)
     return _exit_code(r)
 
 

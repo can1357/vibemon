@@ -193,21 +193,16 @@ class DaemonClient:
                         raw = self._enter_raw()
                         self._send_winsize(conn)
                         winch = self._install_winch(conn)
-                        target: Callable[..., None] = self._forward_raw_stdin
-                        args: tuple[Any, ...] = (conn, stop)
-                    else:
-                        stdin = getattr(sys.stdin, "buffer", sys.stdin)
-                        target = self._forward_stdin
-                        args = (conn, stdin, stop)
-                    stdin_thread = threading.Thread(
-                        target=target,
-                        args=args,
-                        name="vmon-stdin",
-                        daemon=True,
-                    )
-                    stdin_thread.start()
-                    # After the stdin path is live, stop any boot spinner so the
-                    # guest prompt/output owns the terminal from this point on.
+                        stdin_thread = threading.Thread(
+                            target=self._forward_raw_stdin,
+                            args=(conn, stop),
+                            name="vmon-stdin",
+                            daemon=True,
+                        )
+                        stdin_thread.start()
+                    # A non-PTY one-off (`shell -c`) reads no stdin; forwarding it
+                    # races the quick command's exit against a stdin-EOF teardown
+                    # that can SIGHUP the guest and surface a spurious 129 exit.
                     if on_ready is not None:
                         on_ready(str(frame.get("data") or ""))
                     continue

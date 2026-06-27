@@ -63,7 +63,7 @@ just agent-musl      # build static vmon-agent → python/vmon/_agent/vmon-agent
 
 macOS HVF requires the `vmm` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
 
-Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` live there): `cd python && uv run vmon ...`, `cd python && uv run pytest`, `cd python && uv run ruff check`, `cd python && uv run mypy`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`).
+A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] members = ["python"]`) makes the `python/` package resolve from the repository root, so a single root `.venv` + root `uv.lock` serve both `uv run <cmd>` from the repo root (e.g. `uv run python/cli_e2e.py`) and `cd python && uv run <cmd>`. The package's own `pyproject.toml` stays in `python/`. Python tooling: `uv run vmon ...`, `uv run pytest` (server tests need `--extra server`), `uv run ruff check`, `uv run mypy` — from the root or `python/`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`).
 
 ## Code Conventions & Common Patterns
 
@@ -98,9 +98,9 @@ Python tooling runs from the `python/` directory (`pyproject.toml`/`uv.lock` liv
   explicit `encoding="utf-8"` for text files, `time.monotonic()` for deadlines,
   `contextlib.suppress()` for deliberately ignored cleanup errors, and
   `hashlib.file_digest()` for file hashes.
-- After changing `requires-python` or dependency constraints, regenerate
-  `python/uv.lock` with `cd python && uv lock`; never hand-edit generated
-  lockfile markers.
+- After changing `requires-python` or dependency constraints, regenerate the
+  root workspace lockfile `uv.lock` with `uv lock` (from the repo root); never
+  hand-edit generated lockfile markers.
 - **Synchronous core:** `Engine` and the daemon are threaded/blocking (registry guarded by `RLock`). Only `server.py` (FastAPI, via `asyncio.to_thread`) and `net.py` tunnels use `asyncio`. CLI rendering (`click` + `rich`) lives only in `console.py`; core stays dependency-light and FastAPI is lazy-imported for `vmon serve`.
 - **Errors:** typed exceptions with `code` fields (`EngineError`, `NotFound`, `NotRunning`, `Busy`, `Invalid`, `Unsupported`; `DaemonError`, `AgentError`). Adapters map codes → JSON frames / HTTP status.
 - **State:** single daemon per `$VMON_HOME` (flock `vmond.lock`); `VMRecord`s persist to `~/.vmon/vms/*/meta.json` and rehydrate on restart. Secrets live in memory only — never written to disk.
