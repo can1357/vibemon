@@ -245,7 +245,12 @@ def cached_template(
     engine, reference = build_or_pull(image, dockerfile, context, engine)
     spec = _inspect(engine, reference)
     digest = _image_digest(engine, reference)
-    key = f"{digest}-{disk_mb}"
+    # The static agent is injected into the rootfs and baked into the booted
+    # snapshot, so a different agent build must invalidate both the image cache
+    # (rootfs.ext4) and the template snapshot keyed below.
+    with ensure_agent().open("rb") as fh:
+        agent_digest = hashlib.file_digest(fh, "sha256").hexdigest()
+    key = f"{digest}-{disk_mb}-a{agent_digest[:12]}"
     image_dir = _state() / "images" / key
     rootfs_ext4 = image_dir / "rootfs.ext4"
     spec_path = image_dir / "spec.json"
@@ -278,7 +283,7 @@ def cached_template(
         + ("-h" if host_slot else "")
         + ("-n" if nic_slot else "")
     )
-    tpl_name = f"tpl-{digest[:12]}-{disk_mb}{suffix}"
+    tpl_name = f"tpl-{digest[:12]}-{disk_mb}-a{agent_digest[:12]}{suffix}"
     tpl_dir = _state() / "templates" / tpl_name
     template = CachedTemplate(
         name=tpl_name,
@@ -313,7 +318,7 @@ def cached_template(
 
     from .vmm import MicroVM
 
-    vm_name = f"_template-{digest[:12]}-{disk_mb}{suffix}"
+    vm_name = f"_template-{digest[:12]}-{disk_mb}-a{agent_digest[:12]}{suffix}"
     old = MicroVM(vm_name)
     if old.is_running():
         old.stop()
@@ -350,6 +355,7 @@ def cached_template(
                 {
                     "image": spec.reference,
                     "digest": digest,
+                    "agent_digest": agent_digest,
                     "disk_mb": disk_mb,
                     "boot_version": _TEMPLATE_BOOT_VERSION,
                     "kernel_sha": kernel_sha,
