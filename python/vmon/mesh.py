@@ -18,6 +18,8 @@ from typing import Any, Protocol
 
 from .core import state_dir
 
+_CPU_BASELINE_CACHE: str | None = None
+
 
 class MeshError(Exception):
     """A mesh operation failed with a stable machine-readable code."""
@@ -55,6 +57,8 @@ class NodeState:
     last_seen: float = 0.0
     backend: str = ""
     arch: str = ""
+    cpu_baseline: str = ""
+    template_index: dict[str, str] = field(default_factory=dict)
 
     @property
     def free_vcpus(self) -> int:
@@ -78,12 +82,14 @@ class NodeState:
             "region": self.region,
             "backend": self.backend,
             "arch": self.arch,
+            "cpu_baseline": self.cpu_baseline,
             "vcpus": self.caps.vcpus,
             "mem_mib": self.caps.mem_mib,
             "committed_vcpus": self.committed_vcpus,
             "committed_mem_mib": self.committed_mem_mib,
             "inflight": self.inflight,
             "templates": list(self.templates),
+            "template_index": dict(self.template_index),
             "pools": dict(self.pools),
             "owned": list(self.owned),
             "ts": self.ts,
@@ -101,18 +107,25 @@ class NodeState:
             mem_mib=int(data.get("mem_mib") or caps_raw.get("mem_mib") or 2048),
         )
         pools_raw: dict[str, Any] = data["pools"] if isinstance(data.get("pools"), dict) else {}
+        template_index_raw: dict[str, Any] = (
+            data["template_index"] if isinstance(data.get("template_index"), dict) else {}
+        )
         return cls(
             node_id=str(data.get("node_id") or ""),
             advertise=str(data.get("advertise") or ""),
             region=str(data.get("region") or ""),
             backend=str(data.get("backend") or ""),
             arch=str(data.get("arch") or ""),
+            cpu_baseline=str(data.get("cpu_baseline") or ""),
             caps=caps,
             committed_vcpus=int(data.get("committed_vcpus") or 0),
             committed_mem_mib=int(data.get("committed_mem_mib") or 0),
             inflight=int(data.get("inflight") or 0),
             templates=[str(item) for item in data.get("templates") or []],
             pools={str(key): int(value) for key, value in pools_raw.items()},
+            template_index={
+                str(key): str(value) for key, value in template_index_raw.items() if key and value
+            },
             owned=[str(item) for item in data.get("owned") or []],
             ts=float(data.get("ts") or 0.0),
             last_seen=float(data.get("last_seen") or 0.0),
@@ -208,14 +221,90 @@ def probe_compat() -> tuple[str, str]:
 
     Snapshots are backend- and arch-specific (a KVM snapshot restores only on a
     KVM build; an arm64 image won't boot on x86), so placement must match both.
-    For x86/KVM this is necessary but not sufficient — guest CPUID/XSAVE is
-    captured in the snapshot and reapplied verbatim on restore, so a finer
-    CPU-feature class is a later refinement.
+    For x86/KVM this is necessary but not sufficient; ``cpu_baseline`` gates
+    the finer CPUID/XSAVE restore surface.
     """
     from .vmm import _arch
 
     backend = "hvf" if platform.system() == "Darwin" else "kvm"
     return backend, _arch()
+
+
+def probe_cpu_baseline() -> str:
+    """Probe this host's restore-relevant CPU feature baseline."""
+    global _CPU_BASELINE_CACHE
+    if _CPU_BASELINE_CACHE is not None:
+        return _CPU_BASELINE_CACHE
+    from .vmm import _arch, find_binary
+
+    arch = _arch()
+    if arch != "x86_64":
+        baseline = f"arch:{arch}"
+    else:
+        # An x86 host with a working KVM probe bakes a precise CPUID/XSAVE surface
+        # into its snapshots; a failed probe must NOT masquerade as a generic arch
+        # class, or fine-grained restore gating silently turns off.
+        baseline = "unknown:x86_64"
+        with contextlib.suppress(Exception):
+            proc = subprocess.run(
+                [find_binary(), "--print-cpu-baseline"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            if out := proc.stdout.strip():
+                baseline = out
+    _CPU_BASELINE_CACHE = baseline
+    return baseline
+
+
+def cpu_baseline_covers(have: str, need: str) -> bool:
+    """Return whether candidate ``have`` covers ingress ``need``'s restore surface.
+
+    ``need`` is the snapshot-baking ingress baseline; ``have`` is a candidate's.
+    Callers arch-filter first. An empty or arch-token ``need`` (aarch64's single
+    class) imposes no fine-grained gate. A real x86 CPUID/XSAVE ``need`` must be a
+    strict subset of a JSON ``have``: a candidate advertising no comparable
+    surface (empty, arch-token, or ``unknown:`` ``have``) cannot be verified and
+    is rejected. An ``unknown:`` ``need`` (a failed x86 probe) is never trusted,
+    so a ref-bound restore from such an ingress strands to the local node rather
+    than gamble on an unverifiable surface.
+    """
+    if not need:
+        return True
+    if need.startswith("unknown:"):
+        return False
+    if need.startswith("arch:"):
+        # An arch-token need (aarch64 single class) imposes no fine-grained gate;
+        # any same-arch candidate (callers arch-filter first) is fine, including a
+        # pre-upgrade peer with no advertised baseline. Only a DIFFERENT arch
+        # token is incompatible.
+        return not have.startswith("arch:") or have == need
+    if not have or have.startswith(("arch:", "unknown:")):
+        return False
+    try:
+        have_obj = json.loads(have)
+        need_obj = json.loads(need)
+    except json.JSONDecodeError:
+        return have == need
+    if not isinstance(have_obj, dict) or not isinstance(need_obj, dict):
+        return False
+    for key, need_val in need_obj.items():
+        if key not in have_obj:
+            return False
+        if key == "v":
+            if have_obj[key] != need_val:
+                return False
+            continue
+        try:
+            have_int = int(have_obj[key])
+            need_int = int(need_val)
+        except TypeError, ValueError:
+            return False
+        if have_int & need_int != need_int:
+            return False
+    return True
 
 
 def _total_mem_mib() -> int:
@@ -287,20 +376,101 @@ W_REGION = _weight("REGION", 30.0)
 W_INFLIGHT = _weight("INFLIGHT", 80.0)
 
 
+def template_key(
+    ref: str | None,
+    *,
+    disk_mb: int,
+    memory: int,
+    cpus: int,
+    fs_slots: int,
+    host_slot: bool,
+    nic_slot: bool,
+) -> str:
+    """Return the request-derivable identity for a bootable warm template."""
+    from .image import _normalize_reference
+
+    normalized = _normalize_reference(ref)
+    if normalized is None:
+        raise ValueError("template key requires an image reference")
+    return (
+        f"{normalized}|d{int(disk_mb)}|m{int(memory)}|c{int(cpus)}"
+        f"|s{int(fs_slots)}|h{int(host_slot)}|n{int(nic_slot)}"
+    )
+
+
+def _volume_count(value: Any) -> int:
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, list | tuple):
+        return len(value)
+    return 0
+
+
+def _warm_volume_slots() -> int:
+    try:
+        return min(8, max(0, int(os.environ.get("VMON_WARM_VOLUME_SLOTS", "8"))))
+    except ValueError:
+        return 8
+
+
+def request_template_key(req: dict[str, Any]) -> str | None:
+    """Return the warm-template key a create request would resolve, if derivable."""
+    ref = req.get("image")
+    if (
+        not ref
+        or req.get("template")
+        or req.get("dockerfile")
+        or req.get("context") not in (None, ".")
+    ):
+        return None
+    n_vols = _volume_count(req.get("volumes"))
+    block_network = bool(req.get("block_network"))
+    fs_dir = req.get("fs_dir")
+    template = req.get("template")
+    warm_volumes = (
+        block_network and fs_dir is None and template is None and 0 < n_vols <= _warm_volume_slots()
+    )
+    host_slot = block_network and fs_dir is not None and template is None and n_vols == 0
+    networked_warm = (
+        not block_network
+        and platform.system() == "Darwin"
+        and template is None
+        and fs_dir is None
+        and n_vols == 0
+        and not req.get("ports")
+        and not req.get("egress_allow")
+        and not req.get("egress_allow_domains")
+        and not req.get("inbound_cidr_allowlist")
+    )
+    try:
+        return template_key(
+            ref,
+            disk_mb=int(req.get("disk_mb") or 1024),
+            memory=int(req.get("memory") or req.get("mem") or 512),
+            cpus=int(req.get("cpus") or 1),
+            fs_slots=n_vols if warm_volumes else 0,
+            host_slot=host_slot,
+            nic_slot=networked_warm,
+        )
+    except TypeError, ValueError:
+        return None
+
+
 def pool_ref(req: dict[str, Any]) -> str | None:
     """Return the image/template ref a request would use for a warm pool."""
     return str(req.get("template") or req.get("image") or "") or None
 
 
 def pool_eligible(req: dict[str, Any]) -> bool:
-    """Return whether a create request can actually claim a warm pool."""
-    return (
-        int(req.get("pool_size") or 0) > 0
-        and bool(req.get("block_network"))
-        and not req.get("name")
-        and not req.get("volumes")
-        and not req.get("fs_dir")
-    )
+    """Return whether a create request can claim a warm-pool clone.
+
+    Pooled clones are generic block-network forks. A caller-requested ``name`` is
+    fine (the clone is renamed on claim) and a prewarmed pool serves requests
+    that omit ``pool_size``, so neither gates eligibility. Named volumes and
+    host-dir (``fs_dir``) shares need a restore-with-rebind the pool cannot
+    serve, so they remain ineligible.
+    """
+    return bool(req.get("block_network")) and not req.get("volumes") and not req.get("fs_dir")
 
 
 def score_node(
@@ -308,7 +478,10 @@ def score_node(
 ) -> float:
     """Score one candidate node for a placement request."""
     ref = pool_ref(req)
-    warm = 1.0 if pool_eligible(req) and ref and node.pools.get(ref, 0) > 0 else 0.0
+    key = request_template_key(req)
+    pool_warm = 1.0 if pool_eligible(req) and ref and node.pools.get(ref, 0) > 0 else 0.0
+    template_warm = 1.0 if key and key in node.template_index else 0.0
+    warm = max(pool_warm, template_warm)
     free_frac = node.free_vcpus / node.caps.vcpus if node.caps.vcpus else 0.0
     local = 1.0 if node.node_id == ingress_id else 0.0
     region = 1.0 if ingress_region and node.region == ingress_region else 0.0
@@ -348,6 +521,7 @@ class Mesh:
         probed_backend, probed_arch = probe_compat()
         self.backend = backend or probed_backend
         self.arch = arch or probed_arch
+        self.cpu_baseline = probe_cpu_baseline()
         self.state_path = state_path or state_dir() / "mesh.json"
         self.node_id = new_node_id()
         self.enabled = False
@@ -364,6 +538,8 @@ class Mesh:
         from .sandbox import pool_inventory
 
         committed_vcpus, committed_mem_mib = self.engine.committed()
+        template_index_fn = getattr(self.engine, "template_index", None)
+        template_index = template_index_fn() if callable(template_index_fn) else {}
         now = time.time()
         with self._lock:
             node_id = self.node_id or new_node_id()
@@ -375,12 +551,14 @@ class Mesh:
                 region=self.region,
                 backend=self.backend,
                 arch=self.arch,
+                cpu_baseline=self.cpu_baseline,
                 caps=self.caps,
                 committed_vcpus=committed_vcpus,
                 committed_mem_mib=committed_mem_mib,
                 inflight=self._inflight,
                 templates=self.engine.templates_present(),
                 pools=pool_inventory(),
+                template_index=template_index,
                 owned=self.engine.owned_ids(),
                 ts=now,
                 last_seen=now,
@@ -528,18 +706,24 @@ class Mesh:
             nodes = [self.self_state()]
             nodes.extend(peer for peer in self._peers.values() if peer.healthy(now, self.interval))
         ref = str(req.get("template") or req.get("snapshot") or "")
-        # Compat is derived from THIS ingress node, never from caller-supplied
-        # request JSON (unvalidated public input) — a client must not be able to
-        # steer snapshot/warm placement onto an incompatible node. The guest kernel
-        # and injected agent are arch-specific, so EVERY placement (even a fresh
-        # boot) must match this node's arch; snapshot-class requests (warm-pool
-        # clones, template/snapshot restore or fork) reuse a backend-specific memory
-        # image, so those must also match the backend.
+        # Compat is derived from THIS ingress node, never caller-supplied request
+        # JSON (unvalidated public input): a client must not steer placement onto
+        # an incompatible node. The guest kernel and injected agent are arch-
+        # specific, so EVERY placement (even a fresh boot) must match this arch.
         nodes = [n for n in nodes if n.arch == self.arch]
-        if ref or pool_eligible(req):
-            nodes = [n for n in nodes if n.backend == self.backend]
+        # A named snapshot/template restore or fork reuses a backend-specific
+        # memory image, so it must land on a same-backend node that already holds
+        # the template. A zero-config image request (warm-pooled or not) is not
+        # backend-bound: each node builds its own backend-appropriate template, so
+        # warm preference stays a scoring bias (see score_node), not a hard filter.
         if ref:
-            nodes = [n for n in nodes if ref in n.templates]
+            nodes = [
+                n
+                for n in nodes
+                if n.backend == self.backend
+                and ref in n.templates
+                and cpu_baseline_covers(n.cpu_baseline, self.cpu_baseline)
+            ]
         return nodes
 
     def place(self, req: dict[str, Any]) -> str:
@@ -592,6 +776,28 @@ class Mesh:
                 return self.advertise
             peer = self._peers.get(node_id)
             return peer.advertise if peer is not None else None
+
+    def find_template_provider(self, key: str) -> tuple[str, str] | None:
+        """Return ``(advertise_url, digest)`` for a compatible peer advertising *key*.
+
+        A pulled snapshot is restored locally, so the provider must be the same
+        backend + arch and this node's CPU must cover the provider's baseline
+        (snapshots bake the originating CPUID/XSAVE) — the same compat class
+        ``candidates()`` enforces for ref-bound restores, in the pull direction.
+        """
+        now = time.time()
+        with self._lock:
+            for peer in self._peers.values():
+                if peer.node_id == self.node_id or not peer.healthy(now, self.interval):
+                    continue
+                if peer.arch != self.arch or peer.backend != self.backend:
+                    continue
+                if not cpu_baseline_covers(self.cpu_baseline, peer.cpu_baseline):
+                    continue
+                digest = peer.template_index.get(key)
+                if digest:
+                    return peer.advertise, digest
+        return None
 
     def note_inflight(self, delta: int) -> None:
         """Adjust the local placement in-flight counter."""

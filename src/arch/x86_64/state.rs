@@ -6,7 +6,10 @@
 //! the complete xstate image (legacy FPU/SSE, AVX, PKRU, and larger dynamic
 //! components such as AMX when present), paired with `kvm_xcrs`.
 
-use std::{collections::BTreeSet, mem::size_of};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	mem::size_of,
+};
 
 use kvm_bindings::{
 	CpuId, KVM_MAX_CPUID_ENTRIES, Msrs, Xsave, kvm_clock_data, kvm_debugregs, kvm_irqchip,
@@ -22,6 +25,43 @@ use crate::{
 	hv::Vcpu,
 	result::{Result, err},
 };
+
+/// Return the host x86 restore-compatibility feature surface as canonical JSON.
+#[cfg(target_os = "linux")]
+pub fn cpu_baseline() -> Result<String> {
+	let cpuid = Kvm::new()?.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+	let mut baseline = BTreeMap::new();
+	baseline.insert("v".to_string(), serde_json::json!(1_u32));
+	for entry in cpuid.as_slice() {
+		match (entry.function, entry.index) {
+			(0x1, 0) => {
+				baseline.insert("1.0.ecx".to_string(), serde_json::json!(entry.ecx));
+				baseline.insert("1.0.edx".to_string(), serde_json::json!(entry.edx));
+			},
+			(0x7, 0) => {
+				baseline.insert("7.0.ebx".to_string(), serde_json::json!(entry.ebx));
+				baseline.insert("7.0.ecx".to_string(), serde_json::json!(entry.ecx));
+				baseline.insert("7.0.edx".to_string(), serde_json::json!(entry.edx));
+			},
+			(0xd, 0) => {
+				baseline.insert("D.0.eax".to_string(), serde_json::json!(entry.eax));
+				baseline.insert("D.0.ecx".to_string(), serde_json::json!(entry.ecx));
+				let xcr0 = u64::from(entry.eax) | (u64::from(entry.edx) << 32);
+				baseline.insert("xcr0".to_string(), serde_json::json!(xcr0));
+			},
+			(0xd, 1) => {
+				baseline.insert("D.1.eax".to_string(), serde_json::json!(entry.eax));
+				baseline.insert("D.1.ecx".to_string(), serde_json::json!(entry.ecx));
+			},
+			(0x80000001, 0) => {
+				baseline.insert("80000001.0.ecx".to_string(), serde_json::json!(entry.ecx));
+				baseline.insert("80000001.0.edx".to_string(), serde_json::json!(entry.edx));
+			},
+			_ => {},
+		}
+	}
+	Ok(serde_json::to_string(&baseline)?)
+}
 
 /// Complete migratable state of one x86 vCPU.
 #[derive(Serialize, Deserialize, Clone)]

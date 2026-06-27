@@ -34,6 +34,12 @@ fn main() {
 }
 
 fn run() -> result::Result<()> {
+	if std::env::args().nth(1).as_deref() == Some("--print-cpu-baseline") {
+		// Probe only the restore-relevant CPU surface for mesh placement; skip normal
+		// CLI parsing.
+		println!("{}", arch::state::cpu_baseline()?);
+		return Ok(());
+	}
 	let config = Config::from_args()?;
 	init_logging(&config)?;
 	vmm::run(config)

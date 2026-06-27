@@ -1,5 +1,7 @@
+import asyncio
 import json
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -7,7 +9,17 @@ pytest.importorskip("fastapi")
 from starlette.responses import Response
 from starlette.testclient import TestClient
 
-from vmon.mesh import Mesh, MeshError, NodeCaps, NodeState, decode_blob, encode_blob
+from vmon.mesh import (
+    Mesh,
+    MeshError,
+    NodeCaps,
+    NodeState,
+    cpu_baseline_covers,
+    decode_blob,
+    encode_blob,
+    pool_eligible,
+    template_key,
+)
 
 
 class FakeEngine:
@@ -68,6 +80,158 @@ class FakeSandbox:
         return None
 
 
+def _write_indexed_template(
+    template_dir,
+    *,
+    image: str = "ubuntu:latest",
+    disk_mb: int = 1024,
+    memory: int = 512,
+    cpus: int = 1,
+    fs_slots: int = 0,
+    host_slot: bool = False,
+    nic_slot: bool = False,
+    rootfs: bytes = b"rootfs",
+) -> tuple[str, str]:
+    from vmon import cas
+
+    template_dir.mkdir(parents=True, exist_ok=True)
+    (template_dir / "rootfs.img").write_bytes(rootfs)
+    (template_dir / "state.bin").write_bytes(b"state")
+    marker = {
+        "image": image,
+        "digest": "image-digest",
+        "disk_mb": disk_mb,
+        "boot_version": 5,
+        "kernel_sha": "kernel",
+        "fs_slots": fs_slots,
+        "memory": memory,
+        "cpus": cpus,
+        "host_slot": host_slot,
+        "nic_slot": nic_slot,
+    }
+    marker_path = template_dir / "agent-ready.json"
+    marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+    digest = cas.index_template(template_dir)
+    marker["content_digest"] = digest
+    marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+    cas.index_template(template_dir, digest)
+    key = template_key(
+        image,
+        disk_mb=disk_mb,
+        memory=memory,
+        cpus=cpus,
+        fs_slots=fs_slots,
+        host_slot=host_slot,
+        nic_slot=nic_slot,
+    )
+    return digest, key
+
+
+class MeshHTTPResponse:
+    def __init__(self, response):
+        self._response = response
+        self.status_code = response.status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self):
+        yield self._response.content
+
+
+class MeshHTTPStream:
+    def __init__(self, response):
+        self._response = MeshHTTPResponse(response)
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class TestClientMeshHTTP:
+    def __init__(self, clients):
+        self.clients = clients
+
+    def stream(self, method, url, headers=None):
+        parsed = urlsplit(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        response = self.clients[base].request(method, path, headers=headers)
+        return MeshHTTPStream(response)
+
+
+def test_template_key_canonicalizes_shape_and_reference():
+    assert (
+        template_key(
+            " ubuntu:latest ",
+            disk_mb=1024,
+            memory=2048,
+            cpus=2,
+            fs_slots=3,
+            host_slot=True,
+            nic_slot=False,
+        )
+        == "ubuntu:latest|d1024|m2048|c2|s3|h1|n0"
+    )
+
+
+def test_find_template_provider_skips_unhealthy_and_missing(tmp_path):
+    key = template_key(
+        "ubuntu:latest",
+        disk_mb=1024,
+        memory=512,
+        cpus=1,
+        fs_slots=0,
+        host_slot=False,
+        nic_slot=False,
+    )
+    digest = "a" * 64
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    now = time.time()
+    mesh.register(
+        NodeState(
+            "missing",
+            "http://missing",
+            template_index={},
+            last_seen=now,
+        )
+    )
+    mesh.register(
+        NodeState(
+            "stale",
+            "http://stale",
+            template_index={key: "b" * 64},
+            last_seen=now,
+        )
+    )
+    mesh.register(
+        NodeState(
+            "provider",
+            "http://provider",
+            template_index={key: digest},
+            last_seen=now,
+        )
+    )
+    mesh.mark_unhealthy("stale")
+
+    assert mesh.find_template_provider(key) == ("http://provider", digest)
+    assert mesh.find_template_provider("missing-key") is None
+
+
 def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
     mesh = Mesh(
         FakeEngine(committed=(1, 0)),
@@ -124,6 +288,64 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
 
     mesh.mark_unhealthy("free")
     assert mesh.place({"image": "plain"}) != "free"
+
+
+def test_zero_config_warm_named_claims_and_backend_filter(tmp_path):
+    mesh = Mesh(
+        FakeEngine(committed=(0, 0)),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(8, 8192),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    now = time.time()
+    warm = NodeState(
+        "warm",
+        "http://warm",
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        pools={"img:x": 2},
+        templates=["snap1"],
+        last_seen=now,
+    )
+    mesh.register(warm)
+
+    # Zero-config: a block_network image request with no pool_size still prefers a
+    # node holding a ready warm pool, and a caller-named request claims one too.
+    assert mesh.place({"image": "img:x", "block_network": True}) == "warm"
+    assert mesh.place({"image": "img:x", "block_network": True, "name": "foo"}) == "warm"
+
+    # Eligibility: block_network is required; volumes/fs_dir need restore-rebind a
+    # pooled clone cannot serve, so they stay ineligible.
+    assert pool_eligible({"image": "img:x", "block_network": True}) is True
+    assert pool_eligible({"image": "img:x", "block_network": True, "name": "foo"}) is True
+    assert pool_eligible({"image": "img:x"}) is False
+    assert pool_eligible({"image": "img:x", "block_network": True, "volumes": {"/d": "v"}}) is False
+    assert pool_eligible({"image": "img:x", "block_network": True, "fs_dir": "/tmp"}) is False
+
+    # Backend filter is for snapshot-class requests only: a zero-config image can
+    # land on an opposite-backend node (it builds its own template), but a named
+    # snapshot restore must match the backend that baked the memory image.
+    hvf = NodeState(
+        "hvf",
+        "http://hvf",
+        caps=NodeCaps(16, 16384),
+        backend="hvf",
+        arch="x86_64",
+        templates=["snap1"],
+        last_seen=now,
+    )
+    mesh.register(hvf)
+    cold = {n.node_id for n in mesh.candidates({"image": "plain", "block_network": True})}
+    assert "hvf" in cold
+    snap = {n.node_id for n in mesh.candidates({"snapshot": "snap1"})}
+    assert snap == {"warm"}
 
 
 def test_join_blob_round_trip_and_invalid():
@@ -220,6 +442,89 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
         assert any(row["id"] == sid and row["node"] == "B" for row in rows)
 
 
+def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+    from vmon import cas
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
+    digest, key = _write_indexed_template(
+        tmp_path / "peer-template",
+        image="ubuntu:latest",
+        host_slot=True,
+    )
+    app_a = server_mod.create_app(token="secret")
+    app_b = server_mod.create_app(token="secret")
+    transport = FakeTransport()
+    app_a.state.mesh.transport = transport
+    app_b.state.mesh.transport = transport
+    app_a.state.mesh.node_id = "A"
+    app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
+    app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
+    app_a.state.mesh.setup("http://a")
+    app_b.state.mesh.setup("http://b")
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        app_a.state.mesh.mesh_http = TestClientMeshHTTP({"http://b": client_b})
+        state_b = app_b.state.mesh.self_state()
+        state_b.template_index = {key: digest}
+        state_b.last_seen = time.time()
+        app_a.state.mesh.register(state_b)
+
+        created = client_a.post(
+            "/v1/sandboxes",
+            json={
+                "image": "ubuntu:latest",
+                "block_network": True,
+                "fs_dir": str(tmp_path / "host"),
+            },
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert created.status_code == 201
+        installed = cas.resolve_digest(digest)
+        assert installed is not None
+        assert installed.parent == tmp_path / "templates"
+        assert cas.template_digest(installed) == digest
+        assert app_a.state.supervisor._engine.template_index()[key] == digest
+
+
+def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+    from vmon import cas
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    _digest, _key = _write_indexed_template(tmp_path / "peer-template", image="ubuntu:latest")
+    archive = server_mod._template_archive(tmp_path / "peer-template")
+    body = archive.read_bytes()
+    archive.unlink()
+    requested = "0" * 64
+    if requested == cas.template_digest(tmp_path / "peer-template"):
+        requested = "1" * 64
+
+    class StaticMeshHTTP:
+        def stream(self, method, url, headers=None):
+            response = type("Response", (), {"status_code": 200, "content": body})()
+            return MeshHTTPStream(response)
+
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="secret",
+        transport=FakeTransport(),
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.mesh_http = StaticMeshHTTP()
+
+    with pytest.raises(ValueError):
+        asyncio.run(server_mod.pull_template(mesh, "http://peer", requested, "secret"))
+
+    assert cas.resolve_digest(requested) is None
+    templates = tmp_path / "templates"
+    assert not templates.exists() or not list(templates.iterdir())
+
+
 def test_cli_client_selection(monkeypatch, tmp_path):
     from vmon import cli
     from vmon.client import DaemonClient, GatewayClient
@@ -269,12 +574,119 @@ def test_gateway_call_mapping():
     ) in client.calls
 
 
-def test_node_state_wire_tolerates_missing_backend_arch():
-    # Old peers / persisted blobs predate backend+arch: they must still load.
+def test_node_state_wire_tolerates_missing_backend_arch_cpu_baseline():
+    # Old peers / persisted blobs predate backend+arch+cpu_baseline; they must
+    # still load.
     old = NodeState.from_wire({"node_id": "old", "advertise": "http://old"})
-    assert (old.backend, old.arch) == ("", "")
-    rt = NodeState.from_wire(NodeState("n", "u", backend="kvm", arch="x86_64").to_wire())
-    assert (rt.backend, rt.arch) == ("kvm", "x86_64")
+    assert (old.backend, old.arch, old.cpu_baseline) == ("", "", "")
+    rt = NodeState.from_wire(
+        NodeState("n", "u", backend="kvm", arch="x86_64", cpu_baseline="base").to_wire()
+    )
+    assert (rt.backend, rt.arch, rt.cpu_baseline) == ("kvm", "x86_64", "base")
+
+
+def test_cpu_baseline_covers_feature_surfaces_and_arch_tokens():
+    need = json.dumps({"1.0.ecx": 0b0011, "D.0.eax": 0b0101, "v": 1}, sort_keys=True)
+    have = json.dumps({"1.0.ecx": 0b1011, "D.0.eax": 0b0111, "v": 1}, sort_keys=True)
+    missing_bit = json.dumps({"1.0.ecx": 0b0001, "D.0.eax": 0b0111, "v": 1}, sort_keys=True)
+    missing_key = json.dumps({"1.0.ecx": 0b1011, "v": 1}, sort_keys=True)
+
+    assert cpu_baseline_covers(have, need)
+    assert not cpu_baseline_covers(missing_bit, need)
+    assert not cpu_baseline_covers(missing_key, need)
+    assert cpu_baseline_covers("arch:aarch64", "arch:aarch64")
+    assert not cpu_baseline_covers("arch:x86_64", "arch:aarch64")
+    # A missing or arch-token baseline cannot prove a real x86 surface, so a
+    # stale/pre-upgrade peer never bypasses the ref-bound x86 restore gate.
+    assert not cpu_baseline_covers("", need)
+    assert not cpu_baseline_covers("arch:x86_64", need)
+    # An empty or arch-token need imposes no fine-grained constraint.
+    assert cpu_baseline_covers(have, "")
+    assert cpu_baseline_covers("arch:x86_64", "arch:x86_64")
+    # A failed x86 probe yields an explicit unknown token: it never proves a peer
+    # surface, and as an ingress need it strands ref-bound restores to local.
+    assert not cpu_baseline_covers("unknown:x86_64", need)
+    assert not cpu_baseline_covers(have, "unknown:x86_64")
+
+
+def test_cpu_baseline_filters_ref_candidates_only(tmp_path):
+    need = json.dumps({"1.0.ecx": 0b0011, "xcr0": 0b0101, "v": 1}, sort_keys=True)
+    have = json.dumps({"1.0.ecx": 0b1011, "xcr0": 0b0111, "v": 1}, sort_keys=True)
+    lacks_bit = json.dumps({"1.0.ecx": 0b0001, "xcr0": 0b0111, "v": 1}, sort_keys=True)
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        backend="kvm",
+        arch="x86_64",
+        caps=NodeCaps(2, 1024),
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    mesh.cpu_baseline = need
+    now = time.time()
+    compatible = NodeState(
+        "compatible",
+        "http://c",
+        backend="kvm",
+        arch="x86_64",
+        cpu_baseline=have,
+        caps=NodeCaps(8, 4096),
+        templates=["snap1"],
+        last_seen=now,
+    )
+    incompatible = NodeState(
+        "incompatible",
+        "http://i",
+        backend="kvm",
+        arch="x86_64",
+        cpu_baseline=lacks_bit,
+        caps=NodeCaps(8, 4096),
+        templates=["snap1"],
+        last_seen=now,
+    )
+    for peer in (compatible, incompatible):
+        mesh.register(peer)
+
+    assert {n.node_id for n in mesh.candidates({"snapshot": "snap1"})} == {"compatible"}
+    cold = {n.node_id for n in mesh.candidates({"image": "plain", "block_network": True})}
+    assert {"compatible", "incompatible"} <= cold
+
+
+def test_unknown_cpu_baseline_strands_ref_restores_local(tmp_path):
+    mesh = Mesh(
+        FakeEngine(templates=["snap1"]),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        backend="kvm",
+        arch="x86_64",
+        caps=NodeCaps(2, 1024),
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    mesh.cpu_baseline = "unknown:x86_64"  # local CPU probe failed
+    now = time.time()
+    peer = NodeState(
+        "peer",
+        "http://p",
+        backend="kvm",
+        arch="x86_64",
+        cpu_baseline=json.dumps({"1.0.ecx": 0b1111, "v": 1}, sort_keys=True),
+        caps=NodeCaps(8, 4096),
+        templates=["snap1"],
+        last_seen=now,
+    )
+    mesh.register(peer)
+    # An ingress that cannot prove its own CPU surface never gambles a ref-bound
+    # restore onto a peer; placement strands to the local node instead.
+    assert mesh.candidates({"snapshot": "snap1"}) == []
+    assert mesh.place({"snapshot": "snap1"}) == "self"
+    # Cold image placement is unaffected by the unknown baseline.
+    assert "peer" in {n.node_id for n in mesh.candidates({"image": "x", "block_network": True})}
 
 
 def test_placement_is_backend_and_arch_compatible(tmp_path):
@@ -324,10 +736,13 @@ def test_placement_is_backend_and_arch_compatible(tmp_path):
     for peer in (wrong_backend, wrong_arch, compatible):
         mesh.register(peer)
 
-    # Warm-pool request: incompatible backend/arch peers are filtered out.
+    # Warm-pool image request: arch must match, but the backend need not — each
+    # node serves the image from its own backend-appropriate pool, so an opposite-
+    # backend node with ready clones is a valid (and warm) candidate. Only the
+    # wrong-arch node (incompatible kernel + agent) drops out.
     warm_req = {"image": "img:x", "pool_size": 1, "block_network": True}
-    assert {n.node_id for n in mesh.candidates(warm_req)} == {"self", "kvmnode"}
-    assert mesh.place(warm_req) == "kvmnode"
+    assert {n.node_id for n in mesh.candidates(warm_req)} == {"self", "kvmnode", "hvfnode"}
+    assert mesh.place(warm_req) in {"kvmnode", "hvfnode"}
 
     # Snapshot request: only a compatible node carrying the template qualifies.
     assert {n.node_id for n in mesh.candidates({"snapshot": "snap1"})} == {"kvmnode"}
