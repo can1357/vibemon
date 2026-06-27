@@ -292,35 +292,42 @@ class Sandbox:
                     old_pool.shutdown()
                 vm = pool.claim()
                 from_pool = vm is not None
-            if vm is None and block_network:
+            if vm is None and block_network and fs_dir is None and not volume_specs:
+                # Fast warm path: a plain block_network sandbox (no NIC and no
+                # virtio-fs shares/volumes to enumerate) restores from the
+                # template snapshot.
                 vm = MicroVM.restore(
                     template_dir,
                     name=name,
                     agent=True,
-                    fs_dir=fs_dir,
                     mem=memory,
                     cpus=cpus,
-                    volumes=vol_tuples,
                     timeout_secs=eff_timeout_secs,
                 )
             elif vm is None:
-                # vmon restore cannot synthesize a NIC the template snapshot
-                # lacks, so a networked sandbox fresh-boots from the template disk
-                # (as a CoW overlay) with a virtio-net device on a host TAP.
+                # Fresh copy-on-write overlay boot from the template disk. vmon's
+                # restore can only re-attach devices the snapshot already had, so
+                # anything needing a device the template lacks must fresh-boot to
+                # enumerate it at guest boot: a NIC for networked sandboxes, and
+                # virtio-fs devices for fs_dir / volumes (block_network or not).
                 name = name or _instance_name(Path(str(template_dir)).name or "sandbox")
                 base_disk = Path(template_dir) / "rootfs.img"
                 if not base_disk.is_file():
                     raise RuntimeError(
-                        f"template {template_dir} has no rootfs.img; networked "
-                        "sandboxes require a disk-backed template"
+                        f"template {template_dir} has no rootfs.img; fresh-boot "
+                        "sandboxes (networked, or with fs_dir/volumes) require a "
+                        "disk-backed template"
                     )
-                net_handle = _setup_sandbox_network(
-                    name,
-                    ports=ports,
-                    egress_allow=egress_allow,
-                    egress_allow_domains=egress_allow_domains,
-                    inbound_cidr_allowlist=inbound_cidr_allowlist,
-                )
+                tap: str | None = None
+                if not block_network:
+                    net_handle = _setup_sandbox_network(
+                        name,
+                        ports=ports,
+                        egress_allow=egress_allow,
+                        egress_allow_domains=egress_allow_domains,
+                        inbound_cidr_allowlist=inbound_cidr_allowlist,
+                    )
+                    tap = str(net_handle.guest_config["tap"])
                 vm = MicroVM.boot_rootfs(
                     base_disk,
                     name=name,
@@ -328,7 +335,7 @@ class Sandbox:
                     cpus=cpus,
                     overlay=True,
                     agent=True,
-                    tap=str(net_handle.guest_config["tap"]),
+                    tap=tap,
                     fs_dir=fs_dir,
                     volumes=vol_tuples,
                     timeout_secs=eff_timeout_secs,

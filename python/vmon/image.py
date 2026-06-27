@@ -126,9 +126,10 @@ def _image_digest(engine: str, reference: str) -> str:
 
 
 # Bumped when a template's *booted* state changes incompatibly (e.g. the guest
-# agent boot cmdline), so an upgraded vmon rebuilds snapshots an older one took
-# instead of silently reusing them. v2: rootfs mounted rw (older builds were ro).
-_TEMPLATE_BOOT_VERSION = 2
+# agent boot cmdline or the pinned guest kernel), so an upgraded vmon rebuilds
+# snapshots an older one took instead of silently reusing them. v2: rootfs
+# mounted rw (older builds were ro). v3: virtio-fs-capable aarch64 kernel.
+_TEMPLATE_BOOT_VERSION = 3
 
 
 def _template_marker_current(marker: Path) -> bool:
