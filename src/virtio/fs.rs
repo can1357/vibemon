@@ -67,9 +67,10 @@ const NUM_REQUEST_QUEUES: u32 = 1;
 
 /// FUSE node id of the shared root directory.
 const FUSE_ROOT_ID: u64 = 1;
-/// Highest FUSE minor version whose semantics this server implements. We never
-/// use a feature past 7.31, so we cap the negotiated minor here.
-const FUSE_PROTO_MINOR: u32 = 31;
+/// Highest FUSE minor version whose wire layout this server advertises.
+/// Optional capabilities remain opt-in through INIT flags, which we leave unset
+/// unless the operation is implemented.
+const FUSE_PROTO_MINOR: u32 = 44;
 /// Cache validity (seconds) handed to the guest for attrs and dir entries.
 /// Small so host-side changes to the read-only tree are noticed reasonably
 /// promptly.
@@ -128,14 +129,15 @@ const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FuseInHeader {
-	len:     u32,
-	opcode:  u32,
-	unique:  u64,
-	nodeid:  u64,
-	uid:     u32,
-	gid:     u32,
-	pid:     u32,
-	padding: u32,
+	len:          u32,
+	opcode:       u32,
+	unique:       u64,
+	nodeid:       u64,
+	uid:          u32,
+	gid:          u32,
+	pid:          u32,
+	total_extlen: u16,
+	padding:      u16,
 }
 
 #[allow(
@@ -222,7 +224,9 @@ struct FuseInitOut {
 	max_pages:            u16,
 	map_alignment:        u16,
 	flags2:               u32,
-	unused:               [u32; 7],
+	max_stack_depth:      u32,
+	request_timeout:      u16,
+	unused:               [u16; 11],
 }
 
 #[allow(
@@ -1943,6 +1947,35 @@ mod tests {
 				.unwrap();
 		}
 		(out.error, body)
+	}
+
+	#[test]
+	fn init_negotiates_protocol_7_44_cap() {
+		let root = temp_dir("vmon-fs-init");
+		let mut fs = Fs::new("host".to_string(), root.clone(), true).unwrap();
+		let init_payload = |minor: u32| {
+			let mut payload = 7u32.to_le_bytes().to_vec();
+			payload.extend_from_slice(&minor.to_le_bytes());
+			payload.extend_from_slice(&0x20000u32.to_le_bytes());
+			payload.extend_from_slice(&0u32.to_le_bytes());
+			payload
+		};
+
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_INIT, FUSE_ROOT_ID, &init_payload(45)));
+		assert_eq!(err, 0, "INIT succeeds for a newer guest minor");
+		assert_eq!(body.len(), std::mem::size_of::<FuseInitOut>());
+		let out: FuseInitOut = read_struct(&body, 0).unwrap();
+		assert_eq!(out.major, 7);
+		assert_eq!(out.minor, FUSE_PROTO_MINOR, "newer guest minor is capped");
+		assert_eq!(out.minor, 44);
+		assert_eq!(out.max_readahead, 0x20000);
+
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_INIT, FUSE_ROOT_ID, &init_payload(12)));
+		assert_eq!(err, 0, "INIT succeeds for an older guest minor");
+		let out: FuseInitOut = read_struct(&body, 0).unwrap();
+		assert_eq!(out.minor, 12, "older guest minor passes through");
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]
