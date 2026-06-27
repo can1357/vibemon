@@ -126,24 +126,27 @@ def _image_digest(engine: str, reference: str) -> str:
 
 
 # Bumped when a template's *booted* state changes incompatibly (e.g. the guest
-# agent boot cmdline or the pinned guest kernel), so an upgraded vmon rebuilds
-# snapshots an older one took instead of silently reusing them. v2: rootfs
-# mounted rw (older builds were ro). v3: virtio-fs-capable aarch64 kernel.
+# agent boot cmdline), so an upgraded vmon rebuilds snapshots an older one took
+# instead of silently reusing them. v2: rootfs mounted rw (older builds were ro).
+# v3: virtio-fs-capable aarch64 kernel.
 _TEMPLATE_BOOT_VERSION = 3
 
 
-def _template_marker_current(marker: Path) -> bool:
-    """True if *marker* records a template booted by the current vmon.
+def _template_marker_current(marker: Path, kernel_sha: str) -> bool:
+    """True if *marker* records a template booted by the current vmon and kernel.
 
     Guards against reusing a snapshot whose baked-in boot state predates a
-    breaking change (see :data:`_TEMPLATE_BOOT_VERSION`); a missing or older
-    marker forces a rebuild.
+    breaking change (see :data:`_TEMPLATE_BOOT_VERSION`) or whose booted kernel
+    differs from the current guest kernel; a missing or older marker forces a
+    rebuild.
     """
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except OSError, json.JSONDecodeError:
         return False
-    return data.get("boot_version") == _TEMPLATE_BOOT_VERSION
+    return (
+        data.get("boot_version") == _TEMPLATE_BOOT_VERSION and data.get("kernel_sha") == kernel_sha
+    )
 
 
 def cached_template(
@@ -193,13 +196,16 @@ def cached_template(
     tpl_name = f"tpl-{digest[:12]}-{disk_mb}"
     tpl_dir = _state() / "templates" / tpl_name
     template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb)
-    from .vmm import _snapshot_state_present
+    from .vmm import _snapshot_state_present, default_kernel
 
+    kernel_path = default_kernel()
+    with open(kernel_path, "rb") as fh:
+        kernel_sha = hashlib.file_digest(fh, "sha256").hexdigest()
     marker = tpl_dir / "agent-ready.json"
     if (
         _snapshot_state_present(tpl_dir)
         and (tpl_dir / "rootfs.img").is_file()
-        and _template_marker_current(marker)
+        and _template_marker_current(marker, kernel_sha)
     ):
         return template
     if tpl_dir.exists():
@@ -233,6 +239,7 @@ def cached_template(
                     "digest": digest,
                     "disk_mb": disk_mb,
                     "boot_version": _TEMPLATE_BOOT_VERSION,
+                    "kernel_sha": kernel_sha,
                 },
                 indent=2,
             ),
