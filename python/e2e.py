@@ -63,6 +63,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from vmon.agent_client import AgentError
 from vmon.image import _find_mkfs_ext4, cached_template, detect_engine, find_agent_binary
 from vmon.pool import WarmPool
 from vmon.sandbox import Sandbox
@@ -75,6 +76,7 @@ RUN = f"e2e{os.getpid()}"
 
 _seq = 0
 _template: Path | None = None
+_virtiofs: bool | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +196,42 @@ def net_admin() -> bool:
         return bool(net.has_net_admin())
     except Exception:
         return False
+
+
+def virtiofs_supported() -> bool:
+    """True if the guest kernel can mount virtio-fs (cached one-shot probe).
+
+    The auto-provisioned firecracker-ci kernel is built without
+    ``CONFIG_VIRTIO_FS``, so volume / host-share mounts fail with ENODEV; set
+    ``VMON_KERNEL`` to a virtio-fs-capable kernel to exercise them. Probed by
+    attaching a throwaway host share and trying to mount it.
+    """
+    global _virtiofs
+    if _virtiofs is not None:
+        return _virtiofs
+    share = Path(tempfile.mkdtemp(prefix="vmon-vfs-probe-"))
+    sb = make_sandbox(fs_dir=str(share))
+    try:
+        sb.agent().mount("host", "/mnt/_vfs_probe", ro=True)
+        _virtiofs = True
+    except AgentError as exc:
+        # ENODEV ("no such device") == the guest kernel registers no virtiofs
+        # filesystem type. Only that means "unsupported"; surface any other
+        # failure so a real mount/agent regression is not masked as a skip.
+        msg = str(exc).lower()
+        if "os error 19" not in msg and "no such device" not in msg:
+            raise
+        _virtiofs = False
+    finally:
+        sb.terminate()
+        shutil.rmtree(share, ignore_errors=True)
+    return _virtiofs
+
+
+def require_virtiofs() -> None:
+    """Skip the calling test unless the guest kernel can mount virtio-fs."""
+    if not virtiofs_supported():
+        raise Skip("guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel")
 
 
 # --------------------------------------------------------------------------- #
@@ -385,6 +423,7 @@ def t_snapshot_filesystem_image(_):
 @e2e
 def t_volume_persist(_):
     """A writable named volume keeps data across sandbox lifetimes."""
+    require_virtiofs()
     name = uid("vol")
     VOLUMES.add(name)
     sb1 = make_sandbox(volumes={"/data": Volume(name)})
@@ -403,6 +442,7 @@ def t_volume_persist(_):
 @e2e
 def t_volume_readonly(_):
     """A read-only volume is readable but rejects writes."""
+    require_virtiofs()
     name = uid("rovol")
     VOLUMES.add(name)
     sb = make_sandbox(volumes={"/data": Volume(name)})
@@ -422,6 +462,7 @@ def t_volume_readonly(_):
 @e2e
 def t_host_share(_):
     """A read-only host directory is visible inside the guest over virtio-fs."""
+    require_virtiofs()
     share = Path(tempfile.mkdtemp(prefix="e2e-share-"))
     (share / "hello.txt").write_text("from-host")
     sb = make_sandbox(fs_dir=str(share))

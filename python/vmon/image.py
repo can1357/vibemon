@@ -125,6 +125,26 @@ def _image_digest(engine: str, reference: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "-", digest.replace("sha256:", ""))
 
 
+# Bumped when a template's *booted* state changes incompatibly (e.g. the guest
+# agent boot cmdline), so an upgraded vmon rebuilds snapshots an older one took
+# instead of silently reusing them. v2: rootfs mounted rw (older builds were ro).
+_TEMPLATE_BOOT_VERSION = 2
+
+
+def _template_marker_current(marker: Path) -> bool:
+    """True if *marker* records a template booted by the current vmon.
+
+    Guards against reusing a snapshot whose baked-in boot state predates a
+    breaking change (see :data:`_TEMPLATE_BOOT_VERSION`); a missing or older
+    marker forces a rebuild.
+    """
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return False
+    return data.get("boot_version") == _TEMPLATE_BOOT_VERSION
+
+
 def cached_template(
     image: str | None = None,
     *,
@@ -175,7 +195,11 @@ def cached_template(
     from .vmm import _snapshot_state_present
 
     marker = tpl_dir / "agent-ready.json"
-    if _snapshot_state_present(tpl_dir) and (tpl_dir / "rootfs.img").is_file() and marker.is_file():
+    if (
+        _snapshot_state_present(tpl_dir)
+        and (tpl_dir / "rootfs.img").is_file()
+        and _template_marker_current(marker)
+    ):
         return template
     if tpl_dir.exists():
         shutil.rmtree(tpl_dir)
@@ -202,7 +226,15 @@ def cached_template(
             tpl_name, keep_running=False, disk_src=rootfs_ext4, snapshot_root=_state() / "templates"
         )
         marker.write_text(
-            json.dumps({"image": spec.reference, "digest": digest, "disk_mb": disk_mb}, indent=2),
+            json.dumps(
+                {
+                    "image": spec.reference,
+                    "digest": digest,
+                    "disk_mb": disk_mb,
+                    "boot_version": _TEMPLATE_BOOT_VERSION,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
     finally:
