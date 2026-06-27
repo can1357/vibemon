@@ -312,6 +312,15 @@ class Sandbox:
             and not egress_allow_domains
             and not inbound_cidr_allowlist
         )
+        # Linux networked sandboxes warm-restore from a host-TAP template flavor
+        # and rebind the NIC onto a per-sandbox TAP (full host policy at restore).
+        networked_warm_linux = (
+            not block_network
+            and platform.system() != "Darwin"
+            and template is None
+            and fs_dir is None
+            and n_vols == 0
+        )
         fs_slots = n_vols if warm_volumes else 0
         template_dir, image_spec, image_ref = cls._resolve_template(
             image=image,
@@ -325,6 +334,7 @@ class Sandbox:
             fs_slots=fs_slots,
             host_slot=host_slot,
             nic_slot=networked_warm,
+            tap_slot=networked_warm_linux,
         )
         # Modal-parity default: a 5-minute VMM-enforced wall-clock deadline unless
         # the caller sets timeout_secs (0 disables).
@@ -431,6 +441,27 @@ class Sandbox:
                     timeout_secs=eff_timeout_secs,
                 )
                 user_net_sandbox = True
+            elif vm is None and networked_warm_linux:
+                # Linux networked warm: allocate a per-sandbox host TAP + policy,
+                # warm-restore the tap-slot template rebinding its NIC onto that TAP,
+                # then replay the guest network config (net_handle branch below).
+                name = name or _instance_name(Path(str(template_dir)).name or "sandbox")
+                net_handle = _setup_sandbox_network(
+                    name,
+                    ports=ports,
+                    egress_allow=egress_allow,
+                    egress_allow_domains=egress_allow_domains,
+                    inbound_cidr_allowlist=inbound_cidr_allowlist,
+                )
+                vm = MicroVM.restore(
+                    template_dir,
+                    name=name,
+                    agent=True,
+                    mem=memory,
+                    cpus=cpus,
+                    tap=str(net_handle.guest_config["tap"]),
+                    timeout_secs=eff_timeout_secs,
+                )
             elif vm is None:
                 # Fresh copy-on-write overlay boot from the template disk. vmon's
                 # restore can only re-attach devices the snapshot already had, so
@@ -680,6 +711,7 @@ class Sandbox:
         fs_slots: int = 0,
         host_slot: bool = False,
         nic_slot: bool = False,
+        tap_slot: bool = False,
     ) -> tuple[Path, ImageSpec | None, str | None]:
         if template is not None:
             path = Path(template)
@@ -698,6 +730,7 @@ class Sandbox:
             fs_slots=fs_slots,
             host_slot=host_slot,
             nic_slot=nic_slot,
+            tap_slot=tap_slot,
         )
         return cached.snapshot_dir, cached.spec, cached.spec.reference
 

@@ -385,6 +385,7 @@ def template_key(
     fs_slots: int,
     host_slot: bool,
     nic_slot: bool,
+    tap_slot: bool = False,
 ) -> str:
     """Return the request-derivable identity for a bootable warm template."""
     from .image import _normalize_reference
@@ -394,7 +395,7 @@ def template_key(
         raise ValueError("template key requires an image reference")
     return (
         f"{normalized}|d{int(disk_mb)}|m{int(memory)}|c{int(cpus)}"
-        f"|s{int(fs_slots)}|h{int(host_slot)}|n{int(nic_slot)}"
+        f"|s{int(fs_slots)}|h{int(host_slot)}|n{int(nic_slot)}|t{int(tap_slot)}"
     )
 
 
@@ -409,11 +410,11 @@ def _volume_count(value: Any) -> int:
 def request_template_key(req: dict[str, Any]) -> str | None:
     """Return the cross-node warm-template key for a request, if pull-warm applies.
 
-    Pull-warm currently supports the plain block-network template only: after a
-    pull the create rewrites to ``template=<pulled dir>``, which warm-restores
-    without the image. Requests with ``fs_dir``/volumes or networked (NIC)
-    flavors still need a local image to rebind/enumerate devices on restore, so
-    they are not pull-eligible (they fall back to a local build).
+    Pull-warm covers the plain block-network template and the Linux TAP networked
+    flavor: after a pull the create rewrites to ``template=<pulled dir>`` (block
+    network) or warm-restores the tap-slot snapshot onto a per-sandbox TAP
+    (networked). Requests with ``fs_dir``/volumes still need a local image to
+    rebind/enumerate devices on restore, so they fall back to a local build.
     """
     ref = req.get("image")
     if (
@@ -421,10 +422,15 @@ def request_template_key(req: dict[str, Any]) -> str | None:
         or req.get("template")
         or req.get("dockerfile")
         or req.get("context") not in (None, ".")
-        or not req.get("block_network")
         or req.get("fs_dir") is not None
         or _volume_count(req.get("volumes"))
     ):
+        return None
+    block_network = bool(req.get("block_network"))
+    # macOS user-net networked warm is host-local (single-node); only the Linux
+    # TAP flavor is cross-node pull-warm. A networked request therefore keys to
+    # the TAP flavor on Linux and is not pull-warm on macOS.
+    if not block_network and platform.system() == "Darwin":
         return None
     try:
         return template_key(
@@ -435,8 +441,9 @@ def request_template_key(req: dict[str, Any]) -> str | None:
             fs_slots=0,
             host_slot=False,
             nic_slot=False,
+            tap_slot=not block_network,
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
