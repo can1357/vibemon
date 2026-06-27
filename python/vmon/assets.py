@@ -95,6 +95,21 @@ def ensure_kernel(arch: str | None = None) -> Path:
     return dest
 
 
+def preflight_assets(arch: str | None = None) -> dict[str, str]:
+    """Ensure the zero-config guest assets are present and report their paths.
+
+    The pinned aarch64 kernel is the virtio-fs-capable Cloud Hypervisor kernel,
+    so warm templates using virtio-fs volumes keep working with auto-provisioned
+    assets. The agent import stays lazy to keep this module hypervisor-free.
+    """
+    from .image import ensure_agent
+
+    return {
+        "kernel": str(ensure_kernel(arch)),
+        "agent": str(ensure_agent(arch)),
+    }
+
+
 def _sha256(path: Path) -> str:
     with path.open("rb") as fh:
         return hashlib.file_digest(fh, "sha256").hexdigest()

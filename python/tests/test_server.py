@@ -232,3 +232,53 @@ def test_events_stream_includes_created_event(app):
     event = asyncio.run(read_one_event())
     assert event["event"] == "created"
     assert event["id"] == "evt"
+
+
+def test_parse_warm_images_requires_explicit_count(monkeypatch):
+    from vmon.server import _parse_warm_images
+
+    monkeypatch.delenv("VMON_WARM_POOL_SIZE", raising=False)
+    # Bare refs keep their image tag and take the default count (1); a ':' is
+    # image-tag syntax, never a count delimiter.
+    assert _parse_warm_images("python:3.14") == [("python:3.14", 1)]
+    assert _parse_warm_images("node:20") == [("node:20", 1)]
+    assert _parse_warm_images("alpine:latest, postgres:16") == [
+        ("alpine:latest", 1),
+        ("postgres:16", 1),
+    ]
+    # Counts are set only with an explicit '='.
+    assert _parse_warm_images("alpine:latest=3") == [("alpine:latest", 3)]
+    assert _parse_warm_images("redis:7=2, python:3=4") == [("redis:7", 2), ("python:3", 4)]
+    # Empty / missing input yields no pools.
+    assert _parse_warm_images("") == []
+    assert _parse_warm_images(None) == []
+    # The default count honors VMON_WARM_POOL_SIZE.
+    monkeypatch.setenv("VMON_WARM_POOL_SIZE", "5")
+    assert _parse_warm_images("busybox") == [("busybox", 5)]
+    # Negative or non-integer counts are rejected.
+    with pytest.raises(ValueError):
+        _parse_warm_images("alpine=-1")
+    with pytest.raises(ValueError):
+        _parse_warm_images("alpine=x")
+
+
+def test_server_prewarms_images_and_drains_pools_on_exit(monkeypatch, tmp_path):
+    import vmon.sandbox as sandbox_mod
+    import vmon.server as server_mod
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setenv("VMON_WARM_IMAGES", "alpine:latest=2, busybox")
+    monkeypatch.delenv("VMON_WARM_POOL_SIZE", raising=False)
+
+    prewarmed: list[tuple[str, int]] = []
+    drained: list[bool] = []
+    monkeypatch.setattr(
+        sandbox_mod, "prewarm", lambda ref, *, count: prewarmed.append((ref, count))
+    )
+    monkeypatch.setattr(sandbox_mod, "shutdown_all_pools", lambda: drained.append(True))
+
+    app = server_mod.create_app(token="secret")
+    with TestClient(app):
+        assert ("alpine:latest", 2) in prewarmed
+        assert ("busybox", 1) in prewarmed
+    assert drained == [True]

@@ -13,11 +13,15 @@ import contextlib
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import queue
 import re
 import secrets
+import shutil
+import tarfile
+import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator, MutableMapping
@@ -34,9 +38,19 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from .core import Engine, EngineError, VMRecord
-from .mesh import HttpxTransport, Mesh, MeshError, NodeCaps, NodeState, default_advertise
+from .core import Engine, EngineError, VMRecord, state_dir
+from .mesh import (
+    HttpxTransport,
+    Mesh,
+    MeshError,
+    NodeCaps,
+    NodeState,
+    default_advertise,
+    request_template_key,
+)
 from .wsframe import encode_frame, read_frame
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SandboxCreate(BaseModel):
@@ -169,6 +183,50 @@ def _validate_network_request(request: NetworkRequest) -> None:
         raise _bad_request("network request must set at least one field")
     _validate_cidrs("cidr_allow", request.cidr_allow)
     _validate_domains("domain_allow", request.domain_allow)
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _parse_warm_images(value: str | None) -> list[tuple[str, int]]:
+    if not value:
+        return []
+    default_count = _env_non_negative_int("VMON_WARM_POOL_SIZE", 1)
+    entries: list[tuple[str, int]] = []
+    for raw_entry in value.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        ref = entry
+        count = default_count
+        if "=" in entry:
+            ref, raw_count = entry.rsplit("=", 1)
+            count = _parse_warm_image_count(raw_count)
+        ref = ref.strip()
+        if not ref:
+            raise ValueError("VMON_WARM_IMAGES entries must include an image reference")
+        entries.append((ref, count))
+    return entries
+
+
+def _parse_warm_image_count(raw: str) -> int:
+    try:
+        count = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError("VMON_WARM_IMAGES counts must be non-negative integers") from exc
+    if count < 0:
+        raise ValueError("VMON_WARM_IMAGES counts must be non-negative integers")
+    return count
 
 
 class Supervisor:
@@ -907,6 +965,102 @@ async def _proxy_to_peer(request: Request, peer_url: str, token: str) -> Respons
     )
 
 
+def _template_archive(template_dir: Path) -> Path:
+    fd, archive_s = tempfile.mkstemp(prefix="vmon-template-", suffix=".tar.gz")
+    os.close(fd)
+    archive = Path(archive_s)
+    try:
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(template_dir, arcname=template_dir.name)
+    except Exception:
+        archive.unlink(missing_ok=True)
+        raise
+    return archive
+
+
+def _extracted_template_root(root: Path) -> Path:
+    if (root / "agent-ready.json").is_file():
+        return root
+    for child in root.iterdir():
+        if child.is_dir() and (child / "agent-ready.json").is_file():
+            return child
+    raise ValueError("template archive did not contain an agent-ready marker")
+
+
+def _template_name_from_marker(template_dir: Path, digest: str) -> str:
+    try:
+        data = json.loads((template_dir / "agent-ready.json").read_text(encoding="utf-8"))
+    except OSError:
+        data = {}
+    except json.JSONDecodeError:
+        data = {}
+    raw = data.get("tpl_name") if isinstance(data, dict) else None
+    name = raw if isinstance(raw, str) and raw else template_dir.name
+    safe = Path(name).name
+    return safe if safe and safe not in {".", ".."} else f"tpl-{digest[:12]}"
+
+
+def _install_pulled_template(archive: Path, digest: str) -> Path:
+    from . import cas
+
+    templates = state_dir() / "templates"
+    templates.mkdir(parents=True, exist_ok=True)
+    extract_root = Path(tempfile.mkdtemp(prefix=".pull-extract-", dir=templates))
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(extract_root, filter="data")
+        source = _extracted_template_root(extract_root)
+        actual = cas.template_digest(source)
+        if actual != digest:
+            raise ValueError("pulled template digest mismatch")
+        target = templates / _template_name_from_marker(source, digest)
+        if target.exists():
+            if target.is_dir() and cas.template_digest(target) == digest:
+                cas.index_template(target, digest)
+                return target
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        os.replace(source, target)
+        cas.index_template(target, digest)
+        return target
+    finally:
+        archive.unlink(missing_ok=True)
+        shutil.rmtree(extract_root, ignore_errors=True)
+
+
+async def pull_template(client: Any, peer_url: str, digest: str, token: str) -> Path:
+    """Fetch, verify, install, and index a peer's content-addressed template.
+
+    ``client`` is an httpx-like async client (``app.state.mesh_http`` in the
+    server; a fake stream client in tests) exposing
+    ``.stream(method, url, headers=...)`` as an async context manager. Integrity
+    is enforced in ``_install_pulled_template``: a payload whose content does not
+    hash to ``digest`` is rejected and nothing is installed.
+    """
+    archive_dir = state_dir()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    fd, archive_s = tempfile.mkstemp(prefix=".template-pull-", suffix=".tar.gz", dir=archive_dir)
+    os.close(fd)
+    archive = Path(archive_s)
+    headers = {"Authorization": f"Bearer {token}", "X-Vmon-Mesh-Hop": "1"}
+    try:
+        url = f"{peer_url.rstrip('/')}/v1/templates/{digest}"
+        async with client.stream("GET", url, headers=headers) as response:
+            if response.status_code == status.HTTP_404_NOT_FOUND:
+                raise FileNotFoundError(f"unknown template digest {digest}")
+            response.raise_for_status()
+            with archive.open("wb") as fh:
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        fh.write(chunk)
+        return await asyncio.to_thread(_install_pulled_template, archive, digest)
+    except Exception:
+        archive.unlink(missing_ok=True)
+        raise
+
+
 def _sandbox_id_in_path(path: str) -> str | None:
     match = _SANDBOX_PATH_RE.match(path)
     if match is None:
@@ -1297,12 +1451,16 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         import httpx
 
+        from . import sandbox as sandbox_mod
+
         app.state.mesh_http = httpx.AsyncClient(timeout=None)
-        mesh.load()
-        if mesh.enabled:
-            ensure_mesh_heartbeat()
-        app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
         try:
+            for ref, count in _parse_warm_images(os.environ.get("VMON_WARM_IMAGES")):
+                await asyncio.to_thread(sandbox_mod.prewarm, ref, count=count)
+            mesh.load()
+            if mesh.enabled:
+                ensure_mesh_heartbeat()
+            app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
             yield
         finally:
             stop = getattr(app.state, "mesh_stop", None)
@@ -1315,6 +1473,7 @@ def create_app(
                     await task
                 except asyncio.CancelledError:
                     pass
+            await asyncio.to_thread(sandbox_mod.shutdown_all_pools)
             await app.state.mesh_http.aclose()
             close = getattr(mesh.transport, "close", None)
             if close is not None:
@@ -1515,6 +1674,24 @@ def create_app(
             return {"owner": mesh.node_id}
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown sandbox")
 
+    @app.get("/v1/templates/{digest}", dependencies=[Depends(require_auth)])
+    async def template_blob(digest: str) -> FileResponse:
+        from . import cas
+
+        try:
+            template_dir = cas.resolve_digest(digest)
+        except ValueError:
+            template_dir = None
+        if template_dir is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown template")
+        archive = await asyncio.to_thread(_template_archive, template_dir)
+        return FileResponse(
+            str(archive),
+            media_type="application/gzip",
+            filename=f"{digest}.tar.gz",
+            background=BackgroundTask(archive.unlink),
+        )
+
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
     async def create_sandbox(request: Request, body: SandboxCreate) -> JSONResponse:
         _validate_create_request(body)
@@ -1557,6 +1734,21 @@ def create_app(
                 if sid:
                     mesh.record_owner(sid, owner)
                 return JSONResponse(view, status_code=status.HTTP_201_CREATED)
+        key = request_template_key(body_dict)
+        local_index_fn = getattr(supervisor._engine, "template_index", None)
+        local_index = local_index_fn() if callable(local_index_fn) else {}
+        if mesh.enabled and key and key not in local_index:
+            provider = mesh.find_template_provider(key)
+            if provider is not None:
+                peer_url, digest = provider
+                try:
+                    await pull_template(
+                        request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "pull-warm template %s from %s failed: %s", digest, peer_url, exc
+                    )
         record = await supervisor.create(body)
         return JSONResponse(record.view(), status_code=status.HTTP_201_CREATED)
 
