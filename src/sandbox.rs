@@ -358,6 +358,17 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		syscalls.insert(libc::SYS_arch_prctl);
 		syscalls.insert(libc::SYS_lchown);
 		syscalls.insert(libc::SYS_poll);
+		// x86_64 glibc's `mkdir` (e.g. via Rust's `fs::create_dir[_all]`, used by
+		// the snapshot writer) issues the legacy SYS_mkdir; aarch64 has only
+		// mkdirat. Without this the snapshot path's create_dir_all is rejected
+		// with EPERM under the sandbox.
+		syscalls.insert(libc::SYS_mkdir);
+		// Likewise x86_64 routes rename/unlink/rmdir through the legacy syscalls
+		// (aarch64 has only renameat2/unlinkat). The snapshot writer renames temp
+		// files into place ("publishing") and prunes superseded generations.
+		syscalls.insert(libc::SYS_rename);
+		syscalls.insert(libc::SYS_unlink);
+		syscalls.insert(libc::SYS_rmdir);
 	}
 	syscalls
 }

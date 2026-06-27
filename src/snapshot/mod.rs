@@ -330,7 +330,7 @@ pub fn write_snapshot<F>(
 where
 	F: FnOnce(Vec<MemRegion>, Option<DeltaMemory>) -> Snapshot,
 {
-	fs::create_dir_all(dir)?;
+	fs::create_dir_all(dir).map_err(|e| err(format!("creating snapshot dir {}: {e}", dir.display())))?;
 
 	let generation = next_generation(dir)?;
 	let memory_tmp = dir.join(generation_memory_tmp_file(generation));

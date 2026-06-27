@@ -61,6 +61,9 @@ impl Vm {
 			fd.create_irq_chip()?;
 			fd.create_pit2(kvm_pit_config { flags: KVM_PIT_SPEAKER_DUMMY, ..Default::default() })?;
 			let supported_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+			// Capture the supported-MSR list now, while /dev/kvm is open and the
+			// sandbox filters have not engaged; the snapshot path reuses it.
+			crate::arch::state::cache_supported_msrs(&kvm)?;
 			Ok(Self { kvm, fd, memory, supported_cpuid })
 		}
 

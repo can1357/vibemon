@@ -9,6 +9,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	mem::size_of,
+	sync::OnceLock,
 };
 
 use kvm_bindings::{
@@ -25,6 +26,39 @@ use crate::{
 	hv::Vcpu,
 	result::{Result, err},
 };
+
+/// Host KVM's advertised MSR index list, captured at VM construction while
+/// /dev/kvm is still openable. [`save_vcpu`] runs on the vCPU threads after the
+/// Landlock/seccomp filters engage, which deny reopening /dev/kvm — so the list
+/// is cached up front via [`cache_supported_msrs`] rather than re-derived there.
+static SUPPORTED_MSRS: OnceLock<BTreeSet<u32>> = OnceLock::new();
+
+/// Capture the host's supported MSR index list from an open KVM handle.
+///
+/// Called from the KVM-owning VM constructor before the sandbox filters engage,
+/// so every VM origin — fresh boot, restore, and fork — has the list ready when
+/// it is later snapshotted. Idempotent; the first successful call wins.
+///
+/// # Errors
+/// Propagates `KVM_GET_MSR_INDEX_LIST` failures.
+pub fn cache_supported_msrs(kvm: &Kvm) -> Result<()> {
+	if SUPPORTED_MSRS.get().is_some() {
+		return Ok(());
+	}
+	let set: BTreeSet<u32> = kvm.get_msr_index_list()?.as_slice().iter().copied().collect();
+	let _ = SUPPORTED_MSRS.set(set);
+	Ok(())
+}
+
+/// The cached supported-MSR set, or an error if it was never primed.
+///
+/// # Errors
+/// Errors if [`cache_supported_msrs`] did not run before the filter phase.
+fn supported_msrs() -> Result<&'static BTreeSet<u32>> {
+	SUPPORTED_MSRS.get().ok_or_else(|| {
+		err("supported MSR index list was not cached before the sandbox filters engaged")
+	})
+}
 
 /// Return the host x86 restore-compatibility feature surface as canonical JSON.
 #[cfg(target_os = "linux")]
@@ -132,12 +166,10 @@ pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 	// Read only MSRs the host KVM advertises. A blind KVM_GET_MSRS over an
 	// optional curated list stops at the first unsupported index, which can
 	// silently drop later critical state (e.g. CET/XSS on newer Intel hosts).
-	let supported: BTreeSet<u32> = Kvm::new()?
-		.get_msr_index_list()?
-		.as_slice()
-		.iter()
-		.copied()
-		.collect();
+	// The list is captured at VM construction (`cache_supported_msrs`) because
+	// this runs on a vCPU thread under the sandbox filters, which deny reopening
+	// /dev/kvm.
+	let supported = supported_msrs()?;
 	let probe: Vec<kvm_msr_entry> = super::msr::MIGRATION_MSRS
 		.iter()
 		.copied()
@@ -204,14 +236,17 @@ pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 pub fn save_machine(vm: &VmFd) -> Result<MachineState> {
 	let mut pic_master =
 		kvm_irqchip { chip_id: kvm_bindings::KVM_IRQCHIP_PIC_MASTER, ..Default::default() };
-	vm.get_irqchip(&mut pic_master)?;
+	vm.get_irqchip(&mut pic_master)
+		.map_err(|e| err(format!("snapshot get_irqchip PIC_MASTER: {e}")))?;
 	let mut pic_slave =
 		kvm_irqchip { chip_id: kvm_bindings::KVM_IRQCHIP_PIC_SLAVE, ..Default::default() };
-	vm.get_irqchip(&mut pic_slave)?;
+	vm.get_irqchip(&mut pic_slave)
+		.map_err(|e| err(format!("snapshot get_irqchip PIC_SLAVE: {e}")))?;
 	let mut ioapic = kvm_irqchip { chip_id: kvm_bindings::KVM_IRQCHIP_IOAPIC, ..Default::default() };
-	vm.get_irqchip(&mut ioapic)?;
-	let pit = vm.get_pit2()?;
-	let clock = vm.get_clock()?;
+	vm.get_irqchip(&mut ioapic)
+		.map_err(|e| err(format!("snapshot get_irqchip IOAPIC: {e}")))?;
+	let pit = vm.get_pit2().map_err(|e| err(format!("snapshot get_pit2: {e}")))?;
+	let clock = vm.get_clock().map_err(|e| err(format!("snapshot get_clock: {e}")))?;
 	Ok(MachineState { pic_master, pic_slave, ioapic, pit, clock })
 }
 
