@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Return the non-x86 restore-compatibility token.
 ///
 /// aarch64 has a single restore class, so this never fails; it mirrors the
-/// fallible x86_64 KVM CPUID probe's signature so `main` can call it uniformly.
+/// fallible `x86_64` KVM CPUID probe's signature so `main` can call it
+/// uniformly.
 #[allow(clippy::unnecessary_wraps, reason = "signature parity with the x86_64 KVM probe")]
 pub fn cpu_baseline() -> crate::result::Result<String> {
 	Ok("arch:aarch64".to_string())
