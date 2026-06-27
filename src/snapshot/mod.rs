@@ -330,7 +330,8 @@ pub fn write_snapshot<F>(
 where
 	F: FnOnce(Vec<MemRegion>, Option<DeltaMemory>) -> Snapshot,
 {
-	fs::create_dir_all(dir).map_err(|e| err(format!("creating snapshot dir {}: {e}", dir.display())))?;
+	fs::create_dir_all(dir)
+		.map_err(|e| err(format!("creating snapshot dir {}: {e}", dir.display())))?;
 
 	let generation = next_generation(dir)?;
 	let memory_tmp = dir.join(generation_memory_tmp_file(generation));
@@ -378,6 +379,19 @@ pub fn read_snapshot(dir: &Path) -> Result<SnapshotImage> {
 	let snapshot = read_state_file(&layout.state_file)?;
 	let image = SnapshotImage { snapshot, memory_file: layout.memory_file };
 	validate_snapshot(&image)?;
+	Ok(image)
+}
+
+/// Read and validate snapshot metadata without requiring the memory file.
+///
+/// Lazy remote restore uses this when guest RAM is supplied page-by-page by a
+/// mesh peer. Only full snapshots are accepted; deltas require reconstructing a
+/// base chain locally before individual pages can be addressed.
+pub fn read_snapshot_metadata(dir: &Path) -> Result<SnapshotImage> {
+	let layout = selected_layout(dir)?;
+	let snapshot = read_state_file(&layout.state_file)?;
+	let image = SnapshotImage { snapshot, memory_file: layout.memory_file };
+	validate_snapshot_metadata_only(&image)?;
 	Ok(image)
 }
 
@@ -560,6 +574,31 @@ fn validate_snapshot_metadata(snap: &Snapshot, memory_file: &Path) -> Result<()>
 	}
 	let memory_len = snapshot_memory_len(memory_file)?;
 	validate_memory_regions(snap, memory_len)?;
+	validate_devices(snap)?;
+	Ok(())
+}
+
+fn validate_snapshot_metadata_only(image: &SnapshotImage) -> Result<()> {
+	let snap = image.snapshot();
+	validate_snapshot_header(snap)?;
+	validate_snapshot_resource_caps(snap.cpus, snap.mem_mib)?;
+	if snap.vcpus.len() != usize::from(snap.cpus) {
+		return Err(err(format!(
+			"snapshot vcpu state count {} != cpus {}",
+			snap.vcpus.len(),
+			snap.cpus
+		)));
+	}
+	if snap.serial.in_buffer.len() > SERIAL_FIFO_SIZE {
+		return Err(err(format!(
+			"serial input FIFO length {} exceeds {SERIAL_FIFO_SIZE}",
+			snap.serial.in_buffer.len()
+		)));
+	}
+	validate_region_layout(snap)?;
+	if snap.delta.is_some() {
+		return Err(err("remote page-in does not support delta snapshots"));
+	}
 	validate_devices(snap)?;
 	Ok(())
 }
