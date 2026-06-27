@@ -109,3 +109,63 @@ def test_fork_snapshot_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     assert "--timeout-secs" in args
     assert args[args.index("--timeout-secs") + 1] == "5"
     assert holder["meta"]["volumes"] == [{"tag": "t", "dir": "/d", "ro": False}]
+
+
+def test_control_snapshot_payload_includes_allow_user_net_only_when_set(monkeypatch):
+    from vmon.control import Control
+
+    seen: list[tuple[str, dict | None]] = []
+    monkeypatch.setattr(
+        Control, "_request", lambda self, method, params=None: seen.append((method, params)) or {}
+    )
+    control = Control("/nonexistent.sock")
+    control.snapshot("t")
+    control.snapshot("t", base="b", allow_user_net=True)
+    assert seen[0] == ("snapshot", {"name": "t"})
+    assert seen[1] == ("snapshot", {"name": "t", "base": "b", "allow_user_net": True})
+
+
+def test_microvm_snapshot_forwards_allow_user_net(monkeypatch, mvm_home):
+    from vmon.control import Control
+    from vmon.vmm import MicroVM
+
+    seen: dict[str, bool] = {}
+    monkeypatch.setattr(Control, "pause", lambda self: {})
+    monkeypatch.setattr(Control, "resume", lambda self: {})
+    monkeypatch.setattr(
+        Control,
+        "snapshot",
+        lambda self, name, base=None, allow_user_net=False: seen.update(flag=allow_user_net) or {},
+    )
+    monkeypatch.setattr(MicroVM, "stop", lambda self, wait=True: None)
+    MicroVM("snaptest").snapshot("s", keep_running=False, allow_user_net=True)
+    assert seen["flag"] is True
+
+
+def test_prewarm_picks_nic_slot_flavor_by_platform(monkeypatch, mvm_home):
+    import types
+
+    import vmon.sandbox as sandbox_mod
+
+    seen: dict[str, bool | None] = {}
+
+    def fake_cached_template(image, **kw):
+        seen["nic_slot"] = kw.get("nic_slot")
+        return types.SimpleNamespace(
+            snapshot_dir=Path(f"/tmp/tpl-{seen['nic_slot']}-{image}"),
+            spec=types.SimpleNamespace(reference=image),
+        )
+
+    monkeypatch.setattr(sandbox_mod, "cached_template", fake_cached_template)
+    monkeypatch.setattr(
+        sandbox_mod, "WarmPool", lambda d, n: types.SimpleNamespace(size=n, shutdown=lambda: None)
+    )
+    try:
+        monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Darwin")
+        sandbox_mod.prewarm("img", count=1)
+        assert seen["nic_slot"] is True
+        monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Linux")
+        sandbox_mod.prewarm("img2", count=1)
+        assert seen["nic_slot"] is False
+    finally:
+        sandbox_mod.shutdown_all_pools()

@@ -133,6 +133,11 @@ def run(
 ) -> tuple[int | None, str, str]:
     """Exec ``argv`` in ``sb``; return ``(returncode, stdout, stderr)`` as text."""
     proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir, _track_entry=False)
+    if not pty:
+        try:
+            proc.close_stdin()
+        except Exception:
+            pass
     try:
         rc = proc.wait(timeout=timeout)
     except TimeoutError:
@@ -490,15 +495,17 @@ def t_secrets(_):
 
 @e2e
 def t_network_block(_):
-    """A block_network sandbox boots and exec works, but has no external egress."""
+    """A block_network sandbox boots and exec works, but has no guest egress device."""
     sb = make_sandbox(block_network=True)
     try:
         rc, out, _ = run(sb, "sh", "-lc", "echo up")
         assert rc == 0 and "up" in out, "block_network sandbox failed to boot/exec"
-        t0 = time.time()
-        rc, _, _ = run(sb, "sh", "-lc", "wget -T 3 -q -O- http://example.com", timeout=12)
-        assert rc != 0, "egress unexpectedly succeeded in a block_network sandbox"
-        assert time.time() - t0 < 12, "egress attempt did not fail fast"
+        rc, addr, err = run(sb, "ip", "-4", "addr", "show", "scope", "global", timeout=15)
+        assert rc == 0, f"ip addr failed in block_network sandbox: rc={rc} err={err!r}"
+        assert "inet " not in addr, f"block_network sandbox has a guest IPv4 address: {addr!r}"
+        rc, route, err = run(sb, "ip", "route", timeout=15)
+        assert rc == 0, f"ip route failed in block_network sandbox: rc={rc} err={err!r}"
+        assert "default" not in route, f"block_network sandbox has a default route: {route!r}"
     finally:
         sb.terminate()
 

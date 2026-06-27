@@ -44,6 +44,59 @@ def pool_inventory() -> dict[str, int]:
         return inventory
 
 
+def prewarm(ref: str, *, count: int, **template_kwargs: Any) -> WarmPool:
+    """Build ``ref``'s template and register an exact-shape warm pool.
+
+    Warms the host's default warm flavor so a zero-config ``Sandbox.create``
+    claims it: a user-mode-NAT NIC template on macOS (where the default
+    networked sandbox warm-restores), and a plain block-network template
+    elsewhere (Linux networked needs a host TAP that is not yet warm-poolable).
+    """
+    count = int(count)
+    if count < 0:
+        raise ValueError("pool size must be >= 0")
+    networked = platform.system() == "Darwin"
+    cached = cached_template(image=ref, nic_slot=networked, **template_kwargs)
+    key = str(cached.snapshot_dir)
+    old_pool: WarmPool | None = None
+    with _POOLS_LOCK:
+        pool = _POOLS.get(key)
+        if pool is None or pool.size != count:
+            old_pool = pool
+            pool = WarmPool(cached.snapshot_dir, count)
+            _POOLS[key] = pool
+        _POOL_REFS[key] = cached.spec.reference
+    if old_pool is not None:
+        old_pool.shutdown()
+    return pool
+
+
+def shutdown_prewarms(pools: Iterable[WarmPool]) -> None:
+    """Unregister and stop warm pools created by ``prewarm``."""
+    pool_set = set(pools)
+    with _POOLS_LOCK:
+        keys = [key for key, pool in _POOLS.items() if pool in pool_set]
+        for key in keys:
+            _POOLS.pop(key, None)
+            _POOL_REFS.pop(key, None)
+    for pool in pool_set:
+        pool.shutdown()
+
+
+def shutdown_all_pools() -> None:
+    """Unregister and stop every warm pool; used on server teardown.
+
+    Drains the whole registry, so pools created or replaced at runtime (a request
+    with a different ``pool_size``) are reclaimed too, not just the startup set.
+    """
+    with _POOLS_LOCK:
+        pools = list(_POOLS.values())
+        _POOLS.clear()
+        _POOL_REFS.clear()
+    for pool in pools:
+        pool.shutdown()
+
+
 def _setup_sandbox_network(
     name: str,
     *,
@@ -236,15 +289,28 @@ class Sandbox:
                 _validate_timeout_secs(timeout_secs) if timeout_secs is not None else 300
             )
         # A block_network, image-built request with named volumes (no fs_dir) can
-        # warm-restore from a slot-provisioned template: it bakes one virtio-fs slot
-        # per volume, rebound onto the request's host dirs on restore (vmon's restore
-        # re-attaches snapshot devices but cannot synthesize ones the template lacks).
+        # warm-restore from a slot-provisioned template; an fs_dir-only request can
+        # warm-restore from a template with the reserved "host" virtio-fs slot.
+        # Restore re-attaches snapshot devices but cannot synthesize devices the
+        # template lacks.
         n_vols = len(volumes or {})
         warm_volumes = (
             block_network
             and fs_dir is None
             and template is None
             and 0 < n_vols <= _WARM_VOLUME_SLOTS
+        )
+        host_slot = block_network and fs_dir is not None and template is None and n_vols == 0
+        networked_warm = (
+            not block_network
+            and platform.system() == "Darwin"
+            and template is None
+            and fs_dir is None
+            and n_vols == 0
+            and not ports
+            and not egress_allow
+            and not egress_allow_domains
+            and not inbound_cidr_allowlist
         )
         fs_slots = n_vols if warm_volumes else 0
         template_dir, image_spec, image_ref = cls._resolve_template(
@@ -257,6 +323,8 @@ class Sandbox:
             memory=memory,
             cpus=cpus,
             fs_slots=fs_slots,
+            host_slot=host_slot,
+            nic_slot=networked_warm,
         )
         # Modal-parity default: a 5-minute VMM-enforced wall-clock deadline unless
         # the caller sets timeout_secs (0 disables).
@@ -289,29 +357,26 @@ class Sandbox:
                 (spec["tag"], spec["host_dir"], bool(spec["read_only"])) for spec in volume_specs
             ]
             pool: WarmPool | None = None
-            # The warm pool only serves auto-named sandboxes: a pooled clone keeps
-            # its pre-assigned name, so a caller-requested `name` (and SDK-level
-            # from_id / named uniqueness) must take the cold-restore path instead.
-            if (
-                pool_size > 0
-                and block_network
-                and not volume_specs
-                and name is None
-                and fs_dir is None
-            ):
+            if (block_network or networked_warm) and not volume_specs and fs_dir is None:
                 key = str(template_dir)
                 old_pool: WarmPool | None = None
                 with _POOLS_LOCK:
                     pool = _POOLS.get(key)
-                    if pool is None or pool.size != int(pool_size):
+                    if pool_size > 0 and (pool is None or pool.size != int(pool_size)):
                         old_pool = pool
                         pool = WarmPool(template_dir, int(pool_size))
                         _POOLS[key] = pool
-                    _POOL_REFS[key] = str(template) if template else str(image)
+                    if pool is not None:
+                        _POOL_REFS[key] = image_ref or str(template_dir)
                 if old_pool is not None:
                     old_pool.shutdown()
-                vm = pool.claim()
-                from_pool = vm is not None
+                if pool is not None:
+                    vm = pool.claim()
+                    if vm is not None and name is not None:
+                        vm.rename(name)
+                    from_pool = vm is not None
+                    if from_pool and networked_warm:
+                        user_net_sandbox = True
             if vm is None and block_network and fs_dir is None and not volume_specs:
                 # Fast warm path: a plain block_network sandbox (no NIC and no
                 # virtio-fs shares/volumes to enumerate) restores from the
@@ -346,6 +411,26 @@ class Sandbox:
                     volumes=slot_vols,
                     timeout_secs=eff_timeout_secs,
                 )
+            elif vm is None and host_slot:
+                vm = MicroVM.restore(
+                    template_dir,
+                    name=name,
+                    agent=True,
+                    mem=memory,
+                    cpus=cpus,
+                    fs_dir=fs_dir,
+                    timeout_secs=eff_timeout_secs,
+                )
+            elif vm is None and networked_warm:
+                vm = MicroVM.restore(
+                    template_dir,
+                    name=name,
+                    agent=True,
+                    mem=memory,
+                    cpus=cpus,
+                    timeout_secs=eff_timeout_secs,
+                )
+                user_net_sandbox = True
             elif vm is None:
                 # Fresh copy-on-write overlay boot from the template disk. vmon's
                 # restore can only re-attach devices the snapshot already had, so
@@ -593,6 +678,8 @@ class Sandbox:
         memory: int,
         cpus: int,
         fs_slots: int = 0,
+        host_slot: bool = False,
+        nic_slot: bool = False,
     ) -> tuple[Path, ImageSpec | None, str | None]:
         if template is not None:
             path = Path(template)
@@ -609,6 +696,8 @@ class Sandbox:
             memory=memory,
             cpus=cpus,
             fs_slots=fs_slots,
+            host_slot=host_slot,
+            nic_slot=nic_slot,
         )
         return cached.snapshot_dir, cached.spec, cached.spec.reference
 

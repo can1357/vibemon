@@ -45,8 +45,8 @@ class FakeAgentConn:
         self.mounts.append((tag, path, ro))
         return {"ok": True}
 
-    def net_config(self, **kwargs: object) -> dict[str, bool]:
-        self.net_configs.append(kwargs)
+    def net_config(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        self.net_configs.append({"args": tuple(args), "kwargs": dict(kwargs)})
         return {"ok": True}
 
     def exec(
@@ -249,3 +249,117 @@ def test_sandbox_exec_layers_image_caller_and_secret_env(monkeypatch, mvm_home):
     assert seen["HOME"] == "/root"
     assert seen["PATH"] == "/custom/bin"
     assert seen["TOKEN"] == "s3cret"
+
+
+def test_macos_networked_create_warm_restores_and_replays_net_config(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    from vmon import net
+
+    # Force the macOS user-net path regardless of the test host OS.
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Darwin")
+
+    nic_slots: list[bool] = []
+    real_resolve = sandbox_mod.Sandbox._resolve_template
+
+    def spy_resolve(**kwargs):
+        nic_slots.append(bool(kwargs.get("nic_slot")))
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "_resolve_template", staticmethod(spy_resolve))
+
+    sb = sandbox_mod.Sandbox.create(image="img", block_network=False)
+    try:
+        # A default (networked) macOS create resolves the nic-slot template and
+        # warm-restores it instead of cold fresh-booting.
+        assert nic_slots == [True]
+        assert FakeMicroVM.booted == []
+        assert FakeMicroVM.restored, "networked create should warm-restore the nic-slot template"
+        # net_config is replayed positionally with the fixed user-net layout.
+        cfg = FakeMicroVM.restored[-1][3]._agent.net_configs
+        assert cfg, "net_config was not replayed on the warm networked sandbox"
+        assert cfg[-1]["args"] == (
+            net.USER_NET_GUEST_IP,
+            net.USER_NET_PREFIX,
+            net.USER_NET_GATEWAY,
+            list(net.USER_NET_DNS),
+        )
+    finally:
+        sb.terminate()
+
+
+class _FakePool:
+    size = 1
+
+    def __init__(self, clone: FakeMicroVM) -> None:
+        self._clone = clone
+        self.hits = 0
+
+    def claim(self) -> FakeMicroVM | None:
+        self.hits += 1
+        return self._clone
+
+    def stats(self) -> dict[str, int]:
+        return {"hits": self.hits, "misses": 0, "ready_count": 0}
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_named_pool_claim_renames_clone(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+
+    clone = FakeMicroVM("pool-clone-auto", sandbox_mod.STATE)
+    renamed: dict[str, str] = {}
+
+    def fake_rename(self, new_name: str) -> None:
+        renamed["to"] = new_name
+        self.name = new_name
+
+    monkeypatch.setattr(FakeMicroVM, "rename", fake_rename, raising=False)
+    key = str(mvm_home / "templates" / "t")
+    with sandbox_mod._POOLS_LOCK:
+        sandbox_mod._POOLS[key] = _FakePool(clone)
+        sandbox_mod._POOL_REFS[key] = "img"
+    try:
+        sb = sandbox_mod.Sandbox.create(image="img", block_network=True, name="my-name")
+        # The pooled clone was claimed (not restored/booted) and renamed in place.
+        assert FakeMicroVM.restored == []
+        assert FakeMicroVM.booted == []
+        assert renamed["to"] == "my-name"
+        assert sb.vm.name == "my-name"
+        sb.terminate()
+    finally:
+        with sandbox_mod._POOLS_LOCK:
+            sandbox_mod._POOLS.pop(key, None)
+            sandbox_mod._POOL_REFS.pop(key, None)
+
+
+def test_macos_networked_pool_claim_replays_net_config(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    from vmon import net
+
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Darwin")
+    clone = FakeMicroVM("netpool-clone", sandbox_mod.STATE)
+    key = str(mvm_home / "templates" / "t")
+    with sandbox_mod._POOLS_LOCK:
+        sandbox_mod._POOLS[key] = _FakePool(clone)
+        sandbox_mod._POOL_REFS[key] = "img"
+    try:
+        sb = sandbox_mod.Sandbox.create(image="img", block_network=False)
+        # A default networked create claims the nic-slot pool (no restore/boot)
+        # and replays user-net config on the claimed clone.
+        assert FakeMicroVM.restored == []
+        assert FakeMicroVM.booted == []
+        assert sb.vm is clone
+        cfg = clone._agent.net_configs
+        assert cfg and cfg[-1]["args"] == (
+            net.USER_NET_GUEST_IP,
+            net.USER_NET_PREFIX,
+            net.USER_NET_GATEWAY,
+            list(net.USER_NET_DNS),
+        )
+        sb.terminate()
+    finally:
+        with sandbox_mod._POOLS_LOCK:
+            sandbox_mod._POOLS.pop(key, None)
+            sandbox_mod._POOL_REFS.pop(key, None)

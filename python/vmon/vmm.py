@@ -179,6 +179,16 @@ def _valid_snapshot_name(name: str) -> str:
     return name
 
 
+def _valid_vm_name(name: str) -> str:
+    if not name or name in {".", ".."} or name.startswith("."):
+        raise ValueError("VM name must be a non-hidden relative name")
+    if "\x00" in name or "/" in name or "\\" in name or ".." in name:
+        raise ValueError("VM name must not contain path separators or '..'")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", name) is None:
+        raise ValueError("VM name must contain only letters, digits, '_', '.', or '-'")
+    return name
+
+
 def _snapshot_state_present(snap_dir: Path) -> bool:
     """True if *snap_dir* holds restorable snapshot state.
 
@@ -251,6 +261,36 @@ class MicroVM:
         m = self.meta
         m.update(kw)
         self.meta_path.write_text(json.dumps(m, indent=2, sort_keys=True))
+
+    def rename(self, new_name: str) -> None:
+        """Move a running VM's on-disk identity to ``new_name``.
+
+        The VMM's AF_UNIX control and agent sockets are directory entries under
+        ``self.dir``. Renaming that parent directory keeps the bound socket inodes
+        alive, and clients resolving the rewritten paths reconnect through the new
+        location. Any cached agent connection is closed so the next call uses the
+        moved ``agent.sock`` path.
+        """
+        new_name = _valid_vm_name(str(new_name))
+        new_dir = STATE / "vms" / new_name
+        if new_dir == self.dir:
+            return
+        if new_dir.exists():
+            raise FileExistsError(f"VM {new_name!r} already exists")
+        meta = self.meta
+        self._close_agent()
+        os.rename(self.dir, new_dir)
+        self.name = new_name
+        self.dir = new_dir
+        self.sock = self.dir / "api.sock"
+        self.log = self.dir / "console.log"
+        self.meta_path = self.dir / "meta.json"
+        updates: dict[str, object] = {"sock": str(self.sock)}
+        if "agent_sock" in meta:
+            updates["agent_sock"] = str(self.dir / "agent.sock") if meta.get("agent_sock") else None
+        if "rootfs" in meta:
+            updates["rootfs"] = str(self.dir / "rootfs.img") if meta.get("rootfs") else None
+        self._save_meta(**updates)
 
     @staticmethod
     def _meta_optional_path(value: object) -> Path | None:
@@ -761,12 +801,17 @@ class MicroVM:
         disk_src: str | os.PathLike[str] | None = None,
         snapshot_root: str | os.PathLike[str] | None = None,
         base: str | None = None,
+        allow_user_net: bool = False,
     ) -> Path:
         """Pause, optionally capture rootfs.img, snapshot VM state, then resume or stop.
 
         When ``base`` names a sibling snapshot (same launch ``--snapshot-root``), the
         VMM stores only the guest-RAM pages that differ from it, producing a delta
         (incremental) snapshot. Restore reconstructs the base+delta chain.
+
+        User-mode NAT NICs can be snapshotted only when ``allow_user_net`` is true;
+        in-flight NAT flows are dropped, and restore reopens a fresh NAT backend.
+        Use this only for idle templates.
 
         ``snapshot_root`` only redirects the host-side ``rootfs.img`` copy and the
         returned directory; the VMM always writes state under its launch
@@ -785,7 +830,7 @@ class MicroVM:
             paused = True
             if disk_src is not None:
                 copy_reflink(disk_src, snap_dir / "rootfs.img")
-            self.control.snapshot(name, base=base)
+            self.control.snapshot(name, base=base, allow_user_net=allow_user_net)
         except BaseException:
             if paused and keep_running:
                 try:

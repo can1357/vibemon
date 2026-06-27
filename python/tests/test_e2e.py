@@ -1,5 +1,4 @@
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -142,10 +141,19 @@ def test_block_network_blocks_egress():
 
     sb = Sandbox.create(image=_image(), block_network=True, timeout=300)
     try:
-        start = time.monotonic()
-        proc = sb.exec("sh", "-lc", "wget -T 3 -q -O- https://example.com", timeout=10)
+        proc = sb.exec("ip", "-4", "addr", "show", "scope", "global", timeout=10)
+        proc.close_stdin()
         rc = proc.wait(timeout=15)
-        assert rc != 0
-        assert time.monotonic() - start < 15
+        data = proc.stdout.read()
+        addr = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+        assert rc == 0
+        assert "inet " not in addr, f"block_network sandbox has a guest IPv4 address: {addr!r}"
+        proc = sb.exec("ip", "route", timeout=10)
+        proc.close_stdin()
+        rc = proc.wait(timeout=15)
+        data = proc.stdout.read()
+        route = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+        assert rc == 0
+        assert "default" not in route, f"block_network sandbox has a default route: {route!r}"
     finally:
         sb.terminate()

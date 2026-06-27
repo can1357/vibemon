@@ -2582,7 +2582,7 @@ impl Vmm {
 				.resume()
 				.map(|()| json!({}))
 				.map_err(|e| control::ApiError::internal(e.to_string())),
-			ControlKind::Snapshot { name, base } => {
+			ControlKind::Snapshot { name, base, allow_user_net } => {
 				if let Some(b) = &base {
 					if !snapshot::is_safe_snapshot_name(b) {
 						return Err(control::ApiError::path_denied(format!(
@@ -2600,7 +2600,7 @@ impl Vmm {
 					return Err(control::ApiError::not_paused("snapshot requires a paused VM"));
 				}
 				self
-					.snapshot(&dir, base.as_deref())
+					.snapshot(&dir, base.as_deref(), allow_user_net)
 					.map(|()| json!({}))
 					.map_err(|e| control::ApiError::internal(e.to_string()))
 			},
@@ -2923,8 +2923,10 @@ impl Vmm {
 
 	/// Write a complete snapshot of the (paused) VM to `dir`.
 	/// If `base` is `Some`, store only the pages that differ from that sibling
-	/// snapshot.
-	fn snapshot(&self, dir: &Path, base: Option<&str>) -> Result<()> {
+	/// snapshot. When `allow_user_net` is true, in-flight user-mode NAT flows
+	/// are dropped; restore reopens a fresh NAT backend, which is suitable for
+	/// idle templates.
+	fn snapshot(&self, dir: &Path, base: Option<&str>, allow_user_net: bool) -> Result<()> {
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
 			RunState::Paused => {},
@@ -2967,9 +2969,9 @@ impl Vmm {
 		let mut devices = Vec::with_capacity(self.devices.len());
 		for d in &self.devices {
 			self.ensure_not_stopping("snapshot device state")?;
-			if matches!(d.backend, BackendHint::UserNet { .. }) {
+			if !allow_user_net && matches!(d.backend, BackendHint::UserNet { .. }) {
 				return Err(err(
-					"snapshot is not supported with --net user until user-mode NAT state is serialized",
+					"snapshot with --net user requires allow_user_net; NAT state is not serialized",
 				));
 			}
 			let (

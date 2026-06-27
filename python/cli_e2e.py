@@ -33,12 +33,15 @@ Usage:
 """
 
 import argparse
+import http.server
 import os
 import platform
 import shutil
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections.abc import Callable, Sequence
@@ -94,7 +97,7 @@ def cli(
     proc = subprocess.run(
         [sys.executable, "-m", "vmon", *args],
         env=ENV,
-        input=input_bytes,
+        input=input_bytes if input_bytes is not None else b"",
         capture_output=True,
         timeout=timeout,
     )
@@ -106,6 +109,61 @@ def cli(
             f"--stdout--\n{out}\n--stderr--\n{err}"
         )
     return proc.returncode, out, err
+
+
+class _HostHTTPServer:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self._server: socketserver.ThreadingTCPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return int(self._server.server_address[1])
+
+    def start(self) -> _HostHTTPServer:
+        body = self._body
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="vmon-cli-e2e-http",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def close(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
+def _default_gateway(route: str) -> str | None:
+    for line in route.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "default":
+            if "via" in parts:
+                idx = parts.index("via") + 1
+                if idx < len(parts):
+                    return parts[idx]
+            return ""
+    return None
+
 
 
 def track(name: str) -> None:
@@ -229,8 +287,10 @@ def t_detach_ps_exec_stop_rm(_):
 
 @e2e
 def t_run_networked(_):
-    """run -d without --block-network gives the guest outbound network egress."""
+    """run -d without --block-network proves guest networking without internet."""
     name = uid("net")
+    marker = "NET-OK-" + RUN
+    server = _HostHTTPServer(marker.encode("utf-8")).start()
     try:
         cli(
             "run",
@@ -253,20 +313,50 @@ def t_run_networked(_):
             time.sleep(0.5)
         else:
             raise AssertionError(f"{name} never reached running in ps after networked run")
-        rc, out, err = cli(
-            "exec",
-            name,
-            "--",
-            "sh",
-            "-lc",
-            "wget -T 8 -q -O- http://example.com >/dev/null && echo NET-OK",
+
+        rc, addr, err = cli("exec", name, "--", "ip", "-4", "addr", "show", "eth0")
+        assert rc == 0 and "inet " in addr, f"eth0 has no IPv4: rc={rc} out={addr!r} err={err!r}"
+        rc, route, err = cli("exec", name, "--", "ip", "route")
+        assert rc == 0 and "default" in route, (
+            f"no default route: rc={rc} out={route!r} err={err!r}"
         )
-        assert rc == 0 and "NET-OK" in out, f"network exec rc={rc} out={out!r} err={err}"
+        gateway = _default_gateway(route)
+        assert gateway is not None, f"could not parse default gateway: {route!r}"
+
+        if gateway == "10.0.2.2":
+            assert "10.0.2.15" in addr, f"user-net IP missing from eth0: {addr!r}"
+            rc, resolv, err = cli("exec", name, "--", "cat", "/etc/resolv.conf")
+            assert rc == 0 and "10.0.2.3" in resolv, (
+                f"user-net DNS missing: rc={rc} out={resolv!r} err={err!r}"
+            )
+            url = f"http://10.0.2.2:{server.port}/"
+            rc, out, err = cli(
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-lc",
+                f"wget -T 8 -q -O- {url}",
+            )
+            assert rc == 0 and marker in out, f"network exec rc={rc} out={out!r} err={err}"
+        else:
+            # Linux TAP guests use a per-VM host gateway, not libslirp's
+            # 10.0.2.2 host-loopback alias. Keep this hermetic on TAP hosts by
+            # asserting configured guest networking instead of reaching the
+            # internet or a loopback-only host listener that TAP cannot see.
+            assert gateway, f"default route has no gateway: {route!r}"
     finally:
         if name in CREATED:
-            cli("stop", name)
-            cli("rm", name)
+            try:
+                cli("stop", name, timeout=FAST_TIMEOUT)
+            except Exception:
+                pass
+            try:
+                cli("rm", name, timeout=FAST_TIMEOUT)
+            except Exception:
+                pass
             untrack(name)
+        server.close()
 
 
 @e2e
