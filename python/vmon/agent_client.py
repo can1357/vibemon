@@ -24,6 +24,10 @@ TYPE_RESP = 6
 TYPE_KILL = 7
 
 _HEADER = struct.Struct("<IBI")
+# Resync preamble (mirrors agent `proto::SYNC`): an impossible 0xFFFFFFFF length
+# prefix + b"vmon". Sent on every connect so the agent can recover frame
+# alignment past any pre-protocol console noise on the virtio-console channel.
+_SYNC = b"\xff\xff\xff\xff\xffvmon"
 _EOF = object()
 type _BytesLike = bytes | bytearray | memoryview
 
@@ -217,6 +221,7 @@ class AgentConn:
             self._sock.settimeout(connect_timeout)
         self._sock.connect(self.sock_path)
         self._sock.settimeout(None)
+        self._sock.sendall(_SYNC)
 
         self._send_lock = threading.Lock()
         self._lock = threading.Lock()
