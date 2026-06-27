@@ -13,12 +13,13 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from vmon.assets import ensure_kernel
 from vmon.image import (
     CachedTemplate,
     _find_mkfs_ext4,
     cached_template,
     detect_engine,
-    find_agent_binary,
+    ensure_agent,
 )
 from vmon.pool import wait_for_agent_ready
 from vmon.sandbox import Sandbox
@@ -42,11 +43,15 @@ def preflight() -> str | None:
             else "no usable hypervisor; needs an Apple-silicon Mac with "
             "Hypervisor.framework (kern.hv_support=1)"
         )
+    # Pin the microVM kernel before resolving anything: a host /boot/vmlinuz is
+    # modular and will not direct-boot in the minimal guest. Respects an explicit
+    # VMON_KERNEL, and keeps preflight and runtime on the same default_kernel().
+    os.environ.setdefault("VMON_KERNEL", str(ensure_kernel()))
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
         (detect_engine, "container engine"),
-        (find_agent_binary, "static guest agent"),
+        (ensure_agent, "static guest agent"),
     ):
         try:
             probe()
