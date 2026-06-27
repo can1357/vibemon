@@ -1,4 +1,5 @@
 import hashlib
+import json
 import struct
 from pathlib import Path
 
@@ -135,6 +136,46 @@ def test_build_or_pull_normalizes_and_rejects_image_refs(monkeypatch):
 
     with pytest.raises(ValueError, match="must not contain whitespace"):
         image.build_or_pull("bad ref", None, engine="docker")
+
+
+def test_template_marker_current_requires_matching_kernel_sha(tmp_path):
+    import vmon.image as image
+
+    kernel_sha = "current-kernel-sha"
+    marker = tmp_path / "agent-ready.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "boot_version": image._TEMPLATE_BOOT_VERSION,
+                "kernel_sha": kernel_sha,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert image._template_marker_current(marker, kernel_sha) is True
+
+    marker.write_text(
+        json.dumps(
+            {
+                "boot_version": image._TEMPLATE_BOOT_VERSION,
+                "kernel_sha": "previous-kernel-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert image._template_marker_current(marker, kernel_sha) is False
+
+    marker.write_text(
+        json.dumps({"boot_version": image._TEMPLATE_BOOT_VERSION}),
+        encoding="utf-8",
+    )
+    assert image._template_marker_current(marker, kernel_sha) is False
+
+    assert image._template_marker_current(tmp_path / "missing.json", kernel_sha) is False
+
+    marker.write_text("{", encoding="utf-8")
+    assert image._template_marker_current(marker, kernel_sha) is False
 
 
 def test_ensure_kernel_expands_home_and_normalizes_arch(monkeypatch, tmp_path):
