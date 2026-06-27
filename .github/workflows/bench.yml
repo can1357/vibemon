@@ -1,23 +1,22 @@
-name: integration
+name: bench
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      iters:
+        description: Benchmark iterations per path
+        required: false
+        default: '10'
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 6 * * *'
 
 permissions:
   contents: read
 
 jobs:
-  integration:
-    name: KVM integration
+  kvm-bench:
+    name: KVM p50 benchmark
     runs-on: [self-hosted, kvm, x64]
-    env:
-      VMON_TAP: vmon0
-      VMON_HOST_IP: 192.168.249.1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,29 +42,17 @@ jobs:
       - name: Fetch test assets
         run: just fetch-assets
 
-      - name: Prepare host tap
-        run: |
-          sudo ip link delete vmon0 2>/dev/null || true
-          sudo ip tuntap add dev vmon0 mode tap
-          sudo ip addr add 192.168.249.1/24 dev vmon0
-          sudo ip link set dev vmon0 up
+      - name: Run p50 benchmark
+        run: just bench --iters "${{ github.event.inputs.iters || '10' }}" --json bench-p50-kvm.json
 
-      - name: Run Python real-VM e2e
-        working-directory: python
-        run: |
-          uv run e2e.py
-          uv run cli_e2e.py
-          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
+      - name: Upload benchmark JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-p50-kvm
+          path: python/bench-p50-kvm.json
 
-      - name: Run integration tests
-        run: just integration
-
-      - name: Run soak tests
-        if: github.event_name == 'schedule'
-        run: just soak
-
-  hvf-integration:
-    name: HVF integration
+  hvf-bench:
+    name: HVF p50 benchmark
     # Needs a bare-metal Apple Silicon self-hosted runner: GitHub-hosted macOS
     # runners are themselves VMs and cannot create an HVF guest (HV_DENIED).
     runs-on: [self-hosted, macos, arm64]
@@ -97,22 +84,20 @@ jobs:
       - name: Build vmm
         run: cargo build --locked
 
+      - name: Codesign vmm for HVF
+        run: just codesign
+
       - name: Build static guest agent
         run: just agent-musl
 
       - name: Fetch test assets
         run: just fetch-assets
 
-      - name: Run Python real-VM e2e
-        working-directory: python
-        run: |
-          uv run e2e.py
-          uv run cli_e2e.py
-          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
+      - name: Run p50 benchmark
+        run: just bench --iters "${{ github.event.inputs.iters || '10' }}" --json bench-p50-hvf.json
 
-      - name: Run HVF integration tests
-        run: just integration
-
-      - name: Run soak tests
-        if: github.event_name == 'schedule'
-        run: just soak
+      - name: Upload benchmark JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-p50-hvf
+          path: python/bench-p50-hvf.json

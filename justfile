@@ -175,6 +175,11 @@ check-py:
 test-py:
     cd python && uv run --extra server pytest
 
+# Real-VM create-to-first-useful-byte benchmark (KVM/HVF-gated; skips elsewhere).
+[positional-arguments]
+bench *args: fetch-assets
+    cd python && VMON_BENCH=1 uv run python -m bench.p50 "$@"
+
 # -- Web UI (ui/) --
 fmt-ui:
     cd ui && bun run format
