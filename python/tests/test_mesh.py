@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -97,6 +98,9 @@ def _write_indexed_template(
     template_dir.mkdir(parents=True, exist_ok=True)
     (template_dir / "rootfs.img").write_bytes(rootfs)
     (template_dir / "state.bin").write_bytes(b"state")
+    (template_dir / "current-generation").write_text("1", encoding="utf-8")
+    (template_dir / "vmstate.1.bin").write_bytes(b"state")
+    (template_dir / "memory.1.bin").write_bytes(b"page".ljust(4096, b"\0"))
     marker = {
         "image": image,
         "digest": "image-digest",
@@ -482,7 +486,6 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
 
 def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
     import vmon.server as server_mod
-    from vmon import cas
 
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     captured: dict[str, object] = {}
@@ -518,21 +521,23 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
         app_a.state.mesh.register(state_b)
 
         # The hop header makes A the local owner (as if placement already chose it),
-        # so A's create must pull the plain block-network template from B and
-        # warm-restore it by path instead of building the image locally.
+        # so A's create must install a metadata-only lazy template stub and
+        # warm-restore it with a remote page source instead of building locally.
         created = client_a.post(
             "/v1/sandboxes",
             json={"image": "ubuntu:latest", "block_network": True},
             headers={"Authorization": "Bearer secret", "X-Vmon-Mesh-Hop": "1"},
         )
         assert created.status_code == 201
-        installed = cas.resolve_digest(digest)
-        assert installed is not None
+        installed = Path(str(captured.get("template")))
         assert installed.parent == tmp_path / "templates"
-        assert cas.template_digest(installed) == digest
-        assert app_a.state.supervisor._engine.template_index()[key] == digest
-        # The real create path selected the pulled template (no image build).
-        assert captured.get("template") == str(installed)
+        assert installed.name.startswith("remote-")
+        assert (installed / "remote-page.json").is_file()
+        assert not (installed / "memory.1.bin").exists()
+        assert key not in app_a.state.supervisor._engine.template_index()
+        assert captured.get("remote_page_url") == f"http://b/v1/templates/{digest}/pages"
+        assert captured.get("remote_page_token") == "secret"
+        assert captured.get("remote_page_digest") == digest
 
 
 def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
