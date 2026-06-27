@@ -110,6 +110,15 @@ def test_run_detach_uses_call(rec):
     assert rec.last["params"]["name"] == "web"
 
 
+def test_run_block_network_flag(rec):
+    # The flag must precede the image: `run` uses allow_interspersed_args=False,
+    # so anything after IMAGE is captured as the guest command, not a CLI option.
+    assert cli.main(["run", "alpine"]) == 0
+    assert rec.last["params"]["block_network"] is False
+    assert cli.main(["run", "--block-network", "alpine"]) == 0
+    assert rec.last["params"]["block_network"] is True
+
+
 def test_run_without_image_or_dockerfile_is_usage_error(rec, capsys):
     assert cli.main(["run"]) == 2
     assert "image" in capsys.readouterr().err.lower()
