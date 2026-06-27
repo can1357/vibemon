@@ -5,7 +5,9 @@ mod linux {
 	use std::{
 		collections::HashMap,
 		fs::{File, OpenOptions},
-		io, mem,
+		io::{self, Read, Write},
+		mem,
+		net::TcpStream,
 		os::{
 			fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 			unix::fs::OpenOptionsExt,
@@ -14,8 +16,9 @@ mod linux {
 		ptr,
 		sync::{
 			Arc,
-			atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+			atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 		},
+		time::Duration,
 	};
 
 	use parking_lot::Mutex;
@@ -23,6 +26,7 @@ mod linux {
 	use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
 	use crate::{
+		control::{PauseGate, RunState},
 		memory::GuestMemoryMmap,
 		result::{Result, err},
 	};
@@ -94,6 +98,7 @@ mod linux {
 		Zero,
 		Ram(Box<[u8]>),
 		Swap { slot: u32, len: u32 },
+		Remote { page: u32 },
 	}
 
 	struct SwapAlloc {
@@ -126,6 +131,138 @@ mod linux {
 		}
 	}
 
+	#[derive(Clone)]
+	struct HttpEndpoint {
+		host:        String,
+		host_header: String,
+		port:        u16,
+		path:        String,
+	}
+
+	/// HTTP page source used by lazy restore to fetch snapshot RAM on first
+	/// touch.
+	#[derive(Clone)]
+	pub struct RemotePageSource {
+		endpoint: HttpEndpoint,
+		token:    String,
+	}
+
+	impl RemotePageSource {
+		pub fn new(base_url: &str, token: String) -> Result<Self> {
+			Ok(Self { endpoint: parse_http_endpoint(base_url)?, token })
+		}
+
+		fn fetch_page(&self, page: u32, out: &mut [u8; PAGE_SIZE]) -> Result<()> {
+			let mut stream = TcpStream::connect((self.endpoint.host.as_str(), self.endpoint.port))
+				.map_err(|e| err(format!("connecting remote page source: {e}")))?;
+			let timeout = Some(Duration::from_secs(10));
+			stream
+				.set_read_timeout(timeout)
+				.map_err(|e| err(format!("setting remote page read timeout: {e}")))?;
+			stream
+				.set_write_timeout(timeout)
+				.map_err(|e| err(format!("setting remote page write timeout: {e}")))?;
+			let path = if self.endpoint.path.is_empty() {
+				format!("/{page}")
+			} else {
+				format!("{}/{page}", self.endpoint.path)
+			};
+			let request = format!(
+				"GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nX-Vmon-Mesh-Hop: \
+				 1\r\nConnection: close\r\n\r\n",
+				self.endpoint.host_header, self.token
+			);
+			stream
+				.write_all(request.as_bytes())
+				.map_err(|e| err(format!("requesting remote page {page}: {e}")))?;
+			let mut response = Vec::with_capacity(PAGE_SIZE + 512);
+			stream
+				.read_to_end(&mut response)
+				.map_err(|e| err(format!("reading remote page {page}: {e}")))?;
+			let split = response
+				.windows(4)
+				.position(|w| w == b"\r\n\r\n")
+				.ok_or_else(|| err("remote page response has no HTTP header terminator"))?;
+			let head = std::str::from_utf8(&response[..split])
+				.map_err(|e| err(format!("remote page response header is not UTF-8: {e}")))?;
+			let status = head.lines().next().unwrap_or_default();
+			if !status.contains(" 200 ") {
+				return Err(err(format!("remote page source returned {status}")));
+			}
+			let body = &response[split + 4..];
+			if body.len() != PAGE_SIZE {
+				return Err(err(format!(
+					"remote page source returned {} bytes, expected {PAGE_SIZE}",
+					body.len()
+				)));
+			}
+			out.copy_from_slice(body);
+			Ok(())
+		}
+	}
+
+	/// Shutdown hook fired when lazy remote memory cannot supply a faulting
+	/// page.
+	#[derive(Clone)]
+	pub struct PagerFatal {
+		gate:        Arc<PauseGate>,
+		exit_reason: Arc<AtomicU8>,
+		exit_code:   u8,
+	}
+
+	impl PagerFatal {
+		pub fn new(gate: Arc<PauseGate>, exit_reason: Arc<AtomicU8>, exit_code: u8) -> Self {
+			Self { gate, exit_reason, exit_code }
+		}
+	}
+
+	fn parse_http_endpoint(url: &str) -> Result<HttpEndpoint> {
+		let rest = url
+			.strip_prefix("http://")
+			.ok_or_else(|| err("remote page-in supports only http:// mesh URLs"))?;
+		let (authority, raw_path) = rest.split_once('/').unwrap_or((rest, ""));
+		if authority.is_empty() {
+			return Err(err("remote page URL is missing a host"));
+		}
+		let (host, port, host_header) = parse_authority(authority)?;
+		let trimmed_path = raw_path.trim_matches('/');
+		let path = if trimmed_path.is_empty() {
+			String::new()
+		} else {
+			format!("/{trimmed_path}")
+		};
+		Ok(HttpEndpoint { host, host_header, port, path })
+	}
+
+	fn parse_authority(authority: &str) -> Result<(String, u16, String)> {
+		if let Some(rest) = authority.strip_prefix('[') {
+			let Some((host, tail)) = rest.split_once(']') else {
+				return Err(err("remote page URL has an unterminated IPv6 host"));
+			};
+			let port = if let Some(port) = tail.strip_prefix(':') {
+				parse_port(port)?
+			} else if tail.is_empty() {
+				80
+			} else {
+				return Err(err("remote page URL has invalid IPv6 authority"));
+			};
+			return Ok((host.to_string(), port, authority.to_string()));
+		}
+		if let Some((host, port)) = authority.rsplit_once(':')
+			&& !host.is_empty()
+			&& port.chars().all(|ch| ch.is_ascii_digit())
+		{
+			return Ok((host.to_string(), parse_port(port)?, authority.to_string()));
+		}
+		Ok((authority.to_string(), 80, authority.to_string()))
+	}
+
+	fn parse_port(port: &str) -> Result<u16> {
+		port
+			.parse::<u16>()
+			.map_err(|e| err(format!("remote page URL has invalid port {port:?}: {e}")))
+	}
+
 	pub struct Pager {
 		uffd:            OwnedFd,
 		stop_evt:        OwnedFd,
@@ -142,6 +279,8 @@ mod linux {
 		clock_hand:      AtomicUsize,
 		registered:      AtomicBool,
 		disabled:        AtomicBool,
+		remote_source:   Option<RemotePageSource>,
+		fatal:           Option<PagerFatal>,
 	}
 
 	#[allow(
@@ -346,6 +485,90 @@ mod linux {
 		Ok(())
 	}
 
+	fn collect_regions(mem: &GuestMemoryMmap) -> Result<(Vec<PagerRegion>, usize)> {
+		let mut regions = Vec::new();
+		let mut total_pages = 0usize;
+		for region in mem.iter() {
+			let len =
+				usize::try_from(region.len()).map_err(|_| err("pager region length exceeds usize"))?;
+			if len == 0 {
+				return Err(err("pager memory region is empty"));
+			}
+			if !len.is_multiple_of(PAGE_SIZE) {
+				return Err(err(format!("pager region length {len} is not page-aligned")));
+			}
+			let fo = region
+				.file_offset()
+				.ok_or_else(|| err("pager requires file-backed guest memory"))?;
+			let memfd = fo
+				.file()
+				.try_clone()
+				.map_err(|e| err(format!("cloning guest memory fd for pager: {e}")))?;
+			regions.push(PagerRegion {
+				base: region.as_ptr(),
+				gpa: region.start_addr().raw_value(),
+				len,
+				memfd,
+				foff: fo.start(),
+				page_start: total_pages,
+			});
+			total_pages = total_pages
+				.checked_add(len / PAGE_SIZE)
+				.ok_or_else(|| err("pager page count overflow"))?;
+		}
+		if total_pages == 0 {
+			return Err(err("pager guest memory has no pages"));
+		}
+		Ok((regions, total_pages))
+	}
+
+	fn new_pager(
+		uffd: OwnedFd,
+		swap_fd: OwnedFd,
+		regions: Vec<PagerRegion>,
+		total_pages: usize,
+		target_pages: usize,
+		store_max_bytes: usize,
+		resident_pages: usize,
+		remote_source: Option<RemotePageSource>,
+		fatal: Option<PagerFatal>,
+	) -> Result<Arc<Pager>> {
+		let cap = u32::try_from(total_pages)
+			.map_err(|_| err("pager supports at most u32::MAX guest pages"))?;
+		// SAFETY: `eventfd` has no Rust-side preconditions; on success it
+		// returns a new owned file descriptor.
+		let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+		if stop_fd < 0 {
+			return Err(io::Error::last_os_error().into());
+		}
+		let words = total_pages.div_ceil(64);
+		let mut shards = Vec::with_capacity(SHARDS);
+		for _ in 0..SHARDS {
+			shards.push(Mutex::new(HashMap::new()));
+		}
+		// SAFETY: `stop_fd` was just returned by `eventfd` and is not owned
+		// by any Rust value yet.
+		let stop_evt = unsafe { OwnedFd::from_raw_fd(stop_fd) };
+		Ok(Arc::new(Pager {
+			uffd,
+			stop_evt,
+			regions,
+			total_pages,
+			target_pages,
+			store_max_bytes,
+			swap: Mutex::new(SwapAlloc { fd: swap_fd, next: 0, free: Vec::new(), cap }),
+			shards,
+			evicted: (0..words).map(|_| AtomicU64::new(0)).collect(),
+			referenced: (0..words).map(|_| AtomicU64::new(0)).collect(),
+			resident_pages: AtomicUsize::new(resident_pages),
+			store_bytes: AtomicUsize::new(0),
+			clock_hand: AtomicUsize::new(0),
+			registered: AtomicBool::new(false),
+			disabled: AtomicBool::new(false),
+			remote_source,
+			fatal,
+		}))
+	}
 	impl Pager {
 		pub fn new(
 			uffd: OwnedFd,
@@ -354,72 +577,42 @@ mod linux {
 			target_pages: usize,
 			store_max_bytes: usize,
 		) -> Result<Arc<Self>> {
-			let mut regions = Vec::new();
-			let mut total_pages = 0usize;
-			for region in mem.iter() {
-				let len = usize::try_from(region.len())
-					.map_err(|_| err("pager region length exceeds usize"))?;
-				if len == 0 {
-					return Err(err("pager memory region is empty"));
-				}
-				if !len.is_multiple_of(PAGE_SIZE) {
-					return Err(err(format!("pager region length {len} is not page-aligned")));
-				}
-				let fo = region
-					.file_offset()
-					.ok_or_else(|| err("pager requires file-backed guest memory"))?;
-				let memfd = fo
-					.file()
-					.try_clone()
-					.map_err(|e| err(format!("cloning guest memory fd for pager: {e}")))?;
-				regions.push(PagerRegion {
-					base: region.as_ptr(),
-					gpa: region.start_addr().raw_value(),
-					len,
-					memfd,
-					foff: fo.start(),
-					page_start: total_pages,
-				});
-				total_pages = total_pages
-					.checked_add(len / PAGE_SIZE)
-					.ok_or_else(|| err("pager page count overflow"))?;
-			}
-			if total_pages == 0 {
-				return Err(err("pager guest memory has no pages"));
-			}
-			let cap = u32::try_from(total_pages)
-				.map_err(|_| err("pager supports at most u32::MAX guest pages"))?;
-			// SAFETY: `eventfd` has no Rust-side preconditions; on success it
-			// returns a new owned file descriptor.
-			let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-			if stop_fd < 0 {
-				return Err(io::Error::last_os_error().into());
-			}
-			let words = total_pages.div_ceil(64);
-			let mut shards = Vec::with_capacity(SHARDS);
-			for _ in 0..SHARDS {
-				shards.push(Mutex::new(HashMap::new()));
-			}
-			// SAFETY: `stop_fd` was just returned by `eventfd` and is not owned
-			// by any Rust value yet.
-			let stop_evt = unsafe { OwnedFd::from_raw_fd(stop_fd) };
-			Ok(Arc::new(Self {
+			let (regions, total_pages) = collect_regions(mem)?;
+			new_pager(
 				uffd,
-				stop_evt,
+				swap_fd,
 				regions,
 				total_pages,
 				target_pages,
 				store_max_bytes,
-				swap: Mutex::new(SwapAlloc { fd: swap_fd, next: 0, free: Vec::new(), cap }),
-				shards,
-				evicted: (0..words).map(|_| AtomicU64::new(0)).collect(),
-				referenced: (0..words).map(|_| AtomicU64::new(0)).collect(),
-				resident_pages: AtomicUsize::new(total_pages),
-				store_bytes: AtomicUsize::new(0),
-				clock_hand: AtomicUsize::new(0),
-				registered: AtomicBool::new(false),
-				disabled: AtomicBool::new(false),
-			}))
+				total_pages,
+				None,
+				None,
+			)
+		}
+
+		pub fn new_remote(
+			uffd: OwnedFd,
+			swap_fd: OwnedFd,
+			mem: &GuestMemoryMmap,
+			source: RemotePageSource,
+			fatal: PagerFatal,
+		) -> Result<Arc<Self>> {
+			let (regions, total_pages) = collect_regions(mem)?;
+			let pager = new_pager(
+				uffd,
+				swap_fd,
+				regions,
+				total_pages,
+				total_pages,
+				0,
+				0,
+				Some(source),
+				Some(fatal),
+			)?;
+			pager.seed_remote_pages()?;
+			pager.register_all_missing()?;
+			Ok(pager)
 		}
 
 		pub fn handler_loop(self: Arc<Self>) {
@@ -544,6 +737,20 @@ mod linux {
 						tmp.as_ptr()
 					}
 				},
+				Loc::Remote { page } => {
+					let Some(source) = &self.remote_source else {
+						self.fatal_remote_fault(
+							page_va,
+							format!("remote page fault for page {page} has no remote source"),
+						);
+						return;
+					};
+					if let Err(e) = source.fetch_page(*page, &mut tmp) {
+						self.fatal_remote_fault(page_va, format!("fetching remote page {page}: {e}"));
+						return;
+					}
+					tmp.as_ptr()
+				},
 			};
 
 			if let Err(e) = uffd_copy(self.uffd.as_raw_fd(), page_va, src, PAGE_SIZE) {
@@ -563,16 +770,9 @@ mod linux {
 			if self.disabled.load(Ordering::SeqCst) {
 				return;
 			}
-			if !self.registered.load(Ordering::SeqCst) {
-				for region in &self.regions {
-					if let Err(e) =
-						register_missing(self.uffd.as_raw_fd(), region.base as u64, region.len as u64)
-					{
-						self.disable_once(e.to_string());
-						return;
-					}
-				}
-				self.registered.store(true, Ordering::SeqCst);
+			if let Err(e) = self.register_all_missing() {
+				self.disable_once(e.to_string());
+				return;
 			}
 
 			let mut budget = MAX_EVICT_PER_SWEEP;
@@ -587,6 +787,23 @@ mod linux {
 				}
 			}
 			self.publish_gauges();
+		}
+
+		fn fatal_remote_fault(&self, page_va: u64, message: String) {
+			self.disable_once(message);
+			if let Some(fatal) = &self.fatal {
+				let _ = fatal.exit_reason.compare_exchange(
+					0,
+					fatal.exit_code,
+					Ordering::SeqCst,
+					Ordering::SeqCst,
+				);
+				fatal.gate.set_state(RunState::Stopping);
+				fatal.gate.signal_all_vcpus();
+			}
+			if let Err(e) = uffd_copy(self.uffd.as_raw_fd(), page_va, ZERO_PAGE.as_ptr(), PAGE_SIZE) {
+				self.disable_once(format!("zero-fill after remote page fault failed: {e}"));
+			}
 		}
 
 		pub fn over_target(&self) -> bool {
@@ -744,7 +961,7 @@ mod linux {
 
 		fn release_loc(&self, loc: Loc) {
 			match loc {
-				Loc::Zero => {},
+				Loc::Zero | Loc::Remote { .. } => {},
 				Loc::Ram(buf) => {
 					self.store_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
 				},
@@ -794,6 +1011,29 @@ mod linux {
 			bits[word].fetch_and(bit, Ordering::SeqCst);
 		}
 
+		fn register_all_missing(&self) -> Result<()> {
+			if self.registered.load(Ordering::SeqCst) {
+				return Ok(());
+			}
+			for region in &self.regions {
+				register_missing(self.uffd.as_raw_fd(), region.base as u64, region.len as u64)?;
+			}
+			self.registered.store(true, Ordering::SeqCst);
+			Ok(())
+		}
+
+		fn seed_remote_pages(&self) -> Result<()> {
+			for idx in 0..self.total_pages {
+				let page = u32::try_from(idx).map_err(|_| err("remote page index exceeds u32"))?;
+				self.shards[idx % SHARDS]
+					.lock()
+					.insert(page, Loc::Remote { page });
+				self.set_bit(&self.evicted, idx);
+			}
+			self.publish_gauges();
+			Ok(())
+		}
+
 		fn disable_once(&self, message: String) {
 			if !self.disabled.swap(true, Ordering::SeqCst) {
 				warn!("disabling pager: {message}");
@@ -810,13 +1050,7 @@ mod linux {
 
 		#[cfg(test)]
 		fn register_for_test(&self) -> Result<()> {
-			if !self.registered.load(Ordering::SeqCst) {
-				for region in &self.regions {
-					register_missing(self.uffd.as_raw_fd(), region.base as u64, region.len as u64)?;
-				}
-				self.registered.store(true, Ordering::SeqCst);
-			}
-			Ok(())
+			self.register_all_missing()
 		}
 	}
 
@@ -901,6 +1135,9 @@ mod linux {
 	#[cfg(test)]
 	mod tests {
 		use std::{
+			io::{Read, Write},
+			net::TcpListener,
+			sync::atomic::AtomicU8,
 			thread::{self, JoinHandle},
 			time::{Duration, Instant},
 		};
@@ -931,6 +1168,29 @@ mod linux {
 				let p = pager.clone();
 				let handler = thread::Builder::new()
 					.name("pager-test".into())
+					.spawn(move || p.handler_loop())
+					.expect("spawn pager handler");
+				Some(Self { mem, pager, handler: Some(handler) })
+			}
+
+			fn new_remote(url: &str) -> Option<Self> {
+				let uffd = match create_uffd() {
+					Ok(uffd) => uffd,
+					Err(e) if e.to_string().contains("userfaultfd denied") => {
+						eprintln!("skipping pager userfaultfd test: {e}");
+						return None;
+					},
+					Err(e) => panic!("create userfaultfd for remote pager test: {e}"),
+				};
+				let swap = open_swap_file(None).expect("open swap file");
+				let mem = crate::memory::create_guest_memory(2 << 20).expect("guest memory");
+				let source = RemotePageSource::new(url, "secret".to_string()).expect("remote source");
+				let gate = crate::control::PauseGate::new(1);
+				let fatal = PagerFatal::new(gate, Arc::new(AtomicU8::new(0)), 4);
+				let pager = Pager::new_remote(uffd, swap, &mem, source, fatal).expect("remote pager");
+				let p = pager.clone();
+				let handler = thread::Builder::new()
+					.name("pager-remote-test".into())
 					.spawn(move || p.handler_loop())
 					.expect("spawn pager handler");
 				Some(Self { mem, pager, handler: Some(handler) })
@@ -994,6 +1254,24 @@ mod linux {
 			noisy
 		}
 
+		fn one_page_server(page: [u8; PAGE_SIZE], expected_page: u32) -> (String, JoinHandle<()>) {
+			let listener = TcpListener::bind("127.0.0.1:0").expect("bind page server");
+			let addr = listener.local_addr().expect("page server address");
+			let handle = thread::spawn(move || {
+				let (mut stream, _) = listener.accept().expect("accept page request");
+				let mut req = [0u8; 1024];
+				let n = stream.read(&mut req).expect("read page request");
+				let req = std::str::from_utf8(&req[..n]).expect("request utf8");
+				assert!(req.starts_with(&format!("GET /pages/{expected_page} HTTP/1.1")));
+				assert!(req.contains("Authorization: Bearer secret"));
+				stream
+					.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+					.expect("write response header");
+				stream.write_all(&page).expect("write page");
+			});
+			(format!("http://{addr}/pages"), handle)
+		}
+
 		#[test]
 		fn encode_decode_roundtrip_variants() {
 			let zero = [0u8; PAGE_SIZE];
@@ -1011,6 +1289,29 @@ mod linux {
 			assert_eq!(raw[0], 1);
 			decode(&raw, &mut out).expect("decode raw");
 			assert_eq!(out, noisy);
+		}
+
+		#[test]
+		fn remote_page_source_fetches_page_over_http() {
+			let page = noisy_page();
+			let (url, handle) = one_page_server(page, 7);
+			let source = RemotePageSource::new(&url, "secret".to_string()).expect("remote source");
+			let mut out = [0u8; PAGE_SIZE];
+			source.fetch_page(7, &mut out).expect("fetch page");
+			assert_eq!(out, page);
+			handle.join().expect("page server");
+		}
+
+		#[test]
+		fn remote_pager_faults_in_source_page() {
+			let page = noisy_page();
+			let (url, handle) = one_page_server(page, 0);
+			let Some(f) = Fixture::new_remote(&url) else {
+				return;
+			};
+			assert_eq!(f.read_page(0), page);
+			f.wait_resident(0);
+			handle.join().expect("page server");
 		}
 
 		#[test]
@@ -1083,13 +1384,17 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{Pager, create_uffd, open_swap_file};
+pub use linux::{Pager, PagerFatal, RemotePageSource, create_uffd, open_swap_file};
 
 #[cfg(not(target_os = "linux"))]
 mod non_linux {
-	use std::{path::Path, sync::Arc};
+	use std::{
+		path::Path,
+		sync::{Arc, atomic::AtomicU8},
+	};
 
 	use crate::{
+		control::PauseGate,
 		memory::GuestMemoryMmap,
 		result::{Result, err},
 	};
@@ -1104,6 +1409,22 @@ mod non_linux {
 		Err(err("pager requires Linux"))
 	}
 
+	pub struct RemotePageSource;
+
+	impl RemotePageSource {
+		pub fn new(_base_url: &str, _token: String) -> Result<Self> {
+			Err(err("pager requires Linux"))
+		}
+	}
+
+	pub struct PagerFatal;
+
+	impl PagerFatal {
+		pub fn new(_gate: Arc<PauseGate>, _exit_reason: Arc<AtomicU8>, _exit_code: u8) -> Self {
+			Self
+		}
+	}
+
 	impl Pager {
 		pub fn new(
 			_uffd: std::os::fd::OwnedFd,
@@ -1111,6 +1432,16 @@ mod non_linux {
 			_mem: &GuestMemoryMmap,
 			_target_pages: usize,
 			_store_max_bytes: usize,
+		) -> Result<Arc<Self>> {
+			Err(err("pager requires Linux"))
+		}
+
+		pub fn new_remote(
+			_uffd: std::os::fd::OwnedFd,
+			_swap_fd: std::os::fd::OwnedFd,
+			_mem: &GuestMemoryMmap,
+			_source: RemotePageSource,
+			_fatal: PagerFatal,
 		) -> Result<Arc<Self>> {
 			Err(err("pager requires Linux"))
 		}
@@ -1144,4 +1475,4 @@ mod non_linux {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use non_linux::{Pager, create_uffd, open_swap_file};
+pub use non_linux::{Pager, PagerFatal, RemotePageSource, create_uffd, open_swap_file};

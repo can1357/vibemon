@@ -30,7 +30,8 @@ use crate::{
 /// Host KVM's advertised MSR index list, captured at VM construction while
 /// /dev/kvm is still openable. [`save_vcpu`] runs on the vCPU threads after the
 /// Landlock/seccomp filters engage, which deny reopening /dev/kvm — so the list
-/// is cached up front via [`cache_supported_msrs`] rather than re-derived there.
+/// is cached up front via [`cache_supported_msrs`] rather than re-derived
+/// there.
 static SUPPORTED_MSRS: OnceLock<BTreeSet<u32>> = OnceLock::new();
 
 /// Capture the host's supported MSR index list from an open KVM handle.
@@ -45,7 +46,12 @@ pub fn cache_supported_msrs(kvm: &Kvm) -> Result<()> {
 	if SUPPORTED_MSRS.get().is_some() {
 		return Ok(());
 	}
-	let set: BTreeSet<u32> = kvm.get_msr_index_list()?.as_slice().iter().copied().collect();
+	let set: BTreeSet<u32> = kvm
+		.get_msr_index_list()?
+		.as_slice()
+		.iter()
+		.copied()
+		.collect();
 	let _ = SUPPORTED_MSRS.set(set);
 	Ok(())
 }
@@ -245,8 +251,12 @@ pub fn save_machine(vm: &VmFd) -> Result<MachineState> {
 	let mut ioapic = kvm_irqchip { chip_id: kvm_bindings::KVM_IRQCHIP_IOAPIC, ..Default::default() };
 	vm.get_irqchip(&mut ioapic)
 		.map_err(|e| err(format!("snapshot get_irqchip IOAPIC: {e}")))?;
-	let pit = vm.get_pit2().map_err(|e| err(format!("snapshot get_pit2: {e}")))?;
-	let clock = vm.get_clock().map_err(|e| err(format!("snapshot get_clock: {e}")))?;
+	let pit = vm
+		.get_pit2()
+		.map_err(|e| err(format!("snapshot get_pit2: {e}")))?;
+	let clock = vm
+		.get_clock()
+		.map_err(|e| err(format!("snapshot get_clock: {e}")))?;
 	Ok(MachineState { pic_master, pic_slave, ioapic, pit, clock })
 }
 
