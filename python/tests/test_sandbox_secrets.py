@@ -71,6 +71,7 @@ class FakeControl:
 
 class FakeMicroVM:
     restored: list[tuple[object, str | None, dict[str, object], object]] = []
+    booted: list[tuple[object, str | None, dict[str, object], object]] = []
 
     def __init__(self, name: str, root: Path) -> None:
         self.name = name
@@ -87,6 +88,14 @@ class FakeMicroVM:
 
         vm = cls(name or "sb", sandbox_mod.STATE)
         cls.restored.append((template, name, dict(kwargs), vm))
+        return vm
+
+    @classmethod
+    def boot_rootfs(cls, rootfs: object, name: str | None = None, **kwargs: object):
+        import vmon.sandbox as sandbox_mod
+
+        vm = cls(name or "sb", sandbox_mod.STATE)
+        cls.booted.append((rootfs, name, dict(kwargs), vm))
         return vm
 
     def agent(self, connect_timeout: float | None = None) -> FakeAgentConn:
@@ -107,6 +116,12 @@ def _install_fakes(monkeypatch, mvm_home: Path):
     import vmon.sandbox as sandbox_mod
 
     FakeMicroVM.restored = []
+    FakeMicroVM.booted = []
+    # A disk-backed template so the fresh-boot path (networked, or block_network
+    # with fs_dir/volumes) finds its copy-on-write overlay base.
+    tpl = mvm_home / "templates" / "t"
+    tpl.mkdir(parents=True, exist_ok=True)
+    (tpl / "rootfs.img").touch()
     monkeypatch.setattr(sandbox_mod, "MicroVM", FakeMicroVM)
     monkeypatch.setattr(
         sandbox_mod.Sandbox,
@@ -146,19 +161,21 @@ def test_create_never_persists_secret_values_and_exec_merges_env(monkeypatch, mv
     sb.terminate()
 
 
-def test_volume_tag_collisions_get_unique_restore_tags(monkeypatch, mvm_home):
+def test_volume_tag_collisions_get_unique_tags(monkeypatch, mvm_home):
     sandbox_mod = _install_fakes(monkeypatch, mvm_home)
     from vmon.volume import Volume
 
+    # block_network + volumes fresh-boots (the warm-restore path cannot enumerate
+    # virtio-fs devices the template snapshot lacks), so assert on the boot kwargs.
     sb = sandbox_mod.Sandbox.create(
         template="t",
         volumes={"/one": Volume("a-b"), "/two": Volume("a_b")},
         pool_size=0,
         block_network=True,
     )
-    restore_kwargs = FakeMicroVM.restored[-1][2]
-    assert FakeMicroVM.restored[-1][3]._agent.ping_timeouts == [300]
-    tags = [tag for tag, _host_dir, _read_only in restore_kwargs["volumes"]]
+    boot_kwargs = FakeMicroVM.booted[-1][2]
+    assert FakeMicroVM.booted[-1][3]._agent.ping_timeouts == [300]
+    tags = [tag for tag, _host_dir, _read_only in boot_kwargs["volumes"]]
 
     assert tags == ["a_b", "a_b_2"]
     assert len(tags) == len(set(tags))

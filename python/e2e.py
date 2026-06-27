@@ -201,10 +201,10 @@ def net_admin() -> bool:
 def virtiofs_supported() -> bool:
     """True if the guest kernel can mount virtio-fs (cached one-shot probe).
 
-    The auto-provisioned firecracker-ci kernel is built without
-    ``CONFIG_VIRTIO_FS``, so volume / host-share mounts fail with ENODEV; set
-    ``VMON_KERNEL`` to a virtio-fs-capable kernel to exercise them. Probed by
-    attaching a throwaway host share and trying to mount it.
+    The default aarch64 kernel ships ``CONFIG_VIRTIO_FS`` (virtio-fs works out of
+    the box on macOS/HVF and Linux/aarch64); the x86_64 firecracker kernel and
+    some custom ``VMON_KERNEL`` builds lack it, so mounts fail with ENODEV there.
+    Probed by attaching a throwaway host share and trying to mount it.
     """
     global _virtiofs
     if _virtiofs is not None:

@@ -43,7 +43,7 @@ def test_writable_volume_persists_across_sandboxes():
         )
     except AgentError as exc:
         # ENODEV == the guest kernel registers no virtiofs filesystem type (the
-        # auto-provisioned macOS kernel); skip rather than fail.
+        # x86_64 firecracker kernel, or a custom VMON_KERNEL without it); skip.
         if "os error 19" in str(exc).lower() or "no such device" in str(exc).lower():
             pytest.skip(
                 "guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel"

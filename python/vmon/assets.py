@@ -20,14 +20,21 @@ import urllib.request
 from pathlib import Path
 
 # Pinned, checksum-verified guest kernels per host arch, shared with the
-# integration suite (`demo/fetch-test-assets.sh`): the firecracker-ci aarch64
-# kernel boots cleanly under both KVM and HVF, and the x86_64 quickstart kernel
-# is the firecracker default. Each entry is (filename, url, sha256).
+# integration suite (`demo/fetch-test-assets.sh`). Each entry is
+# (filename, url, sha256).
+#
+# aarch64: the Cloud Hypervisor release kernel (raw arm64 `Image`, v6.16.9). It
+# boots cleanly under both KVM and HVF and, unlike the firecracker-ci kernel,
+# ships `CONFIG_VIRTIO_FS=y` so virtio-fs shares/volumes work in the guest.
+# x86_64: the firecracker quickstart kernel (raw ELF `vmlinux`). It lacks
+# virtio-fs; the matching Cloud Hypervisor `vmlinux-x86_64` is the drop-in once
+# boot-verified on a Linux/KVM host (its PVH entry vs our Linux-bootparams loader
+# is unverified here).
 _KERNELS: dict[str, tuple[str, str, str]] = {
     "aarch64": (
         "Image-aarch64",
-        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/aarch64/vmlinux-6.1.128",
-        "cb1291c66bca75bc11cb9c8357fcef9965bb1786dffcb42a60923c3e0e49f319",
+        "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/Image-arm64",
+        "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010",
     ),
     "x86_64": (
         "vmlinux-x86_64",
