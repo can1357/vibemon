@@ -418,23 +418,41 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// parent dir already exists here (bound above, or pre-created by the jailer).
 	let mut status_file = open_status_file(status_sock.as_deref());
 
-	let pager_setup = match config.mem_target_mib {
-		Some(target_mib) => {
-			let setup = crate::pager::create_uffd().and_then(|uffd| {
-				crate::pager::open_swap_file(config.zram_swap_file.as_deref())
-					.map(|swap| (uffd, swap, target_mib))
-			});
-			match setup {
-				Ok(setup) => Some(setup),
-				Err(e) => {
-					write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
-					cleanup_agent_socket(agent_socket.as_ref());
-					cleanup_control_server(control_server.as_ref());
-					return Err(e);
-				},
-			}
-		},
-		None => None,
+	enum PagerSetup {
+		Zram(std::os::fd::OwnedFd, std::os::fd::OwnedFd, usize),
+		Remote(std::os::fd::OwnedFd, std::os::fd::OwnedFd, String),
+	}
+	let pager_setup = if let Some(remote_url) = config.remote_page_url.clone() {
+		let setup = crate::pager::create_uffd()
+			.and_then(|uffd| crate::pager::open_swap_file(None).map(|swap| (uffd, swap)));
+		match setup {
+			Ok((uffd, swap)) => Some(PagerSetup::Remote(uffd, swap, remote_url)),
+			Err(e) => {
+				write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+				cleanup_agent_socket(agent_socket.as_ref());
+				cleanup_control_server(control_server.as_ref());
+				return Err(e);
+			},
+		}
+	} else {
+		match config.mem_target_mib {
+			Some(target_mib) => {
+				let setup = crate::pager::create_uffd().and_then(|uffd| {
+					crate::pager::open_swap_file(config.zram_swap_file.as_deref())
+						.map(|swap| (uffd, swap, target_mib))
+				});
+				match setup {
+					Ok((uffd, swap, target_mib)) => Some(PagerSetup::Zram(uffd, swap, target_mib)),
+					Err(e) => {
+						write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+						cleanup_agent_socket(agent_socket.as_ref());
+						cleanup_control_server(control_server.as_ref());
+						return Err(e);
+					},
+				}
+			},
+			None => None,
+		}
 	};
 
 	// Privilege phase: no_new_privs + uid/gid drop. Run BEFORE the VMM opens
@@ -477,40 +495,54 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	} else {
 		crate::metrics::record_boot_duration(reconstruct_elapsed);
 	}
-	if let Some((uffd, swap, target_mib)) = pager_setup {
-		let pager_limits = (|| -> Result<(usize, usize)> {
-			let target_bytes = target_mib
-				.checked_mul(1 << 20)
-				.ok_or_else(|| err("--mem-target-mib overflows usize"))?;
-			let target_pages = target_bytes / 4096;
-			let store_max_mib = config
-				.zram_store_max_mib
-				.unwrap_or_else(|| (config.mem_mib / 4).max(16));
-			let store_max = store_max_mib
-				.checked_mul(1 << 20)
-				.ok_or_else(|| err("--zram-store-max-mib overflows usize"))?;
-			Ok((target_pages, store_max))
-		})();
-		let (target_pages, store_max) = match pager_limits {
-			Ok(limits) => limits,
+	if let Some(pager_setup) = pager_setup {
+		let pager = match pager_setup {
+			PagerSetup::Zram(uffd, swap, target_mib) => {
+				let pager_limits = (|| -> Result<(usize, usize)> {
+					let target_bytes = target_mib
+						.checked_mul(1 << 20)
+						.ok_or_else(|| err("--mem-target-mib overflows usize"))?;
+					let target_pages = target_bytes / 4096;
+					let store_max_mib = config
+						.zram_store_max_mib
+						.unwrap_or_else(|| (config.mem_mib / 4).max(16));
+					let store_max = store_max_mib
+						.checked_mul(1 << 20)
+						.ok_or_else(|| err("--zram-store-max-mib overflows usize"))?;
+					Ok((target_pages, store_max))
+				})();
+				let (target_pages, store_max) = match pager_limits {
+					Ok(limits) => limits,
+					Err(e) => {
+						write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+						cleanup_agent_socket(agent_socket.as_ref());
+						cleanup_control_server(control_server.as_ref());
+						return Err(e);
+					},
+				};
+				crate::pager::Pager::new(uffd, swap, vmm.vm.memory(), target_pages, store_max)
+			},
+			PagerSetup::Remote(uffd, swap, url) => {
+				let token = std::env::var("VMON_REMOTE_PAGE_TOKEN")
+					.map_err(|_| err("remote page-in requires VMON_REMOTE_PAGE_TOKEN"))?;
+				let source = crate::pager::RemotePageSource::new(&url, token)?;
+				let fatal = crate::pager::PagerFatal::new(
+					vmm.gate.clone(),
+					vmm.exit_reason.clone(),
+					VmmExit::Killed.as_u8(),
+				);
+				crate::pager::Pager::new_remote(uffd, swap, vmm.vm.memory(), source, fatal)
+			},
+		};
+		match pager {
+			Ok(pager) => vmm.pager = Some(pager),
 			Err(e) => {
 				write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 				cleanup_agent_socket(agent_socket.as_ref());
 				cleanup_control_server(control_server.as_ref());
 				return Err(e);
 			},
-		};
-		let pager =
-			match crate::pager::Pager::new(uffd, swap, vmm.vm.memory(), target_pages, store_max) {
-				Ok(pager) => pager,
-				Err(e) => {
-					write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
-					cleanup_agent_socket(agent_socket.as_ref());
-					cleanup_control_server(control_server.as_ref());
-					return Err(e);
-				},
-			};
-		vmm.pager = Some(pager);
+		}
 	}
 
 	// Installed before any vCPU can be asked to pause; harmless without a socket.
@@ -1916,15 +1948,20 @@ impl Vmm {
 
 	/// Restore a previously snapshotted VM (no kernel boot).
 	fn restore(dir: &Path, config: &Config) -> Result<Self> {
-		let image = snapshot::read_snapshot(dir)?;
-		snapshot::validate_snapshot(&image)?;
+		let image = if config.remote_page_url.is_some() {
+			snapshot::read_snapshot_metadata(dir)?
+		} else {
+			snapshot::read_snapshot(dir)?
+		};
 		let mem_bytes = image
 			.snapshot()
 			.mem_mib
 			.checked_mul(1 << 20)
 			.ok_or("snapshot memory size overflows usize")?;
 		let vm = Arc::new(Vm::new(mem_bytes)?);
-		snapshot::load_memory_chain(dir, &image, vm.memory())?;
+		if config.remote_page_url.is_none() {
+			snapshot::load_memory_chain(dir, &image, vm.memory())?;
+		}
 		if config.ksm {
 			crate::memory::advise_mergeable(vm.memory());
 		}
@@ -2231,6 +2268,16 @@ impl Vmm {
 		#[cfg(target_arch = "aarch64")]
 		let xsave_size = 0usize;
 
+		if let Some(pager) = &self.pager {
+			let p = pager.clone();
+			self.pager_handler = Some(
+				thread::Builder::new()
+					.name("vmon-pager".into())
+					.spawn(move || p.handler_loop())
+					.map_err(|e| err(format!("spawning pager handler failed: {e}")))?,
+			);
+		}
+
 		#[cfg(target_os = "linux")]
 		{
 			let vcpus = std::mem::take(&mut self.vcpus);
@@ -2247,15 +2294,6 @@ impl Vmm {
 		}
 		#[cfg(target_os = "macos")]
 		self.start_macos_vcpus(xsave_size)?;
-		if let Some(pager) = &self.pager {
-			let p = pager.clone();
-			self.pager_handler = Some(
-				thread::Builder::new()
-					.name("vmon-pager".into())
-					.spawn(move || p.handler_loop())
-					.map_err(|e| err(format!("spawning pager handler failed: {e}")))?,
-			);
-		}
 		Ok(())
 	}
 
