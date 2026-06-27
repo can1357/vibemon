@@ -45,6 +45,9 @@ class CachedTemplate:
     spec: ImageSpec
     digest: str
     disk_mb: int
+    # Count of pre-provisioned virtio-fs slots (`vmon.slot0..`) baked into the
+    # snapshot for warm volume rebinding on restore; 0 is a plain (no-slot) template.
+    fs_slots: int = 0
 
 
 def _state() -> Path:
@@ -132,7 +135,7 @@ def _image_digest(engine: str, reference: str) -> str:
 _TEMPLATE_BOOT_VERSION = 3
 
 
-def _template_marker_current(marker: Path, kernel_sha: str) -> bool:
+def _template_marker_current(marker: Path, kernel_sha: str, fs_slots: int) -> bool:
     """True if *marker* records a template booted by the current vmon and kernel.
 
     Guards against reusing a snapshot whose baked-in boot state predates a
@@ -145,8 +148,20 @@ def _template_marker_current(marker: Path, kernel_sha: str) -> bool:
     except OSError, json.JSONDecodeError:
         return False
     return (
-        data.get("boot_version") == _TEMPLATE_BOOT_VERSION and data.get("kernel_sha") == kernel_sha
+        data.get("boot_version") == _TEMPLATE_BOOT_VERSION
+        and data.get("kernel_sha") == kernel_sha
+        and data.get("fs_slots", 0) == fs_slots
     )
+
+
+def slot_tag(i: int) -> str:
+    """Reserved virtio-fs tag for warm-volume slot *i*.
+
+    Used identically by the provisioned template (where the slot devices are
+    enumerated at boot) and the warm-restore remap (where a request's volumes
+    rebind onto these tags). Matches the CLI tag charset ``[a-z0-9_]{1,32}``.
+    """
+    return f"vmon_slot{i}"
 
 
 def cached_template(
@@ -159,6 +174,7 @@ def cached_template(
     timeout: float = 300,
     memory: int = 512,
     cpus: int = 1,
+    fs_slots: int = 0,
 ) -> CachedTemplate:
     """Build/cache an agent-capable ext4 rootfs and a ping-verified VM snapshot."""
     if disk_mb <= 0:
@@ -193,9 +209,9 @@ def cached_template(
                 tmp_ext4.unlink(missing_ok=True)
     spec_path.write_text(json.dumps(asdict(spec), indent=2), encoding="utf-8")
 
-    tpl_name = f"tpl-{digest[:12]}-{disk_mb}"
+    tpl_name = f"tpl-{digest[:12]}-{disk_mb}" + (f"-s{fs_slots}" if fs_slots else "")
     tpl_dir = _state() / "templates" / tpl_name
-    template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb)
+    template = CachedTemplate(tpl_name, tpl_dir, rootfs_ext4, spec, digest, disk_mb, fs_slots)
     from .vmm import _snapshot_state_present, default_kernel
 
     kernel_path = default_kernel()
@@ -205,7 +221,7 @@ def cached_template(
     if (
         _snapshot_state_present(tpl_dir)
         and (tpl_dir / "rootfs.img").is_file()
-        and _template_marker_current(marker, kernel_sha)
+        and _template_marker_current(marker, kernel_sha, fs_slots)
     ):
         return template
     if tpl_dir.exists():
@@ -213,17 +229,23 @@ def cached_template(
 
     from .vmm import MicroVM
 
-    vm_name = f"_template-{digest[:12]}-{disk_mb}"
+    vm_name = f"_template-{digest[:12]}-{disk_mb}" + (f"-s{fs_slots}" if fs_slots else "")
     old = MicroVM(vm_name)
     if old.is_running():
         old.stop()
     old.remove()
 
+    slot_void = _state() / "slot-void"
+    slot_void.mkdir(parents=True, exist_ok=True)
+    slot_vols: list[tuple[str, str | os.PathLike[str], bool]] = [
+        (slot_tag(i), str(slot_void), True) for i in range(fs_slots)
+    ]
     vm = MicroVM.boot_rootfs(
         rootfs_ext4,
         name=vm_name,
         mem=memory,
         cpus=cpus,
+        volumes=slot_vols,
         snapshot_root=_state() / "templates",
         image=spec.reference,
     )
@@ -240,6 +262,7 @@ def cached_template(
                     "disk_mb": disk_mb,
                     "boot_version": _TEMPLATE_BOOT_VERSION,
                     "kernel_sha": kernel_sha,
+                    "fs_slots": fs_slots,
                 },
                 indent=2,
             ),

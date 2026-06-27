@@ -75,6 +75,8 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
         token="t",
         transport=FakeTransport(),
         caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
         state_path=tmp_path / "mesh.json",
     )
     mesh.node_id = "self"
@@ -84,12 +86,22 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
         "warm",
         "http://warm",
         caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
         committed_vcpus=1,
         committed_mem_mib=512,
         pools={"img:x": 2},
         last_seen=now,
     )
-    free = NodeState("free", "http://free", caps=NodeCaps(8, 4096), pools={}, last_seen=now)
+    free = NodeState(
+        "free",
+        "http://free",
+        backend="kvm",
+        arch="x86_64",
+        caps=NodeCaps(8, 4096),
+        pools={},
+        last_seen=now,
+    )
     mesh.register(warm)
     mesh.register(free)
 
@@ -99,7 +111,13 @@ def test_score_warm_capacity_pinned_templates_and_overcommit(tmp_path):
     assert mesh.place({"dockerfile": "Dockerfile"}) == "self"
 
     templated = NodeState(
-        "templated", "http://templated", templates=["snap1"], caps=NodeCaps(1, 512), last_seen=now
+        "templated",
+        "http://templated",
+        backend="kvm",
+        arch="x86_64",
+        templates=["snap1"],
+        caps=NodeCaps(1, 512),
+        last_seen=now,
     )
     mesh.register(templated)
     assert mesh.place({"snapshot": "snap1", "cpus": 8, "memory": 8192}) == "templated"
@@ -249,3 +267,74 @@ def test_gateway_call_mapping():
         "/v1/sandboxes/sb/snapshot_template",
         {"snapshot": "snap", "stop": True},
     ) in client.calls
+
+
+def test_node_state_wire_tolerates_missing_backend_arch():
+    # Old peers / persisted blobs predate backend+arch: they must still load.
+    old = NodeState.from_wire({"node_id": "old", "advertise": "http://old"})
+    assert (old.backend, old.arch) == ("", "")
+    rt = NodeState.from_wire(NodeState("n", "u", backend="kvm", arch="x86_64").to_wire())
+    assert (rt.backend, rt.arch) == ("kvm", "x86_64")
+
+
+def test_placement_is_backend_and_arch_compatible(tmp_path):
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        backend="kvm",
+        arch="x86_64",
+        caps=NodeCaps(2, 1024),
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    now = time.time()
+    wrong_backend = NodeState(
+        "hvfnode",
+        "http://h",
+        backend="hvf",
+        arch="x86_64",
+        caps=NodeCaps(8, 4096),
+        pools={"img:x": 4},
+        templates=["snap1"],
+        last_seen=now,
+    )
+    wrong_arch = NodeState(
+        "armnode",
+        "http://a",
+        backend="kvm",
+        arch="aarch64",
+        caps=NodeCaps(8, 4096),
+        pools={"img:x": 4},
+        templates=["snap1"],
+        last_seen=now,
+    )
+    compatible = NodeState(
+        "kvmnode",
+        "http://k",
+        backend="kvm",
+        arch="x86_64",
+        caps=NodeCaps(8, 4096),
+        pools={"img:x": 4},
+        templates=["snap1"],
+        last_seen=now,
+    )
+    for peer in (wrong_backend, wrong_arch, compatible):
+        mesh.register(peer)
+
+    # Warm-pool request: incompatible backend/arch peers are filtered out.
+    warm_req = {"image": "img:x", "pool_size": 1, "block_network": True}
+    assert {n.node_id for n in mesh.candidates(warm_req)} == {"self", "kvmnode"}
+    assert mesh.place(warm_req) == "kvmnode"
+
+    # Snapshot request: only a compatible node carrying the template qualifies.
+    assert {n.node_id for n in mesh.candidates({"snapshot": "snap1"})} == {"kvmnode"}
+
+    # Plain image boot: arch must match (kernel + injected agent are arch-specific),
+    # but the backend need not — a fresh boot runs under either hypervisor. So the
+    # wrong-arch node drops out while the wrong-backend (same-arch) node stays in.
+    plain = {n.node_id for n in mesh.candidates({"image": "plain"})}
+    assert plain == {"self", "hvfnode", "kvmnode"}
+    assert "armnode" not in plain

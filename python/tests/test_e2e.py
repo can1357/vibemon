@@ -1,5 +1,6 @@
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -49,15 +50,66 @@ def test_writable_volume_persists_across_sandboxes():
                 "guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel"
             )
         raise
+
     try:
+        # The image-built volume request must warm-restore from a slot-provisioned
+        # template (one virtio-fs slot per volume), never cold-boot.
+        restored = Path(str(sb.vm.meta.get("restored_from") or ""))
+        assert restored.name.endswith("-s1") and restored.exists(), restored
         assert sb.exec("sh", "-lc", "echo hi >/data/x").wait(timeout=30) == 0
     finally:
         sb.terminate()
 
     sb2 = Sandbox.create(image=_image(), volumes={"/data": volume}, block_network=True, timeout=300)
     try:
+        # The second create reuses the same provisioned template (warm restore).
+        restored2 = Path(str(sb2.vm.meta.get("restored_from") or ""))
+        assert restored2.name.endswith("-s1") and restored2.exists(), restored2
+        assert str(restored2) == str(restored)
         proc = sb2.exec("cat", "/data/x")
         assert _read_stdout(proc).strip() == "hi"
+    finally:
+        sb2.terminate()
+
+
+def test_two_volume_warm_restore_provisions_two_slots():
+    from vmon.agent_client import AgentError
+    from vmon.sandbox import Sandbox
+    from vmon.volume import Volume
+
+    a, b = Volume("pytest-slot-a"), Volume("pytest-slot-b")
+    try:
+        sb = Sandbox.create(
+            image=_image(), volumes={"/a": a, "/b": b}, block_network=True, timeout=300
+        )
+    except AgentError as exc:
+        if "os error 19" in str(exc).lower() or "no such device" in str(exc).lower():
+            pytest.skip(
+                "guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel"
+            )
+        raise
+    try:
+        # Two volumes -> a 2-slot provisioned template; distinct per-mount content
+        # proves each slot rebinds to its own host dir (no aliasing).
+        restored = Path(str(sb.vm.meta.get("restored_from") or ""))
+        assert restored.name.endswith("-s2") and restored.exists(), restored
+        assert sb.exec("sh", "-lc", "echo AA >/a/m && echo BB >/b/m").wait(timeout=30) == 0
+        assert _read_stdout(sb.exec("cat", "/a/m")).strip() == "AA"
+        assert _read_stdout(sb.exec("cat", "/b/m")).strip() == "BB"
+    finally:
+        sb.terminate()
+
+    sb2 = Sandbox.create(
+        image=_image(), volumes={"/a": a, "/b": b}, block_network=True, timeout=300
+    )
+    try:
+        # The second create reuses the same 2-slot provisioned template (warm), and
+        # both slots still map to their own persistent host dirs.
+        restored2 = Path(str(sb2.vm.meta.get("restored_from") or ""))
+        assert restored2.name.endswith("-s2") and restored2.exists(), restored2
+        assert str(restored2) == str(restored)
+        assert _read_stdout(sb2.exec("cat", "/a/m")).strip() == "AA"
+        assert _read_stdout(sb2.exec("cat", "/b/m")).strip() == "BB"
     finally:
         sb2.terminate()
 

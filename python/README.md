@@ -2,7 +2,7 @@
 
 Run containers as hardware-isolated microVMs, suspend/resume them, snapshot a
 booted container into a template, then **warm-boot** (restore) or **fork** that
-template in milliseconds. Built on the [`vmm`](../) KVM VMM.
+template in milliseconds. Built on the [`vmm`](../) KVM (Linux) / HVF (Apple-silicon macOS) VMM.
 
 ```
                     docker image / Dockerfile
@@ -16,10 +16,12 @@ template in milliseconds. Built on the [`vmm`](../) KVM VMM.
 
 ## Requirements
 
-Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`), a container
-engine (`docker` or `podman`), and the `vmm` binary built (`cargo build --release`).
-A guest kernel is auto-detected from `/boot/vmlinuz-$(uname -r)` (override with
-`VMON_KERNEL`).
+Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`) or an
+Apple-silicon **macOS** host with **HVF**, a container engine (`docker` or
+`podman`), and the `vmm` binary built (`cargo build --release`, or `just build`
+on macOS to ad-hoc codesign it). A guest kernel is auto-detected from
+`/boot/vmlinuz-$(uname -r)` on Linux and auto-downloaded into `$VMON_HOME/assets`
+on macOS (override with `VMON_KERNEL`).
 
 `run` boots an agent-enabled microVM: a small, statically linked guest agent
 (`vmon-agent`) is injected into the image rootfs. Release wheels ship it; in a

@@ -6,6 +6,7 @@ import base64
 import contextlib
 import json
 import os
+import platform
 import secrets
 import socket
 import subprocess
@@ -52,6 +53,8 @@ class NodeState:
     owned: list[str] = field(default_factory=list)
     ts: float = 0.0
     last_seen: float = 0.0
+    backend: str = ""
+    arch: str = ""
 
     @property
     def free_vcpus(self) -> int:
@@ -73,6 +76,8 @@ class NodeState:
             "node_id": self.node_id,
             "advertise": self.advertise,
             "region": self.region,
+            "backend": self.backend,
+            "arch": self.arch,
             "vcpus": self.caps.vcpus,
             "mem_mib": self.caps.mem_mib,
             "committed_vcpus": self.committed_vcpus,
@@ -100,6 +105,8 @@ class NodeState:
             node_id=str(data.get("node_id") or ""),
             advertise=str(data.get("advertise") or ""),
             region=str(data.get("region") or ""),
+            backend=str(data.get("backend") or ""),
+            arch=str(data.get("arch") or ""),
             caps=caps,
             committed_vcpus=int(data.get("committed_vcpus") or 0),
             committed_mem_mib=int(data.get("committed_mem_mib") or 0),
@@ -194,6 +201,21 @@ def new_node_id() -> str:
 def probe_caps() -> NodeCaps:
     """Probe this host's default advertised capacity."""
     return NodeCaps(os.cpu_count() or 1, _total_mem_mib())
+
+
+def probe_compat() -> tuple[str, str]:
+    """Probe this host's snapshot-restore compatibility class as ``(backend, arch)``.
+
+    Snapshots are backend- and arch-specific (a KVM snapshot restores only on a
+    KVM build; an arm64 image won't boot on x86), so placement must match both.
+    For x86/KVM this is necessary but not sufficient — guest CPUID/XSAVE is
+    captured in the snapshot and reapplied verbatim on restore, so a finer
+    CPU-feature class is a later refinement.
+    """
+    from .vmm import _arch
+
+    backend = "hvf" if platform.system() == "Darwin" else "kvm"
+    return backend, _arch()
 
 
 def _total_mem_mib() -> int:
@@ -312,6 +334,8 @@ class Mesh:
         transport: MeshTransport,
         region: str = "",
         caps: NodeCaps | None = None,
+        backend: str | None = None,
+        arch: str | None = None,
         state_path: Path | None = None,
     ) -> None:
         self.engine = engine
@@ -321,6 +345,9 @@ class Mesh:
         self.transport = transport
         self.region = region
         self.caps = caps or probe_caps()
+        probed_backend, probed_arch = probe_compat()
+        self.backend = backend or probed_backend
+        self.arch = arch or probed_arch
         self.state_path = state_path or state_dir() / "mesh.json"
         self.node_id = new_node_id()
         self.enabled = False
@@ -346,6 +373,8 @@ class Mesh:
                 node_id=node_id,
                 advertise=self.advertise,
                 region=self.region,
+                backend=self.backend,
+                arch=self.arch,
                 caps=self.caps,
                 committed_vcpus=committed_vcpus,
                 committed_mem_mib=committed_mem_mib,
@@ -499,8 +528,18 @@ class Mesh:
             nodes = [self.self_state()]
             nodes.extend(peer for peer in self._peers.values() if peer.healthy(now, self.interval))
         ref = str(req.get("template") or req.get("snapshot") or "")
+        # Compat is derived from THIS ingress node, never from caller-supplied
+        # request JSON (unvalidated public input) — a client must not be able to
+        # steer snapshot/warm placement onto an incompatible node. The guest kernel
+        # and injected agent are arch-specific, so EVERY placement (even a fresh
+        # boot) must match this node's arch; snapshot-class requests (warm-pool
+        # clones, template/snapshot restore or fork) reuse a backend-specific memory
+        # image, so those must also match the backend.
+        nodes = [n for n in nodes if n.arch == self.arch]
+        if ref or pool_eligible(req):
+            nodes = [n for n in nodes if n.backend == self.backend]
         if ref:
-            nodes = [node for node in nodes if ref in node.templates]
+            nodes = [n for n in nodes if ref in n.templates]
         return nodes
 
     def place(self, req: dict[str, Any]) -> str:

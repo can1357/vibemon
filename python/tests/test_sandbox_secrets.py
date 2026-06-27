@@ -165,8 +165,9 @@ def test_volume_tag_collisions_get_unique_tags(monkeypatch, mvm_home):
     sandbox_mod = _install_fakes(monkeypatch, mvm_home)
     from vmon.volume import Volume
 
-    # block_network + volumes fresh-boots (the warm-restore path cannot enumerate
-    # virtio-fs devices the template snapshot lacks), so assert on the boot kwargs.
+    # A template-based create cold-boots even with volumes: a pre-built template
+    # snapshot has no provisioned slots to rebind, so virtio-fs devices are
+    # enumerated by a fresh boot. (Image-built requests warm-restore; see below.)
     sb = sandbox_mod.Sandbox.create(
         template="t",
         volumes={"/one": Volume("a-b"), "/two": Volume("a_b")},
@@ -179,6 +180,41 @@ def test_volume_tag_collisions_get_unique_tags(monkeypatch, mvm_home):
 
     assert tags == ["a_b", "a_b_2"]
     assert len(tags) == len(set(tags))
+    sb.terminate()
+
+
+def test_image_volume_request_warm_restores_with_slot_tags(monkeypatch, mvm_home):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    from vmon.image import slot_tag
+    from vmon.volume import Volume
+
+    resolved_slots: list[int] = []
+    real_resolve = sandbox_mod.Sandbox._resolve_template
+
+    def spy_resolve(**kwargs):
+        resolved_slots.append(int(kwargs.get("fs_slots", -1)))
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "_resolve_template", staticmethod(spy_resolve))
+
+    # An image-built block_network request with volumes warm-restores from a
+    # slot-provisioned template instead of cold-booting.
+    sb = sandbox_mod.Sandbox.create(
+        image="img",
+        volumes={"/one": Volume("a-b"), "/two": Volume("c_d")},
+        pool_size=0,
+        block_network=True,
+    )
+    # The provisioned template is requested with exactly one slot per volume.
+    assert resolved_slots == [2]
+    # Warm restore was used, never a cold boot.
+    assert FakeMicroVM.booted == []
+    restore_kwargs = FakeMicroVM.restored[-1][2]
+    tags = [tag for tag, _host, _ro in restore_kwargs["volumes"]]
+    assert tags == [slot_tag(0), slot_tag(1)]
+    # Each slot tag is mounted at its requested mountpoint in the guest.
+    mounts = FakeMicroVM.restored[-1][3]._agent.mounts
+    assert {(t, p) for t, p, _ro in mounts} == {(slot_tag(0), "/one"), (slot_tag(1), "/two")}
     sb.terminate()
 
 

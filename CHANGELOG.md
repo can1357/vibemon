@@ -13,11 +13,18 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added support for warm-restoring sandboxes with multiple virtio-fs volumes
+- Included hypervisor backend and architecture in node state for mesh placement compatibility
+- Added outbound internet access for microVMs by default on macOS/HVF
+
 - Added outbound networking support via user-mode NAT for microVMs on macOS (HVF)
 - Added automatic guest kernel provisioning for environments without a local kernel (e.g., macOS/HVF)
 - Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g., macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmm` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
+
+- Refactored stdin forwarding loop in `vmon exec` to improve terminal responsiveness
+- Enabled warm-restore path for networked sandboxes (block_network=True) with volumes
 
 - Updated `vmon run` to enable networking by default on macOS, removing the requirement for `--block-network`
 - Renamed the hypervisor binary from `vmon` to `vmm` to resolve naming collisions
@@ -26,8 +33,11 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
-- Fixed hanging `vmon exec` commands by correctly closing stdin when run from a TTY
+- Fixed template resolution to account for virtio-fs slot variations
+- Prevented potential deadlocks in stdin forwarding when handling non-TTY streams
+- Fixed mesh placement to strictly enforce hypervisor and architecture compatibility
 
+- Fixed hanging `vmon exec` commands by correctly closing stdin when run from a TTY
 - Fixed TTY stdin forwarding to prevent daemon crashes during shell execution
 - Prevented premature stdin-EOF teardown during non-interactive shell commands
 

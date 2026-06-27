@@ -5,9 +5,14 @@ These exercise :mod:`vmon.cli` against a recording fake of
 how the CLI parses args and which daemon method/params it would send.
 """
 
+import os
+import threading
+import time
+
 import pytest
 
 import vmon.cli as cli
+import vmon.client as client
 
 
 class RecordingClient:
@@ -156,6 +161,42 @@ def test_exec_tty_terminal_sends_immediate_eof_stdin(rec, monkeypatch):
     stdin = rec.last["stdin"]
     assert stdin is not None
     assert stdin.read() == b""
+
+
+def test_forward_stdin_fd_source_stops_without_eof():
+    class FakeConn:
+        def __init__(self):
+            self.chunks = []
+            self.eof = False
+
+        def send_stdin(self, chunk):
+            self.chunks.append(chunk)
+
+        def send_eof(self):
+            self.eof = True
+
+    rfd, wfd = os.pipe()
+    stdin = os.fdopen(rfd, "rb", buffering=0)
+    stop = threading.Event()
+    conn = FakeConn()
+    worker = threading.Thread(
+        target=client.DaemonClient._forward_stdin,
+        args=(conn, stdin, stop),
+    )
+    try:
+        worker.start()
+        time.sleep(0.1)
+        stop.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert conn.chunks == []
+        assert conn.eof is False
+    finally:
+        stop.set()
+        os.close(wfd)
+        stdin.close()
+        if worker.is_alive():
+            worker.join(timeout=1)
 
 
 def test_exec_tty_routes_to_interactive(rec):

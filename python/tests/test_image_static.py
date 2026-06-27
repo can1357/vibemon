@@ -153,7 +153,7 @@ def test_template_marker_current_requires_matching_kernel_sha(tmp_path):
         encoding="utf-8",
     )
 
-    assert image._template_marker_current(marker, kernel_sha) is True
+    assert image._template_marker_current(marker, kernel_sha, 0) is True
 
     marker.write_text(
         json.dumps(
@@ -164,18 +164,32 @@ def test_template_marker_current_requires_matching_kernel_sha(tmp_path):
         ),
         encoding="utf-8",
     )
-    assert image._template_marker_current(marker, kernel_sha) is False
+    assert image._template_marker_current(marker, kernel_sha, 0) is False
 
     marker.write_text(
         json.dumps({"boot_version": image._TEMPLATE_BOOT_VERSION}),
         encoding="utf-8",
     )
-    assert image._template_marker_current(marker, kernel_sha) is False
+    assert image._template_marker_current(marker, kernel_sha, 0) is False
 
-    assert image._template_marker_current(tmp_path / "missing.json", kernel_sha) is False
+    assert image._template_marker_current(tmp_path / "missing.json", kernel_sha, 0) is False
 
     marker.write_text("{", encoding="utf-8")
-    assert image._template_marker_current(marker, kernel_sha) is False
+    assert image._template_marker_current(marker, kernel_sha, 0) is False
+
+    # A template's slot topology must match the requested fs_slots, else rebuild.
+    marker.write_text(
+        json.dumps(
+            {
+                "boot_version": image._TEMPLATE_BOOT_VERSION,
+                "kernel_sha": kernel_sha,
+                "fs_slots": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert image._template_marker_current(marker, kernel_sha, 2) is True
+    assert image._template_marker_current(marker, kernel_sha, 0) is False
 
 
 def test_ensure_kernel_expands_home_and_normalizes_arch(monkeypatch, tmp_path):

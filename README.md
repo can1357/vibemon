@@ -71,7 +71,7 @@ vmon-agent (guest agent, Linux guest only)
 | x86_64 direct kernel format | uncompressed ELF `vmlinux` or `bzImage` | Loaded directly by vmon. |
 | aarch64 direct kernel format | uncompressed `Image` | The demo can extract an `Image` from a host `vmlinuz` on arm64 Linux. |
 | UEFI firmware | QEMU/EDK2 firmware supplied by the operator | Pass `--boot-mode uefi --firmware <path>`; vmon does not vendor firmware blobs. |
-| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. Snapshot/restore covers MMIO/PCI virtio state and virtio-fs inode/mode state on Linux/KVM, and MMIO virtio state on macOS/HVF, including snapshot capture, delta snapshots, cold restore, and fork. Named volumes are re-attached by host path. |
+| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. The default aarch64 kernel includes virtio-fs; x86_64/firecracker and custom non-virtiofs kernels lack it. Snapshot/restore covers MMIO/PCI virtio state and virtio-fs inode/mode state on Linux/KVM, and MMIO virtio state on macOS/HVF, including snapshot capture, delta snapshots, cold restore, and fork. Named volumes are re-attached by host path. |
 
 Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. KVM and HVF guest-boot coverage live in the self-hosted integration workflow (Linux/KVM and Apple Silicon/HVF runners).
 
@@ -206,7 +206,7 @@ sudo ./target/release/vmm \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-Snapshots record the virtio-fs mode in the v1 snapshot format and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Snapshot restores are backend-specific: a KVM snapshot restores only on a KVM build, and a macOS/HVF snapshot restores only on a macOS/HVF build (cross-hypervisor migration is out of scope). Delta snapshots follow the same backend-specific rule.
+Snapshots record the virtio-fs mode in the v1 snapshot format and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Snapshot restores are backend- and architecture-specific: a KVM snapshot restores only on a KVM build, a macOS/HVF snapshot restores only on a macOS/HVF build, and arm64 images restore only on arm64 (cross-hypervisor/cross-architecture migration is out of scope). Delta snapshots follow the same rule.
 
 ### Production platform flags
 

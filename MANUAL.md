@@ -23,7 +23,7 @@ else.
 | Python SDK logic + unit tests | ✅ | ✅ |
 | Building the Rust `vmm` binary | ✅ (HVF backend, auto-codesigned) | ✅ |
 | **Booting a microVM** (`vmon run`, exec, snapshot, fork) | ✅ (HVF) | ✅ |
-| virtio-fs volumes / host shares | ✅ (default aarch64 kernel has it) | ✅ |
+| virtio-fs volumes / host shares | ✅ (default aarch64 kernel has it) | ✅ on aarch64; x86_64/custom kernels need `CONFIG_VIRTIO_FS` |
 | Outbound networking (egress) | ✅ (HVF user-mode NAT) | ✅ (TAP) |
 | Port tunnels / host egress policy | ❌ Linux-only (TAP) | ✅ |
 | Demos (`demo/*.sh`) | ⚠️ Linux-oriented; some need Lima | ✅ |
@@ -32,8 +32,8 @@ So on an Apple-silicon Mac you get the full thing — panel, API, and real
 microVMs — natively. Caveats: **aarch64 guests only**; the `vmm` binary must be
 ad-hoc codesigned with the hypervisor entitlement (`just build` / `just codesign`
 handle this); networked sandboxes get outbound egress via macOS user-mode NAT,
-but inbound port tunnels and host egress allowlists are Linux-only. virtio-fs volumes/shares work out of the box (the default
-aarch64 kernel has `CONFIG_VIRTIO_FS`; a custom `VMON_KERNEL` must too). Intel
+but inbound port tunnels and host egress allowlists are Linux-only. virtio-fs volumes/shares work out of the box with the default
+aarch64 kernel; x86_64/firecracker and custom kernels need `CONFIG_VIRTIO_FS`. Intel
 Macs and x86_64 guests still need
 Linux/KVM — run those in a Linux VM with nested KVM (see [§6, Lima](#6-run-the-hypervisor-in-lima-control-it-from-macos)).
 
@@ -136,7 +136,7 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 
 | Command | What it does | Example |
 | --- | --- | --- |
-| `run` | boot a container image / Dockerfile as a microVM | `vmon run --block-network alpine -- sh -c 'uname -a'` |
+| `run` | boot a container image / Dockerfile as a microVM | `vmon run alpine -- sh -c 'uname -a'` |
 | `run -f` | build & boot a Dockerfile | `vmon run -f ./Dockerfile --context .` |
 | `run -d` | run detached (background) | `vmon run -d --name web nginx` |
 | `shell` | drop into an ephemeral interactive shell (attach a running VM, warm-boot a snapshot, or boot a fresh image) | `vmon shell` · `vmon shell web` · `vmon shell --image alpine` |
@@ -367,7 +367,7 @@ call("GET", "/healthz")        # {'ok': True}
 call("GET", "/v1/sandboxes")   # list (auth required)
 
 # create a sandbox — needs a hypervisor-backed server (macOS/HVF or Linux/KVM):
-call("POST", "/v1/sandboxes", {"image": "alpine", "block_network": True, "timeout_secs": 300})
+call("POST", "/v1/sandboxes", {"image": "alpine", "timeout_secs": 300})
 ```
 
 Prefer `curl`? `curl -s -H 'Authorization: Bearer secret' http://127.0.0.1:8137/v1/sandboxes`.
@@ -382,8 +382,8 @@ The `Sandbox` / `MicroVM` SDK drives the hypervisor directly and needs one
 ```python
 from vmon.sandbox import Sandbox
 
-# block_network=True is required on macOS today (host TAP networking is Linux-only):
-sb = Sandbox.create(image="alpine", block_network=True, timeout_secs=300)
+# Networked sandboxes work on macOS/HVF via user-mode NAT; set block_network=True only for a no-NIC sandbox.
+sb = Sandbox.create(image="alpine", timeout_secs=300)
 try:
     proc = sb.exec("sh", "-lc", "echo hi")
     print(proc.stdout.read())        # b'hi\n'

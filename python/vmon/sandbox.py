@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .agent_client import AgentClosed, AgentConn, ByteStream, ExecSession
-from .image import ImageSpec, cached_template
+from .image import ImageSpec, cached_template, slot_tag
 from .pool import WarmPool, wait_for_agent_ready
 from .secret import Secret, merge_secrets
 from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_timeout_secs
@@ -25,6 +25,11 @@ from .volume import Volume
 _POOLS: dict[str, WarmPool] = {}
 _POOL_REFS: dict[str, str] = {}
 _POOLS_LOCK = threading.Lock()
+# Max named volumes served by the warm path: a request with up to this many
+# volumes restores from a slot-provisioned template (one virtio-fs slot per
+# volume, rebound on restore); beyond it the sandbox cold-boots. Capped at the
+# VMM's hard limit of 8 total --volume mounts (config.rs); override via env.
+_WARM_VOLUME_SLOTS = min(8, max(0, int(os.environ.get("VMON_WARM_VOLUME_SLOTS", "8"))))
 
 
 def pool_inventory() -> dict[str, int]:
@@ -230,6 +235,18 @@ class Sandbox:
             eff_timeout_secs = (
                 _validate_timeout_secs(timeout_secs) if timeout_secs is not None else 300
             )
+        # A block_network, image-built request with named volumes (no fs_dir) can
+        # warm-restore from a slot-provisioned template: it bakes one virtio-fs slot
+        # per volume, rebound onto the request's host dirs on restore (vmon's restore
+        # re-attaches snapshot devices but cannot synthesize ones the template lacks).
+        n_vols = len(volumes or {})
+        warm_volumes = (
+            block_network
+            and fs_dir is None
+            and template is None
+            and 0 < n_vols <= _WARM_VOLUME_SLOTS
+        )
+        fs_slots = n_vols if warm_volumes else 0
         template_dir, image_spec, image_ref = cls._resolve_template(
             image=image,
             template=template,
@@ -239,6 +256,7 @@ class Sandbox:
             timeout=timeout,
             memory=memory,
             cpus=cpus,
+            fs_slots=fs_slots,
         )
         # Modal-parity default: a 5-minute VMM-enforced wall-clock deadline unless
         # the caller sets timeout_secs (0 disables).
@@ -304,6 +322,28 @@ class Sandbox:
                     agent=True,
                     mem=memory,
                     cpus=cpus,
+                    timeout_secs=eff_timeout_secs,
+                )
+            elif vm is None and warm_volumes:
+                # Warm volume path: restore the slot-provisioned template and rebind
+                # each requested volume onto its reserved slot tag. The remap must
+                # cover every provisioned slot exactly, else `resolve_backend` falls
+                # back to the empty slot-void share baked into the snapshot.
+                if len(volume_specs) != fs_slots:
+                    raise RuntimeError("warm-volume slot/remap mismatch")
+                for i, spec in enumerate(volume_specs):
+                    spec["tag"] = slot_tag(i)
+                slot_vols = [
+                    (spec["tag"], spec["host_dir"], bool(spec["read_only"]))
+                    for spec in volume_specs
+                ]
+                vm = MicroVM.restore(
+                    template_dir,
+                    name=name,
+                    agent=True,
+                    mem=memory,
+                    cpus=cpus,
+                    volumes=slot_vols,
                     timeout_secs=eff_timeout_secs,
                 )
             elif vm is None:
@@ -552,6 +592,7 @@ class Sandbox:
         timeout: float,
         memory: int,
         cpus: int,
+        fs_slots: int = 0,
     ) -> tuple[Path, ImageSpec | None, str | None]:
         if template is not None:
             path = Path(template)
@@ -567,6 +608,7 @@ class Sandbox:
             timeout=timeout,
             memory=memory,
             cpus=cpus,
+            fs_slots=fs_slots,
         )
         return cached.snapshot_dir, cached.spec, cached.spec.reference
 

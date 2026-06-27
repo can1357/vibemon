@@ -228,6 +228,48 @@ def t_detach_ps_exec_stop_rm(_):
 
 
 @e2e
+def t_run_networked(_):
+    """run -d without --block-network gives the guest outbound network egress."""
+    name = uid("net")
+    try:
+        cli(
+            "run",
+            "-d",
+            "--name",
+            name,
+            IMAGE,
+            "--",
+            "sh",
+            "-c",
+            "sleep 300",
+            timeout=BOOT_TIMEOUT,
+            check=True,
+        )
+        track(name)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if ps_status(name) == "running":
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError(f"{name} never reached running in ps after networked run")
+        rc, out, err = cli(
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-lc",
+            "wget -T 8 -q -O- http://example.com >/dev/null && echo NET-OK",
+        )
+        assert rc == 0 and "NET-OK" in out, f"network exec rc={rc} out={out!r} err={err}"
+    finally:
+        if name in CREATED:
+            cli("stop", name)
+            cli("rm", name)
+            untrack(name)
+
+
+@e2e
 def t_shell_ephemeral(_):
     """shell -c boots a fresh ephemeral VM, runs the command, and removes it."""
     marker = "shelled-" + RUN

@@ -352,13 +352,30 @@ class DaemonClient:
     @staticmethod
     def _forward_stdin(conn: _Conn, stdin: BinaryIO, stop: threading.Event) -> None:
         try:
+            try:
+                fd = stdin.fileno()
+            except Exception:
+                fd = None
+
+            if fd is None:
+                while not stop.is_set():
+                    chunk = stdin.read(65536)
+                    if not chunk:
+                        conn.send_eof()
+                        return
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode()
+                    conn.send_stdin(chunk)
+                return
+
             while not stop.is_set():
-                chunk = stdin.read(65536)
+                readable, _, _ = select.select([fd], [], [], 0.2)
+                if not readable:
+                    continue
+                chunk = os.read(fd, 65536)
                 if not chunk:
                     conn.send_eof()
                     return
-                if isinstance(chunk, str):
-                    chunk = chunk.encode()
                 conn.send_stdin(chunk)
         except Exception:
             pass
