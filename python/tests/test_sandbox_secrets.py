@@ -1,5 +1,7 @@
 import io
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -129,6 +131,146 @@ def _install_fakes(monkeypatch, mvm_home: Path):
         staticmethod(lambda **kwargs: (mvm_home / "templates" / "t", None, "t")),
     )
     return sandbox_mod
+
+
+def _sample_remote_sum(x: int, y: int = 0) -> dict[str, int]:
+    print("remote ran")
+    return {"sum": x + y}
+
+
+def _sample_remote_non_json() -> set[int]:
+    return {1, 2}
+
+
+class _CompletedFakeProcess:
+    def __init__(self, rc: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> None:
+        self._rc = rc
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._rc
+
+
+class _RunnerFakeProcess:
+    def __init__(self, runner: str) -> None:
+        self._runner = runner
+        self._stdin = bytearray()
+        self._rc: int | None = None
+        self.stdout = io.BytesIO()
+        self.stderr = io.BytesIO()
+
+    def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
+        raw = data.encode() if isinstance(data, str) else bytes(data)
+        self._stdin.extend(raw)
+
+    def close_stdin(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-c", self._runner],
+            input=bytes(self._stdin),
+            capture_output=True,
+            check=False,
+        )
+        self._rc = completed.returncode
+        self.stdout = io.BytesIO(completed.stdout)
+        self.stderr = io.BytesIO(completed.stderr)
+
+    def wait(self, timeout: float | None = None) -> int:
+        return int(self._rc if self._rc is not None else 0)
+
+
+class _RemoteFakeFilesystem:
+    def __init__(self) -> None:
+        self.writes: dict[str, str] = {}
+
+    def write_text(self, path: str, text: str, encoding: str = "utf-8", mode: int = 0o644) -> None:
+        self.writes[path] = text
+
+
+class _RemoteFakeSandbox:
+    def __init__(self, sandbox_mod) -> None:
+        self._sandbox_mod = sandbox_mod
+        self.filesystem = _RemoteFakeFilesystem()
+        self.execs: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return None
+
+    def exec(self, *cmd: str, **kwargs: object):
+        self.execs.append((tuple(cmd), dict(kwargs)))
+        if tuple(cmd) == ("python3", "--version"):
+            return _CompletedFakeProcess(stdout=b"Python 3.14\n")
+        return _RunnerFakeProcess(self._sandbox_mod._REMOTE_FUNCTION_RUNNER)
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+def test_remote_function_runner_executes_source_function() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    payload = sandbox_mod._remote_function_payload(_sample_remote_sum, (2,), {"y": 5})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    assert sandbox_mod._remote_function_result(completed.stdout) == {"sum": 7}
+
+
+def test_remote_function_runner_reports_non_json_result() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    payload = sandbox_mod._remote_function_payload(_sample_remote_non_json, (), {})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    with pytest.raises(sandbox_mod.RemoteFunctionError) as exc:
+        sandbox_mod._remote_function_result(completed.stdout)
+    assert exc.value.remote_type == "TypeError"
+    assert "JSON-serializable" in str(exc.value)
+
+
+def test_remote_function_rejects_closures() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    captured = 3
+
+    def inner() -> int:
+        return captured
+
+    with pytest.raises(ValueError, match="cannot close over"):
+        sandbox_mod._remote_function_payload(inner, (), {})
+
+
+def test_function_decorator_remote_uses_cached_python_sandbox(monkeypatch) -> None:
+    import vmon.sandbox as sandbox_mod
+
+    created: list[dict[str, object]] = []
+    sandboxes: list[_RemoteFakeSandbox] = []
+
+    def fake_create(**kwargs: object) -> _RemoteFakeSandbox:
+        created.append(dict(kwargs))
+        sandbox = _RemoteFakeSandbox(sandbox_mod)
+        sandboxes.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "create", staticmethod(fake_create))
+
+    remote = sandbox_mod.function(block_network=True)(_sample_remote_sum)
+
+    assert remote.remote(4, y=6) == {"sum": 10}
+    assert remote.remote(1, y=2) == {"sum": 3}
+    assert created == [{"image": "python:3.14-slim", "block_network": True}]
+    assert len(sandboxes) == 1
+    assert sandboxes[0].execs[0][0] == ("python3", "--version")
+    assert sandboxes[0].execs[1][0] == ("python3", "-u", "/tmp/vmon-function-runner.py")
+    assert "/tmp/vmon-function-runner.py" in sandboxes[0].filesystem.writes
 
 
 def test_create_never_persists_secret_values_and_exec_merges_env(monkeypatch, mvm_home):

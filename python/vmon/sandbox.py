@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import json
 import os
 import platform
 import secrets as _secrets
 import shutil
+import textwrap
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -1051,6 +1054,172 @@ class _AsyncSandbox:
 
     async def set_network_policy(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.set_network_policy, *args, **kwargs)
+
+
+_REMOTE_FUNCTION_RUNNER = r"""
+import asyncio
+import inspect
+import io
+import json
+import sys
+import traceback
+
+payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+namespace = {"__builtins__": __builtins__, "__name__": "__vmon_remote_function__"}
+response = {"ok": False}
+captured_stdout = io.StringIO()
+real_stdout = sys.stdout
+try:
+    exec(payload["source"], namespace)
+    fn = namespace[payload["name"]]
+    sys.stdout = captured_stdout
+    result = fn(*payload["args"], **payload["kwargs"])
+    if inspect.isawaitable(result):
+        result = asyncio.run(result)
+    sys.stdout = real_stdout
+    try:
+        json.dumps(result)
+    except TypeError as exc:
+        raise TypeError("remote function result must be JSON-serializable") from exc
+    response = {"ok": True, "result": result, "stdout": captured_stdout.getvalue()}
+except BaseException as exc:
+    sys.stdout = real_stdout
+    response = {
+        "ok": False,
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc(),
+        "stdout": captured_stdout.getvalue(),
+    }
+sys.stdout.buffer.write(json.dumps(response, separators=(",", ":")).encode("utf-8"))
+"""
+
+
+class RemoteFunctionError(RuntimeError):
+    """A remote function call failed inside the sandbox."""
+
+    def __init__(self, message: str, *, remote_type: str = "", traceback_text: str = "") -> None:
+        super().__init__(message)
+        self.remote_type = remote_type
+        self.traceback = traceback_text
+
+
+class RemoteFunction:
+    """A source-serialized Python function that can run inside a warm sandbox."""
+
+    def __init__(self, fn: Callable[..., Any], sandbox_kwargs: dict[str, Any]) -> None:
+        self._fn = fn
+        self._sandbox_kwargs = dict(sandbox_kwargs)
+        self._sandbox: Sandbox | None = None
+        self._python_checked = False
+        self._lock = threading.Lock()
+        self._runner_path = "/tmp/vmon-function-runner.py"
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._fn(*args, **kwargs)
+
+    def remote(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> Any:
+        """Run the function in a sandbox and return its deserialized result."""
+        sandbox = self._ensure_sandbox()
+        sandbox.filesystem.write_text(self._runner_path, _REMOTE_FUNCTION_RUNNER)
+        payload = _remote_function_payload(self._fn, args, kwargs)
+        proc = sandbox.exec(
+            "python3",
+            "-u",
+            self._runner_path,
+            timeout=timeout,
+            _track_entry=False,
+        )
+        proc.write_stdin(payload)
+        proc.close_stdin()
+        rc = proc.wait(timeout=timeout)
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read().decode("utf-8", "replace")
+        if rc != 0:
+            detail = stderr.strip() or f"remote function runner exited with {rc}"
+            raise RemoteFunctionError(detail)
+        return _remote_function_result(stdout)
+
+    def terminate(self) -> None:
+        """Terminate the cached sandbox backing this function, if it exists."""
+        with self._lock:
+            sandbox = self._sandbox
+            self._sandbox = None
+        if sandbox is not None:
+            sandbox.terminate()
+
+    def _ensure_sandbox(self) -> Sandbox:
+        with self._lock:
+            if self._sandbox is None or self._sandbox.poll() is not None:
+                kwargs = {"image": "python:3.14-slim", **self._sandbox_kwargs}
+                self._sandbox = Sandbox.create(**kwargs)
+                self._python_checked = False
+            sandbox = self._sandbox
+            if not self._python_checked:
+                self._check_python(sandbox)
+                self._python_checked = True
+            return sandbox
+
+    @staticmethod
+    def _check_python(sandbox: Sandbox) -> None:
+        proc = sandbox.exec("python3", "--version", timeout=10, _track_entry=False)
+        rc = proc.wait(timeout=10)
+        if rc != 0:
+            raise RemoteFunctionError(
+                "remote function images must provide python3; pass image='python:3.14-slim' "
+                "or another Python-capable image"
+            )
+
+
+def _remote_function_payload(
+    fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> bytes:
+    if fn.__closure__:
+        raise ValueError("remote functions cannot close over local variables")
+    try:
+        source = inspect.getsource(fn)
+    except OSError as exc:
+        raise ValueError("remote functions must be defined in source files") from exc
+    source = _strip_decorators(textwrap.dedent(source))
+    payload = {"source": source, "name": fn.__name__, "args": args, "kwargs": kwargs}
+    try:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    except TypeError as exc:
+        raise ValueError("remote function arguments must be JSON-serializable") from exc
+
+
+def _strip_decorators(source: str) -> str:
+    lines = source.splitlines()
+    while lines and lines[0].lstrip().startswith("@"):
+        lines.pop(0)
+    return "\n".join(lines) + "\n"
+
+
+def _remote_function_result(raw: bytes) -> Any:
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RemoteFunctionError("remote function returned an invalid response") from exc
+    if not isinstance(response, dict):
+        raise RemoteFunctionError("remote function returned a non-object response")
+    if response.get("ok") is True:
+        return response.get("result")
+    remote_type = str(response.get("type") or "RemoteError")
+    message = str(response.get("message") or "remote function failed")
+    traceback_text = str(response.get("traceback") or "")
+    raise RemoteFunctionError(message, remote_type=remote_type, traceback_text=traceback_text)
+
+
+def function(fn: Callable[..., Any] | None = None, **sandbox_kwargs: Any) -> Any:
+    """Decorate a source-available function with a ``.remote(...)`` sandbox call."""
+
+    def decorate(inner: Callable[..., Any]) -> RemoteFunction:
+        return RemoteFunction(inner, sandbox_kwargs)
+
+    if fn is not None:
+        return decorate(fn)
+    return decorate
 
 
 def default_command(spec: ImageSpec | None, override: list[str] | None = None) -> list[str]:

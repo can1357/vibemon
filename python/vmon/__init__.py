@@ -14,7 +14,7 @@ __version__ = "0.2.0"
 
 from .control import Control
 from .image import ImageSpec
-from .sandbox import Sandbox
+from .sandbox import RemoteFunction, RemoteFunctionError, Sandbox, function
 from .vmm import MicroVM, default_kernel, find_binary
 
 __all__ = [
@@ -22,6 +22,9 @@ __all__ = [
     "MicroVM",
     "Control",
     "ImageSpec",
+    "RemoteFunction",
+    "RemoteFunctionError",
+    "function",
     "find_binary",
     "default_kernel",
 ]
