@@ -35,9 +35,9 @@ Mac, or a nested-KVM Lima VM):
   * ``mkfs.ext4`` / ``mke2fs``   (e2fsprogs; ``brew install e2fsprogs`` on macOS)
 
 Note: feature sandboxes below boot with ``block_network=True`` (no NIC, no root).
-The dedicated networking + tunnel tests opt into a networked sandbox bound to a
-host TAP, which is Linux-only and needs root / ``CAP_NET_ADMIN`` -- they SKIP on
-macOS or without that capability.
+The dedicated networking test opts into user-mode NAT on macOS/HVF or a host TAP
+on Linux. The tunnel test remains TAP-only because macOS user-net has no inbound
+port forwarding.
 
 Usage:
   python3.14 python/e2e.py                 # run everything
@@ -182,12 +182,7 @@ def rm_snapshot(name: str) -> None:
 
 
 def net_admin() -> bool:
-    """True if the host can create TAP devices (Linux + root/CAP_NET_ADMIN).
-
-    Host-side TAP/iptables networking is Linux-only; macOS sandboxes would use
-    the VMM's user-mode NAT, which the Python SDK does not drive, so the
-    networking tests SKIP there.
-    """
+    """True if the host can create TAP devices (Linux + root/CAP_NET_ADMIN)."""
     if platform.system() != "Linux":
         return False
     try:
@@ -196,6 +191,11 @@ def net_admin() -> bool:
         return bool(net.has_net_admin())
     except Exception:
         return False
+
+
+def networking_supported() -> bool:
+    """True if networked sandboxes can run on this host."""
+    return platform.system() == "Darwin" or net_admin()
 
 
 def virtiofs_supported() -> bool:
@@ -521,8 +521,8 @@ def t_network_lease(_):
 @e2e
 def t_networking(_):
     """A networked sandbox fresh-boots with a guest IPv4 address and default route."""
-    if not net_admin():
-        raise Skip("needs root/CAP_NET_ADMIN for TAP networking")
+    if not networking_supported():
+        raise Skip("needs macOS/HVF user-net or Linux root/CAP_NET_ADMIN")
     sb = Sandbox.create(image=IMAGE, block_network=False)
     try:
         _, addr, _ = run(sb, "ip", "-4", "addr", "show", "eth0")
@@ -537,7 +537,7 @@ def t_networking(_):
 def t_ports_tunnels(_):
     """An exposed guest port is reachable end-to-end through the host tunnel."""
     if not net_admin():
-        raise Skip("needs root/CAP_NET_ADMIN for TAP networking")
+        raise Skip("needs Linux root/CAP_NET_ADMIN; macOS user-net has no inbound forwarding")
     sb = Sandbox.create(image=IMAGE, ports=[18080])
     listener = None
     try:
