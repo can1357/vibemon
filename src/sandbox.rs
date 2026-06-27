@@ -275,6 +275,7 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		libc::SYS_clone,
 		libc::SYS_clone3,
 		libc::SYS_close,
+		libc::SYS_connect,
 		libc::SYS_epoll_create1,
 		libc::SYS_epoll_ctl,
 		libc::SYS_epoll_pwait,
@@ -342,6 +343,9 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		// connections via setsockopt; without this the sandbox drops every
 		// control client before the banner.
 		libc::SYS_setsockopt,
+		// Lazy remote page-in opens outbound mesh HTTP connections from the pager
+		// thread after filters are installed.
+		libc::SYS_socket,
 		libc::SYS_sigaltstack,
 		libc::SYS_statx,
 		libc::SYS_tgkill,
