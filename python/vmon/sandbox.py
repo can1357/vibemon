@@ -257,6 +257,10 @@ class Sandbox:
         self._terminated = False
         self._secret_env: dict[str, str] = {}
         self._volumes: list[Volume] = []
+        # Migration eligibility: only a block-network sandbox with no host-local
+        # state (named volumes, fs_dir share) can move to another mesh node.
+        self._block_network: bool = False
+        self._fs_dir: str | None = None
         self.connect_token: str | None = None
         self._timeout_secs: int | None = None
         self._watchdog_stop: threading.Event | None = None
@@ -539,6 +543,7 @@ class Sandbox:
                     mem=memory,
                     cpus=cpus,
                     overlay=True,
+                    rng=True,
                     agent=True,
                     tap=tap,
                     user_net=user_net_sandbox,
@@ -552,6 +557,8 @@ class Sandbox:
             sb._network = net_handle
             sb._secret_env = merge_secrets(secrets)
             sb._volumes = list(acquired)
+            sb._block_network = bool(block_network)
+            sb._fs_dir = str(fs_dir) if fs_dir is not None else None
             sb._timeout_secs = eff_timeout_secs
             if sb._timeout_secs is not None:
                 sb._start_timeout_watchdog(sb._timeout_secs)
@@ -679,6 +686,7 @@ class Sandbox:
                     base_disk,
                     name=sandbox_name,
                     overlay=True,
+                    rng=True,
                     agent=True,
                     tap=str(net_handle.guest_config["tap"]),
                     snapshot_root=STATE / "snapshots",

@@ -146,7 +146,9 @@ def _image_digest(engine: str, reference: str) -> str:
 # v3: virtio-fs-capable aarch64 kernel. v4: template identity records resource
 # shape and reserved virtio-fs host slots. v5: networked templates can bake a
 # user-mode NAT NIC for warm macOS sandboxes.
-_TEMPLATE_BOOT_VERSION = 5
+# Bumped to 6: agent templates now boot with a virtio-rng device, so snapshots
+# taken by older vmon builds must be rebuilt to gain it.
+_TEMPLATE_BOOT_VERSION = 6
 
 
 def _template_marker_current(
@@ -368,6 +370,7 @@ def cached_template(
             fs_dir=host_fs_dir,
             tap=build_tap,
             user_net=nic_slot,
+            rng=True,
             snapshot_root=_state() / "templates",
             image=spec.reference,
         )

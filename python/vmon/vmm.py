@@ -492,6 +492,7 @@ class MicroVM:
         overlay: bool = False,
         tap: str | None = None,
         user_net: bool = False,
+        rng: bool = False,
         fs_dir: str | os.PathLike[str] | None = None,
         volumes: list[tuple[str, str | os.PathLike[str], bool]] | None = None,
         timeout_secs: int | None = None,
@@ -503,7 +504,8 @@ class MicroVM:
         to a pre-created host TAP; ``user_net`` attaches the VMM's user-mode NAT
         device. The restore path cannot synthesize a NIC the snapshot lacks, so
         networked sandboxes fresh-boot through here. ``fs_dir``/``volumes`` add
-        virtio-fs shares and ``timeout_secs`` arms the VMM wall-clock deadline.
+        virtio-fs shares, ``rng`` attaches a virtio-rng entropy device (`/dev/hwrng`),
+        and ``timeout_secs`` arms the VMM wall-clock deadline.
         """
         mem = _validate_int_range(mem, "mem", maximum=_MAX_MEM_MIB, unit=" MiB")
         cpus = _validate_int_range(cpus, "cpus", maximum=_MAX_CPUS)
@@ -541,6 +543,8 @@ class MicroVM:
             args.extend(["--net", "user"])
         elif tap is not None:
             args.extend(["--tap", str(tap)])
+        if rng:
+            args.append("--rng")
         if fs_dir is not None:
             args.extend(["--fs-tag", "host", "--fs-dir", str(fs_dir)])
         vols = list(volumes or [])
