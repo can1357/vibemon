@@ -27,6 +27,14 @@ fn fork_from_count_two_starts_two_clones() {
 	if !common::require_hv() {
 		return;
 	}
+	// The supervisor only exits once every forked clone self-terminates, but the
+	// x86_64 test guest cannot power off under vmm (no ACPI shutdown — its kernel
+	// halts instead of exiting), so the supervisor would never return. Fork
+	// reaping is exercised on aarch64 (PSCI poweroff) and by the Python e2e
+	// `t_fork`, which covers fork on x86_64 too.
+	if cfg!(target_arch = "x86_64") {
+		return;
+	}
 
 	let snap = create_snapshot("fork");
 	let args = vec![
