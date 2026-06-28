@@ -545,6 +545,16 @@ class GatewayClient:
         if method == "restore":
             payload = {**params, "detach": True}
             return self._json("POST", "/v1/restore", payload)
+        if method == "inspect":
+            return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}")
+        if method == "metrics":
+            return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}/metrics")
+        if method == "extend":
+            return self._json(
+                "POST",
+                f"/v1/sandboxes/{self._q(params['name'])}/extend",
+                {"secs": int(params["secs"])},
+            )
         raise DaemonError(f"gateway does not support {method}", code="unsupported")
 
     def stream(

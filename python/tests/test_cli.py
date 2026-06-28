@@ -291,3 +291,28 @@ def test_daemon_status_reports_socket(rec, capsys):
     assert cli.main(["daemon", "status"]) == 0
     out = capsys.readouterr().out
     assert "running" in out and "vmond.sock" in out
+
+
+# -- inspect / stats / extend ----------------------------------------------
+
+
+def test_inspect_routes_to_inspect(rec):
+    assert cli.main(["inspect", "vm1"]) == 0
+    assert rec.last["method"] == "inspect"
+    assert rec.last["params"]["name"] == "vm1"
+
+
+def test_stats_routes_to_metrics(rec):
+    assert cli.main(["stats", "vm1"]) == 0
+    assert rec.last["method"] == "metrics"
+    assert rec.last["params"]["name"] == "vm1"
+
+
+def test_extend_routes_with_int_secs(rec):
+    assert cli.main(["extend", "vm1", "120"]) == 0
+    assert rec.last["method"] == "extend"
+    assert rec.last["params"] == {"name": "vm1", "secs": 120}
+
+
+def test_extend_rejects_non_int_secs(rec, capsys):
+    assert cli.main(["extend", "vm1", "abc"]) == 2

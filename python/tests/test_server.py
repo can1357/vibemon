@@ -42,6 +42,9 @@ class FakeSandbox:
     def extend(self, secs):
         return {"deadline_unix": 1}
 
+    def metrics(self):
+        return {"vcpu_exits": 7}
+
     def terminate(self):
         self.terminated = True
 
@@ -113,6 +116,13 @@ def test_snapshot_extend_network_and_tunnels_endpoints(client):
     tunnels = client.get("/v1/sandboxes/sb1/tunnels")
     assert tunnels.status_code == 200
     assert tunnels.json() == {"tunnels": {"8080": ["127.0.0.1", 12345]}, "connect_token": "tok"}
+
+
+def test_metrics_endpoint_returns_runtime_counters(client):
+    client.post("/v1/sandboxes", json={"template": "tpl", "name": "sb1"})
+    response = client.get("/v1/sandboxes/sb1/metrics")
+    assert response.status_code == 200
+    assert response.json() == {"vcpu_exits": 7}
 
 
 def test_bearer_auth_required_when_token_is_configured(monkeypatch):

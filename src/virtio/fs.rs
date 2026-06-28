@@ -1189,7 +1189,7 @@ impl FsState {
 				let stored = if md.file_type().is_symlink() {
 					child.clone()
 				} else {
-					fs::canonicalize(&child).unwrap_or(child.clone())
+					fs::canonicalize(&child).unwrap_or_else(|_| child.clone())
 				};
 				let id = self.intern(stored);
 				listing.push((name, id, dtype_from_mode(md.mode()), FuseEntryOut {

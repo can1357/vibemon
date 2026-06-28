@@ -974,6 +974,10 @@ class Sandbox:
         self._start_timeout_watchdog(int(secs))
         return result if isinstance(result, dict) else {}
 
+    def metrics(self) -> dict[str, Any]:
+        """Live additive runtime counters from the VMM control API."""
+        return dict(self.vm.control.metrics() or {})
+
     def set_network_policy(
         self,
         block_network: bool | None = None,

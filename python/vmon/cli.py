@@ -371,6 +371,20 @@ def logs(name, follow):
     return 0
 
 
+@cli.command(panel="Commands", context_settings=_CTX, help="Show a microVM's full detail.")
+@click.argument("name")
+def inspect(name):
+    ui.inspect_view(_client().call("inspect", name=name))
+    return 0
+
+
+@cli.command(panel="Commands", context_settings=_CTX, help="Show a microVM's live runtime metrics.")
+@click.argument("name")
+def stats(name):
+    ui.stats_table(name, _client().call("metrics", name=name))
+    return 0
+
+
 # -- lifecycle -------------------------------------------------------------
 
 
@@ -387,6 +401,19 @@ def pause(name):
 def resume(name):
     _client().call("resume", name=name)
     ui.success(f"resumed [vmon.command]{name}[/]")
+    return 0
+
+
+@cli.command(
+    panel="Lifecycle",
+    context_settings=_CTX,
+    help="Reset a running microVM's wall-clock deadline (SECS from now).",
+)
+@click.argument("name")
+@click.argument("secs", type=int)
+def extend(name, secs):
+    _client().call("extend", name=name, secs=secs)
+    ui.success(f"extended [vmon.command]{name}[/] deadline to {secs}s from now")
     return 0
 
 

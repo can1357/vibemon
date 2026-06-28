@@ -444,10 +444,11 @@ class Supervisor:
         return await self._run(self._engine.snapshot_filesystem, record.name, name)
 
     async def extend(self, record: VMRecord, secs: int) -> dict[str, Any]:
-        result = await self._run(self._engine.extend, record.name, secs)
-        record.timeout = float(secs)
-        record.touch()
-        return result
+        # ``Engine.extend`` realigns ``record.timeout``/``last_active`` in place.
+        return await self._run(self._engine.extend, record.name, secs)
+
+    async def metrics(self, record: VMRecord) -> dict[str, Any]:
+        return await self._run(self._engine.metrics, record.name)
 
     async def set_network_policy(self, record: VMRecord, request: NetworkRequest) -> dict[str, Any]:
         result = await self._run(
@@ -1072,7 +1073,7 @@ def _remote_page_url(peer_url: str, digest: str) -> str:
     if parsed.scheme == "http" and parsed.hostname:
         port = parsed.port or 80
         try:
-            addr = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)[0][4][0]
+            addr = str(socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)[0][4][0])
         except OSError:
             pass
         else:
@@ -2073,6 +2074,11 @@ def create_app(
         _validate_extend_request(body)
         record = supervisor.get(sandbox_id, require_running=True)
         return await supervisor.extend(record, body.secs)
+
+    @app.get("/v1/sandboxes/{sandbox_id}/metrics", dependencies=[Depends(require_auth)])
+    async def metrics_sandbox(sandbox_id: str) -> dict[str, Any]:
+        record = supervisor.get(sandbox_id, require_running=True)
+        return await supervisor.metrics(record)
 
     @app.post("/v1/sandboxes/{sandbox_id}/exec", dependencies=[Depends(require_auth)])
     async def exec_sandbox(sandbox_id: str, body: ExecRequest) -> StreamingResponse:

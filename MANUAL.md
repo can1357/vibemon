@@ -144,7 +144,10 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `cp` | copy files host↔guest | `vmon cp web:/etc/os-release ./` |
 | `ps` | list microVMs | `vmon ps` |
 | `logs` | show a VM's console (`-f` to follow) | `vmon logs web -f` |
+| `inspect` | print a VM's full detail view as JSON | `vmon inspect web` |
+| `stats` | show a VM's live runtime metrics | `vmon stats web` |
 | `pause` / `resume` | suspend / resume | `vmon pause web` |
+| `extend` | reset a running VM's deadline (seconds from now) | `vmon extend web 600` |
 | `snapshot` | snapshot a VM into a template | `vmon snapshot web tpl --stop` |
 | `restore` | warm-boot from a snapshot | `vmon restore tpl --name web2` |
 | `fork` | CoW-clone N copies from a snapshot | `vmon fork tpl --count 5` |

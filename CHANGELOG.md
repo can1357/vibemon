@@ -13,10 +13,14 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `vmon inspect <name>` to print detailed VM configuration as JSON
+- Added `vmon stats <name>` to display live runtime VMM metrics
+- Added `vmon extend <name> <secs>` to update a VM's runtime deadline
+
+- Added `vmon inspect <name>`, `vmon stats <name>`, and `vmon extend <name> <secs>` CLI commands. `inspect` prints a VM's full detail view as highlighted JSON, `stats` renders the VMM's live runtime counters, and `extend` resets a running VM's wall-clock deadline (persisted so a rehydrated daemon reports the extended window). All three route through both the `vmond` daemon and the HTTP gateway; `stats` is backed by a new `GET /v1/sandboxes/{id}/metrics` route.
 - Added `@function` decorator to execute local Python functions in a remote sandbox
 - Added `RemoteFunction` class to manage serialized function execution and sandbox lifecycle
 - Added `RemoteFunctionError` for handling failures occurring inside remote execution environments
-
 - Added support for warm-restoring sandboxes with multiple virtio-fs volumes
 - Included hypervisor backend and architecture in node state for mesh placement compatibility
 - Added outbound internet access for microVMs by default on macOS/HVF
@@ -35,6 +39,7 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed the remote page-source URL builder (`_remote_page_url`) to coerce the resolved host to `str`, fixing a type error and guarding the IPv6-bracketing check against non-string `getaddrinfo` results.
 - Fixed template resolution to account for virtio-fs slot variations
 - Prevented potential deadlocks in stdin forwarding when handling non-TTY streams
 - Fixed mesh placement to strictly enforce hypervisor and architecture compatibility

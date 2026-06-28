@@ -982,12 +982,45 @@ class Engine:
         snap = fn(snapshot)
         return str(snap if snap is not None else snapshot)
 
+    def inspect(self, name: str) -> dict[str, Any]:
+        """Return the rich detail view for one VM, refreshing live status first."""
+        record = self.get(name)
+        self._refresh_record_status(record)
+        return record.view()
+
+    def metrics(self, name: str) -> dict[str, Any]:
+        """Return the VMM's live additive runtime counters for a running VM."""
+        self.get(name, require_running=True)
+        sandbox = self._sandbox_for(name)
+        fn = getattr(sandbox, "metrics", None)
+        if fn is None:
+            raise Unsupported("sandbox metrics API unavailable")
+        return dict(fn() or {})
+
     def extend(self, name: str, secs: int) -> dict[str, Any]:
+        """Reset a running VM's wall-clock deadline to ``secs`` from now.
+
+        Realigns the registry record so ``expires_at`` (and thus ``inspect``/
+        ``ps``) reflects the new deadline for both the daemon and HTTP transports.
+        """
+        self.get(name, require_running=True)
         sandbox = self._sandbox_for(name)
         fn = getattr(sandbox, "extend", None)
         if fn is None:
             raise Unsupported("sandbox extend API unavailable")
-        return dict(fn(secs) or {})
+        result = dict(fn(secs) or {})
+        with self._lock:
+            record = self._records.get(name)
+            if record is not None:
+                record.timeout = float(secs)
+                record.touch()
+        # Persist so a rehydrated record (post daemon restart) reports the
+        # extended deadline rather than the original creation timeout.
+        try:
+            MicroVM(name)._save_meta(timeout_secs=int(secs))
+        except Exception:
+            pass
+        return result
 
     def set_network_policy(
         self,

@@ -101,6 +101,13 @@ class FakeSandbox:
         type(self).last_proc = proc
         return proc
 
+    def metrics(self):
+        return {"vcpu_exits": 42, "mmio_reads": 7}
+
+    def extend(self, secs):
+        self.last_extend = int(secs)
+        return {"deadline_secs": int(secs)}
+
     def terminate(self, *a, **k):
         self.terminated = True
         if self._child is not None:
@@ -480,3 +487,59 @@ def test_rehydrate_lists_disk_vms_and_reacquires_volume_locks(monkeypatch):
         child.terminate()
         with suppress(Exception):
             child.wait(timeout=2)
+
+
+def test_inspect_returns_full_detail_view(client):
+    client.call("run", image="alpine", detach=True, name="vm-ins")
+    try:
+        view = client.call("inspect", name="vm-ins")
+        assert view["id"] == "vm-ins"
+        assert view["name"] == "vm-ins"
+        assert view["status"] == "running"
+        assert view["image"] == "alpine"
+        assert "created_at" in view and "expires_at" in view
+    finally:
+        client.call("rm", name="vm-ins")
+
+
+def test_inspect_unknown_vm_raises_not_found(client):
+    with pytest.raises(DaemonError) as excinfo:
+        client.call("inspect", name="ghost")
+    assert excinfo.value.code == "not_found"
+
+
+def test_metrics_returns_runtime_counters(client):
+    client.call("run", image="alpine", detach=True, name="vm-met")
+    try:
+        assert client.call("metrics", name="vm-met") == {"vcpu_exits": 42, "mmio_reads": 7}
+    finally:
+        client.call("rm", name="vm-met")
+
+
+def test_metrics_unknown_vm_raises_not_found(client):
+    with pytest.raises(DaemonError) as excinfo:
+        client.call("metrics", name="ghost")
+    assert excinfo.value.code == "not_found"
+
+
+def test_extend_resets_deadline_and_persists(client):
+    client.call("run", image="alpine", detach=True, name="vm-ext")
+    try:
+        assert client.call("inspect", name="vm-ext")["expires_at"] is None
+        assert client.call("extend", name="vm-ext", secs=120) == {"deadline_secs": 120}
+        view = client.call("inspect", name="vm-ext")
+        assert view["expires_at"] is not None and view["expires_at"] > time.time() + 110
+        # Persisted so a rehydrated daemon reports the extended window, not the original.
+        assert MicroVM("vm-ext").meta.get("timeout_secs") == 120
+    finally:
+        client.call("rm", name="vm-ext")
+
+
+def test_extend_rejects_nonpositive_secs(client):
+    client.call("run", image="alpine", detach=True, name="vm-bad")
+    try:
+        with pytest.raises(DaemonError) as excinfo:
+            client.call("extend", name="vm-bad", secs=0)
+        assert excinfo.value.code == "invalid"
+    finally:
+        client.call("rm", name="vm-bad")

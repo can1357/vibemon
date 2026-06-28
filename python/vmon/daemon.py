@@ -153,6 +153,9 @@ class Daemon:
             "fork": self._h_fork,
             "stop": self._h_stop,
             "rm": self._h_rm,
+            "inspect": self._h_inspect,
+            "metrics": self._h_metrics,
+            "extend": self._h_extend,
         }
 
     # -- lifecycle ----------------------------------------------------------
@@ -323,6 +326,18 @@ class Daemon:
 
     def _h_rm(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         conn.send({"id": rid, "ok": True, "result": self._engine.remove(self._name(params))})
+
+    def _h_inspect(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
+        conn.send({"id": rid, "ok": True, "result": self._engine.inspect(self._name(params))})
+
+    def _h_metrics(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
+        conn.send({"id": rid, "ok": True, "result": self._engine.metrics(self._name(params))})
+
+    def _h_extend(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
+        secs = params.get("secs")
+        if not isinstance(secs, int) or isinstance(secs, bool) or secs <= 0:
+            raise EngineError("secs must be a positive integer", code="invalid")
+        conn.send({"id": rid, "ok": True, "result": self._engine.extend(self._name(params), secs)})
 
     def _h_cp_read(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
         data = self._engine.cp_read(self._name(params), str(params["path"]))

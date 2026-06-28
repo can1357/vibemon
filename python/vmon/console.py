@@ -140,6 +140,35 @@ def mesh_table(status: Mapping[str, Any]) -> None:
     console.print(table)
 
 
+def _format_metric(value: Any) -> str:
+    """Right-aligned number formatting for runtime counters; pass-through otherwise."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:,.3f}"
+    return str(value)
+
+
+def stats_table(name: str, metrics: Mapping[str, Any]) -> None:
+    """Render a VM's live VMM runtime counters as a borderless table."""
+    if not metrics:
+        info(f"no metrics reported for [vmon.command]{name}[/]")
+        return
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("METRIC", style="vmon.command", no_wrap=True)
+    table.add_column("VALUE", justify="right", no_wrap=True)
+    for key in sorted(metrics):
+        table.add_row(str(key), _format_metric(metrics[key]))
+    console.print(table)
+
+
+def inspect_view(detail: Mapping[str, Any]) -> None:
+    """Pretty-print a sandbox's full detail view as highlighted, sorted JSON."""
+    console.print_json(data=dict(detail), sort_keys=True, default=str)
+
+
 def _status_text(status: str) -> Text:
     palette = {
         "running": "vmon.success",
