@@ -367,6 +367,10 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		// mkdirat. Without this the snapshot path's create_dir_all is rejected
 		// with EPERM under the sandbox.
 		syscalls.insert(libc::SYS_mkdir);
+		// Likewise x86_64 glibc can still route `std::fs::canonicalize` and
+		// `read_link` through the legacy readlink syscall; virtio-fs path
+		// confinement hits that on its hot path under the sandbox.
+		syscalls.insert(libc::SYS_readlink);
 		// Likewise x86_64 routes rename/unlink/rmdir through the legacy syscalls
 		// (aarch64 has only renameat2/unlinkat). The snapshot writer renames temp
 		// files into place ("publishing") and prunes superseded generations.
