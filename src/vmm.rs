@@ -1374,6 +1374,10 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 				BackendHint::Fs { .. } => None,
 			})
 		});
+	let snap_has_net = snap
+		.devices
+		.iter()
+		.any(|d| matches!(d.backend, BackendHint::Net { .. } | BackendHint::UserNet { .. }));
 	let fork_user_net = config.user_net
 		|| (config.tap.is_none()
 			&& snap
@@ -1390,13 +1394,18 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 
 		let mut cmd = Command::new(&exe);
 		cmd.arg("--fork-from").arg(dir).arg("--count").arg("1");
-		if fork_user_net {
-			cmd.arg("--net").arg("user");
-		} else {
-			cmd.arg("--tap").arg(format!("tap{i}"));
+		// Only attach networking to a clone when the snapshot actually has a net
+		// device (or the operator forced user-net); a no-net snapshot's clone must
+		// not be handed a TAP it never had — a non-root host cannot create one.
+		if snap_has_net || config.user_net {
+			if fork_user_net {
+				cmd.arg("--net").arg("user");
+			} else {
+				cmd.arg("--tap").arg(format!("tap{i}"));
+			}
+			cmd.arg("--mac")
+				.arg(format!("02:00:00:00:00:{:02x}", i + 1));
 		}
-		cmd.arg("--mac")
-			.arg(format!("02:00:00:00:00:{:02x}", i + 1));
 		cmd.arg("--transport").arg(config.transport.as_str());
 		if let Some(base) = &base_disk {
 			cmd.arg("--disk-overlay-of")
@@ -1472,7 +1481,7 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 					.arg(format!("{}.{i}", sock.display()));
 			}
 		}
-		info!("fork child {i}: tap=tap{i} mac=02:00:00:00:00:{:02x}", i + 1);
+		info!("fork child {i}");
 		let child = match cmd.spawn() {
 			Ok(child) => child,
 			Err(e) => {
