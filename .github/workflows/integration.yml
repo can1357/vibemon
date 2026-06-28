@@ -20,6 +20,9 @@ jobs:
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
+      # Pin the guest kernel to the fetched test asset; otherwise default_kernel()
+      # falls back to the runner's own /boot/vmlinuz-*, which is root-only (0600).
+      VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,8 +34,11 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -e /dev/kvm || { echo "::error::/dev/kvm missing on this runner"; exit 1; }
+          sudo udevadm trigger --name-match=kvm || true
+          # The udev rule covers nodes created later; chmod the already-present
+          # device so a non-root vmm can open it this run.
+          sudo chmod 0666 /dev/kvm || true
+          test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not accessible"; exit 1; }
           ls -l /dev/kvm
 
       - name: Install system dependencies
