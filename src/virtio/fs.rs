@@ -86,6 +86,7 @@ const FUSE_GETATTR: u32 = 3;
 const FUSE_SETATTR: u32 = 4;
 const FUSE_READLINK: u32 = 5;
 const FUSE_SYMLINK: u32 = 6;
+const FUSE_MKNOD: u32 = 8;
 const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RMDIR: u32 = 11;
@@ -108,6 +109,7 @@ const FUSE_CREATE: u32 = 35;
 const FUSE_INTERRUPT: u32 = 36;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_FALLOCATE: u32 = 43;
+const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_RENAME2: u32 = 45;
 
 const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
@@ -386,6 +388,19 @@ struct FuseMkdirIn {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct FuseMknodIn {
+	mode:    u32,
+	rdev:    u32,
+	umask:   u32,
+	padding: u32,
+}
+
+#[allow(
+	dead_code,
+	reason = "POD wire struct: fields are serialized as raw bytes, not all read by name."
+)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct FuseRenameIn {
 	newdir: u64,
 }
@@ -431,6 +446,7 @@ const _: () = assert!(std::mem::size_of::<FuseWriteIn>() == 40);
 const _: () = assert!(std::mem::size_of::<FuseWriteOut>() == 8);
 const _: () = assert!(std::mem::size_of::<FuseSetattrIn>() == 88);
 const _: () = assert!(std::mem::size_of::<FuseMkdirIn>() == 8);
+const _: () = assert!(std::mem::size_of::<FuseMknodIn>() == 16);
 const _: () = assert!(std::mem::size_of::<FuseRenameIn>() == 8);
 const _: () = assert!(std::mem::size_of::<FuseRename2In>() == 16);
 const _: () = assert!(std::mem::size_of::<FuseLinkIn>() == 8);
@@ -1123,6 +1139,97 @@ impl FsState {
 		Ok(Self { root, inodes, by_path, next, handles: HashMap::new(), next_fh: 1 })
 	}
 
+	fn build_readdirplus(&mut self, dir: &Path, offset: u64, max: usize) -> Vec<u8> {
+		let dir_id = self
+			.by_path
+			.get(dir)
+			.copied()
+			.unwrap_or_else(|| self.intern(dir.to_path_buf()));
+		let parent_path = if dir == self.root {
+			self.root.clone()
+		} else {
+			dir.parent().unwrap_or(&self.root).to_path_buf()
+		};
+		let parent_id = self
+			.by_path
+			.get(&parent_path)
+			.copied()
+			.unwrap_or_else(|| self.intern(parent_path.clone()));
+		let mut entries: Vec<(Vec<u8>, u64, u32, FuseEntryOut)> = Vec::new();
+		if let Ok(md) = fs::symlink_metadata(dir) {
+			entries.push((b".".to_vec(), dir_id, libc::DT_DIR as u32, FuseEntryOut {
+				nodeid:           dir_id,
+				generation:       0,
+				entry_valid:      TIMEOUT_SEC,
+				attr_valid:       TIMEOUT_SEC,
+				entry_valid_nsec: 0,
+				attr_valid_nsec:  0,
+				attr:             attr_from(dir_id, &md),
+			}));
+		}
+		if let Ok(md) = fs::symlink_metadata(&parent_path) {
+			entries.push((b"..".to_vec(), parent_id, libc::DT_DIR as u32, FuseEntryOut {
+				nodeid:           parent_id,
+				generation:       0,
+				entry_valid:      TIMEOUT_SEC,
+				attr_valid:       TIMEOUT_SEC,
+				entry_valid_nsec: 0,
+				attr_valid_nsec:  0,
+				attr:             attr_from(parent_id, &md),
+			}));
+		}
+		if let Ok(rd) = fs::read_dir(dir) {
+			let mut listing: Vec<(Vec<u8>, u64, u32, FuseEntryOut)> = Vec::new();
+			for ent in rd.flatten() {
+				let name = ent.file_name().as_os_str().as_bytes().to_vec();
+				let child = ent.path();
+				let Ok(md) = fs::symlink_metadata(&child) else {
+					continue;
+				};
+				let stored = if md.file_type().is_symlink() {
+					child.clone()
+				} else {
+					fs::canonicalize(&child).unwrap_or(child.clone())
+				};
+				let id = self.intern(stored);
+				listing.push((name, id, dtype_from_mode(md.mode()), FuseEntryOut {
+					nodeid:           id,
+					generation:       0,
+					entry_valid:      TIMEOUT_SEC,
+					attr_valid:       TIMEOUT_SEC,
+					entry_valid_nsec: 0,
+					attr_valid_nsec:  0,
+					attr:             attr_from(id, &md),
+				}));
+			}
+			listing.sort_by(|a, b| a.0.cmp(&b.0));
+			entries.extend(listing);
+		}
+
+		let mut out = Vec::new();
+		let plus_header = std::mem::size_of::<FuseEntryOut>() + DIRENT_HEADER;
+		for (idx, (name, ino, dtype, entry)) in entries.iter().enumerate() {
+			if (idx as u64) < offset {
+				continue;
+			}
+			let reclen = align8(plus_header + name.len());
+			if out.len() + reclen > max {
+				break;
+			}
+			let dirent = FuseDirent {
+				ino:     *ino,
+				off:     idx as u64 + 1,
+				namelen: name.len() as u32,
+				type_:   *dtype,
+			};
+			out.extend_from_slice(struct_bytes(entry));
+			out.extend_from_slice(struct_bytes(&dirent));
+			out.extend_from_slice(name);
+			out.resize(out.len() + (reclen - plus_header - name.len()), 0);
+		}
+		out
+	}
+
 	/// Service one FUSE request and return the number of reply bytes written
 	/// (0 for the no-reply opcodes).
 	fn dispatch(
@@ -1276,11 +1383,15 @@ impl FsState {
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
-			FUSE_READDIR => match read_struct::<FuseReadIn>(req, IN_HEADER_SIZE) {
+			FUSE_READDIR | FUSE_READDIRPLUS => match read_struct::<FuseReadIn>(req, IN_HEADER_SIZE) {
 				Some(rin) => match self.confined_existing_path(nodeid) {
 					Ok(path) => {
 						let max = (rin.size as usize).min(body_cap);
-						let body = build_readdir(&path, rin.offset, max);
+						let body = if h.opcode == FUSE_READDIRPLUS {
+							self.build_readdirplus(&path, rin.offset, max)
+						} else {
+							build_readdir(&path, rin.offset, max)
+						};
 						write_reply(mem, writable, unique, 0, &body)
 					},
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
@@ -1456,6 +1567,40 @@ impl FsState {
 						};
 						write_reply(mem, writable, unique, 0, struct_bytes(&out))
 					},
+					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
+				}
+			},
+			FUSE_MKNOD => {
+				if read_only {
+					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+				}
+				let Some(min) = read_struct::<FuseMknodIn>(req, IN_HEADER_SIZE) else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMknodIn>())
+				else {
+					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+				};
+				let Some(child) = self
+					.inodes
+					.get(&nodeid)
+					.cloned()
+					.and_then(|parent| self.resolve_new_child(&parent, name))
+				else {
+					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+				};
+				let kind = min.mode & libc::S_IFMT as u32;
+				if kind != 0 && kind != libc::S_IFREG as u32 {
+					return write_reply(mem, writable, unique, -libc::EOPNOTSUPP, &[]);
+				}
+				let mut create = fs::OpenOptions::new();
+				create
+					.read(true)
+					.write(true)
+					.create_new(true)
+					.mode(min.mode & !min.umask & 0o7777);
+				match create.open(&child) {
+					Ok(_) => self.reply_entry(mem, writable, unique, child),
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				}
 			},
@@ -2013,6 +2158,39 @@ mod tests {
 		assert_eq!(wout.size, 5, "all 5 bytes accounted for");
 		assert_eq!(fs::read(root.join("f")).unwrap(), b"hello");
 
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn writable_mknod_regular_file_persists_to_host() {
+		let root = temp_dir("vmon-fs-mknod");
+		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
+
+		let min =
+			FuseMknodIn { mode: libc::S_IFREG as u32 | 0o644, rdev: 0, umask: 0, padding: 0 };
+		let mut payload = struct_bytes(&min).to_vec();
+		payload.extend_from_slice(b"g\0");
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_MKNOD, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, 0, "mknod regular file succeeds on a writable share");
+		let entry: FuseEntryOut = read_struct(&body, 0).unwrap();
+		assert_eq!(entry.nodeid, 2, "mknod interns the new file");
+		assert!(root.join("g").is_file(), "mknod materialized a regular file on host");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn readdirplus_lists_entries_without_following_symlinks() {
+		let root = temp_dir("vmon-fs-readdirplus");
+		fs::write(root.join("f"), b"data").unwrap();
+		std::os::unix::fs::symlink("f", root.join("l")).unwrap();
+		let mut fs = Fs::new("host".to_string(), root.clone(), true).unwrap();
+
+		let rin = FuseReadIn { size: 4096, ..Default::default() };
+		let payload = struct_bytes(&rin).to_vec();
+		let (err, body) = run_op(&mut fs, &fuse_request(FUSE_READDIRPLUS, FUSE_ROOT_ID, &payload));
+		assert_eq!(err, 0, "readdirplus succeeds");
+		assert!(body.windows(1).any(|w| w == b"f"), "readdirplus body includes file entry");
+		assert!(body.windows(1).any(|w| w == b"l"), "readdirplus body includes symlink entry");
 		fs::remove_dir_all(root).unwrap();
 	}
 
