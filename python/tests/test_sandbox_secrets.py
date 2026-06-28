@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -555,3 +556,117 @@ def test_macos_networked_pool_claim_replays_net_config(monkeypatch, mvm_home):
         with sandbox_mod._POOLS_LOCK:
             sandbox_mod._POOLS.pop(key, None)
             sandbox_mod._POOL_REFS.pop(key, None)
+
+
+def _install_prewarm_fakes(monkeypatch, mvm_home: Path):
+    """Fakes exercising the real ``prewarm`` -> ``create`` pool-claim key path.
+
+    Only ``cached_template`` is faked, and its snapshot dir is keyed by the
+    network-slot flavor exactly as the real builder is (block-network, macOS
+    user-NAT, and Linux TAP templates are distinct dirs). Both ``prewarm`` and
+    ``Sandbox._resolve_template`` route through it, so the key one registers and
+    the key the other looks up are compared for real rather than pinned to a
+    constant. ``WarmPool`` returns a claimable stub recording one clone per key.
+    """
+    import vmon.sandbox as sandbox_mod
+
+    FakeMicroVM.restored = []
+    FakeMicroVM.booted = []
+    monkeypatch.setattr(sandbox_mod, "MicroVM", FakeMicroVM)
+
+    def fake_cached_template(
+        image, *, nic_slot=False, tap_slot=False, host_slot=False, fs_slots=0, **_kw
+    ):
+        if nic_slot:
+            flavor = "nic"
+        elif tap_slot:
+            flavor = "tap"
+        elif host_slot:
+            flavor = "host"
+        elif fs_slots:
+            flavor = f"fs{fs_slots}"
+        else:
+            flavor = "plain"
+        safe = str(image).replace("/", "_").replace(":", "_")
+        snapshot_dir = mvm_home / "templates" / f"{safe}-{flavor}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        (snapshot_dir / "rootfs.img").touch()
+        return SimpleNamespace(
+            snapshot_dir=snapshot_dir,
+            spec=SimpleNamespace(reference=image, workdir=None, env_dict=lambda: {}),
+        )
+
+    monkeypatch.setattr(sandbox_mod, "cached_template", fake_cached_template)
+
+    clones: dict[str, FakeMicroVM] = {}
+
+    def fake_warmpool(template_dir, count):
+        key = str(template_dir)
+        clone = FakeMicroVM(f"pool-{Path(key).name}", sandbox_mod.STATE)
+        pool = _FakePool(clone)
+        pool.size = int(count)
+        clones[key] = clone
+        return pool
+
+    monkeypatch.setattr(sandbox_mod, "WarmPool", fake_warmpool)
+    return sandbox_mod, clones
+
+
+def test_prewarm_block_network_pool_claimed_on_linux(monkeypatch, mvm_home):
+    sandbox_mod, clones = _install_prewarm_fakes(monkeypatch, mvm_home)
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Linux")
+    try:
+        sandbox_mod.prewarm("img", count=1)
+        # Linux prewarms the block-network flavor; a block_network=True create
+        # resolves the same key and claims the pooled clone (no restore/boot).
+        sb = sandbox_mod.Sandbox.create(image="img", block_network=True)
+        assert FakeMicroVM.restored == []
+        assert FakeMicroVM.booted == []
+        assert sb.vm is clones[str(mvm_home / "templates" / "img-plain")]
+        sb.terminate()
+    finally:
+        sandbox_mod.shutdown_all_pools()
+
+
+def test_prewarm_pool_not_claimed_by_networked_linux_create(monkeypatch, mvm_home):
+    sandbox_mod, _clones = _install_prewarm_fakes(monkeypatch, mvm_home)
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Linux")
+    fake_net = SimpleNamespace(
+        guest_config={
+            "tap": "vmon0",
+            "guest_ip": "10.42.0.2",
+            "host_ip": "10.42.0.1",
+            "prefix": 30,
+            "dns": ["1.1.1.1"],
+        },
+        teardown=lambda: None,
+    )
+    monkeypatch.setattr(sandbox_mod, "_setup_sandbox_network", lambda name, **kw: fake_net)
+    try:
+        pool = sandbox_mod.prewarm("img", count=1)
+        # A networked (default) Linux sandbox needs a per-sandbox TAP the pool
+        # cannot bake in, so the create warm-restores onto a fresh TAP instead of
+        # claiming the prewarmed block-network clone.
+        sb = sandbox_mod.Sandbox.create(image="img", block_network=False)
+        assert pool.hits == 0
+        assert FakeMicroVM.restored, "networked Linux create should warm-restore"
+        assert FakeMicroVM.restored[-1][2].get("tap") == "vmon0"
+        sb.terminate()
+    finally:
+        sandbox_mod.shutdown_all_pools()
+
+
+def test_prewarm_pool_claimed_by_default_create_on_macos(monkeypatch, mvm_home):
+    sandbox_mod, clones = _install_prewarm_fakes(monkeypatch, mvm_home)
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Darwin")
+    try:
+        sandbox_mod.prewarm("img", count=1)
+        # macOS prewarms the user-NAT NIC flavor; the default networked create
+        # resolves the same key and claims the pooled clone.
+        sb = sandbox_mod.Sandbox.create(image="img")
+        assert FakeMicroVM.restored == []
+        assert FakeMicroVM.booted == []
+        assert sb.vm is clones[str(mvm_home / "templates" / "img-nic")]
+        sb.terminate()
+    finally:
+        sandbox_mod.shutdown_all_pools()

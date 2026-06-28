@@ -1,50 +1,56 @@
 import { useEffect, useState } from "react";
-import { api } from "../api.ts";
+import { api, type SandboxMetrics } from "../api.ts";
 
-interface MetricLine {
+const numberFmt = new Intl.NumberFormat();
+
+interface MetricGroup {
   name: string;
-  labels: Record<string, string>;
-  value: number;
+  rows: [string, number][];
 }
 
-// Parse the Prometheus exposition format served at /metrics into rows.
-function parseMetrics(text: string): { help: Record<string, string>; lines: MetricLine[] } {
-  const help: Record<string, string> = {};
-  const lines: MetricLine[] = [];
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith("# HELP")) {
-      const [, , name, ...rest] = line.split(/\s+/);
-      help[name] = rest.join(" ");
-      continue;
+// Split the per-sandbox metrics object into named groups of scalar counters:
+// top-level scalars collapse into one "runtime" group, while nested objects
+// (vm_exits, snapshot, pager, …) each become their own group in server order.
+function groupMetrics(metrics: SandboxMetrics): MetricGroup[] {
+  const groups: MetricGroup[] = [];
+  const scalars: [string, number][] = [];
+  for (const key in metrics) {
+    const value = metrics[key];
+    if (typeof value === "number") {
+      scalars.push([key, value]);
+    } else if (value && typeof value === "object") {
+      const rows: [string, number][] = [];
+      for (const field in value) rows.push([field, value[field]]);
+      groups.push({ name: key, rows });
     }
-    if (line.startsWith("#")) continue;
-    const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(\S+)/);
-    if (!m) continue;
-    const labels: Record<string, string> = {};
-    if (m[2]) {
-      for (const pair of m[2].split(",")) {
-        const eq = pair.indexOf("=");
-        if (eq > 0) labels[pair.slice(0, eq).trim()] = pair.slice(eq + 2, -1);
-      }
-    }
-    lines.push({ name: m[1], labels, value: Number(m[3]) });
   }
-  return { help, lines };
+  if (scalars.length > 0) groups.unshift({ name: "runtime", rows: scalars });
+  return groups;
 }
 
-export function MetricsPanel(): React.ReactElement {
-  const [text, setText] = useState<string>("");
+// Live VMM runtime counters for the selected sandbox. The endpoint is
+// running-only, so polling is gated on status to avoid a 5s error loop against
+// a stopped/terminated VM.
+export function MetricsPanel({
+  sandboxId,
+  running,
+}: {
+  sandboxId: string;
+  running: boolean;
+}): React.ReactElement {
+  const [metrics, setMetrics] = useState<SandboxMetrics | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setMetrics(null);
+    setError(null);
+    if (!running) return;
     let stop = false;
     async function pull(): Promise<void> {
       try {
-        const t = await api.metrics();
+        const m = await api.sandboxMetrics(sandboxId);
         if (!stop) {
-          setText(t);
+          setMetrics(m);
           setError(null);
         }
       } catch (e) {
@@ -57,57 +63,63 @@ export function MetricsPanel(): React.ReactElement {
       stop = true;
       clearInterval(t);
     };
-  }, []);
+  }, [sandboxId, running]);
 
+  if (!running)
+    return (
+      <p className="muted" style={{ padding: "var(--pad)" }} aria-live="polite">
+        Metrics are available while the sandbox is running.
+      </p>
+    );
   if (error)
     return (
-      <p className="mono" style={{ color: "var(--err)", padding: "var(--pad)" }}>
+      <p className="mono" style={{ color: "var(--err)", padding: "var(--pad)" }} aria-live="polite">
         {error}
       </p>
     );
-  if (!text)
+  if (!metrics)
     return (
       <p className="muted" style={{ padding: "var(--pad)" }}>
-        loading…
+        Loading…
       </p>
     );
 
-  const { help, lines } = parseMetrics(text);
+  const groups = groupMetrics(metrics);
+  if (groups.length === 0)
+    return (
+      <p className="muted" style={{ padding: "var(--pad)" }}>
+        No metrics reported.
+      </p>
+    );
 
   return (
     <div className="panel">
-      {Object.keys(help).map((family) => {
-        const rows = lines.filter((l) => l.name === family);
-        if (rows.length === 0) return null;
-        return (
-          <div key={family} className="card" style={{ marginBottom: "var(--gap)" }}>
-            <div className="modal__head" style={{ padding: "var(--pad-sm) var(--pad)" }}>
-              <h3 className="mono" style={{ fontSize: "var(--fs-sm)", margin: 0 }}>
-                {family}
-              </h3>
-              <span className="muted" style={{ fontSize: "var(--fs-xs)" }}>
-                {help[family]}
-              </span>
-            </div>
-            <table className="fs-table">
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i}>
-                    <td className="mono muted" style={{ fontSize: "var(--fs-xs)" }}>
-                      {Object.entries(r.labels)
-                        .map(([k, v]) => `${k}="${v}"`)
-                        .join(" ") || "—"}
-                    </td>
-                    <td className="mono" style={{ textAlign: "right" }}>
-                      {r.value}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {groups.map((group) => (
+        <div key={group.name} className="card" style={{ marginBottom: "var(--gap)" }}>
+          <div className="modal__head" style={{ padding: "var(--pad-sm) var(--pad)" }}>
+            <h3 className="mono" style={{ fontSize: "var(--fs-sm)", margin: 0 }}>
+              {group.name}
+            </h3>
           </div>
-        );
-      })}
+          <table className="fs-table">
+            <tbody>
+              {group.rows.map(([key, value]) => (
+                <tr key={key}>
+                  <td className="mono muted" style={{ fontSize: "var(--fs-xs)" }}>
+                    {key}
+                  </td>
+                  <td
+                    className="mono"
+                    style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}
+                  >
+                    {numberFmt.format(value)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
     </div>
   );
 }

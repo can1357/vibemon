@@ -382,3 +382,22 @@ def test_fs_table_renders_dirs_first_with_modes_and_sizes(capsys):
     assert "adir/" in out and "run.sh*" in out
     assert "drwxr-xr-x" in out and "2.0K" in out
     assert "2023-" in out
+
+
+def test_stats_table_flattens_metric_groups(capsys):
+    """Nested VMM counter groups render as ``group.field`` rows, not dict reprs."""
+    from vmon import console
+
+    metrics = {
+        "boot_duration_ms": 142,
+        "control_requests": 12,
+        "vm_exits": {"io_in": 3, "total": 17},
+        "pager": {"resident_pages": 1280},
+    }
+    console.stats_table("vm", metrics)
+    out = capsys.readouterr().out
+    assert "vm_exits.total" in out and "vm_exits.io_in" in out
+    assert "pager.resident_pages" in out
+    assert "boot_duration_ms" in out
+    # The whole point: groups are expanded, never dumped as a Python dict repr.
+    assert "{" not in out and "}" not in out

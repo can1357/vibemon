@@ -121,7 +121,7 @@ export function DetailView({
 
       {tab === "terminal" && <TerminalPanel sandboxId={sandbox.id} />}
       {tab === "files" && <FilesPanel sandboxId={sandbox.id} notify={notify} />}
-      {tab === "metrics" && <MetricsPanel />}
+      {tab === "metrics" && <MetricsPanel sandboxId={sandbox.id} running={running} />}
     </div>
   );
 }

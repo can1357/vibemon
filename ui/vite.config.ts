@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { resolve } from "node:path";
 
 // Build straight into the Python package so `vmon serve` ships the UI with
-// `vmon[server]`. The dev server proxies /v1, /healthz, /metrics to a local
+// `vmon[server]`. The dev server proxies /v1 and /healthz to a local
 // `vmon serve` instance on :8000.
 export default defineConfig({
   plugins: [react()],
@@ -17,7 +17,6 @@ export default defineConfig({
     proxy: {
       "/v1": { target: "http://127.0.0.1:8000", ws: true },
       "/healthz": { target: "http://127.0.0.1:8000" },
-      "/metrics": { target: "http://127.0.0.1:8000" },
     },
   },
 });

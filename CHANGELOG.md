@@ -13,8 +13,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
-- Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem
+- Added per-sandbox runtime metrics in the Dashboard's **Metrics** tab
 
+- Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem
 - Added client-side retry logic for idempotent sandbox creation and restoration
 - Enabled idempotent sandbox creation and restoration across mesh-connected nodes
 - Added support for idempotent sandbox creation to prevent duplicate VM instantiation
@@ -34,6 +35,9 @@ All notable changes to this project are recorded here.
 - Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g., macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmm` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
+
+- Flattened nested VMM counter groups into `group.field` rows in `vmon stats` and Dashboard
+- Improved prewarm pool logic to distinguish between networked and block-network sandbox flavors
 
 - Updated mesh request handling to distinguish between unreachable peers and ambiguous responses
 - Improved error messaging for sandbox creation to indicate when retries with an idempotency key are required
@@ -55,6 +59,9 @@ All notable changes to this project are recorded here.
 - Fixed hanging `vmon exec` commands by correctly closing stdin when run from a TTY
 - Fixed TTY stdin forwarding to prevent daemon crashes during shell execution
 - Prevented premature stdin-EOF teardown during non-interactive shell commands
+- Scoped the web panel's sandbox **Metrics** tab to the selected sandbox: it now polls `GET /v1/sandboxes/{id}/metrics` (the VMM's live per-sandbox runtime counters) instead of the process-global Prometheus `/metrics`, renders nested counter groups (`vm_exits`, `pager`, …) as grouped tables, and shows a neutral placeholder for non-running sandboxes rather than error-polling the running-only endpoint. Dropped the now-dead global-metrics client helper and its Vite dev-proxy entry.
+- `vmon stats` now flattens nested VMM counter groups (`vm_exits`, `snapshot`, `pager`, `ksm`) into `group.field` rows instead of printing raw Python dict reprs.
+- Corrected the `prewarm` contract and its docstring: a networked Linux sandbox needs a per-sandbox host TAP a pre-forked pool cannot bake in, so `prewarm` warms the block-network flavor (claimed by `Sandbox.create(image=ref, block_network=True)` — the shape the web panel's create form and `vmon shell` use) while a default networked Linux create warm-restores directly; macOS warms the user-NAT flavor a default create claims. Added regression tests pinning the prewarm→claim path on each host.
 
 ## 0.2.0
 

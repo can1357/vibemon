@@ -1,5 +1,5 @@
 // Same-origin client for the `vmon serve` HTTP+WS API.
-// In dev, vite.config.ts proxies /v1, /healthz, /metrics to 127.0.0.1:8000.
+// In dev, vite.config.ts proxies /v1 and /healthz to 127.0.0.1:8000.
 // In production the UI is served by `vmon serve` itself, so relative URLs are
 // correct regardless of host/port/proxy in front of it.
 
@@ -53,6 +53,11 @@ export interface FsStat {
   mode: number;
   mtime: number;
 }
+
+// Per-sandbox VMM runtime counters from GET /v1/sandboxes/{id}/metrics. Values
+// are either scalar counters/gauges or a named group of counters (e.g. vm_exits,
+// pager). Kept open so guest/VMM-added fields render without a client change.
+export type SandboxMetrics = Record<string, number | Record<string, number>>;
 
 const TOKEN_KEY = "vmon.api_token";
 
@@ -119,7 +124,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => req<{ ok: boolean }>("/healthz"),
-  metrics: () => req<string>("/metrics"),
+  sandboxMetrics: (id: string) =>
+    req<SandboxMetrics>(`/v1/sandboxes/${encodeURIComponent(id)}/metrics`),
 
   listSandboxes: () => req<{ sandboxes: SandboxView[] }>("/v1/sandboxes").then((r) => r.sandboxes),
   getSandbox: (id: string) => req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}`),

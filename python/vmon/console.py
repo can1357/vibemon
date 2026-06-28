@@ -153,6 +153,24 @@ def _format_metric(value: Any) -> str:
     return str(value)
 
 
+def _flatten_metrics(metrics: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """Flatten one level of grouped counters into ``parent.child`` rows.
+
+    The VMM reports scalar counters alongside named groups (``vm_exits``,
+    ``pager``, …); each group becomes one ``group.field`` row so the table shows
+    numbers instead of a dict repr.
+    """
+    rows: list[tuple[str, Any]] = []
+    for key in sorted(metrics):
+        value = metrics[key]
+        if isinstance(value, Mapping):
+            for sub in sorted(value):
+                rows.append((f"{key}.{sub}", value[sub]))
+        else:
+            rows.append((key, value))
+    return rows
+
+
 def stats_table(name: str, metrics: Mapping[str, Any]) -> None:
     """Render a VM's live VMM runtime counters as a borderless table."""
     if not metrics:
@@ -161,8 +179,8 @@ def stats_table(name: str, metrics: Mapping[str, Any]) -> None:
     table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
     table.add_column("METRIC", style="vmon.command", no_wrap=True)
     table.add_column("VALUE", justify="right", no_wrap=True)
-    for key in sorted(metrics):
-        table.add_row(str(key), _format_metric(metrics[key]))
+    for metric, value in _flatten_metrics(metrics):
+        table.add_row(metric, _format_metric(value))
     console.print(table)
 
 

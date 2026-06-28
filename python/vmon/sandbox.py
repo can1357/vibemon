@@ -48,12 +48,24 @@ def pool_inventory() -> dict[str, int]:
 
 
 def prewarm(ref: str, *, count: int, **template_kwargs: Any) -> WarmPool:
-    """Build ``ref``'s template and register an exact-shape warm pool.
+    """Build ``ref``'s template and keep ``count`` warm clones of the host's
+    pool-claimable sandbox flavor ready for instant claim.
 
-    Warms the host's default warm flavor so a zero-config ``Sandbox.create``
-    claims it: a user-mode-NAT NIC template on macOS (where the default
-    networked sandbox warm-restores), and a plain block-network template
-    elsewhere (Linux networked needs a host TAP that is not yet warm-poolable).
+    Which ``Sandbox.create`` actually claims the pool is host-dependent, because
+    only some network flavors are poolable:
+
+    - **macOS/HVF:** warms the user-mode-NAT NIC flavor, claimed by a default
+      (networked) ``Sandbox.create(image=ref)`` — user-mode NAT is in-process, so
+      each pre-forked clone is self-contained.
+    - **Linux/KVM:** warms the block-network flavor (no NIC). A *networked* Linux
+      sandbox needs a per-sandbox host TAP allocated at restore time, which a
+      pre-forked pool cannot bake in, so a default ``Sandbox.create`` warm-restores
+      onto a fresh TAP rather than claiming. The block-network pool is claimed by
+      ``Sandbox.create(image=ref, block_network=True)`` — the shape the web panel's
+      create form and ``vmon shell`` use.
+
+    Returns the registered :class:`WarmPool`; pass it to :func:`shutdown_prewarms`
+    to drain it.
     """
     count = int(count)
     if count < 0:
