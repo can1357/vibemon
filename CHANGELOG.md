@@ -16,7 +16,6 @@ All notable changes to this project are recorded here.
 - Added `vmon inspect <name>` to print detailed VM configuration as JSON
 - Added `vmon stats <name>` to display live runtime VMM metrics
 - Added `vmon extend <name> <secs>` to update a VM's runtime deadline
-
 - Added `vmon inspect <name>`, `vmon stats <name>`, and `vmon extend <name> <secs>` CLI commands. `inspect` prints a VM's full detail view as highlighted JSON, `stats` renders the VMM's live runtime counters, and `extend` resets a running VM's wall-clock deadline (persisted so a rehydrated daemon reports the extended window). All three route through both the `vmond` daemon and the HTTP gateway; `stats` is backed by a new `GET /v1/sandboxes/{id}/metrics` route.
 - Added `@function` decorator to execute local Python functions in a remote sandbox
 - Added `RemoteFunction` class to manage serialized function execution and sandbox lifecycle
@@ -29,6 +28,9 @@ All notable changes to this project are recorded here.
 - Zero-setup `vmon shell`/`run` on hosts without a guest kernel (e.g., macOS/HVF): when neither `$VMON_KERNEL` nor a matching `/boot` kernel is present, the daemon downloads a pinned, checksum-verified kernel into `~/.vmon/assets` on first boot — no manual `just fetch-assets`. `find_binary()` now locates the locally built, HVF-signed `vmm` VMM through `cargo metadata` (native and cross `debug`/`release` layouts), so `$VMON_BIN` is no longer required, and `mkfs.ext4` is resolved from a keg-only Homebrew e2fsprogs install (`/opt/homebrew/opt/e2fsprogs/sbin`).
 
 ### Changed
+
+- Updated mesh request handling to distinguish between unreachable peers and ambiguous responses
+- Improved error messaging for sandbox creation to indicate when retries with an idempotency key are required
 
 - Refactored stdin forwarding loop in `vmon exec` to improve terminal responsiveness
 - Enabled warm-restore path for networked sandboxes (block_network=True) with volumes

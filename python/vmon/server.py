@@ -960,9 +960,18 @@ async def _proxy_to_peer(request: Request, peer_url: str, token: str) -> Respons
     req = client.build_request(request.method, target, content=body, headers=headers)
     try:
         resp = await client.send(req, stream=True)
-    except httpx.HTTPError as exc:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        # Connection never established: the request provably did not run.
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
+        ) from exc
+    except httpx.HTTPError as exc:
+        # Bytes were sent without a clean response: the outcome is unknown, so a
+        # mutating caller must retry with the same idempotency key rather than
+        # assume failure.
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "sandbox owner response ambiguous; retry with the same idempotency key",
         ) from exc
     return StreamingResponse(
         resp.aiter_raw(),
@@ -1235,6 +1244,7 @@ def _mesh_http_status(exc: MeshError) -> int:
     return {
         "unauthorized": status.HTTP_401_UNAUTHORIZED,
         "unreachable": status.HTTP_502_BAD_GATEWAY,
+        "ambiguous": status.HTTP_504_GATEWAY_TIMEOUT,
         "conflict": status.HTTP_409_CONFLICT,
     }.get(exc.code, status.HTTP_400_BAD_REQUEST)
 

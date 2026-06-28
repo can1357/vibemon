@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -26,7 +27,7 @@ class MeshError(Exception):
 
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
-        known = {"invalid", "unauthorized", "unreachable", "conflict"}
+        known = {"invalid", "unauthorized", "unreachable", "ambiguous", "conflict"}
         self.message = message
         self.code = code or (message if message in known else "invalid")
 
@@ -149,16 +150,24 @@ class HttpxTransport:
         self._client = httpx.Client(timeout=timeout)
         self._token = token
 
-    def post(self, base_url: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def post(
+        self, base_url: str, path: str, payload: dict[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]:
         """POST a JSON payload to a peer and return its JSON object response."""
-        return self._request("POST", base_url, path, payload=payload)
+        return self._request("POST", base_url, path, payload=payload, timeout=timeout)
 
-    def get(self, base_url: str, path: str) -> dict[str, Any]:
+    def get(self, base_url: str, path: str, *, timeout: float | None = None) -> dict[str, Any]:
         """GET a JSON object response from a peer."""
-        return self._request("GET", base_url, path)
+        return self._request("GET", base_url, path, timeout=timeout)
 
     def _request(
-        self, method: str, base_url: str, path: str, *, payload: dict[str, Any] | None = None
+        self,
+        method: str,
+        base_url: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         import httpx
 
@@ -167,10 +176,23 @@ class HttpxTransport:
             "Authorization": f"Bearer {self._token}",
             "X-Vmon-Mesh-Hop": "1",
         }
+        # A longer per-call deadline for slow create/fork dispatch must not slow
+        # heartbeat failure detection, so it overrides the short client default
+        # only for this request.
+        kwargs: dict[str, Any] = {"json": payload, "headers": headers}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         try:
-            response = self._client.request(method, url, json=payload, headers=headers)
-        except httpx.HTTPError as exc:
+            response = self._client.request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Connection never established: the request provably did not run, so a
+            # caller may safely reroute it to another node.
             raise MeshError("peer unreachable", code="unreachable") from exc
+        except httpx.HTTPError as exc:
+            # Bytes were on the wire with no clean response (read timeout, reset,
+            # protocol error): the peer MAY have committed, so the outcome is
+            # unknown and the caller must NOT reroute — it duplicates committed work.
+            raise MeshError("peer response ambiguous", code="ambiguous") from exc
         if response.status_code < 200 or response.status_code >= 300:
             code = _mesh_code_for_status(response.status_code)
             detail = _response_detail(response)
@@ -193,7 +215,9 @@ def _mesh_code_for_status(status: int) -> str:
     if status == 409:
         return "conflict"
     if status >= 500:
-        return "unreachable"
+        # A 5xx response means the peer handled the request and may have
+        # committed before failing, so a mutating caller must not reroute it.
+        return "ambiguous"
     return "invalid"
 
 
@@ -486,6 +510,12 @@ def score_node(
     )
 
 
+def _hrw_score(key: str, node_id: str) -> int:
+    """Rendezvous-hash weight of *node_id* for *key*; the highest weight wins."""
+    digest = hashlib.blake2b(f"{key}\x00{node_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
 class Mesh:
     """Owns local mesh state, membership persistence, gossip, and placement."""
 
@@ -523,6 +553,13 @@ class Mesh:
         self._owners: dict[str, str] = {}
         self._explicit_owners: dict[str, tuple[str, float]] = {}
         self._inflight = 0
+        self.idem_ttl = float(os.environ.get("VMON_MESH_IDEM_TTL_SEC", "900.0"))
+        self.create_timeout = float(os.environ.get("VMON_MESH_CREATE_TIMEOUT_SEC", "120.0"))
+        # key -> (workload owner node id, pin timestamp): a coordinator's transient
+        # record fixing one owner per idempotency key so retries converge.
+        self._idem_pins: dict[str, tuple[str, float]] = {}
+        # idempotency keys whose create is in flight on THIS node (worker serialization).
+        self._idem_busy: set[str] = set()
 
     def self_state(self) -> NodeState:
         """Build a fresh placement snapshot for this node."""
@@ -794,6 +831,76 @@ class Mesh:
         """Adjust the local placement in-flight counter."""
         with self._lock:
             self._inflight = max(0, self._inflight + delta)
+
+    def coordinator_for(self, key: str) -> str:
+        """Return the node id that owns idempotency decisions for *key*.
+
+        Rendezvous (highest-random-weight) hashing over the live membership picks
+        one coordinator per key with no shared state, so independent ingress
+        nodes converge a retried key onto the same coordinator as long as their
+        member views agree. Membership churn can move the choice; see the
+        idempotency durability note on :meth:`idem_pin`.
+        """
+        now = time.time()
+        with self._lock:
+            members = [self.node_id]
+            members.extend(
+                peer.node_id for peer in self._peers.values() if peer.healthy(now, self.interval)
+            )
+        return max(members, key=lambda nid: _hrw_score(key, nid))
+
+    def idem_pin(self, key: str, owner: str) -> str:
+        """Pin *key* to a workload *owner*, returning the effective (possibly prior) owner.
+
+        First-writer-wins under the lock: concurrent creates of one key all
+        observe the same owner, so they cannot scatter onto different nodes. The
+        pin is in-memory and transient — it survives owner restart (the committed
+        record is rebuilt from VM metadata) but not coordinator restart, which
+        degrades that key to at-least-once until its next commit.
+        """
+        with self._lock:
+            self._prune_idem_locked()
+            existing = self._idem_pins.get(key)
+            if existing is not None:
+                return existing[0]
+            self._idem_pins[key] = (owner, time.time())
+            return owner
+
+    def idem_owner(self, key: str) -> str | None:
+        """Return the owner currently pinned for *key*, if any."""
+        with self._lock:
+            self._prune_idem_locked()
+            pin = self._idem_pins.get(key)
+            return pin[0] if pin is not None else None
+
+    def idem_repin(self, key: str, owner: str) -> None:
+        """Move *key*'s pin to *owner* after the prior owner failed before committing."""
+        with self._lock:
+            self._idem_pins[key] = (owner, time.time())
+
+    def idem_unpin(self, key: str) -> None:
+        """Drop *key*'s pin so a fresh create may re-place it."""
+        with self._lock:
+            self._idem_pins.pop(key, None)
+
+    def worker_begin(self, key: str) -> bool:
+        """Claim local creation of *key*; ``False`` if a create is already in flight here."""
+        with self._lock:
+            if key in self._idem_busy:
+                return False
+            self._idem_busy.add(key)
+            return True
+
+    def worker_end(self, key: str) -> None:
+        """Release the local creation claim for *key*."""
+        with self._lock:
+            self._idem_busy.discard(key)
+
+    def _prune_idem_locked(self) -> None:
+        now = time.time()
+        stale = [k for k, (_, ts) in self._idem_pins.items() if now - ts > self.idem_ttl]
+        for key in stale:
+            del self._idem_pins[key]
 
     def heartbeat_once(self) -> None:
         """Run one gossip round against every known peer."""
