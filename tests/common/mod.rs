@@ -125,7 +125,7 @@ pub const fn supports_linux_isolation() -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-const KERNEL_ASSET: &str = "vmlinux-x86_64";
+const KERNEL_ASSET: &str = "bzImage-x86_64";
 #[cfg(target_arch = "aarch64")]
 const KERNEL_ASSET: &str = "Image-aarch64";
 

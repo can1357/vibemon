@@ -25,9 +25,9 @@ ASSET_DIR=${ASSET_DIR:-"$REPO/target/test-assets"}
 MUSL_LOADER=""
 
 if [ "$ARCH" = x86_64 ]; then
-  KERNEL_NAME="vmlinux-x86_64"
-  KERNEL_URL=${KERNEL_URL:-"https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"}
-  KERNEL_SHA256=${KERNEL_SHA256:-"ea5e7d5cf494a8c4ba043259812fc018b44880d70bcbbfc4d57d2760631b1cd6"}
+  KERNEL_NAME="bzImage-x86_64"
+  KERNEL_URL=${KERNEL_URL:-"https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.12.8-20250613/bzImage-x86_64"}
+  KERNEL_SHA256=${KERNEL_SHA256:-"d4af401aa859e4659d4b08a153ac608eb6a315c6918e567daa46981af5d2e5ef"}
 
   BUSYBOX_PATH=${BUSYBOX_PATH:-"$ASSET_DIR/busybox-x86_64"}
   BUSYBOX_URL=${BUSYBOX_URL:-"https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"}
