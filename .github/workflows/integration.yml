@@ -12,13 +12,13 @@ permissions:
   contents: read
 
 jobs:
-  # Hosted real-VM integration: boots real microVMs on a GitHub-hosted Linux
-  # runner (/dev/kvm) and drives the full stack (vmm + guest agent + SDK + CLI)
-  # through the Python e2e suite. Runs on every push/PR in ~5 minutes.
+  # The Python real-VM e2e and the Rust integration suite each boot real
+  # microVMs on a GitHub-hosted Linux runner (/dev/kvm). They run as parallel
+  # jobs (shared build + asset caches) so the whole check finishes in ~5 min.
   kvm-integration:
     name: KVM integration
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
@@ -39,42 +39,20 @@ jobs:
           uv run cli_e2e.py
           VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
 
-  # The Rust integration + soak suites boot many VMs single-threaded and depend
-  # on bare-metal KVM pause/snapshot timing that GitHub-hosted *nested* KVM does
-  # not provide (snapshot/pause tests hang and the suite is slow there). Keep
-  # them on a self-hosted KVM runner via the nightly schedule or manual dispatch.
   kvm-rust:
     name: KVM Rust integration
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: [self-hosted, kvm, x64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
+      VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install pinned Rust toolchain
-        run: rustup show
-
-      - name: Install just
-        uses: taiki-e/install-action@just
-
-      - name: Build vmm
-        run: cargo build --locked
-
-      - name: Build static guest agent
-        run: just agent-musl
-
-      - name: Fetch test assets
-        run: just fetch-assets
-
-      - name: Prepare host tap
-        run: |
-          sudo ip link delete vmon0 2>/dev/null || true
-          sudo ip tuntap add dev vmon0 mode tap
-          sudo ip addr add 192.168.249.1/24 dev vmon0
-          sudo ip link set dev vmon0 up
+      - name: Prepare KVM host
+        uses: ./.github/actions/kvm-host
 
       - name: Run integration tests
         run: just integration
