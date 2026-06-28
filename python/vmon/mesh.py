@@ -136,9 +136,11 @@ class NodeState:
 class MeshTransport(Protocol):
     """Unary inter-node HTTP transport used by mesh membership and placement."""
 
-    def post(self, base_url: str, path: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def post(
+        self, base_url: str, path: str, payload: dict[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]: ...
 
-    def get(self, base_url: str, path: str) -> dict[str, Any]: ...
+    def get(self, base_url: str, path: str, *, timeout: float | None = None) -> dict[str, Any]: ...
 
 
 class HttpxTransport:

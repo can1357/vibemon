@@ -13,6 +13,8 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added support for idempotent sandbox creation to prevent duplicate VM instantiation
+
 - Added `vmon inspect <name>` to print detailed VM configuration as JSON
 - Added `vmon stats <name>` to display live runtime VMM metrics
 - Added `vmon extend <name> <secs>` to update a VM's runtime deadline
@@ -31,7 +33,6 @@ All notable changes to this project are recorded here.
 
 - Updated mesh request handling to distinguish between unreachable peers and ambiguous responses
 - Improved error messaging for sandbox creation to indicate when retries with an idempotency key are required
-
 - Refactored stdin forwarding loop in `vmon exec` to improve terminal responsiveness
 - Enabled warm-restore path for networked sandboxes (block_network=True) with volumes
 - Updated `vmon run` to enable networking by default on macOS, removing the requirement for `--block-network`

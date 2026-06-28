@@ -81,6 +81,7 @@ class SandboxCreate(BaseModel):
     remote_page_url: str | None = None
     remote_page_token: str | None = None
     remote_page_digest: str | None = None
+    idempotency_key: str | None = None
 
 
 class ExecRequest(BaseModel):
@@ -1812,6 +1813,168 @@ def create_app(
             return {"owner": mesh.node_id}
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown sandbox")
 
+    def _idem_payload(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        key = str(body.get("key") or "").strip()
+        params = body.get("params")
+        if not key:
+            raise MeshError("missing idempotency key")
+        if not isinstance(params, dict):
+            raise MeshError("missing idempotency params")
+        clean = dict(params)
+        clean.pop("idempotency_key", None)
+        return key, clean
+
+    async def _local_sandbox_create_view(request: Request, params: dict[str, Any]) -> dict[str, Any]:
+        body = SandboxCreate(**params)
+        _validate_create_request(body)
+        clean = body.model_dump(exclude_none=True)
+        clean.pop("idempotency_key", None)
+        key = request_template_key(clean)
+        local_index_fn = getattr(supervisor._engine, "template_index", None)
+        local_index = local_index_fn() if callable(local_index_fn) else {}
+        if mesh.enabled and key and key not in local_index:
+            provider = mesh.find_template_provider(key)
+            if provider is not None:
+                peer_url, digest = provider
+                try:
+                    installed = await pull_template_metadata(
+                        request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                    )
+                    body.template = str(installed)
+                    body.remote_page_url = _remote_page_url(peer_url, digest)
+                    body.remote_page_token = expected_token or ""
+                    body.remote_page_digest = digest
+                except Exception as exc:
+                    LOGGER.warning(
+                        "lazy pull-warm metadata %s from %s failed: %s", digest, peer_url, exc
+                    )
+                    try:
+                        installed = await pull_template(
+                            request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                        )
+                        # Warm-restore the pulled snapshot directly: selecting it by path
+                        # skips build_or_pull, so the node needs no local image/engine.
+                        body.template = str(installed)
+                    except Exception as full_exc:
+                        LOGGER.warning(
+                            "pull-warm template %s from %s failed: %s",
+                            digest,
+                            peer_url,
+                            full_exc,
+                        )
+        record = await supervisor.create(body)
+        return record.view()
+
+    async def _worker_sandbox_create(
+        request: Request, idem_key: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        if not mesh.worker_begin(idem_key):
+            deadline = time.monotonic() + min(5.0, mesh.create_timeout)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                existing = supervisor._engine.find_by_idempotency_key(idem_key)
+                if existing is not None:
+                    return existing.view()
+            raise MeshError("idempotent create already in progress", code="conflict")
+        try:
+            existing = supervisor._engine.find_by_idempotency_key(idem_key)
+            if existing is not None:
+                return existing.view()
+            view = await _local_sandbox_create_view(request, params)
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                supervisor._engine.record_idempotency(sid, idem_key)
+                recorded = supervisor._engine.get(sid)
+                return recorded.view()
+            return view
+        finally:
+            mesh.worker_end(idem_key)
+
+    async def _coordinate_sandbox_create(
+        request: Request, idem_key: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        tried: set[str] = set()
+        for _ in range(max(1, len(mesh.peers()) + 1)):
+            pinned = mesh.idem_owner(idem_key)
+            owner = pinned or mesh.place(params)
+            owner = mesh.idem_pin(idem_key, owner)
+            if owner == mesh.node_id:
+                return await _worker_sandbox_create(request, idem_key, params)
+            peer_url = mesh.peer_url(owner)
+            if peer_url is None:
+                mesh.mark_unhealthy(owner)
+                mesh.idem_unpin(idem_key)
+                tried.add(owner)
+                continue
+            try:
+                view = await asyncio.to_thread(
+                    mesh.transport.post,
+                    peer_url,
+                    "/v1/mesh/idem/sandboxes/work",
+                    {"key": idem_key, "params": params},
+                    timeout=mesh.create_timeout,
+                )
+            except MeshError as exc:
+                if exc.code == "unreachable":
+                    mesh.mark_unhealthy(owner)
+                    mesh.idem_unpin(idem_key)
+                    tried.add(owner)
+                    continue
+                raise
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                mesh.record_owner(sid, owner)
+            return view
+        raise MeshError("no reachable owner for idempotent create", code="unreachable")
+
+    async def _idempotent_sandbox_create(
+        request: Request, idem_key: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not mesh.enabled or mesh.pinned_local(params):
+            return await _worker_sandbox_create(request, idem_key, params)
+        coordinator = mesh.coordinator_for(idem_key)
+        if coordinator == mesh.node_id:
+            return await _coordinate_sandbox_create(request, idem_key, params)
+        peer_url = mesh.peer_url(coordinator)
+        if peer_url is None:
+            mesh.mark_unhealthy(coordinator)
+            return await _coordinate_sandbox_create(request, idem_key, params)
+        try:
+            return await asyncio.to_thread(
+                mesh.transport.post,
+                peer_url,
+                "/v1/mesh/idem/sandboxes/coordinate",
+                {"key": idem_key, "params": params},
+                timeout=mesh.create_timeout,
+            )
+        except MeshError as exc:
+            if exc.code == "unreachable":
+                mesh.mark_unhealthy(coordinator)
+                return await _coordinate_sandbox_create(request, idem_key, params)
+            raise
+
+    @app.post("/v1/mesh/idem/sandboxes/coordinate", dependencies=[Depends(require_auth)])
+    async def mesh_idem_sandbox_coordinate(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            return await _coordinate_sandbox_create(request, idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    @app.post("/v1/mesh/idem/sandboxes/work", dependencies=[Depends(require_auth)])
+    async def mesh_idem_sandbox_work(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            return await _worker_sandbox_create(request, idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
     @app.get("/v1/templates/{digest}/metadata", dependencies=[Depends(require_auth)])
     async def template_metadata_blob(digest: str) -> FileResponse:
         from . import cas
@@ -1868,6 +2031,14 @@ def create_app(
     async def create_sandbox(request: Request, body: SandboxCreate) -> JSONResponse:
         _validate_create_request(body)
         body_dict = body.model_dump(exclude_none=True)
+        idem_key = str(body_dict.pop("idempotency_key", "") or "").strip()
+        body.idempotency_key = None
+        if idem_key:
+            try:
+                view = await _idempotent_sandbox_create(request, idem_key, body_dict)
+            except MeshError as exc:
+                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            return JSONResponse(view, status_code=status.HTTP_201_CREATED)
         if (
             mesh.enabled
             and not request.headers.get("x-vmon-mesh-hop")
@@ -1897,9 +2068,11 @@ def create_app(
                     view = await asyncio.to_thread(
                         mesh.transport.post, url, "/v1/sandboxes", body_dict
                     )
-                except MeshError:
-                    mesh.mark_unhealthy(owner)
-                    continue
+                except MeshError as exc:
+                    if exc.code == "unreachable":
+                        mesh.mark_unhealthy(owner)
+                        continue
+                    raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
                 finally:
                     mesh.note_inflight(-1)
                 sid = str(view.get("id") or view.get("name") or "")

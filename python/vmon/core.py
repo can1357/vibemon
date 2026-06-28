@@ -158,8 +158,9 @@ class VMRecord:
         for web-created ones) is spread first so the canonical fields below win;
         ``returncode`` prefers a terminate-captured exit code over the live probe.
         """
+        detail = {key: value for key, value in self.detail.items() if key != "idempotency_key"}
         return {
-            **self.detail,
+            **detail,
             "id": self.id,
             "name": self.name,
             "status": self.status,
@@ -192,6 +193,9 @@ class Engine:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._records: dict[str, VMRecord] = {}
+        # Idempotency key -> sandbox id for create dedup; rebuilt from VM metadata
+        # on rehydrate so a retry after an owner restart replays, not duplicates.
+        self._idem_index: dict[str, str] = {}
         self.rehydrate()
 
     # -- backend injection (overridden in tests) ---------------------------
@@ -257,8 +261,14 @@ class Engine:
             elif saved_status != status:
                 self._persist_record_status(record, status)
             records[vm.name] = record
+        index: dict[str, str] = {}
+        for name, record in records.items():
+            key = record.detail.get("idempotency_key")
+            if isinstance(key, str) and key and record.status != "terminated":
+                index[key] = name
         with self._lock:
             self._records = records
+            self._idem_index = index
 
     @staticmethod
     def _pid_of(meta: Mapping[str, object]) -> int | None:
@@ -955,6 +965,41 @@ class Engine:
         with self._lock:
             self._records[sid] = record
         return record
+
+    def find_by_idempotency_key(self, key: str) -> VMRecord | None:
+        """Return the live record created for *key*, or ``None`` if none exists.
+
+        Backs create idempotency: a worker consults this before creating so a
+        re-dispatched or restart-survived key replays its sandbox instead of
+        spawning a duplicate. A terminated match is ignored (and its stale index
+        entry dropped) so the key may be reused for a fresh create.
+        """
+        with self._lock:
+            sid = self._idem_index.get(key)
+            if sid is None:
+                return None
+            record = self._records.get(sid)
+            if record is None or record.status == "terminated":
+                if self._idem_index.get(key) == sid:
+                    del self._idem_index[key]
+                return None
+            return record
+
+    def record_idempotency(self, sid: str, key: str) -> None:
+        """Bind idempotency *key* to sandbox *sid* and persist it to VM metadata."""
+        with self._lock:
+            record = self._records.get(sid)
+            if record is None:
+                return
+            record.detail["idempotency_key"] = key
+            self._idem_index[key] = sid
+            name = record.name
+        try:
+            MicroVM(name)._save_meta(idempotency_key=key)
+        except Exception:
+            # Metadata persistence is best-effort; the in-memory index still dedups
+            # for this process lifetime even if the on-disk replay hint is lost.
+            pass
 
     def terminate(self, name: str, *, reason: str = "api") -> VMRecord:
         """Terminate a running sandbox (web semantics: status -> ``terminated``)."""
