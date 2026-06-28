@@ -7,6 +7,7 @@ pub mod mmio;
 pub mod net;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
+pub mod rng;
 
 use std::{
 	io,
