@@ -13,8 +13,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
-- Added support for idempotent sandbox creation to prevent duplicate VM instantiation
+- Added client-side retry logic for idempotent sandbox creation and restoration
+- Enabled idempotent sandbox creation and restoration across mesh-connected nodes
 
+- Added support for idempotent sandbox creation to prevent duplicate VM instantiation
 - Added `vmon inspect <name>` to print detailed VM configuration as JSON
 - Added `vmon stats <name>` to display live runtime VMM metrics
 - Added `vmon extend <name> <secs>` to update a VM's runtime deadline

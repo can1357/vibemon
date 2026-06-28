@@ -1824,7 +1824,9 @@ def create_app(
         clean.pop("idempotency_key", None)
         return key, clean
 
-    async def _local_sandbox_create_view(request: Request, params: dict[str, Any]) -> dict[str, Any]:
+    async def _local_sandbox_create_view(
+        request: Request, params: dict[str, Any]
+    ) -> dict[str, Any]:
         body = SandboxCreate(**params)
         _validate_create_request(body)
         clean = body.model_dump(exclude_none=True)
@@ -1883,6 +1885,13 @@ def create_app(
             existing = supervisor._engine.find_by_idempotency_key(idem_key)
             if existing is not None:
                 return existing.view()
+            name = params.get("name")
+            if isinstance(name, str) and name and (
+                _engine_has(supervisor, name)
+                or mesh.owner_of(name)
+                or await _scatter_locate(mesh, name)
+            ):
+                raise MeshError(f"sandbox {name!r} already exists", code="conflict")
             view = await _local_sandbox_create_view(request, params)
             sid = str(view.get("id") or view.get("name") or "")
             if sid:
@@ -1960,7 +1969,9 @@ def create_app(
             raise
 
     @app.post("/v1/mesh/idem/sandboxes/coordinate", dependencies=[Depends(require_auth)])
-    async def mesh_idem_sandbox_coordinate(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    async def mesh_idem_sandbox_coordinate(
+        request: Request, body: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
             idem_key, params = _idem_payload(body)
             return await _coordinate_sandbox_create(request, idem_key, params)
@@ -1972,6 +1983,246 @@ def create_app(
         try:
             idem_key, params = _idem_payload(body)
             return await _worker_sandbox_create(request, idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    async def _local_detached_run_view(params: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(params)
+        clean.pop("idempotency_key", None)
+        clean["detach"] = True
+        result = await supervisor._run(supervisor._engine.run, clean)
+        sid = str(result.get("name") or "")
+        if sid:
+            return supervisor._engine.get(sid).view()
+        return result
+
+    async def _worker_run_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        if not mesh.worker_begin(idem_key):
+            deadline = time.monotonic() + min(5.0, mesh.create_timeout)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                existing = supervisor._engine.find_by_idempotency_key(idem_key)
+                if existing is not None:
+                    return existing.view()
+            raise MeshError("idempotent create already in progress", code="conflict")
+        try:
+            existing = supervisor._engine.find_by_idempotency_key(idem_key)
+            if existing is not None:
+                return existing.view()
+            name = params.get("name")
+            if isinstance(name, str) and name and (
+                _engine_has(supervisor, name)
+                or mesh.owner_of(name)
+                or await _scatter_locate(mesh, name)
+            ):
+                raise MeshError(f"sandbox {name!r} already exists", code="conflict")
+            view = await _local_detached_run_view(params)
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                supervisor._engine.record_idempotency(sid, idem_key)
+                recorded = supervisor._engine.get(sid)
+                return recorded.view()
+            return view
+        finally:
+            mesh.worker_end(idem_key)
+
+    async def _coordinate_run_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        for _ in range(max(1, len(mesh.peers()) + 1)):
+            pinned = mesh.idem_owner(idem_key)
+            owner = pinned or mesh.place(params)
+            owner = mesh.idem_pin(idem_key, owner)
+            if owner == mesh.node_id:
+                return await _worker_run_create(idem_key, params)
+            peer_url = mesh.peer_url(owner)
+            if peer_url is None:
+                mesh.mark_unhealthy(owner)
+                mesh.idem_unpin(idem_key)
+                continue
+            try:
+                view = await asyncio.to_thread(
+                    mesh.transport.post,
+                    peer_url,
+                    "/v1/mesh/idem/run/work",
+                    {"key": idem_key, "params": params},
+                    timeout=mesh.create_timeout,
+                )
+            except MeshError as exc:
+                if exc.code == "unreachable":
+                    mesh.mark_unhealthy(owner)
+                    mesh.idem_unpin(idem_key)
+                    continue
+                raise
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                mesh.record_owner(sid, owner)
+            return view
+        raise MeshError("no reachable owner for idempotent run", code="unreachable")
+
+    async def _idempotent_run_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        if not mesh.enabled or mesh.pinned_local(params):
+            return await _worker_run_create(idem_key, params)
+        coordinator = mesh.coordinator_for(idem_key)
+        if coordinator == mesh.node_id:
+            return await _coordinate_run_create(idem_key, params)
+        peer_url = mesh.peer_url(coordinator)
+        if peer_url is None:
+            mesh.mark_unhealthy(coordinator)
+            return await _coordinate_run_create(idem_key, params)
+        try:
+            return await asyncio.to_thread(
+                mesh.transport.post,
+                peer_url,
+                "/v1/mesh/idem/run/coordinate",
+                {"key": idem_key, "params": params},
+                timeout=mesh.create_timeout,
+            )
+        except MeshError as exc:
+            if exc.code == "unreachable":
+                mesh.mark_unhealthy(coordinator)
+                return await _coordinate_run_create(idem_key, params)
+            raise
+
+    @app.post("/v1/mesh/idem/run/coordinate", dependencies=[Depends(require_auth)])
+    async def mesh_idem_run_coordinate(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            params["detach"] = True
+            return await _coordinate_run_create(idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    @app.post("/v1/mesh/idem/run/work", dependencies=[Depends(require_auth)])
+    async def mesh_idem_run_work(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            params["detach"] = True
+            return await _worker_run_create(idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    async def _local_detached_restore_view(params: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(params)
+        clean.pop("idempotency_key", None)
+        clean["detach"] = True
+        result = await supervisor._run(supervisor._engine.restore, clean)
+        sid = str(result.get("name") or "")
+        if sid:
+            return supervisor._engine.get(sid).view()
+        return result
+
+    async def _worker_restore_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        if not mesh.worker_begin(idem_key):
+            deadline = time.monotonic() + min(5.0, mesh.create_timeout)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                existing = supervisor._engine.find_by_idempotency_key(idem_key)
+                if existing is not None:
+                    return existing.view()
+            raise MeshError("idempotent create already in progress", code="conflict")
+        try:
+            existing = supervisor._engine.find_by_idempotency_key(idem_key)
+            if existing is not None:
+                return existing.view()
+            name = params.get("name")
+            if isinstance(name, str) and name and (
+                _engine_has(supervisor, name)
+                or mesh.owner_of(name)
+                or await _scatter_locate(mesh, name)
+            ):
+                raise MeshError(f"sandbox {name!r} already exists", code="conflict")
+            view = await _local_detached_restore_view(params)
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                supervisor._engine.record_idempotency(sid, idem_key)
+                recorded = supervisor._engine.get(sid)
+                return recorded.view()
+            return view
+        finally:
+            mesh.worker_end(idem_key)
+
+    async def _coordinate_restore_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        existing = supervisor._engine.find_by_idempotency_key(idem_key)
+        if existing is not None:
+            return existing.view()
+        for _ in range(max(1, len(mesh.peers()) + 1)):
+            pinned = mesh.idem_owner(idem_key)
+            owner = pinned or mesh.place(params)
+            owner = mesh.idem_pin(idem_key, owner)
+            if owner == mesh.node_id:
+                return await _worker_restore_create(idem_key, params)
+            peer_url = mesh.peer_url(owner)
+            if peer_url is None:
+                mesh.mark_unhealthy(owner)
+                mesh.idem_unpin(idem_key)
+                continue
+            try:
+                view = await asyncio.to_thread(
+                    mesh.transport.post,
+                    peer_url,
+                    "/v1/mesh/idem/restore/work",
+                    {"key": idem_key, "params": params},
+                    timeout=mesh.create_timeout,
+                )
+            except MeshError as exc:
+                if exc.code == "unreachable":
+                    mesh.mark_unhealthy(owner)
+                    mesh.idem_unpin(idem_key)
+                    continue
+                raise
+            sid = str(view.get("id") or view.get("name") or "")
+            if sid:
+                mesh.record_owner(sid, owner)
+            return view
+        raise MeshError("no reachable owner for idempotent restore", code="unreachable")
+
+    async def _idempotent_restore_create(idem_key: str, params: dict[str, Any]) -> dict[str, Any]:
+        if not mesh.enabled:
+            return await _worker_restore_create(idem_key, params)
+        coordinator = mesh.coordinator_for(idem_key)
+        if coordinator == mesh.node_id:
+            return await _coordinate_restore_create(idem_key, params)
+        peer_url = mesh.peer_url(coordinator)
+        if peer_url is None:
+            mesh.mark_unhealthy(coordinator)
+            return await _coordinate_restore_create(idem_key, params)
+        try:
+            return await asyncio.to_thread(
+                mesh.transport.post,
+                peer_url,
+                "/v1/mesh/idem/restore/coordinate",
+                {"key": idem_key, "params": params},
+                timeout=mesh.create_timeout,
+            )
+        except MeshError as exc:
+            if exc.code == "unreachable":
+                mesh.mark_unhealthy(coordinator)
+                return await _coordinate_restore_create(idem_key, params)
+            raise
+
+    @app.post("/v1/mesh/idem/restore/coordinate", dependencies=[Depends(require_auth)])
+    async def mesh_idem_restore_coordinate(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            params["detach"] = True
+            return await _coordinate_restore_create(idem_key, params)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+
+    @app.post("/v1/mesh/idem/restore/work", dependencies=[Depends(require_auth)])
+    async def mesh_idem_restore_work(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            idem_key, params = _idem_payload(body)
+            params["detach"] = True
+            return await _worker_restore_create(idem_key, params)
         except MeshError as exc:
             raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
 
@@ -2148,7 +2399,13 @@ def create_app(
     @app.post("/v1/run", dependencies=[Depends(require_auth)])
     async def run_gateway(request: Request, detach: bool = False) -> Response:
         params = dict(await request.json())
+        idem_key = str(params.pop("idempotency_key", "") or "").strip()
         params["detach"] = detach or bool(params.get("detach"))
+        if params["detach"] and idem_key:
+            try:
+                return JSONResponse(await _idempotent_run_create(idem_key, params))
+            except MeshError as exc:
+                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
         if (
             mesh.enabled
             and not request.headers.get("x-vmon-mesh-hop")
@@ -2171,6 +2428,12 @@ def create_app(
     @app.post("/v1/restore", dependencies=[Depends(require_auth)])
     async def restore_gateway(request: Request) -> Response:
         params = dict(await request.json())
+        idem_key = str(params.pop("idempotency_key", "") or "").strip()
+        if params.get("detach") and idem_key:
+            try:
+                return JSONResponse(await _idempotent_restore_create(idem_key, params))
+            except MeshError as exc:
+                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
         if mesh.enabled and not request.headers.get("x-vmon-mesh-hop"):
             owner = mesh.place(params)
             if owner != mesh.node_id:
@@ -2197,7 +2460,10 @@ def create_app(
                     raise HTTPException(
                         status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
                     )
-                response = await asyncio.to_thread(mesh.transport.post, url, "/v1/fork", params)
+                try:
+                    response = await asyncio.to_thread(mesh.transport.post, url, "/v1/fork", params)
+                except MeshError as exc:
+                    raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
                 for clone in response.get("clones") or []:
                     if isinstance(clone, dict) and clone.get("name"):
                         mesh.record_owner(str(clone["name"]), owner)

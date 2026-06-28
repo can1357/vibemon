@@ -44,7 +44,7 @@ class FakeTransport:
         self.clients = {}
         self.token = "secret"
 
-    def post(self, base_url, path, payload):
+    def post(self, base_url, path, payload, *, timeout=None):
         response = self.clients[base_url].post(
             path,
             json=payload,
@@ -54,7 +54,7 @@ class FakeTransport:
             raise MeshError(response.text)
         return response.json() if response.content else {}
 
-    def get(self, base_url, path):
+    def get(self, base_url, path, *, timeout=None):
         response = self.clients[base_url].get(
             path,
             headers={"Authorization": f"Bearer {self.token}", "X-Vmon-Mesh-Hop": "1"},
@@ -79,6 +79,23 @@ class FakeSandbox:
 
     def terminate(self):
         return None
+
+
+def _two_node_apps(monkeypatch, tmp_path, server_mod):
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
+    app_a = server_mod.create_app(token="secret")
+    app_b = server_mod.create_app(token="secret")
+    transport = FakeTransport()
+    app_a.state.mesh.transport = transport
+    app_b.state.mesh.transport = transport
+    app_a.state.mesh.node_id = "A"
+    app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
+    app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
+    app_a.state.mesh.setup("http://a")
+    app_b.state.mesh.setup("http://b")
+    return app_a, app_b, transport
 
 
 def _write_indexed_template(
@@ -482,6 +499,159 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
         listed = client_a.get("/v1/sandboxes", headers={"Authorization": "Bearer secret"})
         rows = listed.json()["sandboxes"]
         assert any(row["id"] == sid and row["node"] == "B" for row in rows)
+
+
+def test_idempotent_sandbox_create_replays_same_key(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        state_b = app_b.state.mesh.self_state()
+        state_b.pools = {"img:x": 2}
+        state_b.last_seen = time.time()
+        app_a.state.mesh.register(state_b)
+
+        payload = {
+            "image": "img:x",
+            "block_network": True,
+            "pool_size": 1,
+            "idempotency_key": "create-key",
+        }
+        first = client_a.post(
+            "/v1/sandboxes", json=payload, headers={"Authorization": "Bearer secret"}
+        )
+        second = client_a.post(
+            "/v1/sandboxes", json=payload, headers={"Authorization": "Bearer secret"}
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert second.json()["id"] == first.json()["id"]
+        assert len(app_a.state.supervisor._engine._records) + len(
+            app_b.state.supervisor._engine._records
+        ) == 1
+
+
+def test_idempotent_sandbox_create_does_not_reroute_ambiguous_commit(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+
+    class AmbiguousAfterCommitTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.raised = False
+
+        def post(self, base_url, path, payload, *, timeout=None):
+            if (
+                base_url == "http://b"
+                and path == "/v1/mesh/idem/sandboxes/work"
+                and not self.raised
+            ):
+                response = self.clients[base_url].post(
+                    path,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "X-Vmon-Mesh-Hop": "1",
+                    },
+                )
+                assert response.status_code == 200
+                self.raised = True
+                raise MeshError("peer response ambiguous", code="ambiguous")
+            return super().post(base_url, path, payload, timeout=timeout)
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: FakeSandbox))
+    app_a = server_mod.create_app(token="secret")
+    app_b = server_mod.create_app(token="secret")
+    transport = AmbiguousAfterCommitTransport()
+    app_a.state.mesh.transport = transport
+    app_b.state.mesh.transport = transport
+    app_a.state.mesh.node_id = "A"
+    app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
+    app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
+    app_a.state.mesh.setup("http://a")
+    app_b.state.mesh.setup("http://b")
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        state_b = app_b.state.mesh.self_state()
+        state_b.pools = {"img:x": 2}
+        state_b.last_seen = time.time()
+        app_a.state.mesh.register(state_b)
+        key = next(
+            f"ambiguous-key-{idx}"
+            for idx in range(64)
+            if app_a.state.mesh.coordinator_for(f"ambiguous-key-{idx}") == "A"
+        )
+
+        payload = {
+            "image": "img:x",
+            "block_network": True,
+            "pool_size": 1,
+            "idempotency_key": key,
+        }
+        first = client_a.post(
+            "/v1/sandboxes", json=payload, headers={"Authorization": "Bearer secret"}
+        )
+        assert first.status_code == 504
+        assert len(app_b.state.supervisor._engine._records) == 1
+        assert len(app_a.state.supervisor._engine._records) == 0
+
+        second = client_a.post(
+            "/v1/sandboxes", json=payload, headers={"Authorization": "Bearer secret"}
+        )
+        assert second.status_code == 201
+        assert len(app_b.state.supervisor._engine._records) == 1
+
+
+def test_idempotent_sandbox_create_rejects_same_name_different_key(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        created = client_a.post(
+            "/v1/sandboxes",
+            json={"image": "img:x", "name": "fixed", "idempotency_key": "one"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        conflict = client_a.post(
+            "/v1/sandboxes",
+            json={"image": "img:x", "name": "fixed", "idempotency_key": "two"},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+        assert created.status_code == 201
+        assert conflict.status_code == 409
+
+
+def test_engine_rehydrates_idempotency_index(monkeypatch, tmp_path):
+    import vmon.vmm as vmm_mod
+    from vmon.core import Engine
+
+    monkeypatch.setattr(vmm_mod, "STATE", tmp_path)
+    vm_dir = tmp_path / "vms" / "replayed"
+    vm_dir.mkdir(parents=True)
+    (vm_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "idempotency_key": "rehydrate-key",
+                "image": "img:x",
+                "status": "stopped",
+                "timeout_secs": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = Engine()
+
+    record = engine.find_by_idempotency_key("rehydrate-key")
+    assert record is not None
+    assert record.id == "replayed"
+    assert "idempotency_key" not in record.view()
 
 
 def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):

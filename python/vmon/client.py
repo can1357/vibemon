@@ -21,6 +21,7 @@ import fcntl
 import itertools
 import json
 import os
+import secrets
 import select
 import signal
 import socket
@@ -541,10 +542,13 @@ class GatewayClient:
             self._bytes("PUT", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}", raw)
             return {"written": len(raw)}
         if method == "run":
-            return self._json("POST", "/v1/run?detach=1", params)
+            payload = {**params}
+            payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
+            return self._json("POST", "/v1/run?detach=1", payload, retries=3)
         if method == "restore":
             payload = {**params, "detach": True}
-            return self._json("POST", "/v1/restore", payload)
+            payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
+            return self._json("POST", "/v1/restore", payload, retries=3)
         if method == "inspect":
             return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}")
         if method == "metrics":
@@ -636,13 +640,29 @@ class GatewayClient:
                 f"cannot reach gateway {self.base_url}: {exc.reason}", code="unreachable"
             ) from exc
 
-    def _json(self, method: str, path: str, payload: Any | None = None) -> dict[str, Any]:
-        with self._request(method, path, payload) as response:
-            raw = response.read()
-        if not raw:
-            return {}
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
+    def _json(
+        self, method: str, path: str, payload: Any | None = None, *, retries: int = 0
+    ) -> dict[str, Any]:
+        for attempt in range(retries + 1):
+            try:
+                with self._request(method, path, payload) as response:
+                    raw = response.read()
+                if not raw:
+                    return {}
+                data = json.loads(raw)
+                return data if isinstance(data, dict) else {}
+            except DaemonError as exc:
+                if attempt >= retries or not self._retryable_create_error(exc):
+                    raise
+                time.sleep(min(0.1 * (2**attempt), 1.0))
+        return {}
+
+    @staticmethod
+    def _retryable_create_error(exc: DaemonError) -> bool:
+        """Return whether an idempotent create may be retried after *exc*."""
+        if exc.code in {"unreachable", "502", "503", "504"}:
+            return True
+        return exc.code == "409" and "idempotent create already in progress" in exc.message
 
     def _bytes(self, method: str, path: str, raw: bytes | None = None) -> bytes:
         with self._request(method, path, raw=raw) as response:

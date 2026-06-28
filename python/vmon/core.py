@@ -176,6 +176,7 @@ class VMRecord:
 
 def _coerce_create_params(params: dict[str, Any]) -> dict[str, Any]:
     """Inflate JSON ``secrets``/``volumes`` into SDK objects for ``Sandbox.create``."""
+    params.pop("idempotency_key", None)
     if "secrets" in params:
         from .secret import Secret
 
