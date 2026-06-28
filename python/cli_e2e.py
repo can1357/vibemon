@@ -284,9 +284,28 @@ def t_detach_ps_exec_stop_rm(_):
     assert ps_status(name) is None, f"{name} still listed after rm"
 
 
+def net_admin() -> bool:
+    """True if the host can create TAP devices (Linux + root/CAP_NET_ADMIN)."""
+    if platform.system() != "Linux":
+        return False
+    try:
+        from vmon import net
+
+        return bool(net.has_net_admin())
+    except Exception:
+        return False
+
+
+def networking_supported() -> bool:
+    """True if networked sandboxes can run on this host (macOS user-net or Linux root)."""
+    return platform.system() == "Darwin" or net_admin()
+
+
 @e2e
 def t_run_networked(_):
     """run -d without --block-network proves guest networking without internet."""
+    if not networking_supported():
+        raise Skip("needs Linux root/CAP_NET_ADMIN (or macOS user-net) for guest networking")
     name = uid("net")
     marker = "NET-OK-" + RUN
     server = _HostHTTPServer(marker.encode("utf-8")).start()
