@@ -1081,16 +1081,16 @@ mod tests {
 		fs::create_dir(&dir).unwrap();
 		let sock = dir.join("control.sock");
 		let listener = UnixListener::bind(&sock).unwrap();
-		let meta = fs::symlink_metadata(&sock).unwrap();
-		let identity = SocketIdentity::from_metadata(&meta);
+		let live = fs::symlink_metadata(&sock).unwrap();
+		// A recorded identity from a *previous* socket at this path. Craft it to
+		// differ from the live inode rather than relying on the filesystem to hand
+		// a replacement a fresh inode number — Linux readily recycles it, which
+		// would make a stale identity spuriously match the live socket.
+		let stale = SocketIdentity { dev: live.dev(), ino: live.ino().wrapping_add(1) };
+		cleanup_socket_for_uid(&sock, live.uid(), Some(stale));
+
+		assert!(sock.exists(), "cleanup removed a socket whose identity did not match");
 		drop(listener);
-		fs::remove_file(&sock).unwrap();
-
-		let replacement = UnixListener::bind(&sock).unwrap();
-		cleanup_socket_for_uid(&sock, meta.uid(), Some(identity));
-
-		assert!(sock.exists(), "cleanup removed a replacement socket");
-		drop(replacement);
 		fs::remove_file(&sock).unwrap();
 		fs::remove_dir(&dir).unwrap();
 	}
