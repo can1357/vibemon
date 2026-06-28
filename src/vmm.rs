@@ -1294,6 +1294,7 @@ const fn device_kind_name(kind: DeviceKind) -> &'static str {
 		DeviceKind::Net => "net",
 		DeviceKind::Console => "console",
 		DeviceKind::Fs => "fs",
+		DeviceKind::Rng => "rng",
 	}
 }
 
@@ -1372,6 +1373,7 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 				BackendHint::Net { .. } | BackendHint::UserNet { .. } => None,
 				BackendHint::Console => None,
 				BackendHint::Fs { .. } => None,
+				BackendHint::Rng => None,
 			})
 		});
 	let snap_has_net = snap
@@ -1726,6 +1728,55 @@ impl Vmm {
 							device,
 							DeviceKind::Console,
 							BackendHint::Console,
+							gsi,
+							pci_slot,
+							pci_bar_base,
+							None,
+							&mut workers,
+							&mut devices,
+						)?;
+						pci_slot += 1;
+						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
+					}
+					#[cfg(not(target_arch = "x86_64"))]
+					unreachable!("--transport pci is rejected during config parsing");
+				},
+			}
+			gsi += 1;
+		}
+
+		if config.rng {
+			let rng = crate::virtio::rng::Rng::new()?;
+			let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(rng));
+			match config.transport {
+				Transport::Mmio => {
+					wire_device(
+						&vm,
+						&mut mmio_bus,
+						device,
+						DeviceKind::Rng,
+						BackendHint::Rng,
+						gsi,
+						mmio_base,
+						None,
+						0,
+						&mut workers,
+						&mut devices,
+					)?;
+					push_virtio_cmdline(&mut cmdline, mmio_base, gsi);
+					virtio_infos.push((mmio_base, gsi));
+					mmio_base += MMIO_DEVICE_SIZE;
+				},
+				Transport::Pci => {
+					#[cfg(target_arch = "x86_64")]
+					{
+						wire_pci_device(
+							&vm,
+							pci_root.as_ref().expect("pci root"),
+							pci_mmio.as_ref().expect("pci mmio"),
+							device,
+							DeviceKind::Rng,
+							BackendHint::Rng,
 							gsi,
 							pci_slot,
 							pci_bar_base,
@@ -2128,6 +2179,7 @@ impl Vmm {
 					console_output = Some(console.output_handle());
 					Arc::new(Mutex::new(console))
 				},
+				BackendHint::Rng => Arc::new(Mutex::new(crate::virtio::rng::Rng::new()?)),
 			};
 			match ds.transport {
 				DeviceTransportKind::Mmio => {
@@ -3330,6 +3382,7 @@ fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
 			BackendHint::Fs { tag: tag.clone(), shared_dir, read_only }
 		},
 		BackendHint::Console => BackendHint::Console,
+		BackendHint::Rng => BackendHint::Rng,
 	}
 }
 

@@ -116,6 +116,9 @@ pub struct Config {
 	pub count:              u32,
 	/// Attach a virtio-console agent channel (/dev/hvc0) for warm-boot exec.
 	pub console_agent:      bool,
+	/// Attach a virtio-rng entropy device (/dev/hwrng) seeded from
+	/// `/dev/urandom`.
+	pub rng:                bool,
 	/// After (warm) boot, send this command line to the guest agent over the
 	/// console.
 	pub agent_exec:         Option<String>,
@@ -289,6 +292,10 @@ struct CliArgs {
 	/// Attach a virtio-console agent channel (/dev/hvc0)
 	#[arg(long)]
 	console_agent: bool,
+
+	/// Attach a virtio-rng entropy device (/dev/hwrng) seeded from the host
+	#[arg(long)]
+	rng: bool,
 
 	/// Send <cmd> to the guest agent after (warm) boot
 	#[arg(long, value_name = "CMD", allow_hyphen_values = true)]
@@ -649,6 +656,7 @@ impl Config {
 			disk_overlay_of: cli.disk_overlay_of,
 			count: count as u32,
 			console_agent,
+			rng: cli.rng,
 			agent_exec: cli.agent_exec,
 			jail,
 			id: cli.id,
