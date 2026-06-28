@@ -32,10 +32,10 @@ use crate::{
 	result::{Result, err},
 };
 
-/// Snapshot format version. This is the first postcard-encoded format;
-/// snapshots from earlier (bincode) builds are unsupported and must be
-/// recaptured.
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// Snapshot format version (postcard-encoded). Bumped to 2 to add the
+/// virtio-rng device kind; v1 and earlier (bincode) snapshots are unsupported
+/// and must be recaptured.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 const DELTA_PAGE_SIZE: u64 = 4096;
 const MAX_DELTA_CHAIN_DEPTH: usize = 64;
@@ -122,6 +122,7 @@ pub enum DeviceKind {
 	Net,
 	Console,
 	Fs,
+	Rng,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,6 +154,8 @@ pub enum BackendHint {
 		shared_dir: String,
 		read_only:  bool,
 	},
+	/// virtio-rng entropy source; no host backend to reopen.
+	Rng,
 }
 
 /// Per-device transport + queue + backend state.
@@ -767,6 +770,7 @@ fn validate_device_states(devices: &[DeviceState], mem_regions: &[MemRegion]) ->
 			(DeviceKind::Net, BackendHint::Net { .. } | BackendHint::UserNet { .. }) => 2,
 			(DeviceKind::Console, BackendHint::Console) => 2,
 			(DeviceKind::Fs, BackendHint::Fs { .. }) => 2,
+			(DeviceKind::Rng, BackendHint::Rng) => 1,
 			(kind, _) => {
 				return Err(err(format!("snapshot device {idx} backend does not match kind {kind:?}")));
 			},

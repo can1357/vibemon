@@ -10,7 +10,7 @@ fn restore_resumes_past_snapshot_marker() {
 		return;
 	}
 
-	let snap = create_snapshot("restore");
+	let snap = create_snapshot("restore", &[]);
 	let args = vec!["--restore".to_string(), snap.display().to_string()];
 	let refs = common::as_refs(&args);
 	let output = common::boot_capture(&refs, "SNAPSHOT_AFTER_RESTORE", Duration::from_secs(90));
@@ -36,7 +36,7 @@ fn fork_from_count_two_starts_two_clones() {
 		return;
 	}
 
-	let snap = create_snapshot("fork");
+	let snap = create_snapshot("fork", &[]);
 	let args = vec![
 		"--fork-from".to_string(),
 		snap.display().to_string(),
@@ -59,7 +59,7 @@ fn fork_from_count_two_starts_two_clones() {
 	common::assert_no_panic(&output);
 }
 
-fn create_snapshot(name: &str) -> PathBuf {
+fn create_snapshot(name: &str, extra_args: &[&str]) -> PathBuf {
 	let dir = common::test_dir(&format!("snapshot-{name}"));
 	let sock = dir.join("control.sock");
 	let snap_name = "snapshot";
@@ -69,6 +69,9 @@ fn create_snapshot(name: &str) -> PathBuf {
 	args.push(sock.display().to_string());
 	args.push("--snapshot-root".into());
 	args.push(dir.display().to_string());
+	for arg in extra_args {
+		args.push((*arg).to_string());
+	}
 	let refs = common::as_refs(&args);
 	let mut vm = common::spawn_vmm(&refs);
 	vm.wait_for("SNAPSHOT_READY", Duration::from_mins(1));
@@ -136,6 +139,29 @@ fn delta_snapshot_restores_and_is_smaller() {
 	restore_args.push(restore.display().to_string());
 	let refs = common::as_refs(&restore_args);
 	let output = common::boot_capture(&refs, "SNAPSHOT_AFTER_RESTORE", Duration::from_secs(90));
+	assert!(
+		output.contains("SNAPSHOT_AFTER_RESTORE") || output.contains("SNAPSHOT_RESTORED"),
+		"restore marker missing:\n{output}"
+	);
+	common::assert_no_panic(&output);
+}
+
+#[test]
+fn rng_device_survives_snapshot_restore() {
+	if !common::require_hv() {
+		return;
+	}
+
+	// Snapshot a VM carrying the virtio-rng device, then restore it (the device
+	// is reconstructed from the snapshot's backend hint, so no flag is needed on
+	// restore) and confirm it resumes past the snapshot marker. This exercises
+	// rng device-state capture, restore validation, and the BackendHint::Rng
+	// reconstruct + reactivate path.
+	let snap = create_snapshot("rng", &["--rng"]);
+	let args = vec!["--restore".to_string(), snap.display().to_string()];
+	let refs = common::as_refs(&args);
+	let output = common::boot_capture(&refs, "SNAPSHOT_AFTER_RESTORE", Duration::from_secs(90));
+
 	assert!(
 		output.contains("SNAPSHOT_AFTER_RESTORE") || output.contains("SNAPSHOT_RESTORED"),
 		"restore marker missing:\n{output}"
