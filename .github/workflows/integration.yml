@@ -40,6 +40,8 @@ jobs:
           sudo chmod 0666 /dev/kvm || true
           test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not accessible"; exit 1; }
           ls -l /dev/kvm
+          # Allow non-root userfaultfd so the pager (mem-target) tests can run.
+          sudo sysctl -w vm.unprivileged_userfaultfd=1 || true
 
       - name: Install system dependencies
         # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds the
@@ -72,7 +74,7 @@ jobs:
       - name: Prepare host tap
         run: |
           sudo ip link delete vmon0 2>/dev/null || true
-          sudo ip tuntap add dev vmon0 mode tap
+          sudo ip tuntap add dev vmon0 mode tap user "$(id -un)"
           sudo ip addr add 192.168.249.1/24 dev vmon0
           sudo ip link set dev vmon0 up
 
