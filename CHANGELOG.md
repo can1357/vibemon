@@ -40,6 +40,7 @@ All notable changes to this project are recorded here.
 ### Fixed
 
 - Fixed the remote page-source URL builder (`_remote_page_url`) to coerce the resolved host to `str`, fixing a type error and guarding the IPv6-bracketing check against non-string `getaddrinfo` results.
+- Restored a green AArch64 Linux clippy CI gate: the FUSE_MKNOD/`FUSE_CREATE` mode checks now suppress `unnecessary_cast` for the `libc::S_IF*` constants (signed `c_int` on macOS, `c_uint` on Linux), `PagerFatal::new` is `const fn`, and the remote-pager test server takes its 4 KiB page by reference.
 - Fixed template resolution to account for virtio-fs slot variations
 - Prevented potential deadlocks in stdin forwarding when handling non-TTY streams
 - Fixed mesh placement to strictly enforce hypervisor and architecture compatibility

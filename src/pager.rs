@@ -211,7 +211,7 @@ mod linux {
 	}
 
 	impl PagerFatal {
-		pub fn new(gate: Arc<PauseGate>, exit_reason: Arc<AtomicU8>, exit_code: u8) -> Self {
+		pub const fn new(gate: Arc<PauseGate>, exit_reason: Arc<AtomicU8>, exit_code: u8) -> Self {
 			Self { gate, exit_reason, exit_code }
 		}
 	}
@@ -1254,7 +1254,8 @@ mod linux {
 			noisy
 		}
 
-		fn one_page_server(page: [u8; PAGE_SIZE], expected_page: u32) -> (String, JoinHandle<()>) {
+		fn one_page_server(page: &[u8; PAGE_SIZE], expected_page: u32) -> (String, JoinHandle<()>) {
+			let page = *page;
 			let listener = TcpListener::bind("127.0.0.1:0").expect("bind page server");
 			let addr = listener.local_addr().expect("page server address");
 			let handle = thread::spawn(move || {
@@ -1294,7 +1295,7 @@ mod linux {
 		#[test]
 		fn remote_page_source_fetches_page_over_http() {
 			let page = noisy_page();
-			let (url, handle) = one_page_server(page, 7);
+			let (url, handle) = one_page_server(&page, 7);
 			let source = RemotePageSource::new(&url, "secret".to_string()).expect("remote source");
 			let mut out = [0u8; PAGE_SIZE];
 			source.fetch_page(7, &mut out).expect("fetch page");
@@ -1305,7 +1306,7 @@ mod linux {
 		#[test]
 		fn remote_pager_faults_in_source_page() {
 			let page = noisy_page();
-			let (url, handle) = one_page_server(page, 0);
+			let (url, handle) = one_page_server(&page, 0);
 			let Some(f) = Fixture::new_remote(&url) else {
 				return;
 			};

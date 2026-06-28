@@ -1589,8 +1589,10 @@ impl FsState {
 				else {
 					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
 				};
-				let kind = min.mode & libc::S_IFMT as u32;
-				if kind != 0 && kind != libc::S_IFREG as u32 {
+				#[allow(clippy::unnecessary_cast, reason = "S_IF* are c_int on macOS, c_uint on Linux")]
+				let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+				let kind = min.mode & ifmt;
+				if kind != 0 && kind != ifreg {
 					return write_reply(mem, writable, unique, -libc::EOPNOTSUPP, &[]);
 				}
 				let mut create = fs::OpenOptions::new();
@@ -2166,6 +2168,7 @@ mod tests {
 		let root = temp_dir("vmon-fs-mknod");
 		let mut fs = Fs::new("host".to_string(), root.clone(), false).unwrap();
 
+		#[allow(clippy::unnecessary_cast, reason = "S_IFREG is c_int on macOS, c_uint on Linux")]
 		let min =
 			FuseMknodIn { mode: libc::S_IFREG as u32 | 0o644, rdev: 0, umask: 0, padding: 0 };
 		let mut payload = struct_bytes(&min).to_vec();
