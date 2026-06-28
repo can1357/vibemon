@@ -1,0 +1,76 @@
+name: KVM host setup
+description: >-
+  Prepare a GitHub-hosted Linux runner to boot vmon microVMs under KVM: enable
+  /dev/kvm + userfaultfd, install build deps, build the vmm + guest agent (cached),
+  fetch guest assets (cached), and bring up the shared host tap.
+
+runs:
+  using: composite
+  steps:
+    - name: Enable KVM and userfaultfd
+      # Grant the runner user /dev/kvm (fail loudly if absent so tests can't
+      # silently skip into a false green) and allow non-root userfaultfd for the
+      # pager tests.
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm || true
+        sudo chmod 0666 /dev/kvm || true
+        test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not accessible"; exit 1; }
+        sudo sysctl -w vm.unprivileged_userfaultfd=1 || true
+
+    - name: Install system dependencies
+      # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds the rootfs
+      # fixtures. docker is preinstalled and builds image rootfses.
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cpio e2fsprogs
+
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: rustup show
+
+    - name: Cache cargo build
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: kvm-integration
+
+    - name: Install just
+      uses: taiki-e/install-action@just
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Install Python 3.14
+      shell: bash
+      run: uv python install 3.14
+
+    - name: Build vmm
+      shell: bash
+      run: cargo build --locked
+
+    - name: Build static guest agent
+      shell: bash
+      run: just agent-musl
+
+    - name: Cache guest assets
+      uses: actions/cache@v4
+      with:
+        path: target/test-assets
+        key: test-assets-${{ runner.arch }}-${{ hashFiles('demo/fetch-test-assets.sh') }}
+
+    - name: Fetch test assets
+      shell: bash
+      run: just fetch-assets
+
+    - name: Prepare host tap
+      # Owned by the runner user so a non-root vmm can open it (net tests).
+      shell: bash
+      run: |
+        sudo ip link delete vmon0 2>/dev/null || true
+        sudo ip tuntap add dev vmon0 mode tap user "$(id -un)"
+        sudo ip addr add 192.168.249.1/24 dev vmon0
+        sudo ip link set dev vmon0 up

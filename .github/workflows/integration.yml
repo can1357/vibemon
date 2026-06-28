@@ -12,11 +12,13 @@ permissions:
   contents: read
 
 jobs:
-  integration:
+  # Hosted real-VM integration: boots real microVMs on a GitHub-hosted Linux
+  # runner (/dev/kvm) and drives the full stack (vmm + guest agent + SDK + CLI)
+  # through the Python e2e suite. Runs on every push/PR in ~5 minutes.
+  kvm-integration:
     name: KVM integration
-    # GitHub-hosted Linux runners expose /dev/kvm (nested virtualization), so the
-    # full KVM e2e suite runs here without a self-hosted box.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
@@ -27,40 +29,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable KVM
-        # Grant the runner user access to /dev/kvm and fail loudly if the runner
-        # lacks it, so the e2e suite can never silently skip into a false green.
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm || true
-          # The udev rule covers nodes created later; chmod the already-present
-          # device so a non-root vmm can open it this run.
-          sudo chmod 0666 /dev/kvm || true
-          test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not accessible"; exit 1; }
-          ls -l /dev/kvm
-          # Allow non-root userfaultfd so the pager (mem-target) tests can run.
-          sudo sysctl -w vm.unprivileged_userfaultfd=1 || true
+      - name: Prepare KVM host
+        uses: ./.github/actions/kvm-host
 
-      - name: Install system dependencies
-        # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds the
-        # rootfs fixtures. docker is preinstalled and builds image rootfses.
+      - name: Run Python real-VM e2e
+        working-directory: python
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cpio e2fsprogs
+          uv run e2e.py
+          uv run cli_e2e.py
+          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
+
+  # The Rust integration + soak suites boot many VMs single-threaded and depend
+  # on bare-metal KVM pause/snapshot timing that GitHub-hosted *nested* KVM does
+  # not provide (snapshot/pause tests hang and the suite is slow there). Keep
+  # them on a self-hosted KVM runner via the nightly schedule or manual dispatch.
+  kvm-rust:
+    name: KVM Rust integration
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, kvm, x64]
+    env:
+      VMON_TAP: vmon0
+      VMON_HOST_IP: 192.168.249.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install pinned Rust toolchain
         run: rustup show
 
       - name: Install just
         uses: taiki-e/install-action@just
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install Python 3.14
-        run: uv python install 3.14
 
       - name: Build vmm
         run: cargo build --locked
@@ -74,16 +72,9 @@ jobs:
       - name: Prepare host tap
         run: |
           sudo ip link delete vmon0 2>/dev/null || true
-          sudo ip tuntap add dev vmon0 mode tap user "$(id -un)"
+          sudo ip tuntap add dev vmon0 mode tap
           sudo ip addr add 192.168.249.1/24 dev vmon0
           sudo ip link set dev vmon0 up
-
-      - name: Run Python real-VM e2e
-        working-directory: python
-        run: |
-          uv run e2e.py
-          uv run cli_e2e.py
-          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
 
       - name: Run integration tests
         run: just integration
