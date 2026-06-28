@@ -10,6 +10,7 @@ pytest.importorskip("fastapi")
 from starlette.responses import Response
 from starlette.testclient import TestClient
 
+from vmon.image import _TEMPLATE_BOOT_VERSION
 from vmon.mesh import (
     Mesh,
     MeshError,
@@ -122,7 +123,7 @@ def _write_indexed_template(
         "image": image,
         "digest": "image-digest",
         "disk_mb": disk_mb,
-        "boot_version": 5,
+        "boot_version": _TEMPLATE_BOOT_VERSION,
         "kernel_sha": "kernel",
         "fs_slots": fs_slots,
         "memory": memory,
@@ -977,3 +978,225 @@ def test_placement_is_backend_and_arch_compatible(tmp_path):
     plain = {n.node_id for n in mesh.candidates({"image": "plain"})}
     assert plain == {"self", "hvfnode", "kvmnode"}
     assert "armnode" not in plain
+
+
+def _register_compatible_peer(app_a, app_b):
+    """Make A see B as a healthy, restore-compatible migration target."""
+    app_a.state.mesh.cpu_baseline = "arch:test"
+    state_b = app_b.state.mesh.self_state()
+    state_b.cpu_baseline = "arch:test"
+    state_b.last_seen = time.time()
+    app_a.state.mesh.register(state_b)
+
+
+def test_two_node_migration_moves_sandbox_and_converges(monkeypatch, tmp_path):
+    """A block-network sandbox migrates A->B; ownership remaps and the old owner
+    now proxies to the new one. The snapshot/restore boundary is faked (no
+    hypervisor); ``test_migrate.py`` covers the engine internals."""
+    import vmon.core as core_mod
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+
+    async def fake_proxy(request, peer_url, token):
+        body = await request.body()
+        path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        response = transport.clients[peer_url].request(
+            request.method,
+            path,
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Vmon-Mesh-Hop": "1",
+                "Content-Type": request.headers.get("content-type", "application/json"),
+            },
+        )
+        return Response(response.content, status_code=response.status_code)
+
+    monkeypatch.setattr(server_mod, "_proxy_to_peer", fake_proxy)
+    digest, _key = _write_indexed_template(tmp_path / "ckpt", image="img")
+
+    def fake_prepare(self, name):
+        return {
+            "digest": digest,
+            "snapshot": "migrate-job",
+            "snapshot_dir": str(tmp_path / "ckpt"),
+            "params": {"name": name, "block_network": True, "memory": 512, "cpus": 1},
+        }
+
+    def fake_commit(self, name, snapshot_dir, digest):
+        with self._lock:
+            self._records.pop(name, None)
+        return {"name": name, "migrated": True}
+
+    monkeypatch.setattr(core_mod.Engine, "migrate_prepare", fake_prepare)
+    monkeypatch.setattr(core_mod.Engine, "migrate_commit", fake_commit)
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        app_b.state.mesh_http = FakeMeshHTTP({"http://a": client_a})
+        _register_compatible_peer(app_a, app_b)
+        app_a.state.supervisor._engine.create(
+            {"image": "img", "name": "job", "block_network": True, "memory": 512, "cpus": 1}
+        )
+
+        moved = client_a.post(
+            "/v1/sandboxes/job/migrate",
+            json={"target": "B"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert moved.status_code == 200, moved.text
+        assert "job" not in app_a.state.supervisor._engine._records
+        assert "job" in app_b.state.supervisor._engine._records
+        assert app_a.state.mesh.owner_of("job") == "B"
+
+        # The old owner now transparently proxies the sandbox to its new home.
+        got = client_a.get("/v1/sandboxes/job", headers={"Authorization": "Bearer secret"})
+        assert got.status_code == 200, got.text
+        assert got.json()["id"] == "job"
+
+
+def test_two_node_migration_rolls_back_on_target_failure(monkeypatch, tmp_path):
+    """A target-side failure leaves the source in place and ownership unchanged."""
+    import vmon.core as core_mod
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+
+    def fake_prepare(self, name):
+        # A digest the target cannot pull: the receive fails and the source rolls back.
+        return {
+            "digest": "0" * 64,
+            "snapshot": "migrate-job",
+            "snapshot_dir": str(tmp_path / "ckpt-missing"),
+            "params": {"name": name, "block_network": True, "memory": 512, "cpus": 1},
+        }
+
+    aborted: list[str] = []
+
+    def fake_abort(self, name, snapshot_dir, digest, params):
+        aborted.append(name)
+        return self.get(name).view()
+
+    monkeypatch.setattr(core_mod.Engine, "migrate_prepare", fake_prepare)
+    monkeypatch.setattr(core_mod.Engine, "migrate_abort", fake_abort)
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        app_b.state.mesh_http = FakeMeshHTTP({"http://a": client_a})
+        _register_compatible_peer(app_a, app_b)
+        app_a.state.supervisor._engine.create(
+            {"image": "img", "name": "job", "block_network": True, "memory": 512, "cpus": 1}
+        )
+
+        moved = client_a.post(
+            "/v1/sandboxes/job/migrate",
+            json={"target": "B"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert moved.status_code == 502, moved.text
+        assert aborted == ["job"]
+        assert "job" in app_a.state.supervisor._engine._records
+        assert "job" not in app_b.state.supervisor._engine._records
+        assert app_a.state.mesh.owner_of("job") == "A"
+
+
+def test_migrate_to_unknown_target_is_rejected(monkeypatch, tmp_path):
+    """An unknown target is rejected before any checkpoint, so the source is untouched."""
+    import vmon.core as core_mod
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+    prepared: list[str] = []
+
+    def fake_prepare(self, name):
+        prepared.append(name)
+        return {}
+
+    monkeypatch.setattr(core_mod.Engine, "migrate_prepare", fake_prepare)
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        app_a.state.supervisor._engine.create(
+            {"image": "img", "name": "job", "block_network": True, "memory": 512, "cpus": 1}
+        )
+        moved = client_a.post(
+            "/v1/sandboxes/job/migrate",
+            json={"target": "ghost"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert moved.status_code >= 400
+        assert prepared == []
+        assert "job" in app_a.state.supervisor._engine._records
+
+
+def test_mesh_leave_drain_migrates_owned_sandboxes(monkeypatch, tmp_path):
+    """``leave --drain`` migrates every locally-owned sandbox to a peer first."""
+    import vmon.core as core_mod
+    import vmon.server as server_mod
+
+    app_a, app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+    digest, _key = _write_indexed_template(tmp_path / "ckpt", image="img")
+
+    def fake_prepare(self, name):
+        return {
+            "digest": digest,
+            "snapshot": f"m-{name}",
+            "snapshot_dir": str(tmp_path / "ckpt"),
+            "params": {"name": name, "block_network": True, "memory": 512, "cpus": 1},
+        }
+
+    def fake_commit(self, name, snapshot_dir, digest):
+        with self._lock:
+            self._records.pop(name, None)
+        return {"name": name, "migrated": True}
+
+    monkeypatch.setattr(core_mod.Engine, "migrate_prepare", fake_prepare)
+    monkeypatch.setattr(core_mod.Engine, "migrate_commit", fake_commit)
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        app_b.state.mesh_http = FakeMeshHTTP({"http://a": client_a})
+        _register_compatible_peer(app_a, app_b)
+        for sid in ("j1", "j2"):
+            app_a.state.supervisor._engine.create(
+                {"image": "img", "name": sid, "block_network": True, "memory": 512, "cpus": 1}
+            )
+
+        left = client_a.post(
+            "/v1/mesh/leave", json={"drain": True}, headers={"Authorization": "Bearer secret"}
+        )
+        assert left.status_code == 200, left.text
+        drained = {item["sandbox"]: item["status"] for item in left.json()["drained"]}
+        assert drained == {"j1": "migrated", "j2": "migrated"}
+        assert "j1" not in app_a.state.supervisor._engine._records
+        assert "j2" not in app_a.state.supervisor._engine._records
+        assert "j1" in app_b.state.supervisor._engine._records
+        assert "j2" in app_b.state.supervisor._engine._records
+        assert app_a.state.mesh.enabled is False
+
+
+def test_mesh_leave_drain_skips_when_no_peer(monkeypatch, tmp_path):
+    """With no reachable peer, drain reports each owned sandbox as skipped, then leaves."""
+    import vmon.core as core_mod
+    import vmon.server as server_mod
+
+    app_a, _app_b, transport = _two_node_apps(monkeypatch, tmp_path, server_mod)
+
+    def fail_prepare(self, name):
+        raise AssertionError("drain must not checkpoint without a target")
+
+    monkeypatch.setattr(core_mod.Engine, "migrate_prepare", fail_prepare)
+
+    with TestClient(app_a) as client_a:
+        transport.clients = {"http://a": client_a}
+        app_a.state.supervisor._engine.create(
+            {"image": "img", "name": "solo", "block_network": True, "memory": 512, "cpus": 1}
+        )
+        left = client_a.post(
+            "/v1/mesh/leave", json={"drain": True}, headers={"Authorization": "Bearer secret"}
+        )
+        assert left.status_code == 200, left.text
+        drained = left.json()["drained"]
+        assert drained == [{"sandbox": "solo", "status": "skipped", "reason": "no compatible peer"}]
+        assert app_a.state.mesh.enabled is False

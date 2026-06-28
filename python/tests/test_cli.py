@@ -401,3 +401,33 @@ def test_stats_table_flattens_metric_groups(capsys):
     assert "boot_duration_ms" in out
     # The whole point: groups are expanded, never dumped as a Python dict repr.
     assert "{" not in out and "}" not in out
+
+
+def test_mesh_migrate_cli_posts_to_gateway(monkeypatch):
+    """``vmon mesh migrate NAME NODE`` calls the per-sandbox migrate gateway route."""
+    import vmon.cli as cli
+
+    calls = []
+
+    def fake_call(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {}
+
+    monkeypatch.setattr(cli, "_mesh_call", fake_call)
+    assert cli.main(["mesh", "migrate", "web", "nodeB"]) == 0
+    assert calls == [("POST", "/v1/sandboxes/web/migrate", {"target": "nodeB"})]
+
+
+def test_mesh_leave_drain_cli_passes_flag(monkeypatch):
+    """``vmon mesh leave --drain`` asks the gateway to drain before leaving."""
+    import vmon.cli as cli
+
+    calls = []
+
+    def fake_call(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {"drained": []}
+
+    monkeypatch.setattr(cli, "_mesh_call", fake_call)
+    assert cli.main(["mesh", "leave", "--drain"]) == 0
+    assert calls == [("POST", "/v1/mesh/leave", {"drain": True})]
