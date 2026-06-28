@@ -195,3 +195,21 @@ def test_prewarm_picks_nic_slot_flavor_by_platform(monkeypatch, mvm_home):
         assert seen["nic_slot"] is False
     finally:
         sandbox_mod.shutdown_all_pools()
+
+
+def test_boot_rootfs_passes_rng_flag_only_when_requested(monkeypatch, mvm_home):
+    from vmon.vmm import MicroVM
+
+    monkeypatch.setenv("VMON_KERNEL", "/tmp/fake-kernel")
+    captured: dict[str, list[str]] = {}
+
+    def fake_launch(self, args, **meta):
+        captured["args"] = list(args)
+
+    monkeypatch.setattr(MicroVM, "_launch", fake_launch)
+
+    MicroVM.boot_rootfs(mvm_home / "rootfs.img", rng=True)
+    assert "--rng" in captured["args"]
+
+    MicroVM.boot_rootfs(mvm_home / "rootfs.img")
+    assert "--rng" not in captured["args"]

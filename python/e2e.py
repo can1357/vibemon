@@ -276,6 +276,23 @@ def t_exec(_):
 
 
 @e2e
+def t_rng(_):
+    """The guest exposes a working /dev/hwrng entropy device by default."""
+    sb = make_sandbox(memory=256)
+    try:
+        rc, out, err = run(
+            sb,
+            "sh",
+            "-lc",
+            "test -c /dev/hwrng && dd if=/dev/hwrng bs=32 count=1 2>/dev/null | wc -c",
+        )
+        assert rc == 0, f"hwrng check failed: rc={rc} err={err!r}"
+        assert out.strip() == "32", f"expected 32 entropy bytes from /dev/hwrng, got {out!r}"
+    finally:
+        sb.terminate()
+
+
+@e2e
 def t_pty(_):
     """pty exec presents a tty on stdout; plain exec does not; resize is accepted."""
     sb = make_sandbox()
