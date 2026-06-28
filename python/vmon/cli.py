@@ -578,10 +578,26 @@ def status():
     return 0
 
 
-@mesh.command(context_settings=_CTX, help="Leave the cluster (does not migrate running VMs).")
-def leave():
-    _mesh_call("POST", "/v1/mesh/leave")
+@mesh.command(context_settings=_CTX, help="Leave the cluster (--drain migrates owned VMs first).")
+@click.option("--drain", is_flag=True, help="migrate owned sandboxes to peers before leaving")
+def leave(drain):
+    result = _mesh_call("POST", "/v1/mesh/leave", {"drain": drain})
+    for item in result.get("drained") or []:
+        name = item.get("sandbox")
+        if item.get("status") == "migrated":
+            ui.success(f"drained [vmon.command]{name}[/] → {item.get('target')}")
+        else:
+            ui.error(f"{item.get('status')} [vmon.command]{name}[/]: {item.get('reason')}")
     ui.success("left the cluster")
+    return 0
+
+
+@mesh.command(context_settings=_CTX, help="Migrate a running microVM to another mesh NODE.")
+@click.argument("name")
+@click.argument("node")
+def migrate(name, node):
+    _mesh_call("POST", f"/v1/sandboxes/{name}/migrate", {"target": node})
+    ui.success(f"migrated [vmon.command]{name}[/] to node {node}")
     return 0
 
 

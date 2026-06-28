@@ -134,6 +134,19 @@ def resolve_digest(digest: str) -> Path | None:
     return template_dir
 
 
+def drop_digest(digest: str) -> None:
+    """Remove a digest's CAS pointer (the template directory is left untouched).
+
+    Used to un-advertise a transient template (e.g. a migration checkpoint) so
+    peers can no longer pull it, without deleting any directory a live VM may
+    still reference.
+    """
+    try:
+        _pointer_path(digest).unlink(missing_ok=True)
+    except ValueError:
+        pass
+
+
 def list_digests() -> dict[str, str]:
     """Return digest -> template directory for all live CAS pointers."""
     live: dict[str, str] = {}

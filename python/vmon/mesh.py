@@ -799,6 +799,46 @@ class Mesh:
             self._explicit_owners.pop(sid, None)
             self._owners.pop(sid, None)
 
+    def migration_target(self, node_id: str) -> NodeState:
+        """Validate and return a healthy, restore-compatible peer for a migration.
+
+        The target restores the source's snapshot, so it must be a *different* node
+        of the same backend + arch whose CPU covers this node's snapshot baseline
+        (snapshots bake the originating CPUID/XSAVE surface).
+        """
+        with self._lock:
+            if not node_id or node_id == self.node_id:
+                raise MeshError("a sandbox cannot migrate to its current node", code="invalid")
+            peer = self._peers.get(node_id)
+            if peer is None or not peer.healthy(time.time(), self.interval):
+                raise MeshError(
+                    f"target node {node_id!r} is not a healthy mesh peer", code="unreachable"
+                )
+            if peer.arch != self.arch or peer.backend != self.backend:
+                raise MeshError(
+                    "target node has an incompatible hypervisor or architecture", code="invalid"
+                )
+            if not cpu_baseline_covers(peer.cpu_baseline, self.cpu_baseline):
+                raise MeshError(
+                    "target node CPU cannot restore this node's snapshots", code="invalid"
+                )
+            return peer
+
+    def broadcast_owner(self, sid: str, node_id: str) -> None:
+        """Record a sandbox's new owner locally and push it to every peer.
+
+        Speeds cluster-wide convergence after a migration so requests route to the
+        new owner without waiting for the next gossip round; ``_scatter_locate`` is
+        the backstop for any peer that misses the push.
+        """
+        self.record_owner(sid, node_id)
+        with self._lock:
+            peers = list(self._peers.values())
+        payload = {"sid": sid, "node_id": node_id}
+        for peer in peers:
+            with contextlib.suppress(Exception):
+                self.transport.post(peer.advertise, "/v1/mesh/owner", payload)
+
     def peer_url(self, node_id: str) -> str | None:
         """Return the advertised URL for a node id."""
         with self._lock:

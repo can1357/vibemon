@@ -1777,10 +1777,38 @@ def create_app(
         ensure_mesh_heartbeat()
         return status_view
 
+    def _drain_target() -> str | None:
+        """The first healthy peer this node can migrate a sandbox to (never self)."""
+        for peer in mesh.peers():
+            try:
+                mesh.migration_target(peer.node_id)
+            except MeshError:
+                continue
+            return peer.node_id
+        return None
+
     @app.post("/v1/mesh/leave", dependencies=[Depends(require_auth)])
-    async def mesh_leave() -> dict[str, bool]:
+    async def mesh_leave(body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Leave the cluster. With ``{"drain": true}`` migrate locally-owned
+        sandboxes to peers first; any that cannot move are reported and abandoned."""
+        drained: list[dict[str, Any]] = []
+        if bool((body or {}).get("drain")) and mesh.enabled:
+            for sid in list(supervisor._engine.owned_ids()):
+                target = _drain_target()
+                if target is None:
+                    drained.append(
+                        {"sandbox": sid, "status": "skipped", "reason": "no compatible peer"}
+                    )
+                    continue
+                try:
+                    await _migrate_sandbox_to(sid, target)
+                except Exception as exc:
+                    detail = getattr(exc, "detail", str(exc))
+                    drained.append({"sandbox": sid, "status": "failed", "reason": str(detail)})
+                else:
+                    drained.append({"sandbox": sid, "status": "migrated", "target": target})
         mesh.leave()
-        return {"ok": True}
+        return {"ok": True, "drained": drained}
 
     @app.get("/v1/mesh/status", dependencies=[Depends(require_auth)])
     async def mesh_status() -> dict[str, Any]:
@@ -1812,6 +1840,49 @@ def create_app(
         if _engine_has(supervisor, sandbox_id):
             return {"owner": mesh.node_id}
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown sandbox")
+
+    @app.post("/v1/mesh/owner", dependencies=[Depends(require_auth)])
+    async def mesh_owner(body: dict[str, Any]) -> dict[str, bool]:
+        sid = str(body.get("sid") or "")
+        node_id = str(body.get("node_id") or "")
+        if sid and node_id:
+            mesh.record_owner(sid, node_id)
+        return {"ok": True}
+
+    @app.post("/v1/mesh/migrate/receive", dependencies=[Depends(require_auth)])
+    async def mesh_migrate_receive(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """Target side of a migration: pull the source's checkpoint and restore it."""
+        digest = str(body.get("digest") or "")
+        source_url = str(body.get("source_url") or "")
+        params = dict(body.get("params") or {})
+        name = str(params.get("name") or "")
+        if not (digest and source_url and name):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="digest, source_url, and params.name are required",
+            )
+        if _engine_has(supervisor, name):
+            # A single-shot migration carries no idempotency token, so an existing
+            # local name is a genuine collision, not a replay: reject it so the
+            # source rolls back instead of committing onto an unrelated sandbox.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"sandbox {name!r} already exists on the target node",
+            )
+        try:
+            installed = await pull_template(
+                request.app.state.mesh_http, source_url, digest, expected_token or ""
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=f"failed to pull migration checkpoint: {exc}",
+            ) from exc
+        record = await supervisor._run(
+            supervisor._engine.create, {**params, "template": str(installed)}
+        )
+        mesh.record_owner(name, mesh.node_id)
+        return record.view()
 
     def _idem_payload(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         key = str(body.get("key") or "").strip()
@@ -2540,6 +2611,61 @@ def create_app(
     async def metrics_sandbox(sandbox_id: str) -> dict[str, Any]:
         record = supervisor.get(sandbox_id, require_running=True)
         return await supervisor.metrics(record)
+
+    async def _migrate_sandbox_to(sandbox_id: str, target: str) -> dict[str, Any]:
+        """Run an offline migration of a locally-owned sandbox to ``target``.
+
+        Checkpoint here, restore on the target, remap ownership cluster-wide, then
+        drop the source. Any target-side failure restores the source locally from
+        the same checkpoint, so a failed migration never loses the VM. Raises
+        :class:`HTTPException` on failure.
+        """
+        try:
+            peer = mesh.migration_target(target)
+        except MeshError as exc:
+            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+        prep = await supervisor._run(supervisor._engine.migrate_prepare, sandbox_id)
+        digest = str(prep["digest"])
+        snapshot_dir = str(prep["snapshot_dir"])
+        params = dict(prep["params"])
+        receive = {"digest": digest, "source_url": mesh.advertise, "params": params}
+        try:
+            view = await asyncio.to_thread(
+                mesh.transport.post,
+                peer.advertise,
+                "/v1/mesh/migrate/receive",
+                receive,
+                timeout=mesh.create_timeout,
+            )
+        except Exception as exc:
+            await supervisor._run(
+                supervisor._engine.migrate_abort, sandbox_id, snapshot_dir, digest, params
+            )
+            detail = exc.message if isinstance(exc, MeshError) else str(exc)
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=f"migration to {target} failed (source restored): {detail}",
+            ) from exc
+        await asyncio.to_thread(mesh.broadcast_owner, sandbox_id, target)
+        await supervisor._run(supervisor._engine.migrate_commit, sandbox_id, snapshot_dir, digest)
+        return view
+
+    @app.post("/v1/sandboxes/{sandbox_id}/migrate", dependencies=[Depends(require_auth)])
+    async def migrate_sandbox(sandbox_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Migrate a sandbox to another mesh node (owner-routed here, to the source).
+
+        Offline, snapshot-based: a block-network sandbox with no host-local state is
+        checkpointed here, restored on the target, then dropped here once the target
+        confirms. A failed target never loses the VM (the source is restored).
+        """
+        if not mesh.enabled:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="migration requires mesh mode")
+        target = str(body.get("target") or "")
+        if not target:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, detail="target node id is required"
+            )
+        return await _migrate_sandbox_to(sandbox_id, target)
 
     @app.post("/v1/sandboxes/{sandbox_id}/exec", dependencies=[Depends(require_auth)])
     async def exec_sandbox(sandbox_id: str, body: ExecRequest) -> StreamingResponse:

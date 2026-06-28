@@ -25,6 +25,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -381,6 +382,7 @@ class Engine:
     def template_index(self) -> builtins.dict[str, str]:
         """Return request-derivable template keys mapped to local content digests."""
         from . import cas
+        from .image import _TEMPLATE_BOOT_VERSION
         from .mesh import template_key
 
         templates = state_dir() / "templates"
@@ -402,6 +404,11 @@ class Engine:
             except json.JSONDecodeError:
                 continue
             if not isinstance(data, dict):
+                continue
+            if data.get("boot_version") != _TEMPLATE_BOOT_VERSION:
+                # Don't advertise a template an older vmon built: a peer would
+                # rebuild it locally anyway, and its snapshot may predate a
+                # breaking boot change (e.g. the virtio-rng device).
                 continue
             ref = data.get("image")
             digest = data.get("content_digest")
@@ -836,6 +843,123 @@ class Engine:
         with self._lock:
             self._records.pop(name, None)
         return {"name": name, "removed": True}
+
+    # -- mesh migration (offline, snapshot-based) ---------------------------
+
+    def migrate_prepare(self, name: str) -> dict[str, Any]:
+        """Quiesce a live, migratable sandbox into a transient cross-node checkpoint.
+
+        Returns ``{digest, snapshot, snapshot_dir, params}``: a content-addressed,
+        peer-pullable template (the source VM is *stopped* at the checkpoint) plus
+        the create-equivalent params a target needs to restore an identical live
+        sandbox. Follow with :meth:`migrate_commit` once a target confirms, or
+        :meth:`migrate_abort` to restore the source locally from the same checkpoint.
+
+        Only a live, in-process, block-network sandbox with no host-local state
+        (named volumes or an ``fs_dir`` share) can migrate; others raise
+        :class:`Unsupported` because their NIC or data cannot move hosts.
+        """
+        record = self.get(name, require_running=True)
+        sandbox = record.sandbox
+        if sandbox is None:
+            raise Unsupported(
+                "migration requires a live in-process sandbox; one rehydrated after "
+                "a daemon restart has lost the identity needed to move it"
+            )
+        if not getattr(sandbox, "_block_network", False):
+            raise Unsupported(
+                "only block-network sandboxes can migrate; a networked sandbox needs "
+                "per-node host networking that the snapshot cannot carry"
+            )
+        if getattr(sandbox, "_volumes", None):
+            raise Unsupported(
+                "a sandbox with named volumes cannot migrate; volume data is host-local"
+            )
+        if getattr(sandbox, "_fs_dir", None):
+            raise Unsupported(
+                "a sandbox with an fs_dir share cannot migrate; the share is host-local"
+            )
+        memory = record.detail.get("memory")
+        cpus = record.detail.get("cpus")
+        vm = getattr(sandbox, "vm", None)
+        meta = vm.meta if vm is not None else {}
+        if memory is None:
+            memory = meta.get("mem")
+        if cpus is None:
+            cpus = meta.get("cpus")
+        if memory is None:
+            raise Unsupported(
+                "cannot determine the sandbox memory size needed to restore it elsewhere"
+            )
+        params: dict[str, Any] = {
+            "name": name,
+            "block_network": True,
+            "memory": int(memory),
+            "cpus": int(cpus) if cpus is not None else 1,
+            "env": dict(getattr(sandbox, "env", {}) or {}),
+            "workdir": getattr(sandbox, "workdir", None),
+            "tags": dict(record.tags or {}),
+        }
+        timeout_secs = getattr(sandbox, "_timeout_secs", None)
+        if timeout_secs is not None:
+            params["timeout_secs"] = int(timeout_secs)
+        secret_env = dict(getattr(sandbox, "_secret_env", {}) or {})
+        if secret_env:
+            # Carried over the (bearer-authed) cluster channel, like the memory image.
+            params["secrets"] = [secret_env]
+        transient = f"migrate-{name}-{uuid.uuid4().hex[:12]}"
+        snap_dir = Path(self.snapshot_template(name, transient, stop=True))
+        from . import cas
+
+        digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
+        return {
+            "digest": digest,
+            "snapshot": transient,
+            "snapshot_dir": str(snap_dir),
+            "params": params,
+        }
+
+    def migrate_commit(self, name: str, snapshot_dir: str, digest: str) -> dict[str, Any]:
+        """Finalize a successful migration: drop the stopped source and its checkpoint.
+
+        The local record MUST go: the mesh router treats any local record as
+        owned-here (``_engine_has``) and would refuse to proxy to the new owner, so
+        the registry entry is force-dropped even if teardown was partial.
+        """
+        try:
+            self.remove(name)
+        except EngineError:
+            pass
+        with self._lock:
+            self._records.pop(name, None)
+        self._drop_checkpoint(digest, snapshot_dir, delete_dir=True)
+        return {"name": name, "migrated": True}
+
+    def migrate_abort(
+        self, name: str, snapshot_dir: str, digest: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Roll back a failed migration by restoring the source locally.
+
+        The source was stopped exactly at the checkpoint, so re-creating it from
+        the same checkpoint resumes the VM with no lost work. The checkpoint
+        directory is kept (the restored VM may page from it); only its
+        peer-pullable CAS pointer is dropped.
+        """
+        try:
+            self.remove(name)
+        except EngineError:
+            pass
+        record = self.create({**params, "template": snapshot_dir})
+        self._drop_checkpoint(digest, snapshot_dir, delete_dir=False)
+        return record.view()
+
+    def _drop_checkpoint(self, digest: str, snapshot_dir: str, *, delete_dir: bool) -> None:
+        """Un-advertise a migration checkpoint; optionally delete its directory."""
+        from . import cas
+
+        cas.drop_digest(digest)
+        if delete_dir:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
 
     def _teardown(self, record: VMRecord) -> int | None:
         """Release every host resource a VM holds (idempotent, best-effort).
