@@ -14,6 +14,7 @@ All notable changes to this project are recorded here.
 ### Added
 
 - Added per-sandbox runtime metrics in the Dashboard's **Metrics** tab
+- Added an optional virtio-rng entropy device (`--rng`) feeding the guest `/dev/hwrng` from the host CSPRNG (`/dev/urandom`), seeding the kernel CRNG early so first-boot `getrandom(2)` (TLS, key generation, language runtimes) does not block on a fresh microVM. Wired on both the MMIO transport (all architectures) and the x86_64 virtio-PCI transport, captured and reconstructed across snapshot/restore/fork, and verified by a gated HVF boot test that reads entropy from the guest `/dev/hwrng`. The on-disk snapshot format is bumped to version 2 (older snapshots are rejected and must be recaptured).
 
 - Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem
 - Added client-side retry logic for idempotent sandbox creation and restoration

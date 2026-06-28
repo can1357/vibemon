@@ -56,7 +56,7 @@ else
 fi
 
 KERNEL_PATH=${KERNEL_PATH:-"$ASSET_DIR/$KERNEL_NAME"}
-INITRAMFS_VERSION=${INITRAMFS_VERSION:-"2026-06-26.4-$ARCH"}
+INITRAMFS_VERSION=${INITRAMFS_VERSION:-"2026-06-28.1-$ARCH"}
 ROOTFS_SIZE=${ROOTFS_SIZE:-"64M"}
 ROOTFS_VERSION=${ROOTFS_VERSION:-"2026-06-26.2-$ARCH"}
 
@@ -219,6 +219,18 @@ mode=$(cmdline_get vmon.test boot)
 case "$mode" in
   boot)
     echo "VMON_OK"
+    finish
+    ;;
+
+  rng)
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -c /dev/hwrng ] && break
+      sleep 1
+    done
+    [ -c /dev/hwrng ] || fail "wait for /dev/hwrng"
+    n=$(dd if=/dev/hwrng bs=32 count=1 2>/dev/null | wc -c)
+    [ "$n" -eq 32 ] || fail "short /dev/hwrng read: $n"
+    echo "RNG_OK"
     finish
     ;;
 
