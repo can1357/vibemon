@@ -40,6 +40,7 @@ All notable changes to this project are recorded here.
 ### Fixed
 
 - Fixed the remote page-source URL builder (`_remote_page_url`) to coerce the resolved host to `str`, fixing a type error and guarding the IPv6-bracketing check against non-string `getaddrinfo` results.
+- Fixed the KVM vCPU loop to treat a `KVM_RUN` `EAGAIN` as a transient retry (re-enter the run loop) like `EINTR` rather than a fatal vCPU error, matching Cloud Hypervisor / Firecracker; `EAGAIN` occurs notably under nested virtualization (e.g. KVM-on-cloud-VM, Lima).
 - Restored a green AArch64 Linux clippy CI gate: the FUSE_MKNOD/`FUSE_CREATE` mode checks now suppress `unnecessary_cast` for the `libc::S_IF*` constants (signed `c_int` on macOS, `c_uint` on Linux), `PagerFatal::new` is `const fn`, and the remote-pager test server takes its 4 KiB page by reference.
 - Fixed template resolution to account for virtio-fs slot variations
 - Prevented potential deadlocks in stdin forwarding when handling non-TTY streams
