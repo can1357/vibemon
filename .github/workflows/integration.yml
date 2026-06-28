@@ -1,11 +1,9 @@
 name: integration
 
 on:
-  # Real-VM integration needs a self-hosted KVM (Linux/x64) runner and a
-  # bare-metal Apple Silicon (HVF) runner — GitHub-hosted runners can't boot
-  # guests (hosted macOS is itself a VM → HV_DENIED). Trigger on demand and
-  # nightly only, so push/PR don't leave integration checks perpetually
-  # "Queued — Waiting to run" against a runner that never comes online.
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * *'
@@ -16,13 +14,33 @@ permissions:
 jobs:
   integration:
     name: KVM integration
-    runs-on: [self-hosted, kvm, x64]
+    # GitHub-hosted Linux runners expose /dev/kvm (nested virtualization), so the
+    # full KVM e2e suite runs here without a self-hosted box.
+    runs-on: ubuntu-latest
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Enable KVM
+        # Grant the runner user access to /dev/kvm and fail loudly if the runner
+        # lacks it, so the e2e suite can never silently skip into a false green.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm || { echo "::error::/dev/kvm missing on this runner"; exit 1; }
+          ls -l /dev/kvm
+
+      - name: Install system dependencies
+        # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds the
+        # rootfs fixtures. docker is preinstalled and builds image rootfses.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpio e2fsprogs
 
       - name: Install pinned Rust toolchain
         run: rustup show
@@ -69,7 +87,10 @@ jobs:
   hvf-integration:
     name: HVF integration
     # Needs a bare-metal Apple Silicon self-hosted runner: GitHub-hosted macOS
-    # runners are themselves VMs and cannot create an HVF guest (HV_DENIED).
+    # runners are themselves VMs and cannot create an HVF guest (HV_DENIED). Skip
+    # on push/PR so it never blocks; run via manual dispatch or the nightly
+    # schedule once such a runner is online.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: [self-hosted, macos, arm64]
     steps:
       - name: Checkout
