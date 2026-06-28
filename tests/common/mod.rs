@@ -425,12 +425,15 @@ impl VmmProcess {
 	pub fn kill(&mut self) {
 		// SIGKILL the whole process group, not just the supervisor: `--fork-from`
 		// clones inherit this process's stdout pipe, so a surviving clone would
-		// keep it open and wedge join_readers() forever. The group's pgid equals
-		// the child pid (set via process_group(0) at spawn); signal it before
-		// reaping so the pid is still valid.
-		// SAFETY: kill(2) targeting this child's own process group by its pgid.
-		unsafe {
-			libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+		// keep it open and wedge join_readers() forever. Only signal while the
+		// child is still running: once reaped, its pid (== the group pgid, set via
+		// process_group(0)) could be recycled — and a normally-exited supervisor
+		// has already waited for its clones, so none are orphaned.
+		if matches!(self.child.try_wait(), Ok(None)) {
+			// SAFETY: kill(2) targeting this live child's own process group.
+			unsafe {
+				libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+			}
 		}
 		let _ = self.child.wait();
 		self.join_readers();
