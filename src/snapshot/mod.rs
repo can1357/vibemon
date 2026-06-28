@@ -1562,6 +1562,30 @@ mod tests {
 	}
 
 	#[test]
+	fn accepts_rng_device_with_single_queue() {
+		let mut device = block_device(MMIO_MEM_START, IRQ_BASE);
+		device.kind = DeviceKind::Rng;
+		device.backend = BackendHint::Rng;
+		// virtio-rng exposes a single requestq.
+		device.queues = vec![queue(false)];
+
+		validate_device_states(&[device], &[]).unwrap();
+	}
+
+	#[test]
+	fn rejects_rng_device_with_wrong_queue_count() {
+		let mut device = block_device(MMIO_MEM_START, IRQ_BASE);
+		device.kind = DeviceKind::Rng;
+		device.backend = BackendHint::Rng;
+		device.queues = vec![queue(false), queue(false)];
+
+		let err = validate_device_states(&[device], &[])
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("queue count"), "unexpected error: {err}");
+	}
+
+	#[test]
 	fn rejects_queue_size_larger_than_max() {
 		let mut device = block_device(MMIO_MEM_START, IRQ_BASE);
 		device.queues[0].size = device.queues[0].max_size + 1;
