@@ -206,10 +206,10 @@ def networking_supported() -> bool:
 def virtiofs_supported() -> bool:
     """True if the guest kernel can mount virtio-fs (cached one-shot probe).
 
-    The default aarch64 kernel ships ``CONFIG_VIRTIO_FS`` (virtio-fs works out of
-    the box on macOS/HVF and Linux/aarch64); the x86_64 firecracker kernel and
-    some custom ``VMON_KERNEL`` builds lack it, so mounts fail with ENODEV there.
-    Probed by attaching a throwaway host share and trying to mount it.
+    The pinned default kernels on both supported arches ship ``CONFIG_VIRTIO_FS``
+    (macOS/HVF uses the aarch64 image; Linux/KVM uses the matching arch). Some
+    custom ``VMON_KERNEL`` builds still lack it, so mounts fail with ENODEV
+    there. Probed by attaching a throwaway host share and trying to mount it.
     """
     global _virtiofs
     if _virtiofs is not None:

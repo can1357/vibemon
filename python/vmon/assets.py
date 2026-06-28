@@ -26,10 +26,9 @@ from pathlib import Path
 # aarch64: the Cloud Hypervisor release kernel (raw arm64 `Image`, v6.16.9). It
 # boots cleanly under both KVM and HVF and, unlike the firecracker-ci kernel,
 # ships `CONFIG_VIRTIO_FS=y` so virtio-fs shares/volumes work in the guest.
-# x86_64: the firecracker quickstart kernel (raw ELF `vmlinux`). It lacks
-# virtio-fs; the matching Cloud Hypervisor `vmlinux-x86_64` is the drop-in once
-# boot-verified on a Linux/KVM host (its PVH entry vs our Linux-bootparams loader
-# is unverified here).
+# x86_64: the Cloud Hypervisor release `bzImage` (v6.12.8). It boots through our
+# existing Linux boot-params path on KVM and ships `CONFIG_VIRTIO_FS=y`, so
+# x86 warm templates can restore virtio-fs shares/volumes too.
 _KERNELS: dict[str, tuple[str, str, str]] = {
     "aarch64": (
         "Image-aarch64",
@@ -37,9 +36,9 @@ _KERNELS: dict[str, tuple[str, str, str]] = {
         "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010",
     ),
     "x86_64": (
-        "vmlinux-x86_64",
-        "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin",
-        "ea5e7d5cf494a8c4ba043259812fc018b44880d70bcbbfc4d57d2760631b1cd6",
+        "bzImage-x86_64",
+        "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.12.8-20250613/bzImage-x86_64",
+        "d4af401aa859e4659d4b08a153ac608eb6a315c6918e567daa46981af5d2e5ef",
     ),
 }
 
@@ -98,9 +97,10 @@ def ensure_kernel(arch: str | None = None) -> Path:
 def preflight_assets(arch: str | None = None) -> dict[str, str]:
     """Ensure the zero-config guest assets are present and report their paths.
 
-    The pinned aarch64 kernel is the virtio-fs-capable Cloud Hypervisor kernel,
-    so warm templates using virtio-fs volumes keep working with auto-provisioned
-    assets. The agent import stays lazy to keep this module hypervisor-free.
+    The pinned aarch64 and x86_64 kernels are virtio-fs-capable Cloud Hypervisor
+    builds, so warm templates using virtio-fs shares/volumes keep working with
+    auto-provisioned assets. The agent import stays lazy to keep this module
+    hypervisor-free.
     """
     from .image import ensure_agent
 

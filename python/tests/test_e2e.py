@@ -42,8 +42,8 @@ def test_writable_volume_persists_across_sandboxes():
             image=_image(), volumes={"/data": volume}, block_network=True, timeout=300
         )
     except AgentError as exc:
-        # ENODEV == the guest kernel registers no virtiofs filesystem type (the
-        # x86_64 firecracker kernel, or a custom VMON_KERNEL without it); skip.
+        # ENODEV == the guest kernel registers no virtiofs filesystem type (a
+        # custom VMON_KERNEL without virtio-fs); skip.
         if "os error 19" in str(exc).lower() or "no such device" in str(exc).lower():
             pytest.skip(
                 "guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel"
