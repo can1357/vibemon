@@ -39,7 +39,10 @@ impl Vcpu {
 			Ok(VcpuExit::FailEntry(reason, cpu)) => Ok(Exit::FailEntry { reason, cpu }),
 			Ok(VcpuExit::InternalError) => Ok(Exit::InternalError),
 			Ok(_) => Ok(Exit::Other),
-			Err(e) if e.errno() == libc::EINTR => Ok(Exit::Continue),
+			// EINTR (signal, e.g. the pause kick) and EAGAIN (KVM could not enter
+			// the guest yet — common under nested virtualization) are transient:
+			// re-enter the run loop, matching Cloud Hypervisor / Firecracker.
+			Err(e) if matches!(e.errno(), libc::EINTR | libc::EAGAIN) => Ok(Exit::Continue),
 			Err(e) => Err(e.into()),
 		}
 	}
