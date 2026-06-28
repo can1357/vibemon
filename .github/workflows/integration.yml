@@ -1,9 +1,11 @@
 name: integration
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # Real-VM integration needs a self-hosted KVM (Linux/x64) runner and a
+  # bare-metal Apple Silicon (HVF) runner — GitHub-hosted runners can't boot
+  # guests (hosted macOS is itself a VM → HV_DENIED). Trigger on demand and
+  # nightly only, so push/PR don't leave integration checks perpetually
+  # "Queued — Waiting to run" against a runner that never comes online.
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * *'
