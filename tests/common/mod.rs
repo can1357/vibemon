@@ -3,7 +3,7 @@
 use std::{
 	fs,
 	io::{self, BufRead, BufReader, Read, Write},
-	os::unix::{fs::DirBuilderExt, net::UnixStream},
+	os::unix::{fs::DirBuilderExt, net::UnixStream, process::CommandExt},
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
 	sync::{Arc, Mutex},
@@ -295,7 +295,9 @@ pub fn spawn_vmm_with_input(args: &[&str], serial_input: &[u8]) -> VmmProcess {
 	cmd.args(args)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::piped());
+		.stderr(Stdio::piped())
+		// Own process group so cleanup can SIGKILL forked clones too (see kill()).
+		.process_group(0);
 
 	let mut child = cmd
 		.spawn()
@@ -421,8 +423,14 @@ impl VmmProcess {
 	}
 
 	pub fn kill(&mut self) {
-		if matches!(self.child.try_wait(), Ok(None)) {
-			let _ = self.child.kill();
+		// SIGKILL the whole process group, not just the supervisor: `--fork-from`
+		// clones inherit this process's stdout pipe, so a surviving clone would
+		// keep it open and wedge join_readers() forever. The group's pgid equals
+		// the child pid (set via process_group(0) at spawn); signal it before
+		// reaping so the pid is still valid.
+		// SAFETY: kill(2) targeting this child's own process group by its pgid.
+		unsafe {
+			libc::kill(-(self.child.id() as i32), libc::SIGKILL);
 		}
 		let _ = self.child.wait();
 		self.join_readers();
