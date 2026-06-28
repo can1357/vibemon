@@ -13,14 +13,16 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem
+
 - Added client-side retry logic for idempotent sandbox creation and restoration
 - Enabled idempotent sandbox creation and restoration across mesh-connected nodes
-
 - Added support for idempotent sandbox creation to prevent duplicate VM instantiation
 - Added `vmon inspect <name>` to print detailed VM configuration as JSON
 - Added `vmon stats <name>` to display live runtime VMM metrics
 - Added `vmon extend <name> <secs>` to update a VM's runtime deadline
 - Added `vmon inspect <name>`, `vmon stats <name>`, and `vmon extend <name> <secs>` CLI commands. `inspect` prints a VM's full detail view as highlighted JSON, `stats` renders the VMM's live runtime counters, and `extend` resets a running VM's wall-clock deadline (persisted so a rehydrated daemon reports the extended window). All three route through both the `vmond` daemon and the HTTP gateway; `stats` is backed by a new `GET /v1/sandboxes/{id}/metrics` route.
+- Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem from the CLI: it lists a directory as an `ls -l`-style table (mode, size, mtime, name; directories first, with `ls -F` suffixes) and falls back to a single `stat` row when the path is a file. The path defaults to `/`. The command routes through both the `vmond` daemon (new `fs_list`/`fs_stat` methods) and the HTTP gateway (`GET /v1/sandboxes/{id}/fs/list` and `/fs/stat`), reusing the engine filesystem API that already backs the web panel's file browser.
 - Added `@function` decorator to execute local Python functions in a remote sandbox
 - Added `RemoteFunction` class to manage serialized function execution and sandbox lifecycle
 - Added `RemoteFunctionError` for handling failures occurring inside remote execution environments

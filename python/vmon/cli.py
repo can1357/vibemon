@@ -9,7 +9,7 @@ SDK and daemon stay dependency-light.
 
 import io
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, cast
 
 import click
@@ -89,6 +89,19 @@ def _parse_remote(spec: str) -> tuple[str, str] | None:
     if not name or not path:
         return None
     return name, path
+
+
+def _parse_ref(spec: str) -> tuple[str, str]:
+    """Split a guest reference ``name[:path]``; the path defaults to ``/``.
+
+    Unlike :func:`_parse_remote` (used by ``cp``, where the colon is mandatory
+    because an operand may be a local path), an ``ls`` operand is always a guest
+    reference, so a bare ``name`` is valid and lists the guest root.
+    """
+    name, _, path = spec.partition(":")
+    if not name:
+        raise click.UsageError("ls requires a microVM name (NAME[:PATH])")
+    return name, path or "/"
 
 
 def _mesh_call(
@@ -348,6 +361,28 @@ def cp(src, dst):
         client.call(
             "cp_write", name=name, path=remote_path, data=base64.b64encode(data).decode("ascii")
         )
+    return 0
+
+
+@cli.command(
+    panel="Commands",
+    context_settings=_CTX,
+    help="List files in a microVM's guest filesystem: <name>[:<path>].",
+)
+@click.argument("ref")
+def ls(ref):
+    name, path = _parse_ref(ref)
+    client = _client()
+    try:
+        entries = client.call("fs_list", name=name, path=path).get("entries") or []
+    except DaemonError:
+        # The path may be a file rather than a directory: stat it and show a
+        # single row, like ``ls FILE``. A genuinely missing path re-raises.
+        stat_result = client.call("fs_stat", name=name, path=path)
+        if stat_result.get("type") == "dir":
+            raise
+        entries = [{"name": PurePosixPath(path).name or path, **stat_result}]
+    ui.fs_table(name, path, entries)
     return 0
 
 

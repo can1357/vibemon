@@ -146,6 +146,8 @@ class Daemon:
             "shell": self._h_shell,
             "cp_read": self._h_cp_read,
             "cp_write": self._h_cp_write,
+            "fs_list": self._h_fs_list,
+            "fs_stat": self._h_fs_stat,
             "pause": self._h_pause,
             "resume": self._h_resume,
             "snapshot": self._h_snapshot,
@@ -349,6 +351,14 @@ class Daemon:
         data = base64.b64decode(params.get("data") or "")
         self._engine.cp_write(self._name(params), str(params["path"]), data)
         conn.send({"id": rid, "ok": True, "result": {"written": len(data)}})
+
+    def _h_fs_list(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
+        entries = self._engine.list_files(self._name(params), str(params.get("path") or "/"))
+        conn.send({"id": rid, "ok": True, "result": {"entries": entries}})
+
+    def _h_fs_stat(self, conn: _Conn, rid: Any, params: dict[str, Any]) -> None:
+        stat = self._engine.stat_file(self._name(params), str(params.get("path") or "/"))
+        conn.send({"id": rid, "ok": True, "result": stat})
 
     # -- streaming handlers -------------------------------------------------
 

@@ -763,6 +763,12 @@ class RecordingGatewayClient:
 
     _q = staticmethod(lambda value: str(value))
 
+    @staticmethod
+    def _urlencode(values):
+        import urllib.parse
+
+        return urllib.parse.urlencode(values)
+
     def _json(self, method, path, payload=None):
         self.calls.append((method, path, payload))
         if path == "/v1/sandboxes":
@@ -785,6 +791,10 @@ def test_gateway_call_mapping():
         "/v1/sandboxes/sb/snapshot_template",
         {"snapshot": "snap", "stop": True},
     ) in client.calls
+    GatewayClient.call(client, "fs_list", name="sb", path="/etc")
+    GatewayClient.call(client, "fs_stat", name="sb", path="/etc/hosts")
+    assert ("GET", "/v1/sandboxes/sb/fs/list?path=%2Fetc", None) in client.calls
+    assert ("GET", "/v1/sandboxes/sb/fs/stat?path=%2Fetc%2Fhosts", None) in client.calls
 
 
 def test_node_state_wire_tolerates_missing_backend_arch_cpu_baseline():

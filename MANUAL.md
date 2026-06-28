@@ -142,6 +142,7 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `shell` | drop into an ephemeral interactive shell (attach a running VM, warm-boot a snapshot, or boot a fresh image) | `vmon shell` · `vmon shell web` · `vmon shell --image alpine` |
 | `exec` | run a command in a running microVM (`-t` for an interactive PTY) | `vmon exec web sh -lc 'echo hi'` |
 | `cp` | copy files host↔guest | `vmon cp web:/etc/os-release ./` |
+| `ls` | list files in a microVM's guest filesystem (`<name>[:<path>]`) | `vmon ls web:/etc` |
 | `ps` | list microVMs | `vmon ps` |
 | `logs` | show a VM's console (`-f` to follow) | `vmon logs web -f` |
 | `inspect` | print a VM's full detail view as JSON | `vmon inspect web` |

@@ -541,6 +541,12 @@ class GatewayClient:
             raw = base64.b64decode(str(params["data"]))
             self._bytes("PUT", f"/v1/sandboxes/{self._q(params['name'])}/files?{path}", raw)
             return {"written": len(raw)}
+        if method == "fs_list":
+            path = self._urlencode({"path": params.get("path") or "/"})
+            return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}/fs/list?{path}")
+        if method == "fs_stat":
+            path = self._urlencode({"path": params.get("path") or "/"})
+            return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}/fs/stat?{path}")
         if method == "run":
             payload = {**params}
             payload.setdefault("idempotency_key", secrets.token_urlsafe(18))

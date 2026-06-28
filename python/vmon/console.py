@@ -23,8 +23,10 @@ import inspect
 import io
 import os
 import shutil
+import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 import click
@@ -161,6 +163,76 @@ def stats_table(name: str, metrics: Mapping[str, Any]) -> None:
     table.add_column("VALUE", justify="right", no_wrap=True)
     for key in sorted(metrics):
         table.add_row(str(key), _format_metric(metrics[key]))
+    console.print(table)
+
+
+def _human_size(n: int) -> str:
+    """Compact human-readable byte size: bytes verbatim, then one decimal (``4.0K``)."""
+    if n < 1024:
+        return str(n)
+    size = float(n)
+    for unit in ("K", "M", "G", "T", "P"):
+        size /= 1024.0
+        if size < 1024.0:
+            return f"{size:.1f}{unit}"
+    return f"{size:.1f}E"
+
+
+def _fs_mtime(mtime: Any) -> str:
+    """Format a guest mtime (unix seconds) as local ``YYYY-MM-DD HH:MM``."""
+    try:
+        ts = float(mtime)
+    except TypeError, ValueError:
+        return "-"
+    if ts <= 0:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except OverflowError, OSError, ValueError:
+        return "-"
+
+
+def _fs_name(name: str, mode: int, kind: str) -> Text:
+    """Decorate a guest entry name like ``ls -F`` and color dirs/symlinks."""
+    if stat.S_ISDIR(mode) or kind == "dir":
+        return Text(name + "/", style="vmon.command")
+    if stat.S_ISLNK(mode) or kind == "symlink":
+        return Text(name + "@", style="vmon.option")
+    if stat.S_ISFIFO(mode):
+        return Text(name + "|")
+    if stat.S_ISSOCK(mode):
+        return Text(name + "=")
+    if stat.S_ISREG(mode) and mode & 0o111:
+        return Text(name + "*")
+    return Text(name)
+
+
+def fs_table(name: str, path: str, entries: Sequence[Mapping[str, Any]]) -> None:
+    """Render a guest directory listing (``vmon ls``) as a borderless table.
+
+    Directories sort first, then entries by name; mode, size, and mtime mirror
+    ``ls -l``. An empty directory prints a muted note instead of a bare header.
+    """
+    if not entries:
+        info(f"[vmon.command]{name}[/]:{path} is empty")
+        return
+    rows = sorted(
+        entries,
+        key=lambda e: (not stat.S_ISDIR(int(e.get("mode") or 0)), str(e.get("name") or "")),
+    )
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("MODE", style="vmon.muted", no_wrap=True)
+    table.add_column("SIZE", justify="right", no_wrap=True)
+    table.add_column("MODIFIED", style="vmon.muted", no_wrap=True)
+    table.add_column("NAME", no_wrap=True)
+    for entry in rows:
+        mode = int(entry.get("mode") or 0)
+        table.add_row(
+            stat.filemode(mode),
+            _human_size(int(entry.get("size") or 0)),
+            _fs_mtime(entry.get("mtime")),
+            _fs_name(str(entry.get("name") or ""), mode, str(entry.get("type") or "")),
+        )
     console.print(table)
 
 

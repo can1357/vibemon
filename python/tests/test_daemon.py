@@ -64,6 +64,19 @@ class FakeProc:
         pass
 
 
+class _FakeFs:
+    """Canned guest filesystem exercised by the fs_list/fs_stat round-trip."""
+
+    def list_files(self, path):
+        return [
+            {"name": "etc", "type": "dir", "size": 0, "mode": 0o40755, "mtime": 0},
+            {"name": "hosts", "type": "file", "size": 12, "mode": 0o100644, "mtime": 0},
+        ]
+
+    def stat(self, path):
+        return {"type": "file", "size": 12, "mode": 0o100644, "mtime": 0}
+
+
 class FakeSandbox:
     """Fake backend that persists meta (with a real dummy PID) like the real one."""
 
@@ -79,6 +92,7 @@ class FakeSandbox:
         self.image_spec = None
         self._child = None
         self.vm = MicroVM(name)
+        self.filesystem = _FakeFs()
 
     @classmethod
     def create(cls, **kwargs):
@@ -543,3 +557,15 @@ def test_extend_rejects_nonpositive_secs(client):
         assert excinfo.value.code == "invalid"
     finally:
         client.call("rm", name="vm-bad")
+
+
+def test_fs_list_and_stat_round_trip(client):
+    client.call("run", image="alpine", detach=True, name="vmfs")
+    try:
+        listing = client.call("fs_list", name="vmfs", path="/")
+        assert {e["name"] for e in listing["entries"]} == {"etc", "hosts"}
+        stat = client.call("fs_stat", name="vmfs", path="/hosts")
+        assert stat["type"] == "file"
+        assert stat["size"] == 12
+    finally:
+        client.call("rm", name="vmfs")

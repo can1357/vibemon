@@ -316,3 +316,69 @@ def test_extend_routes_with_int_secs(rec):
 
 def test_extend_rejects_non_int_secs(rec, capsys):
     assert cli.main(["extend", "vm1", "abc"]) == 2
+
+
+# -- ls --------------------------------------------------------------------
+
+
+def test_ls_routes_to_fs_list(rec):
+    assert cli.main(["ls", "vm1:/etc"]) == 0
+    assert rec.last["method"] == "fs_list"
+    assert rec.last["params"] == {"name": "vm1", "path": "/etc"}
+
+
+def test_ls_defaults_path_to_root(rec):
+    assert cli.main(["ls", "vm1"]) == 0
+    assert rec.last["params"] == {"name": "vm1", "path": "/"}
+
+
+def test_ls_requires_a_name(rec):
+    assert cli.main(["ls", ":/etc"]) == 2
+
+
+def test_ls_falls_back_to_stat_for_a_file(monkeypatch, capsys):
+    """``ls NAME:FILE`` stats the path when listing it as a directory fails."""
+
+    class FileClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def call(self, method, **params):
+            if method == "fs_list":
+                raise client.DaemonError("fs_list /etc/hosts: Not a directory")
+            assert method == "fs_stat"
+            return {"type": "file", "size": 12, "mode": 0o100644, "mtime": 0}
+
+    monkeypatch.setattr(cli, "DaemonClient", FileClient)
+    assert cli.main(["ls", "vm1:/etc/hosts"]) == 0
+    assert "hosts" in capsys.readouterr().out
+
+
+def test_ls_reports_error_for_a_missing_path(monkeypatch, capsys):
+    class MissingClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def call(self, method, **params):
+            raise client.DaemonError("fs_stat /nope: No such file or directory")
+
+    monkeypatch.setattr(cli, "DaemonClient", MissingClient)
+    assert cli.main(["ls", "vm1:/nope"]) == 1
+    assert "No such file" in capsys.readouterr().err
+
+
+def test_fs_table_renders_dirs_first_with_modes_and_sizes(capsys):
+    """The listing sorts directories first and mirrors ``ls -l`` columns."""
+    from vmon import console
+
+    entries = [
+        {"name": "zzz.txt", "type": "file", "size": 2048, "mode": 0o100644, "mtime": 1_700_000_000},
+        {"name": "run.sh", "type": "file", "size": 10, "mode": 0o100755, "mtime": 0},
+        {"name": "adir", "type": "dir", "size": 0, "mode": 0o40755, "mtime": 0},
+    ]
+    console.fs_table("vm", "/", entries)
+    out = capsys.readouterr().out
+    assert out.index("adir") < out.index("run.sh") < out.index("zzz.txt")
+    assert "adir/" in out and "run.sh*" in out
+    assert "drwxr-xr-x" in out and "2.0K" in out
+    assert "2023-" in out
