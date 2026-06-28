@@ -528,9 +528,11 @@ def test_idempotent_sandbox_create_replays_same_key(monkeypatch, tmp_path):
         assert first.status_code == 201
         assert second.status_code == 201
         assert second.json()["id"] == first.json()["id"]
-        assert len(app_a.state.supervisor._engine._records) + len(
-            app_b.state.supervisor._engine._records
-        ) == 1
+        assert (
+            len(app_a.state.supervisor._engine._records)
+            + len(app_b.state.supervisor._engine._records)
+            == 1
+        )
 
 
 def test_idempotent_sandbox_create_does_not_reroute_ambiguous_commit(monkeypatch, tmp_path):

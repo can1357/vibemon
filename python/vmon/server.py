@@ -1886,10 +1886,14 @@ def create_app(
             if existing is not None:
                 return existing.view()
             name = params.get("name")
-            if isinstance(name, str) and name and (
-                _engine_has(supervisor, name)
-                or mesh.owner_of(name)
-                or await _scatter_locate(mesh, name)
+            if (
+                isinstance(name, str)
+                and name
+                and (
+                    _engine_has(supervisor, name)
+                    or mesh.owner_of(name)
+                    or await _scatter_locate(mesh, name)
+                )
             ):
                 raise MeshError(f"sandbox {name!r} already exists", code="conflict")
             view = await _local_sandbox_create_view(request, params)
@@ -2013,10 +2017,14 @@ def create_app(
             if existing is not None:
                 return existing.view()
             name = params.get("name")
-            if isinstance(name, str) and name and (
-                _engine_has(supervisor, name)
-                or mesh.owner_of(name)
-                or await _scatter_locate(mesh, name)
+            if (
+                isinstance(name, str)
+                and name
+                and (
+                    _engine_has(supervisor, name)
+                    or mesh.owner_of(name)
+                    or await _scatter_locate(mesh, name)
+                )
             ):
                 raise MeshError(f"sandbox {name!r} already exists", code="conflict")
             view = await _local_detached_run_view(params)
@@ -2133,10 +2141,14 @@ def create_app(
             if existing is not None:
                 return existing.view()
             name = params.get("name")
-            if isinstance(name, str) and name and (
-                _engine_has(supervisor, name)
-                or mesh.owner_of(name)
-                or await _scatter_locate(mesh, name)
+            if (
+                isinstance(name, str)
+                and name
+                and (
+                    _engine_has(supervisor, name)
+                    or mesh.owner_of(name)
+                    or await _scatter_locate(mesh, name)
+                )
             ):
                 raise MeshError(f"sandbox {name!r} already exists", code="conflict")
             view = await _local_detached_restore_view(params)
