@@ -13,6 +13,7 @@ import pytest
 
 import vmon.cli as cli
 import vmon.client as client
+import vmon.doctor as doctor
 
 
 class RecordingClient:
@@ -291,6 +292,102 @@ def test_daemon_status_reports_socket(rec, capsys):
     assert cli.main(["daemon", "status"]) == 0
     out = capsys.readouterr().out
     assert "running" in out and "vmond.sock" in out
+
+
+def test_collect_checks_reports_missing_vmm(monkeypatch, tmp_path):
+    def missing_binary():
+        raise RuntimeError("missing")
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr(doctor, "find_binary", missing_binary)
+    monkeypatch.setattr(doctor, "default_kernel", lambda: str(tmp_path / "kernel"))
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Other")
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+
+    checks = {check.name: check for check in doctor.collect_checks()}
+    assert checks["vmm binary"].status == "fail"
+    assert "cargo build" in checks["vmm binary"].hint
+    assert checks["container engine"].status == "warn"
+    assert checks["mkfs.ext4"].status == "warn"
+
+
+def test_collect_checks_reports_present_prereqs(monkeypatch, tmp_path):
+    vmm = tmp_path / "vmm"
+    kernel = tmp_path / "kernel"
+    vmm.touch()
+    kernel.touch()
+
+    def which(name):
+        return {
+            "docker": "/usr/bin/docker",
+            "podman": None,
+            "mkfs.ext4": "/sbin/mkfs.ext4",
+        }.get(name)
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr(doctor, "find_binary", lambda: str(vmm))
+    monkeypatch.setattr(doctor, "default_kernel", lambda: str(kernel))
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Other")
+    monkeypatch.setattr(doctor.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(doctor.shutil, "which", which)
+
+    checks = {check.name: check for check in doctor.collect_checks()}
+    assert checks["vmm binary"].status == "ok"
+    assert checks["vmm binary"].detail == str(vmm)
+    assert checks["container engine"].status == "ok"
+    assert checks["mkfs.ext4"].status == "ok"
+    assert checks["guest kernel"].status == "ok"
+
+
+def test_doctor_command_returns_failure_status(monkeypatch):
+    monkeypatch.setattr(doctor.ui, "doctor_table", lambda checks: None)
+    monkeypatch.setattr(doctor, "collect_checks", lambda: [doctor.Check("env", "ok", "ready")])
+    assert cli.main(["doctor"]) == 0
+
+    monkeypatch.setattr(
+        doctor, "collect_checks", lambda: [doctor.Check("vmm binary", "fail", "missing")]
+    )
+    assert cli.main(["doctor"]) == 1
+
+
+def test_doctor_table_renders_statuses_and_hints(capsys):
+    from vmon import console
+
+    console.doctor_table([doctor.Check("vmm binary", "fail", "missing", "cargo build")])
+    out = capsys.readouterr().out
+    assert "fail" in out
+    assert "vmm binary" in out
+    assert "cargo build" in out
+
+
+def test_completion_scripts_and_bad_shell(capsys):
+    assert cli.main(["completion", "bash"]) == 0
+    bash_out = capsys.readouterr().out
+    assert "_VMON_COMPLETE" in bash_out
+    assert 'eval "$(vmon completion bash)"' in bash_out
+
+    assert cli.main(["completion", "fish"]) == 0
+    fish_out = capsys.readouterr().out
+    assert "complete --no-files --command vmon" in fish_out
+
+    assert cli.main(["completion", "nope"]) == 2
+    assert "unsupported shell" in capsys.readouterr().err
+
+
+def test_daemon_start_failure_hints_doctor(monkeypatch, capsys):
+    class FailingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def call(self, method, **params):
+            raise client.DaemonError("vmond exited (code 1) on startup", code="start_failed")
+
+    monkeypatch.setattr(cli, "DaemonClient", FailingClient)
+    assert cli.main(["ps"]) == 1
+    captured = capsys.readouterr()
+    assert "vmond exited" in captured.err
+    assert "vmon doctor" in captured.out
 
 
 # -- inspect / stats / extend ----------------------------------------------
