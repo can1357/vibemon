@@ -54,6 +54,7 @@ class NodeState:
     templates: list[str] = field(default_factory=list)
     pools: dict[str, int] = field(default_factory=dict)
     owned: list[str] = field(default_factory=list)
+    owned_epochs: dict[str, int] = field(default_factory=dict)
     ts: float = 0.0
     last_seen: float = 0.0
     backend: str = ""
@@ -93,6 +94,7 @@ class NodeState:
             "template_index": dict(self.template_index),
             "pools": dict(self.pools),
             "owned": list(self.owned),
+            "owned_epochs": dict(self.owned_epochs),
             "ts": self.ts,
             "last_seen": self.last_seen,
             "free_vcpus": self.free_vcpus,
@@ -111,6 +113,7 @@ class NodeState:
         template_index_raw: dict[str, Any] = (
             data["template_index"] if isinstance(data.get("template_index"), dict) else {}
         )
+        owned_epochs_raw = dict(data.get("owned_epochs") or {})
         return cls(
             node_id=str(data.get("node_id") or ""),
             advertise=str(data.get("advertise") or ""),
@@ -128,6 +131,7 @@ class NodeState:
                 str(key): str(value) for key, value in template_index_raw.items() if key and value
             },
             owned=[str(item) for item in data.get("owned") or []],
+            owned_epochs={str(key): int(value) for key, value in owned_epochs_raw.items()},
             ts=float(data.get("ts") or 0.0),
             last_seen=float(data.get("last_seen") or 0.0),
         )
@@ -554,7 +558,10 @@ class Mesh:
         self._peers: dict[str, NodeState] = {}
         self._owners: dict[str, str] = {}
         self._explicit_owners: dict[str, tuple[str, float]] = {}
+        self._owner_epoch: dict[str, tuple[int, str]] = {}
+        self._local_epoch: dict[str, int] = {}
         self._inflight = 0
+        self._orphans: list[tuple[str, str]] = []
         self.idem_ttl = float(os.environ.get("VMON_MESH_IDEM_TTL_SEC", "900.0"))
         self.create_timeout = float(os.environ.get("VMON_MESH_CREATE_TIMEOUT_SEC", "120.0"))
         # key -> (workload owner node id, pin timestamp): a coordinator's transient
@@ -575,6 +582,7 @@ class Mesh:
             node_id = self.node_id or new_node_id()
             if not self.node_id:
                 self.node_id = node_id
+            owned_ids = self.engine.owned_ids()
             return NodeState(
                 node_id=node_id,
                 advertise=self.advertise,
@@ -589,7 +597,8 @@ class Mesh:
                 templates=self.engine.templates_present(),
                 pools=pool_inventory(),
                 template_index=template_index,
-                owned=self.engine.owned_ids(),
+                owned=owned_ids,
+                owned_epochs={sid: self._local_epoch.get(sid, 0) for sid in owned_ids},
                 ts=now,
                 last_seen=now,
             )
@@ -787,17 +796,54 @@ class Mesh:
             self._rebuild_owners_locked()
             return self._owners.get(sid)
 
-    def record_owner(self, sid: str, node_id: str) -> None:
+    def _consider_owner(self, sid: str, epoch: int, node_id: str) -> bool:
+        """Update the authoritative (epoch, owner) for sid; return True iff this claim won."""
+        cur = self._owner_epoch.get(sid)
+        if cur is None or (epoch, node_id) > cur:
+            self._owner_epoch[sid] = (epoch, node_id)
+            self._owners[sid] = node_id
+            return True
+        return False
+
+    def record_owner(self, sid: str, node_id: str, epoch: int) -> None:
         """Record an owner immediately after a proxied creator returns."""
         with self._lock:
-            self._explicit_owners[sid] = (node_id, time.time())
-            self._owners[sid] = node_id
+            won = self._consider_owner(sid, epoch, node_id)
+            if won:
+                self._explicit_owners[sid] = (node_id, time.time())
+                if node_id == self.node_id:
+                    self._local_epoch[sid] = epoch
+                    self._persist_local_epoch(sid, epoch)
 
     def forget_owner(self, sid: str) -> None:
         """Forget an owner mapping after termination or deletion."""
         with self._lock:
             self._explicit_owners.pop(sid, None)
             self._owners.pop(sid, None)
+            self._owner_epoch.pop(sid, None)
+            self._local_epoch.pop(sid, None)
+
+    def forget_local_owner(self, sid: str) -> None:
+        """Drop only this node's local epoch, preserving remote authority after fencing."""
+        with self._lock:
+            self._local_epoch.pop(sid, None)
+
+    def _persist_local_epoch(self, sid: str, epoch: int) -> None:
+        """Best-effort persist of this node's ownership epoch for restart durability."""
+        setter = getattr(self.engine, "set_owner_epoch", None)
+        if callable(setter):
+            with contextlib.suppress(Exception):
+                setter(sid, epoch)
+
+    def _loaded_owned_epoch(self, sid: str) -> int:
+        """Read the persisted ownership epoch for a locally-owned sid (0 if unknown)."""
+        getter = getattr(self.engine, "owned_epoch", None)
+        if not callable(getter):
+            return 0
+        try:
+            return int(getter(sid))
+        except Exception:
+            return 0
 
     def migration_target(self, node_id: str) -> NodeState:
         """Validate and return a healthy, restore-compatible peer for a migration.
@@ -824,20 +870,49 @@ class Mesh:
                 )
             return peer
 
-    def broadcast_owner(self, sid: str, node_id: str) -> None:
+    def broadcast_owner(self, sid: str, node_id: str, epoch: int) -> None:
         """Record a sandbox's new owner locally and push it to every peer.
 
         Speeds cluster-wide convergence after a migration so requests route to the
         new owner without waiting for the next gossip round; ``_scatter_locate`` is
         the backstop for any peer that misses the push.
         """
-        self.record_owner(sid, node_id)
+        self.record_owner(sid, node_id, epoch)
         with self._lock:
             peers = list(self._peers.values())
-        payload = {"sid": sid, "node_id": node_id}
+        payload = {"sid": sid, "node_id": node_id, "epoch": epoch}
         for peer in peers:
             with contextlib.suppress(Exception):
                 self.transport.post(peer.advertise, "/v1/mesh/owner", payload)
+
+    def next_epoch(self, sid: str) -> int:
+        """Return the next epoch that can supersede the current authoritative owner."""
+        with self._lock:
+            return self._owner_epoch.get(sid, (0, ""))[0] + 1
+
+    def authoritative_owner(self, sid: str) -> tuple[str | None, int]:
+        """Return the authoritative ``(owner, epoch)`` for *sid*, or ``(None, -1)``."""
+        with self._lock:
+            cur = self._owner_epoch.get(sid)
+            if cur is None:
+                return None, -1
+            epoch, node = cur
+            return node, epoch
+
+    def local_epoch(self, sid: str) -> int:
+        """Return the epoch at which THIS node owns *sid* (0 if not locally owned)."""
+        with self._lock:
+            return self._local_epoch.get(sid, 0)
+
+    def fenced_local_ids(self, local_ids: list[str]) -> list[str]:
+        """Return local sandbox ids whose authoritative owner is another node."""
+        with self._lock:
+            fenced: list[str] = []
+            for sid in local_ids:
+                cur = self._owner_epoch.get(sid)
+                if cur is not None and cur[1] != self.node_id:
+                    fenced.append(sid)
+            return fenced
 
     def peer_url(self, node_id: str) -> str | None:
         """Return the advertised URL for a node id."""
@@ -890,6 +965,40 @@ class Mesh:
                 peer.node_id for peer in self._peers.values() if peer.healthy(now, self.interval)
             )
         return max(members, key=lambda nid: _hrw_score(key, nid))
+
+    def replica_targets(self, sid: str, k: int) -> list[str]:
+        """Up to *k* live peer node ids for *sid*, highest rendezvous weight first."""
+        if k <= 0:
+            return []
+        with self._lock:
+            now = time.time()
+            targets = [
+                peer.node_id
+                for peer in self._peers.values()
+                if peer.node_id != self.node_id and peer.healthy(now, self.interval)
+            ]
+            targets.sort(key=lambda node_id: _hrw_score(sid, node_id), reverse=True)
+            return targets[:k]
+
+    def restore_owner(self, sid: str, *, exclude: set[str]) -> str | None:
+        """Return the deterministically-elected live restorer for *sid*, excluding dead nodes."""
+        with self._lock:
+            now = time.time()
+            members = [self.node_id]
+            members.extend(
+                peer.node_id for peer in self._peers.values() if peer.healthy(now, self.interval)
+            )
+            members = [node_id for node_id in members if node_id not in exclude]
+            if not members:
+                return None
+            return max(members, key=lambda node_id: _hrw_score(sid, node_id))
+
+    def drain_orphans(self) -> list[tuple[str, str]]:
+        """Return and clear ``(sid, dead_node)`` pairs orphaned by reaped peers."""
+        with self._lock:
+            out = list(self._orphans)
+            self._orphans.clear()
+            return out
 
     def idem_pin(self, key: str, owner: str) -> str:
         """Pin *key* to a workload *owner*, returning the effective (possibly prior) owner.
@@ -1024,6 +1133,8 @@ class Mesh:
                 if node.node_id and node.node_id != self.node_id:
                     node.last_seen = now
                     self._peers[node.node_id] = node
+                    for sid, ep in node.owned_epochs.items():
+                        self._consider_owner(sid, ep, node.node_id)
             for item in response.get("known") or []:
                 node = NodeState.from_wire(item)
                 if not node.node_id or node.node_id == self.node_id:
@@ -1031,6 +1142,8 @@ class Mesh:
                 if node.node_id not in self._peers:
                     node.last_seen = now if node.last_seen <= 0.0 else node.last_seen
                     self._peers[node.node_id] = node
+                for sid, ep in node.owned_epochs.items():
+                    self._consider_owner(sid, ep, node.node_id)
             self._rebuild_owners_locked()
 
     def _reap_stale_peers(self) -> None:
@@ -1041,6 +1154,14 @@ class Mesh:
                 for node_id, peer in self._peers.items()
                 if peer.last_seen > 0.0 and now - peer.last_seen > self.reap_sec
             ]
+            if stale:
+                queued = set(self._orphans)
+                for node_id in stale:
+                    for sid, owner in self._owners.items():
+                        orphan = (sid, node_id)
+                        if owner == node_id and orphan not in queued:
+                            self._orphans.append(orphan)
+                            queued.add(orphan)
             for node_id in stale:
                 self._peers.pop(node_id, None)
             if stale:
@@ -1052,6 +1173,15 @@ class Mesh:
             self._rebuild_owners_locked()
 
     def _rebuild_owners_locked(self) -> None:
+        for sid in self.engine.owned_ids():
+            if sid not in self._local_epoch:
+                self._local_epoch[sid] = self._loaded_owned_epoch(sid)
+            self._consider_owner(sid, self._local_epoch[sid], self.node_id)
+        for peer in self._peers.values():
+            if not peer.healthy(time.time(), self.interval):
+                continue
+            for sid, ep in peer.owned_epochs.items():
+                self._consider_owner(sid, ep, peer.node_id)
         owners: dict[str, str] = {}
         for sid in self.engine.owned_ids():
             owners[sid] = self.node_id
@@ -1066,3 +1196,5 @@ class Mesh:
                 keep_explicit[sid] = (node_id, recorded_at)
         self._explicit_owners = keep_explicit
         self._owners = owners
+        for sid, (_ep, node) in self._owner_epoch.items():
+            self._owners[sid] = node

@@ -426,7 +426,7 @@ def test_owner_index_record_and_reap(tmp_path):
     mesh.enabled = True
     peer = NodeState("peer", "http://peer", owned=["remote"], last_seen=time.time())
     mesh.register(peer)
-    mesh.record_owner("new", "peer")
+    mesh.record_owner("new", "peer", 0)
 
     assert mesh.owner_of("local") == "self"
     assert mesh.owner_of("remote") == "peer"
