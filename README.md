@@ -235,6 +235,11 @@ The Python package adds a Modal-style `Sandbox` SDK and a FastAPI server on top 
 
 The user-facing `vmon` CLI is a thin Docker-like client: it talks to a zero-config local daemon (`vmond`) over a Unix socket at `~/.vmon/vmond.sock`, auto-started on first use. The daemon is the single owner of `~/.vmon` — it holds the VM registry, rehydrates VMs from disk on restart, and spawns one VMM process per microVM, so you never type the VMM's flags by hand (`vmon run`/`ps`/`logs`/`exec`/`stop` route through the daemon, like `docker` ↔ `dockerd` ↔ `runc`). `vmon serve` is the same single-owner process plus a FastAPI HTTP/web gateway over the **same** engine, so the CLI and the REST API share one registry. The engine, daemon, and client are stdlib-only (`pip install vmon`); FastAPI/uvicorn stay in the optional `[server]` extra used only by `vmon serve`.
 
+| Command | What it does |
+| --- | --- |
+| `vmon doctor` | Prints the local prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, Docker/Podman, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment) and exits non-zero on hard failures. |
+| `vmon completion [bash|zsh|fish]` | Prints a sourceable Click shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
+
 ```python
 from vmon.sandbox import Sandbox
 from vmon.secret import Secret
@@ -264,6 +269,27 @@ Named volumes persist outside snapshots and are protected by a single-writer hos
 Exposed ports are available through `sb.tunnels()`. `sb.create_connect_token()` creates a bearer token for the REST proxy at `/v1/sandboxes/{id}/ports/{port}/...`. Runtime deadlines can be extended through `Sandbox.extend(secs)` or `POST /v1/sandboxes/{id}/extend`; `poll()` and `returncode` report the entry process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for terminate.
 
 `Sandbox.create(template=..., pool_size=N)` keeps pre-forked copy-on-write clones ready and falls back to cold restore when the pool is empty. `Sandbox.aio.*` mirrors the synchronous SDK with thread-backed async methods. The REST API covers create/list/filter by tag (`GET /v1/sandboxes?tag=k:v`), exec and pty WebSocket exec, snapshots, network policy, tunnels, lifecycle events (`GET /v1/events` as SSE), metrics, and OpenAPI docs through FastAPI.
+
+Remote functions use `@vmon.function(...)` to ship a source-defined Python function, plus the module-level imports, helpers, and literal constants it references, into a `python:3.14-slim` guest. Use `.remote(...)` for one call or `.map(...)` / `.starmap(...)` for parallel calls across a temporary sandbox pool; arguments and return values must be JSON-serializable, the function must not close over local variables, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
+
+```python
+import math
+import vmon
+
+RF_CONST = 7
+
+def triple(n: int) -> int:
+    return n * 3
+
+@vmon.function(block_network=True)
+def compute(x: int) -> dict[str, int]:
+    print(f"remote x={x}")
+    return {"isqrt": math.isqrt(x), "tripled": triple(x), "const": RF_CONST}
+
+print(compute.remote(16))
+print(compute.map([1, 4, 9]))
+compute.terminate()
+```
 
 The Python `vmon` wrapper has separate usage notes in [`python/README.md`](python/README.md), and a practical copy-paste guide is in [`MANUAL.md`](MANUAL.md).
 

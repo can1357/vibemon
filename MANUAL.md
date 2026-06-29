@@ -155,6 +155,8 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `stop` / `rm` | stop / remove a microVM | `vmon stop web` |
 | `daemon` | `start` / `stop` / `status` of the local `vmond` daemon | `vmon daemon status` |
 | `serve` | run the daemon **and** the REST API + web panel (one owner) | `vmon serve --token secret` |
+| `doctor` | print a prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, Docker/Podman, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment); exits non-zero on hard failures | `vmon doctor` |
+| `completion [bash|zsh|fish]` | print a sourceable Click shell-completion script | `eval "$(vmon completion zsh)"` |
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
 `--disk-mb` (default 1024), `--timeout <s>` (default 300), and `--block-network`
@@ -397,6 +399,36 @@ finally:
 
 `MicroVM.run` / `restore` / `fork` are the lower-level container and snapshot
 primitives; `python/README.md` has the full SDK reference.
+
+### Remote functions
+
+`@vmon.function(...)` wraps a source-defined Python function with
+`RemoteFunction.remote()`, `.map()`, and `.starmap()`. Calls run in a
+`python:3.14-slim` sandbox by default; the function source is shipped with the
+module-level imports, helpers, and literal constants it references. Arguments and
+return values must be JSON-serializable, and the function must not close over
+local variables. Guest `print()` output is forwarded back to the host. `.map()`
+and `.starmap()` run work items in parallel across a temporary sandbox pool and
+return ordered results by default.
+
+```python
+import math
+import vmon
+
+RF_CONST = 7
+
+def triple(n: int) -> int:
+    return n * 3
+
+@vmon.function(block_network=True)
+def compute(x: int) -> dict[str, int]:
+    print(f"remote x={x}")
+    return {"isqrt": math.isqrt(x), "tripled": triple(x), "const": RF_CONST}
+
+print(compute.remote(16))      # {'isqrt': 4, 'tripled': 48, 'const': 7}
+print(compute.map([1, 4, 9]))  # ordered results from parallel sandboxes
+compute.terminate()            # optional: stop the cached .remote() sandbox
+```
 
 ---
 
