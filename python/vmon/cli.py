@@ -16,8 +16,9 @@ import click
 
 from . import __version__, doctor
 from . import console as ui
-from .client import DaemonClient, DaemonError, GatewayClient
+from .client import DaemonClient, DaemonError, GatewayClient, MeshClient
 from .console import RichGroup
+from .context import LOCAL, Context, ContextStore, roster_from_status
 
 # ``-h`` as well as ``--help``; PTY/REMAINDER commands stop option parsing at the
 # first positional so a trailing command keeps its own flags (Docker-style).
@@ -137,8 +138,35 @@ def _mesh_call(
     return json.loads(raw or b"{}")
 
 
-def _client() -> DaemonClient | GatewayClient:
-    """Select daemon or gateway transport for one CLI request."""
+def _normalize_server(server: str) -> str:
+    """Coerce a ``host[:port]`` or URL into an ``http(s)`` base URL."""
+    return (server if "://" in server else f"http://{server}").rstrip("/")
+
+
+def _fetch_mesh_status(url: str, token: str) -> dict[str, object]:
+    """Fetch a gateway's mesh status (the roster source) for context bootstrap."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v1/mesh/status",
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise click.ClickException(f"mesh status error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"cannot reach gateway at {url}: {exc.reason}") from exc
+    return json.loads(raw or b"{}")
+
+
+def _client() -> DaemonClient | GatewayClient | MeshClient:
+    """Select daemon, gateway, or mesh-context transport for one CLI request."""
     import json
     import os
 
@@ -147,6 +175,27 @@ def _client() -> DaemonClient | GatewayClient:
     server = os.environ.get("VMON_SERVER")
     if server:
         return GatewayClient(server)
+    store = ContextStore()
+    store.load()
+    selected = store.current_name()
+    if selected and selected != LOCAL:
+        ctx = store.get(selected)
+        if ctx is None:
+            raise DaemonError(
+                f"selected context {selected!r} not found; run 'vmon context ls'", code="invalid"
+            )
+        if not ctx.endpoints:
+            raise DaemonError(
+                f"context {selected!r} has no endpoints; run 'vmon context refresh'", code="invalid"
+            )
+
+        def _persist(order: list[str]) -> None:
+            ctx.endpoints = order
+            store.put(ctx)
+
+        return MeshClient(ctx.endpoints, os.environ.get("VMON_API_TOKEN"), on_roster=_persist)
+    if selected == LOCAL:
+        return DaemonClient()
     home = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
     mesh_path = home / "mesh.json"
     if mesh_path.exists():
@@ -598,6 +647,132 @@ def leave(drain):
 def migrate(name, node):
     _mesh_call("POST", f"/v1/sandboxes/{name}/migrate", {"target": node})
     ui.success(f"migrated [vmon.command]{name}[/] to node {node}")
+    return 0
+
+
+# -- context ---------------------------------------------------------------
+
+
+@cli.group(
+    cls=RichGroup,
+    panel="Mesh",
+    context_settings=_CTX,
+    help="Target a remote cluster and fail over across its gateways.",
+)
+def context() -> None:
+    pass
+
+
+@context.command(name="create", context_settings=_CTX, help="Create a context from a gateway URL.")
+@click.argument("name")
+@click.option("--server", "-s", required=True, help="gateway URL or host:port to bootstrap from")
+@click.option("--token", help="bearer token for the initial fetch (default: $VMON_API_TOKEN)")
+@click.option("--region", default="", help="locality label (informational)")
+def context_create(name, server, token, region):
+    import os
+    import time
+
+    if name == LOCAL:
+        raise click.ClickException(f"{LOCAL!r} is reserved for the local daemon")
+    tok = token or os.environ.get("VMON_API_TOKEN")
+    if not tok:
+        raise click.ClickException("a token is required: pass --token or set VMON_API_TOKEN")
+    url = _normalize_server(server)
+    try:
+        endpoints = roster_from_status(_fetch_mesh_status(url, tok), fallback=url)
+    except click.ClickException as exc:
+        ui.error(str(exc))
+        ui.hint("storing the single endpoint; run 'vmon context refresh' once reachable")
+        endpoints = [url]
+    store = ContextStore()
+    store.load()
+    store.put(Context(name=name, endpoints=endpoints, region=region, updated=time.time()))
+    if store.current() is None:
+        store.use(name)
+    ui.success(f"context [vmon.command]{name}[/] → {len(endpoints)} endpoint(s)")
+    ui.hint("set VMON_API_TOKEN to authenticate cluster commands")
+    return 0
+
+
+@context.command(name="ls", context_settings=_CTX, help="List configured contexts.")
+def context_ls():
+    store = ContextStore()
+    store.load()
+    ui.context_table(store.list(), store.current_name())
+    return 0
+
+
+@context.command(
+    name="use",
+    context_settings=_CTX,
+    help="Switch the active context ('local' selects the daemon).",
+)
+@click.argument("name")
+def context_use(name):
+    store = ContextStore()
+    store.load()
+    try:
+        store.use(name)
+    except KeyError:
+        raise click.ClickException(f"no such context {name!r}") from None
+    ui.success(f"using context [vmon.command]{name}[/]")
+    return 0
+
+
+@context.command(name="refresh", context_settings=_CTX, help="Re-fetch a context's gateway roster.")
+@click.argument("name", required=False)
+def context_refresh(name):
+    import os
+    import time
+
+    store = ContextStore()
+    store.load()
+    target = name or store.current_name()
+    if not target or target == LOCAL:
+        raise click.ClickException("no context to refresh; pass NAME or run 'vmon context use'")
+    ctx = store.get(target)
+    if ctx is None:
+        raise click.ClickException(f"no such context {target!r}")
+    tok = os.environ.get("VMON_API_TOKEN")
+    if not tok:
+        raise click.ClickException("VMON_API_TOKEN is required to refresh a context")
+    last: click.ClickException | None = None
+    for endpoint in ctx.endpoints:
+        try:
+            status = _fetch_mesh_status(endpoint, tok)
+        except click.ClickException as exc:
+            last = exc
+            continue
+        ctx.endpoints = roster_from_status(status, fallback=endpoint)
+        ctx.updated = time.time()
+        store.put(ctx)
+        ui.success(f"refreshed [vmon.command]{target}[/] → {len(ctx.endpoints)} endpoint(s)")
+        return 0
+    raise last or click.ClickException(f"no reachable endpoint for context {target!r}")
+
+
+@context.command(name="rm", context_settings=_CTX, help="Remove a context.")
+@click.argument("name")
+def context_rm(name):
+    store = ContextStore()
+    store.load()
+    store.remove(name)
+    ui.success(f"removed context [vmon.command]{name}[/]")
+    return 0
+
+
+@context.command(name="inspect", context_settings=_CTX, help="Print a context as JSON.")
+@click.argument("name", required=False)
+def context_inspect(name):
+    store = ContextStore()
+    store.load()
+    target = name or store.current_name()
+    if not target or target == LOCAL:
+        raise click.ClickException("no context selected; pass NAME or run 'vmon context use'")
+    ctx = store.get(target)
+    if ctx is None:
+        raise click.ClickException(f"no such context {target!r}")
+    ui.console.print_json(data=ctx.to_dict())
     return 0
 
 
