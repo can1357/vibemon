@@ -1,5 +1,9 @@
+import ast
+import asyncio
+import inspect
 import io
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +43,11 @@ class FakeAgentConn:
         self.mounts: list[tuple[str, str, bool]] = []
         self.net_configs: list[dict[str, object]] = []
         self.ping_timeouts: list[float | None] = []
+        self.fs_reads: list[str] = []
+        self.fs_writes: list[tuple[str, bytes, int]] = []
+        self.fs_storage: dict[str, bytes] = {}
+        self.fs_mkdirs: list[tuple[str, bool]] = []
+        self.fs_removes: list[tuple[str, bool]] = []
 
     def ping(self, timeout: float | None = None) -> dict[str, bool]:
         self.ping_timeouts.append(timeout)
@@ -63,6 +72,32 @@ class FakeAgentConn:
         self.exec_envs.append(dict(env or {}))
         return FakeSession()
 
+    def fs_read(self, path: str) -> bytes:
+        self.fs_reads.append(path)
+        return self.fs_storage[path]
+
+    def fs_write(self, path: str, data: bytes | bytearray | memoryview, mode: int = 0o644) -> None:
+        raw = bytes(data)
+        self.fs_writes.append((path, raw, mode))
+        self.fs_storage[path] = raw
+
+    def fs_list(self, path: str = ".") -> list[dict[str, object]]:
+        return [
+            {"path": child, "type": "file"}
+            for child in sorted(self.fs_storage)
+            if child.startswith(path)
+        ]
+
+    def fs_mkdir(self, path: str, parents: bool = True) -> None:
+        self.fs_mkdirs.append((path, parents))
+
+    def fs_remove(self, path: str, recursive: bool = False) -> None:
+        self.fs_removes.append((path, recursive))
+        self.fs_storage.pop(path, None)
+
+    def fs_stat(self, path: str) -> dict[str, object]:
+        return {"path": path, "size": len(self.fs_storage[path])}
+
     def close(self) -> None:
         self.closed = True
 
@@ -70,6 +105,9 @@ class FakeAgentConn:
 class FakeControl:
     def extend(self, secs: int) -> dict[str, int]:
         return {"deadline_unix": secs}
+
+    def metrics(self) -> dict[str, int]:
+        return {"vcpu_exits": 42}
 
 
 class FakeMicroVM:
@@ -84,6 +122,7 @@ class FakeMicroVM:
         self.control = FakeControl()
         self._agent = FakeAgentConn()
         self.stopped = False
+        self.snapshots: list[tuple[str, bool, Path]] = []
 
     @classmethod
     def restore(cls, template: object, name: str | None = None, **kwargs: object):
@@ -100,6 +139,13 @@ class FakeMicroVM:
         vm = cls(name or "sb", sandbox_mod.STATE)
         cls.booted.append((rootfs, name, dict(kwargs), vm))
         return vm
+
+    def snapshot(self, name: str, keep_running: bool = True, disk_src: Path | None = None) -> Path:
+        disk = disk_src or self.rootfs_img
+        self.snapshots.append((name, keep_running, disk))
+        snap_dir = self.dir / "snapshots" / name
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        return snap_dir
 
     def agent(self, connect_timeout: float | None = None) -> FakeAgentConn:
         return self._agent
@@ -132,6 +178,45 @@ def _install_fakes(monkeypatch, mvm_home: Path):
         staticmethod(lambda **kwargs: (mvm_home / "templates" / "t", None, "t")),
     )
     return sandbox_mod
+
+
+_REMOTE_FN_CONSTANT = 7
+
+
+def _identity_decorator(**_kwargs):
+    def decorate(fn):
+        return fn
+
+    return decorate
+
+
+@_identity_decorator(
+    marker="multi",
+)
+def _sample_multiline_decorated(x: int) -> int:
+    return x + 1
+
+
+def _remote_fn_helper(value: float) -> int:
+    return math.ceil(value) + _REMOTE_FN_CONSTANT
+
+
+def _sample_remote_uses_module_context(value: float) -> int:
+    return _remote_fn_helper(value)
+
+
+def _rf_param_shadows_import(math: int) -> int:
+    # `math` is a parameter, not the module's `import math`.
+    return math + 1
+
+
+def _rf_closure_shadows_const() -> int:
+    _REMOTE_FN_CONSTANT = 99  # local shadow of the module constant
+
+    def _inner() -> int:
+        return _REMOTE_FN_CONSTANT  # binds the enclosing local, not the module const
+
+    return _inner()
 
 
 def _sample_remote_sum(x: int, y: int = 0) -> dict[str, int]:
@@ -237,6 +322,91 @@ def test_remote_function_runner_reports_non_json_result() -> None:
     assert "JSON-serializable" in str(exc.value)
 
 
+def test_remote_function_source_strips_multiline_decorator() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    source = sandbox_mod._remote_function_source(_sample_multiline_decorated)
+    ast.parse(source)
+    payload = sandbox_mod._remote_function_payload(_sample_multiline_decorated, (8,), {})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    assert sandbox_mod._remote_function_result(completed.stdout) == 9
+
+
+def test_remote_function_source_includes_module_context() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    source = sandbox_mod._remote_function_source(_sample_remote_uses_module_context)
+    assert "import math" in source
+    assert "_REMOTE_FN_CONSTANT = 7" in source
+    assert "def _remote_fn_helper" in source
+    payload = sandbox_mod._remote_function_payload(_sample_remote_uses_module_context, (2.2,), {})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    assert sandbox_mod._remote_function_result(completed.stdout) == 10
+
+
+def test_remote_function_source_excludes_param_shadowed_import() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    source = sandbox_mod._remote_function_source(_rf_param_shadows_import)
+    # `math` is a parameter; the module's `import math` must not be shipped.
+    assert "import math" not in source
+    assert "_rf_param_shadows_import" in source
+
+
+def test_remote_function_source_excludes_closure_shadowed_const() -> None:
+    import vmon.sandbox as sandbox_mod
+
+    source = sandbox_mod._remote_function_source(_rf_closure_shadows_const)
+    # The inner function captures the enclosing LOCAL constant, so the module
+    # constant of the same name must not leak into the shipped source.
+    assert "_REMOTE_FN_CONSTANT = 7" not in source
+    payload = sandbox_mod._remote_function_payload(_rf_closure_shadows_const, (), {})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    assert sandbox_mod._remote_function_result(completed.stdout) == 99
+
+
+def test_remote_function_result_forwards_captured_stdout(capsys) -> None:
+    import vmon.sandbox as sandbox_mod
+
+    payload = sandbox_mod._remote_function_payload(_sample_remote_sum, (2,), {"y": 5})
+    completed = subprocess.run(
+        [sys.executable, "-c", sandbox_mod._REMOTE_FUNCTION_RUNNER],
+        input=payload,
+        capture_output=True,
+        check=True,
+    )
+    assert sandbox_mod._remote_function_result(completed.stdout) == {"sum": 7}
+    assert capsys.readouterr().out == "remote ran\n"
+
+    raw = json.dumps(
+        {
+            "ok": False,
+            "type": "ValueError",
+            "message": "boom",
+            "traceback": "",
+            "stdout": "before failure\n",
+        }
+    ).encode()
+    with pytest.raises(sandbox_mod.RemoteFunctionError):
+        sandbox_mod._remote_function_result(raw)
+    assert capsys.readouterr().out == "before failure\n"
+
+
 def test_remote_function_rejects_closures() -> None:
     import vmon.sandbox as sandbox_mod
 
@@ -272,6 +442,58 @@ def test_function_decorator_remote_uses_cached_python_sandbox(monkeypatch) -> No
     assert sandboxes[0].execs[0][0] == ("python3", "--version")
     assert sandboxes[0].execs[1][0] == ("python3", "-u", "/tmp/vmon-function-runner.py")
     assert "/tmp/vmon-function-runner.py" in sandboxes[0].filesystem.writes
+
+
+def test_remote_function_aio_remote_delegates(monkeypatch) -> None:
+    import vmon.sandbox as sandbox_mod
+
+    monkeypatch.setattr(
+        sandbox_mod.Sandbox,
+        "create",
+        staticmethod(lambda **kwargs: _RemoteFakeSandbox(sandbox_mod)),
+    )
+    remote = sandbox_mod.function(block_network=True)(_sample_remote_sum)
+    # `fn.aio.{remote,map,starmap}` await the same paths as the sync `fn.*`.
+    assert asyncio.run(remote.aio.remote(4, y=6)) == {"sum": 10}
+    assert asyncio.run(remote.aio.starmap([(1, 2), (3, 4)])) == [{"sum": 3}, {"sum": 7}]
+    ctx = sandbox_mod.function(block_network=True)(_sample_remote_uses_module_context)
+    assert asyncio.run(ctx.aio.map([1.1, 2.1])) == [9, 10]
+
+
+def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None:
+    import vmon.sandbox as sandbox_mod
+
+    created: list[dict[str, object]] = []
+    sandboxes: list[_RemoteFakeSandbox] = []
+
+    def fake_create(**kwargs: object) -> _RemoteFakeSandbox:
+        created.append(dict(kwargs))
+        sandbox = _RemoteFakeSandbox(sandbox_mod)
+        sandboxes.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "create", staticmethod(fake_create))
+
+    remote = sandbox_mod.function(block_network=True)(_sample_remote_uses_module_context)
+    assert remote.map([1.1, 2.1, 3.1, 4.1], concurrency=3) == [9, 10, 11, 12]
+    assert len(sandboxes) == 3
+    assert len(created) == 3
+    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
+    assert all(sandbox.terminated for sandbox in sandboxes)
+
+    created.clear()
+    sandboxes.clear()
+
+    star_remote = sandbox_mod.function(block_network=True)(_sample_remote_sum)
+    assert star_remote.starmap([(1, 2), (3, 4), (5, 6)], concurrency=2) == [
+        {"sum": 3},
+        {"sum": 7},
+        {"sum": 11},
+    ]
+    assert len(sandboxes) == 2
+    assert len(created) == 2
+    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
+    assert all(sandbox.terminated for sandbox in sandboxes)
 
 
 def test_create_never_persists_secret_values_and_exec_merges_env(monkeypatch, mvm_home):
@@ -392,6 +614,78 @@ def test_sandbox_exec_layers_image_caller_and_secret_env(monkeypatch, mvm_home):
     assert seen["HOME"] == "/root"
     assert seen["PATH"] == "/custom/bin"
     assert seen["TOKEN"] == "s3cret"
+
+
+def test_async_sandbox_lifecycle_methods_delegate(monkeypatch, mvm_home) -> None:
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    vm = FakeMicroVM("sb", mvm_home)
+    network = SimpleNamespace(tunnels=lambda: {8000: ("127.0.0.1", 18000)})
+    sb = sandbox_mod.Sandbox(vm, network=network)
+    monkeypatch.setattr(sb, "_start_timeout_watchdog", lambda secs: None)
+    monkeypatch.setattr(sb, "_stop_timeout_watchdog", lambda: None)
+
+    assert asyncio.run(sb.aio.snapshot("snap")) == sb.snapshot("snap")
+    assert asyncio.run(sb.aio.extend(90)) == sb.extend(90)
+    assert asyncio.run(sb.aio.metrics()) == sb.metrics()
+    assert asyncio.run(sb.aio.tunnels()) == sb.tunnels()
+    assert asyncio.run(sb.aio.create_connect_token()) == sb.create_connect_token()
+    assert vm.snapshots == [
+        ("snap", True, vm.rootfs_img),
+        ("snap", True, vm.rootfs_img),
+    ]
+
+
+def test_async_sandbox_filesystem_delegates_to_agent(monkeypatch, mvm_home) -> None:
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    vm = FakeMicroVM("sb", mvm_home)
+    sb = sandbox_mod.Sandbox(vm)
+    path = "/tmp/async.txt"
+
+    asyncio.run(sb.aio.filesystem.write_text(path, "hello async", mode=0o600))
+    assert asyncio.run(sb.aio.filesystem.read_text(path)) == "hello async"
+    assert vm._agent.fs_writes == [(path, b"hello async", 0o600)]
+    assert vm._agent.fs_reads == [path]
+
+    assert asyncio.run(sb.aio.filesystem.stat(path)) == {"path": path, "size": 11}
+    assert asyncio.run(sb.aio.filesystem.list_files("/tmp")) == [{"path": path, "type": "file"}]
+    asyncio.run(sb.aio.filesystem.make_directory("/tmp/nested", parents=False))
+    asyncio.run(sb.aio.filesystem.remove(path, recursive=True))
+    assert vm._agent.fs_mkdirs == [("/tmp/nested", False)]
+    assert vm._agent.fs_removes == [(path, True)]
+
+
+def test_async_sandbox_parity_guard(monkeypatch, mvm_home) -> None:
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    sb = sandbox_mod.Sandbox(FakeMicroVM("sb", mvm_home))
+    async_sb = sandbox_mod._AsyncSandbox(sb)
+    sandbox_methods = {
+        "exec",
+        "terminate",
+        "wait_until_ready",
+        "snapshot",
+        "snapshot_filesystem",
+        "poll",
+        "set_network_policy",
+        "extend",
+        "metrics",
+        "tunnels",
+        "create_connect_token",
+    }
+    filesystem_methods = {
+        "read_bytes",
+        "read_text",
+        "write_bytes",
+        "write_text",
+        "list_files",
+        "make_directory",
+        "remove",
+        "stat",
+    }
+
+    for name in sandbox_methods:
+        assert inspect.iscoroutinefunction(getattr(async_sb, name))
+    for name in filesystem_methods:
+        assert inspect.iscoroutinefunction(getattr(async_sb.filesystem, name))
 
 
 def test_macos_networked_create_warm_restores_and_replays_net_config(monkeypatch, mvm_home):

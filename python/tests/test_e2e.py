@@ -1,7 +1,10 @@
+import math
 import os
 from pathlib import Path
 
 import pytest
+
+from vmon import function
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("VMON_KVM_E2E"),
@@ -157,3 +160,35 @@ def test_block_network_blocks_egress():
         assert "default" not in route, f"block_network sandbox has a default route: {route!r}"
     finally:
         sb.terminate()
+
+
+_RF_CONST = 7
+
+
+def _rf_helper(n: int) -> int:
+    return n * 3
+
+
+@function(
+    block_network=True,
+)
+def _rf_compute(x: int) -> dict[str, int]:
+    # Real-VM cover for remote functions: a module import (math), module helper
+    # (_rf_helper), module constant (_RF_CONST), a multi-line decorator, and
+    # forwarded stdout must all survive shipping into a python:3.14-slim guest.
+    print(f"rf-e2e x={x}")
+    return {"isqrt": math.isqrt(x), "tripled": _rf_helper(x), "const": _RF_CONST}
+
+
+def test_remote_function_runs_in_real_vm(capsys):
+    assert _rf_compute.remote(16) == {"isqrt": 4, "tripled": 48, "const": 7}
+    # The guest's print() must be forwarded to the host by _remote_function_result.
+    assert "rf-e2e x=16" in capsys.readouterr().out
+    try:
+        assert _rf_compute.map([1, 4, 9]) == [
+            {"isqrt": 1, "tripled": 3, "const": 7},
+            {"isqrt": 2, "tripled": 12, "const": 7},
+            {"isqrt": 3, "tripled": 27, "const": 7},
+        ]
+    finally:
+        _rf_compute.terminate()
