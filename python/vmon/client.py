@@ -837,3 +837,170 @@ class GatewayClient:
                 DaemonClient._exit_raw(raw)
             with contextlib.suppress(OSError):
                 sock.close()
+
+
+# DaemonError codes proving a request never reached a backend (safe to fail over).
+_DENIES_DELIVERY = frozenset({"unreachable"})
+# Whitelist of replay-safe RPCs: reads, idempotent writes, and detached
+# run/restore (server-deduplicated by a stable idempotency key). Every other
+# method — extend, fork, snapshot, and any future mutating RPC — uses a health
+# probe plus a single attempt so a delivered request is never duplicated.
+_REPLAY_SAFE_CALLS = frozenset(
+    {
+        "ps",
+        "inspect",
+        "metrics",
+        "fs_list",
+        "fs_stat",
+        "cp_read",
+        "cp_write",
+        "pause",
+        "resume",
+        "stop",
+        "rm",
+        "run",
+        "restore",
+    }
+)
+_REPLAY_SAFE_STREAMS = frozenset({"logs"})
+
+
+class MeshClient:
+    """Multi-endpoint gateway transport with failover across a context's roster.
+
+    Wraps :class:`GatewayClient`: replay-safe operations (reads, idempotent
+    writes, and detached creates) fail over across all endpoints after
+    connection-establishment failures. Attached creates, exec, and shell fail
+    over only during a ``/healthz`` endpoint probe and then run once against the
+    selected gateway, so a delivered request is never duplicated. An HTTP 5xx
+    from a reachable gateway is surfaced to the caller, not retried elsewhere.
+    On success the answering endpoint is promoted to the head of the list and
+    ``on_roster`` (if given) is invoked with the new order so the caller can
+    persist the reordered roster.
+    """
+
+    def __init__(
+        self,
+        endpoints: list[str],
+        token: str | None = None,
+        *,
+        on_roster: Callable[[list[str]], None] | None = None,
+    ) -> None:
+        """Create a failover client for an ordered gateway endpoint roster."""
+
+        self._endpoints = [endpoint for endpoint in endpoints if endpoint]
+        if not self._endpoints:
+            raise DaemonError("no endpoints configured", code="invalid")
+        self._token = token
+        self._on_roster = on_roster
+
+    @property
+    def endpoints(self) -> list[str]:
+        """Return the current endpoint roster order."""
+
+        return list(self._endpoints)
+
+    def call(self, method: str, **params: Any) -> dict[str, Any]:
+        """Invoke a gateway RPC with delivery-safe endpoint failover."""
+
+        if method in {"run", "restore"} and "idempotency_key" not in params:
+            params["idempotency_key"] = secrets.token_urlsafe(18)
+        if method in _REPLAY_SAFE_CALLS:
+            return self._with_failover(lambda gc: gc.call(method, **params))
+        return self._single_live(lambda gc: gc.call(method, **params))
+
+    def stream(
+        self, method: str, on_event: OnEvent, stdin: BinaryIO | None = None, **params: Any
+    ) -> dict[str, Any]:
+        """Invoke a streaming gateway RPC with delivery-safe endpoint failover."""
+
+        if method in _REPLAY_SAFE_STREAMS:
+            return self._with_failover(
+                lambda gc: gc.stream(method, on_event, stdin=stdin, **params)
+            )
+        return self._single_live(lambda gc: gc.stream(method, on_event, stdin=stdin, **params))
+
+    def interactive(
+        self,
+        method: str,
+        on_event: OnEvent,
+        *,
+        tty: bool = True,
+        on_ready: Callable[[str], None] | None = None,
+        **params: Any,
+    ) -> dict[str, Any]:
+        """Invoke an interactive gateway RPC with delivery-safe endpoint failover."""
+
+        return self._single_live(
+            lambda gc: gc.interactive(method, on_event, tty=tty, on_ready=on_ready, **params)
+        )
+
+    def ensure_running(self) -> dict[str, Any]:
+        """Ensure a reachable gateway is running and promote the responder."""
+
+        return self._with_failover(lambda gc: gc.ensure_running())
+
+    def stop_daemon(self) -> dict[str, Any]:
+        """Reject daemon shutdown through a shared mesh context."""
+
+        raise DaemonError("not supported over a mesh context", code="unsupported")
+
+    def _pick_live(self) -> str:
+        """Promote and return the first endpoint answering GET /healthz; raise if none."""
+
+        last: Exception | None = None
+        for endpoint in list(self._endpoints):
+            try:
+                GatewayClient(endpoint, self._token).ensure_running()
+            except DaemonError as exc:
+                if exc.code in _DENIES_DELIVERY:
+                    last = exc
+                    continue
+                raise
+            except OSError as exc:
+                last = exc
+                continue
+            self._promote(endpoint)
+            return endpoint
+        if isinstance(last, DaemonError):
+            raise last
+        raise DaemonError(
+            f"no reachable gateway in context roster ({len(self._endpoints)} endpoints)",
+            code="unreachable",
+        ) from last
+
+    def _single_live(self, fn: Callable[[GatewayClient], dict[str, Any]]) -> dict[str, Any]:
+        """Probe /healthz to select a live endpoint, then run fn against it exactly once."""
+
+        return fn(GatewayClient(self._pick_live(), self._token))
+
+    def _with_failover(self, fn: Callable[[GatewayClient], dict[str, Any]]) -> dict[str, Any]:
+        last: Exception | None = None
+        for endpoint in list(self._endpoints):
+            client = GatewayClient(endpoint, self._token)
+            try:
+                result = fn(client)
+            except DaemonError as exc:
+                if exc.code in _DENIES_DELIVERY:
+                    last = exc
+                    continue
+                raise
+            except OSError as exc:
+                last = exc
+                continue
+            self._promote(endpoint)
+            return result
+        if isinstance(last, DaemonError):
+            raise last
+        raise DaemonError(
+            f"no reachable gateway in context roster ({len(self._endpoints)} endpoints)",
+            code="unreachable",
+        ) from last
+
+    def _promote(self, endpoint: str) -> None:
+        if self._endpoints[0] == endpoint:
+            return
+        self._endpoints.remove(endpoint)
+        self._endpoints.insert(0, endpoint)
+        if self._on_roster is not None:
+            self._on_roster(list(self._endpoints))
