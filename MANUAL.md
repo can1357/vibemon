@@ -70,7 +70,7 @@ bun run build      # outputs into python/vmon/web so `vmon serve` can serve it
 ### Step 2 — install the server dependencies (once)
 
 Use a virtualenv — this avoids macOS's `externally-managed-environment` error
-and keeps things isolated. The `test` extra also installs `pytest` for §8.
+and keeps things isolated. The `test` extra also installs `pytest` for §9.
 
 ```sh
 cd ../python
@@ -350,7 +350,145 @@ limactl shell kvm -- bash ~/vmon/demo/run-arm64-ubuntu.sh
 
 ---
 
-## 7. Programmatic use: Python SDK & REST API
+## 7. Cluster: pool multiple servers
+
+A cluster lets several `vmon serve` gateways act as one pool. Each gateway still owns the sandboxes running on its own host, but the CLI can keep a roster of gateways and route commands through the members that are reachable.
+
+### Step 1: form the cluster
+
+Pick one node as the seed. Start its gateway with the shared bearer token:
+
+```sh
+vmon serve --token T
+```
+
+In another shell on the seed host, initialize the mesh. The command prints a `vmon mesh join <blob>` command; keep that blob for the other nodes.
+
+```sh
+VMON_API_TOKEN=T vmon mesh setup --advertise http://<seed-ip>:8000
+```
+
+On every other node, start the gateway with the same token, then run the join command printed by the seed:
+
+```sh
+vmon serve --token T
+VMON_API_TOKEN=T vmon mesh join <blob>
+```
+
+All nodes must share the same `--token` / `VMON_API_TOKEN`. The join blob embeds the shared token, so treat it as secret too.
+
+Verify the membership, health, and capacity from any node:
+
+```sh
+VMON_API_TOKEN=T vmon mesh status
+```
+
+### Step 2: make the client use the cluster
+
+Create a named context from any reachable gateway. The CLI calls `GET /v1/mesh/status`, pulls the full roster, and stores the ordered endpoint list in `~/.vmon/contexts.json`. It does not store the token; keep providing it through `VMON_API_TOKEN`.
+
+```sh
+VMON_API_TOKEN=T vmon context create prod --server http://<any-node>:8000
+vmon context use prod
+```
+
+Now regular CLI commands go through the cluster context:
+
+```sh
+VMON_API_TOKEN=T vmon run alpine -- echo hello
+VMON_API_TOKEN=T vmon ps
+VMON_API_TOKEN=T vmon exec <sandbox> -- uname -a
+```
+
+Use the context commands to inspect, refresh, or remove the saved roster:
+
+```sh
+vmon context ls
+vmon context inspect prod
+VMON_API_TOKEN=T vmon context refresh prod
+vmon context rm prod
+vmon context use local
+```
+
+`vmon context refresh prod` re-pulls the roster from the cluster. `vmon context use local` switches back to the local `vmond` daemon.
+
+### Step 3: make the advertised URLs reachable
+
+Each node's advertise URL must be routable by every other node and by the client. On a LAN or a cloud VPC with reachable private IPs, this is usually just the node's host or VPC address.
+
+There is no built-in NAT traversal and no relay service. If one of the machines is behind NAT, such as a laptop or home server, put all nodes and clients on a WireGuard or Tailscale overlay and advertise the overlay IP for each node:
+
+```sh
+VMON_API_TOKEN=T vmon mesh setup --advertise http://<overlay-ip>:8000
+```
+
+Use the same idea when joining other nodes: the URL carried in the mesh must be the address peers and clients can actually dial.
+
+### Step 4: understand failover and downtime
+
+Once the context exists, the client can tolerate any number of gateways going down, as long as one saved endpoint is still reachable. It tries the saved endpoints in order and only fails over on a connection-level failure, so it does not duplicate a request that reached a server.
+
+That does not automatically make every running sandbox replicated. Without the optional HA replication in Step 5, a sandbox lives on exactly one node; if that node crashes ungracefully, the sandboxes on it are lost and only new placements automatically avoid nodes that are already known dead. Before planned downtime, move the work:
+
+```sh
+VMON_API_TOKEN=T vmon mesh migrate <name> <node>
+```
+
+Or evacuate the node before it leaves:
+
+```sh
+VMON_API_TOKEN=T vmon mesh leave --drain
+```
+
+### Step 5: high availability (optional)
+
+Crash-survival replication is opt-in. Set `VMON_REPLICATE_SEC` to a positive checkpoint cadence in seconds; unset or `0` disables it. `VMON_REPLICAS` sets the replica fan-out `K` and defaults to `1`.
+
+```sh
+export VMON_REPLICATE_SEC=60
+export VMON_REPLICAS=1
+vmon serve --token T
+```
+
+Only eligible sandboxes are protected: they must use block networking and must not have named volumes or an `fs_dir` host share. At each cadence, the owner checkpoint is non-destructive — the VM keeps running, with a brief quiesce — and the checkpoint is copied to the top-`K` rendezvous-ranked peers. If the owner node is reaped as dead, a deterministically elected replica holder restores the sandbox, claims ownership at a higher epoch, and broadcasts the new owner.
+
+Fencing is best-effort rather than quorum or lease based. A higher `(epoch, node_id)` supersedes an older owner, and a node that discovers one of its local sandboxes has been superseded stops and drops its copy. This bounds split-brain to the partition window and converges after rejoin, but it is not a consensus system. Replica secrets live in memory only; if a replica node restarts and loses them, it refuses automatic restore for that sandbox instead of starting it without secrets.
+
+### Step 6: scoped client tokens
+
+Use `VMON_CLIENT_TOKEN` when clients should be able to create and operate sandboxes but not administer the mesh. Start each gateway with the full operator token plus the scoped client token:
+
+```sh
+VMON_CLIENT_TOKEN=C vmon serve --token T
+```
+
+Operators keep using the full token for mesh administration:
+
+```sh
+VMON_API_TOKEN=T vmon mesh status
+VMON_API_TOKEN=T vmon mesh migrate <name> <node>
+```
+
+Clients receive the scoped token and pass it through the normal client environment variable:
+
+```sh
+VMON_API_TOKEN=C vmon run alpine -- echo hello
+VMON_API_TOKEN=C vmon exec <sandbox> -- uname -a
+```
+
+The scoped token is accepted for normal sandbox routes (`run`, `exec`, `ps`, and similar operations) and rejected with `403` on mesh-admin routes, including `vmon mesh ...` and migrate. The full `VMON_API_TOKEN` keeps full control. If a peer advertises an `https` URL, the inter-node exec WebSocket proxy uses `wss`.
+
+### Security
+
+The full bearer token is shared by all nodes and grants full control over the cluster. Keep it secret, avoid checking it into scripts, and rotate it if the join blob or environment leaks. Contexts never write a token to disk; the CLI reads either the full token or a scoped client token from `VMON_API_TOKEN` for each authenticated call.
+
+### Known limitations
+
+Crash recovery exists only when HA replication is enabled and the sandbox is eligible, replicated in sync, and restorable by a survivor; fencing is best-effort and convergence-based, not consensus. There is no NAT traversal; use a WireGuard or Tailscale overlay and advertise overlay IPs. A real two-node `vmon serve` boot test is gated CI-only future work; the current integration coverage is a lightweight real-socket client-failover test rather than a full multi-host hypervisor end-to-end.
+
+---
+
+## 8. Programmatic use: Python SDK & REST API
 
 ### From macOS — REST client against a running `vmon serve`
 
@@ -432,7 +570,7 @@ compute.terminate()            # optional: stop the cached .remote() sandbox
 
 ---
 
-## 8. Smoke-testing every part
+## 9. Smoke-testing every part
 
 ### Anywhere (macOS or Linux) — panel, CLI, API, and unit tests
 
@@ -481,7 +619,7 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 
 ---
 
-## 9. Environment variables
+## 10. Environment variables
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
@@ -497,7 +635,7 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |

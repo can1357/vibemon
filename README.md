@@ -293,6 +293,100 @@ compute.terminate()
 
 The Python `vmon` wrapper has separate usage notes in [`python/README.md`](python/README.md), and a practical copy-paste guide is in [`MANUAL.md`](MANUAL.md).
 
+## Cluster
+
+Use `vmon serve` gateways to pool multiple machines behind one CLI context. Every node in the cluster must use the same bearer token, and clients must provide that token through `VMON_API_TOKEN`.
+
+### Form a cluster
+
+On the seed node, start the gateway:
+
+```sh
+vmon serve --token T
+```
+
+In another shell on the same host, initialize the mesh and copy the printed `vmon mesh join <blob>` command:
+
+```sh
+VMON_API_TOKEN=T vmon mesh setup --advertise http://<seed-ip>:8000
+```
+
+On each other node, start the gateway with the same token, then join with the blob printed by the seed:
+
+```sh
+vmon serve --token T
+VMON_API_TOKEN=T vmon mesh join <blob>
+```
+
+`vmon mesh status` lists members, health, and capacity:
+
+```sh
+VMON_API_TOKEN=T vmon mesh status
+```
+
+### Connect a client
+
+Create a cluster context from any reachable gateway. The CLI fetches the full roster and stores the ordered endpoint list; it never writes the bearer token to disk.
+
+```sh
+export VMON_API_TOKEN=T
+vmon context create prod --server http://<any-node>:8000
+vmon context use prod
+
+vmon run alpine -- echo hello
+vmon ps
+vmon exec <sandbox> -- uname -a
+```
+
+Manage contexts with:
+
+```sh
+vmon context ls
+vmon context inspect prod
+VMON_API_TOKEN=T vmon context refresh prod
+vmon context rm prod
+vmon context use local
+```
+
+After `vmon context use prod`, ordinary `vmon run`, `vmon exec`, and `vmon ps` commands route across the cluster. `vmon context use local` returns the CLI to the local `vmond` daemon.
+
+### Connectivity prerequisite
+
+Each node's advertised URL must be routable by every other node and by the client. On a LAN or cloud VPC with reachable IPs, that is usually automatic. There is no built-in NAT traversal or relay: for machines behind NAT, including a laptop or home server, put the nodes on a WireGuard or Tailscale overlay and advertise each node's overlay IP:
+
+```sh
+VMON_API_TOKEN=T vmon mesh setup --advertise http://<overlay-ip>:8000
+```
+
+### Downtime semantics
+
+Once a context exists, the client tolerates any number of gateways going down, as long as one saved endpoint is still reachable: requests route through the surviving gateways. Failover happens only on connection-level failure, so a delivered request is never duplicated. By default, a sandbox still lives on exactly one node; without HA replication enabled, an ungraceful crash loses the sandboxes on that node. Move work before planned downtime:
+
+```sh
+VMON_API_TOKEN=T vmon mesh migrate <name> <node>
+VMON_API_TOKEN=T vmon mesh leave --drain
+```
+
+Only new placements automatically avoid dead nodes unless high availability replication is enabled.
+
+### High availability (opt-in)
+
+Set `VMON_REPLICATE_SEC` to a positive cadence in seconds to enable crash-survival replication; `0` or unset disables it. `VMON_REPLICAS` controls the fan-out `K` (default `1`). Eligible sandboxes — block-network sandboxes with no named volumes and no `fs_dir` host share — are periodically checkpointed non-destructively, with the VM kept running except for a brief quiesce at each cadence, and the checkpoint is replicated to the top-`K` rendezvous-ranked peers. If the owner node dies, a surviving replica holder restores the sandbox and takes ownership.
+
+```sh
+VMON_REPLICATE_SEC=60 VMON_REPLICAS=1 vmon serve --token T
+```
+
+Ineligible sandboxes are not protected. Fencing is best-effort: it bounds split-brain to the partition window and converges on rejoin, but it is not a consensus system. Replica secrets are kept in memory only; if a replica node restarts and loses them, it refuses automatic restore rather than silently restoring without secrets.
+
+### Scoped client token
+
+Set `VMON_CLIENT_TOKEN` when clients should run sandboxes without full mesh administration. The client token authorizes normal sandbox commands such as `run`, `exec`, and `ps`, but mesh-admin routes (`vmon mesh ...` and `vmon mesh migrate` / `/v1/sandboxes/{id}/migrate`) reject it with `403`; the full `VMON_API_TOKEN` still has full control. Give clients their scoped token through the usual `VMON_API_TOKEN` environment variable. When peers advertise `https` URLs, the inter-node exec WebSocket proxy uses `wss`.
+
+### Security
+
+The full bearer token is shared by all nodes and grants full control. Keep it secret. Contexts never persist a token; clients read either the full token or a scoped client token from `VMON_API_TOKEN` when they connect.
+
 ## Compared with Modal sandboxes
 
 vmon's wedge is local ownership of the sandbox stack. It can create from memory snapshots using copy-on-write fork, and the warm pool keeps those clones ready for near-instant starts. Modal's VM runtime does not expose memory snapshots. vmon also ships a self-hosted REST API; Modal's control plane is SDK-only over proprietary gRPC.
