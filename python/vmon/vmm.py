@@ -647,6 +647,8 @@ class MicroVM:
             control_sock=vm.sock,
             agent_sock=agent_sock,
             restored_from=str(snapshot),
+            mem=mem,
+            cpus=cpus,
             tap=tap,
             user_net=user_net,
             rootfs=str(rootfs) if rootfs else None,
