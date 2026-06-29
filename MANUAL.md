@@ -377,7 +377,7 @@ VMON_API_TOKEN=T vmon mesh join <blob>
 
 All nodes must share the same `--token` / `VMON_API_TOKEN`. The join blob embeds the shared token, so treat it as secret too.
 
-Verify the membership, health, and capacity from any node:
+Verify the membership, health, capacity, top-level `replicas_held`, and per-node HA counters (`stats.replication`, `stats.restore`, and `stats.fence`) from any node. The same data is available from `GET /v1/mesh/status`:
 
 ```sh
 VMON_API_TOKEN=T vmon mesh status
@@ -447,10 +447,15 @@ Crash-survival replication is opt-in. Set `VMON_REPLICATE_SEC` to a positive che
 ```sh
 export VMON_REPLICATE_SEC=60
 export VMON_REPLICAS=1
+export VMON_RESTORE_QUORUM=1  # optional: require majority confirmation before auto-restore
 vmon serve --token T
 ```
 
 Only eligible sandboxes are protected: they must use block networking and must not have named volumes or an `fs_dir` host share. At each cadence, the owner checkpoint is non-destructive — the VM keeps running, with a brief quiesce — and the checkpoint is copied to the top-`K` rendezvous-ranked peers. If the owner node is reaped as dead, a deterministically elected replica holder restores the sandbox, claims ownership at a higher epoch, and broadcasts the new owner.
+
+`VMON_REPLICATE_CONCURRENCY` bounds how many peer replica pushes run at once and defaults to `2`. Replication also skips re-pushing a sandbox when its checkpoint digest is unchanged from the previous round, and a receiver skips pulling content it already has for the same sandbox id and digest. That saves redundant network and disk I/O, but it does not skip the checkpoint cadence itself: every eligible VM still briefly quiesces every `VMON_REPLICATE_SEC`. Tune that frequency first if the quiesce is too visible.
+
+Leave `VMON_RESTORE_QUORUM` unset for the default best-effort epoch-fenced restore. Set `VMON_RESTORE_QUORUM=1` to make automatic crash restore quorum-gated: before restoring an orphaned sandbox, the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must get a strict majority of the expected cluster to confirm the dead owner is unreachable. A node in a minority partition cannot reach that majority and defers, preventing split-brain restores during a network partition. This is safety over availability: use at least three nodes to tolerate one failure; a two-node cluster cannot form a majority after losing one node, so it deliberately defers.
 
 Fencing is best-effort rather than quorum or lease based. A higher `(epoch, node_id)` supersedes an older owner, and a node that discovers one of its local sandboxes has been superseded stops and drops its copy. This bounds split-brain to the partition window and converges after rejoin, but it is not a consensus system. Replica secrets live in memory only; if a replica node restarts and loses them, it refuses automatic restore for that sandbox instead of starting it without secrets.
 
@@ -476,7 +481,21 @@ VMON_API_TOKEN=C vmon run alpine -- echo hello
 VMON_API_TOKEN=C vmon exec <sandbox> -- uname -a
 ```
 
-The scoped token is accepted for normal sandbox routes (`run`, `exec`, `ps`, and similar operations) and rejected with `403` on mesh-admin routes, including `vmon mesh ...` and migrate. The full `VMON_API_TOKEN` keeps full control. If a peer advertises an `https` URL, the inter-node exec WebSocket proxy uses `wss`.
+The scoped token is accepted for normal sandbox routes (`run`, `exec`, `ps`, and similar operations) and rejected with `403` on mesh-admin routes, including `vmon mesh ...` and migrate. The full `VMON_API_TOKEN` keeps full control.
+
+For token rotation, `VMON_API_TOKEN` and `VMON_CLIENT_TOKEN` can each contain a comma-separated list. Run gateways with both old and new values during rollover, then remove the old value after clients have moved. Any listed value authorizes for its tier; client-tier values still cannot administer mesh routes or migrate sandboxes.
+
+### Step 7: serve the gateway over TLS
+
+Use `vmon serve --tls-cert PATH --tls-key PATH` to serve HTTPS directly from the gateway. The same settings can come from `VMON_TLS_CERT` and `VMON_TLS_KEY`.
+
+Advertise the matching `https://...` URL when forming or joining the mesh. When a peer advertises `https`, the inter-node exec proxy upgrades its WebSocket URL to `wss`.
+
+### Step 8: test the real cluster path
+
+Run `just cluster-e2e` on a KVM/HVF host to exercise the gated two-node boot, failover, and restore end-to-end. `demo/cluster-e2e.sh` is the script behind the recipe, and CI runs the same check on the self-hosted hypervisor runner.
+
+This is the only real multi-host boot test. It is hardware-gated and separate from the lightweight local tests, so a normal developer machine without KVM/HVF support should not be expected to run it.
 
 ### Security
 
@@ -484,7 +503,7 @@ The full bearer token is shared by all nodes and grants full control over the cl
 
 ### Known limitations
 
-Crash recovery exists only when HA replication is enabled and the sandbox is eligible, replicated in sync, and restorable by a survivor; fencing is best-effort and convergence-based, not consensus. There is no NAT traversal; use a WireGuard or Tailscale overlay and advertise overlay IPs. A real two-node `vmon serve` boot test is gated CI-only future work; the current integration coverage is a lightweight real-socket client-failover test rather than a full multi-host hypervisor end-to-end.
+Crash recovery exists only when HA replication is enabled and the sandbox is eligible, replicated in sync, and restorable by a survivor; fencing is best-effort and convergence-based, not consensus. There is no NAT traversal; use a WireGuard or Tailscale overlay and advertise overlay IPs. The real two-node boot, failover, and restore test is `just cluster-e2e` / `demo/cluster-e2e.sh`; it is the only multi-host boot coverage and is gated on KVM/HVF hardware, including in CI on the self-hosted hypervisor runner.
 
 ---
 

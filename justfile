@@ -175,6 +175,10 @@ check-py:
 test-py:
     cd python && uv run --extra server pytest
 
+# Gated two-node cluster e2e (real hypervisor required; skips otherwise).
+cluster-e2e:
+    cd python && VMON_CLUSTER_E2E=1 VMON_E2E=1 uv run --extra server pytest tests/test_cluster_e2e.py -q -s
+
 # Real-VM create-to-first-useful-byte benchmark (KVM/HVF-gated; skips elsewhere).
 [positional-arguments]
 bench *args: fetch-assets
