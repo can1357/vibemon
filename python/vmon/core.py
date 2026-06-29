@@ -864,6 +864,31 @@ class Engine:
 
     # -- mesh migration (offline, snapshot-based) ---------------------------
 
+    def _stamp_template_marker(self, snap_dir: Path, meta: dict[str, Any]) -> None:
+        """Copy the source template's ``agent-ready.json`` marker into a checkpoint dir.
+
+        A raw ``MicroVM.snapshot`` writes only ``rootfs.img`` + VM state, but
+        ``cas.resolve_digest`` refuses to serve a template dir without the marker,
+        so a migration/replication checkpoint would 404 on its own owner. Must run
+        before the digest is computed so the marker is part of the content hash.
+        """
+        marker = snap_dir / "agent-ready.json"
+        if marker.exists():
+            return
+        source = meta.get("template") or meta.get("restored_from")
+        if not source:
+            return
+        src_marker = Path(str(source)) / "agent-ready.json"
+        if not src_marker.is_file():
+            return
+        try:
+            data = json.loads(src_marker.read_text(encoding="utf-8"))
+        except OSError, json.JSONDecodeError:
+            return
+        if isinstance(data, dict):
+            data.pop("content_digest", None)
+            marker.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
     def migrate_prepare(self, name: str) -> dict[str, Any]:
         """Quiesce a live, migratable sandbox into a transient cross-node checkpoint.
 
@@ -927,6 +952,7 @@ class Engine:
             params["secrets"] = [secret_env]
         transient = f"migrate-{name}-{uuid.uuid4().hex[:12]}"
         snap_dir = Path(self.snapshot_template(name, transient, stop=True))
+        self._stamp_template_marker(snap_dir, meta)
         from . import cas
 
         digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
@@ -1037,6 +1063,7 @@ class Engine:
             params["secrets"] = [secret_env]
         transient = f"replica-{name}-{uuid.uuid4().hex[:12]}"
         snap_dir = Path(self.snapshot_template(name, transient, stop=False))
+        self._stamp_template_marker(snap_dir, meta)
         from . import cas
 
         digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
