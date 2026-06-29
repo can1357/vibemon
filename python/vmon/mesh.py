@@ -556,12 +556,14 @@ class Mesh:
         self.reap_sec = float(os.environ.get("VMON_MESH_REAP_SEC", "300.0"))
         self._lock = threading.RLock()
         self._peers: dict[str, NodeState] = {}
+        self._expected_members: int = 1
         self._owners: dict[str, str] = {}
         self._explicit_owners: dict[str, tuple[str, float]] = {}
         self._owner_epoch: dict[str, tuple[int, str]] = {}
         self._local_epoch: dict[str, int] = {}
         self._inflight = 0
         self._orphans: list[tuple[str, str]] = []
+        self._stats: dict[str, int] = {"replication": 0, "restore": 0, "fence": 0}
         self.idem_ttl = float(os.environ.get("VMON_MESH_IDEM_TTL_SEC", "900.0"))
         self.create_timeout = float(os.environ.get("VMON_MESH_CREATE_TIMEOUT_SEC", "120.0"))
         # key -> (workload owner node id, pin timestamp): a coordinator's transient
@@ -608,12 +610,58 @@ class Mesh:
         with self._lock:
             return list(self._peers.values())
 
+    def _bump_expected(self) -> bool:
+        """Raise expected cluster size to the current known membership.
+
+        Callers must hold ``self._lock``. This is a high-water mark: reap/partition
+        paths do not shrink it, so quorum stays sized against the expected cluster.
+        Quorum restore needs at least 3 nodes to tolerate 1 failure; a 2-node
+        cluster cannot form a majority after losing one and correctly defers.
+        """
+        before = self._expected_members
+        self._expected_members = max(self._expected_members, 1 + len(self._peers))
+        return self._expected_members != before
+
+    def is_peer_healthy(self, node_id: str) -> bool:
+        """Return whether *node_id* is currently reachable from this node."""
+        now = time.time()
+        with self._lock:
+            if node_id == self.node_id:
+                return True
+            peer = self._peers.get(node_id)
+            return bool(peer is not None and peer.healthy(now, self.interval))
+
+    def live_member_ids(self) -> list[str]:
+        """Return this node plus peers that are healthy right now."""
+        now = time.time()
+        with self._lock:
+            members = [self.node_id]
+            members.extend(
+                peer.node_id for peer in self._peers.values() if peer.healthy(now, self.interval)
+            )
+            return members
+
+    def quorum_needed(self) -> int:
+        """Return the strict majority required for the expected cluster size."""
+        with self._lock:
+            return self._expected_members // 2 + 1
+
+    def restore_quorum_met(self, confirmations: int) -> bool:
+        """Return whether unreachable confirmations meet restore quorum."""
+        return confirmations >= self.quorum_needed()
+
+    def note_event(self, kind: str) -> None:
+        """Increment an HA event counter (replication/restore/fence) for status()."""
+        with self._lock:
+            self._stats[kind] = self._stats.get(kind, 0) + 1
+
     def status(self) -> dict[str, Any]:
         """Return a JSON-ready mesh status snapshot for operators."""
         now = time.time()
         with self._lock:
             self_state = self.self_state().to_wire()
             self_state["healthy"] = True
+            self_state["stats"] = dict(self._stats)
             peers = []
             for peer in self._peers.values():
                 wire = peer.to_wire()
@@ -678,6 +726,7 @@ class Mesh:
             self._owners.clear()
             self._explicit_owners.clear()
             self.enabled = False
+            self._expected_members = 1
             self.save()
 
     def register(self, node: NodeState) -> dict[str, Any]:
@@ -689,6 +738,7 @@ class Mesh:
                 self._peers[node.node_id] = node
                 self.enabled = True
             self._rebuild_owners_locked()
+            self._bump_expected()
             self.save()
             members = [self.self_state(), *self._peers.values()]
             return {"members": [member.to_wire() for member in members]}
@@ -716,6 +766,7 @@ class Mesh:
         """Forget a peer that announced it is leaving."""
         with self._lock:
             self._peers.pop(node_id, None)
+            self._expected_members = max(1, self._expected_members - 1)
             self._explicit_owners = {
                 sid: entry for sid, entry in self._explicit_owners.items() if entry[0] != node_id
             }
@@ -1102,6 +1153,7 @@ class Mesh:
                     node.last_seen = node.last_seen or now
                     self._peers[node.node_id] = node
             self.enabled = True
+            self._expected_members = max(1, int(data.get("expected_members") or 1))
             self._rebuild_owners_locked()
 
     def save(self) -> None:
@@ -1119,6 +1171,7 @@ class Mesh:
             "vcpus": self.caps.vcpus,
             "mem_mib": self.caps.mem_mib,
             "peers": [peer.to_wire() for peer in self._peers.values()],
+            "expected_members": self._expected_members,
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
@@ -1145,6 +1198,7 @@ class Mesh:
                 for sid, ep in node.owned_epochs.items():
                     self._consider_owner(sid, ep, node.node_id)
             self._rebuild_owners_locked()
+            self._bump_expected()
 
     def _reap_stale_peers(self) -> None:
         now = time.time()
@@ -1198,3 +1252,5 @@ class Mesh:
         self._owners = owners
         for sid, (_ep, node) in self._owner_epoch.items():
             self._owners[sid] = node
+        if self._bump_expected():
+            self.save()

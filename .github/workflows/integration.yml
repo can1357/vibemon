@@ -110,6 +110,11 @@ jobs:
           uv run cli_e2e.py
           VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
 
+      - name: Run cluster e2e
+        env:
+          VMON_CLUSTER_E2E: "1"
+        run: just cluster-e2e
+
       - name: Run HVF integration tests
         run: just integration
 
