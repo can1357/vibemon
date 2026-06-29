@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import functools
@@ -9,14 +10,17 @@ import inspect
 import json
 import os
 import platform
+import queue
 import secrets as _secrets
 import shutil
+import symtable
+import sys
 import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, overload
 
 from .agent_client import AgentClosed, AgentConn, ByteStream, ExecSession
 from .image import ImageSpec, cached_template, slot_tag
@@ -1057,9 +1061,54 @@ class Sandbox:
             network.teardown()
 
 
+class _AsyncFilesystem:
+    """Async filesystem RPC facade for a Sandbox."""
+
+    def __init__(self, filesystem: Filesystem) -> None:
+        self._filesystem = filesystem
+
+    async def read_bytes(self, *args: Any, **kwargs: Any) -> bytes:
+        """Read bytes from a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.read_bytes, *args, **kwargs)
+
+    async def read_text(self, *args: Any, **kwargs: Any) -> str:
+        """Read text from a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.read_text, *args, **kwargs)
+
+    async def write_bytes(self, *args: Any, **kwargs: Any) -> None:
+        """Write bytes to a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.write_bytes, *args, **kwargs)
+
+    async def write_text(self, *args: Any, **kwargs: Any) -> None:
+        """Write text to a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.write_text, *args, **kwargs)
+
+    async def list_files(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """List files under a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.list_files, *args, **kwargs)
+
+    async def make_directory(self, *args: Any, **kwargs: Any) -> None:
+        """Create a directory inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.make_directory, *args, **kwargs)
+
+    async def remove(self, *args: Any, **kwargs: Any) -> None:
+        """Remove a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.remove, *args, **kwargs)
+
+    async def stat(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Stat a path inside the sandbox."""
+        return await asyncio.to_thread(self._filesystem.stat, *args, **kwargs)
+
+
 class _AsyncSandbox:
     def __init__(self, sandbox: Sandbox) -> None:
         self._sandbox = sandbox
+        self._filesystem = _AsyncFilesystem(sandbox.filesystem)
+
+    @property
+    def filesystem(self) -> _AsyncFilesystem:
+        """Async filesystem RPC facade for this sandbox."""
+        return self._filesystem
 
     async def exec(self, *cmd: str | Iterable[str], **kwargs: Any) -> Process:
         return await asyncio.to_thread(self._sandbox.exec, *cmd, **kwargs)
@@ -1070,6 +1119,10 @@ class _AsyncSandbox:
     async def wait_until_ready(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.wait_until_ready, *args, **kwargs)
 
+    async def snapshot(self, *args: Any, **kwargs: Any) -> str:
+        """Snapshot the running sandbox."""
+        return await asyncio.to_thread(self._sandbox.snapshot, *args, **kwargs)
+
     async def snapshot_filesystem(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self._sandbox.snapshot_filesystem, *args, **kwargs)
 
@@ -1078,6 +1131,22 @@ class _AsyncSandbox:
 
     async def set_network_policy(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.set_network_policy, *args, **kwargs)
+
+    async def extend(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Extend the sandbox timeout."""
+        return await asyncio.to_thread(self._sandbox.extend, *args, **kwargs)
+
+    async def metrics(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Return live runtime counters."""
+        return await asyncio.to_thread(self._sandbox.metrics, *args, **kwargs)
+
+    async def tunnels(self, *args: Any, **kwargs: Any) -> dict[int, tuple[str, int]]:
+        """Return active tunnel endpoints."""
+        return await asyncio.to_thread(self._sandbox.tunnels, *args, **kwargs)
+
+    async def create_connect_token(self, *args: Any, **kwargs: Any) -> str:
+        """Create or return the sandbox connect token."""
+        return await asyncio.to_thread(self._sandbox.create_connect_token, *args, **kwargs)
 
 
 _REMOTE_FUNCTION_RUNNER = r"""
@@ -1128,6 +1197,25 @@ class RemoteFunctionError(RuntimeError):
         self.traceback = traceback_text
 
 
+class _AsyncRemoteFunction:
+    """Async facade over :class:`RemoteFunction` (``await fn.aio.remote(...)``)."""
+
+    def __init__(self, fn: RemoteFunction) -> None:
+        self._fn = fn
+
+    async def remote(self, *args: Any, **kwargs: Any) -> Any:
+        """Await the function in the cached sandbox and return its result."""
+        return await asyncio.to_thread(self._fn.remote, *args, **kwargs)
+
+    async def map(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """Await a parallel map across an ephemeral sandbox pool."""
+        return await asyncio.to_thread(self._fn.map, *args, **kwargs)
+
+    async def starmap(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """Await a parallel starmap across an ephemeral sandbox pool."""
+        return await asyncio.to_thread(self._fn.starmap, *args, **kwargs)
+
+
 class RemoteFunction:
     """A source-serialized Python function that can run inside a warm sandbox."""
 
@@ -1143,9 +1231,119 @@ class RemoteFunction:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._fn(*args, **kwargs)
 
+    @property
+    def aio(self) -> _AsyncRemoteFunction:
+        """Async facade: ``await fn.aio.remote(...)`` / ``.map(...)`` / ``.starmap(...)``."""
+        return _AsyncRemoteFunction(self)
+
     def remote(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> Any:
-        """Run the function in a sandbox and return its deserialized result."""
-        sandbox = self._ensure_sandbox()
+        """Run the function in a cached sandbox and return its deserialized result."""
+        return self._run_once(self._ensure_sandbox(), args, kwargs, timeout)
+
+    def map(
+        self,
+        iterable: Iterable[Any],
+        *,
+        order: bool = True,
+        concurrency: int | None = None,
+        timeout: float | None = None,
+    ) -> list[Any]:
+        """Run one remote call per item across an ephemeral sandbox pool."""
+        return self._map_items(
+            iterable, star=False, order=order, concurrency=concurrency, timeout=timeout
+        )
+
+    def starmap(self, iterable: Iterable[Iterable[Any]], **kwargs: Any) -> list[Any]:
+        """Run one remote call per argument tuple across an ephemeral sandbox pool."""
+        return self._map_items(iterable, star=True, **kwargs)
+
+    def _map_items(
+        self,
+        iterable: Iterable[Any],
+        *,
+        star: bool,
+        order: bool = True,
+        concurrency: int | None = None,
+        timeout: float | None = None,
+    ) -> list[Any]:
+        items = list(iterable)
+        if not items:
+            return []
+        if concurrency is None:
+            pool_size = min(len(items), 8)
+        else:
+            pool_size = min(int(concurrency), len(items))
+            if pool_size < 1:
+                raise ValueError("concurrency must be >= 1")
+
+        work: queue.Queue[int] = queue.Queue()
+        for index in range(len(items)):
+            work.put(index)
+        stop = threading.Event()
+        results: list[Any] = [None] * len(items)
+        completed: list[tuple[int, Any]] = []
+        result_lock = threading.Lock()
+        first_error: list[BaseException] = []
+        sandboxes: list[Sandbox] = []
+
+        try:
+            create_kwargs = {"image": "python:3.14-slim", **self._sandbox_kwargs}
+            for _ in range(pool_size):
+                sandbox = Sandbox.create(**create_kwargs)
+                sandboxes.append(sandbox)
+                self._check_python(sandbox)
+
+            def worker(sandbox: Sandbox) -> None:
+                while not stop.is_set():
+                    try:
+                        index = work.get_nowait()
+                    except queue.Empty:
+                        return
+                    if stop.is_set():
+                        return
+                    item = items[index]
+                    args = tuple(item) if star else (item,)
+                    try:
+                        value = self._run_once(sandbox, args, {}, timeout)
+                    except BaseException as exc:
+                        with result_lock:
+                            if not first_error:
+                                first_error.append(exc)
+                                stop.set()
+                        return
+                    with result_lock:
+                        results[index] = value
+                        completed.append((index, value))
+
+            threads = [
+                threading.Thread(target=worker, args=(sandbox,), name=f"vmon-map-{i}", daemon=True)
+                for i, sandbox in enumerate(sandboxes)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            if first_error:
+                error = first_error[0]
+                if isinstance(error, RemoteFunctionError):
+                    raise error
+                raise RemoteFunctionError(str(error)) from error
+            if order:
+                return results
+            return [value for _, value in completed]
+        finally:
+            for sandbox in sandboxes:
+                with contextlib.suppress(Exception):
+                    sandbox.terminate()
+
+    def _run_once(
+        self,
+        sandbox: Sandbox,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        timeout: float | None,
+    ) -> Any:
         sandbox.filesystem.write_text(self._runner_path, _REMOTE_FUNCTION_RUNNER)
         payload = _remote_function_payload(self._fn, args, kwargs)
         proc = sandbox.exec(
@@ -1199,13 +1397,7 @@ class RemoteFunction:
 def _remote_function_payload(
     fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> bytes:
-    if fn.__closure__:
-        raise ValueError("remote functions cannot close over local variables")
-    try:
-        source = inspect.getsource(fn)
-    except OSError as exc:
-        raise ValueError("remote functions must be defined in source files") from exc
-    source = _strip_decorators(textwrap.dedent(source))
+    source = _remote_function_source(fn)
     payload = {"source": source, "name": fn.__name__, "args": args, "kwargs": kwargs}
     try:
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -1213,11 +1405,165 @@ def _remote_function_payload(
         raise ValueError("remote function arguments must be JSON-serializable") from exc
 
 
+def _remote_function_source(fn: Callable[..., Any]) -> str:
+    if fn.__closure__:
+        raise ValueError("remote functions cannot close over local variables")
+    try:
+        function_source = textwrap.dedent(inspect.getsource(fn))
+    except OSError as exc:
+        raise ValueError("remote functions must be defined in source files") from exc
+    stripped_target = _strip_decorators(function_source)
+    module = inspect.getmodule(fn)
+    if module is None:
+        return stripped_target
+    try:
+        module_source = inspect.getsource(module)
+    except OSError, TypeError:
+        return stripped_target
+    try:
+        module_tree = ast.parse(module_source)
+    except SyntaxError:
+        return stripped_target
+
+    imports: dict[str, tuple[int, str]] = {}
+    consts: dict[str, tuple[int, str]] = {}
+    defs: dict[str, tuple[int, str, set[str]]] = {}
+    target_def: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    target_lineno = getattr(getattr(fn, "__code__", None), "co_firstlineno", None)
+
+    for node in module_tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            source = ast.unparse(node)
+            for name in _import_bound_names(node):
+                imports[name] = (node.lineno, source)
+        elif isinstance(node, ast.Assign):
+            try:
+                ast.literal_eval(node.value)
+            except TypeError, ValueError:
+                continue
+            source = ast.unparse(node)
+            for name in _assignment_bound_names(node.targets):
+                consts[name] = (node.lineno, source)
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                continue
+            try:
+                ast.literal_eval(node.value)
+            except TypeError, ValueError:
+                continue
+            source = ast.unparse(node)
+            for name in _assignment_bound_names([node.target]):
+                consts[name] = (node.lineno, source)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node.decorator_list = []
+            source = ast.unparse(node)
+            referenced = _free_names(source)
+            defs[node.name] = (node.lineno, source, referenced)
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == fn.__name__
+                and (target_lineno is None or node.lineno == target_lineno)
+            ):
+                target_def = node
+
+    if target_def is None:
+        for node in module_tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == fn.__name__
+            ):
+                target_def = node
+                break
+    if target_def is None:
+        return stripped_target
+
+    target_source = _strip_decorators(ast.unparse(target_def))
+    target_references = _free_names(target_source)
+    selected_imports: dict[int, str] = {}
+    selected_consts: dict[int, str] = {}
+    selected_defs: dict[int, str] = {}
+    worklist = list(target_references)
+    seen_names: set[str] = set()
+
+    while worklist:
+        name = worklist.pop()
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        if name in imports:
+            lineno, source = imports[name]
+            selected_imports.setdefault(lineno, source)
+        elif name in consts:
+            lineno, source = consts[name]
+            selected_consts.setdefault(lineno, source)
+        elif name in defs and name != fn.__name__:
+            lineno, source, referenced = defs[name]
+            if lineno not in selected_defs:
+                selected_defs[lineno] = source
+                worklist.extend(referenced)
+
+    parts = [
+        source
+        for selected in (selected_imports, selected_consts, selected_defs)
+        for _lineno, source in sorted(selected.items())
+    ]
+    parts.append(target_source.rstrip())
+    return "\n\n".join(parts) + "\n"
+
+
 def _strip_decorators(source: str) -> str:
-    lines = source.splitlines()
-    while lines and lines[0].lstrip().startswith("@"):
-        lines.pop(0)
-    return "\n".join(lines) + "\n"
+    tree = ast.parse(textwrap.dedent(source))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.decorator_list = []
+            return ast.unparse(node) + "\n"
+    raise ValueError("remote function source must contain a function definition")
+
+
+def _import_bound_names(node: ast.Import | ast.ImportFrom) -> list[str]:
+    names: list[str] = []
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        if alias.asname:
+            names.append(alias.asname)
+        else:
+            names.append(alias.name.split(".", 1)[0])
+    return names
+
+
+def _assignment_bound_names(targets: Iterable[ast.expr]) -> list[str]:
+    names: list[str] = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names.extend(_assignment_bound_names(target.elts))
+    return names
+
+
+def _free_names(source: str) -> set[str]:
+    """Module-level names a def/class references, via scope-aware symtable analysis.
+
+    Parameters, locals, comprehension/``with``/``except`` targets, and names bound
+    inside nested scopes are excluded; only genuine references to the enclosing
+    module scope remain (builtins are included but simply never match a module
+    symbol). This prevents a local named like a module import (``def f(json):``)
+    from spuriously shipping that import into the guest.
+    """
+    try:
+        table = symtable.symtable(source, "<remote-fn>", "exec")
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    stack = [table]
+    while stack:
+        scope = stack.pop()
+        for symbol in scope.get_symbols():
+            if symbol.is_global():
+                names.add(symbol.get_name())
+        stack.extend(scope.get_children())
+    return names
 
 
 def _remote_function_result(raw: bytes) -> Any:
@@ -1227,6 +1573,9 @@ def _remote_function_result(raw: bytes) -> Any:
         raise RemoteFunctionError("remote function returned an invalid response") from exc
     if not isinstance(response, dict):
         raise RemoteFunctionError("remote function returned a non-object response")
+    stdout_text = response.get("stdout", "")
+    if stdout_text:
+        sys.stdout.write(stdout_text if isinstance(stdout_text, str) else str(stdout_text))
     if response.get("ok") is True:
         return response.get("result")
     remote_type = str(response.get("type") or "RemoteError")
@@ -1235,8 +1584,24 @@ def _remote_function_result(raw: bytes) -> Any:
     raise RemoteFunctionError(message, remote_type=remote_type, traceback_text=traceback_text)
 
 
-def function(fn: Callable[..., Any] | None = None, **sandbox_kwargs: Any) -> Any:
-    """Decorate a source-available function with a ``.remote(...)`` sandbox call."""
+@overload
+def function(fn: Callable[..., Any]) -> RemoteFunction: ...
+
+
+@overload
+def function(
+    fn: None = None, **sandbox_kwargs: Any
+) -> Callable[[Callable[..., Any]], RemoteFunction]: ...
+
+
+def function(
+    fn: Callable[..., Any] | None = None, **sandbox_kwargs: Any
+) -> RemoteFunction | Callable[[Callable[..., Any]], RemoteFunction]:
+    """Decorate a source-available function with a ``.remote(...)`` sandbox call.
+
+    Bare ``@function`` and parameterized ``@function(image=..., block_network=...)``
+    both yield a :class:`RemoteFunction` exposing ``.remote``/``.map``/``.starmap``.
+    """
 
     def decorate(inner: Callable[..., Any]) -> RemoteFunction:
         return RemoteFunction(inner, sandbox_kwargs)
