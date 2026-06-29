@@ -1698,7 +1698,8 @@ def create_app(
                 try:
                     try:
                         prep = await supervisor._run(supervisor._engine.replicate_prepare, sid)
-                    except Exception:
+                    except Exception as exc:
+                        LOGGER.warning("replicate skip %s: %s", sid, exc)
                         continue
                     digest = str(prep["digest"])
                     snapshot_dir = str(prep["snapshot_dir"])
@@ -1707,9 +1708,10 @@ def create_app(
                     # quiesce is inherent — tune via VMON_REPLICATE_SEC.
                     if digest == last.get(sid):
                         continue
+                    targets = mesh.replica_targets(sid, k)
+                    LOGGER.info("replicate %s digest=%s targets=%s", sid, digest[:12], targets)
                     pushes = [
-                        push_replica(semaphore, peer_id, digest, params)
-                        for peer_id in mesh.replica_targets(sid, k)
+                        push_replica(semaphore, peer_id, digest, params) for peer_id in targets
                     ]
                     if not pushes:
                         continue
