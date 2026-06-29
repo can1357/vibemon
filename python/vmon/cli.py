@@ -14,7 +14,7 @@ from typing import BinaryIO, cast
 
 import click
 
-from . import __version__
+from . import __version__, doctor
 from . import console as ui
 from .client import DaemonClient, DaemonError, GatewayClient
 from .console import RichGroup
@@ -601,6 +601,48 @@ def migrate(name, node):
     return 0
 
 
+# -- diagnostics ------------------------------------------------------------
+
+
+@cli.command(
+    name="doctor",
+    panel="Diagnostics",
+    context_settings=_CTX,
+    help="Diagnose vmon prerequisites.",
+)
+def doctor_cmd():
+    """Run preflight diagnostics for first-run prerequisites."""
+    return doctor.run_doctor()
+
+
+@cli.command(
+    panel="Diagnostics",
+    context_settings=_CTX,
+    help="Print a sourceable shell completion script.",
+)
+@click.argument("shell", metavar="[bash|zsh|fish]")
+def completion(shell):
+    """Print Click's shell-native completion script for the requested shell."""
+    from click.shell_completion import get_completion_class
+
+    cls = get_completion_class(shell)
+    if cls is None:
+        raise click.UsageError(f"unsupported shell {shell!r}; expected bash, zsh, or fish")
+    print(f'# Load with: eval "$(vmon completion {shell})"')
+    print(cls(cli, {}, "vmon", "_VMON_COMPLETE").source())
+    return 0
+
+
+def _should_hint_doctor(error: DaemonError) -> bool:
+    message = str(error).lower()
+    return (
+        error.code == "start_failed"
+        or "vmm binary" in message
+        or "vmond exited" in message
+        or "vmond did not become ready" in message
+    )
+
+
 # -- daemon ----------------------------------------------------------------
 
 
@@ -701,6 +743,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except DaemonError as e:
         ui.error(str(e))
+        if _should_hint_doctor(e):
+            ui.hint("run ‘vmon doctor’ to diagnose")
         return 1
     except (RuntimeError, FileNotFoundError, TimeoutError, ValueError) as e:
         ui.error(str(e))

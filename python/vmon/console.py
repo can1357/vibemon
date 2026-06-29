@@ -88,6 +88,30 @@ def hint(message: str) -> None:
     console.print(f"  [vmon.muted]{message}[/]")
 
 
+def doctor_table(checks: Sequence[Any]) -> None:
+    """Render ``vmon doctor`` prerequisite checks with remediation hints."""
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("STATUS", no_wrap=True)
+    table.add_column("CHECK", style="vmon.command", no_wrap=True)
+    table.add_column("DETAIL", overflow="fold")
+    table.add_column("HINT", style="vmon.muted", overflow="fold")
+    for check in checks:
+        status = str(getattr(check, "status", "warn"))
+        table.add_row(
+            _doctor_status_text(status),
+            str(getattr(check, "name", "-")),
+            str(getattr(check, "detail", "-")),
+            str(getattr(check, "hint", "")),
+        )
+    console.print(table)
+
+
+def _doctor_status_text(status: str) -> Text:
+    palette = {"ok": "vmon.success", "warn": "vmon.warn", "fail": "vmon.error"}
+    label = status if status in palette else "warn"
+    return Text(label, style=palette[label])
+
+
 def vm_table(rows: Sequence[Mapping[str, Any]]) -> None:
     """Render ``vmon ps`` as a borderless, pipe-parseable table.
 
