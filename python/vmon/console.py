@@ -166,6 +166,25 @@ def mesh_table(status: Mapping[str, Any]) -> None:
     console.print(table)
 
 
+def context_table(contexts: Sequence[Any], current: str | None) -> None:
+    """Render configured CLI contexts, marking the active one."""
+    if not contexts:
+        info("no contexts; create one with 'vmon context create <name> --server <url>'")
+        return
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("", no_wrap=True)
+    table.add_column("NAME", style="vmon.command", no_wrap=True)
+    table.add_column("ENDPOINTS", no_wrap=True)
+    table.add_column("PRIMARY", overflow="fold")
+    table.add_column("REGION", no_wrap=True)
+    for ctx in contexts:
+        active = ctx.name == current
+        marker = Text("✔" if active else " ", style="vmon.success" if active else "vmon.muted")
+        primary = ctx.endpoints[0] if ctx.endpoints else "-"
+        table.add_row(marker, ctx.name, str(len(ctx.endpoints)), str(primary), ctx.region or "-")
+    console.print(table)
+
+
 def _format_metric(value: Any) -> str:
     """Right-aligned number formatting for runtime counters; pass-through otherwise."""
     if isinstance(value, bool):
