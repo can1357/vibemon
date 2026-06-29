@@ -77,9 +77,10 @@ def find_binary() -> str:
     """Locate the vmm VMM binary (env override, cargo target dirs, or PATH).
 
     Searches ``$VMON_BIN``, then the repo's cargo target directory across native
-    and cross ``release``/``debug`` layouts, then ``PATH``. On macOS a plain
-    ``cargo build`` of the repo produces a binary ad-hoc codesigned with
-    ``com.apple.security.hypervisor``, which this resolver finds without any flags.
+    and cross ``release``/``debug`` layouts (returning the most recently built
+    binary, so a fresh ``just build`` is never shadowed by a stale ``release``
+    artifact), then ``PATH``. On macOS a plain ``cargo build`` produces a binary
+    ad-hoc codesigned with ``com.apple.security.hypervisor``, found without flags.
     """
     if env := os.environ.get("VMON_BIN"):
         return env
@@ -92,18 +93,31 @@ def find_binary() -> str:
         f"{arch}-apple-darwin",
     ]
 
-    def probe(root: Path) -> str | None:
+    roots = [repo / "target"]
+    if (target_dir := _cargo_target_dir(repo)) is not None:
+        roots.append(target_dir)
+    # Return the most recently built binary across every layout so a fresh
+    # `just build` (debug) is never shadowed by a stale `release` left over from
+    # an earlier `just release`. Ties break toward `release` (production profile).
+    best: tuple[float, int, str] | None = None
+    seen: set[Path] = set()
+    for root in roots:
         for triple in triples:
-            for profile in ("release", "debug"):
-                c = root / triple / profile / "vmm"
-                if c.is_file() and os.access(c, os.X_OK):
-                    return str(c)
-        return None
-
-    if found := probe(repo / "target"):
-        return found
-    if (target_dir := _cargo_target_dir(repo)) is not None and (found := probe(target_dir)):
-        return found
+            for rank, profile in enumerate(("debug", "release")):
+                candidate = root / triple / profile / "vmm"
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                try:
+                    if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+                        continue
+                    key = (candidate.stat().st_mtime, rank, str(candidate))
+                except OSError:
+                    continue
+                if best is None or key > best:
+                    best = key
+    if best is not None:
+        return best[2]
     if found := shutil.which("vmm"):
         return found
     raise RuntimeError("vmm binary not found. Build it (cargo build) or set VMON_BIN.")
