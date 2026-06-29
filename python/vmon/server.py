@@ -70,7 +70,7 @@ class SandboxCreate(BaseModel):
     workdir: str | None = None
     env: dict[str, str] | None = None
     secrets: list[dict[str, str]] | None = None
-    volumes: dict[str, str] | None = None
+    volumes: dict[str, str | dict[str, Any]] | None = None
     tags: dict[str, str] | None = None
     fs_dir: str | None = None
     block_network: bool = False
@@ -1785,8 +1785,10 @@ def create_app(
                             continue
                         epoch = mesh.next_epoch(sid)
                         await supervisor._run(
-                            supervisor._engine.create,
-                            {**rec.params, "template": rec.snapshot_dir},
+                            supervisor._engine.restore_from_template,
+                            rec.params,
+                            rec.snapshot_dir,
+                            quorum_ok=bool(os.environ.get("VMON_RESTORE_QUORUM")),
                         )
                         await asyncio.to_thread(mesh.broadcast_owner, sid, mesh.node_id, epoch)
                         replica_store.drop(sid)
@@ -2119,7 +2121,10 @@ def create_app(
                 detail=f"failed to pull migration checkpoint: {exc}",
             ) from exc
         record = await supervisor._run(
-            supervisor._engine.create, {**params, "template": str(installed)}
+            supervisor._engine.restore_from_template,
+            params,
+            str(installed),
+            quorum_ok=True,
         )
         mesh.record_owner(name, mesh.node_id, int(body.get("epoch") or 0))
         return record.view()
