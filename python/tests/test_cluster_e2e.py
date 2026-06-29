@@ -386,10 +386,12 @@ def test_two_node_failover_and_restore(tmp_path: Path, monkeypatch: pytest.Monke
         # The survivor (non-owner) must hold a replica before we kill the owner.
         _eventually(
             f"{survivor_node} to hold a replica for {sid}",
-            lambda: sid
-            in _api_json(
-                "GET", survivor_gw.url, "/v1/mesh/replica/list", token, timeout=5.0
-            ).get("sids", []),
+            lambda: (
+                sid
+                in _api_json(
+                    "GET", survivor_gw.url, "/v1/mesh/replica/list", token, timeout=5.0
+                ).get("sids", [])
+            ),
             timeout=90.0,
             interval=2.0,
         )
@@ -428,6 +430,174 @@ def test_two_node_failover_and_restore(tmp_path: Path, monkeypatch: pytest.Monke
         assert restored.get("node") == survivor_node, (
             f"restored sandbox not owned by survivor: {restored!r}"
         )
+    finally:
+        for gateway in (gateway_b, gateway_a):
+            if gateway.proc is not None and gateway.proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    _api_json(
+                        "DELETE",
+                        gateway.url,
+                        f"/v1/sandboxes/{quoted_sid}/remove",
+                        token,
+                        timeout=10.0,
+                    )
+        gateway_a.stop()
+        gateway_b.stop()
+        shutil.rmtree(home_a, ignore_errors=True)
+        shutil.rmtree(home_b, ignore_errors=True)
+
+
+def _skip_if_no_virtiofs(exc: BaseException) -> None:
+    """Mirror the SDK e2e: a guest kernel without virtio-fs registers no such
+    filesystem type (ENODEV / os error 19); skip rather than hard-fail."""
+    msg = str(exc).lower()
+    if "os error 19" in msg or "no such device" in msg:
+        pytest.skip("guest kernel lacks virtio-fs; set VMON_KERNEL to a virtio-fs-capable kernel")
+
+
+def test_two_node_volume_ha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A read-only named volume's data replicates with the checkpoint and is
+    materialized + readable on the survivor after the owner dies."""
+    from vmon.client import MeshClient
+
+    token = "cluster-e2e-" + secrets.token_urlsafe(24)
+    home_a = Path(tempfile.mkdtemp(prefix="vce-"))
+    home_b = Path(tempfile.mkdtemp(prefix="vce-"))
+    gateway_a = GatewayProcess("vol-a", _free_port(), home_a, token, Path("/tmp/cev-a.log"))
+    gateway_b = GatewayProcess("vol-b", _free_port(), home_b, token, Path("/tmp/cev-b.log"))
+    sid = f"cev-{os.getpid()}"
+    quoted_sid = urllib.parse.quote(sid, safe="")
+    vol_name = f"havol{os.getpid()}"
+    sentinel = "HA_VOLUME_OK"
+
+    try:
+        # Seed the volume host-side on node A, then mount it read-only: the data is
+        # quiescent and divergence-free across replication (no restore quorum needed).
+        seeded = home_a / "volumes" / vol_name
+        seeded.mkdir(parents=True)
+        (seeded / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+
+        gateway_a.start()
+        gateway_b.start()
+        setup = _api_json(
+            "POST",
+            gateway_a.url,
+            "/v1/mesh/setup",
+            token,
+            {"advertise": gateway_a.url, "max_vcpus": 64, "max_mem_mib": 65_536},
+        )
+        join = _api_json(
+            "POST",
+            gateway_b.url,
+            "/v1/mesh/join",
+            token,
+            {"blob": setup["blob"], "advertise": gateway_b.url},
+        )
+        node_a = str(setup["node_id"])
+        node_b = str(join["node_id"])
+        _wait_mesh_pair(gateway_a, gateway_b, token, node_a, node_b)
+        gateway_b.restart()
+        gateway_a.restart()
+        _wait_mesh_pair(gateway_a, gateway_b, token, node_a, node_b)
+
+        endpoints = _write_context_from_status(
+            monkeypatch, tmp_path / "client-home", gateway_a.url, token
+        )
+        client = MeshClient(endpoints, token)
+        image = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
+        # A volume-backed create pins local (mesh.pinned_local), so it lands on the
+        # seeding node A. Cold create can take tens of seconds; use a long timeout.
+        try:
+            _api_json(
+                "POST",
+                gateway_a.url,
+                "/v1/sandboxes",
+                token,
+                payload={
+                    "image": image,
+                    "name": sid,
+                    "block_network": True,
+                    "timeout_secs": 900,
+                    "volumes": {"/data": {"name": vol_name, "read_only": True}},
+                    "idempotency_key": f"{sid}-create",
+                },
+                timeout=300.0,
+            )
+        except AssertionError as exc:
+            _skip_if_no_virtiofs(exc)
+            raise
+
+        owner_row = _eventually(
+            f"volume sandbox {sid} running on node A",
+            lambda: _sandbox_row(
+                _api_json("GET", gateway_a.url, "/v1/sandboxes", token, timeout=10.0), sid
+            ),
+            timeout=240.0,
+            interval=2.0,
+        )
+        assert owner_row.get("node") == node_a, f"volume sandbox not pinned to A: {owner_row!r}"
+
+        # B must hold a replica (carrying the volume payload) before we kill A.
+        _eventually(
+            f"{node_b} to hold a replica for {sid}",
+            lambda: (
+                sid
+                in _api_json("GET", gateway_b.url, "/v1/mesh/replica/list", token, timeout=5.0).get(
+                    "sids", []
+                )
+            ),
+            timeout=90.0,
+            interval=2.0,
+        )
+
+        gateway_a.stop()
+        assert gateway_a.proc is not None and gateway_a.proc.poll() is not None
+        client.call("ps")  # promote the survivor in the client roster
+
+        restored = _eventually(
+            f"orphaned sandbox {sid} to restore on {node_b}",
+            lambda: (
+                r
+                if (
+                    r := _sandbox_row(
+                        _api_json("GET", gateway_b.url, "/v1/sandboxes", token, timeout=5.0), sid
+                    )
+                )
+                and r.get("node") == node_b
+                and r.get("status") == "running"
+                else None
+            ),
+            timeout=120.0,
+            interval=2.0,
+        )
+        assert restored.get("node") == node_b
+
+        # Proof 1: the volume DATA travelled A -> checkpoint -> B and materialized on
+        # the survivor's host (the new replicate/capture/materialize path).
+        materialized = home_b / "volumes" / vol_name / "sentinel.txt"
+        got = _eventually(
+            "volume data materialized on the survivor host",
+            lambda: materialized.read_text(encoding="utf-8") if materialized.is_file() else None,
+            timeout=30.0,
+            interval=1.0,
+        )
+        assert got == sentinel, f"materialized volume mismatch: {got!r}"
+
+        # Proof 2: the restored guest mounts the read-only volume and reads it back.
+        chunks: list[bytes] = []
+        try:
+            client.stream(
+                "exec",
+                lambda _stream, data: chunks.append(data),
+                name=sid,
+                cmd=["cat", "/data/sentinel.txt"],
+                timeout=30,
+            )
+        except Exception as exc:
+            _skip_if_no_virtiofs(exc)
+            raise
+        guest_out = b"".join(chunks).decode("utf-8", errors="replace")
+        assert sentinel in guest_out, f"restored guest did not read volume data: {guest_out!r}"
     finally:
         for gateway in (gateway_b, gateway_a):
             if gateway.proc is not None and gateway.proc.poll() is None:

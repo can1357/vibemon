@@ -61,10 +61,11 @@ def test_migrate_prepare_rejects_networked(mvm_home):
         eng.migrate_prepare("vm1")
 
 
-def test_migrate_prepare_rejects_volumes(mvm_home):
-    eng = _engine_with(_FakeSandbox(volumes=[object()]))
-    with pytest.raises(Unsupported, match="volume"):
-        eng.migrate_prepare("vm1")
+def test_prepare_restore_params_carries_volumes(mvm_home):
+    meta = {"volumes": {"/data": {"name": "vol1", "tag": "vol1", "read_only": True}}}
+    eng = _engine_with(_FakeSandbox(volumes=[object()], meta=meta))
+    _carried_meta, params = eng._prepare_restore_params("vm1")
+    assert params["volumes"] == {"/data": {"name": "vol1", "read_only": True}}
 
 
 def test_migrate_prepare_rejects_fs_dir(mvm_home):

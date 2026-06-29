@@ -87,6 +87,22 @@ def test_post_sandbox_forwards_tags_volumes_and_secrets(client):
     assert call["secrets"][0].names() == ["FOO"]
 
 
+def test_post_sandbox_volume_read_only_preserved(client):
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "template": "tpl",
+            "name": "sb-ro",
+            "volumes": {"/data": {"name": "vol1", "read_only": True}},
+        },
+    )
+
+    assert response.status_code == 201
+    vol, read_only = FakeSandbox.calls[-1]["volumes"]["/data"]
+    assert vol.name == "vol1"
+    assert read_only is True
+
+
 def test_list_sandboxes_filters_by_tag(client):
     client.post("/v1/sandboxes", json={"template": "tpl", "name": "match", "tags": {"k": "v"}})
     client.post("/v1/sandboxes", json={"template": "tpl", "name": "miss", "tags": {"k": "other"}})
