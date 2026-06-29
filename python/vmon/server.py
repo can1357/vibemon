@@ -810,14 +810,35 @@ def _tokens_match(supplied: str | None, expected: str) -> bool:
     return supplied is not None and secrets.compare_digest(supplied, expected)
 
 
+def _token_set(value: str | None) -> frozenset[str]:
+    if value is None:
+        return frozenset()
+    return frozenset(token for token in (part.strip() for part in value.split(",")) if token)
+
+
+def _primary_token(value: str | None) -> str:
+    for part in (value or "").split(","):
+        token = part.strip()
+        if token:
+            return token
+    return ""
+
+
+def _token_matches_any(supplied: str | None, expected: frozenset[str]) -> bool:
+    matched = False
+    for token in expected:
+        matched = _tokens_match(supplied, token) or matched
+    return matched
+
+
 def _bearer_token_authorized(
     supplied: str | None, expected_token: str | None, client_token: str | None = None
 ) -> bool:
-    if expected_token is None and client_token is None:
+    full_tokens = _token_set(expected_token)
+    client_tokens = _token_set(client_token)
+    if not full_tokens and not client_tokens:
         return True
-    full_match = expected_token is not None and _tokens_match(supplied, expected_token)
-    client_match = client_token is not None and _tokens_match(supplied, client_token)
-    return full_match or client_match
+    return _token_matches_any(supplied, full_tokens) or _token_matches_any(supplied, client_tokens)
 
 
 def _ws_bearer_token(websocket: WebSocket) -> str | None:
@@ -849,11 +870,12 @@ def _is_admin_path(path: str) -> bool:
 def _client_token_only(
     supplied: str | None, expected_token: str | None, client_token: str | None
 ) -> bool:
-    if client_token is None or client_token == expected_token:
+    client_tokens = _token_set(client_token)
+    if not client_tokens:
         return False
-    client_match = _tokens_match(supplied, client_token)
-    full_match = expected_token is not None and _tokens_match(supplied, expected_token)
-    return client_match and not full_match
+    return _token_matches_any(supplied, client_tokens) and not _token_matches_any(
+        supplied, _token_set(expected_token)
+    )
 
 
 def _request_connect_token(request: Request) -> str | None:
@@ -1618,24 +1640,59 @@ def create_app(
 ) -> FastAPI:
     supervisor = Supervisor(Engine(), idle_poll=max(1.0, min(float(idle_timeout), 30.0)))
     expected_token = token if token is not None else os.environ.get("VMON_API_TOKEN")
+    outbound_token = _primary_token(expected_token)
     client_token = os.environ.get("VMON_CLIENT_TOKEN")
     mesh = Mesh(
         supervisor._engine,
         advertise=default_advertise(host, port),
-        token=expected_token or "",
-        transport=HttpxTransport(expected_token or ""),
+        token=outbound_token,
+        transport=HttpxTransport(outbound_token),
     )
     bearer = HTTPBearer(auto_error=False)
     replica_store = ReplicaStore()
 
     async def replicate_forever() -> None:
         cadence = float(os.environ.get("VMON_REPLICATE_SEC") or 0)
+        last: dict[str, str] = {}
+
+        async def push_replica(
+            semaphore: asyncio.Semaphore, peer_id: str, digest: str, params: dict[str, Any]
+        ) -> bool:
+            url = mesh.peer_url(peer_id)
+            if not url:
+                return False
+            async with semaphore:
+                try:
+                    await asyncio.to_thread(
+                        mesh.transport.post,
+                        url,
+                        "/v1/mesh/replica/receive",
+                        {
+                            "digest": digest,
+                            "source_url": mesh.advertise,
+                            "source_node": mesh.node_id,
+                            "params": params,
+                        },
+                        timeout=mesh.create_timeout,
+                    )
+                except Exception:
+                    LOGGER.exception("failed to replicate sandbox to peer %s", peer_id)
+                    return False
+            return True
+
         while True:
             await asyncio.sleep(cadence)
             if not mesh.enabled:
                 continue
             k = int(os.environ.get("VMON_REPLICAS") or 1)
-            for sid in list(supervisor._engine.owned_ids()):
+            concurrency = int(os.environ.get("VMON_REPLICATE_CONCURRENCY") or 2)
+            semaphore = asyncio.Semaphore(concurrency)
+            owned_ids = list(supervisor._engine.owned_ids())
+            owned = set(owned_ids)
+            for stale_sid in set(last) - owned:
+                last.pop(stale_sid, None)
+
+            for sid in owned_ids:
                 digest = ""
                 snapshot_dir = ""
                 try:
@@ -1646,23 +1703,21 @@ def create_app(
                     digest = str(prep["digest"])
                     snapshot_dir = str(prep["snapshot_dir"])
                     params = dict(prep["params"])
-                    for peer_id in mesh.replica_targets(sid, k):
-                        url = mesh.peer_url(peer_id)
-                        if not url:
-                            continue
-                        with contextlib.suppress(Exception):
-                            await asyncio.to_thread(
-                                mesh.transport.post,
-                                url,
-                                "/v1/mesh/replica/receive",
-                                {
-                                    "digest": digest,
-                                    "source_url": mesh.advertise,
-                                    "source_node": mesh.node_id,
-                                    "params": params,
-                                },
-                                timeout=mesh.create_timeout,
-                            )
+                    # Saves redundant peer transfer/install only; the per-cadence checkpoint
+                    # quiesce is inherent — tune via VMON_REPLICATE_SEC.
+                    if digest == last.get(sid):
+                        continue
+                    pushes = [
+                        push_replica(semaphore, peer_id, digest, params)
+                        for peer_id in mesh.replica_targets(sid, k)
+                    ]
+                    if not pushes:
+                        continue
+                    results = await asyncio.gather(*pushes)
+                    if any(results):
+                        mesh.note_event("replication")
+                    if all(results):
+                        last[sid] = digest
                 except Exception:
                     LOGGER.exception("replication cycle failed for %s", sid)
                 finally:
@@ -1681,6 +1736,32 @@ def create_app(
                 try:
                     if mesh.restore_owner(sid, exclude={dead}) != mesh.node_id:
                         continue
+                    if os.environ.get("VMON_RESTORE_QUORUM"):
+                        # Quorum restore needs >=3 nodes to tolerate 1 failure; in a
+                        # 2-node cluster, losing one prevents a majority and defers.
+                        confirmations = 1
+                        for member_id in mesh.live_member_ids():
+                            if member_id == mesh.node_id:
+                                continue
+                            url = mesh.peer_url(member_id)
+                            if not url:
+                                continue
+                            try:
+                                resp = await asyncio.to_thread(
+                                    mesh.transport.get, url, f"/v1/mesh/reachable/{dead}"
+                                )
+                            except Exception:
+                                continue
+                            if resp.get("reachable") is False:
+                                confirmations += 1
+                        if not mesh.restore_quorum_met(confirmations):
+                            LOGGER.warning(
+                                "deferring restore of %s: quorum not met (%d/%d)",
+                                sid,
+                                confirmations,
+                                mesh.quorum_needed(),
+                            )
+                            continue
                     if _engine_has(supervisor, sid):
                         continue
                     if not replica_store.holds(sid):
@@ -1707,6 +1788,7 @@ def create_app(
                         )
                         await asyncio.to_thread(mesh.broadcast_owner, sid, mesh.node_id, epoch)
                         replica_store.drop(sid)
+                        mesh.note_event("restore")
                         LOGGER.info(
                             "restored orphaned sandbox %s from replica after %s died", sid, dead
                         )
@@ -1718,6 +1800,7 @@ def create_app(
                 try:
                     await supervisor._run(supervisor._engine.remove, sid)
                     mesh.forget_local_owner(sid)
+                    mesh.note_event("fence")
                     LOGGER.warning("fenced %s: superseded by a higher-epoch owner", sid)
                 except Exception:
                     LOGGER.exception("failed to fence superseded sandbox %s", sid)
@@ -1836,7 +1919,7 @@ def create_app(
         if peer_url is None:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable")
         _require_bearer(request, expected_token, client_token)
-        return await _proxy_to_peer(request, peer_url, expected_token or "")
+        return await _proxy_to_peer(request, peer_url, outbound_token)
 
     async def proxy_ws_owner(websocket: WebSocket, sandbox_id: str) -> bool:
         if not mesh.enabled or websocket.headers.get("x-vmon-mesh-hop"):
@@ -1860,7 +1943,7 @@ def create_app(
             target,
             websocket.url.path,
             extra_headers={
-                "Authorization": f"Bearer {expected_token or ''}",
+                "Authorization": f"Bearer {outbound_token}",
                 "X-Vmon-Mesh-Hop": "1",
             },
             preserve_query=True,
@@ -1957,7 +2040,9 @@ def create_app(
 
     @app.get("/v1/mesh/status", dependencies=[Depends(require_auth)])
     async def mesh_status() -> dict[str, Any]:
-        return mesh.status()
+        status_payload = mesh.status()
+        status_payload["replicas_held"] = len(app.state.replica_store.list())
+        return status_payload
 
     @app.post("/v1/mesh/members", dependencies=[Depends(require_auth)])
     async def mesh_members(body: dict[str, Any]) -> dict[str, Any]:
@@ -1979,6 +2064,10 @@ def create_app(
     async def mesh_depart(body: dict[str, Any]) -> dict[str, bool]:
         mesh.depart(str(body.get("node_id") or ""))
         return {"ok": True}
+
+    @app.get("/v1/mesh/reachable/{node_id}", dependencies=[Depends(require_auth)])
+    async def mesh_reachable(node_id: str) -> dict[str, bool]:
+        return {"reachable": mesh.is_peer_healthy(node_id)}
 
     @app.get("/v1/mesh/locate/{sandbox_id}", dependencies=[Depends(require_auth)])
     async def mesh_locate(sandbox_id: str) -> dict[str, Any]:
@@ -2020,7 +2109,7 @@ def create_app(
             )
         try:
             installed = await pull_template(
-                request.app.state.mesh_http, source_url, digest, expected_token or ""
+                request.app.state.mesh_http, source_url, digest, outbound_token
             )
         except Exception as exc:
             raise HTTPException(
@@ -2047,9 +2136,12 @@ def create_app(
             )
         if _engine_has(supervisor, name):
             return {"ok": True, "skipped": "owner"}
+        current = request.app.state.replica_store.get(name)
+        if current is not None and current.digest == digest:
+            return {"ok": True, "skipped": "current"}
         try:
             installed = await pull_template(
-                request.app.state.mesh_http, source_url, digest, expected_token or ""
+                request.app.state.mesh_http, source_url, digest, outbound_token
             )
         except Exception as exc:
             raise HTTPException(
@@ -2096,11 +2188,11 @@ def create_app(
                 peer_url, digest = provider
                 try:
                     installed = await pull_template_metadata(
-                        request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                        request.app.state.mesh_http, peer_url, digest, outbound_token
                     )
                     body.template = str(installed)
                     body.remote_page_url = _remote_page_url(peer_url, digest)
-                    body.remote_page_token = expected_token or ""
+                    body.remote_page_token = outbound_token
                     body.remote_page_digest = digest
                 except Exception as exc:
                     LOGGER.warning(
@@ -2108,7 +2200,7 @@ def create_app(
                     )
                     try:
                         installed = await pull_template(
-                            request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                            request.app.state.mesh_http, peer_url, digest, outbound_token
                         )
                         # Warm-restore the pulled snapshot directly: selecting it by path
                         # skips build_or_pull, so the node needs no local image/engine.
@@ -2607,11 +2699,11 @@ def create_app(
                 peer_url, digest = provider
                 try:
                     installed = await pull_template_metadata(
-                        request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                        request.app.state.mesh_http, peer_url, digest, outbound_token
                     )
                     body.template = str(installed)
                     body.remote_page_url = _remote_page_url(peer_url, digest)
-                    body.remote_page_token = expected_token or ""
+                    body.remote_page_token = outbound_token
                     body.remote_page_digest = digest
                 except Exception as exc:
                     LOGGER.warning(
@@ -2619,7 +2711,7 @@ def create_app(
                     )
                     try:
                         installed = await pull_template(
-                            request.app.state.mesh_http, peer_url, digest, expected_token or ""
+                            request.app.state.mesh_http, peer_url, digest, outbound_token
                         )
                         # Warm-restore the pulled snapshot directly: selecting it by path
                         # skips build_or_pull, so the node needs no local image/engine.
@@ -2686,7 +2778,7 @@ def create_app(
                     raise HTTPException(
                         status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
                     )
-                return await _proxy_to_peer(request, url, expected_token or "")
+                return await _proxy_to_peer(request, url, outbound_token)
         if params["detach"]:
             return JSONResponse(await supervisor._run(supervisor._engine.run, params))
         return StreamingResponse(
@@ -2710,7 +2802,7 @@ def create_app(
                     raise HTTPException(
                         status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable"
                     )
-                return await _proxy_to_peer(request, url, expected_token or "")
+                return await _proxy_to_peer(request, url, outbound_token)
         if params.get("detach"):
             return JSONResponse(await supervisor._run(supervisor._engine.restore, params))
         return StreamingResponse(
@@ -2944,7 +3036,7 @@ def create_app(
                     target,
                     websocket.url.path,
                     extra_headers={
-                        "Authorization": f"Bearer {expected_token or ''}",
+                        "Authorization": f"Bearer {outbound_token}",
                         "X-Vmon-Mesh-Hop": "1",
                     },
                     preserve_query=True,
@@ -3051,6 +3143,8 @@ def serve(
     port: int = 8000,
     token: str | None = None,
     idle_timeout: float = 300.0,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
 ) -> None:
     """Run the daemon **and** the HTTP/web gateway over a single shared engine.
 
@@ -3071,6 +3165,8 @@ def serve(
     resolved_token = token or os.environ.get("VMON_API_TOKEN")
     if not resolved_token:
         raise RuntimeError("vmon serve requires --token or VMON_API_TOKEN")
+    tls_cert = tls_cert or os.environ.get("VMON_TLS_CERT")
+    tls_key = tls_key or os.environ.get("VMON_TLS_KEY")
     app = create_app(token=resolved_token, idle_timeout=idle_timeout, host=host, port=port)
 
     from .daemon import Daemon, acquire_owner_lock, daemon_paths, parse_tcp_addr, release_owner_lock
@@ -3097,7 +3193,11 @@ def serve(
         raise RuntimeError(f"failed to bind the local vmond socket at {paths['sock']}")
     paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
     try:
-        uvicorn.run(app, host=host, port=port)
+        uvicorn_kwargs: dict[str, Any] = {"host": host, "port": port}
+        if tls_cert and tls_key:
+            uvicorn_kwargs["ssl_certfile"] = tls_cert
+            uvicorn_kwargs["ssl_keyfile"] = tls_key
+        uvicorn.run(app, **uvicorn_kwargs)
     finally:
         daemon.shutdown()
         for path in (paths["sock"], paths["pid"]):

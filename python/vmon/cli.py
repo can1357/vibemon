@@ -860,6 +860,8 @@ def daemon(action):
 @click.option("--host", default="127.0.0.1", show_default=True, help="bind host")
 @click.option("--port", type=int, default=8000, show_default=True, help="bind port")
 @click.option("--token", help="bearer token (or VMON_API_TOKEN)")
+@click.option("--tls-cert", help="PEM cert for HTTPS (or VMON_TLS_CERT)")
+@click.option("--tls-key", help="PEM key for HTTPS (or VMON_TLS_KEY)")
 @click.option(
     "--idle-timeout",
     type=float,
@@ -867,7 +869,7 @@ def daemon(action):
     show_default=True,
     help="terminate idle sandboxes after this many seconds",
 )
-def serve(host, port, token, idle_timeout):
+def serve(host, port, token, tls_cert, tls_key, idle_timeout):
     try:
         from .server import serve as serve_http
     except ModuleNotFoundError as e:
@@ -875,7 +877,14 @@ def serve(host, port, token, idle_timeout):
             ui.error("vmon serve requires the server extra: pip install 'vmon[server]'")
             return 1
         raise
-    serve_http(host=host, port=port, token=token, idle_timeout=idle_timeout)
+    serve_http(
+        host=host,
+        port=port,
+        token=token,
+        idle_timeout=idle_timeout,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+    )
     return 0
 
 
