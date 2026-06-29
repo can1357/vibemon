@@ -367,6 +367,24 @@ class Engine:
         with self._lock:
             return [record.id for record in self._records.values() if record.status != "terminated"]
 
+    def set_owner_epoch(self, sid: str, epoch: int) -> None:
+        """Record the local ownership epoch in memory and persist it (non-secret) so
+        mesh fencing survives a daemon restart."""
+        with self._lock:
+            record = self._records.get(sid)
+            if record is not None:
+                record.detail["owner_epoch"] = int(epoch)
+        try:
+            MicroVM(sid)._save_meta(owner_epoch=int(epoch))
+        except Exception:
+            pass
+
+    def owned_epoch(self, sid: str) -> int:
+        """Return the local ownership epoch for sid from the in-memory record (0 if unknown)."""
+        with self._lock:
+            record = self._records.get(sid)
+            return int(record.detail.get("owner_epoch") or 0) if record is not None else 0
+
     def templates_present(self) -> builtins.list[str]:
         """Return local snapshot and template names available for placement."""
         names: set[str] = set()
@@ -960,6 +978,81 @@ class Engine:
         cas.drop_digest(digest)
         if delete_dir:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    def replicate_prepare(self, name: str) -> dict[str, Any]:
+        """Non-destructively checkpoint a live, migratable sandbox for HA replication.
+
+        This is the non-stopping sibling of :meth:`migrate_prepare` used to
+        pre-stage HA replicas. It uses the same eligibility checks and restore
+        parameter extraction, and raises :class:`Unsupported` for ineligible
+        sandboxes.
+        """
+        record = self.get(name, require_running=True)
+        sandbox = record.sandbox
+        if sandbox is None:
+            raise Unsupported(
+                "migration requires a live in-process sandbox; one rehydrated after "
+                "a daemon restart has lost the identity needed to move it"
+            )
+        if not getattr(sandbox, "_block_network", False):
+            raise Unsupported(
+                "only block-network sandboxes can migrate; a networked sandbox needs "
+                "per-node host networking that the snapshot cannot carry"
+            )
+        if getattr(sandbox, "_volumes", None):
+            raise Unsupported(
+                "a sandbox with named volumes cannot migrate; volume data is host-local"
+            )
+        if getattr(sandbox, "_fs_dir", None):
+            raise Unsupported(
+                "a sandbox with an fs_dir share cannot migrate; the share is host-local"
+            )
+        memory = record.detail.get("memory")
+        cpus = record.detail.get("cpus")
+        vm = getattr(sandbox, "vm", None)
+        meta = vm.meta if vm is not None else {}
+        if memory is None:
+            memory = meta.get("mem")
+        if cpus is None:
+            cpus = meta.get("cpus")
+        if memory is None:
+            raise Unsupported(
+                "cannot determine the sandbox memory size needed to restore it elsewhere"
+            )
+        params: dict[str, Any] = {
+            "name": name,
+            "block_network": True,
+            "memory": int(memory),
+            "cpus": int(cpus) if cpus is not None else 1,
+            "env": dict(getattr(sandbox, "env", {}) or {}),
+            "workdir": getattr(sandbox, "workdir", None),
+            "tags": dict(record.tags or {}),
+        }
+        timeout_secs = getattr(sandbox, "_timeout_secs", None)
+        if timeout_secs is not None:
+            params["timeout_secs"] = int(timeout_secs)
+        secret_env = dict(getattr(sandbox, "_secret_env", {}) or {})
+        if secret_env:
+            # Carried over the (bearer-authed) cluster channel, like the memory image.
+            params["secrets"] = [secret_env]
+        transient = f"replica-{name}-{uuid.uuid4().hex[:12]}"
+        snap_dir = Path(self.snapshot_template(name, transient, stop=False))
+        from . import cas
+
+        digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
+        return {
+            "digest": digest,
+            "snapshot": transient,
+            "snapshot_dir": str(snap_dir),
+            "params": params,
+        }
+
+    def replicate_cleanup(self, digest: str, snapshot_dir: str) -> None:
+        """Drop a local replication checkpoint after peers pulled it.
+
+        The source VM keeps running from its own memory.
+        """
+        self._drop_checkpoint(digest, snapshot_dir, delete_dir=True)
 
     def _teardown(self, record: VMRecord) -> int | None:
         """Release every host resource a VM holds (idempotent, best-effort).

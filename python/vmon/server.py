@@ -21,6 +21,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import tarfile
 import tempfile
 import threading
@@ -49,6 +50,7 @@ from .mesh import (
     default_advertise,
     request_template_key,
 )
+from .replica import ReplicaStore
 from .wsframe import encode_frame, read_frame
 
 LOGGER = logging.getLogger(__name__)
@@ -808,6 +810,16 @@ def _tokens_match(supplied: str | None, expected: str) -> bool:
     return supplied is not None and secrets.compare_digest(supplied, expected)
 
 
+def _bearer_token_authorized(
+    supplied: str | None, expected_token: str | None, client_token: str | None = None
+) -> bool:
+    if expected_token is None and client_token is None:
+        return True
+    full_match = expected_token is not None and _tokens_match(supplied, expected_token)
+    client_match = client_token is not None and _tokens_match(supplied, client_token)
+    return full_match or client_match
+
+
 def _ws_bearer_token(websocket: WebSocket) -> str | None:
     """Extract a bearer token from the Authorization header or a token query param."""
     header = websocket.headers.get("authorization")
@@ -825,6 +837,23 @@ def _request_bearer_token(request: Request) -> str | None:
         return None
     scheme, _, value = header.partition(" ")
     return value.strip() if scheme.lower() == "bearer" and value else None
+
+
+_ADMIN_MIGRATE_PATH = re.compile(r"^/v1/sandboxes/[^/]+/migrate/?$")
+
+
+def _is_admin_path(path: str) -> bool:
+    return path.startswith("/v1/mesh/") or bool(_ADMIN_MIGRATE_PATH.fullmatch(path))
+
+
+def _client_token_only(
+    supplied: str | None, expected_token: str | None, client_token: str | None
+) -> bool:
+    if client_token is None or client_token == expected_token:
+        return False
+    client_match = _tokens_match(supplied, client_token)
+    full_match = expected_token is not None and _tokens_match(supplied, expected_token)
+    return client_match and not full_match
 
 
 def _request_connect_token(request: Request) -> str | None:
@@ -1225,15 +1254,15 @@ async def _scatter_locate(mesh: Mesh, sandbox_id: str) -> str | None:
             continue
         owner = response.get("owner")
         if isinstance(owner, str) and owner:
-            mesh.record_owner(sandbox_id, owner)
+            mesh.record_owner(sandbox_id, owner, int(response.get("epoch") or 0))
             return owner
     return None
 
 
-def _require_bearer(request: Request, expected_token: str | None) -> None:
-    if expected_token is None:
-        return
-    if not _tokens_match(_request_bearer_token(request), expected_token):
+def _require_bearer(
+    request: Request, expected_token: str | None, client_token: str | None = None
+) -> None:
+    if not _bearer_token_authorized(_request_bearer_token(request), expected_token, client_token):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             detail="unauthorized",
@@ -1250,15 +1279,14 @@ def _mesh_http_status(exc: MeshError) -> int:
     }.get(exc.code, status.HTTP_400_BAD_REQUEST)
 
 
-def _split_http_authority(url: str) -> tuple[str, int]:
+def _split_http_authority(url: str) -> tuple[str, int, bool]:
     parsed = urlsplit(url)
-    if parsed.scheme == "https":
-        raise MeshError("ws across https peer unsupported", code="unreachable")
-    if parsed.scheme and parsed.scheme != "http":
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
         raise MeshError("unsupported peer URL scheme", code="invalid")
     if not parsed.hostname:
         raise MeshError("invalid peer URL", code="invalid")
-    return parsed.hostname, parsed.port or 80
+    tls = parsed.scheme == "https"
+    return parsed.hostname, parsed.port or (443 if tls else 80), tls
 
 
 def _ws_build_path(rest: str, websocket: WebSocket, *, preserve_query: bool = False) -> str:
@@ -1272,7 +1300,7 @@ def _ws_build_path(rest: str, websocket: WebSocket, *, preserve_query: bool = Fa
 
 async def _proxy_websocket(
     websocket: WebSocket,
-    target: tuple[str, int],
+    target: tuple[str, int] | tuple[str, int, bool],
     rest: str,
     *,
     extra_headers: dict[str, str] | None = None,
@@ -1280,9 +1308,21 @@ async def _proxy_websocket(
 ) -> None:
     # Minimal RFC 6455 client relay: FastAPI decodes the public WebSocket, then
     # this bridge re-encodes frames to the sandbox's localhost tunnel.
-    host, port = target
+    if len(target) == 2:
+        host, port = target
+        tls = False
+    else:
+        host, port, tls = target
     try:
-        reader, writer = await asyncio.open_connection(host, port)
+        if tls:
+            reader, writer = await asyncio.open_connection(
+                host,
+                port,
+                ssl=ssl.create_default_context(),
+                server_hostname=host,
+            )
+        else:
+            reader, writer = await asyncio.open_connection(host, port)
     except OSError:
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="tunnel connect failed")
         return
@@ -1578,6 +1618,7 @@ def create_app(
 ) -> FastAPI:
     supervisor = Supervisor(Engine(), idle_poll=max(1.0, min(float(idle_timeout), 30.0)))
     expected_token = token if token is not None else os.environ.get("VMON_API_TOKEN")
+    client_token = os.environ.get("VMON_CLIENT_TOKEN")
     mesh = Mesh(
         supervisor._engine,
         advertise=default_advertise(host, port),
@@ -1585,6 +1626,101 @@ def create_app(
         transport=HttpxTransport(expected_token or ""),
     )
     bearer = HTTPBearer(auto_error=False)
+    replica_store = ReplicaStore()
+
+    async def replicate_forever() -> None:
+        cadence = float(os.environ.get("VMON_REPLICATE_SEC") or 0)
+        while True:
+            await asyncio.sleep(cadence)
+            if not mesh.enabled:
+                continue
+            k = int(os.environ.get("VMON_REPLICAS") or 1)
+            for sid in list(supervisor._engine.owned_ids()):
+                digest = ""
+                snapshot_dir = ""
+                try:
+                    try:
+                        prep = await supervisor._run(supervisor._engine.replicate_prepare, sid)
+                    except Exception:
+                        continue
+                    digest = str(prep["digest"])
+                    snapshot_dir = str(prep["snapshot_dir"])
+                    params = dict(prep["params"])
+                    for peer_id in mesh.replica_targets(sid, k):
+                        url = mesh.peer_url(peer_id)
+                        if not url:
+                            continue
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(
+                                mesh.transport.post,
+                                url,
+                                "/v1/mesh/replica/receive",
+                                {
+                                    "digest": digest,
+                                    "source_url": mesh.advertise,
+                                    "source_node": mesh.node_id,
+                                    "params": params,
+                                },
+                                timeout=mesh.create_timeout,
+                            )
+                except Exception:
+                    LOGGER.exception("replication cycle failed for %s", sid)
+                finally:
+                    if digest and snapshot_dir:
+                        with contextlib.suppress(Exception):
+                            await supervisor._run(
+                                supervisor._engine.replicate_cleanup, digest, snapshot_dir
+                            )
+
+    async def ha_reconcile_forever() -> None:
+        while True:
+            await asyncio.sleep(max(1.0, mesh.interval))
+            if not mesh.enabled:
+                continue
+            for sid, dead in mesh.drain_orphans():
+                try:
+                    if mesh.restore_owner(sid, exclude={dead}) != mesh.node_id:
+                        continue
+                    if _engine_has(supervisor, sid):
+                        continue
+                    if not replica_store.holds(sid):
+                        LOGGER.warning("cannot auto-restore %s: no local replica", sid)
+                        continue
+                    if not replica_store.secrets_ready(sid):
+                        LOGGER.warning(
+                            "cannot auto-restore %s: replica secrets unavailable after restart",
+                            sid,
+                        )
+                        continue
+                    key = f"restore:{sid}"
+                    if not mesh.worker_begin(key):
+                        continue
+                    try:
+                        rec = replica_store.get(sid)
+                        if rec is None:
+                            LOGGER.warning("cannot auto-restore %s: no local replica", sid)
+                            continue
+                        epoch = mesh.next_epoch(sid)
+                        await supervisor._run(
+                            supervisor._engine.create,
+                            {**rec.params, "template": rec.snapshot_dir},
+                        )
+                        await asyncio.to_thread(mesh.broadcast_owner, sid, mesh.node_id, epoch)
+                        replica_store.drop(sid)
+                        LOGGER.info(
+                            "restored orphaned sandbox %s from replica after %s died", sid, dead
+                        )
+                    finally:
+                        mesh.worker_end(key)
+                except Exception:
+                    LOGGER.exception("failed to restore orphaned sandbox %s from %s", sid, dead)
+            for sid in mesh.fenced_local_ids(list(supervisor._engine.owned_ids())):
+                try:
+                    await supervisor._run(supervisor._engine.remove, sid)
+                    mesh.forget_local_owner(sid)
+                    LOGGER.warning("fenced %s: superseded by a higher-epoch owner", sid)
+                except Exception:
+                    LOGGER.exception("failed to fence superseded sandbox %s", sid)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -1593,25 +1729,31 @@ def create_app(
         from . import sandbox as sandbox_mod
 
         app.state.mesh_http = httpx.AsyncClient(timeout=None)
+        app.state.replica_store = replica_store
         try:
             for ref, count in _parse_warm_images(os.environ.get("VMON_WARM_IMAGES")):
                 await asyncio.to_thread(sandbox_mod.prewarm, ref, count=count)
             mesh.load()
+            replica_store.load()
             if mesh.enabled:
                 ensure_mesh_heartbeat()
+                app.state.ha_reconcile_task = asyncio.create_task(ha_reconcile_forever())
+                if float(os.environ.get("VMON_REPLICATE_SEC") or 0) > 0:
+                    app.state.replicate_task = asyncio.create_task(replicate_forever())
             app.state.reaper_task = asyncio.create_task(supervisor.reap_forever())
             yield
         finally:
             stop = getattr(app.state, "mesh_stop", None)
             if stop is not None:
                 stop.set()
-            task = getattr(app.state, "reaper_task", None)
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            for task_name in ("reaper_task", "replicate_task", "ha_reconcile_task"):
+                task = getattr(app.state, task_name, None)
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             await asyncio.to_thread(sandbox_mod.shutdown_all_pools)
             await app.state.mesh_http.aclose()
             close = getattr(mesh.transport, "close", None)
@@ -1642,13 +1784,12 @@ def create_app(
     async def require_auth(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> None:
-        if expected_token is None:
-            return
-        if (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not _tokens_match(credentials.credentials, expected_token)
-        ):
+        supplied = (
+            credentials.credentials
+            if credentials is not None and credentials.scheme.lower() == "bearer"
+            else None
+        )
+        if not _bearer_token_authorized(supplied, expected_token, client_token):
             supervisor.count("auth_failed")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
@@ -1679,6 +1820,10 @@ def create_app(
 
     @app.middleware("http")
     async def _mesh_router(request: Request, call_next: Any) -> Response:
+        if _is_admin_path(request.url.path) and _client_token_only(
+            _request_bearer_token(request), expected_token, client_token
+        ):
+            return JSONResponse({"detail": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
         if not mesh.enabled or request.headers.get("x-vmon-mesh-hop"):
             return await call_next(request)
         sandbox_id = _sandbox_id_in_path(request.url.path)
@@ -1690,7 +1835,7 @@ def create_app(
         peer_url = mesh.peer_url(owner)
         if peer_url is None:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable")
-        _require_bearer(request, expected_token)
+        _require_bearer(request, expected_token, client_token)
         return await _proxy_to_peer(request, peer_url, expected_token or "")
 
     async def proxy_ws_owner(websocket: WebSocket, sandbox_id: str) -> bool:
@@ -1836,17 +1981,21 @@ def create_app(
         return {"ok": True}
 
     @app.get("/v1/mesh/locate/{sandbox_id}", dependencies=[Depends(require_auth)])
-    async def mesh_locate(sandbox_id: str) -> dict[str, str]:
+    async def mesh_locate(sandbox_id: str) -> dict[str, Any]:
         if _engine_has(supervisor, sandbox_id):
-            return {"owner": mesh.node_id}
+            owner, epoch = mesh.authoritative_owner(sandbox_id)
+            if owner is None:
+                owner, epoch = mesh.node_id, mesh.local_epoch(sandbox_id)
+            return {"owner": owner, "epoch": epoch}
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown sandbox")
 
     @app.post("/v1/mesh/owner", dependencies=[Depends(require_auth)])
     async def mesh_owner(body: dict[str, Any]) -> dict[str, bool]:
         sid = str(body.get("sid") or "")
         node_id = str(body.get("node_id") or "")
+        epoch = int(body.get("epoch") or 0)
         if sid and node_id:
-            mesh.record_owner(sid, node_id)
+            mesh.record_owner(sid, node_id, epoch)
         return {"ok": True}
 
     @app.post("/v1/mesh/migrate/receive", dependencies=[Depends(require_auth)])
@@ -1881,8 +2030,44 @@ def create_app(
         record = await supervisor._run(
             supervisor._engine.create, {**params, "template": str(installed)}
         )
-        mesh.record_owner(name, mesh.node_id)
+        mesh.record_owner(name, mesh.node_id, int(body.get("epoch") or 0))
         return record.view()
+
+    @app.post("/v1/mesh/replica/receive", dependencies=[Depends(require_auth)])
+    async def mesh_replica_receive(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        digest = str(body.get("digest") or "")
+        source_url = str(body.get("source_url") or "")
+        source_node = str(body.get("source_node") or "")
+        params = dict(body.get("params") or {})
+        name = str(params.get("name") or "")
+        if not (digest and source_url and source_node and name):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="digest, source_url, source_node, and params.name are required",
+            )
+        if _engine_has(supervisor, name):
+            return {"ok": True, "skipped": "owner"}
+        try:
+            installed = await pull_template(
+                request.app.state.mesh_http, source_url, digest, expected_token or ""
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=f"failed to pull replica checkpoint: {exc}",
+            ) from exc
+        replica_store.put(
+            name,
+            digest=digest,
+            source_node=source_node,
+            snapshot_dir=str(installed),
+            params=params,
+        )
+        return {"ok": True}
+
+    @app.get("/v1/mesh/replica/list", dependencies=[Depends(require_auth)])
+    async def mesh_replica_list() -> dict[str, list[str]]:
+        return {"sids": replica_store.list()}
 
     def _idem_payload(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         key = str(body.get("key") or "").strip()
@@ -2013,7 +2198,7 @@ def create_app(
                 raise
             sid = str(view.get("id") or view.get("name") or "")
             if sid:
-                mesh.record_owner(sid, owner)
+                mesh.record_owner(sid, owner, 0)
             return view
         raise MeshError("no reachable owner for idempotent create", code="unreachable")
 
@@ -2139,7 +2324,7 @@ def create_app(
                 raise
             sid = str(view.get("id") or view.get("name") or "")
             if sid:
-                mesh.record_owner(sid, owner)
+                mesh.record_owner(sid, owner, 0)
             return view
         raise MeshError("no reachable owner for idempotent run", code="unreachable")
 
@@ -2263,7 +2448,7 @@ def create_app(
                 raise
             sid = str(view.get("id") or view.get("name") or "")
             if sid:
-                mesh.record_owner(sid, owner)
+                mesh.record_owner(sid, owner, 0)
             return view
         raise MeshError("no reachable owner for idempotent restore", code="unreachable")
 
@@ -2411,7 +2596,7 @@ def create_app(
                     mesh.note_inflight(-1)
                 sid = str(view.get("id") or view.get("name") or "")
                 if sid:
-                    mesh.record_owner(sid, owner)
+                    mesh.record_owner(sid, owner, 0)
                 return JSONResponse(view, status_code=status.HTTP_201_CREATED)
         key = request_template_key(body_dict)
         local_index_fn = getattr(supervisor._engine, "template_index", None)
@@ -2549,7 +2734,7 @@ def create_app(
                     raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
                 for clone in response.get("clones") or []:
                     if isinstance(clone, dict) and clone.get("name"):
-                        mesh.record_owner(str(clone["name"]), owner)
+                        mesh.record_owner(str(clone["name"]), owner, 0)
                 return response
         clones = await supervisor.fork(params)
         return {"clones": clones}
@@ -2628,7 +2813,13 @@ def create_app(
         digest = str(prep["digest"])
         snapshot_dir = str(prep["snapshot_dir"])
         params = dict(prep["params"])
-        receive = {"digest": digest, "source_url": mesh.advertise, "params": params}
+        epoch = mesh.next_epoch(sandbox_id)
+        receive = {
+            "digest": digest,
+            "source_url": mesh.advertise,
+            "params": params,
+            "epoch": epoch,
+        }
         try:
             view = await asyncio.to_thread(
                 mesh.transport.post,
@@ -2646,7 +2837,7 @@ def create_app(
                 status.HTTP_502_BAD_GATEWAY,
                 detail=f"migration to {target} failed (source restored): {detail}",
             ) from exc
-        await asyncio.to_thread(mesh.broadcast_owner, sandbox_id, target)
+        await asyncio.to_thread(mesh.broadcast_owner, sandbox_id, target, epoch)
         await supervisor._run(supervisor._engine.migrate_commit, sandbox_id, snapshot_dir, digest)
         return view
 
@@ -2677,9 +2868,7 @@ def create_app(
 
     @app.websocket("/v1/sandboxes/{sandbox_id}/exec/ws")
     async def exec_sandbox_ws(websocket: WebSocket, sandbox_id: str) -> None:
-        if expected_token is not None and not _tokens_match(
-            _ws_bearer_token(websocket), expected_token
-        ):
+        if not _bearer_token_authorized(_ws_bearer_token(websocket), expected_token, client_token):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
@@ -2713,9 +2902,7 @@ def create_app(
 
     @app.websocket("/v1/shell/ws")
     async def shell_gateway_ws(websocket: WebSocket) -> None:
-        if expected_token is not None and not _tokens_match(
-            _ws_bearer_token(websocket), expected_token
-        ):
+        if not _bearer_token_authorized(_ws_bearer_token(websocket), expected_token, client_token):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
@@ -2828,9 +3015,7 @@ def create_app(
 
     @app.websocket("/v1/sandboxes/{sandbox_id}/ports/{port:int}/ws/{rest:path}")
     async def proxy_ws_port(websocket: WebSocket, sandbox_id: str, port: int, rest: str) -> None:
-        if expected_token is not None and not _tokens_match(
-            _ws_bearer_token(websocket), expected_token
-        ):
+        if not _bearer_token_authorized(_ws_bearer_token(websocket), expected_token, client_token):
             supervisor.count("auth_failed")
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorized")
             return
