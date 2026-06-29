@@ -183,9 +183,17 @@ def _coerce_create_params(params: dict[str, Any]) -> dict[str, Any]:
 
         params["secrets"] = [Secret.from_dict(s) for s in params.get("secrets") or []]
     if "volumes" in params:
-        params["volumes"] = {
-            mountpoint: Volume(name) for mountpoint, name in (params.get("volumes") or {}).items()
-        }
+        by_name: dict[str, Volume] = {}
+        coerced: dict[str, Any] = {}
+        for mountpoint, spec in (params.get("volumes") or {}).items():
+            if isinstance(spec, dict):
+                vname = spec["name"]
+                vol = by_name.setdefault(vname, Volume(vname))
+                coerced[mountpoint] = (vol, bool(spec.get("read_only")))
+            else:
+                vol = by_name.setdefault(spec, Volume(spec))
+                coerced[mountpoint] = vol
+        params["volumes"] = coerced
     return params
 
 
@@ -889,18 +897,15 @@ class Engine:
             data.pop("content_digest", None)
             marker.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
 
-    def migrate_prepare(self, name: str) -> dict[str, Any]:
-        """Quiesce a live, migratable sandbox into a transient cross-node checkpoint.
+    def _prepare_restore_params(self, name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Validate an HA-eligible sandbox and build its cross-node restore params.
 
-        Returns ``{digest, snapshot, snapshot_dir, params}``: a content-addressed,
-        peer-pullable template (the source VM is *stopped* at the checkpoint) plus
-        the create-equivalent params a target needs to restore an identical live
-        sandbox. Follow with :meth:`migrate_commit` once a target confirms, or
-        :meth:`migrate_abort` to restore the source locally from the same checkpoint.
-
-        Only a live, in-process, block-network sandbox with no host-local state
-        (named volumes or an ``fs_dir`` share) can migrate; others raise
-        :class:`Unsupported` because their NIC or data cannot move hosts.
+        Returns ``(meta, params)``; raises :class:`Unsupported` for a sandbox whose
+        NIC (networked), ``fs_dir`` host share, or unknown memory size cannot move
+        hosts. Named volumes ARE carried: ``params['volumes']`` records each
+        ``mountpoint -> {name, read_only}`` from ``vm.meta`` (the source of truth);
+        the volume *data* is copied into the checkpoint by :meth:`_capture_volumes`
+        and a peer re-materializes it under its own ``$VMON_HOME/volumes`` on restore.
         """
         record = self.get(name, require_running=True)
         sandbox = record.sandbox
@@ -913,10 +918,6 @@ class Engine:
             raise Unsupported(
                 "only block-network sandboxes can migrate; a networked sandbox needs "
                 "per-node host networking that the snapshot cannot carry"
-            )
-        if getattr(sandbox, "_volumes", None):
-            raise Unsupported(
-                "a sandbox with named volumes cannot migrate; volume data is host-local"
             )
         if getattr(sandbox, "_fs_dir", None):
             raise Unsupported(
@@ -950,9 +951,26 @@ class Engine:
         if secret_env:
             # Carried over the (bearer-authed) cluster channel, like the memory image.
             params["secrets"] = [secret_env]
-        transient = f"migrate-{name}-{uuid.uuid4().hex[:12]}"
-        snap_dir = Path(self.snapshot_template(name, transient, stop=True))
+        volumes_meta = meta.get("volumes") or {}
+        if volumes_meta:
+            params["volumes"] = {
+                mountpoint: {"name": v["name"], "read_only": bool(v.get("read_only"))}
+                for mountpoint, v in volumes_meta.items()
+            }
+        return meta, params
+
+    def _checkpoint_for(self, name: str, *, kind: str, stop: bool) -> dict[str, Any]:
+        """Build a peer-pullable checkpoint + restore params for migrate/replicate.
+
+        ``stop=True`` quiesces the source (migration); ``stop=False`` keeps it
+        running (replication). Volume data is captured into the checkpoint before
+        the content digest so it travels with the bundle.
+        """
+        meta, params = self._prepare_restore_params(name)
+        transient = f"{kind}-{name}-{uuid.uuid4().hex[:12]}"
+        snap_dir = Path(self.snapshot_template(name, transient, stop=stop))
         self._stamp_template_marker(snap_dir, meta)
+        self._capture_volumes(snap_dir, params.get("volumes"))
         from . import cas
 
         digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
@@ -962,6 +980,126 @@ class Engine:
             "snapshot_dir": str(snap_dir),
             "params": params,
         }
+
+    def _capture_volumes(self, snap_dir: Path, volumes: dict[str, Any] | None) -> None:
+        """Copy each carried volume's host dir into the checkpoint (``.lock`` excluded).
+
+        Data lands under ``<snap_dir>/volumes/<name>`` so it is part of the
+        content-addressed digest and travels to a peer. A live (replication) copy
+        of a *writable* volume is only crash-consistent; a read-only volume cannot
+        be written by the guest, and a stopped (migration) source is quiescent.
+        """
+        if not volumes:
+            return
+        from .volume import VOLUME_DIR
+
+        dest_root = snap_dir / "volumes"
+        seen: set[str] = set()
+        for spec in volumes.values():
+            vname = str(spec["name"])
+            if vname in seen:
+                continue
+            seen.add(vname)
+            src = VOLUME_DIR / vname
+            if not src.is_dir() or src.is_symlink():
+                raise Unsupported(
+                    f"volume {vname!r} has no host directory to checkpoint at {src!s}"
+                )
+            shutil.copytree(
+                src,
+                dest_root / vname,
+                ignore=shutil.ignore_patterns(".lock"),
+                dirs_exist_ok=True,
+            )
+
+    def materialize_volumes(
+        self, template_dir: str, params: dict[str, Any], *, quorum_ok: bool
+    ) -> builtins.list[Path]:
+        """Restore checkpoint-carried volume data onto THIS node before :meth:`create`.
+
+        Returns the freshly-created host volume directories (for rollback on a later
+        create failure). Refuses to clobber a pre-existing same-named local volume
+        (there is no cluster-unique volume identity yet), and refuses a *writable*
+        volume unless restore quorum holds: :meth:`Volume.acquire` is only a
+        host-local ``flock``, so a partitioned old owner could otherwise keep writing
+        its copy while this node writes the restored one. A volume is treated as
+        writable if ANY mountpoint mounts it read-write. Read-only volumes are
+        divergence-free and always allowed. A no-op when no volumes are carried.
+        """
+        volumes = params.get("volumes") or {}
+        if not volumes:
+            return []
+        from .volume import VOLUME_DIR
+
+        # One host dir per volume NAME (copied once); a name is writable if any
+        # mountpoint mounts it read-write.
+        writable: dict[str, bool] = {}
+        for spec in volumes.values():
+            vname = str(spec["name"]) if isinstance(spec, dict) else str(spec)
+            read_only = bool(spec.get("read_only")) if isinstance(spec, dict) else False
+            writable[vname] = writable.get(vname, False) or not read_only
+        src_root = Path(template_dir) / "volumes"
+        # Validate every volume BEFORE copying any, so a rejection leaves no
+        # partially-materialized state behind.
+        for vname, is_writable in writable.items():
+            if is_writable and not quorum_ok:
+                raise Unsupported(
+                    f"cannot restore writable volume {vname!r} without restore quorum: a "
+                    "host-local lock cannot stop a partitioned owner from also writing it; "
+                    "enable VMON_RESTORE_QUORUM"
+                )
+            dest = VOLUME_DIR / vname
+            if dest.exists() or dest.is_symlink():
+                raise Unsupported(
+                    f"cannot restore volume {vname!r}: a volume of that name already exists "
+                    "on this node (no cluster-unique volume identity yet)"
+                )
+            if not (src_root / vname).is_dir():
+                raise Unsupported(f"checkpoint is missing data for volume {vname!r}")
+        created: builtins.list[Path] = []
+        try:
+            VOLUME_DIR.mkdir(parents=True, exist_ok=True)
+            for vname in writable:
+                dest = VOLUME_DIR / vname
+                shutil.copytree(src_root / vname, dest)
+                created.append(dest)
+        except BaseException:
+            for path in created:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+        return created
+
+    def restore_from_template(
+        self, params: dict[str, Any], template_dir: str, *, quorum_ok: bool
+    ) -> VMRecord:
+        """Materialize carried volumes, then create the sandbox from the checkpoint.
+
+        Rolls back any freshly-materialized volume directory if the create fails, so
+        a transient restore error neither leaks host state nor poisons the volume
+        collision guard on the next attempt.
+        """
+        created = self.materialize_volumes(template_dir, params, quorum_ok=quorum_ok)
+        try:
+            return self.create({**params, "template": template_dir})
+        except BaseException:
+            for path in created:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+
+    def migrate_prepare(self, name: str) -> dict[str, Any]:
+        """Quiesce a live, migratable sandbox into a transient cross-node checkpoint.
+
+        Returns ``{digest, snapshot, snapshot_dir, params}``: a content-addressed,
+        peer-pullable template (the source VM is *stopped* at the checkpoint) plus
+        the create-equivalent params a target needs to restore an identical live
+        sandbox. Follow with :meth:`migrate_commit` once a target confirms, or
+        :meth:`migrate_abort` to restore the source locally from the same checkpoint.
+
+        Only a live, in-process, block-network sandbox can migrate; an ``fs_dir``
+        host share or networked NIC raises :class:`Unsupported` (it cannot move
+        hosts). Named volumes ARE carried (their data travels in the checkpoint).
+        """
+        return self._checkpoint_for(name, kind="migrate", stop=True)
 
     def migrate_commit(self, name: str, snapshot_dir: str, digest: str) -> dict[str, Any]:
         """Finalize a successful migration: drop the stopped source and its checkpoint.
@@ -1013,66 +1151,7 @@ class Engine:
         parameter extraction, and raises :class:`Unsupported` for ineligible
         sandboxes.
         """
-        record = self.get(name, require_running=True)
-        sandbox = record.sandbox
-        if sandbox is None:
-            raise Unsupported(
-                "migration requires a live in-process sandbox; one rehydrated after "
-                "a daemon restart has lost the identity needed to move it"
-            )
-        if not getattr(sandbox, "_block_network", False):
-            raise Unsupported(
-                "only block-network sandboxes can migrate; a networked sandbox needs "
-                "per-node host networking that the snapshot cannot carry"
-            )
-        if getattr(sandbox, "_volumes", None):
-            raise Unsupported(
-                "a sandbox with named volumes cannot migrate; volume data is host-local"
-            )
-        if getattr(sandbox, "_fs_dir", None):
-            raise Unsupported(
-                "a sandbox with an fs_dir share cannot migrate; the share is host-local"
-            )
-        memory = record.detail.get("memory")
-        cpus = record.detail.get("cpus")
-        vm = getattr(sandbox, "vm", None)
-        meta = vm.meta if vm is not None else {}
-        if memory is None:
-            memory = meta.get("mem")
-        if cpus is None:
-            cpus = meta.get("cpus")
-        if memory is None:
-            raise Unsupported(
-                "cannot determine the sandbox memory size needed to restore it elsewhere"
-            )
-        params: dict[str, Any] = {
-            "name": name,
-            "block_network": True,
-            "memory": int(memory),
-            "cpus": int(cpus) if cpus is not None else 1,
-            "env": dict(getattr(sandbox, "env", {}) or {}),
-            "workdir": getattr(sandbox, "workdir", None),
-            "tags": dict(record.tags or {}),
-        }
-        timeout_secs = getattr(sandbox, "_timeout_secs", None)
-        if timeout_secs is not None:
-            params["timeout_secs"] = int(timeout_secs)
-        secret_env = dict(getattr(sandbox, "_secret_env", {}) or {})
-        if secret_env:
-            # Carried over the (bearer-authed) cluster channel, like the memory image.
-            params["secrets"] = [secret_env]
-        transient = f"replica-{name}-{uuid.uuid4().hex[:12]}"
-        snap_dir = Path(self.snapshot_template(name, transient, stop=False))
-        self._stamp_template_marker(snap_dir, meta)
-        from . import cas
-
-        digest = cas.index_template(snap_dir, cas.template_digest(snap_dir))
-        return {
-            "digest": digest,
-            "snapshot": transient,
-            "snapshot_dir": str(snap_dir),
-            "params": params,
-        }
+        return self._checkpoint_for(name, kind="replica", stop=False)
 
     def replicate_cleanup(self, digest: str, snapshot_dir: str) -> None:
         """Drop a local replication checkpoint after peers pulled it.
