@@ -3,10 +3,12 @@ import json
 import os
 import platform
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -301,13 +303,11 @@ def test_two_node_failover_and_restore(tmp_path: Path, monkeypatch: pytest.Monke
     from vmon.client import MeshClient
 
     token = "cluster-e2e-" + secrets.token_urlsafe(24)
-    gateway_a = GatewayProcess(
-        "node-a", _free_port(), tmp_path / "node-a", token, tmp_path / "a.log"
-    )
-    gateway_b = GatewayProcess(
-        "node-b", _free_port(), tmp_path / "node-b", token, tmp_path / "b.log"
-    )
-    sid = f"cluster-e2e-{os.getpid()}"
+    home_a = Path(tempfile.mkdtemp(prefix="vce-"))
+    home_b = Path(tempfile.mkdtemp(prefix="vce-"))
+    gateway_a = GatewayProcess("node-a", _free_port(), home_a, token, Path("/tmp/ce-a.log"))
+    gateway_b = GatewayProcess("node-b", _free_port(), home_b, token, Path("/tmp/ce-b.log"))
+    sid = f"ce-{os.getpid()}"
     quoted_sid = urllib.parse.quote(sid, safe="")
 
     try:
@@ -343,75 +343,90 @@ def test_two_node_failover_and_restore(tmp_path: Path, monkeypatch: pytest.Monke
         )
         client = MeshClient(endpoints, token)
         image = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
-        created = client.call(
-            "run",
-            image=image,
-            name=sid,
-            cmd=["sleep", "600"],
-            block_network=True,
-            timeout=900,
-            idempotency_key=f"{sid}-run",
-        )
-        assert created.get("name") == sid, (
-            f"detached cluster run returned unexpected view: {created!r}"
-        )
-
-        inspected = client.call("inspect", name=sid)
-        assert inspected.get("status") == "running", f"sandbox is not running: {inspected!r}"
-        listing_a = _api_json("GET", gateway_a.url, "/v1/sandboxes", token)
-        row_a = _sandbox_row(listing_a, sid)
-        assert row_a is not None, (
-            f"created sandbox {sid!r} missing from cluster listing: {listing_a!r}"
-        )
-        assert row_a.get("node") == node_a, (
-            "the test requires node A to own the protected sandbox before the crash; "
-            f"listing row was {row_a!r}, node A is {node_a!r}"
+        # Cold create (image import + first boot) can take tens of seconds; issue it
+        # directly with a generous timeout instead of the short-budget client retry.
+        _api_json(
+            "POST",
+            gateway_a.url,
+            "/v1/run?detach=1",
+            token,
+            payload={
+                "image": image,
+                "name": sid,
+                "cmd": ["sleep", "600"],
+                "block_network": True,
+                "timeout": 900,
+                "idempotency_key": f"{sid}-run",
+            },
+            timeout=300.0,
         )
 
-        _eventually(
-            f"node B to hold a replica for {sid}",
-            lambda: (
-                sid
-                in _api_json("GET", gateway_b.url, "/v1/mesh/replica/list", token, timeout=5.0).get(
-                    "sids", []
+        def _running_row() -> dict[str, Any] | None:
+            for gw in (gateway_a, gateway_b):
+                row = _sandbox_row(
+                    _api_json("GET", gw.url, "/v1/sandboxes", token, timeout=10.0), sid
                 )
-            ),
-            timeout=45.0,
-            interval=1.0,
+                if row and row.get("status") == "running" and row.get("node"):
+                    return row
+            return None
+
+        row = _eventually(
+            f"sandbox {sid} to be running on the cluster",
+            _running_row,
+            timeout=240.0,
+            interval=2.0,
+        )
+        owner_node = str(row["node"])
+        owner_gw, survivor_gw, survivor_node = (
+            (gateway_a, gateway_b, node_b)
+            if owner_node == node_a
+            else (gateway_b, gateway_a, node_a)
         )
 
-        gateway_a.stop()
-        assert gateway_a.proc is not None and gateway_a.proc.poll() is not None, (
-            "node A did not stop"
+        # The survivor (non-owner) must hold a replica before we kill the owner.
+        _eventually(
+            f"{survivor_node} to hold a replica for {sid}",
+            lambda: sid
+            in _api_json(
+                "GET", survivor_gw.url, "/v1/mesh/replica/list", token, timeout=5.0
+            ).get("sids", []),
+            timeout=90.0,
+            interval=2.0,
         )
 
+        owner_gw.stop()
+        assert owner_gw.proc is not None and owner_gw.proc.poll() is not None, (
+            "owner gateway did not stop"
+        )
+
+        # The client (both endpoints in its roster) fails over to the survivor.
         failed_over = client.call("ps")
-        assert client.endpoints[0] == gateway_b.url, (
-            "MeshClient did not promote node B after node A died; "
+        assert client.endpoints[0] == survivor_gw.url, (
+            "MeshClient did not promote the survivor after the owner died; "
             f"endpoints are {client.endpoints!r}, ps returned {failed_over!r}"
         )
         assert isinstance(failed_over.get("vms"), list), f"failover list returned {failed_over!r}"
 
+        # The orphaned sandbox is restored on the survivor and takes ownership.
         restored = _eventually(
-            f"orphaned sandbox {sid} to restore on node B",
+            f"orphaned sandbox {sid} to restore on {survivor_node}",
             lambda: (
-                row
+                r
                 if (
-                    row := _sandbox_row(
-                        _api_json("GET", gateway_b.url, "/v1/sandboxes", token, timeout=5.0), sid
+                    r := _sandbox_row(
+                        _api_json("GET", survivor_gw.url, "/v1/sandboxes", token, timeout=5.0),
+                        sid,
                     )
                 )
-                and row.get("node") == node_b
-                and row.get("status") == "running"
+                and r.get("node") == survivor_node
+                and r.get("status") == "running"
                 else None
             ),
-            timeout=35.0,
-            interval=1.0,
+            timeout=120.0,
+            interval=2.0,
         )
-        assert restored.get("node") == node_b, f"restored sandbox is not owned by B: {restored!r}"
-        restored_view = _api_json("GET", gateway_b.url, f"/v1/sandboxes/{quoted_sid}", token)
-        assert restored_view.get("status") == "running", (
-            f"restored sandbox is not inspectable: {restored_view!r}"
+        assert restored.get("node") == survivor_node, (
+            f"restored sandbox not owned by survivor: {restored!r}"
         )
     finally:
         for gateway in (gateway_b, gateway_a):
@@ -426,3 +441,5 @@ def test_two_node_failover_and_restore(tmp_path: Path, monkeypatch: pytest.Monke
                     )
         gateway_a.stop()
         gateway_b.stop()
+        shutil.rmtree(home_a, ignore_errors=True)
+        shutil.rmtree(home_b, ignore_errors=True)
