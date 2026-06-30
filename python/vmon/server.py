@@ -2210,7 +2210,7 @@ def create_app(
                             request.app.state.mesh_http, peer_url, digest, outbound_token
                         )
                         # Warm-restore the pulled snapshot directly: selecting it by path
-                        # skips build_or_pull, so the node needs no local image/engine.
+                        # skips local image preparation on this node.
                         body.template = str(installed)
                     except Exception as full_exc:
                         LOGGER.warning(
@@ -2721,7 +2721,7 @@ def create_app(
                             request.app.state.mesh_http, peer_url, digest, outbound_token
                         )
                         # Warm-restore the pulled snapshot directly: selecting it by path
-                        # skips build_or_pull, so the node needs no local image/engine.
+                        # skips local image preparation on this node.
                         body.template = str(installed)
                     except Exception as full_exc:
                         LOGGER.warning(

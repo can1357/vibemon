@@ -1,9 +1,9 @@
 #!/usr/bin/env python3.14
-"""End-to-end smoke test for the ``vmon`` **CLI** (client -> vmond -> engine -> VMM).
+"""End-to-end smoke test for the ``vmon`` **CLI** (client -> vmond -> VMM).
 
 Where ``e2e.py`` drives the Python SDK in-process, this driver shells out to the
 ``vmon`` command and asserts on its stdout / exit codes, exercising the full
-Docker-like control plane on a Linux/KVM or macOS/HVF host:
+sandbox control plane on a Linux/KVM or macOS/HVF host:
 
   * the auto-started local daemon (``vmon daemon status``, first-call auto-start)
   * ``vmon run`` foreground (streamed entry output + propagated exit code)
@@ -20,7 +20,7 @@ socket fits the ``AF_UNIX`` path limit) and prints a PASS/FAIL/SKIP table,
 returning non-zero if anything fails.
 
 Prerequisites (same as ``e2e.py``): a Linux/KVM or macOS/HVF host with a built
-``vmon`` binary, a static guest agent, a guest kernel, ``docker``/``podman``,
+``vmon`` binary, a static guest agent, a guest kernel, ``skopeo`` + ``umoci``,
 and ``mkfs.ext4``/``mke2fs`` (e2fsprogs).
 
 Usage:
@@ -49,7 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon.image import _find_mkfs_ext4, detect_engine, find_agent_binary
+from vmon.image import _find_mkfs_ext4, detect_image_tools, find_agent_binary
 from vmon.vmm import default_kernel, find_binary, hypervisor_present
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
@@ -541,7 +541,7 @@ def preflight() -> str | None:
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
-        (detect_engine, "container engine"),
+        (detect_image_tools, "OCI image tools"),
         (find_agent_binary, "static guest agent"),
     ):
         try:

@@ -190,28 +190,197 @@ def test_ensure_agent_reraises_clear_error_without_toolchain(monkeypatch):
     assert exc.value is clear
 
 
-def test_build_or_pull_normalizes_and_rejects_image_refs(monkeypatch):
+def test_image_transport_ref_prefixes_bare_refs_and_preserves_explicit_transports():
+    from vmon.image import _image_transport_ref
+
+    assert _image_transport_ref("alpine:latest") == "docker://alpine:latest"
+    assert _image_transport_ref("registry.example.com/app:1") == (
+        "docker://registry.example.com/app:1"
+    )
+
+    for reference in (
+        "docker://alpine:latest",
+        "oci:/tmp/layout:latest",
+        "dir:/tmp/rootfs",
+        "docker-archive:/tmp/image.tar",
+        "oci-archive:/tmp/image.tar",
+        "containers-storage:localhost/app:latest",
+    ):
+        assert _image_transport_ref(reference) == reference
+
+
+def test_cached_template_rejects_whitespace_image_refs_before_tooling(monkeypatch):
     import vmon.image as image
 
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    class Result:
-        returncode = 0
-
-    def fake_run(cmd: list[str], **kwargs: object) -> Result:
-        calls.append((cmd, kwargs))
-        return Result()
-
-    monkeypatch.setattr(image.subprocess, "run", fake_run)
-
-    assert image.build_or_pull(" alpine:latest ", None, engine="docker") == (
-        "docker",
-        "alpine:latest",
+    monkeypatch.setattr(
+        image.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("image tooling must not run for invalid references")
+        ),
     )
-    assert calls[0][0] == ["docker", "image", "inspect", "alpine:latest"]
 
     with pytest.raises(ValueError, match="must not contain whitespace"):
-        image.build_or_pull("bad ref", None, engine="docker")
+        image.cached_template("bad ref")
+
+
+def test_skopeo_arch_maps_common_machine_names(monkeypatch):
+    import vmon.image as image
+
+    for machine in ("arm64", "aarch64"):
+        assert image._skopeo_arch(machine) == "arm64"
+    for machine in ("x86_64", "amd64", "x64"):
+        assert image._skopeo_arch(machine) == "amd64"
+    assert image._skopeo_arch("riscv64") == "riscv64"
+
+    monkeypatch.setattr(image.platform, "machine", lambda: "aarch64")
+    assert image._skopeo_arch() == "arm64"
+
+
+def test_detect_image_tools_reports_missing_tools(monkeypatch):
+    import vmon.image as image
+
+    monkeypatch.setattr(
+        image.shutil,
+        "which",
+        lambda name: {"skopeo": "/usr/bin/skopeo", "umoci": "/usr/bin/umoci"}.get(name),
+    )
+    assert image.detect_image_tools() == image.ImageTools(
+        skopeo="/usr/bin/skopeo", umoci="/usr/bin/umoci"
+    )
+
+    monkeypatch.setattr(image.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError) as exc:
+        image.detect_image_tools()
+    message = str(exc.value)
+    assert "skopeo" in message
+    assert "umoci" in message
+
+
+def test_prepare_oci_image_inspects_image_with_skopeo_overrides(monkeypatch):
+    import vmon.image as image
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, stdout: str = ""):
+            self.stdout = stdout
+
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
+        calls.append(cmd)
+        if cmd[:2] == ["/usr/bin/skopeo", "inspect"] and "--config" in cmd:
+            return Result(
+                json.dumps(
+                    {
+                        "config": {
+                            "Entrypoint": ["/usr/bin/app"],
+                            "Cmd": ["serve"],
+                            "Env": ["APP_ENV=test", "PORT=8080"],
+                            "WorkingDir": "/srv/app",
+                        }
+                    }
+                )
+            )
+        if cmd[:2] == ["/usr/bin/skopeo", "inspect"]:
+            return Result(json.dumps({"Digest": "sha256:0123456789abcdef"}))
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(image.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(
+        image,
+        "detect_image_tools",
+        lambda: image.ImageTools("/usr/bin/skopeo", "/usr/bin/umoci"),
+    )
+    monkeypatch.setattr(image.subprocess, "run", fake_run)
+
+    prepared = image._prepare_oci_image("alpine:latest", None)
+
+    assert prepared.reference == "alpine:latest"
+    assert prepared.transport_ref == "docker://alpine:latest"
+    assert prepared.digest == "0123456789abcdef"
+    assert prepared.arch == "arm64"
+    assert prepared.spec.reference == "alpine:latest"
+    assert prepared.spec.entrypoint == ["/usr/bin/app"]
+    assert prepared.spec.cmd == ["serve"]
+    assert prepared.spec.env == ["APP_ENV=test", "PORT=8080"]
+    assert prepared.spec.workdir == "/srv/app"
+
+    inspect_cmds = [cmd for cmd in calls if cmd[:2] == ["/usr/bin/skopeo", "inspect"]]
+    assert len(inspect_cmds) == 2
+    for cmd in inspect_cmds:
+        assert cmd[cmd.index("--override-os") + 1] == "linux"
+        assert cmd[cmd.index("--override-arch") + 1] == "arm64"
+        assert cmd[-1] == "docker://alpine:latest"
+
+
+def test_export_image_uses_skopeo_umoci_and_moves_unpacked_rootfs(monkeypatch, tmp_path):
+    import vmon.image as image
+
+    calls: list[list[str]] = []
+    work = tmp_path / "work"
+    rootfs = tmp_path / "rootfs"
+    work.mkdir()
+    rootfs.mkdir()
+
+    class Result:
+        stdout = ""
+
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
+        calls.append(cmd)
+        if cmd[:2] == ["/usr/bin/skopeo", "copy"]:
+            return Result()
+        if cmd[:2] == ["/usr/bin/umoci", "unpack"]:
+            bundle_rootfs = work / "bundle" / "rootfs"
+            (bundle_rootfs / "etc").mkdir(parents=True)
+            (bundle_rootfs / "etc" / "os-release").write_text("ID=test\n", encoding="utf-8")
+            return Result()
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(image.os, "geteuid", lambda: 501, raising=False)
+    monkeypatch.setattr(image.subprocess, "run", fake_run)
+
+    prepared = image.PreparedImage(
+        reference="alpine:latest",
+        transport_ref="docker://alpine:latest",
+        spec=image.ImageSpec(reference="alpine:latest"),
+        digest="0123456789abcdef",
+        tools=image.ImageTools(skopeo="/usr/bin/skopeo", umoci="/usr/bin/umoci"),
+        arch="arm64",
+    )
+
+    image._export_oci_image(prepared, rootfs, work)
+
+    copy_cmd = next(cmd for cmd in calls if cmd[:2] == ["/usr/bin/skopeo", "copy"])
+    unpack_cmd = next(cmd for cmd in calls if cmd[:2] == ["/usr/bin/umoci", "unpack"])
+    assert "docker://alpine:latest" in copy_cmd
+    assert copy_cmd[copy_cmd.index("--override-os") + 1] == "linux"
+    assert copy_cmd[copy_cmd.index("--override-arch") + 1] == "arm64"
+    assert f"oci:{work / 'oci'}:latest" in copy_cmd
+    assert "--rootless" in unpack_cmd
+    assert (rootfs / "etc" / "os-release").read_text(encoding="utf-8") == "ID=test\n"
+
+
+def test_cached_template_rejects_dockerfile_without_dockerless_builder(monkeypatch, tmp_path):
+    import vmon.image as image
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+    monkeypatch.setattr(
+        image.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("image tooling must not run for unsupported Dockerfile input")
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        image.cached_template(dockerfile=str(dockerfile))
+    message = str(exc.value)
+    assert "Dockerfile builds need" in message
+    assert "buildah" in message or "buildkit" in message
+    assert "image references" in message
+    assert "prebuilt templates" in message
+    assert "do not require Docker" in message
 
 
 def test_template_marker_current_requires_matching_kernel_sha(tmp_path):

@@ -5,7 +5,7 @@ booted container into a template, then **warm-boot** (restore) or **fork** that
 template in milliseconds. Built on the [`vmm`](../) KVM (Linux) / HVF (Apple-silicon macOS) VMM.
 
 ```
-                    docker image / Dockerfile
+                    OCI/container image
                               │  vmon run
                               ▼
    ┌──────────┐  snapshot  ┌────────────┐  restore (~120ms)  ┌──────────┐
@@ -17,9 +17,10 @@ template in milliseconds. Built on the [`vmm`](../) KVM (Linux) / HVF (Apple-sil
 ## Requirements
 
 Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`) or an
-Apple-silicon **macOS** host with **HVF**, a container engine (`docker` or
-`podman`), and the `vmm` binary built (`cargo build --release`, or `just build`
-on macOS to ad-hoc codesign it). A guest kernel is auto-detected from
+Apple-silicon **macOS** host with **HVF**. Image-backed sandboxes need the
+daemonless OCI image tools **skopeo** and **umoci**, `mkfs.ext4`/`mke2fs`, and
+the `vmm` binary built (`cargo build --release`, or `just build` on macOS to
+ad-hoc codesign it). A guest kernel is auto-detected from
 `/boot/vmlinuz-$(uname -r)` on Linux and auto-downloaded into `$VMON_HOME/assets`
 on macOS (override with `VMON_KERNEL`).
 
@@ -38,13 +39,13 @@ PYTHONPATH=python python3 -m vmon --help
 
 ## CLI
 
-`vmon` is a thin Docker-like client. It talks to a **zero-config local daemon**
-(`vmond`) over a Unix socket at `$VMON_HOME/vmond.sock` (default `~/.vmon/vmond.sock`);
-the first command auto-starts the daemon if it is not already running. The daemon
-is the single owner of `~/.vmon`: it holds the VM registry, rehydrates VMs from
-disk on restart, and spawns one `vmm` VMM process per microVM. You never invoke
-the VMM's flags by hand — `run`/`ps`/`logs`/`exec`/`stop` all route through the
-daemon, exactly like `docker` ↔ `dockerd` ↔ `runc`.
+`vmon` is a thin container-style client. It talks to a **zero-config local
+daemon** (`vmond`) over a Unix socket at `$VMON_HOME/vmond.sock` (default
+`~/.vmon/vmond.sock`); the first command auto-starts the daemon if it is not
+already running. The daemon is the single owner of `~/.vmon`: it holds the VM
+registry, rehydrates VMs from disk on restart, and spawns one `vmm` VMM process
+per microVM. You never invoke the VMM's flags by hand — `run`, `ps`, `logs`,
+`exec`, and `stop` all route through the daemon.
 
 ```sh
 # Drop into an ephemeral interactive shell (fresh Debian sandbox, removed on exit)
@@ -58,8 +59,8 @@ vmon shell --image alpine -c 'cat /etc/os-release'
 # Boot a container image (runs the entrypoint, streams the console, exits when done)
 vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
-# Build & boot a Dockerfile
-vmon run -f ./Dockerfile --context .
+# Dockerfile builds are currently unsupported until a daemonless builder such as
+# buildah/buildkit is wired in; publish or prebuild an OCI image, then run it.
 
 # Long-running service, detached
 vmon run -d --name web nginx
@@ -98,8 +99,8 @@ sb = Sandbox.create(image="alpine", memory=256)
 proc = sb.exec("sh", "-c", "echo hi")
 print(proc.wait())
 
-# ...or from a Dockerfile
-sb = Sandbox.create(dockerfile="Dockerfile", context=".")
+# Dockerfile builds are currently unsupported until a daemonless builder such as
+# buildah/buildkit is wired in; prefer image-backed sandboxes or prebuilt templates.
 
 img = sb.snapshot_filesystem("template")      # snapshot the guest filesystem
 again = Sandbox.create(template=img)          # warm-boot from the template
@@ -184,9 +185,9 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 
 ## How it works
 
-- **run** — `docker/podman` builds/exports the image filesystem; `vmm` injects
-  the static guest agent, boots an ext4 rootfs under vmm, and execs the image's
-  entrypoint through the agent-backed sandbox API.
+- **run** — `skopeo` fetches and inspects OCI images; `umoci` unpacks the
+  rootfs; vmon injects the static guest agent, builds an ext4 filesystem, boots
+  it under `vmm`, and execs through the agent-backed sandbox API.
 - **pause/resume** — vmon parks the vCPUs at a safe point and quiesces device
   workers over its Unix control socket.
 - **snapshot** — serializes the full machine state (vCPU regs/MSRs/xstate, the
@@ -200,7 +201,7 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 
 ## Notes / limits
 
-- The static guest agent is injected into built images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
+- The static guest agent is injected into prepared images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
 - The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Set `VMON_REMOTE=host:port` (with `VMON_API_TOKEN`) to drive a remote daemon that listens on TCP — i.e. one started with `VMON_DAEMON_TCP=host:port` (via `python -m vmon.daemon` or `vmon serve`).
 - `VMON_BIN` / `VMON_KERNEL` / `VMON_HOME` override the binary, kernel, and
   state directory (`~/.vmon`).

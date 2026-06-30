@@ -31,8 +31,8 @@ Mac, or a nested-KVM Lima VM):
   * a static guest agent         (``just agent-musl`` or ``VMON_AGENT``)
   * a guest kernel               (``/boot/vmlinuz-$(uname -r)``, ``VMON_KERNEL``,
                                   or auto-downloaded into ``$VMON_HOME`` on macOS)
-  * ``docker`` or ``podman``     (to build the image rootfs)
-  * ``mkfs.ext4`` / ``mke2fs``   (e2fsprogs; ``brew install e2fsprogs`` on macOS)
+  * ``skopeo`` + ``umoci``     (to fetch and unpack OCI image rootfs layers)
+  * ``mkfs.ext4`` / ``mke2fs`` (e2fsprogs; ``brew install e2fsprogs`` on macOS)
 
 Note: feature sandboxes below boot with ``block_network=True`` (no NIC, no root).
 The dedicated networking test opts into user-mode NAT on macOS/HVF or a host TAP
@@ -64,7 +64,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vmon.agent_client import AgentError
-from vmon.image import _find_mkfs_ext4, cached_template, detect_engine, find_agent_binary
+from vmon.image import _find_mkfs_ext4, cached_template, detect_image_tools, find_agent_binary
 from vmon.pool import WarmPool
 from vmon.sandbox import Sandbox
 from vmon.secret import Secret
@@ -737,7 +737,7 @@ def preflight() -> str | None:
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
-        (detect_engine, "container engine"),
+        (detect_image_tools, "OCI image tools"),
         (find_agent_binary, "static guest agent"),
     ):
         try:

@@ -125,9 +125,16 @@ def test_run_block_network_flag(rec):
     assert rec.last["params"]["block_network"] is True
 
 
-def test_run_without_image_or_dockerfile_is_usage_error(rec, capsys):
+def test_run_without_image_is_usage_error(rec, capsys):
     assert cli.main(["run"]) == 2
     assert "image" in capsys.readouterr().err.lower()
+
+
+def test_run_dockerfile_fails_before_rpc(rec, capsys):
+    assert cli.main(["run", "-f", "Dockerfile"]) == 2
+    err = capsys.readouterr().err
+    assert "Dockerfile builds are not supported" in err
+    assert rec.last == {}
 
 
 # -- exec: tty routing -----------------------------------------------------
@@ -308,7 +315,7 @@ def test_collect_checks_reports_missing_vmm(monkeypatch, tmp_path):
     checks = {check.name: check for check in doctor.collect_checks()}
     assert checks["vmm binary"].status == "fail"
     assert "cargo build" in checks["vmm binary"].hint
-    assert checks["container engine"].status == "warn"
+    assert checks["image tools"].status == "warn"
     assert checks["mkfs.ext4"].status == "warn"
 
 
@@ -320,8 +327,8 @@ def test_collect_checks_reports_present_prereqs(monkeypatch, tmp_path):
 
     def which(name):
         return {
-            "docker": "/usr/bin/docker",
-            "podman": None,
+            "skopeo": "/usr/bin/skopeo",
+            "umoci": "/usr/bin/umoci",
             "mkfs.ext4": "/sbin/mkfs.ext4",
         }.get(name)
 
@@ -335,7 +342,7 @@ def test_collect_checks_reports_present_prereqs(monkeypatch, tmp_path):
     checks = {check.name: check for check in doctor.collect_checks()}
     assert checks["vmm binary"].status == "ok"
     assert checks["vmm binary"].detail == str(vmm)
-    assert checks["container engine"].status == "ok"
+    assert checks["image tools"].status == "ok"
     assert checks["mkfs.ext4"].status == "ok"
     assert checks["guest kernel"].status == "ok"
 

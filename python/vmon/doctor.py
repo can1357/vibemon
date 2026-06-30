@@ -12,6 +12,7 @@ from typing import Literal
 
 from . import console as ui
 from .client import DaemonClient, DaemonError
+from .image import detect_image_tools
 from .vmm import default_kernel, find_binary
 
 type Status = Literal["ok", "warn", "fail"]
@@ -144,16 +145,17 @@ def _check_hypervisor(system: str) -> Check:
     )
 
 
-def _check_container_engine() -> Check:
-    engine = shutil.which("docker") or shutil.which("podman")
-    if engine:
-        return Check("container engine", "ok", f"{Path(engine).name} at {engine}")
-    return Check(
-        "container engine",
-        "warn",
-        "docker or podman not found on PATH",
-        "install Docker or Podman before using `vmon run` with container images",
-    )
+def _check_image_tools() -> Check:
+    try:
+        tools = detect_image_tools()
+    except RuntimeError as exc:
+        return Check(
+            "image tools",
+            "warn",
+            str(exc),
+            "install skopeo and umoci before using `vmon run` with image references",
+        )
+    return Check("image tools", "ok", f"skopeo at {tools.skopeo}; umoci at {tools.umoci}")
 
 
 def _check_mkfs(system: str) -> Check:
@@ -274,7 +276,7 @@ def collect_checks() -> list[Check]:
     probes.extend(
         [
             ("hypervisor", "fail", lambda: _check_hypervisor(system)),
-            ("container engine", "warn", _check_container_engine),
+            ("image tools", "warn", _check_image_tools),
             ("mkfs.ext4", "warn", lambda: _check_mkfs(system)),
             ("guest kernel", "warn", _check_guest_kernel),
             ("bundled agent", "warn", _check_bundled_agent),

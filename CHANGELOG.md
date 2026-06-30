@@ -6,6 +6,8 @@ All notable changes to this project are recorded here.
 
 ### Breaking Changes
 
+- Disabled local Dockerfile builds in `vmon run` and the SDK pending a daemonless builder backend like buildah/buildkit; image-backed sandboxes must now use prebuilt/published OCI images
+
 - Renamed Rust hypervisor binary/crate from `vmon` to `vmm`, mapping the user-facing self-identification and binary name in build and CI scripts, and resolved naming collision between the Rust binary and Python CLI.
 - Renamed Python guest-agent host client from `vmon/agent.py` to `vmon/agent_client.py` and updated all importers (`sandbox.py`, `vmm.py`, test suite) to resolve "agent" naming collision.
 - Removed the now-unneeded PATH collision-skip logic from the Python binary locator in `vmm.py`.
@@ -13,12 +15,13 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `vmon_three_node_writable_volume_quorum_ha` e2e test covering quorum-gated crash restore of writable volumes
+
 - Added `vmon context`, a client-side cluster target with gateway failover. `vmon context create <name> --server <url>` bootstraps a named context by fetching the gateway's mesh roster (`/v1/mesh/status`) and persisting its ordered peer-endpoint list; `ls`/`use`/`refresh`/`rm`/`inspect` manage them (`local` selects the local `vmond` daemon). The CLI transport (`MeshClient`) walks the roster in order and fails over to the next gateway only on a connection-establishment failure, so a dead ingress no longer breaks the client; attached `run`/`exec`/`shell` and non-idempotent calls fail over solely during a `/healthz` probe and then run exactly once, while detached `run`/`restore` carry a stable idempotency key, so a delivered request is never duplicated. A selected context that is missing or has no endpoints is a hard error (never a silent fall-through to the local daemon). Bearer tokens are read from `$VMON_API_TOKEN` and never written to `~/.vmon/contexts.json`.
 - Proved cluster crash-survival end-to-end on real hardware (gated two-node KVM e2e: boot a real microVM → replicate its checkpoint to a peer → kill the owner → the survivor restores the sandbox and the client fails over to it). Fixed two checkpoint bugs this surfaced that also broke `vmon mesh migrate` (previously only fake-tested): `MicroVM.restore` now persists the guest `mem`/`cpus` into VM metadata (a warm-restored sandbox otherwise failed replication/migration with "cannot determine the sandbox memory size"), and migration/replication checkpoints now carry the `agent-ready.json` template marker (with the volatile `content_digest` stripped) so the owning node can serve its own content-addressed checkpoint instead of returning 404. Also surfaced two Linux footguns the e2e tripped over: a deep `$VMON_HOME` exceeds the Unix-socket `SUN_LEN` limit, and `vmon` selects the host `/boot` kernel (which lacks built-in virtio) over a pinned microVM kernel.
-- Extended crash-survival replication and `vmon mesh migrate` to **stateful sandboxes with named volumes**: a volume's data is captured into the content-addressed checkpoint and re-materialized under the survivor's `$VMON_HOME/volumes` on restore. A read-only volume is divergence-free and always restored; a writable volume is restored only under `VMON_RESTORE_QUORUM`, since `Volume.acquire` is a host-local `flock` that cannot stop a partitioned old owner from also writing its copy. A restore that would clobber an existing same-named volume on the survivor is refused (there is no cluster-unique volume identity yet), and a create that fails after materialization rolls back the freshly-copied volume directories so a retry is not poisoned. The public create model now accepts `{mountpoint: {name, read_only}}`. Verified by a gated two-node KVM e2e (seed a read-only volume on node A → replicate → kill A → the survivor restores the sandbox and the guest reads the data back via `cat /data/...`) plus engine-level unit tests for capture, coercion, dedup, the collision/quorum guards, and rollback.
+- Extended crash-survival replication and `vmon mesh migrate` to **stateful sandboxes with named volumes**: a volume's data is captured into the content-addressed checkpoint and re-materialized under the survivor's `$VMON_HOME/volumes` on restore. A read-only volume is divergence-free and always restored; a writable volume is restored only under `VMON_RESTORE_QUORUM`, since `Volume.acquire` is a host-local `flock` that cannot stop a partitioned old owner from also writing its copy. A restore that would clobber an existing same-named volume on the survivor is refused (there is no cluster-unique volume identity yet), and a create that fails after materialization rolls back the freshly-copied volume directories so a retry is not poisoned. The public create model now accepts `{mountpoint: {name, read_only}}`. Verified on real hardware by gated KVM e2e tests: a two-node read-only-volume failover (seed on node A → replicate → kill A → the survivor restores and the guest reads the data back) and a three-node writable-volume run under `VMON_RESTORE_QUORUM` (the guest writes into the volume → kill the owner → a surviving majority confirms it gone and restores → the restored guest reads back its own pre-crash write), plus engine-level unit tests for capture, coercion, dedup, the collision/quorum guards, and rollback.
 - Added per-sandbox runtime metrics in the Dashboard's **Metrics** tab
 - Added a virtio-rng entropy device feeding the guest `/dev/hwrng` from the host CSPRNG (`/dev/urandom`), seeding the kernel CRNG early so first-boot `getrandom(2)` (TLS, key generation, language runtimes) does not block on a fresh microVM. Exposed as the `--rng` VMM flag on both the MMIO transport (all architectures) and the x86_64 virtio-PCI transport, and captured/reconstructed across snapshot/restore/fork. Agent sandboxes (`vmon run`, the SDK, and the web panel) boot with it by default — cached templates rebuild once on a bumped boot version, and the cross-node mesh stops advertising pre-rng templates. Verified by a gated HVF boot test reading guest entropy and an SDK end-to-end test that a sandbox exposes a working `/dev/hwrng`. The on-disk snapshot format is bumped to version 2 (older snapshots are rejected and must be recaptured).
-
 - Added `vmon ls <name>[:<path>]` to browse a microVM's guest filesystem
 - Added client-side retry logic for idempotent sandbox creation and restoration
 - Enabled idempotent sandbox creation and restoration across mesh-connected nodes
@@ -51,9 +54,11 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Replaced container engine dependencies (`docker`/`podman`) with daemonless OCI image tools (`skopeo` and `umoci`) for image pulling, inspection, and rootfs extraction
+- Updated `vmon doctor` prerequisite checks to collect and verify `skopeo` and `umoci` availability instead of checking for a local container engine
+
 - Flattened nested VMM counter groups into `group.field` rows in `vmon stats` and Dashboard
 - Improved prewarm pool logic to distinguish between networked and block-network sandbox flavors
-
 - Updated mesh request handling to distinguish between unreachable peers and ambiguous responses
 - Changed HA replication to apply `VMON_REPLICATE_CONCURRENCY` backpressure (default `2`), skip unchanged-digest re-pushes from the owner, and dedupe peer-side when a receiver already holds the same sandbox id and digest.
 - Improved error messaging for sandbox creation to indicate when retries with an idempotency key are required

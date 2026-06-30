@@ -27,7 +27,7 @@ class ImageSpec:
     workdir: str = "/"
 
     def argv(self, override: list[str] | None) -> list[str]:
-        """Final process argv (Docker semantics: entrypoint + cmd; override replaces cmd)."""
+        """Final process argv (image semantics: entrypoint + cmd; override replaces cmd)."""
         if override:
             return [*self.entrypoint, *override] if self.entrypoint else list(override)
         return [*self.entrypoint, *self.cmd]
@@ -62,15 +62,39 @@ class CachedTemplate:
     digest: str = ""
 
 
+@dataclass(frozen=True)
+class ImageTools:
+    """Daemonless OCI tools used to inspect, fetch, and unpack image rootfs layers."""
+
+    skopeo: str
+    umoci: str
+
+
+@dataclass(frozen=True)
+class PreparedImage:
+    """Resolved OCI image metadata and export state for one template build."""
+
+    reference: str
+    transport_ref: str
+    spec: ImageSpec
+    digest: str
+    tools: ImageTools
+    arch: str
+
+
 def _state() -> Path:
     return Path(os.environ.get("VMON_HOME") or str(Path.home() / ".vmon")).expanduser()
 
 
-def detect_engine() -> str:
-    for engine in ("docker", "podman"):
-        if shutil.which(engine):
-            return engine
-    raise RuntimeError("no container engine found (need `docker` or `podman` on PATH)")
+def detect_image_tools() -> ImageTools:
+    """Return the daemonless OCI image tools required by image-backed sandboxes."""
+    missing = [name for name in ("skopeo", "umoci") if not shutil.which(name)]
+    if missing:
+        raise RuntimeError(f"missing required image tool(s): {', '.join(missing)}")
+    return ImageTools(
+        skopeo=shutil.which("skopeo") or "skopeo",
+        umoci=shutil.which("umoci") or "umoci",
+    )
 
 
 def _run(cmd: list[str], **kw) -> str:
@@ -88,38 +112,48 @@ def _normalize_reference(reference: str | None) -> str | None:
     return ref
 
 
-def build_or_pull(
-    reference: str | None, dockerfile: str | None, context: str = ".", engine: str | None = None
-) -> tuple[str, str]:
-    """Return (engine, image_reference), building the Dockerfile or pulling the ref."""
-    engine = engine or detect_engine()
-    if dockerfile:
-        dockerfile_s = os.fspath(dockerfile)
-        context_s = os.fspath(context)
-        h = hashlib.sha1(
-            (os.path.abspath(dockerfile_s) + "\0" + os.path.abspath(context_s)).encode()
-        ).hexdigest()
-        tag = "vmon-" + h[:12]
-        subprocess.run([engine, "build", "-f", dockerfile_s, "-t", tag, context_s], check=True)
-        return engine, tag
-    reference = _normalize_reference(reference)
-    if not reference:
-        raise ValueError("provide an image reference or a --dockerfile")
-    if subprocess.run([engine, "image", "inspect", reference], capture_output=True).returncode != 0:
-        subprocess.run([engine, "pull", reference], check=True)
-    return engine, reference
+_IMAGE_TRANSPORT_PREFIXES = (
+    "docker://",
+    "oci:",
+    "dir:",
+    "docker-archive:",
+    "oci-archive:",
+    "containers-storage:",
+)
 
 
-def _inspect_raw(engine: str, reference: str) -> dict:
-    out = _run([engine, "inspect", reference])
-    data = json.loads(out)
-    if not data:
-        raise RuntimeError(f"container image {reference!r} did not inspect to an image")
-    return data[0]
+def _image_transport_ref(reference: str) -> str:
+    if reference.startswith(_IMAGE_TRANSPORT_PREFIXES):
+        return reference
+    return f"docker://{reference}"
 
 
-def _inspect(engine: str, reference: str) -> ImageSpec:
-    cfg = _inspect_raw(engine, reference).get("Config") or {}
+def _skopeo_arch(arch: str | None = None) -> str:
+    machine = (arch or platform.machine()).strip().lower().replace("-", "_")
+    if machine in {"x86_64", "amd64", "x64"}:
+        return "amd64"
+    if machine in {"aarch64", "arm64"}:
+        return "arm64"
+    return machine
+
+
+def _inspect_oci(tools: ImageTools, reference: str, arch: str | None = None) -> ImageSpec:
+    transport_ref = _image_transport_ref(reference)
+    config = json.loads(
+        _run(
+            [
+                tools.skopeo,
+                "inspect",
+                "--config",
+                "--override-os",
+                "linux",
+                "--override-arch",
+                _skopeo_arch(arch),
+                transport_ref,
+            ]
+        )
+    )
+    cfg = config.get("config") or config.get("Config") or {}
     return ImageSpec(
         reference=reference,
         entrypoint=cfg.get("Entrypoint") or [],
@@ -129,15 +163,50 @@ def _inspect(engine: str, reference: str) -> ImageSpec:
     )
 
 
-def _image_digest(engine: str, reference: str) -> str:
-    raw = _inspect_raw(engine, reference)
-    digest = raw.get("Id") or ""
-    repo_digests = raw.get("RepoDigests") or []
-    if repo_digests:
-        digest = repo_digests[0].split("@", 1)[-1]
-    if not digest:
-        digest = hashlib.sha256(reference.encode()).hexdigest()
+def _image_digest_oci(tools: ImageTools, reference: str, arch: str | None = None) -> str:
+    transport_ref = _image_transport_ref(reference)
+    info = json.loads(
+        _run(
+            [
+                tools.skopeo,
+                "inspect",
+                "--no-tags",
+                "--override-os",
+                "linux",
+                "--override-arch",
+                _skopeo_arch(arch),
+                transport_ref,
+            ]
+        )
+    )
+    digest = info.get("Digest") or hashlib.sha256(reference.encode()).hexdigest()
     return re.sub(r"[^A-Za-z0-9_.-]", "-", digest.replace("sha256:", ""))
+
+
+def _prepare_oci_image(
+    reference: str | None, dockerfile: str | None, _context: str = "."
+) -> PreparedImage:
+    if dockerfile:
+        dockerfile_s = os.fspath(dockerfile)
+        context_s = os.fspath(_context)
+        raise RuntimeError(
+            "Dockerfile builds need a Dockerless builder such as buildah/buildkit; "
+            f"got {dockerfile_s!r} with context {context_s!r}; "
+            "image references and prebuilt templates do not require Docker"
+        )
+    reference = _normalize_reference(reference)
+    if not reference:
+        raise ValueError("provide an image reference")
+    tools = detect_image_tools()
+    arch = _skopeo_arch()
+    return PreparedImage(
+        reference=reference,
+        transport_ref=_image_transport_ref(reference),
+        spec=_inspect_oci(tools, reference, arch),
+        digest=_image_digest_oci(tools, reference, arch),
+        tools=tools,
+        arch=arch,
+    )
 
 
 # Bumped when a template's *booted* state changes incompatibly (e.g. the guest
@@ -234,7 +303,6 @@ def cached_template(
     dockerfile: str | None = None,
     context: str = ".",
     disk_mb: int = 1024,
-    engine: str | None = None,
     timeout: float = 300,
     memory: int = 512,
     cpus: int = 1,
@@ -252,9 +320,9 @@ def cached_template(
         raise ValueError(
             "nic_slot (macOS user-net) and tap_slot (Linux TAP) are mutually exclusive"
         )
-    engine, reference = build_or_pull(image, dockerfile, context, engine)
-    spec = _inspect(engine, reference)
-    digest = _image_digest(engine, reference)
+    prepared = _prepare_oci_image(image, dockerfile, context)
+    spec = prepared.spec
+    digest = prepared.digest
     # The static agent is injected into the rootfs and baked into the booted
     # snapshot, so a different agent build must invalidate both the image cache
     # (rootfs.ext4) and the template snapshot keyed below.
@@ -271,7 +339,7 @@ def cached_template(
             tmp = Path(tmp_s)
             rootfs = tmp / "rootfs"
             rootfs.mkdir()
-            _export_image(engine, reference, rootfs, tmp)
+            _export_oci_image(prepared, rootfs, tmp)
             _inject_agent(rootfs)
             # Stage the ext4 next to its final path so the atomic rename stays
             # on one filesystem: TemporaryDirectory may sit on tmpfs while the
@@ -599,16 +667,33 @@ def ensure_agent(arch: str | None = None) -> Path:
     return find_agent_binary(arch)
 
 
-def _export_image(engine: str, reference: str, rootfs: Path, work: Path) -> None:
-    cid = _run([engine, "create", reference]).strip()
-    try:
-        tar = work / "rootfs.tar"
-        with tar.open("wb") as fh:
-            subprocess.run([engine, "export", cid], check=True, stdout=fh)
-    finally:
-        subprocess.run([engine, "rm", "-f", cid], capture_output=True)
-    subprocess.run(["tar", "-xf", str(tar), "-C", str(rootfs)], check=True)
-    tar.unlink(missing_ok=True)
+def _export_oci_image(image: PreparedImage, rootfs: Path, work: Path) -> None:
+    oci_dir = work / "oci"
+    bundle = work / "bundle"
+    subprocess.run(
+        [
+            image.tools.skopeo,
+            "copy",
+            "--override-os",
+            "linux",
+            "--override-arch",
+            image.arch,
+            image.transport_ref,
+            f"oci:{oci_dir}:latest",
+        ],
+        check=True,
+    )
+    cmd = [image.tools.umoci, "unpack"]
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        cmd.append("--rootless")
+    cmd.extend(["--image", f"{oci_dir}:latest", str(bundle)])
+    subprocess.run(cmd, check=True)
+    unpacked_rootfs = bundle / "rootfs"
+    if not unpacked_rootfs.is_dir():
+        raise RuntimeError(f"image unpack did not produce a rootfs: {unpacked_rootfs}")
+    if rootfs.exists():
+        shutil.rmtree(rootfs)
+    shutil.move(str(unpacked_rootfs), str(rootfs))
 
 
 def _inject_agent(rootfs: Path) -> None:

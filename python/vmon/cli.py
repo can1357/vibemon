@@ -225,13 +225,22 @@ def cli() -> None:
 @cli.command(
     panel="Commands",
     context_settings=_REMAINDER,
-    help="Boot a container image or Dockerfile as an agent sandbox and "
-    "stream its output (use -d to leave it running in the background).",
+    help="Boot an OCI/container image as an agent sandbox and stream its output "
+    "(use -d to leave it running in the background).",
 )
 @click.argument("image", required=False)
 @click.argument("cmd", nargs=-1, type=click.UNPROCESSED, metavar="[-- CMD ...]")
-@click.option("-f", "--dockerfile", help="build & run this Dockerfile instead of an image")
-@click.option("--context", default=".", show_default=True, help="Docker build context")
+@click.option(
+    "-f",
+    "--dockerfile",
+    help="unsupported without a daemonless builder such as buildah/buildkit",
+)
+@click.option(
+    "--context",
+    default=".",
+    show_default=True,
+    help="Dockerfile build context (currently unsupported)",
+)
 @click.option("--name", help="microVM name (default: auto)")
 @click.option("--mem", type=int, default=512, show_default=True, help="guest RAM in MiB")
 @click.option("--cpus", type=int, default=1, show_default=True, help="vCPUs")
@@ -248,8 +257,13 @@ def cli() -> None:
     help="boot without networking (no NIC; needs no root and works on macOS)",
 )
 def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, detach, block_network):
-    if not image and not dockerfile:
-        raise click.UsageError("provide an image (vmon run alpine) or -f Dockerfile")
+    if dockerfile:
+        raise click.UsageError(
+            "Dockerfile builds are not supported by this Dockerless image path; "
+            "publish or prebuild an OCI image, then run it"
+        )
+    if not image:
+        raise click.UsageError("provide an image (for example: vmon run alpine)")
     client = _client()
     params = {
         "image": image,

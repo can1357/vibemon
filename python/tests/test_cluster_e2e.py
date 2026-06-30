@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +151,7 @@ class GatewayProcess:
     log_path: Path
     proc: subprocess.Popen[bytes] | None = None
     _log: Any | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
 
     @property
     def url(self) -> str:
@@ -174,6 +175,7 @@ class GatewayProcess:
                 "VMON_MESH_W_LOCAL": "1000000",
             }
         )
+        env.update(self.extra_env)
         old_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
             str(_PYTHON_ROOT)
@@ -613,3 +615,223 @@ def test_two_node_volume_ha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         gateway_b.stop()
         shutil.rmtree(home_a, ignore_errors=True)
         shutil.rmtree(home_b, ignore_errors=True)
+
+
+def _replica_volume_payload(home: Path, sid: str, vol: str, fname: str) -> str | None:
+    """Return the stripped contents of a survivor's replica volume file, if present.
+
+    Reads ``<home>/replicas/<sid>.json`` -> ``snapshot_dir/volumes/<vol>/<fname>`` so
+    the test can wait until the post-write checkpoint actually landed on a holder.
+    """
+    meta_path = home / "replicas" / f"{sid}.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return None
+    snapshot_dir = meta.get("snapshot_dir")
+    if not isinstance(snapshot_dir, str):
+        return None
+    payload = Path(snapshot_dir) / "volumes" / vol / fname
+    return payload.read_text(encoding="utf-8").strip() if payload.is_file() else None
+
+
+def _wait_mesh_trio(pairs: list[tuple[GatewayProcess, str]], token: str) -> None:
+    """Wait until every node sees the other two healthy (3-node mesh quorum-ready)."""
+    ids = [nid for _, nid in pairs]
+
+    def ready() -> bool | None:
+        for gw, my_id in pairs:
+            status = _api_json("GET", gw.url, "/v1/mesh/status", token, timeout=5.0)
+            if any(other != my_id and not _peer_healthy(status, other) for other in ids):
+                return None
+        return True
+
+    _eventually("all three mesh nodes to see each other healthy", ready, timeout=45.0)
+
+
+def test_three_node_writable_volume_quorum_ha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With VMON_RESTORE_QUORUM on a 3-node cluster, a guest's writes to a *writable*
+    named volume survive the owner's death: a surviving majority confirms the owner
+    gone, restores the sandbox, materializes the writable volume, and the restored
+    guest reads back its own written data."""
+    from vmon.client import MeshClient
+
+    token = "cluster-e2e-" + secrets.token_urlsafe(24)
+    homes = [Path(tempfile.mkdtemp(prefix="vce-")) for _ in range(3)]
+    quorum_env = {"VMON_RESTORE_QUORUM": "1", "VMON_REPLICAS": "2"}
+    gws = [
+        GatewayProcess(
+            f"q-{label}",
+            _free_port(),
+            homes[i],
+            token,
+            Path(f"/tmp/ceq-{label}.log"),
+            extra_env=quorum_env,
+        )
+        for i, label in enumerate("abc")
+    ]
+    sid = f"ceq-{os.getpid()}"
+    quoted_sid = urllib.parse.quote(sid, safe="")
+    vol_name = f"rwvol{os.getpid()}"
+    sentinel = "HA_RW_OK"
+
+    try:
+        for gw in gws:
+            gw.start()
+        setup = _api_json(
+            "POST",
+            gws[0].url,
+            "/v1/mesh/setup",
+            token,
+            {"advertise": gws[0].url, "max_vcpus": 64, "max_mem_mib": 65_536},
+        )
+        node_ids = [str(setup["node_id"])]
+        for gw in gws[1:]:
+            join = _api_json(
+                "POST",
+                gw.url,
+                "/v1/mesh/join",
+                token,
+                {"blob": setup["blob"], "advertise": gw.url},
+            )
+            node_ids.append(str(join["node_id"]))
+        pairs = list(zip(gws, node_ids, strict=True))
+        _wait_mesh_trio(pairs, token)
+        for gw in gws:
+            gw.restart()
+        _wait_mesh_trio(pairs, token)
+
+        endpoints = _write_context_from_status(
+            monkeypatch, tmp_path / "client-home", gws[0].url, token
+        )
+        client = MeshClient(endpoints, token)
+        image = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
+        # Writable volume, created on node A (volume-backed create pins local).
+        try:
+            _api_json(
+                "POST",
+                gws[0].url,
+                "/v1/sandboxes",
+                token,
+                payload={
+                    "image": image,
+                    "name": sid,
+                    "block_network": True,
+                    "timeout_secs": 900,
+                    "volumes": {"/data": {"name": vol_name, "read_only": False}},
+                    "idempotency_key": f"{sid}-create",
+                },
+                timeout=300.0,
+            )
+        except AssertionError as exc:
+            _skip_if_no_virtiofs(exc)
+            raise
+
+        _eventually(
+            f"writable volume sandbox {sid} running on node A",
+            lambda: _sandbox_row(
+                _api_json("GET", gws[0].url, "/v1/sandboxes", token, timeout=10.0), sid
+            ),
+            timeout=240.0,
+            interval=2.0,
+        )
+
+        # The guest writes into the writable volume; sync so the host dir is durable
+        # before the next replication round captures it.
+        try:
+            client.stream(
+                "exec",
+                lambda _stream, _data: None,
+                name=sid,
+                cmd=["sh", "-c", f"echo {sentinel} > /data/written.txt && sync"],
+                timeout=30,
+            )
+        except Exception as exc:
+            _skip_if_no_virtiofs(exc)
+            raise
+
+        # Wait until BOTH survivors hold a replica whose checkpoint carries the
+        # post-write volume payload (deterministic: proves the updated checkpoint
+        # landed on each holder before we kill the owner).
+        survivors = [(gws[i], node_ids[i], homes[i]) for i in (1, 2)]
+        for _gw, nid, home in survivors:
+            _eventually(
+                f"{nid}'s replica of {sid} to carry the post-write volume payload",
+                lambda home=home: (
+                    _replica_volume_payload(home, sid, vol_name, "written.txt") == sentinel
+                ),
+                timeout=120.0,
+                interval=2.0,
+            )
+
+        gws[0].stop()
+        assert gws[0].proc is not None and gws[0].proc.poll() is not None
+        client.call("ps")  # promote a survivor in the client roster
+
+        # A surviving majority (2 of 3) confirms A gone and restores the sandbox.
+        restored = _eventually(
+            f"orphaned sandbox {sid} to restore on a survivor",
+            lambda: next(
+                (
+                    (gw, nid, r)
+                    for gw, nid, _home in survivors
+                    if (
+                        r := _sandbox_row(
+                            _api_json("GET", gw.url, "/v1/sandboxes", token, timeout=5.0), sid
+                        )
+                    )
+                    and r.get("node") == nid
+                    and r.get("status") == "running"
+                ),
+                None,
+            ),
+            timeout=150.0,
+            interval=2.0,
+        )
+        restorer_gw, restorer_id, _ = restored
+        restorer_home = homes[node_ids.index(restorer_id)]
+
+        # Proof 1: the writable volume materialized on the restorer's host with the
+        # data the guest wrote before the crash.
+        materialized = restorer_home / "volumes" / vol_name / "written.txt"
+        got = _eventually(
+            "written volume data materialized on the restorer host",
+            lambda: (
+                materialized.read_text(encoding="utf-8").strip() if materialized.is_file() else None
+            ),
+            timeout=30.0,
+            interval=1.0,
+        )
+        assert got == sentinel, f"materialized writable volume mismatch: {got!r}"
+
+        # Proof 2: the restored guest re-mounts the writable volume and reads its
+        # own pre-crash write back.
+        chunks: list[bytes] = []
+        client.stream(
+            "exec",
+            lambda _stream, data: chunks.append(data),
+            name=sid,
+            cmd=["cat", "/data/written.txt"],
+            timeout=30,
+        )
+        guest_out = b"".join(chunks).decode("utf-8", errors="replace")
+        assert sentinel in guest_out, f"restored guest did not read written data: {guest_out!r}"
+    finally:
+        for gw in reversed(gws):
+            if gw.proc is not None and gw.proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    _api_json(
+                        "DELETE",
+                        gw.url,
+                        f"/v1/sandboxes/{quoted_sid}/remove",
+                        token,
+                        timeout=10.0,
+                    )
+        for gw in gws:
+            gw.stop()
+        for home in homes:
+            shutil.rmtree(home, ignore_errors=True)

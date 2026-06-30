@@ -18,7 +18,7 @@ from vmon.image import (
     CachedTemplate,
     _find_mkfs_ext4,
     cached_template,
-    detect_engine,
+    detect_image_tools,
     ensure_agent,
 )
 from vmon.pool import wait_for_agent_ready
@@ -50,7 +50,7 @@ def preflight() -> str | None:
     for probe, hint in (
         (find_binary, "vmm binary"),
         (default_kernel, "guest kernel"),
-        (detect_engine, "container engine"),
+        (detect_image_tools, "OCI image tools"),
         (ensure_agent, "static guest agent"),
     ):
         try:
