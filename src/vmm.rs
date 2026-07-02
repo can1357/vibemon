@@ -1916,7 +1916,7 @@ impl Vmm {
 		}
 
 		if let Some(backend) = fresh_net_backend(&config) {
-			let device = open_net_device(&backend)?;
+			let device = open_net_device(&backend, None)?;
 			match config.transport {
 				Transport::Mmio => {
 					wire_device(
@@ -2159,7 +2159,9 @@ impl Vmm {
 					};
 					Arc::new(Mutex::new(block))
 				},
-				BackendHint::Net { .. } | BackendHint::UserNet { .. } => open_net_device(&backend)?,
+				BackendHint::Net { .. } | BackendHint::UserNet { .. } => {
+					open_net_device(&backend, ds.user_net_state.as_deref())?
+				},
 				BackendHint::Fs { tag, shared_dir, read_only } => {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
 						err("snapshot virtio-fs backend is missing serialized fs state")
@@ -2681,7 +2683,7 @@ impl Vmm {
 				.resume()
 				.map(|()| json!({}))
 				.map_err(|e| control::ApiError::internal(e.to_string())),
-			ControlKind::Snapshot { name, base, allow_user_net } => {
+			ControlKind::Snapshot { name, base } => {
 				if let Some(b) = &base {
 					if !snapshot::is_safe_snapshot_name(b) {
 						return Err(control::ApiError::path_denied(format!(
@@ -2699,7 +2701,7 @@ impl Vmm {
 					return Err(control::ApiError::not_paused("snapshot requires a paused VM"));
 				}
 				self
-					.snapshot(&dir, base.as_deref(), allow_user_net)
+					.snapshot(&dir, base.as_deref())
 					.map(|()| json!({}))
 					.map_err(|e| control::ApiError::internal(e.to_string()))
 			},
@@ -3022,10 +3024,9 @@ impl Vmm {
 
 	/// Write a complete snapshot of the (paused) VM to `dir`.
 	/// If `base` is `Some`, store only the pages that differ from that sibling
-	/// snapshot. When `allow_user_net` is true, in-flight user-mode NAT flows
-	/// are dropped; restore reopens a fresh NAT backend, which is suitable for
-	/// idle templates.
-	fn snapshot(&self, dir: &Path, base: Option<&str>, allow_user_net: bool) -> Result<()> {
+	/// snapshot. User-mode NAT devices serialize libslirp's guest-visible state;
+	/// in-flight host-side sockets are intentionally not carried across restore.
+	fn snapshot(&self, dir: &Path, base: Option<&str>) -> Result<()> {
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
 			RunState::Paused => {},
@@ -3068,11 +3069,6 @@ impl Vmm {
 		let mut devices = Vec::with_capacity(self.devices.len());
 		for d in &self.devices {
 			self.ensure_not_stopping("snapshot device state")?;
-			if !allow_user_net && matches!(d.backend, BackendHint::UserNet { .. }) {
-				return Err(err(
-					"snapshot with --net user requires allow_user_net; NAT state is not serialized",
-				));
-			}
 			let (
 				transport,
 				device_features_select,
@@ -3114,7 +3110,10 @@ impl Vmm {
 			};
 			// After activation the device owns the queues, so read live state
 			// from it; fall back to the transport for a not-yet-activated device.
-			let live = d.device.lock().queue_states();
+			let (live, user_net_state) = {
+				let device = d.device.lock();
+				(device.queue_states(), device.user_net_state()?)
+			};
 			let queues = if live.is_empty() {
 				transport_queues
 			} else {
@@ -3148,6 +3147,7 @@ impl Vmm {
 				activated,
 				queues: queues.into_iter().map(Into::into).collect(),
 				backend: d.backend.clone(),
+				user_net_state,
 				transport_pci,
 				fs,
 			});
@@ -3297,25 +3297,34 @@ fn fresh_net_backend(config: &Config) -> Option<BackendHint> {
 	}
 }
 
-fn open_net_device(backend: &BackendHint) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+fn open_net_device(
+	backend: &BackendHint,
+	user_net_state: Option<&[u8]>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	match backend {
 		BackendHint::Net { tap, mac } => {
 			let tap = Tap::open(tap, *mac)?;
 			let mac = tap.mac();
 			Ok(Arc::new(Mutex::new(Net::new(tap, mac))))
 		},
-		BackendHint::UserNet { mac } => open_user_net_device(*mac),
+		BackendHint::UserNet { mac } => open_user_net_device(*mac, user_net_state),
 		_ => Err(err("backend is not a virtio-net device")),
 	}
 }
 
 #[cfg(target_os = "macos")]
-fn open_user_net_device(mac: [u8; 6]) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
-	Ok(Arc::new(Mutex::new(Net::new_user(mac)?)))
+fn open_user_net_device(
+	mac: [u8; 6],
+	user_net_state: Option<&[u8]>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	Ok(Arc::new(Mutex::new(Net::new_user_with_state(mac, user_net_state.map(<[u8]>::to_vec))?)))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_user_net_device(_mac: [u8; 6]) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+fn open_user_net_device(
+	_mac: [u8; 6],
+	_user_net_state: Option<&[u8]>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	Err(err("--net user is currently supported only on macOS"))
 }
 

@@ -3,12 +3,15 @@
 //! The guest still sees a virtio-net NIC, but packets are handled by libslirp
 //! in userspace instead of vmnet.framework. This provides outbound NAT, DHCP,
 //! and DNS without `com.apple.vm.networking`; inbound connectivity requires
-//! explicit forwarding support.
+//! explicit forwarding support. Snapshots serialize libslirp's guest-visible
+//! state (DHCP lease, ARP/NAT tables) on the slirp thread. Host-side sockets
+//! are not carried across restore, so in-flight TCP connections reset; new
+//! outbound connections work after restore.
 
 use std::{
 	cell::RefCell,
 	collections::VecDeque,
-	io,
+	io::{self, Cursor},
 	net::{Ipv4Addr, Ipv6Addr},
 	os::fd::{AsRawFd, RawFd},
 	rc::Rc,
@@ -18,7 +21,7 @@ use std::{
 };
 
 use flume::{Receiver, Sender, TryRecvError, TrySendError};
-use libslirp::{Context, Handler, PollEvents};
+use libslirp::{Context, Handler, PollEvents, state_version};
 use parking_lot::Mutex;
 
 use crate::{
@@ -34,6 +37,7 @@ const USER_DHCP_START: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const USER_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 const MAX_PENDING_RX_FRAMES: usize = 1024;
 const MAX_PENDING_TX_FRAMES: usize = 1024;
+const SLIRP_STATE_VERSION_BYTES: usize = 4;
 
 /// User-mode NAT backend driven by a private libslirp thread.
 pub struct UserNet {
@@ -46,6 +50,7 @@ pub struct UserNet {
 
 enum Command {
 	Packet(Vec<u8>),
+	Save(Sender<Result<Vec<u8>>>),
 	Stop,
 }
 
@@ -65,8 +70,10 @@ struct SlirpHandler {
 }
 
 impl UserNet {
-	/// Start an entitlement-free user-mode NAT backend.
-	pub fn new(_mac: [u8; 6]) -> Result<Self> {
+	/// Start an entitlement-free user-mode NAT backend and optionally restore
+	/// its serialized guest-visible libslirp state before the backend is exposed
+	/// to vCPUs.
+	pub fn new_with_state(_mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
 		let (tx, rx) = flume::bounded(MAX_PENDING_TX_FRAMES);
 		let command_evt = EventFd::new(EFD_NONBLOCK)
 			.map_err(|e| err(format!("creating user-net command eventfd: {e}")))?;
@@ -84,6 +91,7 @@ impl UserNet {
 			.try_clone()
 			.map_err(|e| err(format!("cloning user-net packet eventfd: {e}")))?;
 		let thread_packets = packets.clone();
+		let (ready_tx, ready_rx) = flume::bounded(1);
 		let thread = thread::Builder::new()
 			.name("vmon-slirp".to_string())
 			.spawn(move || {
@@ -93,11 +101,22 @@ impl UserNet {
 					handler_command_evt,
 					handler_packet_evt,
 					thread_packets,
+					state,
+					ready_tx,
 				);
 			})
 			.map_err(|e| err(format!("spawning user-net slirp thread: {e}")))?;
 
-		Ok(Self { tx, command_evt, packet_evt, packets, thread: Some(thread) })
+		match ready_rx
+			.recv()
+			.map_err(|_| err("user-net slirp thread exited during startup"))?
+		{
+			Ok(()) => Ok(Self { tx, command_evt, packet_evt, packets, thread: Some(thread) }),
+			Err(e) => {
+				let _ = thread.join();
+				Err(e)
+			},
+		}
 	}
 
 	/// Read one vnet-header-prefixed Ethernet frame produced by libslirp.
@@ -138,6 +157,22 @@ impl UserNet {
 			Err(TrySendError::Full(_)) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
 			Err(TrySendError::Disconnected(_)) => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
 		}
+	}
+
+	/// Serialize libslirp's guest-visible state on the owning slirp thread.
+	pub fn save_state(&self) -> Result<Vec<u8>> {
+		let (reply_tx, reply_rx) = flume::bounded(1);
+		self
+			.tx
+			.send(Command::Save(reply_tx))
+			.map_err(|_| err("saving user-net state failed: slirp thread gone"))?;
+		self
+			.command_evt
+			.write(1)
+			.map_err(|e| err(format!("waking user-net slirp thread for state save: {e}")))?;
+		reply_rx
+			.recv()
+			.map_err(|_| err("saving user-net state failed: slirp thread exited"))?
 	}
 
 	/// Reject TAP offloads; libslirp consumes plain Ethernet frames.
@@ -297,6 +332,8 @@ fn run_slirp(
 	handler_loop_evt: EventFd,
 	packet_evt: EventFd,
 	packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+	state: Option<Vec<u8>>,
+	ready: Sender<Result<()>>,
 ) {
 	let handler = Rc::new(RefCell::new(SlirpHandler {
 		start: Instant::now(),
@@ -326,6 +363,15 @@ fn run_slirp(
 		None,
 		handler.clone(),
 	);
+
+	let startup = state
+		.as_deref()
+		.map_or_else(|| Ok(()), |state| load_slirp_state(&context, state));
+	let startup_ok = startup.is_ok();
+	let _ = ready.send(startup);
+	if !startup_ok {
+		return;
+	}
 
 	loop {
 		if !drain_commands(&context, &rx) {
@@ -391,11 +437,43 @@ fn drain_commands(context: &Context<Rc<RefCell<SlirpHandler>>>, rx: &Receiver<Co
 	loop {
 		match rx.try_recv() {
 			Ok(Command::Packet(frame)) => context.input(&frame),
+			Ok(Command::Save(reply)) => {
+				let _ = reply.send(save_slirp_state(context));
+			},
 			Ok(Command::Stop) => return false,
 			Err(TryRecvError::Empty) => return true,
 			Err(TryRecvError::Disconnected) => return false,
 		}
 	}
+}
+
+fn save_slirp_state(context: &Context<Rc<RefCell<SlirpHandler>>>) -> Result<Vec<u8>> {
+	let mut data = state_version().to_be_bytes().to_vec();
+	let mut state = context
+		.state_get()
+		.map_err(|e| err(format!("saving libslirp state: {e}")))?;
+	data.append(&mut state);
+	Ok(data)
+}
+
+fn load_slirp_state(context: &Context<Rc<RefCell<SlirpHandler>>>, data: &[u8]) -> Result<()> {
+	if data.len() < SLIRP_STATE_VERSION_BYTES {
+		return Err(err("libslirp state is missing its version header"));
+	}
+	let mut version = [0u8; SLIRP_STATE_VERSION_BYTES];
+	version.copy_from_slice(&data[..SLIRP_STATE_VERSION_BYTES]);
+	let version = i32::from_be_bytes(version);
+	let current = state_version();
+	if version > current {
+		return Err(err(format!(
+			"libslirp state version {version} is newer than supported {current}"
+		)));
+	}
+	let mut reader = Cursor::new(&data[SLIRP_STATE_VERSION_BYTES..]);
+	context
+		.state_read(version, &mut reader)
+		.map_err(|e| err(format!("loading libslirp state: {e}")))?;
+	Ok(())
 }
 
 fn fire_due_timers(handler: &Rc<RefCell<SlirpHandler>>) {

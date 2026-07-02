@@ -56,7 +56,7 @@ else
 fi
 
 KERNEL_PATH=${KERNEL_PATH:-"$ASSET_DIR/$KERNEL_NAME"}
-INITRAMFS_VERSION=${INITRAMFS_VERSION:-"2026-06-28.1-$ARCH"}
+INITRAMFS_VERSION=${INITRAMFS_VERSION:-"2026-07-02.1-$ARCH"}
 ROOTFS_SIZE=${ROOTFS_SIZE:-"64M"}
 ROOTFS_VERSION=${ROOTFS_VERSION:-"2026-06-26.2-$ARCH"}
 
@@ -337,7 +337,7 @@ case "$mode" in
     finish
     ;;
 
-  usernet | usernet_dhcp)
+  usernet | usernet_dhcp | usernet_snapshot)
     host_ip=$(cmdline_get vmon.host_ip 10.0.2.2)
     port=$(cmdline_get vmon.tput_port 5050)
     mib=$(cmdline_get vmon.tput_mib 8)
@@ -355,10 +355,21 @@ case "$mode" in
     done
     [ -n "$iface" ] || fail "no non-loopback network interface"
     ip link set "$iface" up || fail "bring up $iface"
-    if [ "$mode" = usernet_dhcp ]; then
+    if [ "$mode" = usernet_dhcp ] || [ "$mode" = usernet_snapshot ]; then
       # DHCP is mandatory here: a slirp DHCP-server regression must fail.
       udhcpc -i "$iface" -n -q -t 8 -T 1 >/dev/null 2>&1 || fail "udhcpc lease on $iface"
-      echo "USERNET_DHCP_OK"
+      lease=$(ip addr show dev "$iface" | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+      [ -n "$lease" ] || fail "read DHCP lease on $iface"
+      if [ "$mode" = usernet_snapshot ]; then
+        echo "USERNET_SNAPSHOT_READY lease=$lease"
+        sleep "$(cmdline_get vmon.snapshot_delay 30)"
+        lease_after=$(ip addr show dev "$iface" | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+        echo "USERNET_SNAPSHOT_RESTORED lease=$lease_after"
+        [ "$lease_after" = "$lease" ] || fail "DHCP lease changed after restore: $lease_after != $lease"
+        echo "USERNET_SAME_LEASE"
+      else
+        echo "USERNET_DHCP_OK"
+      fi
     else
       # Deterministic static config exercising only the NAT data path.
       ip addr add 10.0.2.15/24 dev "$iface" 2>/dev/null \
@@ -371,6 +382,7 @@ case "$mode" in
     dd if=/dev/zero bs=1048576 count="$mib" 2>/dev/null | nc -w 20 "$host_ip" "$port" \
       || fail "usernet transfer to $host_ip:$port"
     echo "USERNET_OK"
+    [ "$mode" = usernet_snapshot ] && echo "USERNET_SNAPSHOT_OK"
     finish
     ;;
 

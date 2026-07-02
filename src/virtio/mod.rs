@@ -164,6 +164,11 @@ pub trait VirtioDevice: Send {
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {
 		Vec::new()
 	}
+	/// Optional serialized backend state for user-mode networking. Non-net
+	/// devices and TAP/vmnet net backends return `None`.
+	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
+		Ok(None)
+	}
 	/// Quiesce in-flight backend IO before a snapshot (e.g. drain async
 	/// completions). Default: nothing to do. Block (`io_uring`) overrides this.
 	fn drain(&mut self) -> Result<()> {

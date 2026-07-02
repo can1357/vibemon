@@ -224,7 +224,7 @@ pub enum ControlKind {
 	Info,
 	Pause,
 	Resume,
-	Snapshot { name: String, base: Option<String>, allow_user_net: bool },
+	Snapshot { name: String, base: Option<String> },
 	Quit,
 	Metrics,
 	Extend { secs: u64 },
@@ -937,14 +937,7 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 					return Err(ApiError::bad_request("snapshot params.base must be a string"));
 				},
 			};
-			let allow_user_net = match request.params.get("allow_user_net") {
-				None | Some(serde_json::Value::Null) => false,
-				Some(serde_json::Value::Bool(v)) => *v,
-				Some(_) => {
-					return Err(ApiError::bad_request("snapshot params.allow_user_net must be a bool"));
-				},
-			};
-			ControlKind::Snapshot { name: name.to_owned(), base, allow_user_net }
+			ControlKind::Snapshot { name: name.to_owned(), base }
 		},
 		"quit" => ControlKind::Quit,
 		"metrics" => ControlKind::Metrics,
@@ -975,7 +968,6 @@ mod tests {
 			ControlKind::Snapshot {
 				name,
 				base: None,
-				allow_user_net: false,
 			} if name == "safe"
 		));
 
@@ -987,21 +979,7 @@ mod tests {
 			ControlKind::Snapshot {
 				name,
 				base,
-				allow_user_net: false,
 			} if name == "d" && base.as_deref() == Some("base0")
-		));
-
-		let (_, kind) = parse_request(
-			r#"{"id":10,"method":"snapshot","params":{"name":"net","allow_user_net":true}}"#,
-		)
-		.unwrap();
-		assert!(matches!(
-			kind,
-			ControlKind::Snapshot {
-				name,
-				base: None,
-				allow_user_net: true,
-			} if name == "net"
 		));
 
 		let (_, kind) = parse_request(r#"{"id":9,"method":"metrics","params":null}"#).unwrap();

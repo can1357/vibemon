@@ -847,7 +847,6 @@ class MicroVM:
         disk_src: str | os.PathLike[str] | None = None,
         snapshot_root: str | os.PathLike[str] | None = None,
         base: str | None = None,
-        allow_user_net: bool = False,
     ) -> Path:
         """Pause, optionally capture rootfs.img, snapshot VM state, then resume or stop.
 
@@ -855,9 +854,9 @@ class MicroVM:
         VMM stores only the guest-RAM pages that differ from it, producing a delta
         (incremental) snapshot. Restore reconstructs the base+delta chain.
 
-        User-mode NAT NICs can be snapshotted only when ``allow_user_net`` is true;
-        in-flight NAT flows are dropped, and restore reopens a fresh NAT backend.
-        Use this only for idle templates.
+        User-mode NAT NIC snapshots include libslirp's guest-visible state (DHCP
+        lease and NAT tables). Host-side sockets are not carried across restore,
+        so in-flight TCP connections reset while new outbound connections work.
 
         ``snapshot_root`` only redirects the host-side ``rootfs.img`` copy and the
         returned directory; the VMM always writes state under its launch
@@ -876,7 +875,7 @@ class MicroVM:
             paused = True
             if disk_src is not None:
                 copy_reflink(disk_src, snap_dir / "rootfs.img")
-            self.control.snapshot(name, base=base, allow_user_net=allow_user_net)
+            self.control.snapshot(name, base=base)
         except BaseException:
             if paused and keep_running:
                 try:

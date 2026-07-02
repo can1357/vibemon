@@ -7,6 +7,8 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use serde_json::json;
+
 #[test]
 fn virtio_net_pings_host_tap() {
 	if !common::require_hv() || !common::supports_tap() {
@@ -101,6 +103,72 @@ fn virtio_user_net_dhcp_assigns_lease() {
 	user_net_transfer("usernet_dhcp", &["USERNET_DHCP_OK"]);
 }
 
+#[test]
+fn virtio_user_net_snapshot_restore_preserves_dhcp_lease() {
+	if !common::require_hv() || !common::supports_user_net() {
+		return;
+	}
+
+	let port = common::parse_env_usize("VMON_TPUT_PORT", 5050) as u16;
+	let mib = common::parse_env_usize("VMON_USERNET_MIB", 1);
+	let listener = TcpListener::bind(("127.0.0.1", port))
+		.unwrap_or_else(|e| panic!("binding restored user-net sink on 127.0.0.1:{port}: {e}"));
+	listener
+		.set_nonblocking(true)
+		.expect("setting restored user-net sink nonblocking");
+	let sink = thread::spawn(move || drain_one(&listener, Duration::from_mins(2)));
+
+	let dir = common::test_dir("usernet-snapshot");
+	let sock = dir.join("control.sock");
+	let snap_name = "usernet-snapshot";
+	let snap = dir.join(snap_name);
+	let port_s = port.to_string();
+	let mib_s = mib.to_string();
+	let cmdline = common::cmdline_with("usernet_snapshot", &[
+		("vmon.host_ip", "10.0.2.2"),
+		("vmon.tput_port", port_s.as_str()),
+		("vmon.tput_mib", mib_s.as_str()),
+		("vmon.snapshot_delay", "30"),
+	]);
+	let mut args = common::base_args_with_cmdline(cmdline);
+	args.push("--api-sock".into());
+	args.push(sock.display().to_string());
+	args.push("--snapshot-root".into());
+	args.push(dir.display().to_string());
+	args.push("--net".into());
+	args.push("user".into());
+
+	let refs = common::as_refs(&args);
+	let mut vm = common::spawn_vmm(&refs);
+	vm.wait_for("USERNET_SNAPSHOT_READY", Duration::from_mins(2));
+	let lease =
+		wait_for_user_net_snapshot_lease(&vm, "USERNET_SNAPSHOT_READY", Duration::from_secs(5));
+	let mut control = common::ControlClient::connect(&sock, Duration::from_secs(10));
+	let _ = control.request("pause", json!({}));
+	let _ = control.request("snapshot", json!({"name": snap_name}));
+	let _ = control.request("quit", json!({}));
+	let (status, output) = vm.wait(Duration::from_secs(30));
+	assert!(status.success(), "snapshot source exited with {status}; output:\n{output}");
+	common::assert_snapshot_written(&snap);
+	common::assert_no_panic(&output);
+
+	let restore_args = vec!["--restore".to_string(), snap.display().to_string()];
+	let refs = common::as_refs(&restore_args);
+	let restored = common::boot_capture(&refs, "USERNET_SNAPSHOT_OK", Duration::from_mins(2));
+	let restored_lease = user_net_snapshot_lease(&restored, "USERNET_SNAPSHOT_RESTORED");
+	assert_eq!(restored_lease, lease, "DHCP lease changed across restore:\n{restored}");
+	assert!(restored.contains("USERNET_SAME_LEASE"), "same-lease marker missing:\n{restored}");
+	assert!(restored.contains("USERNET_OK"), "restored transfer marker missing:\n{restored}");
+	common::assert_no_panic(&restored);
+
+	let received = sink.join().expect("restored user-net sink thread panicked");
+	let expected = mib * 1024 * 1024 * 9 / 10;
+	assert!(
+		received >= expected,
+		"restored host sink received only {received} bytes, expected >= {expected}"
+	);
+}
+
 /// Boot with `--net user`, drive the guest `mode`, and confirm the guest
 /// streamed bulk data outbound through the slirp NAT to a host listener on the
 /// loopback. libslirp maps the gateway 10.0.2.2 to the host's 127.0.0.1, so the
@@ -146,6 +214,45 @@ fn user_net_transfer(mode: &str, extra_markers: &[&str]) {
 		received >= expected,
 		"host sink received only {received} bytes, expected >= {expected}"
 	);
+}
+
+fn wait_for_user_net_snapshot_lease(
+	vm: &common::VmmProcess,
+	marker: &str,
+	timeout: Duration,
+) -> String {
+	let deadline = Instant::now() + timeout;
+	loop {
+		let output = vm.output();
+		if let Some(lease) = try_user_net_snapshot_lease(&output, marker) {
+			return lease;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"marker {marker:?} with complete lease missing:\n{output}"
+		);
+		thread::sleep(Duration::from_millis(10));
+	}
+}
+
+fn user_net_snapshot_lease(output: &str, marker: &str) -> String {
+	try_user_net_snapshot_lease(output, marker)
+		.unwrap_or_else(|| panic!("marker {marker:?} with complete lease missing:\n{output}"))
+}
+
+fn try_user_net_snapshot_lease(output: &str, marker: &str) -> Option<String> {
+	for line in output.lines() {
+		if let Some(rest) = line.strip_prefix(marker)
+			&& let Some((_, lease)) = rest.split_once("lease=")
+		{
+			let lease = lease.trim();
+			if lease.split('.').count() == 4 && lease.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+			{
+				return Some(lease.to_string());
+			}
+		}
+	}
+	None
 }
 
 /// Accept a single connection on `listener` and drain it to EOF, returning the

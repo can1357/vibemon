@@ -101,6 +101,14 @@ impl Backend {
 			Self::User(user) => vec![user.as_raw_fd()],
 		}
 	}
+
+	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
+		match self {
+			Self::Tap(_) => Ok(None),
+			#[cfg(target_os = "macos")]
+			Self::User(user) => Ok(Some(user.save_state()?)),
+		}
+	}
 }
 
 impl Net {
@@ -109,8 +117,8 @@ impl Net {
 	}
 
 	#[cfg(target_os = "macos")]
-	pub fn new_user(mac: [u8; 6]) -> Result<Self> {
-		Ok(Self::with_backend(Backend::User(user::UserNet::new(mac)?), mac))
+	pub fn new_user_with_state(mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
+		Ok(Self::with_backend(Backend::User(user::UserNet::new_with_state(mac, state)?), mac))
 	}
 
 	fn with_backend(backend: Backend, mac: [u8; 6]) -> Self {
@@ -288,6 +296,10 @@ impl VirtioDevice for Net {
 			v.push(q.state());
 		}
 		v
+	}
+
+	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
+		self.backend.user_net_state()
 	}
 }
 

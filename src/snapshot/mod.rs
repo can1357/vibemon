@@ -32,10 +32,10 @@ use crate::{
 	result::{Result, err},
 };
 
-/// Snapshot format version (postcard-encoded). Bumped to 2 to add the
-/// virtio-rng device kind; v1 and earlier (bincode) snapshots are unsupported
-/// and must be recaptured.
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// Snapshot format version (postcard-encoded). Bumped to 3 to add serialized
+/// libslirp state for virtio user-mode networking; older snapshots are
+/// unsupported and must be recaptured.
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 const DELTA_PAGE_SIZE: u64 = 4096;
 const MAX_DELTA_CHAIN_DEPTH: usize = 64;
@@ -173,6 +173,7 @@ pub struct DeviceState {
 	pub activated:              bool,
 	pub queues:                 Vec<QueueStateSer>,
 	pub backend:                BackendHint,
+	pub user_net_state:         Option<Vec<u8>>,
 	pub transport_pci:          Option<PciTransportStateSer>,
 	pub fs:                     Option<FsStateSer>,
 }
@@ -764,6 +765,19 @@ fn validate_device_states(devices: &[DeviceState], mem_regions: &[MemRegion]) ->
 					return Err(err(format!("snapshot non-fs device {idx} carries virtio-fs state")));
 				}
 			},
+		}
+		match (&device.backend, &device.user_net_state) {
+			(BackendHint::UserNet { .. }, None) => {
+				return Err(err(format!("snapshot user-net device {idx} is missing libslirp state")));
+			},
+			(BackendHint::UserNet { .. }, Some(state)) if state.is_empty() => {
+				return Err(err(format!("snapshot user-net device {idx} has empty libslirp state")));
+			},
+			(BackendHint::UserNet { .. }, Some(_)) => {},
+			(_, Some(_)) => {
+				return Err(err(format!("snapshot non-user-net device {idx} carries libslirp state")));
+			},
+			(_, None) => {},
 		}
 		let expected_queues = match (&device.kind, &device.backend) {
 			(DeviceKind::Block, BackendHint::Block { .. }) => 1,
@@ -1372,6 +1386,7 @@ mod tests {
 			activated: false,
 			queues: vec![queue(false)],
 			backend: BackendHint::Block { path: "disk.img".to_string(), read_only: false },
+			user_net_state: None,
 			transport_pci: None,
 			fs: None,
 		}
@@ -1708,6 +1723,23 @@ mod tests {
 		assert_eq!(pci.msix.table[1].msg_addr, 0xfee0_1000);
 		assert_eq!(pci.msix.table[1].msg_data, 0x4022);
 		assert_eq!(pci.msix.table[1].vector_ctrl, 1);
+	}
+
+	#[test]
+	fn user_net_state_survives_device_serde_round_trip() {
+		let state = vec![0, 0, 0, 7, 0xaa, 0xbb, 0xcc];
+		let mut device = block_device(MMIO_MEM_START, IRQ_BASE);
+		device.kind = DeviceKind::Net;
+		device.queues = vec![queue(false), queue(false)];
+		device.backend = BackendHint::UserNet { mac: [0x02, 0, 0, 0, 0, 1] };
+		device.user_net_state = Some(state.clone());
+
+		validate_device_states(&[device.clone()], &[]).unwrap();
+		let snap = snapshot_with_devices(vec![device]);
+		let bytes = postcard::to_allocvec(&snap).unwrap();
+		let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
+		assert!(rest.is_empty());
+		assert_eq!(decoded.devices[0].user_net_state.as_deref(), Some(state.as_slice()));
 	}
 
 	#[test]

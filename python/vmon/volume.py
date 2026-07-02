@@ -2,8 +2,8 @@
 
 A :class:`Volume` is a host directory shared into a guest (via virtio-fs) that
 persists across sandbox lifetimes. Volumes are excluded from memory snapshots
-and re-attached by name. A single-writer ``flock`` guards each volume so that
-only one live VM may mutate it at a time.
+and re-attached by name. The ``flock`` here is host-local; mesh deployments add
+quorum leases above it when a writable volume may move across nodes.
 """
 
 from __future__ import annotations
