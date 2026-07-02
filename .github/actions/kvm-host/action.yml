@@ -23,11 +23,12 @@ runs:
 
     - name: Install system dependencies
       # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds the rootfs
-      # fixtures. docker is preinstalled and builds image rootfses.
+      # fixtures; skopeo + umoci fetch and unpack OCI images for image-backed
+      # sandboxes (the daemonless image path).
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y cpio e2fsprogs
+        sudo apt-get install -y cpio e2fsprogs skopeo umoci
 
     - name: Install pinned Rust toolchain
       shell: bash
