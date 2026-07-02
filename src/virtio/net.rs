@@ -102,6 +102,10 @@ impl Backend {
 		}
 	}
 
+	#[allow(
+		clippy::unnecessary_wraps,
+		reason = "the macOS user-net arm is fallible; Linux builds only see the Tap arm"
+	)]
 	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
 		match self {
 			Self::Tap(_) => Ok(None),
