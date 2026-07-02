@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -59,15 +60,17 @@ async def replicate_forever(ctx: ServerRuntime) -> None:
         semaphore = asyncio.Semaphore(ctx.config.replicate_concurrency)
         owned_ids = list(supervisor._engine.owned_ids())
         owned = set(owned_ids)
-        for stale_sid in set(last) - owned:
+        for stale_sid in (set(last) | set(ctx.checkpoint_times)) - owned:
             last.pop(stale_sid, None)
-
+            ctx.checkpoint_times.pop(stale_sid, None)
         for sid in owned_ids:
             digest = ""
             snapshot_dir = ""
             try:
-                if _ha_for_sid(ctx, sid) == "off":
+                ha = _ha_for_sid(ctx, sid)
+                if ha == "off":
                     last.pop(sid, None)
+                    ctx.checkpoint_times.pop(sid, None)
                     continue
                 try:
                     prep = await supervisor._run(supervisor._engine.replicate_prepare, sid)
@@ -89,6 +92,7 @@ async def replicate_forever(ctx: ServerRuntime) -> None:
                 results = await asyncio.gather(*pushes)
                 if any(results):
                     mesh.note_event("replication")
+                    ctx.checkpoint_times[sid] = time.time()
                 if all(results):
                     last[sid] = digest
             except Exception:
@@ -172,14 +176,28 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
             await leases.renew_writable_volume_leases_once(ctx)
         except Exception:
             LOGGER.exception("failed to renew writable-volume leases")
+        try:
+            await record_sync.reconcile_records(ctx)
+        except Exception:
+            LOGGER.exception("failed to reconcile create records")
         for sid, dead in mesh.drain_orphans():
+            retry = False
             try:
+                owner = mesh.owner_of(sid)
+                if owner and owner != dead and (
+                    owner == mesh.node_id or mesh.is_peer_healthy(owner)
+                ):
+                    continue  # already restored under a live owner
                 if mesh.is_peer_healthy(dead):
                     LOGGER.warning(
                         "deferring restore of %s: prior owner %s is still reachable", sid, dead
                     )
+                    retry = True
                     continue
                 if mesh.restore_owner(sid, exclude={dead}) != mesh.node_id:
+                    # Another live node is elected; keep the pair so this node can
+                    # take over if the current electee dies before restoring.
+                    retry = True
                     continue
                 create_record = ctx.record_store.get(sid)
                 ha = create_record.ha if create_record is not None else "async"
@@ -217,6 +235,7 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
                             confirmations,
                             mesh.quorum_needed(),
                         )
+                        retry = True
                         continue
                 if _engine_has(supervisor, sid):
                     continue
@@ -229,11 +248,13 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
                 if replica_ready:
                     key = f"restore:{sid}"
                     if not mesh.worker_begin(key):
+                        retry = True
                         continue
                     try:
                         rec = replica_store.get(sid)
                         if rec is None:
                             LOGGER.warning("cannot auto-restore %s: no local replica", sid)
+                            retry = True
                             continue
                         epoch = mesh.next_epoch(sid)
                         lease_records = await leases.acquire_writable_volume_leases(
@@ -270,14 +291,19 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
                 if can_rerun and await _rerun_from_record(ctx, sid, dead):
                     continue
                 if not replica_store.holds(sid):
-                    LOGGER.warning("cannot auto-restore %s: no local replica", sid)
+                    LOGGER.warning("cannot auto-restore %s: no local replica (will retry)", sid)
                 elif not replica_store.secrets_ready(sid):
                     LOGGER.warning(
                         "cannot auto-restore %s: replica secrets unavailable after restart",
                         sid,
                     )
+                retry = True
             except Exception:
+                retry = True
                 LOGGER.exception("failed to restore orphaned sandbox %s from %s", sid, dead)
+            finally:
+                if retry:
+                    mesh.requeue_orphan(sid, dead)
         for sid in mesh.fenced_local_ids(list(supervisor._engine.owned_ids())):
             try:
                 record = supervisor._engine.get(sid)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi.security import HTTPBearer
 
@@ -26,3 +26,5 @@ class ServerRuntime:
     client_token: str | None
     bearer: HTTPBearer
     config: ServeConfig
+
+    checkpoint_times: dict[str, float] = field(default_factory=dict)

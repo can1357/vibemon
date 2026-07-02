@@ -1181,6 +1181,18 @@ class Mesh:
             self._orphans.clear()
             return out
 
+    def requeue_orphan(self, sid: str, dead_node: str) -> None:
+        """Re-queue a drained orphan whose restore was deferred, for the next cycle.
+
+        Reaping queues an orphan exactly once (at peer removal), so a restore
+        deferral (quorum not yet met, lease TTL not yet expired, replica still
+        in flight) must put the pair back or the sandbox is never retried.
+        """
+        with self._lock:
+            pair = (sid, dead_node)
+            if pair not in self._orphans:
+                self._orphans.append(pair)
+
     def idem_pin(self, key: str, owner: str) -> str:
         """Pin *key* to a workload *owner*, returning the effective (possibly prior) owner.
 

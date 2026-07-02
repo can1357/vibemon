@@ -1357,6 +1357,12 @@ class Engine:
         """Create a Modal-style sandbox and register it (used by the web gateway)."""
         request_time = time.time()
         params = _coerce_create_params(dict(params))
+        # Durability-tier metadata is control-plane state, not a Sandbox kwarg.
+        ha = str(params.pop("ha", None) or "off")
+        restart_policy = str(
+            params.pop("restart_policy", None) or ("rerun" if "rerun" in ha else "none")
+        )
+        params.pop("_kind", None)
         sid = str(params.get("name") or f"sb-{uuid.uuid4().hex[:12]}")
         params["name"] = sid
         sandbox_cls = self._sandbox_class()
@@ -1377,6 +1383,8 @@ class Engine:
             "pool_size": params.get("pool_size"),
             "volumes": getattr(getattr(sandbox, "vm", None), "meta", {}).get("volumes"),
             "create_latency_ms": (now - request_time) * 1000.0,
+            "ha": ha,
+            "restart_policy": restart_policy,
         }
         record = VMRecord(
             id=sid,
