@@ -237,6 +237,74 @@ def test_skopeo_arch_maps_common_machine_names(monkeypatch):
     assert image._skopeo_arch() == "arm64"
 
 
+def test_manifest_arches_reads_raw_manifest_list_and_cache(monkeypatch, tmp_path):
+    import vmon.image as image
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr(image.shutil, "which", lambda name: "skopeo" if name == "skopeo" else None)
+    raw_manifest = json.dumps(
+        {
+            "manifests": [
+                {"platform": {"os": "linux", "architecture": "amd64"}},
+                {"platform": {"os": "linux", "architecture": "arm64"}},
+                {"platform": {"os": "windows", "architecture": "amd64"}},
+            ]
+        }
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "--no-tags" in cmd:
+            return json.dumps({"Digest": "sha256:abc"})
+        if "--raw" in cmd:
+            return raw_manifest
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(image, "_run", fake_run)
+
+    assert image.manifest_arches("alpine:latest") == {"x86_64", "aarch64"}
+    cache_root = tmp_path / "manifest-arches"
+    cache_files = sorted(cache_root.glob("**/*.json"))
+    assert cache_root.is_dir()
+    assert len(cache_files) == 1
+    assert cache_files[0].is_file()
+    calls.clear()
+    assert image.manifest_arches("alpine:latest") == {"x86_64", "aarch64"}
+    assert not any("--raw" in cmd for cmd in calls)
+
+
+def test_manifest_arches_uses_single_manifest_arch_from_inspect(monkeypatch, tmp_path):
+    import vmon.image as image
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.setattr(image.shutil, "which", lambda name: "skopeo" if name == "skopeo" else None)
+
+    def fake_run(cmd, **kwargs):
+        if "--no-tags" in cmd:
+            return json.dumps({"Digest": "sha256:def", "Architecture": "arm64"})
+        if "--raw" in cmd:
+            return json.dumps({"schemaVersion": 2, "config": {}})
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(image, "_run", fake_run)
+
+    assert image.manifest_arches("busybox:latest") == {"aarch64"}
+
+
+def test_manifest_arches_returns_none_on_inspection_failure(monkeypatch):
+    import vmon.image as image
+
+    monkeypatch.setattr(image.shutil, "which", lambda name: "skopeo" if name == "skopeo" else None)
+    monkeypatch.setattr(
+        image,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert image.manifest_arches("missing:latest") is None
+
+
 def test_detect_image_tools_reports_missing_tools(monkeypatch):
     import vmon.image as image
 
@@ -360,27 +428,50 @@ def test_export_image_uses_skopeo_umoci_and_moves_unpacked_rootfs(monkeypatch, t
     assert (rootfs / "etc" / "os-release").read_text(encoding="utf-8") == "ID=test\n"
 
 
-def test_cached_template_rejects_dockerfile_without_dockerless_builder(monkeypatch, tmp_path):
+def test_prepare_oci_image_builds_dockerfile_with_default_tag(monkeypatch, tmp_path):
+    import vmon.build as build
     import vmon.image as image
 
-    dockerfile = tmp_path / "Dockerfile"
+    context = tmp_path / "context"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
     dockerfile.write_text("FROM scratch\n", encoding="utf-8")
-    monkeypatch.setattr(
-        image.subprocess,
-        "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("image tooling must not run for unsupported Dockerfile input")
-        ),
-    )
+    built_ref = f"oci:{tmp_path / 'oci-layout'}:vmon-build:latest"
+    build_calls: list[tuple[Path, Path, str]] = []
+    run_calls: list[list[str]] = []
 
-    with pytest.raises(RuntimeError) as exc:
-        image.cached_template(dockerfile=str(dockerfile))
-    message = str(exc.value)
-    assert "Dockerfile builds need" in message
-    assert "buildah" in message or "buildkit" in message
-    assert "image references" in message
-    assert "prebuilt templates" in message
-    assert "do not require Docker" in message
+    def fake_build_image(path: Path, ctx: Path, tag: str) -> str:
+        build_calls.append((path, ctx, tag))
+        return built_ref
+
+    class Result:
+        def __init__(self, stdout: str = ""):
+            self.stdout = stdout
+
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
+        run_calls.append(cmd)
+        if cmd[:2] == ["/usr/bin/skopeo", "inspect"] and "--config" in cmd:
+            return Result(json.dumps({"config": {"Cmd": ["echo", "ok"]}}))
+        if cmd[:2] == ["/usr/bin/skopeo", "inspect"] and "--no-tags" in cmd:
+            return Result(json.dumps({"Digest": "sha256:abc123"}))
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(build, "build_image", fake_build_image)
+    monkeypatch.setattr(
+        image,
+        "detect_image_tools",
+        lambda: image.ImageTools("/usr/bin/skopeo", "/usr/bin/umoci"),
+    )
+    monkeypatch.setattr(image.subprocess, "run", fake_run)
+
+    prepared = image._prepare_oci_image(None, str(dockerfile), str(context))
+
+    assert build_calls == [(dockerfile, context, "vmon-build:latest")]
+    assert prepared.reference == built_ref
+    assert prepared.transport_ref == built_ref
+    assert prepared.spec.reference == built_ref
+    assert prepared.digest == "abc123"
+    assert {cmd[-1] for cmd in run_calls} == {built_ref}
 
 
 def test_template_marker_current_requires_matching_kernel_sha(tmp_path):

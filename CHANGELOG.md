@@ -7,6 +7,8 @@ All notable changes to this project are recorded here.
 ### Breaking Changes
 
 - Disabled local Dockerfile builds in `vmon run` and the SDK pending a daemonless builder backend like buildah/buildkit; image-backed sandboxes must now use prebuilt/published OCI images
+- Removed the raw remote-daemon TCP transport: `VMON_REMOTE` (client) and `VMON_DAEMON_TCP` (listener) are gone; the HTTP gateway (`vmon serve`) is the only remote protocol. `vmond` now serves the local Unix socket only.
+- Removed the `VMON_SERVER` transport selector and the `mesh.json` client fallback in the CLI; a named context (`vmon context create/use`) is the only non-local transport, and mesh-admin commands resolve the selected context's gateway (local gateway when none is selected).
 
 - Renamed Rust hypervisor binary/crate from `vmon` to `vmm`, mapping the user-facing self-identification and binary name in build and CI scripts, and resolved naming collision between the Rust binary and Python CLI.
 - Renamed Python guest-agent host client from `vmon/agent.py` to `vmon/agent_client.py` and updated all importers (`sandbox.py`, `vmm.py`, test suite) to resolve "agent" naming collision.

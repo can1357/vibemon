@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -137,6 +138,131 @@ def _skopeo_arch(arch: str | None = None) -> str:
     return machine
 
 
+def normalize_oci_arch(arch: str | None) -> str | None:
+    """Normalize common OCI/platform architecture names to vmon node arch names."""
+    if arch is None:
+        return None
+    machine = arch.strip().lower().replace("-", "_")
+    if not machine:
+        return None
+    return {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "arm64": "aarch64",
+    }.get(machine, machine)
+
+
+def _manifest_arch_cache_path(reference: str, digest: str) -> Path:
+    ref_key = hashlib.sha256(reference.encode()).hexdigest()
+    digest_key = re.sub(r"[^A-Za-z0-9_.-]", "-", digest.replace("sha256:", ""))
+    return _state() / "manifest-arches" / ref_key / f"{digest_key}.json"
+
+
+def _read_manifest_arch_cache(reference: str, digest: str) -> set[str] | None:
+    path = _manifest_arch_cache_path(reference, digest)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    arches = data.get("arches") if isinstance(data, dict) else None
+    if not isinstance(arches, list):
+        return None
+    normalized = {
+        arch
+        for value in arches
+        if isinstance(value, str)
+        if (arch := normalize_oci_arch(value)) is not None
+    }
+    return normalized or None
+
+
+def _write_manifest_arch_cache(reference: str, digest: str, arches: set[str]) -> None:
+    path = _manifest_arch_cache_path(reference, digest)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"reference": reference, "digest": digest, "arches": sorted(arches)}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _manifest_arches_from_raw(raw: str, inspect_info: dict[str, Any] | None) -> set[str]:
+    manifest = json.loads(raw)
+    arches: set[str] = set()
+
+    manifests = manifest.get("manifests") if isinstance(manifest, dict) else None
+    if isinstance(manifests, list):
+        for entry in manifests:
+            if not isinstance(entry, dict):
+                continue
+            platform_info = entry.get("platform")
+            if not isinstance(platform_info, dict):
+                continue
+            os_name = platform_info.get("os")
+            if isinstance(os_name, str) and os_name.lower() not in {"", "linux"}:
+                continue
+            arch = normalize_oci_arch(platform_info.get("architecture"))
+            if arch is not None:
+                arches.add(arch)
+        if arches:
+            return arches
+
+    for value in (
+        manifest.get("architecture") if isinstance(manifest, dict) else None,
+        (manifest.get("config") or {}).get("architecture")
+        if isinstance(manifest, dict) and isinstance(manifest.get("config"), dict)
+        else None,
+        (inspect_info or {}).get("Architecture"),
+    ):
+        arch = normalize_oci_arch(value) if isinstance(value, str) else None
+        if arch is not None:
+            return {arch}
+    return set()
+
+
+def manifest_arches(reference: str) -> set[str] | None:
+    """Return Linux architectures advertised by an image manifest, or ``None`` on failure."""
+    try:
+        ref = _normalize_reference(reference)
+    except ValueError:
+        return None
+    if ref is None:
+        return None
+
+    skopeo = shutil.which("skopeo")
+    if not skopeo:
+        return None
+    transport_ref = _image_transport_ref(ref)
+    inspect_info: dict[str, Any] | None = None
+    digest: str | None = None
+    try:
+        inspect_info = json.loads(_run([skopeo, "inspect", "--no-tags", transport_ref]))
+        raw_digest = inspect_info.get("Digest") if isinstance(inspect_info, dict) else None
+        digest = str(raw_digest).strip() if raw_digest else None
+    except Exception:
+        inspect_info = None
+
+    if digest:
+        cached = _read_manifest_arch_cache(ref, digest)
+        if cached is not None:
+            return cached
+
+    try:
+        raw = _run([skopeo, "inspect", "--raw", transport_ref])
+        arches = _manifest_arches_from_raw(raw, inspect_info)
+    except Exception:
+        return None
+    if not arches:
+        return None
+    digest = digest or f"raw-{hashlib.sha256(raw.encode()).hexdigest()}"
+    _write_manifest_arch_cache(ref, digest, arches)
+    return arches
+
+
 def _inspect_oci(tools: ImageTools, reference: str, arch: str | None = None) -> ImageSpec:
     transport_ref = _image_transport_ref(reference)
     config = json.loads(
@@ -187,14 +313,12 @@ def _prepare_oci_image(
     reference: str | None, dockerfile: str | None, _context: str = "."
 ) -> PreparedImage:
     if dockerfile:
-        dockerfile_s = os.fspath(dockerfile)
-        context_s = os.fspath(_context)
-        raise RuntimeError(
-            "Dockerfile builds need a Dockerless builder such as buildah/buildkit; "
-            f"got {dockerfile_s!r} with context {context_s!r}; "
-            "image references and prebuilt templates do not require Docker"
-        )
-    reference = _normalize_reference(reference)
+        from .build import build_image
+
+        tag = _normalize_reference(reference) or "vmon-build:latest"
+        reference = build_image(Path(dockerfile), Path(_context), tag)
+    else:
+        reference = _normalize_reference(reference)
     if not reference:
         raise ValueError("provide an image reference")
     tools = detect_image_tools()
@@ -448,7 +572,6 @@ def cached_template(
             keep_running=False,
             disk_src=rootfs_ext4,
             snapshot_root=_state() / "templates",
-            allow_user_net=nic_slot,
         )
         marker.write_text(
             json.dumps(
@@ -486,6 +609,10 @@ def cached_template(
             )
             net.release_guest_config(vm_name)
     _index_cached_template(template, marker)
+    if dockerfile:
+        from .build import prune_build_layouts
+
+        prune_build_layouts(prepared.reference)
     return template
 
 
