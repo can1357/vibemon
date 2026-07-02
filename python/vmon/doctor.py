@@ -1,5 +1,6 @@
 """Diagnostic preflight checks for the local vmon developer environment."""
 
+import json
 import os
 import platform
 import shutil
@@ -9,9 +10,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
+
+from rich.table import Table
 
 from . import console as ui
-from .client import DaemonClient, DaemonError
+from .client import DaemonError, LocalTransport
+from .config import (
+    SERVE_CONFIG_KEYS,
+    ConfigError,
+    ServeConfig,
+    cli_option_for,
+    env_var_for,
+    resolve_serve_config,
+)
 from .image import detect_image_tools
 from .vmm import default_kernel, find_binary
 
@@ -223,7 +235,7 @@ def _check_daemon() -> Check:
             "daemon", "warn", f"vmond socket not present at {sock}", "run `vmon daemon start`"
         )
     try:
-        info = DaemonClient(sock_path=sock, autostart=False).call("info")
+        info = LocalTransport(sock_path=sock, autostart=False).call("info")
     except DaemonError as exc:
         return Check(
             "daemon",
@@ -292,8 +304,178 @@ def collect_checks() -> list[Check]:
     return checks
 
 
-def run_doctor() -> int:
+def _serve_value(key: str, config: ServeConfig) -> str:
+    value = getattr(config, key)
+    if key in {"token", "client_token"}:
+        return "<set>" if value else "unset"
+    if key in {"tls_cert", "tls_key"} and value is None:
+        return "unset"
+    if value is None:
+        return "auto"
+    if key == "warm_images":
+        if not value:
+            return "[]"
+        return ",".join(f"{item.ref}={item.count}" for item in value)
+    return str(value)
+
+
+def _render_serve_config(config: ServeConfig) -> None:
+    table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
+    table.add_column("KEY", style="vmon.command", no_wrap=True)
+    table.add_column("VALUE", overflow="fold")
+    table.add_column("SOURCE", no_wrap=True)
+    table.add_column("ENV", overflow="fold")
+    table.add_column("FLAG", overflow="fold")
+    for key in SERVE_CONFIG_KEYS:
+        table.add_row(
+            key,
+            _serve_value(key, config),
+            config.source(key),
+            env_var_for(key) or "-",
+            cli_option_for(key) or "-",
+        )
+    ui.console.print(table)
+
+
+def _expected_members_from_home(home: Path) -> int:
+    path = home.expanduser() / "mesh.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return 1
+    try:
+        return max(1, int(data.get("expected_members") or 1))
+    except TypeError, ValueError:
+        return 1
+
+
+def collect_serve_config_checks(config: ServeConfig) -> list[Check]:
+    """Validate the mesh/gateway configuration resolved for ``vmon serve``."""
+
+    checks: list[Check] = []
+    if config.token:
+        checks.append(Check("serve token", "ok", "operator bearer token configured"))
+    else:
+        checks.append(
+            Check(
+                "serve token",
+                "fail",
+                "missing operator bearer token",
+                "pass --token, set VMON_API_TOKEN, or set token in the config file",
+            )
+        )
+
+    if bool(config.tls_cert) == bool(config.tls_key):
+        detail = "disabled" if not config.tls_cert else "certificate and key configured"
+        checks.append(Check("serve TLS", "ok", detail))
+    else:
+        checks.append(
+            Check(
+                "serve TLS",
+                "fail",
+                "TLS cert/key must be configured together",
+                "set both tls_cert and tls_key, or neither",
+            )
+        )
+
+    if config.replicas > 0 and config.replicate_sec == 0:
+        checks.append(
+            Check(
+                "replication cadence",
+                "fail",
+                "replicas > 0 but replicate_sec is 0",
+                "set replicate_sec to a positive value, leave it unset for auto, or set replicas=0",
+            )
+        )
+    else:
+        cadence = (
+            "auto (60s when mesh is enabled)"
+            if config.replicate_sec is None
+            else f"{config.replicate_sec:g}s"
+        )
+        checks.append(Check("replication cadence", "ok", f"cadence={cadence}; K={config.replicas}"))
+
+    try:
+        from .mesh import default_advertise
+
+        advertise = default_advertise(config.host, config.port)
+        parsed = urlsplit(advertise)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port is None:
+            raise ValueError(advertise)
+        checks.append(Check("advertise URL", "ok", advertise))
+    except Exception as exc:
+        checks.append(
+            Check(
+                "advertise URL",
+                "fail",
+                f"could not derive a usable advertise URL: {exc}",
+                "set a concrete host/port or configure mesh setup with an explicit advertise URL",
+            )
+        )
+
+    expected_members = _expected_members_from_home(config.home)
+    quorum_on = config.restore_quorum_enabled(expected_members=expected_members)
+    if expected_members == 2:
+        checks.append(
+            Check(
+                "restore quorum",
+                "warn",
+                "2 expected members cannot form a post-failure majority; "
+                "quorum restore is off by default",
+                "use at least 3 expected members for quorum-gated restore",
+            )
+        )
+    elif quorum_on and expected_members < 3:
+        checks.append(
+            Check(
+                "restore quorum",
+                "warn",
+                f"forced on with only {expected_members} expected member(s)",
+                "use at least 3 expected members for quorum-gated restore",
+            )
+        )
+    else:
+        state = "on" if quorum_on else "off"
+        detail = f"{state}; expected_members={expected_members}"
+        checks.append(Check("restore quorum", "ok", detail))
+
+    bad_refs = [
+        item.ref
+        for item in config.warm_images
+        if not item.ref.strip() or any(ch.isspace() for ch in item.ref)
+    ]
+    if bad_refs:
+        checks.append(
+            Check(
+                "warm images",
+                "fail",
+                f"invalid image ref(s): {', '.join(bad_refs)}",
+                "use OCI refs without whitespace, e.g. alpine:latest=2",
+            )
+        )
+    else:
+        checks.append(Check("warm images", "ok", f"{len(config.warm_images)} configured"))
+
+    return checks
+
+
+def _run_serve_doctor(config_path: str | None) -> int:
+    try:
+        config = resolve_serve_config({"config": config_path})
+    except ConfigError as exc:
+        checks = [Check("serve config", "fail", str(exc))]
+        ui.doctor_table(checks)
+        return 1
+    _render_serve_config(config)
+    checks = collect_serve_config_checks(config)
+    ui.doctor_table(checks)
+    return 1 if any(check.status == "fail" for check in checks) else 0
+
+
+def run_doctor(*, serve: bool = False, config_path: str | None = None) -> int:
     """Render diagnostic checks and return a shell exit code for hard failures."""
+    if serve:
+        return _run_serve_doctor(config_path)
     checks = collect_checks()
     ui.doctor_table(checks)
     return 1 if any(check.status == "fail" for check in checks) else 0

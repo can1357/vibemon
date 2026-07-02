@@ -8,7 +8,7 @@ from starlette.testclient import TestClient
 
 
 class FakeSandbox:
-    calls = []
+    calls: list[dict[str, object]] = []
 
     def __init__(self, name, tags=None):
         self.name = name
@@ -140,6 +140,57 @@ def test_metrics_endpoint_returns_runtime_counters(client):
     assert response.status_code == 200
     assert response.json() == {"vcpu_exits": 7}
 
+def test_mesh_routes_accept_request_scoped_arch_without_leaking_to_local_create(
+    app, client, monkeypatch
+):
+    placements: list[dict[str, object]] = []
+    app.state.mesh.enabled = True
+
+    def place_local(params):
+        placements.append(dict(params))
+        return app.state.mesh.node_id
+
+    def run_success(params, **_kwargs):
+        return {"detached": bool(params.get("detach"))}
+
+    def restore_success(params, **_kwargs):
+        return {"detached": bool(params.get("detach"))}
+
+    def fork_success(params):
+        return [{"name": "clone-a"}]
+
+    monkeypatch.setattr(app.state.mesh, "place", place_local)
+    monkeypatch.setattr(app.state.supervisor._engine, "run", run_success)
+    monkeypatch.setattr(app.state.supervisor._engine, "restore", restore_success)
+    monkeypatch.setattr(app.state.supervisor._engine, "fork", fork_success)
+
+    create = client.post(
+        "/v1/sandboxes",
+        json={"template": "tpl", "name": "placed-create", "arch": "aarch64"},
+    )
+    run = client.post(
+        "/v1/run",
+        json={"image": "alpine:latest", "detach": True, "arch": "aarch64"},
+    )
+    restore = client.post(
+        "/v1/restore",
+        json={"snapshot": "snap-a", "detach": True, "arch": "aarch64"},
+    )
+    fork = client.post(
+        "/v1/fork",
+        json={"snapshot": "snap-a", "count": 1, "arch": "aarch64"},
+    )
+
+    assert create.status_code == 201
+    assert run.status_code == 200
+    assert restore.status_code == 200
+    assert fork.status_code == 200
+    assert [params["arch"] for params in placements] == ["aarch64"] * 4
+    assert [params["template"] for params in placements[:1]] == ["tpl"]
+    assert [params["image"] for params in placements[1:2]] == ["alpine:latest"]
+    assert [params["snapshot"] for params in placements[2:]] == ["snap-a", "snap-a"]
+    assert "arch" not in FakeSandbox.calls[-1]
+
 
 def test_bearer_auth_required_when_token_is_configured(monkeypatch):
     import vmon.server as server_mod
@@ -261,7 +312,7 @@ def test_events_stream_includes_created_event(app):
 
 
 def test_parse_warm_images_requires_explicit_count(monkeypatch):
-    from vmon.server import _parse_warm_images
+    from vmon.server.models import _parse_warm_images
 
     monkeypatch.delenv("VMON_WARM_POOL_SIZE", raising=False)
     # Bare refs keep their image tag and take the default count (1); a ':' is
@@ -278,9 +329,8 @@ def test_parse_warm_images_requires_explicit_count(monkeypatch):
     # Empty / missing input yields no pools.
     assert _parse_warm_images("") == []
     assert _parse_warm_images(None) == []
-    # The default count honors VMON_WARM_POOL_SIZE.
-    monkeypatch.setenv("VMON_WARM_POOL_SIZE", "5")
-    assert _parse_warm_images("busybox") == [("busybox", 5)]
+    # The default count is explicit; env overrides are resolved in vmon.config.
+    assert _parse_warm_images("busybox", default_count=5) == [("busybox", 5)]
     # Negative or non-integer counts are rejected.
     with pytest.raises(ValueError):
         _parse_warm_images("alpine=-1")

@@ -25,6 +25,15 @@ __all__ = [
     "RemoteFunction",
     "RemoteFunctionError",
     "function",
+    "connect",
     "find_binary",
     "default_kernel",
 ]
+
+
+def __getattr__(name: str):
+    if name == "connect":
+        from .remote import connect
+
+        return connect
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

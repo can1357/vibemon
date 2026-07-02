@@ -9,7 +9,6 @@ from disk on restart.
 Wire protocol (one request per connection)::
 
     daemon -> {"vmond": <version>, "api": 1}                       # banner
-    client -> {"auth": "<token>"}                                 # TCP only
     client -> {"id": 1, "method": "ps", "params": {}}
     daemon -> {"id": 1, "event": "stdout", "data": "<base64>"}    # 0+ stream frames
     daemon -> {"id": 1, "ok": true, "result": {...}}              # final frame
@@ -117,25 +116,16 @@ def _emitter(conn: _Conn, rid: Any) -> Callable[[str, bytes], None]:
 class Daemon:
     """Accept loop + request dispatcher over one shared :class:`Engine`.
 
-    Bind a Unix socket (and optionally a TCP socket for remote clients) and serve
-    until :meth:`shutdown`. One thread per connection; handler exceptions become
-    an error frame and never take down the daemon.
+    Bind the owner Unix socket and serve until :meth:`shutdown`. One thread per
+    connection; handler exceptions become an error frame and never take down
+    the daemon.
     """
 
-    def __init__(
-        self,
-        engine: Engine,
-        *,
-        sock_path: str | os.PathLike[str],
-        tcp_addr: tuple[str, int] | None = None,
-        token: str | None = None,
-    ) -> None:
+    def __init__(self, engine: Engine, *, sock_path: str | os.PathLike[str]) -> None:
         self._engine = engine
         self._sock_path = Path(sock_path)
-        self._tcp_addr = tcp_addr
-        self._token = token
         self._stop = threading.Event()
-        self._listeners: list[tuple[socket.socket, bool]] = []
+        self._listeners: list[socket.socket] = []
         self._dispatch: dict[str, Callable[[_Conn, Any, dict[str, Any]], None]] = {
             "ping": self._h_ping,
             "info": self._h_info,
@@ -166,9 +156,9 @@ class Daemon:
         self._open_listeners()
         threads = [
             threading.Thread(
-                target=self._accept_loop, args=(sock, is_tcp), name="vmond-accept", daemon=True
+                target=self._accept_loop, args=(sock,), name="vmond-accept", daemon=True
             )
-            for sock, is_tcp in self._listeners
+            for sock in self._listeners
         ]
         for thread in threads:
             thread.start()
@@ -198,16 +188,10 @@ class Daemon:
         uds.bind(str(self._sock_path))
         os.chmod(self._sock_path, 0o600)
         uds.listen(128)
-        self._listeners.append((uds, False))
-        if self._tcp_addr is not None:
-            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            tcp.bind(self._tcp_addr)
-            tcp.listen(128)
-            self._listeners.append((tcp, True))
+        self._listeners.append(uds)
 
     def _close_listeners(self) -> None:
-        for sock, _ in self._listeners:
+        for sock in self._listeners:
             try:
                 sock.close()
             except OSError:
@@ -218,40 +202,25 @@ class Daemon:
         except FileNotFoundError:
             pass
 
-    def _accept_loop(self, listener: socket.socket, is_tcp: bool) -> None:
+    def _accept_loop(self, listener: socket.socket) -> None:
         while not self._stop.is_set():
             try:
                 client, _ = listener.accept()
             except OSError:
                 return
             threading.Thread(
-                target=self._handle, args=(client, is_tcp), name="vmond-conn", daemon=True
+                target=self._handle, args=(client,), name="vmond-conn", daemon=True
             ).start()
 
     # -- connection handling ------------------------------------------------
 
-    def _handle(self, client: socket.socket, is_tcp: bool) -> None:
+    def _handle(self, client: socket.socket) -> None:
         conn = _Conn(client)
         try:
             conn.send({"vmond": __version__, "api": API_VERSION})
             req = conn.read_obj()
             if req is None:
                 return
-            if is_tcp:
-                # TCP connections always lead with an auth frame so a tokenless
-                # daemon and a token-protected one share one wire shape.
-                if self._token is not None and req.get("auth") != self._token:
-                    conn.send(
-                        {
-                            "id": req.get("id"),
-                            "ok": False,
-                            "error": {"code": "unauthorized", "message": "invalid token"},
-                        }
-                    )
-                    return
-                req = conn.read_obj()
-                if req is None:
-                    return
             self._serve_request(conn, req)
         except Exception:
             pass
@@ -533,9 +502,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         paths["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
         engine = Engine()
-        token = os.environ.get("VMON_API_TOKEN")
-        tcp_addr = parse_tcp_addr(os.environ.get("VMON_DAEMON_TCP"))
-        daemon = Daemon(engine, sock_path=paths["sock"], tcp_addr=tcp_addr, token=token)
+        daemon = Daemon(engine, sock_path=paths["sock"])
 
         def _signal(_signum: int, _frame: Any) -> None:
             daemon.shutdown()
@@ -551,16 +518,6 @@ def main(argv: list[str] | None = None) -> int:
                 pass
         release_owner_lock(lock_fd)
     return 0
-
-
-def parse_tcp_addr(value: str | None) -> tuple[str, int] | None:
-    """Parse ``host:port`` for the optional remote TCP listener (``VMON_DAEMON_TCP``)."""
-    if not value:
-        return None
-    host, _, port = value.rpartition(":")
-    if not host or not port.isdigit():
-        raise ValueError(f"invalid VMON_DAEMON_TCP {value!r}; expected host:port")
-    return (host, int(port))
 
 
 if __name__ == "__main__":

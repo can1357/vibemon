@@ -84,15 +84,11 @@ class Control:
     def resume(self) -> dict[str, Any]:
         return self._request("resume")
 
-    def snapshot(
-        self, name: str, base: str | None = None, allow_user_net: bool = False
-    ) -> dict[str, Any]:
+    def snapshot(self, name: str, base: str | None = None) -> dict[str, Any]:
         """Snapshot guest state into ``name``; with ``base`` write a delta against it."""
         params: dict[str, Any] = {"name": name}
         if base is not None:
             params["base"] = base
-        if allow_user_net:
-            params["allow_user_net"] = True
         return self._request("snapshot", params)
 
     def extend(self, secs: int) -> dict[str, Any]:
