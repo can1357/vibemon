@@ -80,6 +80,14 @@ def register_api_routes(
     _idempotent_run_create = idem.run_create
     _idempotent_restore_create = idem.restore_create
 
+    @app.get("/healthz")
+    async def healthz() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.get("/metrics", dependencies=[Depends(require_auth)])
+    async def metrics() -> PlainTextResponse:
+        return PlainTextResponse(supervisor.metrics_text(), media_type="text/plain; version=0.0.4")
+
     async def proxy_ws_owner(websocket: WebSocket, sandbox_id: str) -> bool:
         return await proxy.proxy_ws_owner(ctx, websocket, sandbox_id)
 

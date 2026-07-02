@@ -136,7 +136,7 @@ def vm_table(rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def mesh_table(status: Mapping[str, Any]) -> None:
-    """Render mesh member health, capacity, ownership, and warm-pool counts."""
+    """Render mesh member health, capacity, ownership, warm pools, and RPO age."""
     table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0), header_style="vmon.title")
     table.add_column("NODE", style="vmon.command", no_wrap=True)
     table.add_column("ADVERTISE", overflow="fold")
@@ -164,6 +164,41 @@ def mesh_table(status: Mapping[str, Any]) -> None:
             str(sum(int(value) for value in (node.get("pools") or {}).values())),
         )
     console.print(table)
+
+    sandbox_rows = (status.get("self") or {}).get("sandboxes") or []
+    if not sandbox_rows:
+        return
+    sandboxes = Table(
+        box=None,
+        pad_edge=False,
+        padding=(0, 2, 0, 0),
+        header_style="vmon.title",
+    )
+    sandboxes.add_column("SANDBOX", style="vmon.command", no_wrap=True)
+    sandboxes.add_column("TIER", no_wrap=True)
+    sandboxes.add_column("CHECKPOINT", no_wrap=True)
+    for sandbox in sandbox_rows:
+        sandboxes.add_row(
+            str(sandbox.get("id") or "-"),
+            str(sandbox.get("ha") or "off"),
+            _format_checkpoint_age(sandbox.get("checkpoint_age_sec")),
+        )
+    console.print(sandboxes)
+
+
+def _format_checkpoint_age(age: Any) -> str:
+    if isinstance(age, bool) or not isinstance(age, int | float):
+        return "never"
+    seconds = max(0, int(age))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
 
 
 def context_table(contexts: Sequence[Any], current: str | None) -> None:

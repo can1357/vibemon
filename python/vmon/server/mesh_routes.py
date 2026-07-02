@@ -112,9 +112,40 @@ def register_mesh_routes(
         mesh.leave()
         return {"ok": True, "drained": drained}
 
+    def _sandbox_status_rows() -> list[dict[str, Any]]:
+        now = time.time()
+        rows: list[dict[str, Any]] = []
+        for record in supervisor.list():
+            if record.status == "terminated":
+                continue
+            sid = str(record.id)
+            ha = str(record.detail.get("ha") or "off")
+            restart_policy = str(record.detail.get("restart_policy") or "none")
+            checkpoint_at = ctx.checkpoint_times.get(sid)
+            checkpoint_age_sec = (
+                max(0.0, now - float(checkpoint_at))
+                if ha != "off" and checkpoint_at is not None
+                else None
+            )
+            rows.append(
+                {
+                    "id": sid,
+                    "ha": ha,
+                    "restart_policy": restart_policy,
+                    "checkpoint_age_sec": checkpoint_age_sec,
+                    "replicas": mesh.replica_targets(sid, ctx.config.replicas)
+                    if ha != "off"
+                    else [],
+                }
+            )
+        return rows
+
     @app.get("/v1/mesh/status", dependencies=[Depends(require_auth)])
     async def mesh_status() -> dict[str, Any]:
         status_payload = mesh.status()
+        self_status = dict(status_payload.get("self") or {})
+        self_status["sandboxes"] = _sandbox_status_rows()
+        status_payload["self"] = self_status
         status_payload["replicas_held"] = len(app.state.replica_store.list())
         return status_payload
 
@@ -301,8 +332,10 @@ def register_mesh_routes(
             record = CreateRecord.from_wire(body)
         except (TypeError, ValueError) as exc:
             raise coded_http(status.HTTP_400_BAD_REQUEST, "invalid", str(exc)) from exc
-        record_store.put(record)
-        mesh.record_owner(record.sid, record.owner, record.epoch)
+        existing = record_store.get(record.sid)
+        if existing is None or record.epoch >= existing.epoch:
+            record_store.put(record)
+            mesh.record_owner(record.sid, record.owner, record.epoch)
         return {"ok": True}
 
     @app.post("/v1/mesh/record/remove", dependencies=[Depends(require_auth)])

@@ -100,6 +100,7 @@ def create_app(
     app.state.record_store = record_store
     app.state.lease_manager = lease_manager
     app.state.config = config
+    app.state.checkpoint_times = ctx.checkpoint_times
 
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(
@@ -142,6 +143,15 @@ def serve(
                 "vmon serve requires the server extra: pip install 'vmon[server]'"
             ) from exc
         raise
+
+    # Surface vmon.* application logs (reconciler decisions, lease/fence events)
+    # alongside uvicorn's access log; without this a gateway is operationally mute.
+    import logging
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
 
     if config is None:
         config = resolve_serve_config(
