@@ -59,8 +59,8 @@ async def _proxy_http_request(request: Request, target: tuple[str, int], rest: s
     try:
         reader, writer = await asyncio.open_connection(host, port)
     except OSError as exc:
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY, detail=f"tunnel connect failed: {exc}"
+        raise coded_http(
+            status.HTTP_502_BAD_GATEWAY, "unreachable", f"tunnel connect failed: {exc}"
         ) from exc
     path = "/" + rest.lstrip("/")
     query = _target_query(list(request.query_params.multi_items()))
@@ -225,6 +225,16 @@ def _mesh_http_status(exc: MeshError) -> int:
         "unplaceable": status.HTTP_409_CONFLICT,
         "arch_required": status.HTTP_422_UNPROCESSABLE_CONTENT,
     }.get(exc.code, status.HTTP_400_BAD_REQUEST)
+
+
+def coded_http(status_code: int, code: str, message: str) -> HTTPException:
+    """Build an HTTPException whose detail carries a machine-readable code."""
+    return HTTPException(status_code, detail={"code": code, "message": message})
+
+
+def mesh_http_exception(exc: MeshError) -> HTTPException:
+    """Map a MeshError to a coded HTTPException (status from the error code)."""
+    return coded_http(_mesh_http_status(exc), exc.code, exc.message)
 
 
 def _split_http_authority(url: str) -> tuple[str, int, bool]:
