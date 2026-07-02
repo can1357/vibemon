@@ -1,8 +1,8 @@
-"""Volume (stateful) HA: checkpoint capture + collision/quorum-guarded restore.
+"""Volume (stateful) HA: checkpoint capture + collision-safe restore.
 
 Engine-level unit tests with no hypervisor. They exercise the capture, coercion,
 and restore guards that keep cross-node volume replication from clobbering an
-unrelated local volume or creating two divergent writers under a partition.
+unrelated local volume; quorum leases enforce writable single-writer safety above this layer.
 """
 
 from __future__ import annotations
@@ -88,29 +88,33 @@ def test_materialize_read_only_without_quorum(engine: Engine, tmp_path: Path) ->
     assert created == [volume_mod.VOLUME_DIR / "rovol"]
 
 
-def test_materialize_writable_requires_quorum(engine: Engine, tmp_path: Path) -> None:
+def test_materialize_writable_without_restore_quorum(engine: Engine, tmp_path: Path) -> None:
     tmpl = tmp_path / "tmpl"
     _stage(tmpl, "rwvol", "RW")
     params = {"volumes": {"/data": {"name": "rwvol", "read_only": False}}}
-    with pytest.raises(Unsupported, match="without restore quorum"):
-        engine.materialize_volumes(str(tmpl), params, quorum_ok=False)
-    assert not (volume_mod.VOLUME_DIR / "rwvol").exists()  # nothing materialized on refusal
-    engine.materialize_volumes(str(tmpl), params, quorum_ok=True)
+
+    created = engine.materialize_volumes(str(tmpl), params, quorum_ok=False)
+
+    assert created == [volume_mod.VOLUME_DIR / "rwvol"]
     assert (volume_mod.VOLUME_DIR / "rwvol" / "sentinel.txt").read_text() == "RW"
 
 
 def test_materialize_writable_if_any_mountpoint_rw(engine: Engine, tmp_path: Path) -> None:
     tmpl = tmp_path / "tmpl"
     _stage(tmpl, "mixed", "X")
-    # Same volume mounted RO at /a and RW at /b -> writable -> needs quorum.
+    # Same volume mounted RO at /a and RW at /b is still copied once; the
+    # quorum lease service, not restore quorum, owns single-writer exclusion.
     params = {
         "volumes": {
             "/a": {"name": "mixed", "read_only": True},
             "/b": {"name": "mixed", "read_only": False},
         }
     }
-    with pytest.raises(Unsupported, match="without restore quorum"):
-        engine.materialize_volumes(str(tmpl), params, quorum_ok=False)
+
+    created = engine.materialize_volumes(str(tmpl), params, quorum_ok=False)
+
+    assert created == [volume_mod.VOLUME_DIR / "mixed"]
+    assert (volume_mod.VOLUME_DIR / "mixed" / "sentinel.txt").read_text() == "X"
 
 
 def test_materialize_refuses_name_collision(engine: Engine, tmp_path: Path) -> None:

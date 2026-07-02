@@ -10,6 +10,8 @@ pytest.importorskip("fastapi")
 from starlette.responses import Response
 from starlette.testclient import TestClient
 
+import vmon.server.proxy as server_proxy
+import vmon.server.templates as server_templates
 from vmon.image import _TEMPLATE_BOOT_VERSION
 from vmon.mesh import (
     Mesh,
@@ -63,6 +65,13 @@ class FakeTransport:
         if response.status_code >= 400:
             raise MeshError(response.text)
         return response.json() if response.content else {}
+
+
+@pytest.fixture(autouse=True)
+def _disable_manifest_network(monkeypatch):
+    import vmon.mesh as mesh_mod
+
+    monkeypatch.setattr(mesh_mod, "manifest_arches", lambda ref: None)
 
 
 class FakeSandbox:
@@ -222,15 +231,15 @@ def test_request_template_key_distinguishes_networked_and_block_network(monkeypa
     # block-network is cross-node pull-warm on any platform (plain template).
     block = request_template_key({"image": "img", "block_network": True})
     assert block is not None and block.endswith("|n0|t0")
-    # A networked request is pull-warm only via the Linux TAP flavor...
-    monkeypatch.setattr(mesh_mod.platform, "system", lambda: "Linux")
-    networked = request_template_key({"image": "img", "block_network": False})
-    assert networked is not None and networked.endswith("|n0|t1")
-    # ...while macOS user-net networked warm stays single-node (not pull-warm).
     monkeypatch.setattr(mesh_mod.platform, "system", lambda: "Darwin")
-    assert request_template_key({"image": "img", "block_network": False}) is None
-    # Networked requests are not pool-claim eligible (no per-clone TAP yet), and
-    # volume / fs_dir requests still need a local image and are not pull-warm.
+    darwin_networked = request_template_key({"image": "img", "block_network": False})
+    assert darwin_networked is not None and darwin_networked.endswith("|n1|t0")
+    monkeypatch.setattr(mesh_mod.platform, "system", lambda: "Linux")
+    linux_networked = request_template_key({"image": "img", "block_network": False})
+    assert linux_networked is not None and linux_networked.endswith("|n0|t1")
+    # Networked requests are not pool-claim eligible (Linux needs a per-clone TAP;
+    # macOS user-net uses a distinct nic-slot flavor), and volume / fs_dir requests
+    # still need a local image and are not pull-warm.
     assert pool_eligible({"image": "img", "block_network": False}) is False
     assert request_template_key({"image": "img", "fs_dir": "/x"}) is None
     assert request_template_key({"image": "img", "volumes": {"/a": "v"}}) is None
@@ -408,6 +417,205 @@ def test_zero_config_warm_named_claims_and_backend_filter(tmp_path):
     assert snap == {"warm"}
 
 
+def test_explicit_arch_places_different_arch_peer_without_manifest(monkeypatch, tmp_path):
+    import vmon.mesh as mesh_mod
+
+    def fail_inspection(ref):
+        raise AssertionError(f"manifest inspection should not run for explicit arch: {ref}")
+
+    monkeypatch.setattr(mesh_mod, "manifest_arches", fail_inspection)
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    now = time.time()
+    mesh.register(
+        NodeState(
+            "arm",
+            "http://arm",
+            backend="kvm",
+            arch="aarch64",
+            caps=NodeCaps(8, 4096),
+            last_seen=now,
+        )
+    )
+
+    req = {"image": "img:latest", "arch": "aarch64"}
+    assert {node.node_id for node in mesh.candidates(req)} == {"arm"}
+    assert mesh.place(req) == "arm"
+
+
+def test_create_with_explicit_arch_proxies_to_matching_different_arch(monkeypatch, tmp_path):
+    import vmon.server as server_mod
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    captured: dict[str, object] = {}
+
+    class RecordingSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, **kwargs):
+            captured.update(kwargs)
+            return super().create(**kwargs)
+
+    monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: RecordingSandbox))
+    app_a = server_mod.create_app(token="secret")
+    app_b = server_mod.create_app(token="secret")
+    transport = FakeTransport()
+    app_a.state.mesh.transport = transport
+    app_b.state.mesh.transport = transport
+    app_a.state.mesh.node_id = "A"
+    app_b.state.mesh.node_id = "B"
+    app_a.state.mesh.arch = "x86_64"
+    app_b.state.mesh.arch = "aarch64"
+    app_a.state.mesh.state_path = tmp_path / "a-mesh.json"
+    app_b.state.mesh.state_path = tmp_path / "b-mesh.json"
+    app_a.state.mesh.setup("http://a")
+    app_b.state.mesh.setup("http://b")
+
+    with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+        transport.clients = {"http://a": client_a, "http://b": client_b}
+        state_b = app_b.state.mesh.self_state()
+        state_b.last_seen = time.time()
+        app_a.state.mesh.register(state_b)
+
+        response = client_a.post(
+            "/v1/sandboxes",
+            json={"image": "img:latest", "name": "arm-sb", "arch": "aarch64"},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["id"] == "arm-sb"
+        assert app_a.state.mesh.owner_of("arm-sb") == "B"
+        assert app_b.state.supervisor._engine.get("arm-sb").id == "arm-sb"
+        assert "arch" not in captured
+
+
+def test_manifest_derived_arches_expand_fresh_boot_candidates(monkeypatch, tmp_path):
+    import vmon.mesh as mesh_mod
+
+    monkeypatch.setattr(mesh_mod, "manifest_arches", lambda ref: {"amd64", "arm64"})
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    now = time.time()
+    for node_id, arch in (("x86", "x86_64"), ("arm", "aarch64")):
+        mesh.register(
+            NodeState(
+                node_id,
+                f"http://{node_id}",
+                backend="kvm",
+                arch=arch,
+                caps=NodeCaps(8, 4096),
+                last_seen=now,
+            )
+        )
+
+    candidates = {node.node_id for node in mesh.candidates({"image": "multi:latest"})}
+    assert candidates == {"self", "x86", "arm"}
+
+
+def test_manifest_failure_on_homogeneous_live_arch_is_unambiguous(tmp_path):
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    mesh.register(
+        NodeState(
+            "peer",
+            "http://peer",
+            backend="kvm",
+            arch="x86_64",
+            caps=NodeCaps(8, 4096),
+            last_seen=time.time(),
+        )
+    )
+
+    assert {node.node_id for node in mesh.candidates({"image": "unknown:latest"})} == {
+        "self",
+        "peer",
+    }
+
+
+def test_manifest_failure_on_mixed_arch_mesh_requires_selector(tmp_path):
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+    mesh.register(
+        NodeState(
+            "arm",
+            "http://arm",
+            backend="kvm",
+            arch="aarch64",
+            caps=NodeCaps(8, 4096),
+            last_seen=time.time(),
+        )
+    )
+
+    with pytest.raises(MeshError) as excinfo:
+        mesh.place({"image": "unknown:latest"})
+
+    assert excinfo.value.code == "arch_required"
+    assert "cannot derive image arch" in excinfo.value.message
+    assert "pass arch=" in excinfo.value.message
+
+
+def test_explicit_arch_without_live_match_is_unplaceable(tmp_path):
+    mesh = Mesh(
+        FakeEngine(),
+        advertise="http://self",
+        token="t",
+        transport=FakeTransport(),
+        caps=NodeCaps(2, 1024),
+        backend="kvm",
+        arch="x86_64",
+        state_path=tmp_path / "mesh.json",
+    )
+    mesh.node_id = "self"
+    mesh.enabled = True
+
+    with pytest.raises(MeshError) as excinfo:
+        mesh.place({"image": "img:latest", "arch": "aarch64"})
+
+    assert excinfo.value.code == "unplaceable"
+    assert "aarch64" in excinfo.value.message
+    assert "x86_64" in excinfo.value.message
+
+
 def test_join_blob_round_trip_and_invalid():
     assert decode_blob(encode_blob("http://node", "tok")) == ("http://node", "tok")
     with pytest.raises(MeshError):
@@ -470,7 +678,7 @@ def test_two_node_create_proxy_list_and_per_sandbox_proxy(monkeypatch, tmp_path)
         )
         return Response(response.content, status_code=response.status_code)
 
-    monkeypatch.setattr(server_mod, "_proxy_to_peer", fake_proxy)
+    monkeypatch.setattr(server_proxy, "_proxy_to_peer", fake_proxy)
     with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
         transport.clients = {"http://a": client_a, "http://b": client_b}
         state_b = app_b.state.mesh.self_state()
@@ -714,12 +922,11 @@ def test_two_node_create_pulls_peer_template_by_digest(monkeypatch, tmp_path):
 
 
 def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
-    import vmon.server as server_mod
     from vmon import cas
 
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     _digest, _key = _write_indexed_template(tmp_path / "peer-template", image="ubuntu:latest")
-    archive = server_mod._template_archive(tmp_path / "peer-template")
+    archive = server_templates._template_archive(tmp_path / "peer-template")
     body = archive.read_bytes()
     archive.unlink()
     requested = "0" * 64
@@ -732,7 +939,9 @@ def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
             return MeshHTTPStream(response)
 
     with pytest.raises(ValueError):
-        asyncio.run(server_mod.pull_template(StaticMeshHTTP(), "http://peer", requested, "secret"))
+        asyncio.run(
+            server_templates.pull_template(StaticMeshHTTP(), "http://peer", requested, "secret")
+        )
 
     assert cas.resolve_digest(requested) is None
     templates = tmp_path / "templates"
@@ -741,24 +950,22 @@ def test_pull_template_rejects_digest_mismatch(monkeypatch, tmp_path):
 
 def test_cli_client_selection(monkeypatch, tmp_path):
     from vmon import cli
-    from vmon.client import DaemonClient, GatewayClient
+    from vmon.client import LocalTransport
 
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
+    monkeypatch.delenv("VMON_CONTEXT", raising=False)
     monkeypatch.setenv("VMON_API_TOKEN", "secret")
-    assert isinstance(cli._client(), DaemonClient)
+    assert isinstance(cli._client(), LocalTransport)
 
-    monkeypatch.setenv("VMON_SERVER", "http://gw")
-    assert isinstance(cli._client(), GatewayClient)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
+    # A node-local mesh.json no longer redirects the CLI; contexts are the only
+    # non-local transport.
     (tmp_path / "mesh.json").write_text(
         json.dumps({"enabled": True, "advertise": "http://mesh"}), encoding="utf-8"
     )
-    assert isinstance(cli._client(), GatewayClient)
+    assert isinstance(cli._client(), LocalTransport)
 
 
-class RecordingGatewayClient:
+class RecordingGateway:
     def __init__(self):
         self.calls = []
 
@@ -780,20 +987,20 @@ class RecordingGatewayClient:
 
 
 def test_gateway_call_mapping():
-    from vmon.client import GatewayClient
+    from vmon.client import _Gateway
 
-    client = RecordingGatewayClient()
-    assert GatewayClient.call(client, "ps")["vms"][0]["name"] == "sb"
-    GatewayClient.call(client, "rm", name="sb")
-    GatewayClient.call(client, "snapshot", name="sb", snapshot="snap", stop=True)
+    client = RecordingGateway()
+    assert _Gateway.call(client, "ps")["vms"][0]["name"] == "sb"
+    _Gateway.call(client, "rm", name="sb")
+    _Gateway.call(client, "snapshot", name="sb", snapshot="snap", stop=True)
     assert ("DELETE", "/v1/sandboxes/sb/remove", None) in client.calls
     assert (
         "POST",
         "/v1/sandboxes/sb/snapshot_template",
         {"snapshot": "snap", "stop": True},
     ) in client.calls
-    GatewayClient.call(client, "fs_list", name="sb", path="/etc")
-    GatewayClient.call(client, "fs_stat", name="sb", path="/etc/hosts")
+    _Gateway.call(client, "fs_list", name="sb", path="/etc")
+    _Gateway.call(client, "fs_stat", name="sb", path="/etc/hosts")
     assert ("GET", "/v1/sandboxes/sb/fs/list?path=%2Fetc", None) in client.calls
     assert ("GET", "/v1/sandboxes/sb/fs/stat?path=%2Fetc%2Fhosts", None) in client.calls
 
@@ -961,21 +1168,20 @@ def test_placement_is_backend_and_arch_compatible(tmp_path):
     for peer in (wrong_backend, wrong_arch, compatible):
         mesh.register(peer)
 
-    # Warm-pool image request: arch must match, but the backend need not — each
-    # node serves the image from its own backend-appropriate pool, so an opposite-
-    # backend node with ready clones is a valid (and warm) candidate. Only the
-    # wrong-arch node (incompatible kernel + agent) drops out.
-    warm_req = {"image": "img:x", "pool_size": 1, "block_network": True}
+    # Warm-pool image request with an explicit x86 selector: backend need not
+    # match because each node serves its own backend-appropriate pool, but arch
+    # is request-scoped and excludes the aarch64 pool.
+    warm_req = {"image": "img:x", "pool_size": 1, "block_network": True, "arch": "x86_64"}
     assert {n.node_id for n in mesh.candidates(warm_req)} == {"self", "kvmnode", "hvfnode"}
     assert mesh.place(warm_req) in {"kvmnode", "hvfnode"}
 
-    # Snapshot request: only a compatible node carrying the template qualifies.
+    # Snapshot request: only a same-backend, same-arch, CPU-covered node carrying
+    # the template qualifies.
     assert {n.node_id for n in mesh.candidates({"snapshot": "snap1"})} == {"kvmnode"}
 
-    # Plain image boot: arch must match (kernel + injected agent are arch-specific),
-    # but the backend need not — a fresh boot runs under either hypervisor. So the
-    # wrong-arch node drops out while the wrong-backend (same-arch) node stays in.
-    plain = {n.node_id for n in mesh.candidates({"image": "plain"})}
+    # Plain image boot with the same explicit selector is not backend-bound, so
+    # the opposite-backend x86 node stays in while the arm node drops out.
+    plain = {n.node_id for n in mesh.candidates({"image": "plain", "arch": "x86_64"})}
     assert plain == {"self", "hvfnode", "kvmnode"}
     assert "armnode" not in plain
 
@@ -1013,7 +1219,7 @@ def test_two_node_migration_moves_sandbox_and_converges(monkeypatch, tmp_path):
         )
         return Response(response.content, status_code=response.status_code)
 
-    monkeypatch.setattr(server_mod, "_proxy_to_peer", fake_proxy)
+    monkeypatch.setattr(server_proxy, "_proxy_to_peer", fake_proxy)
     digest, _key = _write_indexed_template(tmp_path / "ckpt", image="img")
 
     def fake_prepare(self, name):

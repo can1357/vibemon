@@ -1,4 +1,4 @@
-"""Real-socket MeshClient failover integration tests using stub HTTP servers.
+"""Real-socket MeshTransport failover integration tests using stub HTTP servers.
 
 These tests exercise the real urllib-backed client and CLI against lightweight
 stdlib HTTP servers. They are not a hypervisor multi-host end-to-end test.
@@ -15,7 +15,7 @@ import pytest
 from click.testing import CliRunner
 
 from vmon import cli
-from vmon.client import DaemonError, MeshClient
+from vmon.client import DaemonError, MeshTransport
 from vmon.context import ContextStore, contexts_path
 
 
@@ -39,8 +39,11 @@ def _handler(node_id: str, roster: list[str]) -> type[BaseHTTPRequestHandler]:
                 return self._send(
                     {
                         "node_id": node_id,
-                        "self": {"advertise": roster[0]},
-                        "peers": [{"advertise": peer, "healthy": True} for peer in roster[1:]],
+                        "self": {"advertise": roster[0], "arch": "x86_64"},
+                        "peers": [
+                            {"advertise": peer, "healthy": True, "arch": "x86_64"}
+                            for peer in roster[1:]
+                        ],
                     }
                 )
             if self.path.startswith("/v1/sandboxes"):
@@ -91,7 +94,7 @@ def server(node_id: str, roster: list[str]):
 def test_meshclient_fails_over_to_live_socket() -> None:
     with server("A", []) as (url_a, srv_a), server("B", []) as (url_b, _srv_b):
         captured: list[list[str]] = []
-        mc = MeshClient([url_a, url_b], "tok", on_roster=captured.append)
+        mc = MeshTransport([url_a, url_b], "tok", on_roster=captured.append)
 
         assert mc.call("ps")["vms"][0]["node"] == "A"
 
@@ -106,7 +109,7 @@ def test_meshclient_all_endpoints_down_raises() -> None:
         _stop_server(srv)
 
         with pytest.raises(DaemonError) as excinfo:
-            MeshClient([dead_url], "tok").call("ps")
+            MeshTransport([dead_url], "tok").call("ps")
 
         assert excinfo.value.code == "unreachable"
 
@@ -115,9 +118,11 @@ def test_meshclient_single_live_probes_then_runs_once() -> None:
     with server("A", []) as (dead_url, srv_a), server("B", []) as (url_b, _srv_b):
         _stop_server(srv_a)
 
-        result = MeshClient([dead_url, url_b], "tok").call("extend", name="x", secs=5)
+        result = MeshTransport([dead_url, url_b], "tok").call("extend", name="x", secs=5)
 
         assert result == {"served_by": "B"}
+
+
 
 
 def test_context_create_over_real_socket(tmp_path, monkeypatch) -> None:
@@ -136,3 +141,4 @@ def test_context_create_over_real_socket(tmp_path, monkeypatch) -> None:
         ctx = store.get("prod")
         assert ctx is not None
         assert ctx.endpoints == [url_a, url_b]
+        assert "endpoint_arches" not in contexts_path(tmp_path).read_text(encoding="utf-8")

@@ -1,7 +1,7 @@
 """CLI tests: Modal-style help rendering, argument parsing, and command routing.
 
 These exercise :mod:`vmon.cli` against a recording fake of
-:class:`vmon.client.DaemonClient`, so no daemon or VM is involved — they assert
+:class:`vmon.client.LocalTransport`, so no daemon or VM is involved — they assert
 how the CLI parses args and which daemon method/params it would send.
 """
 
@@ -17,7 +17,7 @@ import vmon.doctor as doctor
 
 
 class RecordingClient:
-    """Stand-in for ``DaemonClient`` that records the last request it received."""
+    """Stand-in for ``LocalTransport`` that records the last request it received."""
 
     last: dict[str, object] = {}
     returncode = 0
@@ -46,7 +46,7 @@ class RecordingClient:
     def interactive(self, method, on_event, *, tty=True, on_ready=None, **params):
         RecordingClient.last = {"method": method, "params": params, "tty": tty}
         if on_ready is not None:
-            on_ready("vm")
+            on_ready()
         return {"returncode": RecordingClient.returncode, "name": "vm"}
 
     def ensure_running(self):
@@ -58,7 +58,7 @@ class RecordingClient:
 
 @pytest.fixture
 def rec(monkeypatch):
-    monkeypatch.setattr(cli, "DaemonClient", RecordingClient)
+    monkeypatch.setattr(cli, "LocalTransport", RecordingClient)
     RecordingClient.last = {}
     RecordingClient.returncode = 0
     return RecordingClient
@@ -130,11 +130,87 @@ def test_run_without_image_is_usage_error(rec, capsys):
     assert "image" in capsys.readouterr().err.lower()
 
 
-def test_run_dockerfile_fails_before_rpc(rec, capsys):
-    assert cli.main(["run", "-f", "Dockerfile"]) == 2
-    err = capsys.readouterr().err
-    assert "Dockerfile builds are not supported" in err
+def test_run_dockerfile_builds_locally_before_rpc(rec, monkeypatch, tmp_path):
+    import vmon.build as build
+
+    dockerfile = tmp_path / "Dockerfile"
+    context = tmp_path / "context"
+    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+    context.mkdir()
+    calls: list[tuple[object, object, str]] = []
+
+    def fake_build_image(dockerfile_arg, context_arg, tag):
+        calls.append((dockerfile_arg, context_arg, tag))
+        return "oci:/tmp/vmon-build:runner"
+
+    monkeypatch.setattr(build, "build_image", fake_build_image)
+
+    assert (
+        cli.main(
+            [
+                "run",
+                "-f",
+                str(dockerfile),
+                "--context",
+                str(context),
+                "runner",
+                "--",
+                "echo",
+                "hi",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [(dockerfile, context, "runner")]
+    assert rec.last["method"] == "run"
+    assert rec.last["params"]["image"] == "oci:/tmp/vmon-build:runner"
+    assert rec.last["params"]["dockerfile"] is None
+    assert rec.last["params"]["context"] == str(context)
+    assert rec.last["params"]["cmd"] == ["echo", "hi"]
+
+
+def test_run_dockerfile_rejects_selected_remote_context_before_build_or_rpc(
+    rec, monkeypatch, tmp_path, capsys
+):
+    import vmon.build as build
+    from vmon.context import Context, ContextStore
+
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    store = ContextStore()
+    store.put(Context("prod", ["http://prod.example"]))
+    store.use("prod")
+    monkeypatch.setattr(
+        build,
+        "build_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+
+    assert cli.main(["run", "-f", "Dockerfile", "runner"]) == 1
+
+    assert "Dockerfile builds run locally; use a local context" in capsys.readouterr().err
     assert rec.last == {}
+
+
+def test_build_command_prints_daemonless_oci_ref(monkeypatch, tmp_path, capsys):
+    import vmon.build as build
+
+    dockerfile = tmp_path / "Dockerfile"
+    context = tmp_path / "context"
+    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+    context.mkdir()
+    calls: list[tuple[object, object, str]] = []
+
+    def fake_build_image(dockerfile_arg, context_arg, tag):
+        calls.append((dockerfile_arg, context_arg, tag))
+        return "oci:/tmp/vmon-build:cli"
+
+    monkeypatch.setattr(build, "build_image", fake_build_image)
+
+    assert cli.main(["build", "-f", str(dockerfile), "-t", "cli", str(context)]) == 0
+
+    assert calls == [(dockerfile, context, "cli")]
+    assert capsys.readouterr().out == "oci:/tmp/vmon-build:cli\n"
 
 
 # -- exec: tty routing -----------------------------------------------------
@@ -188,7 +264,7 @@ def test_forward_stdin_fd_source_stops_without_eof():
     stop = threading.Event()
     conn = FakeConn()
     worker = threading.Thread(
-        target=client.DaemonClient._forward_stdin,
+        target=client.LocalTransport._forward_stdin,
         args=(conn, stdin, stop),
     )
     try:
@@ -390,7 +466,7 @@ def test_daemon_start_failure_hints_doctor(monkeypatch, capsys):
         def call(self, method, **params):
             raise client.DaemonError("vmond exited (code 1) on startup", code="start_failed")
 
-    monkeypatch.setattr(cli, "DaemonClient", FailingClient)
+    monkeypatch.setattr(cli, "LocalTransport", FailingClient)
     assert cli.main(["ps"]) == 1
     captured = capsys.readouterr()
     assert "vmond exited" in captured.err
@@ -453,7 +529,7 @@ def test_ls_falls_back_to_stat_for_a_file(monkeypatch, capsys):
             assert method == "fs_stat"
             return {"type": "file", "size": 12, "mode": 0o100644, "mtime": 0}
 
-    monkeypatch.setattr(cli, "DaemonClient", FileClient)
+    monkeypatch.setattr(cli, "LocalTransport", FileClient)
     assert cli.main(["ls", "vm1:/etc/hosts"]) == 0
     assert "hosts" in capsys.readouterr().out
 
@@ -466,7 +542,7 @@ def test_ls_reports_error_for_a_missing_path(monkeypatch, capsys):
         def call(self, method, **params):
             raise client.DaemonError("fs_stat /nope: No such file or directory")
 
-    monkeypatch.setattr(cli, "DaemonClient", MissingClient)
+    monkeypatch.setattr(cli, "LocalTransport", MissingClient)
     assert cli.main(["ls", "vm1:/nope"]) == 1
     assert "No such file" in capsys.readouterr().err
 

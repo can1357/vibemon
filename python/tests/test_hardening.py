@@ -8,6 +8,8 @@ pytest.importorskip("fastapi")
 from starlette.testclient import TestClient
 
 import vmon.server as server_mod
+import vmon.server.app as server_app
+import vmon.server.templates as server_templates
 from vmon.mesh import Mesh, NodeCaps
 
 AUTH_T = {"Authorization": "Bearer t"}
@@ -122,7 +124,7 @@ def test_replica_receive_peer_side_dedupe(monkeypatch, tmp_path):
         calls.append((args, kwargs))
         return tmp_path / "pulled"
 
-    monkeypatch.setattr(server_mod, "pull_template", fake_pull_template)
+    monkeypatch.setattr(server_templates, "pull_template", fake_pull_template)
     payload = {
         "digest": "d1",
         "source_url": "http://src",
@@ -172,11 +174,10 @@ def test_serve_forwards_tls_to_uvicorn(monkeypatch, tmp_path):
 
     monkeypatch.delenv("VMON_TLS_CERT", raising=False)
     monkeypatch.delenv("VMON_TLS_KEY", raising=False)
-    monkeypatch.setattr(server_mod, "create_app", lambda **_kwargs: app)
+    monkeypatch.setattr(server_app, "create_app", lambda **_kwargs: app)
     monkeypatch.setattr(daemon_mod, "daemon_paths", lambda: paths)
     monkeypatch.setattr(daemon_mod, "acquire_owner_lock", lambda _path: 7)
     monkeypatch.setattr(daemon_mod, "release_owner_lock", lambda fd: releases.append(fd))
-    monkeypatch.setattr(daemon_mod, "parse_tcp_addr", lambda _value: None)
     monkeypatch.setattr(daemon_mod, "Daemon", FakeDaemon)
     monkeypatch.setattr(uvicorn, "run", lambda _app, **kwargs: recorded.append(kwargs))
 

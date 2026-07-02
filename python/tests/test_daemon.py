@@ -18,7 +18,7 @@ import pytest
 
 import vmon.core as core
 from vmon.agent_client import ByteStream
-from vmon.client import DaemonClient, DaemonError
+from vmon.client import DaemonError, LocalTransport
 from vmon.daemon import Daemon, acquire_owner_lock, daemon_paths, release_owner_lock
 from vmon.vmm import MicroVM
 from vmon.volume import Volume
@@ -146,7 +146,7 @@ def client(fake_engine):
     threading.Thread(target=daemon.serve_forever, kwargs={"ready": ready}, daemon=True).start()
     assert ready.wait(2)
     try:
-        yield DaemonClient(sock_path=sock, autostart=False)
+        yield LocalTransport(sock_path=sock, autostart=False)
     finally:
         daemon.shutdown()
 
@@ -428,7 +428,7 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
     threading.Thread(target=lambda: (time.sleep(8), proc.kill()), daemon=True).start()
     try:
         result = client.interactive(
-            "shell", cli._write_event, tty=True, on_ready=lambda name: live.set(), image="alpine"
+            "shell", cli._write_event, tty=True, on_ready=lambda: live.set(), image="alpine"
         )
     finally:
         termios.tcsetattr(slave, termios.TCSANOW, before)
@@ -445,7 +445,7 @@ def test_interactive_pty_round_trip_raw_mode_and_resize(client, monkeypatch):
 
 def test_autostart_spawns_daemon():
     """A bare client with no running daemon spawns one and binds the socket."""
-    client = DaemonClient()
+    client = LocalTransport()
     try:
         assert client.call("ps") == {"vms": []}
         assert daemon_paths()["sock"].exists()

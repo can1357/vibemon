@@ -137,7 +137,7 @@ def test_fork_snapshot_emits_volume_and_timeout_args(monkeypatch, mvm_home):
     assert holder["meta"]["volumes"] == [{"tag": "t", "dir": "/d", "ro": False}]
 
 
-def test_control_snapshot_payload_includes_allow_user_net_only_when_set(monkeypatch):
+def test_control_snapshot_payload_includes_base_only(monkeypatch):
     from vmon.control import Control
 
     seen: list[tuple[str, dict | None]] = []
@@ -146,26 +146,26 @@ def test_control_snapshot_payload_includes_allow_user_net_only_when_set(monkeypa
     )
     control = Control("/nonexistent.sock")
     control.snapshot("t")
-    control.snapshot("t", base="b", allow_user_net=True)
+    control.snapshot("t", base="b")
     assert seen[0] == ("snapshot", {"name": "t"})
-    assert seen[1] == ("snapshot", {"name": "t", "base": "b", "allow_user_net": True})
+    assert seen[1] == ("snapshot", {"name": "t", "base": "b"})
 
 
-def test_microvm_snapshot_forwards_allow_user_net(monkeypatch, mvm_home):
+def test_microvm_snapshot_forwards_base(monkeypatch, mvm_home):
     from vmon.control import Control
     from vmon.vmm import MicroVM
 
-    seen: dict[str, bool] = {}
+    seen: dict[str, str | None] = {}
     monkeypatch.setattr(Control, "pause", lambda self: {})
     monkeypatch.setattr(Control, "resume", lambda self: {})
     monkeypatch.setattr(
         Control,
         "snapshot",
-        lambda self, name, base=None, allow_user_net=False: seen.update(flag=allow_user_net) or {},
+        lambda self, name, base=None: seen.update(base=base) or {},
     )
     monkeypatch.setattr(MicroVM, "stop", lambda self, wait=True: None)
-    MicroVM("snaptest").snapshot("s", keep_running=False, allow_user_net=True)
-    assert seen["flag"] is True
+    MicroVM("snaptest").snapshot("s", keep_running=False, base="base0")
+    assert seen["base"] == "base0"
 
 
 def test_prewarm_picks_nic_slot_flavor_by_platform(monkeypatch, mvm_home):

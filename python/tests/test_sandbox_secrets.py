@@ -964,3 +964,128 @@ def test_prewarm_pool_claimed_by_default_create_on_macos(monkeypatch, mvm_home):
         sb.terminate()
     finally:
         sandbox_mod.shutdown_all_pools()
+
+
+def test_linux_networked_snapshot_template_restore_allocates_fresh_tap_and_replays_net_config(
+    monkeypatch, mvm_home
+):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Linux")
+    template_dir = mvm_home / "templates" / "t"
+    (template_dir / "current-generation").write_text("1\n", encoding="utf-8")
+    (template_dir / "vmstate.1.bin").touch()
+    guest_config = {
+        "tap": "vmon-fresh",
+        "guest_ip": "10.42.0.2",
+        "host_ip": "10.42.0.1",
+        "prefix": 30,
+        "dns": ["1.1.1.1"],
+    }
+    setup_calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_setup(name, **kwargs):
+        setup_calls.append((name, dict(kwargs)))
+        return SimpleNamespace(
+            guest_config=guest_config,
+            tunnels=lambda: {8080: ("127.0.0.1", 18080)},
+            teardown=lambda: None,
+        )
+
+    monkeypatch.setattr(sandbox_mod, "_setup_sandbox_network", fake_setup)
+
+    sb = sandbox_mod.Sandbox.create(
+        template="t",
+        name="tap-restored",
+        block_network=False,
+        ports=[8080],
+        egress_allow=["10.0.0.0/8"],
+        egress_allow_domains=["example.com"],
+        inbound_cidr_allowlist=["203.0.113.0/24"],
+        pool_size=0,
+    )
+
+    try:
+        assert setup_calls == [
+            (
+                "tap-restored",
+                {
+                    "ports": [8080],
+                    "egress_allow": ["10.0.0.0/8"],
+                    "egress_allow_domains": ["example.com"],
+                    "inbound_cidr_allowlist": ["203.0.113.0/24"],
+                },
+            )
+        ]
+        assert FakeMicroVM.booted == []
+        assert FakeMicroVM.restored, "snapshot template should be restored, not cold-booted"
+        template, name, restore_kwargs, vm = FakeMicroVM.restored[-1]
+        assert template == template_dir
+        assert name == "tap-restored"
+        assert restore_kwargs["tap"] == "vmon-fresh"
+        assert vm._agent.net_configs[-1]["args"] == (
+            "10.42.0.2",
+            30,
+            "10.42.0.1",
+            ["1.1.1.1"],
+        )
+        assert sb._network_spec == {
+            "flavor": "tap",
+            "guest_config": guest_config,
+            "ports": [8080],
+            "tunnels": {"8080": {"host": "127.0.0.1", "port": 18080}},
+            "policy": {
+                "egress_allow": ["10.0.0.0/8"],
+                "egress_allow_domains": ["example.com"],
+                "inbound_cidr_allowlist": ["203.0.113.0/24"],
+            },
+        }
+    finally:
+        sb.terminate()
+
+
+def test_macos_user_net_snapshot_template_restore_passes_user_net_and_replays_fixed_config(
+    monkeypatch, mvm_home
+):
+    sandbox_mod = _install_fakes(monkeypatch, mvm_home)
+    from vmon import net
+
+    monkeypatch.setattr(sandbox_mod.platform, "system", lambda: "Darwin")
+    template_dir = mvm_home / "templates" / "t"
+    (template_dir / "current-generation").write_text("1\n", encoding="utf-8")
+    (template_dir / "vmstate.1.bin").touch()
+
+    sb = sandbox_mod.Sandbox.create(
+        template="t",
+        name="user-restored",
+        block_network=False,
+        pool_size=0,
+    )
+
+    try:
+        assert FakeMicroVM.booted == []
+        assert FakeMicroVM.restored, "snapshot template should be restored, not cold-booted"
+        template, name, restore_kwargs, vm = FakeMicroVM.restored[-1]
+        assert template == template_dir
+        assert name == "user-restored"
+        assert restore_kwargs["user_net"] is True
+        assert "tap" not in restore_kwargs
+        assert vm._agent.net_configs[-1]["args"] == (
+            net.USER_NET_GUEST_IP,
+            net.USER_NET_PREFIX,
+            net.USER_NET_GATEWAY,
+            list(net.USER_NET_DNS),
+        )
+        assert sb._network_spec == {
+            "flavor": "user",
+            "guest_config": {
+                "guest_ip": net.USER_NET_GUEST_IP,
+                "prefix": net.USER_NET_PREFIX,
+                "host_ip": net.USER_NET_GATEWAY,
+                "dns": list(net.USER_NET_DNS),
+            },
+            "ports": [],
+            "tunnels": {},
+            "policy": {},
+        }
+    finally:
+        sb.terminate()

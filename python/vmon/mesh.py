@@ -13,13 +13,60 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from .core import state_dir
+from .image import manifest_arches, normalize_oci_arch
 
 _CPU_BASELINE_CACHE: str | None = None
+_PLACEMENT_ARCHES = {"x86_64", "aarch64"}
+
+
+def validate_request_arch(value: Any) -> str | None:
+    """Validate and return a canonical request-scoped placement arch selector."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _PLACEMENT_ARCHES:
+        allowed = ", ".join(sorted(_PLACEMENT_ARCHES))
+        raise MeshError(f"arch must be one of: {allowed}", code="invalid")
+    return value
+
+
+def _format_arch_set(arches: set[str]) -> str:
+    return ", ".join(sorted(arches)) if arches else "none"
+
+
+def _request_image_ref(req: dict[str, Any]) -> str | None:
+    image = req.get("image")
+    return image.strip() if isinstance(image, str) and image.strip() else None
+
+
+def _normalized_live_arches(nodes: list[NodeState]) -> set[str]:
+    return {
+        normalized
+        for node in nodes
+        if (normalized := normalize_oci_arch(node.arch)) in _PLACEMENT_ARCHES
+    }
+
+
+def _explicit_arch_error(requested: str, live_arches: set[str]) -> MeshError:
+    return MeshError(
+        "unplaceable: requested arch "
+        f"{requested!r} has no live nodes (live arches: {_format_arch_set(live_arches)})",
+        code="unplaceable",
+    )
+
+
+def _manifest_arch_error(image: str, image_arches: set[str], live_arches: set[str]) -> MeshError:
+    return MeshError(
+        "unplaceable: image "
+        f"{image!r} advertises arches {_format_arch_set(image_arches)}; "
+        f"live arches are {_format_arch_set(live_arches)}",
+        code="unplaceable",
+    )
 
 
 class MeshError(Exception):
@@ -27,7 +74,15 @@ class MeshError(Exception):
 
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
-        known = {"invalid", "unauthorized", "unreachable", "ambiguous", "conflict"}
+        known = {
+            "invalid",
+            "unauthorized",
+            "unreachable",
+            "ambiguous",
+            "conflict",
+            "unplaceable",
+            "arch_required",
+        }
         self.message = message
         self.code = code or (message if message in known else "invalid")
 
@@ -393,17 +448,13 @@ def decode_blob(blob: str) -> tuple[str, str]:
         raise MeshError("invalid join blob") from exc
 
 
-def _weight(name: str, default: float) -> float:
-    with contextlib.suppress(ValueError):
-        return float(os.environ.get(f"VMON_MESH_W_{name}", str(default)))
-    return default
-
-
-W_WARM = _weight("WARM", 1000.0)
-W_FREE = _weight("FREE", 100.0)
-W_LOCAL = _weight("LOCAL", 50.0)
-W_REGION = _weight("REGION", 30.0)
-W_INFLIGHT = _weight("INFLIGHT", 80.0)
+DEFAULT_PLACEMENT_WEIGHTS: dict[str, float] = {
+    "warm": 1000.0,
+    "free": 100.0,
+    "local": 50.0,
+    "region": 30.0,
+    "inflight": 80.0,
+}
 
 
 def template_key(
@@ -440,11 +491,11 @@ def _volume_count(value: Any) -> int:
 def request_template_key(req: dict[str, Any]) -> str | None:
     """Return the cross-node warm-template key for a request, if pull-warm applies.
 
-    Pull-warm covers the plain block-network template and the Linux TAP networked
-    flavor: after a pull the create rewrites to ``template=<pulled dir>`` (block
-    network) or warm-restores the tap-slot snapshot onto a per-sandbox TAP
-    (networked). Requests with ``fs_dir``/volumes still need a local image to
-    rebind/enumerate devices on restore, so they fall back to a local build.
+    Pull-warm covers the plain block-network template and both networked
+    checkpointable flavors: Linux TAP templates rebind onto a per-sandbox TAP on
+    restore, while macOS user-net templates reopen slirp on the target host.
+    Requests with ``fs_dir``/volumes still need a local image to rebind/enumerate
+    devices on restore, so they fall back to a local build.
     """
     ref = req.get("image")
     if (
@@ -457,11 +508,7 @@ def request_template_key(req: dict[str, Any]) -> str | None:
     ):
         return None
     block_network = bool(req.get("block_network"))
-    # macOS user-net networked warm is host-local (single-node); only the Linux
-    # TAP flavor is cross-node pull-warm. A networked request therefore keys to
-    # the TAP flavor on Linux and is not pull-warm on macOS.
-    if not block_network and platform.system() == "Darwin":
-        return None
+    user_net_flavor = not block_network and platform.system() == "Darwin"
     try:
         return template_key(
             ref,
@@ -470,8 +517,8 @@ def request_template_key(req: dict[str, Any]) -> str | None:
             cpus=int(req.get("cpus") or 1),
             fs_slots=0,
             host_slot=False,
-            nic_slot=False,
-            tap_slot=not block_network,
+            nic_slot=user_net_flavor,
+            tap_slot=not block_network and not user_net_flavor,
         )
     except TypeError, ValueError:
         return None
@@ -495,9 +542,15 @@ def pool_eligible(req: dict[str, Any]) -> bool:
 
 
 def score_node(
-    node: NodeState, req: dict[str, Any], *, ingress_id: str, ingress_region: str
+    node: NodeState,
+    req: dict[str, Any],
+    *,
+    ingress_id: str,
+    ingress_region: str,
+    weights: Mapping[str, float] | None = None,
 ) -> float:
     """Score one candidate node for a placement request."""
+    placement_weights = weights or DEFAULT_PLACEMENT_WEIGHTS
     ref = pool_ref(req)
     key = request_template_key(req)
     pool_warm = 1.0 if pool_eligible(req) and ref and node.pools.get(ref, 0) > 0 else 0.0
@@ -508,11 +561,11 @@ def score_node(
     region = 1.0 if ingress_region and node.region == ingress_region else 0.0
     inflight_frac = min(1.0, node.inflight / (node.caps.vcpus or 1))
     return (
-        W_WARM * warm
-        + W_FREE * free_frac
-        + W_LOCAL * local
-        + W_REGION * region
-        - W_INFLIGHT * inflight_frac
+        placement_weights["warm"] * warm
+        + placement_weights["free"] * free_frac
+        + placement_weights["local"] * local
+        + placement_weights["region"] * region
+        - placement_weights["inflight"] * inflight_frac
     )
 
 
@@ -537,6 +590,11 @@ class Mesh:
         backend: str | None = None,
         arch: str | None = None,
         state_path: Path | None = None,
+        heartbeat_sec: float = 3.0,
+        reap_sec: float = 300.0,
+        idem_ttl_sec: float = 900.0,
+        create_timeout_sec: float = 120.0,
+        placement_weights: Mapping[str, float] | None = None,
     ) -> None:
         self.engine = engine
         self._default_advertise = advertise
@@ -552,8 +610,11 @@ class Mesh:
         self.state_path = state_path or state_dir() / "mesh.json"
         self.node_id = new_node_id()
         self.enabled = False
-        self.interval = float(os.environ.get("VMON_MESH_HEARTBEAT_SEC", "3.0"))
-        self.reap_sec = float(os.environ.get("VMON_MESH_REAP_SEC", "300.0"))
+        self.interval = float(heartbeat_sec)
+        self.reap_sec = float(reap_sec)
+        self.placement_weights = dict(DEFAULT_PLACEMENT_WEIGHTS)
+        if placement_weights is not None:
+            self.placement_weights.update(placement_weights)
         self._lock = threading.RLock()
         self._peers: dict[str, NodeState] = {}
         self._expected_members: int = 1
@@ -564,8 +625,8 @@ class Mesh:
         self._inflight = 0
         self._orphans: list[tuple[str, str]] = []
         self._stats: dict[str, int] = {"replication": 0, "restore": 0, "fence": 0}
-        self.idem_ttl = float(os.environ.get("VMON_MESH_IDEM_TTL_SEC", "900.0"))
-        self.create_timeout = float(os.environ.get("VMON_MESH_CREATE_TIMEOUT_SEC", "120.0"))
+        self.idem_ttl = float(idem_ttl_sec)
+        self.create_timeout = float(create_timeout_sec)
         # key -> (workload owner node id, pin timestamp): a coordinator's transient
         # record fixing one owner per idempotency key so retries converge.
         self._idem_pins: dict[str, tuple[str, float]] = {}
@@ -646,6 +707,11 @@ class Mesh:
         with self._lock:
             return self._expected_members // 2 + 1
 
+    def expected_members(self) -> int:
+        """Return the expected cluster size high-water mark used for quorum."""
+        with self._lock:
+            return self._expected_members
+
     def restore_quorum_met(self, confirmations: int) -> bool:
         """Return whether unreachable confirmations meet restore quorum."""
         return confirmations >= self.quorum_needed()
@@ -667,10 +733,18 @@ class Mesh:
                 wire = peer.to_wire()
                 wire["healthy"] = peer.healthy(now, self.interval)
                 peers.append(wire)
+            warnings: list[str] = []
+            if self.enabled and self._expected_members == 2:
+                warnings.append(
+                    "2-node mesh has no post-failure quorum; writable volumes are rejected"
+                )
             return {
                 "node_id": self.node_id,
                 "region": self.region,
                 "enabled": self.enabled,
+                "expected_members": self._expected_members,
+                "quorum_needed": self._expected_members // 2 + 1,
+                "warnings": warnings,
                 "self": self_state,
                 "peers": peers,
             }
@@ -789,18 +863,64 @@ class Mesh:
             or req.get("context") not in (None, ".")
         )
 
-    def candidates(self, req: dict[str, Any]) -> list[NodeState]:
+    def _placement_arches(
+        self, req: dict[str, Any], nodes: list[NodeState], *, ref_bound: bool
+    ) -> set[str]:
+        """Resolve the request-scoped arch set before backend/template scoring."""
+        live_arches = _normalized_live_arches(nodes)
+        explicit = validate_request_arch(req.get("arch"))
+        if explicit is not None:
+            if explicit not in live_arches:
+                raise _explicit_arch_error(explicit, live_arches)
+            return {explicit}
+
+        image = _request_image_ref(req)
+        if image is not None:
+            image_arches = manifest_arches(image)
+            if image_arches is None:
+                if len(live_arches) == 1:
+                    return set(live_arches)
+                raise MeshError(
+                    "arch_required: cannot derive image arch; pass arch=... "
+                    "on a mixed-arch mesh "
+                    f"(live arches: {_format_arch_set(live_arches)})",
+                    code="arch_required",
+                )
+            compatible = {
+                arch
+                for arch in (normalize_oci_arch(value) for value in image_arches)
+                if arch in live_arches
+            }
+            if not compatible:
+                raise _manifest_arch_error(image, image_arches, live_arches)
+            return compatible
+
+        if ref_bound:
+            # A snapshot/template/fork request without an explicit selector reuses
+            # state produced in this compatibility class; keep the existing
+            # backend/baseline/template gates and constrain arch to the source.
+            source_arch = normalize_oci_arch(self.arch)
+            return {source_arch} & live_arches if source_arch is not None else set()
+        return set(live_arches)
+
+    def candidates(self, req: dict[str, Any], *, arches: set[str] | None = None) -> list[NodeState]:
         """Return healthy placement candidates for a create/restore/fork request."""
         now = time.time()
         with self._lock:
             nodes = [self.self_state()]
             nodes.extend(peer for peer in self._peers.values() if peer.healthy(now, self.interval))
         ref = str(req.get("template") or req.get("snapshot") or "")
-        # Compat is derived from THIS ingress node, never caller-supplied request
-        # JSON (unvalidated public input): a client must not steer placement onto
-        # an incompatible node. The guest kernel and injected agent are arch-
-        # specific, so EVERY placement (even a fresh boot) must match this arch.
-        nodes = [n for n in nodes if n.arch == self.arch]
+        placement_arches = (
+            set(arches)
+            if arches is not None
+            else self._placement_arches(req, nodes, ref_bound=bool(ref))
+        )
+        nodes = [
+            n
+            for n in nodes
+            if (normalized := normalize_oci_arch(n.arch)) is not None
+            and normalized in placement_arches
+        ]
         # A named snapshot/template restore or fork reuses a backend-specific
         # memory image, so it must land on a same-backend node that already holds
         # the template. A zero-config image request (warm-pooled or not) is not
@@ -818,7 +938,11 @@ class Mesh:
 
     def place(self, req: dict[str, Any]) -> str:
         """Choose the owner node id for a placement request."""
+        explicit = validate_request_arch(req.get("arch"))
         if self.pinned_local(req):
+            local_arch = normalize_oci_arch(self.arch)
+            if explicit is not None and explicit != local_arch:
+                raise _explicit_arch_error(explicit, {local_arch} if local_arch else set())
             return self.node_id
         candidates = self.candidates(req)
         if not candidates:
@@ -834,7 +958,13 @@ class Mesh:
         return max(
             pool,
             key=lambda node: (
-                score_node(node, req, ingress_id=self.node_id, ingress_region=self.region),
+                score_node(
+                    node,
+                    req,
+                    ingress_id=self.node_id,
+                    ingress_region=self.region,
+                    weights=self.placement_weights,
+                ),
                 node.free_vcpus,
                 -node.inflight,
                 node.node_id,

@@ -25,6 +25,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import platform
 import shutil
 import threading
 import time
@@ -329,6 +330,29 @@ class Engine:
             if isinstance(info, dict) and info.get("name"):
                 names.append(str(info["name"]))
         return names
+
+    @staticmethod
+    def _writable_volume_names(volumes: Any) -> builtins.list[str]:
+        """Volume names mounted read-write by at least one mountpoint."""
+        if not isinstance(volumes, Mapping):
+            return []
+        writable: dict[str, bool] = {}
+        for spec in volumes.values():
+            if isinstance(spec, Mapping):
+                name = spec.get("name")
+                if not name:
+                    continue
+                read_only = bool(spec.get("read_only"))
+            else:
+                name = spec
+                read_only = False
+            vname = str(name)
+            writable[vname] = writable.get(vname, False) or not read_only
+        return sorted(vname for vname, is_writable in writable.items() if is_writable)
+
+    def writable_volume_names(self, record: VMRecord) -> builtins.list[str]:
+        """Writable volume names currently described by a registry record."""
+        return self._writable_volume_names(record.detail.get("volumes"))
 
     # -- registry access ----------------------------------------------------
 
@@ -901,11 +925,12 @@ class Engine:
         """Validate an HA-eligible sandbox and build its cross-node restore params.
 
         Returns ``(meta, params)``; raises :class:`Unsupported` for a sandbox whose
-        NIC (networked), ``fs_dir`` host share, or unknown memory size cannot move
-        hosts. Named volumes ARE carried: ``params['volumes']`` records each
-        ``mountpoint -> {name, read_only}`` from ``vm.meta`` (the source of truth);
-        the volume *data* is copied into the checkpoint by :meth:`_capture_volumes`
-        and a peer re-materializes it under its own ``$VMON_HOME/volumes`` on restore.
+        ``fs_dir`` host share, missing network restore state, or unknown memory size
+        cannot move hosts. Named volumes ARE carried: ``params['volumes']`` records
+        each ``mountpoint -> {name, read_only}`` from ``vm.meta`` (the source of
+        truth); the volume *data* is copied into the checkpoint by
+        :meth:`_capture_volumes` and a peer re-materializes it under its own
+        ``$VMON_HOME/volumes`` on restore.
         """
         record = self.get(name, require_running=True)
         sandbox = record.sandbox
@@ -913,11 +938,6 @@ class Engine:
             raise Unsupported(
                 "migration requires a live in-process sandbox; one rehydrated after "
                 "a daemon restart has lost the identity needed to move it"
-            )
-        if not getattr(sandbox, "_block_network", False):
-            raise Unsupported(
-                "only block-network sandboxes can migrate; a networked sandbox needs "
-                "per-node host networking that the snapshot cannot carry"
             )
         if getattr(sandbox, "_fs_dir", None):
             raise Unsupported(
@@ -935,15 +955,18 @@ class Engine:
             raise Unsupported(
                 "cannot determine the sandbox memory size needed to restore it elsewhere"
             )
+        block_network = bool(getattr(sandbox, "_block_network", False))
         params: dict[str, Any] = {
             "name": name,
-            "block_network": True,
+            "block_network": block_network,
             "memory": int(memory),
             "cpus": int(cpus) if cpus is not None else 1,
             "env": dict(getattr(sandbox, "env", {}) or {}),
             "workdir": getattr(sandbox, "workdir", None),
             "tags": dict(record.tags or {}),
         }
+        if not block_network:
+            self._add_network_restore_params(name, sandbox, meta, params)
         timeout_secs = getattr(sandbox, "_timeout_secs", None)
         if timeout_secs is not None:
             params["timeout_secs"] = int(timeout_secs)
@@ -958,6 +981,72 @@ class Engine:
                 for mountpoint, v in volumes_meta.items()
             }
         return meta, params
+
+    def _add_network_restore_params(
+        self,
+        name: str,
+        sandbox: Any,
+        meta: Mapping[str, Any],
+        params: dict[str, Any],
+    ) -> None:
+        """Copy the live sandbox's network flavor/policy into restore params."""
+        network = self._network_restore_spec(name, sandbox, meta)
+        params["network"] = network
+        ports = network.get("ports")
+        if ports is not None:
+            params["ports"] = [int(port) for port in ports]
+        policy = network.get("policy")
+        if isinstance(policy, Mapping):
+            for key in ("egress_allow", "egress_allow_domains", "inbound_cidr_allowlist"):
+                value = policy.get(key)
+                if value is not None:
+                    params[key] = list(value)
+
+    @staticmethod
+    def _network_restore_spec(
+        name: str,
+        sandbox: Any,
+        meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        saved = getattr(sandbox, "_network_spec", None)
+        if isinstance(saved, Mapping):
+            return dict(saved)
+        network = getattr(sandbox, "_network", None)
+        if network is not None:
+            guest_config = dict(getattr(network, "guest_config", {}) or {})
+            try:
+                tunnels = dict(network.tunnels())
+            except Exception:
+                tunnels = {}
+            policy = dict(getattr(sandbox, "_network_policy", {}) or {})
+            return {
+                "flavor": "tap",
+                "guest_config": guest_config,
+                "ports": sorted(int(port) for port in tunnels),
+                "tunnels": {
+                    str(port): {"host": host, "port": int(host_port)}
+                    for port, (host, host_port) in tunnels.items()
+                },
+                "policy": policy,
+            }
+        if meta.get("user_net"):
+            from . import net
+
+            return {
+                "flavor": "user",
+                "guest_config": {
+                    "guest_ip": net.USER_NET_GUEST_IP,
+                    "prefix": net.USER_NET_PREFIX,
+                    "host_ip": net.USER_NET_GATEWAY,
+                    "dns": list(net.USER_NET_DNS),
+                },
+                "ports": [],
+                "tunnels": {},
+                "policy": {},
+            }
+        raise Unsupported(
+            f"networked sandbox {name!r} is missing live host-network restore state"
+        )
 
     def _checkpoint_for(self, name: str, *, kind: str, stop: bool) -> dict[str, Any]:
         """Build a peer-pullable checkpoint + restore params for migrate/replicate.
@@ -1017,14 +1106,14 @@ class Engine:
     ) -> builtins.list[Path]:
         """Restore checkpoint-carried volume data onto THIS node before :meth:`create`.
 
-        Returns the freshly-created host volume directories (for rollback on a later
-        create failure). Refuses to clobber a pre-existing same-named local volume
-        (there is no cluster-unique volume identity yet), and refuses a *writable*
-        volume unless restore quorum holds: :meth:`Volume.acquire` is only a
-        host-local ``flock``, so a partitioned old owner could otherwise keep writing
-        its copy while this node writes the restored one. A volume is treated as
-        writable if ANY mountpoint mounts it read-write. Read-only volumes are
-        divergence-free and always allowed. A no-op when no volumes are carried.
+        Returns the freshly-created host volume directories (for rollback on a
+        later create failure). Refuses to clobber a pre-existing same-named local
+        volume (there is no cluster-unique volume identity yet). Writable-volume
+        single-writer safety is enforced by the mesh lease service before this
+        method is called; this materializer only validates/copies carried bytes.
+        A volume is treated as writable if ANY mountpoint mounts it read-write.
+        Read-only volumes are divergence-free and always allowed. A no-op when
+        no volumes are carried.
         """
         volumes = params.get("volumes") or {}
         if not volumes:
@@ -1041,13 +1130,7 @@ class Engine:
         src_root = Path(template_dir) / "volumes"
         # Validate every volume BEFORE copying any, so a rejection leaves no
         # partially-materialized state behind.
-        for vname, is_writable in writable.items():
-            if is_writable and not quorum_ok:
-                raise Unsupported(
-                    f"cannot restore writable volume {vname!r} without restore quorum: a "
-                    "host-local lock cannot stop a partitioned owner from also writing it; "
-                    "enable VMON_RESTORE_QUORUM"
-                )
+        for vname in writable:
             dest = VOLUME_DIR / vname
             if dest.exists() or dest.is_symlink():
                 raise Unsupported(
@@ -1078,13 +1161,34 @@ class Engine:
         a transient restore error neither leaks host state nor poisons the volume
         collision guard on the next attempt.
         """
+        self._validate_network_restore(params)
         created = self.materialize_volumes(template_dir, params, quorum_ok=quorum_ok)
         try:
-            return self.create({**params, "template": template_dir})
+            return self.create({**self._restore_create_params(params), "template": template_dir})
         except BaseException:
             for path in created:
                 shutil.rmtree(path, ignore_errors=True)
             raise
+
+    @staticmethod
+    def _restore_create_params(params: Mapping[str, Any]) -> dict[str, Any]:
+        create_params = dict(params)
+        create_params.pop("network", None)
+        return create_params
+
+    @staticmethod
+    def _validate_network_restore(params: Mapping[str, Any]) -> None:
+        network = params.get("network")
+        if not isinstance(network, Mapping):
+            return
+        flavor = network.get("flavor")
+        host = platform.system()
+        if flavor == "tap" and host == "Darwin":
+            raise Unsupported("Linux TAP networking cannot be restored on macOS user-net hosts")
+        if flavor == "user" and host != "Darwin":
+            raise Unsupported("macOS user-net checkpoints cannot be restored on Linux TAP hosts")
+        if flavor not in {"tap", "user"}:
+            raise Unsupported(f"unknown network checkpoint flavor {flavor!r}")
 
     def migrate_prepare(self, name: str) -> dict[str, Any]:
         """Quiesce a live, migratable sandbox into a transient cross-node checkpoint.
@@ -1095,8 +1199,9 @@ class Engine:
         sandbox. Follow with :meth:`migrate_commit` once a target confirms, or
         :meth:`migrate_abort` to restore the source locally from the same checkpoint.
 
-        Only a live, in-process, block-network sandbox can migrate; an ``fs_dir``
-        host share or networked NIC raises :class:`Unsupported` (it cannot move
+        Live, in-process sandboxes can migrate when their VM state can be
+        snapshotted and their host-local resources can be rebound on the target.
+        An ``fs_dir`` host share raises :class:`Unsupported` (it cannot move
         hosts). Named volumes ARE carried (their data travels in the checkpoint).
         """
         return self._checkpoint_for(name, kind="migrate", stop=True)
@@ -1131,7 +1236,7 @@ class Engine:
             self.remove(name)
         except EngineError:
             pass
-        record = self.create({**params, "template": snapshot_dir})
+        record = self.create({**self._restore_create_params(params), "template": snapshot_dir})
         self._drop_checkpoint(digest, snapshot_dir, delete_dir=False)
         return record.view()
 
@@ -1270,6 +1375,7 @@ class Engine:
             "egress_allow_domains": params.get("egress_allow_domains"),
             "inbound_cidr_allowlist": params.get("inbound_cidr_allowlist"),
             "pool_size": params.get("pool_size"),
+            "volumes": getattr(getattr(sandbox, "vm", None), "meta", {}).get("volumes"),
             "create_latency_ms": (now - request_time) * 1000.0,
         }
         record = VMRecord(
@@ -1289,6 +1395,61 @@ class Engine:
         with self._lock:
             self._records[sid] = record
         return record
+
+
+    def record_volume_leases(self, sid: str, leases: builtins.list[Any]) -> None:
+        """Attach granted writable-volume lease metadata to a live record."""
+        lease_map: dict[str, dict[str, Any]] = {}
+        for lease in leases:
+            to_wire = getattr(lease, "to_wire", None)
+            if callable(to_wire):
+                wire = dict(to_wire())
+            elif isinstance(lease, Mapping):
+                wire = dict(lease)
+            else:
+                continue
+            volume = str(wire.get("volume") or "")
+            if volume:
+                lease_map[volume] = wire
+        if not lease_map:
+            return
+        with self._lock:
+            record = self._records.get(sid)
+            if record is None:
+                return
+            existing = record.detail.get("volume_leases")
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged.update(lease_map)
+            record.detail["volume_leases"] = merged
+            name = record.name
+        try:
+            MicroVM(name)._save_meta(volume_leases=merged)
+        except Exception:
+            pass
+
+    def clear_volume_leases(self, sid: str) -> None:
+        """Forget lease metadata after all matching votes have been released."""
+        with self._lock:
+            record = self._records.get(sid)
+            if record is None:
+                return
+            record.detail.pop("volume_leases", None)
+            name = record.name
+        try:
+            MicroVM(name)._save_meta(volume_leases={})
+        except Exception:
+            pass
+
+    def volume_lease_records(self) -> builtins.list[VMRecord]:
+        """Running records that both hold writable volumes and have lease metadata."""
+        with self._lock:
+            return [
+                record
+                for record in self._records.values()
+                if record.status == "running"
+                and isinstance(record.detail.get("volume_leases"), dict)
+                and self.writable_volume_names(record)
+            ]
 
     def find_by_idempotency_key(self, key: str) -> VMRecord | None:
         """Return the live record created for *key*, or ``None`` if none exists.
