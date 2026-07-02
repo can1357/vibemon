@@ -149,8 +149,9 @@ class TcpFaultProxy:
     _drop_rules: list[_DropRule] = field(default_factory=list)
     _latency: float = 0.0
     _latency_prefixes: tuple[str, ...] | None = None
-    _blocked_heartbeat_sources: set[str] = field(default_factory=set)
+    _blocked_sources: set[str] = field(default_factory=set)
     _forward_hooks: list[_ForwardHook] = field(default_factory=list)
+    _active: set[socket.socket] = field(default_factory=set)
 
     @property
     def url(self) -> str:
@@ -189,6 +190,21 @@ class TcpFaultProxy:
     def partition(self, enabled: bool = True) -> None:
         with self._lock:
             self.blocked = enabled
+        if enabled:
+            # A real partition also kills established flows: sever live relays so
+            # HTTP keep-alive connections cannot tunnel through the blockade.
+            self.sever()
+
+    def sever(self) -> None:
+        """Tear down every established relay pair (partition or process death)."""
+        with self._lock:
+            active = list(self._active)
+            self._active.clear()
+        for sock in active:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
 
     def drop_next(self, count: int = 1, prefixes: Sequence[str] | None = None) -> None:
         with self._lock:
@@ -199,12 +215,20 @@ class TcpFaultProxy:
             self._latency = max(0.0, seconds)
             self._latency_prefixes = _prefixes(prefixes)
 
-    def block_heartbeat_source(self, node_id: str, enabled: bool = True) -> None:
+    def block_source(self, node_id: str, enabled: bool = True) -> None:
+        """Drop requests whose body identifies *node_id* as the sending node.
+
+        Covers every mesh RPC that carries a source marker (heartbeat state,
+        lease holder, replica/migrate source, owner broadcast, record owner).
+        Requests without a source marker are not affected.
+        """
         with self._lock:
             if enabled:
-                self._blocked_heartbeat_sources.add(node_id)
+                self._blocked_sources.add(node_id)
             else:
-                self._blocked_heartbeat_sources.discard(node_id)
+                self._blocked_sources.discard(node_id)
+        if enabled:
+            self.sever()
 
     def on_forward_once(
         self,
@@ -224,7 +248,7 @@ class TcpFaultProxy:
             self._drop_rules.clear()
             self._latency = 0.0
             self._latency_prefixes = None
-            self._blocked_heartbeat_sources.clear()
+            self._blocked_sources.clear()
             self._forward_hooks.clear()
 
     def _serve(self) -> None:
@@ -260,6 +284,9 @@ class TcpFaultProxy:
                 backend = socket.create_connection((self.host, self.target_port), timeout=5.0)
             except OSError:
                 return
+            with self._lock:
+                self._active.add(client)
+                self._active.add(backend)
             with backend:
                 try:
                     backend.sendall(first)
@@ -274,6 +301,9 @@ class TcpFaultProxy:
                 right.start()
                 left.join()
                 right.join()
+                with self._lock:
+                    self._active.discard(client)
+                    self._active.discard(backend)
 
     def _read_initial_request(self, client: socket.socket) -> bytes:
         client.settimeout(2.0)
@@ -300,13 +330,11 @@ class TcpFaultProxy:
         with self._lock:
             if self.blocked:
                 return "drop"
-            if path.startswith(_HEARTBEAT_PATH):
-                source = _heartbeat_source(body)
-                if (
-                    "*" in self._blocked_heartbeat_sources
-                    or source in self._blocked_heartbeat_sources
-                ):
-                    return "drop"
+            source = _request_source(path, body)
+            if source is not None and (
+                "*" in self._blocked_sources or source in self._blocked_sources
+            ):
+                return "drop"
             for rule in list(self._drop_rules):
                 if _path_matches(path, rule.prefixes):
                     rule.count -= 1
@@ -366,19 +394,38 @@ def _request_body(data: bytes) -> bytes:
     return b"" if header_end < 0 else data[header_end + 4 :]
 
 
-def _heartbeat_source(body: bytes) -> str | None:
+def _request_source(path: str, body: bytes) -> str | None:
+    """Best-effort sending-node id from a mesh RPC body.
+
+    Heartbeats carry ``state.node_id``; lease ops carry ``holder_node``;
+    replica/migrate receives carry ``source_node``; owner broadcasts carry
+    ``node_id``; record puts carry ``owner``. Non-mesh requests return None.
+    """
+    if not path.startswith("/v1/mesh/"):
+        return None
     try:
         payload = json.loads(body.decode("utf-8"))
     except UnicodeDecodeError, json.JSONDecodeError:
         return None
-    state = payload.get("state") if isinstance(payload, dict) else None
-    node_id = state.get("node_id") if isinstance(state, dict) else None
-    return node_id if isinstance(node_id, str) else None
+    if not isinstance(payload, dict):
+        return None
+    state = payload.get("state")
+    if isinstance(state, dict) and isinstance(state.get("node_id"), str):
+        return state["node_id"]
+    for field_name in ("holder_node", "source_node", "node_id", "owner"):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
 
 
 def _relay(src: socket.socket, dst: socket.socket) -> None:
     try:
-        src.settimeout(30.0)
+        # Long-running requests (cold image import + first boot) can sit silent
+        # for minutes before the response; do not let the relay idle out under
+        # them. Severing on partition still closes these sockets immediately.
+        src.settimeout(300.0)
         while True:
             try:
                 chunk = src.recv(65_536)
@@ -536,6 +583,10 @@ def start_node(
 
 def kill_node(node: NodeProc, sig: signal.Signals | int = signal.SIGKILL) -> None:
     node._signal_process(sig, timeout=20.0)
+    if node.proxy is not None:
+        # The process is dead; its established relays must die with it, or a
+        # client blocked on a response through the proxy hangs to its timeout.
+        node.proxy.sever()
 
 
 def signal_node(node: NodeProc, sig: signal.Signals | int) -> None:
@@ -704,14 +755,21 @@ def replica_volume_payload(home: Path, sid: str, vol: str, fname: str) -> str | 
 
 
 def partition_node(node: NodeProc, peers: Sequence[NodeProc], *, enabled: bool = True) -> None:
+    """Isolate *node*: nothing reaches it, and peers drop its mesh RPCs.
+
+    The node's own proxy blocks fully (ingress dead, live relays severed);
+    every peer's proxy drops requests whose body identifies *node* as the
+    sender (heartbeats, lease ops, owner broadcasts, record/replica pushes).
+    Peers keep talking to each other and to clients — this isolates ONE node,
+    it does not shatter the mesh.
+    """
     assert node.proxy is not None, "partition_node requires a fault-proxy node"
     assert node.node_id is not None, "node must have joined a mesh before partition"
     node.proxy.partition(enabled)
     for peer in peers:
         if peer is node or peer.proxy is None:
             continue
-        peer.proxy.partition(enabled)
-        peer.proxy.block_heartbeat_source("*", enabled)
+        peer.proxy.block_source(node.node_id, enabled)
 
 
 def heal_node(node: NodeProc, peers: Sequence[NodeProc]) -> None:

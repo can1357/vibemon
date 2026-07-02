@@ -802,13 +802,21 @@ def test_fault_proxy_sigkill_owner_mid_create_retries_once() -> None:
             interval=0.25,
         )
 
-        retry = api_json(
-            "POST",
-            gateway_b.url,
-            "/v1/sandboxes",
-            token,
-            payload=payload,
-            timeout=300.0,
+        # The dead owner counts as a live peer until reap decays its health, and
+        # during that window a 2-node create is correctly refused with
+        # record_unreplicated (503); real clients retry through it, so do we.
+        retry = eventually(
+            f"retried create of {sid} to be accepted on the survivor",
+            lambda: api_json(
+                "POST",
+                gateway_b.url,
+                "/v1/sandboxes",
+                token,
+                payload=payload,
+                timeout=300.0,
+            ),
+            timeout=60.0,
+            interval=1.0,
         )
         assert_idempotent_create_same_sid([response for response in (first, retry) if response])
         listing = api_json("GET", gateway_b.url, "/v1/sandboxes", token, timeout=10.0)
@@ -1121,10 +1129,11 @@ def test_fault_proxy_writable_volume_lease_handoff_has_no_active_overlap(
         )
         assert owner_stopped.get("status") == "stopped", owner_stopped
 
+        # With granular isolation the survivors kept talking throughout; keep
+        # dropping the old owner's mesh RPCs while it stays partitioned.
         for gateway in gateways[1:]:
             assert gateway.proxy is not None
-            gateway.proxy.partition(False)
-            gateway.proxy.block_heartbeat_source(node_ids[0], True)
+            gateway.proxy.block_source(node_ids[0], True)
 
         restored = eventually(
             f"surviving majority to restore {sid} with a successor lease",

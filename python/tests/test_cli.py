@@ -611,3 +611,43 @@ def test_mesh_leave_drain_cli_passes_flag(monkeypatch):
     monkeypatch.setattr(cli, "_mesh_call", fake_call)
     assert cli.main(["mesh", "leave", "--drain"]) == 0
     assert calls == [("POST", "/v1/mesh/leave", {"drain": True})]
+
+
+def test_mesh_status_cli_renders_sandbox_checkpoint_ages(monkeypatch, capsys):
+    payload = {
+        "self": {
+            "node_id": "node-self",
+            "advertise": "http://self",
+            "region": "iad",
+            "vcpus": 4,
+            "mem_mib": 4096,
+            "free_vcpus": 2,
+            "free_mem_mib": 2048,
+            "owned": ["ha-sb", "cold-sb"],
+            "pools": {},
+            "sandboxes": [
+                {
+                    "id": "ha-sb",
+                    "ha": "async",
+                    "restart_policy": "none",
+                    "checkpoint_age_sec": 12.4,
+                    "replicas": ["peer-a"],
+                },
+                {
+                    "id": "cold-sb",
+                    "ha": "async",
+                    "restart_policy": "none",
+                    "checkpoint_age_sec": None,
+                    "replicas": [],
+                },
+            ],
+        },
+        "peers": [],
+    }
+
+    monkeypatch.setattr(cli, "_mesh_call", lambda _method, _path, _payload=None: payload)
+    assert cli.main(["mesh", "status"]) == 0
+
+    out = capsys.readouterr().out
+    assert "ha-sb" in out and "async" in out and "12s ago" in out
+    assert "cold-sb" in out and "never" in out

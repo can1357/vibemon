@@ -204,6 +204,9 @@ def _remote_fn_helper(value: float) -> int:
 def _sample_remote_uses_module_context(value: float) -> int:
     return _remote_fn_helper(value)
 
+def _sample_remote_always_fails(value: int) -> int:
+    raise ValueError(f"map boom {value}")
+
 
 def _rf_param_shadows_import(math: int) -> int:
     # `math` is a parameter, not the module's `import math`.
@@ -274,8 +277,9 @@ class _RemoteFakeFilesystem:
 
 
 class _RemoteFakeSandbox:
-    def __init__(self, sandbox_mod) -> None:
+    def __init__(self, sandbox_mod, on_terminate=None) -> None:
         self._sandbox_mod = sandbox_mod
+        self._on_terminate = on_terminate
         self.filesystem = _RemoteFakeFilesystem()
         self.execs: list[tuple[tuple[str, ...], dict[str, object]]] = []
         self.terminated = False
@@ -290,7 +294,11 @@ class _RemoteFakeSandbox:
         return _RunnerFakeProcess(self._sandbox_mod._REMOTE_FUNCTION_RUNNER)
 
     def terminate(self) -> None:
+        if self.terminated:
+            return
         self.terminated = True
+        if self._on_terminate is not None:
+            self._on_terminate()
 
 
 def test_remote_function_runner_executes_source_function() -> None:
@@ -465,10 +473,20 @@ def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None
 
     created: list[dict[str, object]] = []
     sandboxes: list[_RemoteFakeSandbox] = []
+    live = 0
+    max_live = 0
 
     def fake_create(**kwargs: object) -> _RemoteFakeSandbox:
+        nonlocal live, max_live
         created.append(dict(kwargs))
-        sandbox = _RemoteFakeSandbox(sandbox_mod)
+        live += 1
+        max_live = max(max_live, live)
+
+        def on_terminate() -> None:
+            nonlocal live
+            live -= 1
+
+        sandbox = _RemoteFakeSandbox(sandbox_mod, on_terminate=on_terminate)
         sandboxes.append(sandbox)
         return sandbox
 
@@ -478,11 +496,17 @@ def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None
     assert remote.map([1.1, 2.1, 3.1, 4.1], concurrency=3) == [9, 10, 11, 12]
     assert len(sandboxes) == 3
     assert len(created) == 3
-    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
+    assert max_live == 3
+    assert live == 0
+    assert all(
+        kwargs == {"image": "python:3.14-slim", "block_network": True}
+        for kwargs in created
+    )
     assert all(sandbox.terminated for sandbox in sandboxes)
 
     created.clear()
     sandboxes.clear()
+    max_live = 0
 
     star_remote = sandbox_mod.function(block_network=True)(_sample_remote_sum)
     assert star_remote.starmap([(1, 2), (3, 4), (5, 6)], concurrency=2) == [
@@ -492,7 +516,48 @@ def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None
     ]
     assert len(sandboxes) == 2
     assert len(created) == 2
-    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
+    assert max_live == 2
+    assert live == 0
+    assert all(
+        kwargs == {"image": "python:3.14-slim", "block_network": True}
+        for kwargs in created
+    )
+    assert all(sandbox.terminated for sandbox in sandboxes)
+
+
+def test_remote_function_map_terminates_workers_on_item_exception(monkeypatch) -> None:
+    import vmon.sandbox as sandbox_mod
+
+    sandboxes: list[_RemoteFakeSandbox] = []
+    live = 0
+
+    def fake_create(**kwargs: object) -> _RemoteFakeSandbox:
+        nonlocal live
+        live += 1
+
+        def on_terminate() -> None:
+            nonlocal live
+            live -= 1
+
+        sandbox = _RemoteFakeSandbox(sandbox_mod, on_terminate=on_terminate)
+        sandboxes.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "create", staticmethod(fake_create))
+
+    remote = sandbox_mod.function(block_network=True)(_sample_remote_always_fails)
+    with pytest.raises(sandbox_mod.RemoteFunctionError, match="map boom"):
+        remote.map([1, 2, 3, 4], concurrency=3)
+
+    runner_calls = sum(
+        1
+        for sandbox in sandboxes
+        for cmd, _kwargs in sandbox.execs
+        if cmd == ("python3", "-u", "/tmp/vmon-function-runner.py")
+    )
+    assert len(sandboxes) == 3
+    assert 1 <= runner_calls <= 3
+    assert live == 0
     assert all(sandbox.terminated for sandbox in sandboxes)
 
 

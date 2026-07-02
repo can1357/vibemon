@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -276,14 +278,33 @@ def test_partition_during_idempotent_create_never_duplicates_after_heal(monkeypa
         second = clients[urls["B"]].post(
             "/v1/sandboxes", json=payload, headers={"Authorization": "Bearer secret"}
         )
+        located = clients[urls["B"]].get(
+            "/v1/mesh/locate/partitioned", headers={"Authorization": "Bearer secret"}
+        )
+        # Anti-entropy: after heal (health refreshed by re-registration), one
+        # reconcile pass pushes A's locally-owned record to B.
+        from vmon.server import record_sync
 
-    assert first.status_code == 503
-    detail = first.json()["detail"]
-    assert detail["code"] == "record_unreplicated"
-    assert "replicated to 1/2 required members" in detail["message"]
-    assert_idempotent_create_same_sid([second])
+        _register_all(apps)
+        asyncio.run(
+            record_sync.reconcile_records(
+                SimpleNamespace(
+                    mesh=apps["A"].state.mesh, record_store=apps["A"].state.record_store
+                )
+            )
+        )
+        assert apps["B"].state.record_store.get("partitioned") is not None
+
+    # 2-node weak metadata tier (ARCHITECTURE.md): the failed forward marks the
+    # peer unreachable, so the create is accepted with a locally-durable record
+    # instead of refusing — a 2-node mesh cannot distinguish partition from
+    # death. The invariant that matters: the retry after heal NEVER duplicates.
+    assert first.status_code == 201
+    assert_idempotent_create_same_sid([first, second])
     assert second.json()["id"] == "partitioned"
     assert _record_count(apps) == 1
+    # And no surviving gateway answers "unknown sid" for the acked create.
+    assert located.status_code == 200
 
 
 def test_drop_once_owner_unavailable_retry_results_in_one_sandbox(monkeypatch, tmp_path):

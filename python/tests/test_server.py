@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -139,6 +140,133 @@ def test_metrics_endpoint_returns_runtime_counters(client):
     response = client.get("/v1/sandboxes/sb1/metrics")
     assert response.status_code == 200
     assert response.json() == {"vcpu_exits": 7}
+
+
+def test_mesh_status_reports_sandbox_checkpoint_ages(app, client):
+    app.state.mesh.enabled = True
+    created = client.post(
+        "/v1/sandboxes",
+        json={"template": "tpl", "name": "ha-sb", "ha": "async"},
+    )
+    off = client.post(
+        "/v1/sandboxes",
+        json={"template": "tpl", "name": "off-sb", "ha": "off"},
+    )
+    assert created.status_code == 201
+    assert off.status_code == 201
+
+    first = client.get("/v1/mesh/status")
+
+    assert first.status_code == 200
+    rows = {row["id"]: row for row in first.json()["self"]["sandboxes"]}
+    assert rows["ha-sb"]["ha"] == "async"
+    assert rows["ha-sb"]["restart_policy"] == "none"
+    assert rows["ha-sb"]["checkpoint_age_sec"] is None
+    assert rows["ha-sb"]["replicas"] == []
+    assert rows["off-sb"]["ha"] == "off"
+    assert rows["off-sb"]["checkpoint_age_sec"] is None
+    assert rows["off-sb"]["replicas"] == []
+
+    app.state.checkpoint_times["ha-sb"] = time.time() - 12.0
+    second = client.get("/v1/mesh/status")
+
+    assert second.status_code == 200
+    rows = {row["id"]: row for row in second.json()["self"]["sandboxes"]}
+    age = rows["ha-sb"]["checkpoint_age_sec"]
+    assert isinstance(age, float)
+    assert 0.0 <= age < 60.0
+    assert rows["off-sb"]["checkpoint_age_sec"] is None
+
+
+def test_replicate_forever_records_checkpoint_timestamps(app, client, monkeypatch, tmp_path):
+    from fastapi.security import HTTPBearer
+
+    import vmon.server.reconciler as reconciler
+    from vmon.server.runtime import ServerRuntime
+
+    created = client.post(
+        "/v1/sandboxes",
+        json={"template": "tpl", "name": "ha-sb", "ha": "async"},
+    )
+    assert created.status_code == 201
+    app.state.mesh.enabled = True
+    app.state.checkpoint_times["gone"] = 1.0
+    posts: list[tuple[str, str, dict[str, object]]] = []
+    cleanups: list[tuple[str, str]] = []
+
+    def fake_prepare(sid):
+        assert sid == "ha-sb"
+        return {
+            "digest": "digest-a",
+            "snapshot_dir": str(tmp_path / "checkpoint"),
+            "params": {"name": sid},
+        }
+
+    def fake_cleanup(digest, snapshot_dir):
+        cleanups.append((digest, snapshot_dir))
+
+    def fake_post(url, path, payload, **_kwargs):
+        posts.append((url, path, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(app.state.supervisor._engine, "replicate_prepare", fake_prepare)
+    monkeypatch.setattr(app.state.supervisor._engine, "replicate_cleanup", fake_cleanup)
+    monkeypatch.setattr(app.state.mesh, "replica_targets", lambda _sid, _k: ["peer-a"])
+    monkeypatch.setattr(app.state.mesh, "peer_url", lambda _peer_id: "http://peer")
+    monkeypatch.setattr(app.state.mesh.transport, "post", fake_post)
+
+    class StopReplicate(Exception):
+        pass
+
+    first_sleep = True
+
+    async def fake_sleep(_delay):
+        nonlocal first_sleep
+        if first_sleep:
+            first_sleep = False
+            return
+        raise StopReplicate
+
+    ctx = ServerRuntime(
+        supervisor=app.state.supervisor,
+        mesh=app.state.mesh,
+        replica_store=app.state.replica_store,
+        record_store=app.state.record_store,
+        lease_manager=app.state.lease_manager,
+        expected_token=None,
+        outbound_token=None,
+        client_token=None,
+        bearer=HTTPBearer(auto_error=False),
+        config=app.state.config,
+        checkpoint_times=app.state.checkpoint_times,
+    )
+    monkeypatch.setattr(reconciler.asyncio, "sleep", fake_sleep)
+
+    async def run_once():
+        try:
+            await reconciler.replicate_forever(ctx)
+        except StopReplicate:
+            return
+        raise AssertionError("replicator did not stop after one pass")
+
+    asyncio.run(run_once())
+
+    assert posts == [
+        (
+            "http://peer",
+            "/v1/mesh/replica/receive",
+            {
+                "digest": "digest-a",
+                "source_url": app.state.mesh.advertise,
+                "source_node": app.state.mesh.node_id,
+                "params": {"name": "ha-sb"},
+            },
+        )
+    ]
+    assert cleanups == [("digest-a", str(tmp_path / "checkpoint"))]
+    assert isinstance(app.state.checkpoint_times["ha-sb"], float)
+    assert "gone" not in app.state.checkpoint_times
+
 
 def test_mesh_routes_accept_request_scoped_arch_without_leaking_to_local_create(
     app, client, monkeypatch

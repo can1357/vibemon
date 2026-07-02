@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -147,6 +147,7 @@ def fake_gateway() -> FastAPI:
     app = FastAPI()
     app.state.sandboxes = {}
     app.state.run_payloads = []
+    app.state.created_names = []
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:
@@ -157,6 +158,7 @@ def fake_gateway() -> FastAPI:
         payload = await request.json()
         app.state.run_payloads.append(dict(payload))
         sandbox_id = str(payload.get("name") or f"sb-{len(app.state.sandboxes) + 1}")
+        app.state.created_names.append(sandbox_id)
         view = {
             "id": sandbox_id,
             "name": sandbox_id,
@@ -386,21 +388,25 @@ def test_context_resolution_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(remote_mod, "LocalTransport", RecordingLocalTransport)
 
     explicit = connect("prod", endpoints=["http://explicit"], token="arg-token")
-    assert explicit.transport.endpoints == ["http://explicit"]
-    assert explicit.transport.token == "arg-token"
+    explicit_transport = cast(RecordingMeshTransport, explicit.transport)
+    assert explicit_transport.endpoints == ["http://explicit"]
+    assert explicit_transport.token == "arg-token"
 
     monkeypatch.setenv("VMON_API_TOKEN", "env-token")
     env_client = connect("prod")
-    assert env_client.transport.endpoints == ["http://prod-a", "http://prod-b"]
-    assert env_client.transport.token == "env-token"
+    env_transport = cast(RecordingMeshTransport, env_client.transport)
+    assert env_transport.endpoints == ["http://prod-a", "http://prod-b"]
+    assert env_transport.token == "env-token"
 
     monkeypatch.delenv("VMON_API_TOKEN", raising=False)
     persisted_client = connect("prod")
-    assert persisted_client.transport.token == "persisted-token"
+    persisted_transport = cast(RecordingMeshTransport, persisted_client.transport)
+    assert persisted_transport.token == "persisted-token"
 
     monkeypatch.setenv("VMON_CONTEXT", "prod")
     selected_client = connect()
-    assert selected_client.transport.endpoints == ["http://prod-a", "http://prod-b"]
+    selected_transport = cast(RecordingMeshTransport, selected_client.transport)
+    assert selected_transport.endpoints == ["http://prod-a", "http://prod-b"]
 
     monkeypatch.setenv("VMON_CONTEXT", "local")
     local_client = connect()
@@ -462,3 +468,23 @@ def test_function_decorator_runs_over_fake_gateway(fake_gateway: FastAPI) -> Non
 
     assert add.remote(2, 5) == 7
     add.terminate()
+
+
+def test_function_decorator_map_runs_over_fake_gateway(fake_gateway: FastAPI) -> None:
+    client = VmonClient(GatewayTestTransport(fake_gateway))
+
+    @client.function(image="python:3.14-slim")
+    def triple(value: int) -> dict[str, int]:
+        return {"value": value, "triple": value * 3}
+
+    assert triple.map([1, 2, 3, 4, 5], concurrency=3) == [
+        {"value": 1, "triple": 3},
+        {"value": 2, "triple": 6},
+        {"value": 3, "triple": 9},
+        {"value": 4, "triple": 12},
+        {"value": 5, "triple": 15},
+    ]
+    assert len(fake_gateway.state.run_payloads) == 3
+    assert len(fake_gateway.state.created_names) == 3
+    assert len(set(fake_gateway.state.created_names)) == 3
+    assert fake_gateway.state.sandboxes == {}

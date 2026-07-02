@@ -61,6 +61,7 @@ def test_sdk_connect_exec_survives_first_gateway_loss(monkeypatch: pytest.Monkey
     try:
         setup = mesh_setup(node_a)
         join = mesh_join(node_b, str(setup["blob"]))
+        node_a_id = str(setup["node_id"])
         node_b_id = str(join["node_id"])
         wait_healthy([node_a, node_b], timeout=60.0)
         # Mesh setup persists membership; restart so HA replication/reconcile
@@ -100,45 +101,64 @@ def test_sdk_connect_exec_survives_first_gateway_loss(monkeypatch: pytest.Monkey
             cmd=["sh", "-c", "sleep 600"],
         )
 
+        # Idempotent creates are placed by the rendezvous coordinator for the
+        # key, so the owner may be either node. Rebind the SDK roster so its
+        # FIRST endpoint is the owner: killing the owner then kills exactly the
+        # gateway the client first contacted (the P1 exit criterion), and HA
+        # must restore the sandbox on the survivor for exec to keep working.
+        owner_row = sandbox_row(
+            api_json("GET", node_a.url, "/v1/sandboxes", token, timeout=10.0), sandbox_id
+        )
+        assert owner_row is not None, "created sandbox missing from mesh listing"
+        if owner_row.get("node") == node_a_id:
+            owner, survivor, survivor_id = node_a, node_b, node_b_id
+        else:
+            owner, survivor, survivor_id = node_b, node_a, node_a_id
+        client = connect(endpoints=[owner.url, survivor.url], token=token)
+        sandbox = client.sandboxes.get(sandbox_id)
+
         first = sandbox.exec("cat", "/etc/hostname", _track_entry=False)
         assert first.wait(timeout=30) == 0
         assert first.stdout.read()
 
         eventually(
-            f"{node_b_id} to hold a replica for {sandbox_id}",
+            f"{survivor_id} to hold a replica for {sandbox_id}",
             lambda: (
                 sandbox_id
-                in api_json("GET", node_b.url, "/v1/mesh/replica/list", token, timeout=5.0).get(
-                    "sids", []
-                )
+                in api_json(
+                    "GET", survivor.url, "/v1/mesh/replica/list", token, timeout=5.0
+                ).get("sids", [])
             ),
             timeout=90.0,
             interval=1.0,
         )
 
-        kill_node(node_a)
+        kill_node(owner)
         eventually(
-            f"{sandbox_id} to be restored and running on {node_b_id}",
+            f"{sandbox_id} to be restored and running on {survivor_id}",
             lambda: (
                 (row := sandbox_row(
-                    api_json("GET", node_b.url, "/v1/sandboxes", token, timeout=5.0), sandbox_id
+                    api_json("GET", survivor.url, "/v1/sandboxes", token, timeout=5.0),
+                    sandbox_id,
                 ))
                 is not None
                 and row.get("status") == "running"
-                and row.get("node") == node_b_id
+                and row.get("node") == survivor_id
             ),
             timeout=120.0,
             interval=2.0,
         )
 
-        # The client's first endpoint is dead; the SDK must fail over to the
-        # survivor for the sandbox it created.
+        # The client's first endpoint (the owner it first contacted) is dead;
+        # the SDK must fail over to the survivor for the sandbox it created.
         second = sandbox.exec("cat", "/etc/hostname", _track_entry=False)
         assert second.wait(timeout=60) == 0
         assert second.stdout.read()
     finally:
-        with contextlib.suppress(Exception):
-            connect(endpoints=[node_b.url], token=token).sandboxes.get(sandbox_id).terminate()
+        for node in (node_a, node_b):
+            with contextlib.suppress(Exception):
+                connect(endpoints=[node.url], token=token).sandboxes.get(sandbox_id).terminate()
+                break
         for node in (node_a, node_b):
             with contextlib.suppress(Exception):
                 kill_node(node)
