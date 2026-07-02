@@ -1394,37 +1394,47 @@ class RemoteFunction:
         self,
         iterable: Iterable[Any],
         *,
-        order: bool = True,
-        concurrency: int | None = None,
-        timeout: float | None = None,
+        concurrency: int = 4,
+        ordered: bool = True,
     ) -> list[Any]:
-        """Run one remote call per item across an ephemeral sandbox pool."""
+        """Run one remote call per item across an ephemeral sandbox pool.
+
+        Map uses fresh worker sandboxes instead of the cached ``remote()`` sandbox
+        because one sandbox cannot execute items concurrently. In mesh contexts the
+        factory is ``client.sandboxes.create``, so normal server-side placement
+        spreads workers across nodes.
+        """
         return self._map_items(
-            iterable, star=False, order=order, concurrency=concurrency, timeout=timeout
+            iterable, star=False, ordered=ordered, concurrency=concurrency
         )
 
-    def starmap(self, iterable: Iterable[Iterable[Any]], **kwargs: Any) -> list[Any]:
+    def starmap(
+        self,
+        iterable: Iterable[Iterable[Any]],
+        *,
+        concurrency: int = 4,
+        ordered: bool = True,
+    ) -> list[Any]:
         """Run one remote call per argument tuple across an ephemeral sandbox pool."""
-        return self._map_items(iterable, star=True, **kwargs)
+        return self._map_items(
+            iterable, star=True, ordered=ordered, concurrency=concurrency
+        )
 
     def _map_items(
         self,
         iterable: Iterable[Any],
         *,
         star: bool,
-        order: bool = True,
-        concurrency: int | None = None,
-        timeout: float | None = None,
+        ordered: bool = True,
+        concurrency: int = 4,
     ) -> list[Any]:
+        pool_limit = int(concurrency)
+        if pool_limit < 1:
+            raise ValueError("concurrency must be >= 1")
         items = list(iterable)
         if not items:
             return []
-        if concurrency is None:
-            pool_size = min(len(items), 8)
-        else:
-            pool_size = min(int(concurrency), len(items))
-            if pool_size < 1:
-                raise ValueError("concurrency must be >= 1")
+        pool_size = min(pool_limit, len(items))
 
         work: queue.Queue[int] = queue.Queue()
         for index in range(len(items)):
@@ -1454,7 +1464,7 @@ class RemoteFunction:
                     item = items[index]
                     args = tuple(item) if star else (item,)
                     try:
-                        value = self._run_once(sandbox, args, {}, timeout)
+                        value = self._run_once(sandbox, args, {}, None)
                     except BaseException as exc:
                         with result_lock:
                             if not first_error:
@@ -1475,11 +1485,8 @@ class RemoteFunction:
                 thread.join()
 
             if first_error:
-                error = first_error[0]
-                if isinstance(error, RemoteFunctionError):
-                    raise error
-                raise RemoteFunctionError(str(error)) from error
-            if order:
+                raise first_error[0]
+            if ordered:
                 return results
             return [value for _, value in completed]
         finally:

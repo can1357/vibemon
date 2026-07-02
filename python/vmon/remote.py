@@ -10,11 +10,14 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, BinaryIO, cast, overload
+from typing import TYPE_CHECKING, Any, BinaryIO, cast, overload
 
 from .client import DaemonError, LocalTransport, MeshTransport, Transport
 from .context import LOCAL, Context, ContextStore
 from .secret import Secret
+
+if TYPE_CHECKING:
+    from .sandbox import RemoteFunction
 
 __all__ = [
     "RemoteFilesystem",
@@ -121,18 +124,18 @@ class VmonClient:
         self.sandboxes = SandboxCollection(self)
 
     @overload
-    def function(self, fn: Callable[..., Any]) -> Any: ...
+    def function(self, fn: Callable[..., Any]) -> RemoteFunction: ...
 
     @overload
     def function(
         self, fn: None = None, **sandbox_kwargs: Any
-    ) -> Callable[[Callable[..., Any]], Any]: ...
+    ) -> Callable[[Callable[..., Any]], RemoteFunction]: ...
 
     def function(
         self,
         fn: Callable[..., Any] | None = None,
         **sandbox_kwargs: Any,
-    ) -> Any | Callable[[Callable[..., Any]], Any]:
+    ) -> RemoteFunction | Callable[[Callable[..., Any]], RemoteFunction]:
         """Decorate a source-available function to run through this client's sandbox plane."""
 
         from .sandbox import RemoteFunction
