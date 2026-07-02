@@ -202,6 +202,6 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 ## Notes / limits
 
 - The static guest agent is injected into prepared images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
-- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Set `VMON_REMOTE=host:port` (with `VMON_API_TOKEN`) to drive a remote daemon that listens on TCP — i.e. one started with `VMON_DAEMON_TCP=host:port` (via `python -m vmon.daemon` or `vmon serve`).
+- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Remote access always goes through the HTTP gateway (`vmon serve`): create a context with `vmon context create` and select it with `vmon context use`.
 - `VMON_BIN` / `VMON_KERNEL` / `VMON_HOME` override the binary, kernel, and
   state directory (`~/.vmon`).

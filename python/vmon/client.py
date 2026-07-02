@@ -1,16 +1,4 @@
-"""Thin stdlib client for the ``vmond`` daemon — what the ``vmon`` CLI talks to.
-
-:class:`DaemonClient` speaks the newline-delimited JSON protocol (see
-:mod:`vmon.daemon`). By default it connects to the local Unix socket and
-*auto-starts* the daemon on first use if it is not running, so ``vmon`` behaves
-like ``docker``: the user never launches ``vmond`` by hand. Set ``VMON_REMOTE=host:port``
-to target a remote daemon over TCP (authenticated with ``VMON_API_TOKEN``); the
-remote path never auto-starts.
-
-Each request uses its own short-lived connection. :meth:`call` returns the final
-result; :meth:`stream` invokes ``on_event(stream, data: bytes)`` for each frame
-(base64-decoding ``stdout``/``stderr``) and optionally forwards an stdin stream.
-"""
+"""Transport implementations for the local daemon and mesh gateways."""
 
 from __future__ import annotations
 
@@ -29,13 +17,33 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, Protocol, cast
 
 from .daemon import API_VERSION, daemon_paths
 
 OnEvent = Callable[[str, bytes], None]
+
+
+class Transport(Protocol):
+    """Shared local/mesh transport contract used by the CLI and SDK."""
+    def call(self, method: str, **params: Any) -> dict[str, Any]: ...
+    def stream(
+        self, method: str, on_event: OnEvent, stdin: BinaryIO | None = None, **params: Any
+    ) -> dict[str, Any]: ...
+    def interactive(
+        self,
+        method: str,
+        on_event: OnEvent,
+        *,
+        tty: bool = True,
+        on_ready: Callable[[], None] | None = None,
+        **params: Any,
+    ) -> dict[str, Any]: ...
+    def ensure_running(self) -> dict[str, Any]: ...
+    def stop_daemon(self) -> dict[str, Any]: ...
+
 
 _AUTOSTART_TIMEOUT = 10.0
 
@@ -74,9 +82,6 @@ class _Conn:
         with self._wlock:
             self._sock.sendall(data)
 
-    def send_auth(self, token: str) -> None:
-        self._send({"auth": token})
-
     def send_request(self, method: str, params: dict[str, Any]) -> None:
         self.rid = next(self._ids)
         self._send({"id": self.rid, "method": method, "params": params})
@@ -101,25 +106,14 @@ class _Conn:
             pass
 
 
-class DaemonClient:
-    """Connects to the ``vmond`` daemon, auto-starting a local one on demand."""
+class LocalTransport:
+    """Connect to the local ``vmond`` daemon, auto-starting one on demand."""
 
     def __init__(
         self, sock_path: str | os.PathLike[str] | None = None, *, autostart: bool = True
     ) -> None:
-        self._token = os.environ.get("VMON_API_TOKEN")
-        self._remote = self._parse_remote(os.environ.get("VMON_REMOTE"))
         self._sock_path = Path(sock_path) if sock_path is not None else daemon_paths()["sock"]
-        self._autostart = autostart and self._remote is None
-
-    @staticmethod
-    def _parse_remote(value: str | None) -> tuple[str, int] | None:
-        if not value:
-            return None
-        host, _, port = value.rpartition(":")
-        if not host or not port.isdigit():
-            raise DaemonError(f"invalid VMON_REMOTE {value!r}; expected host:port", code="invalid")
-        return (host, int(port))
+        self._autostart = autostart
 
     # -- public API ---------------------------------------------------------
 
@@ -162,7 +156,7 @@ class DaemonClient:
         on_event: OnEvent,
         *,
         tty: bool = True,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
         **params: Any,
     ) -> dict[str, Any]:
         """Run a PTY-style streaming method (``shell`` / interactive ``exec``).
@@ -205,7 +199,7 @@ class DaemonClient:
                     # races the quick command's exit against a stdin-EOF teardown
                     # that can SIGHUP the guest and surface a spurious 129 exit.
                     if on_ready is not None:
-                        on_ready(str(frame.get("data") or ""))
+                        on_ready()
                     continue
                 if "event" in frame:
                     self._dispatch_event(frame, on_event)
@@ -300,13 +294,7 @@ class DaemonClient:
         return self.call("info")
 
     def stop_daemon(self) -> dict[str, Any]:
-        """Ask the running local daemon to exit (SIGTERM); returns its prior info.
-
-        Refused for remote targets: ``info["pid"]`` is a PID on the remote host,
-        so a local ``os.kill`` would hit an unrelated process.
-        """
-        if self._remote is not None:
-            raise DaemonError("cannot stop a remote daemon over VMON_REMOTE", code="invalid")
+        """Ask the running local daemon to exit (SIGTERM); returns its prior info."""
         info = self.call("info")
         pid = info.get("pid")
         if pid:
@@ -393,23 +381,12 @@ class DaemonClient:
                 conn.close()
                 raise DaemonError(f"unsupported daemon banner: {banner!r}", code="protocol")
             sock.settimeout(None)
-            if self._remote is not None:
-                # TCP always leads with an auth frame (empty when no token is set).
-                conn.send_auth(self._token or "")
             return conn
         except Exception:
             sock.close()
             raise
 
     def _connect(self) -> socket.socket:
-        if self._remote is not None:
-            host, port = self._remote
-            try:
-                return socket.create_connection((host, port), timeout=10.0)
-            except OSError as exc:
-                raise DaemonError(
-                    f"cannot reach remote daemon {host}:{port}: {exc}", code="unreachable"
-                ) from exc
         try:
             return self._connect_uds()
         except FileNotFoundError, ConnectionRefusedError:
@@ -496,14 +473,14 @@ class DaemonClient:
                 sock.close()
 
 
-class GatewayClient:
-    """HTTP/WebSocket transport that talks to a local or remote vmon gateway."""
+class _Gateway:
+    """Private HTTP/WebSocket engine for one mesh gateway endpoint."""
 
     def __init__(self, base_url: str, token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self._token = token or os.environ.get("VMON_API_TOKEN")
         if not self._token:
-            raise DaemonError("VMON_API_TOKEN required for mesh CLI", code="invalid")
+            raise DaemonError("bearer token required for mesh transport", code="invalid")
 
     def call(self, method: str, **params: Any) -> dict[str, Any]:
         if method == "ps":
@@ -548,12 +525,10 @@ class GatewayClient:
             path = self._urlencode({"path": params.get("path") or "/"})
             return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}/fs/stat?{path}")
         if method == "run":
-            payload = {**params}
-            payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
+            payload = _with_idempotency_key(params)
             return self._json("POST", "/v1/run?detach=1", payload, retries=3)
         if method == "restore":
-            payload = {**params, "detach": True}
-            payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
+            payload = _with_idempotency_key({**params, "detach": True})
             return self._json("POST", "/v1/restore", payload, retries=3)
         if method == "inspect":
             return self._json("GET", f"/v1/sandboxes/{self._q(params['name'])}")
@@ -589,7 +564,7 @@ class GatewayClient:
         on_event: OnEvent,
         *,
         tty: bool = True,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
         **params: Any,
     ) -> dict[str, Any]:
         if method == "exec":
@@ -715,7 +690,7 @@ class GatewayClient:
         *,
         tty: bool,
         stdin: BinaryIO | None = None,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         name = self._q(params["name"])
         sock = self._open_ws(f"/v1/sandboxes/{name}/exec/ws")
@@ -736,7 +711,7 @@ class GatewayClient:
         on_event: OnEvent,
         *,
         tty: bool,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         import urllib.parse
 
@@ -763,7 +738,7 @@ class GatewayClient:
         *,
         tty: bool,
         stdin: BinaryIO | None = None,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
         wait_ready: bool = True,
     ) -> dict[str, Any]:
         from .wsframe import encode_frame, read_frame_sync
@@ -797,7 +772,7 @@ class GatewayClient:
                 return
             src = stdin
             if src is None and tty and sys.stdin.isatty() and sys.stdout.isatty():
-                raw = DaemonClient._enter_raw()
+                raw = LocalTransport._enter_raw()
                 src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
             elif src is None:
                 src = cast(BinaryIO, getattr(sys.stdin, "buffer", sys.stdin))
@@ -817,7 +792,7 @@ class GatewayClient:
                 frame = json.loads(payload.decode("utf-8", "replace"))
                 if "ready" in frame:
                     if on_ready is not None:
-                        on_ready(str(frame.get("ready") or ""))
+                        on_ready()
                     start_input()
                     continue
                 if "stream" in frame:
@@ -832,9 +807,9 @@ class GatewayClient:
             if (stdin_thread := stdin_thread_ref[0]) is not None and raw is not None:
                 stdin_thread.join(timeout=0.3)
             if winch is not None:
-                DaemonClient._restore_winch(winch)
+                LocalTransport._restore_winch(winch)
             if raw is not None:
-                DaemonClient._exit_raw(raw)
+                LocalTransport._exit_raw(raw)
             with contextlib.suppress(OSError):
                 sock.close()
 
@@ -864,20 +839,14 @@ _REPLAY_SAFE_CALLS = frozenset(
 )
 _REPLAY_SAFE_STREAMS = frozenset({"logs"})
 
+def _with_idempotency_key(params: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(params)
+    payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
+    return payload
 
-class MeshClient:
-    """Multi-endpoint gateway transport with failover across a context's roster.
 
-    Wraps :class:`GatewayClient`: replay-safe operations (reads, idempotent
-    writes, and detached creates) fail over across all endpoints after
-    connection-establishment failures. Attached creates, exec, and shell fail
-    over only during a ``/healthz`` endpoint probe and then run once against the
-    selected gateway, so a delivered request is never duplicated. An HTTP 5xx
-    from a reachable gateway is surfaced to the caller, not retried elsewhere.
-    On success the answering endpoint is promoted to the head of the list and
-    ``on_roster`` (if given) is invoked with the new order so the caller can
-    persist the reordered roster.
-    """
+class MeshTransport:
+    """Ordered gateway roster with replay-safe failover and exactly-once probes."""
 
     def __init__(
         self,
@@ -886,7 +855,7 @@ class MeshClient:
         *,
         on_roster: Callable[[list[str]], None] | None = None,
     ) -> None:
-        """Create a failover client for an ordered gateway endpoint roster."""
+        """Create a failover transport for an ordered gateway endpoint roster."""
 
         self._endpoints = [endpoint for endpoint in endpoints if endpoint]
         if not self._endpoints:
@@ -903,8 +872,8 @@ class MeshClient:
     def call(self, method: str, **params: Any) -> dict[str, Any]:
         """Invoke a gateway RPC with delivery-safe endpoint failover."""
 
-        if method in {"run", "restore"} and "idempotency_key" not in params:
-            params["idempotency_key"] = secrets.token_urlsafe(18)
+        if method in {"run", "restore"}:
+            params = _with_idempotency_key(params)
         if method in _REPLAY_SAFE_CALLS:
             return self._with_failover(lambda gc: gc.call(method, **params))
         return self._single_live(lambda gc: gc.call(method, **params))
@@ -926,7 +895,7 @@ class MeshClient:
         on_event: OnEvent,
         *,
         tty: bool = True,
-        on_ready: Callable[[str], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
         **params: Any,
     ) -> dict[str, Any]:
         """Invoke an interactive gateway RPC with delivery-safe endpoint failover."""
@@ -948,36 +917,18 @@ class MeshClient:
     def _pick_live(self) -> str:
         """Promote and return the first endpoint answering GET /healthz; raise if none."""
 
-        last: Exception | None = None
-        for endpoint in list(self._endpoints):
-            try:
-                GatewayClient(endpoint, self._token).ensure_running()
-            except DaemonError as exc:
-                if exc.code in _DENIES_DELIVERY:
-                    last = exc
-                    continue
-                raise
-            except OSError as exc:
-                last = exc
-                continue
-            self._promote(endpoint)
-            return endpoint
-        if isinstance(last, DaemonError):
-            raise last
-        raise DaemonError(
-            f"no reachable gateway in context roster ({len(self._endpoints)} endpoints)",
-            code="unreachable",
-        ) from last
+        self._with_failover(lambda gc: gc.ensure_running())
+        return self._endpoints[0]
 
-    def _single_live(self, fn: Callable[[GatewayClient], dict[str, Any]]) -> dict[str, Any]:
+    def _single_live(self, fn: Callable[[_Gateway], dict[str, Any]]) -> dict[str, Any]:
         """Probe /healthz to select a live endpoint, then run fn against it exactly once."""
 
-        return fn(GatewayClient(self._pick_live(), self._token))
+        return fn(_Gateway(self._pick_live(), self._token))
 
-    def _with_failover(self, fn: Callable[[GatewayClient], dict[str, Any]]) -> dict[str, Any]:
+    def _with_failover(self, fn: Callable[[_Gateway], dict[str, Any]]) -> dict[str, Any]:
         last: Exception | None = None
         for endpoint in list(self._endpoints):
-            client = GatewayClient(endpoint, self._token)
+            client = _Gateway(endpoint, self._token)
             try:
                 result = fn(client)
             except DaemonError as exc:
@@ -1004,3 +955,4 @@ class MeshClient:
         self._endpoints.insert(0, endpoint)
         if self._on_roster is not None:
             self._on_roster(list(self._endpoints))
+

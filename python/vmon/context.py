@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ __all__ = [
     "LOCAL",
     "Context",
     "contexts_path",
+    "context_token_path",
     "ContextStore",
     "roster_from_status",
 ]
@@ -22,10 +24,23 @@ __all__ = [
 #: Reserved built-in context name for using the local vmond daemon.
 LOCAL = "local"
 
+#: Context names double as credential filenames; keep them path-safe.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _require_safe_name(name: str) -> str:
+    """Reject context names that could escape the credentials directory."""
+    if not _NAME_RE.match(name):
+        raise ValueError(
+            f"invalid context name {name!r}; use letters, digits, '.', '_', or '-' "
+            "(starting with a letter or digit)"
+        )
+    return name
+
 
 @dataclass
 class Context:
-    """A named gateway roster; the bearer token is in-memory only, never persisted."""
+    """A named gateway roster; bearer tokens are stored outside contexts.json."""
 
     name: str
     endpoints: list[str]
@@ -34,7 +49,6 @@ class Context:
     updated: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        """Return this context as JSON-ready data (token excluded; never written to disk)."""
         return {
             "name": self.name,
             "endpoints": list(self.endpoints),
@@ -52,7 +66,6 @@ class Context:
             endpoints = []
 
         name_value = data.get("name", "")
-        token_value = data.get("token")
         region_value = data.get("region", "")
         updated_value = data.get("updated", 0.0)
 
@@ -62,7 +75,7 @@ class Context:
         return cls(
             name=name_value if isinstance(name_value, str) else "",
             endpoints=endpoints,
-            token=token_value if isinstance(token_value, str) else None,
+            token=None,
             region=region_value if isinstance(region_value, str) else "",
             updated=float(updated_value),
         )
@@ -71,6 +84,11 @@ class Context:
 def contexts_path(home: Path | None = None) -> Path:
     """Return the JSON store path under the given or default vmon state directory."""
     return (home or state_dir()) / "contexts.json"
+
+
+def context_token_path(name: str, home: Path | None = None) -> Path:
+    """Return the bearer-token path for a context under the credentials store."""
+    return (home or state_dir()) / "credentials" / f"{_require_safe_name(name)}.token"
 
 
 class ContextStore:
@@ -155,16 +173,72 @@ class ContextStore:
         self.save()
 
     def put(self, ctx: Context) -> None:
-        """Insert or replace a context by name and persist the store."""
-        self._contexts[ctx.name] = ctx
+        """Insert or replace a context by name and persist the store.
+
+        Raises ValueError for names unsafe as credential filenames.
+        """
+        self._contexts[_require_safe_name(ctx.name)] = ctx
         self.save()
 
     def remove(self, name: str) -> None:
-        """Remove a context by name, clearing it as current when selected."""
+        """Remove a context and its saved token, clearing it as current when selected."""
         self._contexts.pop(name, None)
+        self.remove_token(name)
         if self._current == name:
             self._current = None
         self.save()
+
+    def token_path(self, name: str) -> Path:
+        """Return the token file path that shares this store's state root."""
+        return self._path.parent / "credentials" / f"{_require_safe_name(name)}.token"
+
+    def save_token(self, name: str, token: str) -> None:
+        """Persist a context token with private directory and file permissions."""
+        directory = self.token_path(name).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        tmp = directory / f".{name}.token.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(token)
+            file.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.token_path(name))
+        os.chmod(self.token_path(name), 0o600)
+
+    def load_token(self, name: str) -> str | None:
+        """Return a saved context token, or None when absent/empty/unreadable."""
+        try:
+            token = self.token_path(name).read_text(encoding="utf-8").strip()
+        except OSError, ValueError:
+            return None
+        return token or None
+
+    def has_token(self, name: str) -> bool:
+        """Return whether a context has an opt-in saved token file."""
+        return self.load_token(name) is not None
+
+    def remove_token(self, name: str) -> None:
+        """Delete a saved token file, tolerating missing files and unsafe names."""
+        try:
+            self.token_path(name).unlink()
+        except FileNotFoundError, ValueError:
+            pass
+
+    def resolve_token(self, name: str) -> str | None:
+        """Resolve a mesh bearer token: environment override, then saved file."""
+        return os.environ.get("VMON_API_TOKEN") or self.load_token(name)
+
+
+def _status_nodes(status: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    nodes: list[Mapping[str, Any]] = []
+    self_status = status.get("self")
+    if isinstance(self_status, Mapping):
+        nodes.append(self_status)
+    peers = status.get("peers")
+    if isinstance(peers, list):
+        nodes.extend(peer for peer in peers if isinstance(peer, Mapping))
+    return nodes
 
 
 def roster_from_status(status: Mapping[str, Any], *, fallback: str | None = None) -> list[str]:
@@ -172,23 +246,14 @@ def roster_from_status(status: Mapping[str, Any], *, fallback: str | None = None
     roster: list[str] = []
     seen: set[str] = set()
 
-    self_status = status.get("self")
-    if isinstance(self_status, Mapping):
-        advertise = self_status.get("advertise")
+    for node in _status_nodes(status):
+        advertise = node.get("advertise")
         if isinstance(advertise, str) and advertise and advertise not in seen:
             seen.add(advertise)
             roster.append(advertise)
 
-    peers = status.get("peers")
-    if isinstance(peers, list):
-        for peer in peers:
-            if not isinstance(peer, Mapping):
-                continue
-            advertise = peer.get("advertise")
-            if isinstance(advertise, str) and advertise and advertise not in seen:
-                seen.add(advertise)
-                roster.append(advertise)
-
     if not roster and fallback:
         return [fallback]
     return roster
+
+

@@ -1,10 +1,9 @@
-"""`vmon` — a Modal-style CLI that drives microVMs through the ``vmond`` daemon.
+"""`vmon` — a Modal-style CLI that drives microVMs through ``Transport`` objects.
 
-Every command is a request to a local daemon (auto-started on first use); the
-daemon owns the registry and spawns the per-VM ``vmon`` VMM processes. The CLI
-speaks to :class:`vmon.client.DaemonClient` and renders everything through
+The daemon owns the registry and spawns the per-VM ``vmon`` VMM processes. The CLI
+speaks through :mod:`vmon.client` transports and renders everything through
 :mod:`vmon.console` (the only place :mod:`click`/:mod:`rich` are imported), so the
-SDK and daemon stay dependency-light.
+runtime stays dependency-light.
 """
 
 import io
@@ -16,9 +15,14 @@ import click
 
 from . import __version__, doctor
 from . import console as ui
-from .client import DaemonClient, DaemonError, GatewayClient, MeshClient
+from .client import DaemonError, LocalTransport, MeshTransport, Transport
 from .console import RichGroup
-from .context import LOCAL, Context, ContextStore, roster_from_status
+from .context import (
+    LOCAL,
+    Context,
+    ContextStore,
+    roster_from_status,
+)
 
 # ``-h`` as well as ``--help``; PTY/REMAINDER commands stop option parsing at the
 # first positional so a trailing command keeps its own flags (Docker-style).
@@ -108,16 +112,34 @@ def _parse_ref(spec: str) -> tuple[str, str]:
 def _mesh_call(
     method: str, path: str, payload: dict[str, object] | None = None
 ) -> dict[str, object]:
-    """Call the local HTTP gateway's mesh API using the shared bearer token."""
+    """Call the mesh API on the selected context's gateway (local gateway when none)."""
     import json
     import os
     import urllib.error
     import urllib.request
 
-    base = os.environ.get("VMON_SERVER", "http://127.0.0.1:8000").rstrip("/")
+    base = "http://127.0.0.1:8000"
+    store = ContextStore()
+    store.load()
+    selected = store.current_name()
+    if selected and selected != LOCAL:
+        ctx = store.get(selected)
+        if ctx is None:
+            raise click.ClickException(
+                f"selected context {selected!r} not found; run 'vmon context ls'"
+            )
+        if not ctx.endpoints:
+            raise click.ClickException(
+                f"context {selected!r} has no endpoints; run 'vmon context refresh'"
+            )
+        base = ctx.endpoints[0].rstrip("/")
     token = os.environ.get("VMON_API_TOKEN")
+    if selected and selected != LOCAL:
+        token = token or store.load_token(selected)
     if not token:
-        raise click.ClickException("VMON_API_TOKEN is required for mesh commands")
+        raise click.ClickException(
+            "VMON_API_TOKEN or a saved context token is required for mesh commands"
+        )
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         base + path,
@@ -165,16 +187,8 @@ def _fetch_mesh_status(url: str, token: str) -> dict[str, object]:
     return json.loads(raw or b"{}")
 
 
-def _client() -> DaemonClient | GatewayClient | MeshClient:
-    """Select daemon, gateway, or mesh-context transport for one CLI request."""
-    import json
-    import os
-
-    if os.environ.get("VMON_REMOTE"):
-        return DaemonClient()
-    server = os.environ.get("VMON_SERVER")
-    if server:
-        return GatewayClient(server)
+def _client() -> Transport:
+    """Select the local daemon or the mesh-context transport for one CLI request."""
     store = ContextStore()
     store.load()
     selected = store.current_name()
@@ -193,19 +207,20 @@ def _client() -> DaemonClient | GatewayClient | MeshClient:
             ctx.endpoints = order
             store.put(ctx)
 
-        return MeshClient(ctx.endpoints, os.environ.get("VMON_API_TOKEN"), on_roster=_persist)
-    if selected == LOCAL:
-        return DaemonClient()
-    home = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
-    mesh_path = home / "mesh.json"
-    if mesh_path.exists():
-        try:
-            data = json.loads(mesh_path.read_text(encoding="utf-8"))
-        except OSError, json.JSONDecodeError:
-            data = {}
-        if data.get("enabled") is True and data.get("advertise"):
-            return GatewayClient(str(data["advertise"]))
-    return DaemonClient()
+        return MeshTransport(
+            ctx.endpoints,
+            store.resolve_token(ctx.name),
+            on_roster=_persist,
+        )
+    return LocalTransport()
+
+
+def _require_local_build_context() -> None:
+    store = ContextStore()
+    store.load()
+    selected = store.current_name()
+    if selected and selected != LOCAL:
+        raise click.ClickException("Dockerfile builds run locally; use a local context")
 
 
 @click.group(
@@ -233,13 +248,13 @@ def cli() -> None:
 @click.option(
     "-f",
     "--dockerfile",
-    help="unsupported without a daemonless builder such as buildah/buildkit",
+    help="Dockerfile to build before running (local context only)",
 )
 @click.option(
     "--context",
     default=".",
     show_default=True,
-    help="Dockerfile build context (currently unsupported)",
+    help="Dockerfile build context",
 )
 @click.option("--name", help="microVM name (default: auto)")
 @click.option("--mem", type=int, default=512, show_default=True, help="guest RAM in MiB")
@@ -256,12 +271,31 @@ def cli() -> None:
     is_flag=True,
     help="boot without networking (no NIC; needs no root and works on macOS)",
 )
-def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, detach, block_network):
+@click.option(
+    "--arch",
+    type=click.Choice(["x86_64", "aarch64"]),
+    help="request a specific owner architecture",
+)
+def run(
+    image,
+    cmd,
+    dockerfile,
+    context,
+    name,
+    mem,
+    cpus,
+    disk_mb,
+    timeout,
+    detach,
+    block_network,
+    arch,
+):
     if dockerfile:
-        raise click.UsageError(
-            "Dockerfile builds are not supported by this Dockerless image path; "
-            "publish or prebuild an OCI image, then run it"
-        )
+        _require_local_build_context()
+        from .build import build_image
+
+        image = build_image(Path(dockerfile), Path(context), image or "vmon-run:latest")
+        dockerfile = None
     if not image:
         raise click.UsageError("provide an image (for example: vmon run alpine)")
     client = _client()
@@ -277,6 +311,7 @@ def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, deta
         "cmd": _strip_dashdash(cmd) or None,
         "detach": detach,
         "block_network": block_network,
+        "arch": arch,
     }
     if detach:
         r = client.call("run", **params)
@@ -286,6 +321,27 @@ def run(image, cmd, dockerfile, context, name, mem, cpus, disk_mb, timeout, deta
         return 0
     r = client.stream("run", _write_event, **params)
     return _exit_code(r)
+
+
+@cli.command(
+    panel="Commands",
+    context_settings=_CTX,
+    help="Build a Dockerfile into a daemonless OCI layout.",
+)
+@click.argument("context", required=False, default=".")
+@click.option(
+    "-f",
+    "--dockerfile",
+    default="Dockerfile",
+    show_default=True,
+    help="Dockerfile path",
+)
+@click.option("-t", "--tag", required=True, help="image tag to write into the OCI layout")
+def build(context, dockerfile, tag):
+    from .build import build_image
+
+    click.echo(build_image(Path(dockerfile), Path(context), tag))
+    return 0
 
 
 @cli.command(
@@ -348,7 +404,7 @@ def shell(ref, command, image, env, mem, cpus, disk_mb, timeout, pty):
     )
     state = {"ready": False}
 
-    def on_ready(name: str) -> None:
+    def on_ready() -> None:
         if spinner is not None and not state["ready"]:
             spinner.stop()
         state["ready"] = True
@@ -555,9 +611,20 @@ def snapshot(name, snapshot, stop):
 @click.option("--name", help="new VM name")
 @click.option("--agent", is_flag=True, help="attach an agent socket")
 @click.option("-d", "--detach", is_flag=True, help="run in background")
-def restore(snapshot, name, agent, detach):
+@click.option(
+    "--arch",
+    type=click.Choice(["x86_64", "aarch64"]),
+    help="request a specific owner architecture",
+)
+def restore(snapshot, name, agent, detach, arch):
     client = _client()
-    params = {"snapshot": snapshot, "name": name, "agent": agent, "detach": detach}
+    params = {
+        "snapshot": snapshot,
+        "name": name,
+        "agent": agent,
+        "detach": detach,
+        "arch": arch,
+    }
     r = (
         client.call("restore", **params)
         if detach
@@ -577,8 +644,13 @@ def restore(snapshot, name, agent, detach):
 )
 @click.argument("snapshot")
 @click.option("--count", type=int, default=2, show_default=True, help="number of clones")
-def fork(snapshot, count):
-    clones = _client().call("fork", snapshot=snapshot, count=count).get("clones") or []
+@click.option(
+    "--arch",
+    type=click.Choice(["x86_64", "aarch64"]),
+    help="request a specific owner architecture",
+)
+def fork(snapshot, count, arch):
+    clones = _client().call("fork", snapshot=snapshot, count=count, arch=arch).get("clones") or []
     ui.info(f"forked {len(clones)} CoW clone(s) from [vmon.command]{snapshot}[/]:")
     for c in clones:
         # Name first so scripts can ``line.split()[0]``; keep the ``(pid`` marker.
@@ -681,8 +753,9 @@ def context() -> None:
 @click.argument("name")
 @click.option("--server", "-s", required=True, help="gateway URL or host:port to bootstrap from")
 @click.option("--token", help="bearer token for the initial fetch (default: $VMON_API_TOKEN)")
+@click.option("--save-token", is_flag=True, help="persist the bearer token for this context")
 @click.option("--region", default="", help="locality label (informational)")
-def context_create(name, server, token, region):
+def context_create(name, server, token, save_token, region):
     import os
     import time
 
@@ -693,18 +766,28 @@ def context_create(name, server, token, region):
         raise click.ClickException("a token is required: pass --token or set VMON_API_TOKEN")
     url = _normalize_server(server)
     try:
-        endpoints = roster_from_status(_fetch_mesh_status(url, tok), fallback=url)
+        status = _fetch_mesh_status(url, tok)
+        endpoints = roster_from_status(status, fallback=url)
     except click.ClickException as exc:
         ui.error(str(exc))
         ui.hint("storing the single endpoint; run 'vmon context refresh' once reachable")
         endpoints = [url]
+    ctx = Context(
+        name=name,
+        endpoints=endpoints,
+        region=region,
+        updated=time.time(),
+    )
     store = ContextStore()
     store.load()
-    store.put(Context(name=name, endpoints=endpoints, region=region, updated=time.time()))
+    store.put(ctx)
+    if save_token:
+        store.save_token(name, tok)
     if store.current() is None:
         store.use(name)
     ui.success(f"context [vmon.command]{name}[/] → {len(endpoints)} endpoint(s)")
-    ui.hint("set VMON_API_TOKEN to authenticate cluster commands")
+    if not save_token:
+        ui.hint("set VMON_API_TOKEN to authenticate cluster commands")
     return 0
 
 
@@ -735,8 +818,7 @@ def context_use(name):
 
 @context.command(name="refresh", context_settings=_CTX, help="Re-fetch a context's gateway roster.")
 @click.argument("name", required=False)
-def context_refresh(name):
-    import os
+def context_refresh(name: str | None) -> int:
     import time
 
     store = ContextStore()
@@ -747,9 +829,11 @@ def context_refresh(name):
     ctx = store.get(target)
     if ctx is None:
         raise click.ClickException(f"no such context {target!r}")
-    tok = os.environ.get("VMON_API_TOKEN")
+    tok = store.resolve_token(target)
     if not tok:
-        raise click.ClickException("VMON_API_TOKEN is required to refresh a context")
+        raise click.ClickException(
+            "VMON_API_TOKEN or a saved context token is required to refresh a context"
+        )
     last: click.ClickException | None = None
     for endpoint in ctx.endpoints:
         try:
@@ -786,7 +870,9 @@ def context_inspect(name):
     ctx = store.get(target)
     if ctx is None:
         raise click.ClickException(f"no such context {target!r}")
-    ui.console.print_json(data=ctx.to_dict())
+    data = ctx.to_dict()
+    data["token_saved"] = store.has_token(ctx.name)
+    ui.console.print_json(data=data)
     return 0
 
 
@@ -799,9 +885,11 @@ def context_inspect(name):
     context_settings=_CTX,
     help="Diagnose vmon prerequisites.",
 )
-def doctor_cmd():
+@click.option("--serve", "serve_config", is_flag=True, help="validate vmon serve configuration")
+@click.option("--config", "config_path", type=click.Path(dir_okay=False), help="serve TOML config")
+def doctor_cmd(serve_config, config_path):
     """Run preflight diagnostics for first-run prerequisites."""
-    return doctor.run_doctor()
+    return doctor.run_doctor(serve=serve_config, config_path=config_path)
 
 
 @cli.command(
@@ -840,7 +928,7 @@ def _should_hint_doctor(error: DaemonError) -> bool:
 def daemon(action):
     if action == "status":
         try:
-            info = DaemonClient(autostart=False).call("info")
+            info = LocalTransport(autostart=False).call("info")
         except DaemonError as e:
             if e.code in ("unreachable", "closed"):
                 ui.console.print("[vmon.warn]vmond[/]: not running")
@@ -853,7 +941,7 @@ def daemon(action):
         return 0
     if action == "stop":
         try:
-            info = DaemonClient(autostart=False).stop_daemon()
+            info = LocalTransport(autostart=False).stop_daemon()
         except DaemonError as e:
             if e.code in ("unreachable", "closed"):
                 ui.console.print("[vmon.warn]vmond[/]: not running")
@@ -861,7 +949,7 @@ def daemon(action):
             raise
         ui.success(f"vmond stopped (pid {info.get('pid')})")
         return 0
-    info = DaemonClient().ensure_running()
+    info = LocalTransport().ensure_running()
     ui.success(f"vmond running (pid {info.get('pid')})  socket={info.get('socket')}")
     return 0
 
@@ -871,19 +959,96 @@ def daemon(action):
     context_settings=_CTX,
     help="Serve the HTTP sandbox API (requires vmon[server]).",
 )
-@click.option("--host", default="127.0.0.1", show_default=True, help="bind host")
-@click.option("--port", type=int, default=8000, show_default=True, help="bind port")
+@click.option("--config", "config_path", type=click.Path(dir_okay=False), help="TOML config file")
+@click.option("--home", type=click.Path(file_okay=False), help="state directory (default ~/.vmon)")
+@click.option("--host", help="bind host (default 127.0.0.1)")
+@click.option("--port", type=int, help="bind port (default 8000)")
 @click.option("--token", help="bearer token (or VMON_API_TOKEN)")
+@click.option("--client-token", help="scoped client bearer token (or VMON_CLIENT_TOKEN)")
 @click.option("--tls-cert", help="PEM cert for HTTPS (or VMON_TLS_CERT)")
 @click.option("--tls-key", help="PEM key for HTTPS (or VMON_TLS_KEY)")
+@click.option("--idle-timeout", type=float, help="terminate idle sandboxes after this many seconds")
+@click.option("--replicate-sec", type=float, help="checkpoint cadence; unset auto-enables on mesh")
+@click.option("--replicas", type=int, help="replica fan-out K")
+@click.option("--replicate-concurrency", type=int, help="concurrent replica push limit")
 @click.option(
-    "--idle-timeout",
-    type=float,
-    default=300.0,
-    show_default=True,
-    help="terminate idle sandboxes after this many seconds",
+    "--restore-quorum/--no-restore-quorum",
+    default=None,
+    help="force quorum-gated restore on or off (default auto)",
 )
-def serve(host, port, token, tls_cert, tls_key, idle_timeout):
+@click.option("--warm-pool-size", type=int, help="default count for bare warm image refs")
+@click.option("--warm-images", help="comma-separated image refs, optionally REF=COUNT")
+@click.option("--mesh-heartbeat-sec", type=float, help="mesh heartbeat interval")
+@click.option("--mesh-reap-sec", type=float, help="mesh peer reap/orphan detection window")
+@click.option("--mesh-idem-ttl-sec", type=float, help="mesh idempotency key TTL")
+@click.option("--mesh-create-timeout-sec", type=float, help="mesh create/proxy timeout")
+@click.option("--mesh-w-warm", type=float, help="placement score weight: warm template/pool")
+@click.option("--mesh-w-free", type=float, help="placement score weight: free capacity")
+@click.option("--mesh-w-local", type=float, help="placement score weight: ingress-local node")
+@click.option("--mesh-w-region", type=float, help="placement score weight: matching region")
+@click.option("--mesh-w-inflight", type=float, help="placement score penalty: in-flight load")
+def serve(
+    config_path,
+    home,
+    host,
+    port,
+    token,
+    client_token,
+    tls_cert,
+    tls_key,
+    idle_timeout,
+    replicate_sec,
+    replicas,
+    replicate_concurrency,
+    restore_quorum,
+    warm_pool_size,
+    warm_images,
+    mesh_heartbeat_sec,
+    mesh_reap_sec,
+    mesh_idem_ttl_sec,
+    mesh_create_timeout_sec,
+    mesh_w_warm,
+    mesh_w_free,
+    mesh_w_local,
+    mesh_w_region,
+    mesh_w_inflight,
+):
+    import os
+
+    from .config import ConfigError, resolve_serve_config
+
+    try:
+        config = resolve_serve_config(
+            {
+                "config": config_path,
+                "home": home,
+                "host": host,
+                "port": port,
+                "token": token,
+                "client_token": client_token,
+                "tls_cert": tls_cert,
+                "tls_key": tls_key,
+                "idle_timeout": idle_timeout,
+                "replicate_sec": replicate_sec,
+                "replicas": replicas,
+                "replicate_concurrency": replicate_concurrency,
+                "restore_quorum": restore_quorum,
+                "warm_pool_size": warm_pool_size,
+                "warm_images": warm_images,
+                "mesh_heartbeat_sec": mesh_heartbeat_sec,
+                "mesh_reap_sec": mesh_reap_sec,
+                "mesh_idem_ttl_sec": mesh_idem_ttl_sec,
+                "mesh_create_timeout_sec": mesh_create_timeout_sec,
+                "mesh_w_warm": mesh_w_warm,
+                "mesh_w_free": mesh_w_free,
+                "mesh_w_local": mesh_w_local,
+                "mesh_w_region": mesh_w_region,
+                "mesh_w_inflight": mesh_w_inflight,
+            }
+        )
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    os.environ["VMON_HOME"] = str(config.home)
     try:
         from .server import serve as serve_http
     except ModuleNotFoundError as e:
@@ -891,14 +1056,7 @@ def serve(host, port, token, tls_cert, tls_key, idle_timeout):
             ui.error("vmon serve requires the server extra: pip install 'vmon[server]'")
             return 1
         raise
-    serve_http(
-        host=host,
-        port=port,
-        token=token,
-        idle_timeout=idle_timeout,
-        tls_cert=tls_cert,
-        tls_key=tls_key,
-    )
+    serve_http(config=config)
     return 0
 
 

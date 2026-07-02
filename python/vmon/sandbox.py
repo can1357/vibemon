@@ -26,7 +26,14 @@ from .agent_client import AgentClosed, AgentConn, ByteStream, ExecSession
 from .image import ImageSpec, cached_template, slot_tag
 from .pool import WarmPool, wait_for_agent_ready
 from .secret import Secret, merge_secrets
-from .vmm import STATE, MicroVM, _instance_name, _validate_int_range, _validate_timeout_secs
+from .vmm import (
+    STATE,
+    MicroVM,
+    _instance_name,
+    _snapshot_state_present,
+    _validate_int_range,
+    _validate_timeout_secs,
+)
 from .volume import Volume
 
 _POOLS: dict[str, WarmPool] = {}
@@ -145,6 +152,41 @@ def _setup_sandbox_network(
     )
 
 
+def _template_has_snapshot_state(template_dir: str | os.PathLike[str]) -> bool:
+    return _snapshot_state_present(Path(template_dir))
+
+
+def _reject_macos_host_network_features(
+    *,
+    ports: Sequence[int] | None,
+    egress_allow: Sequence[str] | None,
+    egress_allow_domains: Sequence[str] | None,
+    inbound_cidr_allowlist: Sequence[str] | None,
+) -> None:
+    for feature, requested in (
+        ("ports", ports),
+        ("egress_allow", egress_allow),
+        ("egress_allow_domains", egress_allow_domains),
+        ("inbound_cidr_allowlist", inbound_cidr_allowlist),
+    ):
+        if requested:
+            raise ValueError(
+                f"{feature} requires Linux host networking (TAP); "
+                "macOS user-mode NAT is outbound-egress only"
+            )
+
+
+def _user_net_guest_config() -> dict[str, Any]:
+    from . import net
+
+    return {
+        "guest_ip": net.USER_NET_GUEST_IP,
+        "prefix": net.USER_NET_PREFIX,
+        "host_ip": net.USER_NET_GATEWAY,
+        "dns": list(net.USER_NET_DNS),
+    }
+
+
 class _ProcessStdin:
     def __init__(self, session: ExecSession) -> None:
         self._session = session
@@ -234,6 +276,30 @@ class Filesystem:
         return self._sandbox.agent().fs_stat(path)
 
 
+def _selected_remote_context(context: str | None) -> str | None:
+    """Resolve SDK context selection without importing the remote SDK at module load.
+
+    Returns the mesh context name to connect to, or None for a local create.
+    Existence is checked by :func:`vmon.remote.connect`, which raises for a
+    missing context instead of silently falling back to a local create.
+    """
+
+    from .context import LOCAL, ContextStore
+
+    if context is not None:
+        # Path-like values ("", ".", "./app") keep the Docker build-context
+        # meaning of the legacy ``context`` parameter and stay local.
+        if context in {"", ".", LOCAL} or "/" in context:
+            return None
+        return context
+    store = ContextStore()
+    store.load()
+    name = store.current_name()
+    if not name or name == LOCAL:
+        return None
+    return name
+
+
 class Sandbox:
     """A warm-restored microVM with Modal-compatible exec and filesystem methods."""
 
@@ -261,9 +327,10 @@ class Sandbox:
         self._terminated = False
         self._secret_env: dict[str, str] = {}
         self._volumes: list[Volume] = []
-        # Migration eligibility: only a block-network sandbox with no host-local
-        # state (named volumes, fs_dir share) can move to another mesh node.
+        # Migration/HA restore eligibility: host-local state must be explicitly
+        # rebound from the restore params; fs_dir remains non-migratable.
         self._block_network: bool = False
+        self._network_spec: dict[str, Any] | None = None
         self._fs_dir: str | None = None
         self.connect_token: str | None = None
         self._timeout_secs: int | None = None
@@ -279,7 +346,7 @@ class Sandbox:
         *,
         template: str | os.PathLike[str] | None = None,
         dockerfile: str | None = None,
-        context: str = ".",
+        context: str | None = None,
         name: str | None = None,
         cpus: int = 1,
         memory: int = 512,
@@ -302,7 +369,45 @@ class Sandbox:
         remote_page_url: str | None = None,
         remote_page_token: str | None = None,
         remote_page_digest: str | None = None,
-    ) -> Sandbox:
+    ) -> Any:
+        """Create a sandbox locally or through the selected SDK mesh context.
+
+        With no explicit ``context=`` argument, SDK context resolution follows
+        the CLI: ``VMON_CONTEXT`` first, then the persisted current context, and
+        finally local ``vmond`` when nothing remote is selected.  Passing a
+        configured non-local context name (for example ``context="prod"``)
+        returns the gateway-backed remote sandbox facade via a lazy import.
+        Passing ``"."`` or ``"local"`` forces the existing local path and keeps
+        the Docker build-context meaning of ``context`` for local creates.
+        """
+        remote_context = _selected_remote_context(context)
+        if remote_context is not None:
+            from .remote import connect
+
+            return connect(remote_context).sandboxes.create(
+                image=image,
+                template=template,
+                dockerfile=dockerfile,
+                name=name,
+                cpus=cpus,
+                memory=memory,
+                disk_mb=disk_mb,
+                timeout=timeout,
+                timeout_secs=timeout_secs,
+                workdir=workdir,
+                env=env,
+                secrets=secrets,
+                volumes=volumes,
+                tags=tags,
+                fs_dir=fs_dir,
+                block_network=block_network,
+                ports=ports,
+                egress_allow=egress_allow,
+                egress_allow_domains=egress_allow_domains,
+                inbound_cidr_allowlist=inbound_cidr_allowlist,
+                readiness_probe=readiness_probe,
+                pool_size=pool_size,
+            )
         if block_network and ports:
             raise ValueError("ports cannot be exposed when block_network=True")
         cpus = _validate_int_range(cpus, "cpus", maximum=64)
@@ -352,7 +457,7 @@ class Sandbox:
             image=image,
             template=template,
             dockerfile=dockerfile,
-            context=context,
+            context=context if context is not None and context != "local" else ".",
             disk_mb=disk_mb,
             timeout=timeout,
             memory=memory,
@@ -466,20 +571,42 @@ class Sandbox:
                     remote_page_token=remote_page_token,
                     remote_page_digest=remote_page_digest,
                 )
-            elif vm is None and networked_warm:
+            elif vm is None and (
+                networked_warm
+                or (
+                    not block_network
+                    and platform.system() == "Darwin"
+                    and _template_has_snapshot_state(template_dir)
+                )
+            ):
+                if not networked_warm:
+                    _reject_macos_host_network_features(
+                        ports=ports,
+                        egress_allow=egress_allow,
+                        egress_allow_domains=egress_allow_domains,
+                        inbound_cidr_allowlist=inbound_cidr_allowlist,
+                    )
                 vm = MicroVM.restore(
                     template_dir,
                     name=name,
                     agent=True,
                     mem=memory,
                     cpus=cpus,
+                    user_net=True,
                     timeout_secs=eff_timeout_secs,
                     remote_page_url=remote_page_url,
                     remote_page_token=remote_page_token,
                     remote_page_digest=remote_page_digest,
                 )
                 user_net_sandbox = True
-            elif vm is None and networked_warm_linux:
+            elif vm is None and (
+                networked_warm_linux
+                or (
+                    not block_network
+                    and platform.system() != "Darwin"
+                    and _template_has_snapshot_state(template_dir)
+                )
+            ):
                 # Linux networked warm: allocate a per-sandbox host TAP + policy,
                 # warm-restore the tap-slot template rebinding its NIC onto that TAP,
                 # then replay the guest network config (net_handle branch below).
@@ -520,17 +647,12 @@ class Sandbox:
                 tap: str | None = None
                 if not block_network:
                     if platform.system() == "Darwin":
-                        for feature, requested in (
-                            ("ports", ports),
-                            ("egress_allow", egress_allow),
-                            ("egress_allow_domains", egress_allow_domains),
-                            ("inbound_cidr_allowlist", inbound_cidr_allowlist),
-                        ):
-                            if requested:
-                                raise ValueError(
-                                    f"{feature} requires Linux host networking (TAP); "
-                                    "macOS user-mode NAT is outbound-egress only"
-                                )
+                        _reject_macos_host_network_features(
+                            ports=ports,
+                            egress_allow=egress_allow,
+                            egress_allow_domains=egress_allow_domains,
+                            inbound_cidr_allowlist=inbound_cidr_allowlist,
+                        )
                         user_net_sandbox = True
                     else:
                         net_handle = _setup_sandbox_network(
@@ -584,7 +706,7 @@ class Sandbox:
                     gc["host_ip"],
                     gc.get("dns") or [],
                 )
-                sb._network_policy = {
+                policy = {
                     "egress_allow": list(egress_allow) if egress_allow is not None else None,
                     "egress_allow_domains": list(egress_allow_domains)
                     if egress_allow_domains is not None
@@ -593,15 +715,36 @@ class Sandbox:
                     if inbound_cidr_allowlist is not None
                     else None,
                 }
+                try:
+                    tunnels = net_handle.tunnels()
+                except Exception:
+                    tunnels = {}
+                sb._network_policy = policy
+                sb._network_spec = {
+                    "flavor": "tap",
+                    "guest_config": dict(gc),
+                    "ports": sorted(int(port) for port in (ports or tunnels.keys())),
+                    "tunnels": {
+                        str(port): {"host": host, "port": int(host_port)}
+                        for port, (host, host_port) in tunnels.items()
+                    },
+                    "policy": policy,
+                }
             elif user_net_sandbox:
-                from . import net
-
+                gc = _user_net_guest_config()
                 sb.agent().net_config(
-                    net.USER_NET_GUEST_IP,
-                    net.USER_NET_PREFIX,
-                    net.USER_NET_GATEWAY,
-                    list(net.USER_NET_DNS),
+                    gc["guest_ip"],
+                    int(gc["prefix"]),
+                    gc["host_ip"],
+                    gc.get("dns") or [],
                 )
+                sb._network_spec = {
+                    "flavor": "user",
+                    "guest_config": gc,
+                    "ports": [],
+                    "tunnels": {},
+                    "policy": {},
+                }
             volumes_meta = {
                 spec["mountpoint"]: {
                     "name": spec["volume"].name,
@@ -620,6 +763,7 @@ class Sandbox:
                 tags=sb.tags,
                 volumes=volumes_meta,
                 block_network=block_network,
+                network=sb._network_spec,
                 timeout_secs=sb._timeout_secs,
             )
             if readiness_probe is not None:
@@ -1219,10 +1363,16 @@ class _AsyncRemoteFunction:
 class RemoteFunction:
     """A source-serialized Python function that can run inside a warm sandbox."""
 
-    def __init__(self, fn: Callable[..., Any], sandbox_kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        sandbox_kwargs: dict[str, Any],
+        sandbox_factory: Callable[..., Any] | None = None,
+    ) -> None:
         self._fn = fn
         self._sandbox_kwargs = dict(sandbox_kwargs)
-        self._sandbox: Sandbox | None = None
+        self._sandbox_factory = sandbox_factory or Sandbox.create
+        self._sandbox: Any | None = None
         self._python_checked = False
         self._lock = threading.Lock()
         self._runner_path = "/tmp/vmon-function-runner.py"
@@ -1284,16 +1434,16 @@ class RemoteFunction:
         completed: list[tuple[int, Any]] = []
         result_lock = threading.Lock()
         first_error: list[BaseException] = []
-        sandboxes: list[Sandbox] = []
+        sandboxes: list[Any] = []
 
         try:
             create_kwargs = {"image": "python:3.14-slim", **self._sandbox_kwargs}
             for _ in range(pool_size):
-                sandbox = Sandbox.create(**create_kwargs)
+                sandbox = self._sandbox_factory(**create_kwargs)
                 sandboxes.append(sandbox)
                 self._check_python(sandbox)
 
-            def worker(sandbox: Sandbox) -> None:
+            def worker(sandbox: Any) -> None:
                 while not stop.is_set():
                     try:
                         index = work.get_nowait()
@@ -1339,7 +1489,7 @@ class RemoteFunction:
 
     def _run_once(
         self,
-        sandbox: Sandbox,
+        sandbox: Any,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         timeout: float | None,
@@ -1371,11 +1521,11 @@ class RemoteFunction:
         if sandbox is not None:
             sandbox.terminate()
 
-    def _ensure_sandbox(self) -> Sandbox:
+    def _ensure_sandbox(self) -> Any:
         with self._lock:
             if self._sandbox is None or self._sandbox.poll() is not None:
                 kwargs = {"image": "python:3.14-slim", **self._sandbox_kwargs}
-                self._sandbox = Sandbox.create(**kwargs)
+                self._sandbox = self._sandbox_factory(**kwargs)
                 self._python_checked = False
             sandbox = self._sandbox
             if not self._python_checked:
@@ -1384,7 +1534,7 @@ class RemoteFunction:
             return sandbox
 
     @staticmethod
-    def _check_python(sandbox: Sandbox) -> None:
+    def _check_python(sandbox: Any) -> None:
         proc = sandbox.exec("python3", "--version", timeout=10, _track_entry=False)
         rc = proc.wait(timeout=10)
         if rc != 0:

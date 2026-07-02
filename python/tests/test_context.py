@@ -2,8 +2,14 @@ import pytest
 from click.testing import CliRunner
 
 from vmon import cli
-from vmon.client import DaemonClient, DaemonError, GatewayClient, MeshClient
-from vmon.context import LOCAL, Context, ContextStore, contexts_path, roster_from_status
+from vmon.client import DaemonError, LocalTransport, MeshTransport
+from vmon.context import (
+    LOCAL,
+    Context,
+    ContextStore,
+    contexts_path,
+    roster_from_status,
+)
 
 
 class FakeGateway:
@@ -50,15 +56,13 @@ def fake_gateway(monkeypatch):
     FakeGateway.behavior = {}
     FakeGateway.healthz = {}
     FakeGateway.seen = []
-    monkeypatch.setattr("vmon.client.GatewayClient", FakeGateway)
+    monkeypatch.setattr("vmon.client._Gateway", FakeGateway)
     return FakeGateway
 
 
 def _configure_cli_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "token")
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
     monkeypatch.delenv("VMON_CONTEXT", raising=False)
 
 
@@ -66,8 +70,8 @@ def _stub_status(monkeypatch):
     monkeypatch.setattr(
         "vmon.cli._fetch_mesh_status",
         lambda url, token: {
-            "self": {"advertise": "http://a"},
-            "peers": [{"advertise": "http://b"}],
+            "self": {"advertise": "http://a", "arch": "x86_64"},
+            "peers": [{"advertise": "http://b", "arch": "x86_64"}],
         },
     )
 
@@ -88,6 +92,20 @@ def test_store_round_trip(tmp_path, monkeypatch):
     assert ctx.region == "r"
     assert ctx.updated == 1.0
     assert reloaded.current_name() == "prod"
+    assert "endpoint_arches" not in path.read_text(encoding="utf-8")
+
+
+def test_store_rejects_path_traversal_names(tmp_path):
+    store = ContextStore(contexts_path(tmp_path))
+    for name in ("../evil", "..", "a/b", ".hidden", ""):
+        with pytest.raises(ValueError):
+            store.put(Context(name, ["http://a"]))
+        with pytest.raises(ValueError):
+            store.save_token(name, "t")
+    # Tolerated on the removal paths so a legacy bad record can still be dropped.
+    store.remove_token("../evil")
+    store.remove("../evil")
+    assert store.load_token("../evil") is None
 
 
 def test_load_missing_and_corrupt(tmp_path):
@@ -138,10 +156,42 @@ def test_token_never_persisted(tmp_path):
     assert ctx.token is None
 
 
+def test_legacy_endpoint_arches_are_ignored(tmp_path):
+    path = contexts_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+{
+  "current": "prod",
+  "contexts": {
+    "prod": {
+      "name": "prod",
+      "endpoints": ["http://a", "http://b"],
+      "endpoint_arches": {"http://a": "x86_64", "http://b": "aarch64"}
+    }
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    store = ContextStore(path)
+    store.load()
+    ctx = store.get("prod")
+
+    assert ctx is not None
+    assert ctx.endpoints == ["http://a", "http://b"]
+    store.save()
+    assert "endpoint_arches" not in path.read_text(encoding="utf-8")
+
+
 def test_roster_from_status():
     status = {
-        "self": {"advertise": "http://a"},
-        "peers": [{"advertise": "http://b"}, {"advertise": "http://a"}],
+        "self": {"advertise": "http://a", "arch": "x86_64"},
+        "peers": [
+            {"advertise": "http://b", "arch": "aarch64"},
+            {"advertise": "http://a", "arch": "x86_64"},
+        ],
     }
 
     assert roster_from_status(status) == ["http://a", "http://b"]
@@ -150,7 +200,7 @@ def test_roster_from_status():
 
 def test_empty_endpoints_rejected():
     with pytest.raises(DaemonError) as excinfo:
-        MeshClient([])
+        MeshTransport([])
 
     assert excinfo.value.code == "invalid"
 
@@ -163,7 +213,9 @@ def test_failover_rotates_on_unreachable(fake_gateway):
         "method": method,
     }
     captured = []
-    client = MeshClient(["http://dead", "http://live"], on_roster=lambda eps: captured.append(eps))
+    client = MeshTransport(
+        ["http://dead", "http://live"], on_roster=lambda eps: captured.append(eps)
+    )
 
     assert client.call("ps") == {"ok": True, "ep": "http://live", "method": "ps"}
     assert captured[-1] == ["http://live", "http://dead"]
@@ -173,7 +225,7 @@ def test_no_rotation_on_5xx(fake_gateway):
     fake_gateway.behavior["http://dead"] = DaemonError("x", code="503")
 
     with pytest.raises(DaemonError) as excinfo:
-        MeshClient(["http://dead", "http://live"]).call("ps")
+        MeshTransport(["http://dead", "http://live"]).call("ps")
 
     assert excinfo.value.code == "503"
     assert not any(
@@ -185,7 +237,7 @@ def test_no_rotation_on_5xx(fake_gateway):
 def test_stable_idempotency_key_across_endpoints(fake_gateway):
     fake_gateway.behavior["http://dead"] = DaemonError("x", code="unreachable")
 
-    MeshClient(["http://dead", "http://live"]).call("run", image="x")
+    MeshTransport(["http://dead", "http://live"]).call("run", image="x")
 
     run_calls = [
         record for record in fake_gateway.seen if record[1] == "call" and record[2] == "run"
@@ -201,7 +253,7 @@ def test_mutating_call_uses_healthz_then_single(fake_gateway):
     fake_gateway.healthz["http://dead"] = DaemonError("x", code="unreachable")
     fake_gateway.healthz["http://live"] = None
 
-    MeshClient(["http://dead", "http://live"]).call("extend", secs=10)
+    MeshTransport(["http://dead", "http://live"]).call("extend", secs=10)
 
     assert ("http://dead", "healthz", None, {}) in fake_gateway.seen
     assert ("http://live", "healthz", None, {}) in fake_gateway.seen
@@ -213,7 +265,7 @@ def test_mutating_call_uses_healthz_then_single(fake_gateway):
 
 def test_stop_daemon_unsupported():
     with pytest.raises(DaemonError) as excinfo:
-        MeshClient(["http://a"]).stop_daemon()
+        MeshTransport(["http://a"]).stop_daemon()
 
     assert excinfo.value.code == "unsupported"
 
@@ -221,28 +273,18 @@ def test_stop_daemon_unsupported():
 def test_client_selection_context(tmp_path, monkeypatch):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "t")
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
     monkeypatch.delenv("VMON_CONTEXT", raising=False)
 
     store = ContextStore(contexts_path(tmp_path))
     store.put(Context("prod", ["http://a"]))
     store.use("prod")
-    assert isinstance(cli._client(), MeshClient)
+    assert isinstance(cli._client(), MeshTransport)
 
-    monkeypatch.setenv("VMON_REMOTE", "host:1")
-    assert isinstance(cli._client(), DaemonClient)
-
-    monkeypatch.delenv("VMON_REMOTE")
-    monkeypatch.setenv("VMON_SERVER", "http://server")
-    assert isinstance(cli._client(), GatewayClient)
 
 
 def test_client_selection_missing_context_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "t")
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
     monkeypatch.setenv("VMON_CONTEXT", "ghost")
     with pytest.raises(DaemonError):
         cli._client()
@@ -251,8 +293,6 @@ def test_client_selection_missing_context_errors(tmp_path, monkeypatch):
 def test_client_selection_endpointless_context_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "t")
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
     monkeypatch.delenv("VMON_CONTEXT", raising=False)
     store = ContextStore(contexts_path(tmp_path))
     store.put(Context("empty", []))
@@ -264,16 +304,15 @@ def test_client_selection_endpointless_context_errors(tmp_path, monkeypatch):
 def test_client_selection_local_uses_daemon(tmp_path, monkeypatch):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "t")
-    monkeypatch.delenv("VMON_REMOTE", raising=False)
-    monkeypatch.delenv("VMON_SERVER", raising=False)
     monkeypatch.delenv("VMON_CONTEXT", raising=False)
-    # A mesh.json on disk would auto-select the gateway; explicit 'local' forces the daemon.
+    # A mesh.json on disk is ignored by the CLI; contexts are the only non-local
+    # transport, and explicit 'local' always selects the daemon.
     (tmp_path / "mesh.json").write_text(
         '{"enabled": true, "advertise": "http://mesh"}', encoding="utf-8"
     )
     store = ContextStore(contexts_path(tmp_path))
     store.use(LOCAL)
-    assert isinstance(cli._client(), DaemonClient)
+    assert isinstance(cli._client(), LocalTransport)
 
 
 def test_cli_create_and_ls(tmp_path, monkeypatch):
@@ -307,6 +346,80 @@ def test_cli_create_does_not_persist_token(tmp_path, monkeypatch):
     assert "SECRET123" not in contexts_path(tmp_path).read_text(encoding="utf-8")
 
 
+def test_cli_create_save_token_private_file_not_contexts(tmp_path, monkeypatch):
+    _configure_cli_env(monkeypatch, tmp_path)
+    _stub_status(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "context",
+            "create",
+            "prod",
+            "--server",
+            "http://a",
+            "--token",
+            "SECRET123",
+            "--save-token",
+        ],
+    )
+
+    assert result.exit_code == 0
+    store = ContextStore(contexts_path(tmp_path))
+    token_path = store.token_path("prod")
+    assert token_path.read_text(encoding="utf-8").strip() == "SECRET123"
+    assert token_path.stat().st_mode & 0o777 == 0o600
+    assert token_path.parent.stat().st_mode & 0o777 == 0o700
+    assert "SECRET123" not in contexts_path(tmp_path).read_text(encoding="utf-8")
+
+
+
+
+def test_cli_client_token_resolution_env_beats_saved_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.delenv("VMON_API_TOKEN", raising=False)
+    monkeypatch.delenv("VMON_CONTEXT", raising=False)
+    store = ContextStore(contexts_path(tmp_path))
+    store.put(Context("prod", ["http://a"]))
+    store.save_token("prod", "FILE_TOKEN")
+    store.use("prod")
+    seen: list[str | None] = []
+
+    class RecordingMesh:
+        def __init__(self, endpoints, token=None, *, on_roster=None):
+            seen.append(token)
+
+    monkeypatch.setattr(cli, "MeshTransport", RecordingMesh)
+
+    cli._client()
+    monkeypatch.setenv("VMON_API_TOKEN", "ENV_TOKEN")
+    cli._client()
+
+    assert seen == ["FILE_TOKEN", "ENV_TOKEN"]
+
+
+def test_cli_refresh_uses_saved_token_and_keeps_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("VMON_HOME", str(tmp_path))
+    monkeypatch.delenv("VMON_API_TOKEN", raising=False)
+    monkeypatch.delenv("VMON_CONTEXT", raising=False)
+    store = ContextStore(contexts_path(tmp_path))
+    store.put(Context("prod", ["http://a"]))
+    store.save_token("prod", "SAVED_TOKEN")
+    seen: list[str] = []
+
+    def fake_status(url, token):
+        seen.append(token)
+        return {"self": {"advertise": url, "arch": "x86_64"}, "peers": []}
+
+    monkeypatch.setattr(cli, "_fetch_mesh_status", fake_status)
+
+    result = CliRunner().invoke(cli.cli, ["context", "refresh", "prod"])
+
+    assert result.exit_code == 0
+    assert seen == ["SAVED_TOKEN"]
+    assert store.load_token("prod") == "SAVED_TOKEN"
+
+
 def test_cli_use_unknown_fails(tmp_path, monkeypatch):
     _configure_cli_env(monkeypatch, tmp_path)
 
@@ -322,12 +435,15 @@ def test_cli_rm(tmp_path, monkeypatch):
 
     result = runner.invoke(cli.cli, ["context", "create", "prod", "--server", "http://a"])
     assert result.exit_code == 0
+    store = ContextStore(contexts_path(tmp_path))
+    store.save_token("prod", "SAVED_TOKEN")
     result = runner.invoke(cli.cli, ["context", "rm", "prod"])
     assert result.exit_code == 0
 
     store = ContextStore(contexts_path(tmp_path))
     store.load()
     assert "prod" not in [ctx.name for ctx in store.list()]
+    assert not store.token_path("prod").exists()
 
 
 def test_cli_inspect_omits_token(tmp_path, monkeypatch):
@@ -344,4 +460,5 @@ def test_cli_inspect_omits_token(tmp_path, monkeypatch):
     result = runner.invoke(cli.cli, ["context", "inspect", "prod"])
     assert result.exit_code == 0
     assert "http://a" in result.output
+    assert '"token_saved": false' in result.output
     assert "SECRET123" not in result.output
