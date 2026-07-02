@@ -48,7 +48,7 @@ Five runtime layers. The Python daemon spawns one Rust `vmon` process per microV
 ```
 Web UI (React SPA)
    │ HTTP / WebSocket
-vmon serve (FastAPI, server.py)
+vmon serve (FastAPI, server/ package)
    │ Unix socket  $VMON_HOME/vmond.sock
 vmond (daemon.py) ──> Engine (core.py, single registry owner)
    │ spawns subprocess per VM, --api-sock JSON control socket
@@ -71,9 +71,9 @@ vmon-agent (guest agent, Linux guest only)
 | x86_64 direct kernel format | uncompressed ELF `vmlinux` or `bzImage` | Loaded directly by vmon. |
 | aarch64 direct kernel format | uncompressed `Image` | The demo can extract an `Image` from a host `vmlinuz` on arm64 Linux. |
 | UEFI firmware | QEMU/EDK2 firmware supplied by the operator | Pass `--boot-mode uefi --firmware <path>`; vmon does not vendor firmware blobs. |
-| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, virtio-rng, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. The default aarch64 kernel includes virtio-fs; x86_64/firecracker and custom non-virtiofs kernels lack it. Snapshot/restore covers MMIO/PCI virtio state and virtio-fs inode/mode state on Linux/KVM, and MMIO virtio state on macOS/HVF, including snapshot capture, delta snapshots, cold restore, and fork. Named volumes are re-attached by host path. |
+| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, virtio-rng, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. The default aarch64 kernel includes virtio-fs; x86_64/firecracker and custom non-virtiofs kernels lack it. Snapshot/restore covers MMIO/PCI virtio state, virtio-fs inode/mode state, and macOS user-net libslirp state; host-side TCP flows reset after user-net restore. Named volumes are re-attached by host path locally and are lease-protected on mesh writable mounts. |
 
-Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. KVM and HVF guest-boot coverage live in the self-hosted integration workflow (Linux/KVM and Apple Silicon/HVF runners).
+Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. KVM and HVF guest-boot coverage live in the self-hosted integration workflow, and `mesh-soak.yml` runs the nightly three-node tc-netem soak.
 
 ## Build
 
@@ -237,7 +237,7 @@ The user-facing `vmon` CLI is a thin Docker-like client: it talks to a zero-conf
 
 | Command | What it does |
 | --- | --- |
-| `vmon doctor` | Prints the local prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, Docker/Podman, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment) and exits non-zero on hard failures. |
+| `vmon doctor` | Prints the local prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
 | `vmon completion [bash|zsh|fish]` | Prints a sourceable Click shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
 
 ```python
@@ -270,7 +270,7 @@ Exposed ports are available through `sb.tunnels()`. `sb.create_connect_token()` 
 
 `Sandbox.create(template=..., pool_size=N)` keeps pre-forked copy-on-write clones ready and falls back to cold restore when the pool is empty. `Sandbox.aio.*` mirrors the synchronous SDK with thread-backed async methods. The REST API covers create/list/filter by tag (`GET /v1/sandboxes?tag=k:v`), exec and pty WebSocket exec, snapshots, network policy, tunnels, lifecycle events (`GET /v1/events` as SSE), metrics, and OpenAPI docs through FastAPI.
 
-Remote functions use `@vmon.function(...)` to ship a source-defined Python function, plus the module-level imports, helpers, and literal constants it references, into a `python:3.14-slim` guest. Use `.remote(...)` for one call or `.map(...)` / `.starmap(...)` for parallel calls across a temporary sandbox pool; arguments and return values must be JSON-serializable, the function must not close over local variables, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
+Remote functions use `@vmon.function(...)` to ship a source-defined Python function, plus the module-level imports, helpers, and literal constants it references, into a `python:3.14-slim` guest. Use `.remote(...)` for one call or `.map(iterable, concurrency=N)` / `.starmap(..., concurrency=N)` for parallel calls across a temporary sandbox pool; arguments and return values must be JSON-serializable, the function must not close over local variables, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
 
 ```python
 import math
@@ -295,17 +295,28 @@ The Python `vmon` wrapper has separate usage notes in [`python/README.md`](pytho
 
 ## Cluster
 
-Use `vmon serve` gateways to pool multiple machines behind one CLI context. Every node in the cluster must use the same bearer token, and clients must provide that token through `VMON_API_TOKEN`.
+Use `vmon serve` gateways to pool multiple machines behind one CLI/SDK context. Every node shares the full operator bearer token (`--token` or `VMON_API_TOKEN`); clients pass either that token or a scoped `VMON_CLIENT_TOKEN` value through `VMON_API_TOKEN`.
+
+`vmon serve` has one config surface. Defaults come from `ServeConfig`, then an optional TOML file (`vmon serve --config file.toml` or `$VMON_CONFIG`), then `VMON_*` environment variables, then CLI flags. Unknown config keys are rejected.
+
+```toml
+[serve]
+host = "0.0.0.0"
+port = 8000
+token = "T"
+replicas = 1
+# replicate_sec defaults to 60 on mesh-enabled nodes; explicit 0 disables it.
+```
 
 ### Form a cluster
 
 On the seed node, start the gateway:
 
 ```sh
-vmon serve --token T
+vmon serve --config serve.toml
 ```
 
-In another shell on the same host, initialize the mesh and copy the printed `vmon mesh join <blob>` command:
+In another shell on the seed host, initialize the mesh and copy the printed `vmon mesh join <blob>` command:
 
 ```sh
 VMON_API_TOKEN=T vmon mesh setup --advertise http://<seed-ip>:8000
@@ -314,11 +325,11 @@ VMON_API_TOKEN=T vmon mesh setup --advertise http://<seed-ip>:8000
 On each other node, start the gateway with the same token, then join with the blob printed by the seed:
 
 ```sh
-vmon serve --token T
+vmon serve --config serve.toml
 VMON_API_TOKEN=T vmon mesh join <blob>
 ```
 
-`vmon mesh status` (or `GET /v1/mesh/status`) lists members, health, and capacity, including top-level `replicas_held` and per-node HA counters under `stats` (`replication`, `restore`, and `fence`):
+`vmon mesh status` renders members, health, capacity, and local sandboxes with durability tier plus checkpoint age/RPO. The underlying `GET /v1/mesh/status` payload also includes top-level `replicas_held`, status warnings, and per-node HA counters (`stats.replication`, `stats.restore`, `stats.fence`):
 
 ```sh
 VMON_API_TOKEN=T vmon mesh status
@@ -326,11 +337,11 @@ VMON_API_TOKEN=T vmon mesh status
 
 ### Connect a client
 
-Create a cluster context from any reachable gateway. The CLI fetches the full roster and stores the ordered endpoint list; it never writes the bearer token to disk.
+Create a cluster context from any reachable gateway. The CLI fetches the full roster and stores the ordered endpoint list. Tokens are not stored unless you opt in with `--save-token`, which writes a private file under `$VMON_HOME/credentials/`.
 
 ```sh
 export VMON_API_TOKEN=T
-vmon context create prod --server http://<any-node>:8000
+vmon context create prod --server http://<any-node>:8000 --save-token
 vmon context use prod
 
 vmon run alpine -- echo hello
@@ -343,12 +354,25 @@ Manage contexts with:
 ```sh
 vmon context ls
 vmon context inspect prod
-VMON_API_TOKEN=T vmon context refresh prod
+vmon context refresh prod
 vmon context rm prod
 vmon context use local
 ```
 
-After `vmon context use prod`, ordinary `vmon run`, `vmon exec`, and `vmon ps` commands route across the cluster. `vmon context use local` returns the CLI to the local `vmond` daemon.
+After `vmon context use prod`, ordinary `vmon run`, `vmon exec`, and `vmon ps` route across the cluster through the shared `Transport` plane (`LocalTransport` for the daemon, `MeshTransport` for gateway rosters). Failover happens only before delivery: idempotent detached `run`/`restore` calls carry a stable key and may walk the roster, while attached/interactive operations probe `/healthz` once and then run exactly once. `vmon context use local` returns the CLI to the local `vmond` daemon.
+
+The SDK uses the same context rules:
+
+```python
+import vmon
+from vmon import Sandbox
+
+client = vmon.connect("prod")
+sb = client.sandboxes.create(image="alpine")
+same_plane = Sandbox.create(image="alpine", context="prod")
+```
+
+An explicit missing context is an error; it does not fall back to local.
 
 ### Connectivity prerequisite
 
@@ -358,34 +382,52 @@ Each node's advertised URL must be routable by every other node and by the clien
 VMON_API_TOKEN=T vmon mesh setup --advertise http://<overlay-ip>:8000
 ```
 
-### Downtime semantics
+### Placement
 
-Once a context exists, the client tolerates any number of gateways going down, as long as one saved endpoint is still reachable: requests route through the surviving gateways. Failover happens only on connection-level failure, so a delivered request is never duplicated. By default, a sandbox still lives on exactly one node; without HA replication enabled, an ungraceful crash loses the sandboxes on that node. Move work before planned downtime:
+Placement is request-scoped. The optional `arch` selector is accepted on create/run/restore/fork requests and is never defaulted from the ingress machine. If `arch` is omitted, the coordinator derives compatible arches from the image manifest (`skopeo inspect`, cached) intersected with live node arches. A single live arch is used directly; mixed live arches with an underivable image return `arch_required`, and no live match returns `unplaceable`.
+
+```sh
+vmon run --arch aarch64 alpine -- uname -m
+vmon restore tpl --arch x86_64 --name restored
+vmon fork tpl --arch aarch64 --count 2
+```
+
+### Durability and downtime
+
+Mesh creates write a durable create record before acknowledgement. On meshes with at least three expected members, the record must reach a strict majority; on a two-node mesh the implemented tier is weaker: every live peer must ack, and if no peer is live the local node accepts the record. Anti-entropy re-pushes locally owned records so a surviving gateway does not answer `unknown sid` for an acknowledged create.
+
+The per-sandbox durability tier is `ha=off|async|rerun|async+rerun`. Mesh nodes default to `ha=async`; local daemon creates default to `off`. `async` means periodic non-destructive checkpoints to rendezvous-ranked peers (`replicate_sec`, default 60s on mesh; `VMON_REPLICATE_SEC=0` disables). `rerun` means a surviving node can re-execute the durable create record at a higher epoch if no checkpoint exists. `async+rerun` prefers the checkpoint and falls back to rerun.
+
+Use the REST/SDK request field when you need a non-default tier:
+
+```sh
+curl -sS -H "Authorization: Bearer T" -H "Content-Type: application/json" \
+  -d '{"image":"alpine","detach":true,"ha":"async+rerun"}' \
+  http://<gateway>:8000/v1/run
+```
+
+Automatic orphan restore is quorum-gated by default at `expected_members >= 3`: the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must collect a strict majority of the expected cluster confirming the former owner is unreachable. Set `VMON_RESTORE_QUORUM=0` to force it off. A two-node mesh cannot form a post-failure majority, so quorum restore defaults off and the status payload carries a two-node warning.
+
+```sh
+# default on mesh: 60s async checkpointing, one replica, quorum restore at >=3 nodes
+vmon serve --config serve.toml
+
+# force replication off for this gateway
+VMON_REPLICATE_SEC=0 vmon serve --config serve.toml
+```
+
+Networked sandboxes are HA/migration-eligible. Linux restores allocate a fresh TAP on the destination; macOS/HVF restores reopen user-net and replay guest-visible libslirp state (DHCP lease, ARP/NAT tables). Host-side TCP flows are not preserved. `fs_dir` host shares are rejected on mesh creates; use a volume.
+
+Writable mesh volumes use quorum-granted, epoch-fenced leases with TTL self-fencing. The holder renews by `ttl/2`; if renewal misses that deadline it stops writers, and a successor cannot be granted until the full TTL has elapsed. Writable volumes on mesh contexts require at least three nodes and are rejected otherwise; read-only volumes are unrestricted. The local daemon still uses the plain host `flock`.
+
+Before planned downtime, move work or drain the node:
 
 ```sh
 VMON_API_TOKEN=T vmon mesh migrate <name> <node>
 VMON_API_TOKEN=T vmon mesh leave --drain
 ```
 
-Only new placements automatically avoid dead nodes unless high availability replication is enabled.
-
-### High availability (opt-in)
-
-Set `VMON_REPLICATE_SEC` to a positive cadence in seconds to enable crash-survival replication; `0` or unset disables it. `VMON_REPLICAS` controls the fan-out `K` (default `1`). Eligible sandboxes — block-network sandboxes with no `fs_dir` host share — are periodically checkpointed non-destructively, with the VM kept running except for a brief quiesce at each cadence, and the checkpoint is replicated to the top-`K` rendezvous-ranked peers. A named volume's data is captured into the checkpoint and re-materialized on the survivor: a **read-only** volume is divergence-free and always restored, while a **writable** volume is restored only under `VMON_RESTORE_QUORUM` (a host-local lock cannot stop a partitioned old owner from also writing its copy). There is no cluster-unique volume identity yet, so a restore that would clobber an existing same-named volume on the survivor is refused. If the owner node dies, a surviving replica holder restores the sandbox and takes ownership.
-
-`VMON_REPLICATE_CONCURRENCY` bounds concurrent replica pushes across peers (default `2`). Each replication round also skips re-pushing a sandbox whose checkpoint digest is unchanged since the last round, and a peer that already holds the same sandbox id plus digest skips re-pulling that content. These reduce redundant network and disk I/O; they do not remove the per-cadence checkpoint, so each eligible VM still briefly quiesces every `VMON_REPLICATE_SEC`.
-
-```sh
-# default best-effort epoch-fenced restore
-VMON_REPLICATE_SEC=60 VMON_REPLICAS=1 vmon serve --token T
-
-# require quorum confirmation before automatic crash restore
-VMON_RESTORE_QUORUM=1 VMON_REPLICATE_SEC=60 VMON_REPLICAS=1 vmon serve --token T
-```
-
-Leave `VMON_RESTORE_QUORUM` unset for the default best-effort epoch-fenced restore. Set `VMON_RESTORE_QUORUM=1` to gate automatic crash restore on a static-membership majority: before restoring an orphaned sandbox, the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must collect a strict majority of the expected cluster confirming the former owner is unreachable. A node in a minority partition cannot reach that majority, so it defers instead of risking split-brain restores during a network partition. This trades availability for safety: run at least three nodes to tolerate one failure; a two-node cluster cannot form a majority after losing one node, so restore deliberately waits.
-
-Ineligible sandboxes are not protected. Fencing is best-effort: it bounds split-brain to the partition window and converges on rejoin, but it is not a consensus system. Replica secrets are kept in memory only; if a replica node restarts and loses them, it refuses automatic restore rather than silently restoring without secrets.
+Fencing is epoch-based and best-effort for non-volume state. It bounds split-brain to the partition window and converges on rejoin; writable volume safety comes from leases, not epochs alone.
 
 ### Scoped client token
 
@@ -399,11 +441,11 @@ Run `vmon serve --tls-cert PATH --tls-key PATH` (or set `VMON_TLS_CERT` and `VMO
 
 ### Testing the cluster
 
-`just cluster-e2e` runs the gated two-node boot, failover, and restore end-to-end on a KVM/HVF host; `demo/cluster-e2e.sh` is the underlying script. The same check runs in CI on the self-hosted hypervisor runner. This is the only real multi-host boot test, so it is hardware-gated rather than part of ordinary local unit coverage.
+`just cluster-e2e` runs the gated cluster end-to-end suite on KVM/HVF hosts; `VMON_CLUSTER_E2E=1` enables the Python cluster tests. The nightly `mesh-soak.yml` workflow runs a three-node tc-netem soak, and the fault/invariant tests cover the failure-mode contracts without booting guests.
 
 ### Security
 
-The full bearer token is shared by all nodes and grants full control. Keep it secret. Contexts never persist a token; clients read either the full token or a scoped client token from `VMON_API_TOKEN` when they connect.
+The full bearer token is shared by all nodes and grants full control. Keep it secret. Contexts persist tokens only with `--save-token`; otherwise clients read either the full token or a scoped client token from `VMON_API_TOKEN` when they connect.
 
 ## Compared with Modal sandboxes
 
@@ -456,9 +498,8 @@ demo/run-uefi-ubuntu.sh
 
 - This is not a production isolation boundary. It has not had a security audit.
 - The trusted computing base includes the vmon process, KVM or HVF, the host kernel, guest kernel/image inputs, disk images, snapshots, and host paths passed on the command line.
-- Snapshot restore requires a matching build architecture, hypervisor backend, and supported snapshot version.
+- Snapshot restore requires a matching build architecture, hypervisor backend, and supported snapshot version (currently version 3).
 - Bare VMM networking uses host TAP devices on Linux. On macOS/HVF, `--net user` provides entitlement-free user-mode NAT via libslirp, while `--tap` still requires vmnet-style host networking support that is not available to the ad-hoc-signed binary. User-mode NAT currently provides outbound/DHCP/DNS guest connectivity, not same-LAN bridging or inbound host port forwarding.
-- `--net user` rejects snapshot creation until user-mode NAT backend state is serialized.
 - Host paths exposed through virtio-fs should be dedicated directories. `--fs-dir` is read-only; named `--volume` mounts are writable unless `:ro` is set.
 - Stage-B process filters (seccomp syscall filtering, Landlock path policy, `no_new_privs`, and resource-limit tightening) are applied by default; pass `--no-sandbox` to disable them for local development. `--jail` is the full production isolation path, adding cgroup v2, namespaces, pivot-root, and uid/gid drop on top of the always-on filters.
 - Launch-time caps are enforced for accidental fanout: up to 64 vCPUs, 64 GiB RAM, and 32 fork children.

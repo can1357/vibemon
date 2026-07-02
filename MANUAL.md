@@ -48,7 +48,7 @@ Linux/KVM — run those in a Linux VM with nested KVM (see [§6, Lima](#6-run-th
 **For the full path (real microVMs), additionally:**
 - A hypervisor host: Apple-silicon Mac (macOS 15+, HVF) **or** Linux with `/dev/kvm`
 - A Rust toolchain (`rustup`)
-- `docker` **or** `podman`, plus `e2fsprogs` (`brew install e2fsprogs` on macOS)
+- `skopeo` and `umoci` for OCI images, `e2fsprogs`, and optional `buildah` (or Docker with buildx) for Dockerfile builds (`brew install e2fsprogs` on macOS)
 
 On macOS the `vmm` binary must be codesigned with the hypervisor entitlement;
 `just build` / `just release` do this automatically, and HVF itself needs no root.
@@ -136,8 +136,9 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 
 | Command | What it does | Example |
 | --- | --- | --- |
-| `run` | boot a container image / Dockerfile as a microVM | `vmon run alpine -- sh -c 'uname -a'` |
-| `run -f` | build & boot a Dockerfile | `vmon run -f ./Dockerfile --context .` |
+| `run` | boot a container image as a microVM | `vmon run alpine -- sh -c 'uname -a'` |
+| `run -f` | build & boot a Dockerfile locally with buildah or Docker buildx | `vmon run -f ./Dockerfile --context . demo:latest` |
+| `build` | build a Dockerfile into a local OCI layout | `vmon build -f Dockerfile -t demo:latest .` |
 | `run -d` | run detached (background) | `vmon run -d --name web nginx` |
 | `shell` | drop into an ephemeral interactive shell (attach a running VM, warm-boot a snapshot, or boot a fresh image) | `vmon shell` · `vmon shell web` · `vmon shell --image alpine` |
 | `exec` | run a command in a running microVM (`-t` for an interactive PTY) | `vmon exec web sh -lc 'echo hi'` |
@@ -155,14 +156,14 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `stop` / `rm` | stop / remove a microVM | `vmon stop web` |
 | `daemon` | `start` / `stop` / `status` of the local `vmond` daemon | `vmon daemon status` |
 | `serve` | run the daemon **and** the REST API + web panel (one owner) | `vmon serve --token secret` |
-| `doctor` | print a prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, Docker/Podman, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment); exits non-zero on hard failures | `vmon doctor` |
+| `doctor` | print a prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment); `--serve` validates `ServeConfig`; exits non-zero on hard failures | `vmon doctor` |
 | `completion [bash|zsh|fish]` | print a sourceable Click shell-completion script | `eval "$(vmon completion zsh)"` |
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
-`--disk-mb` (default 1024), `--timeout <s>` (default 300), and `--block-network`
-(boot with no NIC; optional — a networked sandbox otherwise gets outbound egress
-via TAP on Linux or user-mode NAT on macOS, and `--block-network` also lets
-`vmon run` skip the root-only TAP setup on Linux).
+`--disk-mb` (default 1024), `--timeout <s>` (default 300), `--arch x86_64|aarch64`,
+and `--block-network` (boot with no NIC; optional — a networked sandbox otherwise
+gets outbound egress via TAP on Linux or user-mode NAT on macOS, and
+`--block-network` also lets `vmon run` skip the root-only TAP setup on Linux).
 
 `vmon shell` drops you into an ephemeral Linux shell. With no argument (or
 `--image <ref>`) it boots a fresh sandbox (default `debian:stable-slim`, override
@@ -212,16 +213,13 @@ The `vmon` CLI is a thin client. By default it drives a **local** daemon (`vmond
 that:
 - spawns the `vmm` VMM as a **child process** on the same host,
 - talks to it over **Unix domain sockets** (`control.sock`, `agent.sock`),
-- builds container rootfs with a **local** docker/podman.
+- builds container rootfs with local daemonless image tools (`skopeo` + `umoci`).
 
-There are two ways to drive a remote KVM host from your Mac:
-- the **REST API** (`vmon serve`), which wraps the same engine over HTTP/WS — the
-  recommended, fully-featured remote interface; or
-- the CLI's native **`VMON_REMOTE=host:port`** mode, which speaks the daemon's
-  JSON protocol over TCP to a remote daemon started with `VMON_DAEMON_TCP=host:port`
-  (authenticated with `VMON_API_TOKEN`). This never auto-starts a daemon.
+To drive a remote KVM host from your Mac, use the **REST API** (`vmon serve`) and
+a named context. That is the only non-local transport; it wraps the same engine
+over HTTP/WebSocket and gives the CLI/SDK gateway failover.
 
-Two practical patterns follow.
+Three practical patterns follow.
 
 ### One-time guest setup
 
@@ -248,18 +246,19 @@ limactl shell kvm           # drop into the guest
   pip install -e '.[server]'
 
   # --- additionally, only for `vmon run <image>` (booting containers) ---
-  sudo apt-get install -y docker.io e2fsprogs cpio gzip
-  sudo usermod -aG docker "$USER"                 # then log out/in (or `newgrp docker`)
+  sudo apt-get install -y skopeo umoci e2fsprogs cpio gzip
+  # Optional only for `vmon build` / `vmon run -f` Dockerfile builds:
+  sudo apt-get install -y buildah
   rustup target add aarch64-unknown-linux-musl    # match the guest arch (x86_64-... on Intel)
   cd ~/vmon && just agent-musl                 # builds the static guest agent vmon injects
   exit
 ```
 
 > The base block is enough for the REST control plane and for
-> snapshot/restore/fork. The second block is required only for `vmon run`, which
-> builds a container rootfs (`docker`/`podman` + `e2fsprogs`/`cpio`) and injects
-  a **statically linked** guest agent (`just agent-musl`, or point `VMON_AGENT`
-> at one). Rootless `podman` avoids the docker-group step.
+> snapshot/restore/fork. The second block is required for `vmon run`, which
+> pulls/unpacks an OCI image (`skopeo`/`umoci` + `e2fsprogs`/`cpio`) and injects
+> a **statically linked** guest agent (`just agent-musl`, or point `VMON_AGENT`
+> at one). Dockerfile builds add `buildah` or Docker buildx.
 
 ### Pattern A (recommended) — REST API + web panel from your Mac
 
@@ -293,7 +292,7 @@ Use the wrapper `demo/vmon-lima`, which relays the CLI into the guest via
 
 ```sh
 ./demo/vmon-lima ps
-./demo/vmon-lima run alpine -- sh -c 'uname -a'   # needs docker in the guest
+./demo/vmon-lima run alpine -- sh -c 'uname -a'   # needs skopeo/umoci in the guest
 ./demo/vmon-lima logs web -f
 ```
 
@@ -308,28 +307,21 @@ It activates the guest venv, points `VMON_BIN` at the built binary, and runs
 > tree is **not** mounted in the guest — only your home dir is, read-only. Copy or
 > clone what you need into the guest first.
 
-### Pattern C — drive a remote daemon natively with `VMON_REMOTE`
+### Pattern C — normal CLI context from your Mac
 
-The CLI can target a remote daemon directly, no `limactl shell` hop. In the
-guest, start a daemon that listens on TCP:
-
-```sh
-# in Lima (the KVM host):
-VMON_API_TOKEN=secret VMON_DAEMON_TCP=0.0.0.0:9137 python3 -m vmon.daemon
-```
-
-Then from the Mac, point the CLI at it (the same JSON protocol the local Unix
-socket uses, authenticated with the token):
+After Pattern A starts `vmon serve` in Lima and Lima forwards the port, create a
+context on the Mac and use the regular CLI/SDK against the gateway:
 
 ```sh
-export VMON_REMOTE=127.0.0.1:9137 VMON_API_TOKEN=secret   # forward the guest port first
+export VMON_API_TOKEN=secret
+vmon context create lima --server http://127.0.0.1:8137 --save-token
+vmon context use lima
 vmon ps
 vmon run alpine -- sh -c 'uname -a'
 ```
 
-`VMON_REMOTE` never auto-starts a daemon and `vmon daemon stop` is refused for it
-(the pid lives on the remote host). For a fuller, browser-friendly interface use
-the REST API (`vmon serve`) instead.
+This uses the same HTTP/WebSocket gateway as the browser. `vmon context use local`
+switches the CLI back to the Mac's local daemon.
 
 ### Quick demos (low-level, no `vmon`)
 
@@ -352,14 +344,25 @@ limactl shell kvm -- bash ~/vmon/demo/run-arm64-ubuntu.sh
 
 ## 7. Cluster: pool multiple servers
 
-A cluster lets several `vmon serve` gateways act as one pool. Each gateway still owns the sandboxes running on its own host, but the CLI can keep a roster of gateways and route commands through the members that are reachable.
+A cluster lets several `vmon serve` gateways act as one pool. Each gateway still owns the sandboxes running on its own host, but the CLI/SDK can keep a roster of gateways and route commands through reachable members.
 
 ### Step 1: form the cluster
+
+`vmon serve` reads one config surface: dataclass defaults, then a TOML file (`--config` or `VMON_CONFIG`), then `VMON_*` environment variables, then CLI flags. Unknown keys are errors.
+
+```toml
+[serve]
+host = "0.0.0.0"
+port = 8000
+token = "T"
+replicas = 1
+# replicate_sec defaults to 60 on mesh-enabled nodes; set 0 to disable.
+```
 
 Pick one node as the seed. Start its gateway with the shared bearer token:
 
 ```sh
-vmon serve --token T
+vmon serve --config serve.toml
 ```
 
 In another shell on the seed host, initialize the mesh. The command prints a `vmon mesh join <blob>` command; keep that blob for the other nodes.
@@ -371,13 +374,13 @@ VMON_API_TOKEN=T vmon mesh setup --advertise http://<seed-ip>:8000
 On every other node, start the gateway with the same token, then run the join command printed by the seed:
 
 ```sh
-vmon serve --token T
+vmon serve --config serve.toml
 VMON_API_TOKEN=T vmon mesh join <blob>
 ```
 
-All nodes must share the same `--token` / `VMON_API_TOKEN`. The join blob embeds the shared token, so treat it as secret too.
+All nodes must share the same full `--token` / `VMON_API_TOKEN`. The join blob embeds the shared token, so treat it as secret too.
 
-Verify the membership, health, capacity, top-level `replicas_held`, and per-node HA counters (`stats.replication`, `stats.restore`, and `stats.fence`) from any node. The same data is available from `GET /v1/mesh/status`:
+Verify membership, health, capacity, and local sandbox tier/RPO rows from any node. The underlying `GET /v1/mesh/status` payload also includes top-level `replicas_held`, status warnings, and per-node HA counters (`stats.replication`, `stats.restore`, `stats.fence`):
 
 ```sh
 VMON_API_TOKEN=T vmon mesh status
@@ -385,19 +388,20 @@ VMON_API_TOKEN=T vmon mesh status
 
 ### Step 2: make the client use the cluster
 
-Create a named context from any reachable gateway. The CLI calls `GET /v1/mesh/status`, pulls the full roster, and stores the ordered endpoint list in `~/.vmon/contexts.json`. It does not store the token; keep providing it through `VMON_API_TOKEN`.
+Create a named context from any reachable gateway. The CLI calls `GET /v1/mesh/status`, pulls the full roster, and stores the ordered endpoint list in `~/.vmon/contexts.json`. By default it does not store the token; `--save-token` opts in to a private token file under `$VMON_HOME/credentials/`.
 
 ```sh
-VMON_API_TOKEN=T vmon context create prod --server http://<any-node>:8000
+export VMON_API_TOKEN=T
+vmon context create prod --server http://<any-node>:8000 --save-token
 vmon context use prod
 ```
 
 Now regular CLI commands go through the cluster context:
 
 ```sh
-VMON_API_TOKEN=T vmon run alpine -- echo hello
-VMON_API_TOKEN=T vmon ps
-VMON_API_TOKEN=T vmon exec <sandbox> -- uname -a
+vmon run alpine -- echo hello
+vmon ps
+vmon exec <sandbox> -- uname -a
 ```
 
 Use the context commands to inspect, refresh, or remove the saved roster:
@@ -405,12 +409,23 @@ Use the context commands to inspect, refresh, or remove the saved roster:
 ```sh
 vmon context ls
 vmon context inspect prod
-VMON_API_TOKEN=T vmon context refresh prod
+vmon context refresh prod
 vmon context rm prod
 vmon context use local
 ```
 
-`vmon context refresh prod` re-pulls the roster from the cluster. `vmon context use local` switches back to the local `vmond` daemon.
+`vmon context refresh prod` re-pulls the roster from the cluster. `vmon context use local` switches back to the local `vmond` daemon. The CLI and SDK share the same `Transport` plane: `LocalTransport` for the daemon, `MeshTransport` for a context roster. In Python, use:
+
+```python
+import vmon
+from vmon import Sandbox
+
+client = vmon.connect("prod")
+sb = client.sandboxes.create(image="alpine")
+same = Sandbox.create(image="alpine", context="prod")
+```
+
+An explicit missing context is an error; it does not silently fall back to local.
 
 ### Step 3: make the advertised URLs reachable
 
@@ -424,11 +439,21 @@ VMON_API_TOKEN=T vmon mesh setup --advertise http://<overlay-ip>:8000
 
 Use the same idea when joining other nodes: the URL carried in the mesh must be the address peers and clients can actually dial.
 
-### Step 4: understand failover and downtime
+### Step 4: placement
 
-Once the context exists, the client can tolerate any number of gateways going down, as long as one saved endpoint is still reachable. It tries the saved endpoints in order and only fails over on a connection-level failure, so it does not duplicate a request that reached a server.
+Placement is request-scoped. `--arch x86_64|aarch64` is optional on `run`, `restore`, and `fork`; API/SDK create requests use the `arch` field. If unspecified, the coordinator derives compatible arches from the image manifest (`skopeo inspect`, cached) intersected with live node arches. A single live arch is used directly; mixed live arches with an underivable image return `arch_required`, and no live match returns `unplaceable`.
 
-That does not automatically make every running sandbox replicated. Without the optional HA replication in Step 5, a sandbox lives on exactly one node; if that node crashes ungracefully, the sandboxes on it are lost and only new placements automatically avoid nodes that are already known dead. Before planned downtime, move the work:
+```sh
+vmon run --arch aarch64 alpine -- uname -m
+vmon restore tpl --arch x86_64 --name restored
+vmon fork tpl --arch aarch64 --count 2
+```
+
+### Step 5: understand failover and downtime
+
+Once the context exists, the client can tolerate any number of gateways going down as long as one saved endpoint is still reachable. Idempotent detached `run`/`restore` calls carry a stable key and may walk the roster; attached/interactive operations probe `/healthz` once and then run exactly once.
+
+Before planned downtime, move the work:
 
 ```sh
 VMON_API_TOKEN=T vmon mesh migrate <name> <node>
@@ -440,31 +465,40 @@ Or evacuate the node before it leaves:
 VMON_API_TOKEN=T vmon mesh leave --drain
 ```
 
-### Step 5: high availability (optional)
+### Step 6: high availability
 
-Crash-survival replication is opt-in. Set `VMON_REPLICATE_SEC` to a positive checkpoint cadence in seconds; unset or `0` disables it. `VMON_REPLICAS` sets the replica fan-out `K` and defaults to `1`.
+Mesh create records are durable before acknowledgement. On meshes with at least three expected members, the record must reach a strict majority; on a two-node mesh the tier is weaker: every live peer must ack, and with no live peer the local node accepts the record. Anti-entropy re-pushes records so a surviving gateway does not answer `unknown sid` for an acknowledged create.
+
+Per-sandbox tiers are `ha=off|async|rerun|async+rerun`. Mesh-enabled nodes default to `ha=async`; local daemon creates default to `off`.
+
+- `async`: checkpoint periodically and push to rendezvous-ranked peers. The default cadence is 60 seconds on mesh-enabled nodes; set `VMON_REPLICATE_SEC=0` to disable it.
+- `rerun`: if no checkpoint exists, re-execute the durable create record at a higher epoch.
+- `async+rerun`: prefer checkpoint restore, fall back to rerun.
+
+Use the REST/SDK request field when you need a non-default tier:
 
 ```sh
-export VMON_REPLICATE_SEC=60
-export VMON_REPLICAS=1
-export VMON_RESTORE_QUORUM=1  # optional: require majority confirmation before auto-restore
-vmon serve --token T
+curl -sS -H "Authorization: Bearer T" -H "Content-Type: application/json" \
+  -d '{"image":"alpine","detach":true,"ha":"async+rerun"}' \
+  http://<gateway>:8000/v1/run
 ```
 
-Only eligible sandboxes are protected: they must use block networking and must not have an `fs_dir` host share. A named volume's data travels in the checkpoint and is re-materialized on the survivor — a **read-only** volume is divergence-free and always restored, a **writable** volume is restored only when `VMON_RESTORE_QUORUM` is set (a host-local lock cannot stop a partitioned old owner from also writing its copy), and a restore that would clobber an existing same-named volume on the survivor is refused (there is no cluster-unique volume identity yet). At each cadence, the owner checkpoint is non-destructive — the VM keeps running, with a brief quiesce — and the checkpoint is copied to the top-`K` rendezvous-ranked peers. If the owner node is reaped as dead, a deterministically elected replica holder restores the sandbox, claims ownership at a higher epoch, and broadcasts the new owner.
+`VMON_REPLICAS` sets replica fan-out `K` and defaults to `1`; `VMON_REPLICATE_CONCURRENCY` bounds concurrent peer pushes and defaults to `2`. Replication skips unchanged-digest re-pushes and receivers skip content they already hold, but each cadence still briefly quiesces every `ha=async` sandbox.
 
-`VMON_REPLICATE_CONCURRENCY` bounds how many peer replica pushes run at once and defaults to `2`. Replication also skips re-pushing a sandbox when its checkpoint digest is unchanged from the previous round, and a receiver skips pulling content it already has for the same sandbox id and digest. That saves redundant network and disk I/O, but it does not skip the checkpoint cadence itself: every eligible VM still briefly quiesces every `VMON_REPLICATE_SEC`. Tune that frequency first if the quiesce is too visible.
+Automatic orphan restore is quorum-gated by default at `expected_members >= 3`: the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must get a strict majority of the expected cluster to confirm the former owner is unreachable. Set `VMON_RESTORE_QUORUM=0` to force it off. A two-node mesh cannot form a post-failure majority, so quorum restore defaults off and mesh status carries a two-node warning. If a restore cannot safely complete, the orphan is requeued for the next reconciliation pass.
 
-Leave `VMON_RESTORE_QUORUM` unset for the default best-effort epoch-fenced restore. Set `VMON_RESTORE_QUORUM=1` to make automatic crash restore quorum-gated: before restoring an orphaned sandbox, the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must get a strict majority of the expected cluster to confirm the dead owner is unreachable. A node in a minority partition cannot reach that majority and defers, preventing split-brain restores during a network partition. This is safety over availability: use at least three nodes to tolerate one failure; a two-node cluster cannot form a majority after losing one node, so it deliberately defers.
+Networked sandboxes are HA/migration-eligible. Linux restores allocate a fresh TAP on the destination; macOS/HVF restores reopen user-net and replay guest-visible libslirp state. Host-side TCP flows are not preserved. `fs_dir` host shares are rejected on mesh creates; use a named volume.
 
-Fencing is best-effort rather than quorum or lease based. A higher `(epoch, node_id)` supersedes an older owner, and a node that discovers one of its local sandboxes has been superseded stops and drops its copy. This bounds split-brain to the partition window and converges after rejoin, but it is not a consensus system. Replica secrets live in memory only; if a replica node restarts and loses them, it refuses automatic restore for that sandbox instead of starting it without secrets.
+Writable mesh volumes use quorum-granted, epoch-fenced leases with TTL self-fencing. The holder renews by `ttl/2`; if it cannot renew by that deadline, it stops writers, and a successor is not granted until the full TTL has elapsed. Writable volumes on mesh contexts require at least three expected members and are rejected otherwise. Read-only volumes are unrestricted. The local daemon still uses a plain host `flock`.
 
-### Step 6: scoped client tokens
+Fencing for non-volume state is best-effort rather than consensus. A higher `(epoch, node_id)` supersedes an older owner, and a node that discovers one of its local sandboxes has been superseded stops and drops its copy. This bounds split-brain to the partition window and converges after rejoin. Replica secrets live in memory only; if a replica node restarts and loses them, it refuses automatic restore for that sandbox instead of starting it without secrets.
+
+### Step 7: scoped client tokens
 
 Use `VMON_CLIENT_TOKEN` when clients should be able to create and operate sandboxes but not administer the mesh. Start each gateway with the full operator token plus the scoped client token:
 
 ```sh
-VMON_CLIENT_TOKEN=C vmon serve --token T
+VMON_CLIENT_TOKEN=C vmon serve --config serve.toml
 ```
 
 Operators keep using the full token for mesh administration:
@@ -485,25 +519,23 @@ The scoped token is accepted for normal sandbox routes (`run`, `exec`, `ps`, and
 
 For token rotation, `VMON_API_TOKEN` and `VMON_CLIENT_TOKEN` can each contain a comma-separated list. Run gateways with both old and new values during rollover, then remove the old value after clients have moved. Any listed value authorizes for its tier; client-tier values still cannot administer mesh routes or migrate sandboxes.
 
-### Step 7: serve the gateway over TLS
+### Step 8: serve the gateway over TLS
 
 Use `vmon serve --tls-cert PATH --tls-key PATH` to serve HTTPS directly from the gateway. The same settings can come from `VMON_TLS_CERT` and `VMON_TLS_KEY`.
 
 Advertise the matching `https://...` URL when forming or joining the mesh. When a peer advertises `https`, the inter-node exec proxy upgrades its WebSocket URL to `wss`.
 
-### Step 8: test the real cluster path
+### Step 9: test the real cluster path
 
-Run `just cluster-e2e` on a KVM/HVF host to exercise the gated two-node boot, failover, and restore end-to-end. `demo/cluster-e2e.sh` is the script behind the recipe, and CI runs the same check on the self-hosted hypervisor runner.
-
-This is the only real multi-host boot test. It is hardware-gated and separate from the lightweight local tests, so a normal developer machine without KVM/HVF support should not be expected to run it.
+Run `VMON_CLUSTER_E2E=1 just cluster-e2e` on a KVM/HVF host to exercise the gated cluster end-to-end suite. CI runs the KVM and macOS/HVF cluster paths on self-hosted hypervisor runners. `mesh-soak.yml` runs the nightly three-node tc-netem soak, and `python/tests/test_faults.py` / `test_invariants.py` cover the fault-injection contracts with `cluster_harness.py`.
 
 ### Security
 
-The full bearer token is shared by all nodes and grants full control over the cluster. Keep it secret, avoid checking it into scripts, and rotate it if the join blob or environment leaks. Contexts never write a token to disk; the CLI reads either the full token or a scoped client token from `VMON_API_TOKEN` for each authenticated call.
+The full bearer token is shared by all nodes and grants full control over the cluster. Keep it secret, avoid checking it into scripts, and rotate it if the join blob or environment leaks. Contexts write a token only when `--save-token` is used; otherwise the CLI reads either the full token or a scoped client token from `VMON_API_TOKEN` for each authenticated call.
 
 ### Known limitations
 
-Crash recovery exists only when HA replication is enabled and the sandbox is eligible, replicated in sync, and restorable by a survivor; fencing is best-effort and convergence-based, not consensus. There is no NAT traversal; use a WireGuard or Tailscale overlay and advertise overlay IPs. The real two-node boot, failover, and restore test is `just cluster-e2e` / `demo/cluster-e2e.sh`; it is the only multi-host boot coverage and is gated on KVM/HVF hardware, including in CI on the self-hosted hypervisor runner.
+Crash recovery is asynchronous unless a workload uses `rerun`; it is not consensus-grade zero-loss memory replication. There is no NAT traversal; use a WireGuard or Tailscale overlay and advertise overlay IPs. Writable mesh volumes require at least three expected members.
 
 ---
 
@@ -691,11 +723,12 @@ Other common variables:
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
-| `VMON_REMOTE` | `vmon` CLI | `host:port` of a remote daemon to drive over TCP (no auto-start) |
-| `VMON_DAEMON_TCP` | `vmond` | `host:port` for the daemon to also listen on for `VMON_REMOTE` clients |
+| `VMON_CONFIG` | `vmon serve`, `vmon doctor --serve` | TOML config file for the `ServeConfig` surface |
+| `VMON_CONTEXT` | CLI / SDK | active context override (`local` selects the daemon) |
 | `VMON_BIN` | vmon | path to the `vmm` binary (else auto-detected) |
 | `VMON_KERNEL` | vmon | guest kernel (else `/boot/vmlinuz-$(uname -r)` on Linux, or auto-downloaded on macOS) |
 | `VMON_KVM_E2E` | tests | set to `1` to enable the real-VM e2e tests (Linux/KVM or macOS/HVF) |
+| `VMON_CLUSTER_E2E` | tests | set to `1` to enable gated cluster e2e tests |
 | `VMON_E2E_IMAGE` | tests | image for e2e tests (default `alpine:latest`) |
 | `VMON_E2E` | Rust tests | set to `1` to run Rust real-VM integration tests |
 

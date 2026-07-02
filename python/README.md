@@ -20,7 +20,8 @@ Runs on Python 3.14+ on a Linux host with **KVM** (`/dev/kvm`) or an
 Apple-silicon **macOS** host with **HVF**. Image-backed sandboxes need the
 daemonless OCI image tools **skopeo** and **umoci**, `mkfs.ext4`/`mke2fs`, and
 the `vmm` binary built (`cargo build --release`, or `just build` on macOS to
-ad-hoc codesign it). A guest kernel is auto-detected from
+ad-hoc codesign it). Dockerfile builds additionally need rootless **buildah** or
+Docker with buildx. A guest kernel is auto-detected from
 `/boot/vmlinuz-$(uname -r)` on Linux and auto-downloaded into `$VMON_HOME/assets`
 on macOS (override with `VMON_KERNEL`).
 
@@ -59,8 +60,9 @@ vmon shell --image alpine -c 'cat /etc/os-release'
 # Boot a container image (runs the entrypoint, streams the console, exits when done)
 vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
-# Dockerfile builds are currently unsupported until a daemonless builder such as
-# buildah/buildkit is wired in; publish or prebuild an OCI image, then run it.
+# Build a Dockerfile locally through buildah or Docker buildx, then run it.
+vmon build -f Dockerfile -t demo:latest .
+vmon run -f Dockerfile --context . demo:latest
 
 # Long-running service, detached
 vmon run -d --name web nginx
@@ -99,12 +101,21 @@ sb = Sandbox.create(image="alpine", memory=256)
 proc = sb.exec("sh", "-c", "echo hi")
 print(proc.wait())
 
-# Dockerfile builds are currently unsupported until a daemonless builder such as
-# buildah/buildkit is wired in; prefer image-backed sandboxes or prebuilt templates.
+# Dockerfile builds are local-only and use buildah or Docker buildx.
+# Mesh contexts should run the resulting image/template by reference.
 
 img = sb.snapshot_filesystem("template")      # snapshot the guest filesystem
 again = Sandbox.create(template=img)          # warm-boot from the template
 print(again.name)
+```
+
+Remote clusters are selected with contexts:
+
+```sh
+export VMON_API_TOKEN=T
+vmon context create prod --server http://gateway:8000 --save-token
+vmon context use prod
+vmon run alpine --arch aarch64 -- uname -m
 ```
 
 ## Sandbox SDK
@@ -130,7 +141,7 @@ p.write_stdin("echo hello >/data/out\nexit\n")
 code = p.wait()
 ```
 
-Volumes are named host directories under `VMON_HOME`, mounted into the guest with writable virtio-fs by default. They persist across sandbox restores and are excluded from filesystem snapshots; `Sandbox.create(volumes={"/data": Volume("agent_data")})` re-attaches the same volume by name. Each volume has a single-writer lock so two live VMs cannot write it at once.
+Volumes are named host directories under `VMON_HOME`, mounted into the guest with writable virtio-fs by default. They persist across sandbox restores and are excluded from ordinary filesystem snapshots; `Sandbox.create(volumes={"/data": Volume("agent_data")})` re-attaches the same volume by name. The local daemon protects writable volumes with a host `flock`; mesh writable volumes require a quorum lease on at least three expected members, while read-only mesh volumes are unrestricted.
 
 Secrets are injected into exec environments and are never written to `meta.json`. Use `Secret.from_dict({...})` for explicit values or `Secret.from_env("TOKEN")` to copy selected host variables.
 
@@ -169,6 +180,21 @@ Warm pools keep pre-forked copy-on-write clones for a template and fall back to 
 
 `Sandbox.aio.*` mirrors the synchronous SDK using `asyncio.to_thread`, so async callers do not need a second API.
 
+### Mesh contexts and remote SDK
+
+The CLI and SDK share one transport plane. `LocalTransport` talks to the local `vmond`; `MeshTransport` talks to an ordered gateway roster from a named context. `vmon.connect(context)` returns a `VmonClient`, and `Sandbox.create(context="prod", ...)` routes to a `RemoteSandbox` through that same mesh context. Passing a missing explicit context raises instead of silently falling back to local.
+
+```python
+import vmon
+from vmon import Sandbox
+
+client = vmon.connect("prod")
+sb = client.sandboxes.create(image="alpine", ha="async+rerun", arch="aarch64")
+same = Sandbox.create(image="alpine", context="prod")
+```
+
+`RemoteFunction.map(iterable, concurrency=N)` and `.starmap(..., concurrency=N)` fan out through the selected sandbox factory, so a mesh-backed client spreads work through placement.
+
 ### REST API
 
 Install the server extra, then run `vmon serve` — the same single-owner process as
@@ -180,7 +206,7 @@ pip install -e 'python[server]'
 VMON_API_TOKEN=secret vmon serve --host 0.0.0.0 --port 8000
 ```
 
-The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, snapshots, network policy, tunnels, authenticated port proxying, deadline extension, metrics, and lifecycle events. `GET /v1/events` streams lifecycle events as SSE, and FastAPI serves OpenAPI docs at `/docs`. A bearer token (`--token` or `VMON_API_TOKEN`) is required; the `core.Engine` underneath is dependency-free (the `[server]` extra only adds FastAPI/uvicorn for this gateway).
+The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, snapshots, network policy, tunnels, authenticated port proxying, deadline extension, metrics, and lifecycle events. `GET /v1/events` streams lifecycle events as SSE, and FastAPI serves OpenAPI docs at `/docs`. A bearer token (`--token` or `VMON_API_TOKEN`) is required; `vmon serve --config file.toml`, `$VMON_CONFIG`, env overrides, and `vmon doctor --serve` all use the single `ServeConfig` surface.
 
 
 ## How it works
@@ -202,6 +228,6 @@ The REST API covers sandbox create/list/attach, exec and pty WebSocket exec, sna
 ## Notes / limits
 
 - The static guest agent is injected into prepared images, including distroless images, so Sandbox exec/filesystem/network RPCs do not depend on `/bin/sh`.
-- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Remote access always goes through the HTTP gateway (`vmon serve`): create a context with `vmon context create` and select it with `vmon context use`.
+- The `vmon` CLI never touches `~/.vmon` or the VMM directly; it speaks JSON to the daemon over `~/.vmon/vmond.sock`. The per-VM `vmm` VMM and its many flags are an internal runtime detail spawned by the daemon. Remote access always goes through the HTTP gateway (`vmon serve`): create a context with `vmon context create`, select it with `vmon context use`, and pass `--save-token` only when you want a `0600` token file under `$VMON_HOME/credentials/`.
 - `VMON_BIN` / `VMON_KERNEL` / `VMON_HOME` override the binary, kernel, and
   state directory (`~/.vmon`).

@@ -14,7 +14,7 @@ Three layers. The Python daemon spawns one Rust `vmm` process per microVM; the g
 ```
 Web UI (React SPA)
    │ HTTP / WebSocket
-vmon serve (FastAPI, server.py)
+vmon serve (FastAPI, server/ package)
    │ Unix socket  $VMON_HOME/vmond.sock
 vmond (daemon.py) ──> Engine (core.py, single registry owner)
    │ spawns subprocess per VM, --api-sock JSON control socket
@@ -37,7 +37,7 @@ vmon-agent (guest agent, Linux guest only)
   - `src/devices/`, `src/snapshot/`.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
-- `python/vmon/` — Python package (CLI, daemon, server, Engine, sandbox SDK). Bundled assets: `_agent/` (static guest agent), `web/` (built UI).
+- `python/vmon/` — Python package (CLI, daemon, server package, Engine, sandbox SDK). Bundled assets: `_agent/` (static guest agent), `web/` (built UI).
 - `python/tests/`, `python/e2e.py`, `python/cli_e2e.py` — Python unit + e2e suites.
 - `ui/` — React + Vite + TypeScript web panel; **builds into `python/vmon/web/`**.
 - `demo/` — runnable demo and asset-fetch scripts (Ubuntu/arm64 boots, OCI→ext4, Lima bridge for macOS).
@@ -101,7 +101,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - After changing `requires-python` or dependency constraints, regenerate the
   root workspace lockfile `uv.lock` with `uv lock` (from the repo root); never
   hand-edit generated lockfile markers.
-- **Synchronous core:** `Engine` and the daemon are threaded/blocking (registry guarded by `RLock`). Only `server.py` (FastAPI, via `asyncio.to_thread`) and `net.py` tunnels use `asyncio`. CLI rendering (`click` + `rich`) lives only in `console.py`; core stays dependency-light and FastAPI is lazy-imported for `vmon serve`.
+- **Synchronous core:** `Engine` and the daemon are threaded/blocking (registry guarded by `RLock`). The FastAPI gateway lives in `python/vmon/server/` (`app.py`, route modules, `reconciler.py`) and uses `asyncio.to_thread`; `net.py` tunnels also use `asyncio`. CLI rendering (`click` + `rich`) lives only in `console.py`; core stays dependency-light and FastAPI is lazy-imported for `vmon serve`.
 - **Errors:** typed exceptions with `code` fields (`EngineError`, `NotFound`, `NotRunning`, `Busy`, `Invalid`, `Unsupported`; `DaemonError`, `AgentError`). Adapters map codes → JSON frames / HTTP status.
 - **State:** single daemon per `$VMON_HOME` (flock `vmond.lock`); `VMRecord`s persist to `~/.vmon/vms/*/meta.json` and rehydrate on restart. Secrets live in memory only — never written to disk.
 
@@ -115,7 +115,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `src/control.rs` — Unix-socket JSON control plane and `PauseGate`.
 - `src/result.rs` — error type, `Result<T>`, `bail!`.
 - `agent/src/main.rs`, `agent/src/proto.rs` — guest agent and its frame protocol.
-- `python/vmon/cli.py` (`vmon` entry point), `daemon.py`, `server.py`, `core.py` (`Engine`), `vmm.py` (`MicroVM`), `sandbox.py`.
+- `python/vmon/cli.py` (`vmon` entry point), `daemon.py`, `config.py` (`ServeConfig`), `core.py` (`Engine`), `server/` (`app.py`, `api.py`, `mesh_routes.py`, `reconciler.py`, `record_sync.py`, `leases.py`), `records.py`, `lease.py`, `remote.py`, `build.py`, `vmm.py` (`MicroVM`), `sandbox.py`.
 - `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `python/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.
 
 ## Runtime/Tooling Preferences
@@ -123,7 +123,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - **Rust:** pinned `nightly-2026-04-29` (`rust-toolchain.toml`, with rustfmt/clippy/rust-analyzer). Release profile: `opt-level = 2`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 - **Python:** `>=3.14`; **`uv`** for everything, run from `python/` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime deps: `click`, `rich`; `[server]` extra adds `fastapi`, `uvicorn`.
 - **UI:** **bun** for everything (`bun.lock`; no `package-lock.json`). React 18.3 / Vite 5.4 / TS 5.6; biome (`ui/biome.json`) formats + lints `ui/src`, `tsc` type-checks. `just {fmt,lint,check}-ui` and CI all run via bun.
-- **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_REMOTE`. The Rust binary is located by `find_binary()` (cargo target dirs → `$VMON_BIN` → `PATH`).
+- **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`. The Rust binary is located by `find_binary()` (cargo target dirs → `$VMON_BIN` → `PATH`).
 
 ## Testing & QA
 
@@ -132,8 +132,8 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `boot.rs`, `blk.rs`, `lifecycle.rs`, `net.rs`, `pager.rs`, `snapshot.rs`, `timeout.rs`, `uefi.rs`, `soak.rs` — one concern each (boot markers, block I/O, control protocol, networking, pager eviction, snapshot/fork, timeout self-kill, UEFI boot, stability).
 - Integration runs single-threaded (`--test-threads=1`). Boot tests require assets from `just fetch-assets` (cached in `target/test-assets/`). macOS uses `demo/hvf-test-runner.sh` to codesign spawned test binaries.
 
-**Python** — `pytest` (`testpaths = ["tests"]`). Unit tests use fake backends / `FastAPI TestClient` and need **no** hypervisor (`test_cli.py`, `test_daemon.py`, `test_server.py`, `test_volume.py`, `test_secret.py`, `test_vmm_args.py`). `test_e2e.py` and the `python/e2e.py` / `python/cli_e2e.py` drivers exercise real VMs on a Linux/KVM **or** macOS/HVF host (a built `vmm` binary + static agent + guest kernel + docker/podman). Networked sandboxes get outbound egress on both (TAP on Linux, user-mode NAT via `--net user` on macOS); inbound port tunnels and host-side egress allowlists are Linux/TAP-only, so those cases auto-skip off Linux. virtio-fs works with the default aarch64 kernel (the auto-downloaded Cloud Hypervisor `Image` ships `CONFIG_VIRTIO_FS=y`) but the x86_64 firecracker kernel lacks it, so virtio-fs cases auto-skip on x86_64 or under a custom `VMON_KERNEL` without it. `test_e2e.py` is gated by `VMON_KVM_E2E=1`; the standalone drivers self-detect the hypervisor in their `preflight()`.
+**Python** — `pytest` (`testpaths = ["tests"]`). Unit tests use fake backends / `FastAPI TestClient` and need **no** hypervisor (CLI, daemon, server, volume, secret, VMM-arg, fault, and invariant coverage; `cluster_harness.py` supplies the fault proxy helpers). `test_e2e.py` and the `python/e2e.py` / `python/cli_e2e.py` drivers exercise real VMs on a Linux/KVM **or** macOS/HVF host (a built `vmm` binary + static agent + guest kernel + `skopeo`/`umoci`). The gated `VMON_CLUSTER_E2E=1` suite also runs on macOS/HVF for cluster failover paths. Networked sandboxes get outbound egress on both (TAP on Linux, user-mode NAT via `--net user` on macOS); inbound port tunnels and host-side egress allowlists are Linux/TAP-only, so those cases auto-skip off Linux.
 
-**CI** — `ci.yml` (ubuntu): fmt-check, check, clippy `-D warnings`, AArch64 check/clippy, `cargo test`, cargo-audit; macOS job builds + codesigns + `cargo test --no-run`. `integration.yml` runs the KVM (self-hosted x64) and HVF (self-hosted arm64) e2e + scheduled soak suites. `release.yml` builds musl binaries (`cargo-zigbuild`) and the Python wheel/sdist with bundled agents on `v*` tags.
+**CI** — `ci.yml` (ubuntu): fmt-check, check, clippy `-D warnings`, AArch64 check/clippy, `cargo test`, cargo-audit; macOS job builds + codesigns + `cargo test --no-run`. `integration.yml` runs the KVM (self-hosted x64) and HVF (self-hosted arm64) e2e suites, including gated cluster coverage; `mesh-soak.yml` runs the nightly three-node tc-netem soak; `release.yml` builds musl binaries (`cargo-zigbuild`) and the Python wheel/sdist with bundled agents on `v*` tags.
 
 When changing exported Rust symbols, check call sites with the language server (`lsp references`) before editing. Verify behavioral changes with the specific gated test rather than relying on `cargo check` alone.
