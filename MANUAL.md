@@ -638,19 +638,66 @@ cd python && VMON_KVM_E2E=1 python3 -m pytest tests/test_e2e.py -q
 
 ---
 
-## 10. Environment variables
+## 10. Configuration and environment variables
+
+`vmon serve` has one config surface. Values are resolved in this order:
+dataclass defaults < TOML config file (`vmon serve --config PATH`, or
+`VMON_CONFIG`) < `VMON_*` environment variables < explicit CLI flags. A TOML
+file may put these keys at top level or under `[serve]`; unknown keys are errors
+so typos do not silently disable protection.
+
+| Config key | Default | Environment override | CLI flag | Meaning |
+| --- | --- | --- | --- | --- |
+| `home` | `~/.vmon` | `VMON_HOME` | `--home` | state dir for VMs, snapshots, volumes, daemon socket/lock, mesh state, and leases |
+| `host` | `127.0.0.1` | `VMON_SERVE_HOST` | `--host` | HTTP bind host |
+| `port` | `8000` | `VMON_SERVE_PORT` | `--port` | HTTP bind port |
+| `token` | unset (required for `vmon serve`) | `VMON_API_TOKEN` | `--token` | full operator bearer token; comma-separated values support rotation |
+| `client_token` | unset | `VMON_CLIENT_TOKEN` | `--client-token` | scoped client bearer token for sandbox routes, not mesh/admin routes |
+| `tls_cert` | unset | `VMON_TLS_CERT` | `--tls-cert` | HTTPS certificate path; must be set together with `tls_key` |
+| `tls_key` | unset | `VMON_TLS_KEY` | `--tls-key` | HTTPS private-key path; must be set together with `tls_cert` |
+| `idle_timeout` | `300.0` seconds | `VMON_IDLE_TIMEOUT` | `--idle-timeout` | idle sandbox reaper timeout |
+| `replicate_sec` | auto: `60.0` seconds when mesh is enabled, off when mesh is disabled | `VMON_REPLICATE_SEC` | `--replicate-sec` | checkpoint/replication cadence; explicit `0` disables replication |
+| `replicas` | `1` | `VMON_REPLICAS` | `--replicas` | replica fan-out `K` |
+| `replicate_concurrency` | `2` | `VMON_REPLICATE_CONCURRENCY` | `--replicate-concurrency` | concurrent peer replica pushes |
+| `restore_quorum` | auto: on at `expected_members >= 3`, off below that; 2-node meshes warn | `VMON_RESTORE_QUORUM` | `--restore-quorum` / `--no-restore-quorum` | require majority confirmation before automatic orphan restore |
+| `warm_pool_size` | `1` | `VMON_WARM_POOL_SIZE` | `--warm-pool-size` | default count for bare entries in `warm_images` |
+| `warm_images` | `[]` | `VMON_WARM_IMAGES` | `--warm-images` | comma-separated image refs to prewarm; entries may be `REF` or `REF=COUNT` |
+| `mesh_heartbeat_sec` | `3.0` seconds | `VMON_MESH_HEARTBEAT_SEC` | `--mesh-heartbeat-sec` | mesh heartbeat interval |
+| `mesh_reap_sec` | `300.0` seconds | `VMON_MESH_REAP_SEC` | `--mesh-reap-sec` | stale-peer reap/orphan detection window |
+| `mesh_idem_ttl_sec` | `900.0` seconds | `VMON_MESH_IDEM_TTL_SEC` | `--mesh-idem-ttl-sec` | idempotency key retention window for mesh creates |
+| `mesh_create_timeout_sec` | `120.0` seconds | `VMON_MESH_CREATE_TIMEOUT_SEC` | `--mesh-create-timeout-sec` | peer create/proxy timeout |
+| `mesh_w_warm` | `1000.0` | `VMON_MESH_W_WARM` | `--mesh-w-warm` | placement score weight for a warm pool/template |
+| `mesh_w_free` | `100.0` | `VMON_MESH_W_FREE` | `--mesh-w-free` | placement score weight for free capacity |
+| `mesh_w_local` | `50.0` | `VMON_MESH_W_LOCAL` | `--mesh-w-local` | placement score weight for the ingress-local node |
+| `mesh_w_region` | `30.0` | `VMON_MESH_W_REGION` | `--mesh-w-region` | placement score weight for matching region |
+| `mesh_w_inflight` | `80.0` | `VMON_MESH_W_INFLIGHT` | `--mesh-w-inflight` | placement score penalty for in-flight load |
+
+Example config file:
+
+```toml
+[serve]
+host = "0.0.0.0"
+port = 8000
+token = "operator-token"
+replicate_sec = 60
+replicas = 1
+warm_images = ["alpine:latest=2", "debian:stable-slim"]
+```
+
+Run `vmon doctor --serve --config PATH` to print every resolved knob, its source
+(`default`, `file`, `env`, or `flag`), and validation results.
+
+Other common variables:
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
-| `VMON_API_TOKEN` | `vmon serve`, daemon TCP, `VMON_REMOTE` | bearer token for the REST API and remote daemon (required for REST) |
-| `VMON_HOME` | vmon | state dir for VMs/snapshots/volumes + daemon socket/lock (default `~/.vmon`) |
 | `VMON_REMOTE` | `vmon` CLI | `host:port` of a remote daemon to drive over TCP (no auto-start) |
 | `VMON_DAEMON_TCP` | `vmond` | `host:port` for the daemon to also listen on for `VMON_REMOTE` clients |
 | `VMON_BIN` | vmon | path to the `vmm` binary (else auto-detected) |
 | `VMON_KERNEL` | vmon | guest kernel (else `/boot/vmlinuz-$(uname -r)` on Linux, or auto-downloaded on macOS) |
 | `VMON_KVM_E2E` | tests | set to `1` to enable the real-VM e2e tests (Linux/KVM or macOS/HVF) |
 | `VMON_E2E_IMAGE` | tests | image for e2e tests (default `alpine:latest`) |
-| `VMON_KVM` | Rust tests | set to `1` to run KVM integration tests |
+| `VMON_E2E` | Rust tests | set to `1` to run Rust real-VM integration tests |
 
 ---
 
