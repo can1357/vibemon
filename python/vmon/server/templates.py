@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Response, status
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from ..core import state_dir
+from .proxy import coded_http
 
 
 def _template_archive(template_dir: Path) -> Path:
@@ -248,7 +249,7 @@ def register_template_routes(app: FastAPI, require_auth: Any) -> None:
         except ValueError:
             template_dir = None
         if template_dir is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown template")
+            raise coded_http(status.HTTP_404_NOT_FOUND, "not_found", "unknown template")
         archive = await asyncio.to_thread(_template_metadata_archive, template_dir)
         return FileResponse(
             str(archive),
@@ -266,11 +267,11 @@ def register_template_routes(app: FastAPI, require_auth: Any) -> None:
         except ValueError:
             template_dir = None
         if template_dir is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown template")
+            raise coded_http(status.HTTP_404_NOT_FOUND, "not_found", "unknown template")
         try:
             data = await asyncio.to_thread(_template_memory_page, template_dir, page)
         except (FileNotFoundError, OSError) as exc:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_404_NOT_FOUND, "not_found", str(exc)) from exc
         return Response(data, media_type="application/octet-stream")
 
     @app.get("/v1/templates/{digest}", dependencies=[Depends(require_auth)])
@@ -282,7 +283,7 @@ def register_template_routes(app: FastAPI, require_auth: Any) -> None:
         except ValueError:
             template_dir = None
         if template_dir is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown template")
+            raise coded_http(status.HTTP_404_NOT_FOUND, "not_found", "unknown template")
         archive = await asyncio.to_thread(_template_archive, template_dir)
         return FileResponse(
             str(archive),

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import status
 
 from ..mesh import MeshError
 from . import leases, record_sync
-from .proxy import _mesh_http_status
+from .proxy import coded_http, mesh_http_exception
 from .runtime import ServerRuntime
 
 
@@ -27,7 +27,7 @@ async def migrate_sandbox_to(ctx: ServerRuntime, sandbox_id: str, target: str) -
     try:
         peer = mesh.migration_target(target)
     except MeshError as exc:
-        raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+        raise mesh_http_exception(exc) from exc
     prep = await supervisor._run(supervisor._engine.migrate_prepare, sandbox_id)
     digest = str(prep["digest"])
     snapshot_dir = str(prep["snapshot_dir"])
@@ -52,9 +52,10 @@ async def migrate_sandbox_to(ctx: ServerRuntime, sandbox_id: str, target: str) -
             supervisor._engine.migrate_abort, sandbox_id, snapshot_dir, digest, params
         )
         detail = exc.message if isinstance(exc, MeshError) else str(exc)
-        raise HTTPException(
+        raise coded_http(
             status.HTTP_502_BAD_GATEWAY,
-            detail=f"migration to {target} failed (source restored): {detail}",
+            "unreachable",
+            f"migration to {target} failed (source restored): {detail}",
         ) from exc
     await asyncio.to_thread(mesh.broadcast_owner, sandbox_id, target, epoch)
     await record_sync.update_record_owner(ctx, sandbox_id, target, epoch, require_quorum=False)

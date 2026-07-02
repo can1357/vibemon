@@ -15,7 +15,7 @@ from ..mesh import MeshError, NodeCaps, NodeState, request_template_key
 from ..records import CreateRecord
 from . import leases, migration, record_sync, templates
 from .models import SandboxCreate, _apply_ha_defaults, _validate_create_request
-from .proxy import _engine_has, _mesh_http_status, _scatter_locate
+from .proxy import _engine_has, _scatter_locate, coded_http, mesh_http_exception
 from .runtime import ServerRuntime
 
 LOGGER = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ def register_mesh_routes(
                 caps=caps,
             )
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
         ensure_mesh_heartbeat()
         return {"blob": blob, "node_id": mesh.node_id, "advertise": mesh.advertise}
 
@@ -75,7 +75,7 @@ def register_mesh_routes(
                 region=str(body.get("region") or ""),
             )
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
         ensure_mesh_heartbeat()
         return status_view
 
@@ -123,7 +123,7 @@ def register_mesh_routes(
         try:
             return mesh.register(NodeState.from_wire(body))
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     @app.post("/v1/mesh/heartbeat", dependencies=[Depends(require_auth)])
     async def mesh_heartbeat(body: dict[str, Any]) -> dict[str, Any]:
@@ -132,7 +132,7 @@ def register_mesh_routes(
             known = list(body.get("known") or [])
             return mesh.heartbeat(state, known)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     @app.post("/v1/mesh/depart", dependencies=[Depends(require_auth)])
     async def mesh_depart(body: dict[str, Any]) -> dict[str, bool]:
@@ -178,7 +178,7 @@ def register_mesh_routes(
                 float(body.get("ttl") or 0),
             )
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid", str(exc)) from exc
         return decision.to_wire()
 
     @app.post("/v1/mesh/lease/renew", dependencies=[Depends(require_auth)])
@@ -191,7 +191,7 @@ def register_mesh_routes(
                 float(body.get("ttl") or 0),
             )
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid", str(exc)) from exc
         return decision.to_wire()
 
     @app.post("/v1/mesh/lease/release", dependencies=[Depends(require_auth)])
@@ -203,7 +203,7 @@ def register_mesh_routes(
                 int(body.get("epoch") or 0),
             )
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid", str(exc)) from exc
         payload = decision.to_wire()
         payload["released"] = decision.granted
         return payload
@@ -224,18 +224,20 @@ def register_mesh_routes(
             # A single-shot migration carries no idempotency token, so an existing
             # local name is a genuine collision, not a replay: reject it so the
             # source rolls back instead of committing onto an unrelated sandbox.
-            raise HTTPException(
+            raise coded_http(
                 status.HTTP_409_CONFLICT,
-                detail=f"sandbox {name!r} already exists on the target node",
+                "conflict",
+                f"sandbox {name!r} already exists on the target node",
             )
         try:
             installed = await templates.pull_template(
                 request.app.state.mesh_http, source_url, digest, outbound_token
             )
         except Exception as exc:
-            raise HTTPException(
+            raise coded_http(
                 status.HTTP_502_BAD_GATEWAY,
-                detail=f"failed to pull migration checkpoint: {exc}",
+                "unreachable",
+                f"failed to pull migration checkpoint: {exc}",
             ) from exc
         epoch = int(body.get("epoch") or 0)
         lease_records = await leases.acquire_writable_volume_leases(ctx, params, epoch=epoch)
@@ -275,9 +277,10 @@ def register_mesh_routes(
                 request.app.state.mesh_http, source_url, digest, outbound_token
             )
         except Exception as exc:
-            raise HTTPException(
+            raise coded_http(
                 status.HTTP_502_BAD_GATEWAY,
-                detail=f"failed to pull replica checkpoint: {exc}",
+                "unreachable",
+                f"failed to pull replica checkpoint: {exc}",
             ) from exc
         replica_store.put(
             name,
@@ -297,7 +300,7 @@ def register_mesh_routes(
         try:
             record = CreateRecord.from_wire(body)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_400_BAD_REQUEST, "invalid", str(exc)) from exc
         record_store.put(record)
         mesh.record_owner(record.sid, record.owner, record.epoch)
         return {"ok": True}
@@ -569,7 +572,7 @@ def register_mesh_routes(
             idem_key, params = _idem_payload(body)
             return await _coordinate_sandbox_create(request, idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     @app.post("/v1/mesh/idem/sandboxes/work", dependencies=[Depends(require_auth)])
     async def mesh_idem_sandbox_work(request: Request, body: dict[str, Any]) -> dict[str, Any]:
@@ -577,7 +580,7 @@ def register_mesh_routes(
             idem_key, params = _idem_payload(body)
             return await _worker_sandbox_create(request, idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     async def _local_detached_run_view(params: dict[str, Any]) -> dict[str, Any]:
         clean = dict(params)
@@ -727,7 +730,7 @@ def register_mesh_routes(
             params["detach"] = True
             return await _coordinate_run_create(idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     @app.post("/v1/mesh/idem/run/work", dependencies=[Depends(require_auth)])
     async def mesh_idem_run_work(body: dict[str, Any]) -> dict[str, Any]:
@@ -736,7 +739,7 @@ def register_mesh_routes(
             params["detach"] = True
             return await _worker_run_create(idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     async def _local_detached_restore_view(params: dict[str, Any]) -> dict[str, Any]:
         clean = dict(params)
@@ -886,7 +889,7 @@ def register_mesh_routes(
             params["detach"] = True
             return await _coordinate_restore_create(idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
     @app.post("/v1/mesh/idem/restore/work", dependencies=[Depends(require_auth)])
     async def mesh_idem_restore_work(body: dict[str, Any]) -> dict[str, Any]:
@@ -895,7 +898,7 @@ def register_mesh_routes(
             params["detach"] = True
             return await _worker_restore_create(idem_key, params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
 
     return IdempotencyHandlers(

@@ -40,7 +40,7 @@ from .models import (
     _validate_extend_request,
     _validate_network_request,
 )
-from .proxy import _engine_has, _mesh_http_status, _scatter_locate
+from .proxy import _engine_has, _scatter_locate, coded_http, mesh_http_exception
 from .runtime import ServerRuntime
 from .supervisor import (
     _creator_sse,
@@ -93,7 +93,7 @@ def register_api_routes(
         try:
             return mesh.place(params)
         except MeshError as exc:
-            raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+            raise mesh_http_exception(exc) from exc
 
 
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
@@ -108,7 +108,7 @@ def register_api_routes(
             try:
                 view = await _idempotent_sandbox_create(request, idem_key, body_dict)
             except MeshError as exc:
-                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+                raise mesh_http_exception(exc) from exc
             return JSONResponse(view, status_code=status.HTTP_201_CREATED)
         if (
             mesh.enabled
@@ -121,8 +121,8 @@ def register_api_routes(
                 or mesh.owner_of(name)
                 or await _scatter_locate(mesh, name, ctx.record_store)
             ):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT, detail=f"sandbox {name!r} already exists"
+                raise coded_http(
+                    status.HTTP_409_CONFLICT, "conflict", f"sandbox {name!r} already exists"
                 )
             tried: set[str] = set()
             for _ in range(2):
@@ -143,7 +143,7 @@ def register_api_routes(
                     if exc.code == "unreachable":
                         mesh.mark_unhealthy(owner)
                         continue
-                    raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+                    raise mesh_http_exception(exc) from exc
                 finally:
                     mesh.note_inflight(-1)
                 sid = str(view.get("id") or view.get("name") or "")
@@ -186,16 +186,17 @@ def register_api_routes(
         local_params = body.model_dump(exclude_none=True)
         local_params.pop("idempotency_key", None)
         if mesh.enabled and local_params.get("fs_dir"):
-            raise HTTPException(
+            raise coded_http(
                 status.HTTP_400_BAD_REQUEST,
-                detail="host-local fs_dir cannot be placed or protected; use a volume",
+                "invalid",
+                "host-local fs_dir cannot be placed or protected; use a volume",
             )
         try:
             _apply_ha_defaults(
                 local_params, mesh_enabled=mesh.enabled, config=getattr(ctx, "config", None)
             )
         except ValueError as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            raise coded_http(status.HTTP_400_BAD_REQUEST, "invalid", str(exc)) from exc
         body = SandboxCreate(**local_params)
         lease_records = await leases.acquire_writable_volume_leases(ctx, local_params, epoch=0)
         try:
@@ -253,7 +254,7 @@ def register_api_routes(
             try:
                 return JSONResponse(await _idempotent_run_create(idem_key, params))
             except MeshError as exc:
-                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+                raise mesh_http_exception(exc) from exc
         if (
             mesh.enabled
             and not request.headers.get("x-vmon-mesh-hop")
@@ -273,7 +274,7 @@ def register_api_routes(
                     params, mesh_enabled=mesh.enabled, config=getattr(ctx, "config", None)
                 )
             except ValueError as exc:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+                raise coded_http(status.HTTP_400_BAD_REQUEST, "invalid", str(exc)) from exc
             result = await supervisor._run(supervisor._engine.run, params)
             sid = str(result.get("name") or "")
             if sid:
@@ -302,7 +303,7 @@ def register_api_routes(
             try:
                 return JSONResponse(await _idempotent_restore_create(idem_key, params))
             except MeshError as exc:
-                raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+                raise mesh_http_exception(exc) from exc
         if mesh.enabled and not request.headers.get("x-vmon-mesh-hop"):
             owner = place_or_http(params)
             if owner != mesh.node_id:
@@ -318,7 +319,7 @@ def register_api_routes(
                     params, mesh_enabled=mesh.enabled, config=getattr(ctx, "config", None)
                 )
             except ValueError as exc:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+                raise coded_http(status.HTTP_400_BAD_REQUEST, "invalid", str(exc)) from exc
             result = await supervisor._run(supervisor._engine.restore, params)
             sid = str(result.get("name") or "")
             if sid:
@@ -346,7 +347,7 @@ def register_api_routes(
                 try:
                     response = await asyncio.to_thread(mesh.transport.post, url, "/v1/fork", params)
                 except MeshError as exc:
-                    raise HTTPException(_mesh_http_status(exc), detail=exc.message) from exc
+                    raise mesh_http_exception(exc) from exc
                 for clone in response.get("clones") or []:
                     if isinstance(clone, dict) and clone.get("name"):
                         mesh.record_owner(str(clone["name"]), owner, 0)

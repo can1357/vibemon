@@ -63,8 +63,8 @@ class Supervisor:
         ] = set()
 
     def _http_error(self, exc: EngineError) -> HTTPException:
-        code = self._STATUS.get(exc.code, status.HTTP_503_SERVICE_UNAVAILABLE)
-        return HTTPException(code, detail=exc.message)
+        status_code = self._STATUS.get(exc.code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        return HTTPException(status_code, detail={"code": exc.code, "message": exc.message})
 
     async def _run(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         """Run a blocking engine call off the event loop, mapping engine errors."""

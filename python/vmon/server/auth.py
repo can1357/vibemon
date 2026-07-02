@@ -110,7 +110,7 @@ def _require_bearer(
     if not _bearer_token_authorized(_request_bearer_token(request), expected_token, client_token):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            detail="unauthorized",
+            detail={"code": "unauthorized", "message": "unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -129,7 +129,7 @@ def make_require_auth(ctx: ServerRuntime):
             ctx.supervisor.count("auth_failed")
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
-                detail="unauthorized",
+                detail={"code": "unauthorized", "message": "unauthorized"},
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
@@ -142,6 +142,6 @@ def require_connect_token(ctx: ServerRuntime, record: VMRecord, supplied: str | 
         ctx.supervisor.count("auth_failed")
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            detail="invalid connect token",
+            detail={"code": "unauthorized", "message": "invalid connect token"},
             headers={"WWW-Authenticate": "Bearer"},
         )

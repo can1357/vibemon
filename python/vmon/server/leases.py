@@ -12,6 +12,7 @@ from fastapi import HTTPException, status
 
 from ..lease import DEFAULT_TTL, LeaseRecord, LeaseUnavailable
 from ..mesh import Mesh
+from .proxy import coded_http
 from .runtime import ServerRuntime
 
 LOGGER = logging.getLogger(__name__)
@@ -56,12 +57,8 @@ def _post(ctx: ServerRuntime, url: str, path: str, payload: dict[str, Any]) -> d
     return ctx.mesh.transport.post(url, path, payload, timeout=ctx.mesh.create_timeout)
 
 
-def _coded_http(status_code: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code, detail={"code": code, "message": message})
-
-
 def _lease_unavailable(exc: LeaseUnavailable) -> HTTPException:
-    return _coded_http(status.HTTP_503_SERVICE_UNAVAILABLE, exc.code, exc.message)
+    return coded_http(status.HTTP_503_SERVICE_UNAVAILABLE, exc.code, exc.message)
 
 
 async def acquire_writable_volume_leases(
@@ -79,7 +76,7 @@ async def acquire_writable_volume_leases(
         return []
     expected = expected_members(ctx.mesh)
     if expected < 3:
-        raise _coded_http(
+        raise coded_http(
             status.HTTP_501_NOT_IMPLEMENTED,
             "unsupported",
             "writable volumes need >=3 nodes on mesh contexts",
