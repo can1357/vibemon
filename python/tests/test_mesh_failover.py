@@ -123,8 +123,6 @@ def test_meshclient_single_live_probes_then_runs_once() -> None:
         assert result == {"served_by": "B"}
 
 
-
-
 def test_context_create_over_real_socket(tmp_path, monkeypatch) -> None:
     roster_a: list[str] = []
     with server("A", roster_a) as (url_a, _srv_a), server("B", []) as (url_b, _srv_b):

@@ -14,6 +14,7 @@ from ..core import VMRecord
 if TYPE_CHECKING:
     from .runtime import ServerRuntime
 
+
 def _tokens_match(supplied: str | None, expected: str) -> bool:
     return supplied is not None and secrets.compare_digest(supplied, expected)
 
@@ -104,6 +105,7 @@ def _ws_connect_token(websocket: WebSocket) -> str | None:
         return token
     return _ws_bearer_token(websocket)
 
+
 def _require_bearer(
     request: Request, expected_token: str | None, client_token: str | None = None
 ) -> None:
@@ -117,6 +119,7 @@ def _require_bearer(
 
 def make_require_auth(ctx: ServerRuntime):
     bearer_dependency = Depends(ctx.bearer)
+
     async def require_auth(
         credentials: HTTPAuthorizationCredentials | None = bearer_dependency,
     ) -> None:

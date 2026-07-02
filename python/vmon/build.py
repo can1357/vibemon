@@ -209,9 +209,7 @@ def prune_build_layouts(keep_ref: str | None = None, *, keep_recent: int = 3) ->
         keep_layout = _layout_from_ref(keep_ref) if keep_ref else None
         keep = keep_layout.resolve() if keep_layout is not None else None
         entries = [
-            path
-            for path in builds.iterdir()
-            if path.is_dir() and not path.name.startswith(".")
+            path for path in builds.iterdir() if path.is_dir() and not path.name.startswith(".")
         ]
         entries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         protected = {path.resolve() for path in entries[: max(0, keep_recent)]}

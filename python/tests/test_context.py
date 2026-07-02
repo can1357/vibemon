@@ -281,7 +281,6 @@ def test_client_selection_context(tmp_path, monkeypatch):
     assert isinstance(cli._client(), MeshTransport)
 
 
-
 def test_client_selection_missing_context_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("VMON_HOME", str(tmp_path))
     monkeypatch.setenv("VMON_API_TOKEN", "t")
@@ -371,8 +370,6 @@ def test_cli_create_save_token_private_file_not_contexts(tmp_path, monkeypatch):
     assert token_path.stat().st_mode & 0o777 == 0o600
     assert token_path.parent.stat().st_mode & 0o777 == 0o700
     assert "SECRET123" not in contexts_path(tmp_path).read_text(encoding="utf-8")
-
-
 
 
 def test_cli_client_token_resolution_env_beats_saved_file(tmp_path, monkeypatch):

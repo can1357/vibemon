@@ -28,6 +28,7 @@ OnEvent = Callable[[str, bytes], None]
 
 class Transport(Protocol):
     """Shared local/mesh transport contract used by the CLI and SDK."""
+
     def call(self, method: str, **params: Any) -> dict[str, Any]: ...
     def stream(
         self, method: str, on_event: OnEvent, stdin: BinaryIO | None = None, **params: Any
@@ -854,6 +855,7 @@ _REPLAY_SAFE_CALLS = frozenset(
 )
 _REPLAY_SAFE_STREAMS = frozenset({"logs"})
 
+
 def _with_idempotency_key(params: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(params)
     payload.setdefault("idempotency_key", secrets.token_urlsafe(18))
@@ -970,4 +972,3 @@ class MeshTransport:
         self._endpoints.insert(0, endpoint)
         if self._on_roster is not None:
             self._on_roster(list(self._endpoints))
-

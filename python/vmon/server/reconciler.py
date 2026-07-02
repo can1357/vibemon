@@ -164,6 +164,7 @@ async def _rerun_from_record(ctx: ServerRuntime, sid: str, dead: str) -> bool:
     finally:
         mesh.worker_end(key)
 
+
 async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
     supervisor = ctx.supervisor
     mesh = ctx.mesh
@@ -184,8 +185,10 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
             retry = False
             try:
                 owner = mesh.owner_of(sid)
-                if owner and owner != dead and (
-                    owner == mesh.node_id or mesh.is_peer_healthy(owner)
+                if (
+                    owner
+                    and owner != dead
+                    and (owner == mesh.node_id or mesh.is_peer_healthy(owner))
                 ):
                     continue  # already restored under a live owner
                 if mesh.is_peer_healthy(dead):
@@ -201,9 +204,8 @@ async def ha_reconcile_forever(ctx: ServerRuntime) -> None:
                     continue
                 create_record = ctx.record_store.get(sid)
                 ha = create_record.ha if create_record is not None else "async"
-                can_rerun = (
-                    create_record is not None
-                    and (create_record.restart_policy == "rerun" or "rerun" in create_record.ha)
+                can_rerun = create_record is not None and (
+                    create_record.restart_policy == "rerun" or "rerun" in create_record.ha
                 )
                 if ha == "off":
                     continue

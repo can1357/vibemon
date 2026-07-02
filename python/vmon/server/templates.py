@@ -291,4 +291,3 @@ def register_template_routes(app: FastAPI, require_auth: Any) -> None:
             filename=f"{digest}.tar.gz",
             background=BackgroundTask(archive.unlink),
         )
-

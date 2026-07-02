@@ -419,7 +419,6 @@ def _request_source(path: str, body: bytes) -> str | None:
     return None
 
 
-
 def _relay(src: socket.socket, dst: socket.socket) -> None:
     try:
         # Long-running requests (cold image import + first boot) can sit silent

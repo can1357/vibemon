@@ -37,7 +37,6 @@ def register_mesh_routes(
     outbound_token = ctx.outbound_token or ""
     record_store = ctx.record_store
 
-
     def ensure_mesh_heartbeat() -> None:
         from .reconciler import ensure_mesh_heartbeat as start_mesh_heartbeat
 
@@ -45,7 +44,6 @@ def register_mesh_routes(
 
     async def _migrate_sandbox_to(sandbox_id: str, target: str) -> dict[str, Any]:
         return await migration.migrate_sandbox_to(ctx, sandbox_id, target)
-
 
     @app.post("/v1/mesh/setup", dependencies=[Depends(require_auth)])
     async def mesh_setup(body: dict[str, Any]) -> dict[str, Any]:
@@ -932,7 +930,6 @@ def register_mesh_routes(
             return await _worker_restore_create(idem_key, params)
         except MeshError as exc:
             raise mesh_http_exception(exc) from exc
-
 
     return IdempotencyHandlers(
         sandbox_create=_idempotent_sandbox_create,

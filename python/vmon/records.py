@@ -108,7 +108,7 @@ class RecordStore:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 record = CreateRecord.from_wire(data)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            except OSError, json.JSONDecodeError, TypeError, ValueError:
                 continue
             clean, _ = self._split_secrets(record.params)
             meta = record.to_wire()
@@ -147,7 +147,7 @@ class RecordStore:
         data["params"] = params
         try:
             return CreateRecord.from_wire(data)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
     def update_owner(self, sid: str, owner: str, epoch: int) -> CreateRecord | None:

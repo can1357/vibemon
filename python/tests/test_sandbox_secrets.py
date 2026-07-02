@@ -204,6 +204,7 @@ def _remote_fn_helper(value: float) -> int:
 def _sample_remote_uses_module_context(value: float) -> int:
     return _remote_fn_helper(value)
 
+
 def _sample_remote_always_fails(value: int) -> int:
     raise ValueError(f"map boom {value}")
 
@@ -498,10 +499,7 @@ def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None
     assert len(created) == 3
     assert max_live == 3
     assert live == 0
-    assert all(
-        kwargs == {"image": "python:3.14-slim", "block_network": True}
-        for kwargs in created
-    )
+    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
     assert all(sandbox.terminated for sandbox in sandboxes)
 
     created.clear()
@@ -518,10 +516,7 @@ def test_remote_function_map_and_starmap_use_ephemeral_pool(monkeypatch) -> None
     assert len(created) == 2
     assert max_live == 2
     assert live == 0
-    assert all(
-        kwargs == {"image": "python:3.14-slim", "block_network": True}
-        for kwargs in created
-    )
+    assert all(kwargs == {"image": "python:3.14-slim", "block_network": True} for kwargs in created)
     assert all(sandbox.terminated for sandbox in sandboxes)
 
 

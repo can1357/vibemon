@@ -150,9 +150,7 @@ class LeaseManager:
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.root = (
-            Path(root)
-            if root is not None
-            else Path(os.environ.get("VMON_HOME", STATE)) / "leases"
+            Path(root) if root is not None else Path(os.environ.get("VMON_HOME", STATE)) / "leases"
         )
         self._clock = clock or time.time
         self._lock = threading.RLock()
@@ -181,9 +179,7 @@ class LeaseManager:
                     out.append(record)
             return sorted(out, key=lambda rec: rec.volume)
 
-    def vote_grant(
-        self, volume: str, holder_node: str, epoch: int, ttl: float
-    ) -> LeaseDecision:
+    def vote_grant(self, volume: str, holder_node: str, epoch: int, ttl: float) -> LeaseDecision:
         """Persist a yes vote iff no unexpired conflicting or newer vote exists."""
         volume = _valid_volume(volume)
         holder = _valid_holder(holder_node)
@@ -201,9 +197,7 @@ class LeaseManager:
             self._store(record)
             return LeaseDecision(True, record)
 
-    def vote_renew(
-        self, volume: str, holder_node: str, epoch: int, ttl: float
-    ) -> LeaseDecision:
+    def vote_renew(self, volume: str, holder_node: str, epoch: int, ttl: float) -> LeaseDecision:
         """Extend a matching vote before its renew deadline."""
         volume = _valid_volume(volume)
         holder = _valid_holder(holder_node)

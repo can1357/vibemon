@@ -103,7 +103,6 @@ def register_api_routes(
         except MeshError as exc:
             raise mesh_http_exception(exc) from exc
 
-
     @app.post("/v1/sandboxes", dependencies=[Depends(require_auth)])
     async def create_sandbox(request: Request, body: SandboxCreate) -> JSONResponse:
         _validate_create_request(body)

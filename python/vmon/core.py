@@ -1044,9 +1044,7 @@ class Engine:
                 "tunnels": {},
                 "policy": {},
             }
-        raise Unsupported(
-            f"networked sandbox {name!r} is missing live host-network restore state"
-        )
+        raise Unsupported(f"networked sandbox {name!r} is missing live host-network restore state")
 
     def _checkpoint_for(self, name: str, *, kind: str, stop: bool) -> dict[str, Any]:
         """Build a peer-pullable checkpoint + restore params for migrate/replicate.
@@ -1403,7 +1401,6 @@ class Engine:
         with self._lock:
             self._records[sid] = record
         return record
-
 
     def record_volume_leases(self, sid: str, leases: builtins.list[Any]) -> None:
         """Attach granted writable-volume lease metadata to a live record."""

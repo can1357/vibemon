@@ -178,8 +178,7 @@ class SandboxCollection:
                 row
                 for row in normalized
                 if all(
-                    str((row.get("tags") or {}).get(key)) == value
-                    for key, value in wanted.items()
+                    str((row.get("tags") or {}).get(key)) == value for key, value in wanted.items()
                 )
             ]
         return normalized
@@ -714,5 +713,3 @@ def _optional_str(value: object) -> str | None:
 
 def _new_idempotency_key() -> str:
     return secrets.token_urlsafe(18)
-
-

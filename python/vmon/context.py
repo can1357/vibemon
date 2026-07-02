@@ -255,5 +255,3 @@ def roster_from_status(status: Mapping[str, Any], *, fallback: str | None = None
     if not roster and fallback:
         return [fallback]
     return roster
-
-

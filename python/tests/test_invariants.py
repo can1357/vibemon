@@ -216,13 +216,13 @@ def _register_peer_with_pool(app_a: Any, app_b: Any) -> None:
     state_b.last_seen = time.time()
     app_a.state.mesh.register(state_b)
 
+
 def _key_for_coordinator(app: Any, coordinator: str, prefix: str) -> str:
     for idx in range(1_000):
         key = f"{prefix}-{idx}"
         if app.state.mesh.coordinator_for(key) == coordinator:
             return key
     raise AssertionError(f"could not find idempotency key coordinated by {coordinator}")
-
 
 
 def test_no_epoch_overlap_accepts_sequential_failover_history() -> None:

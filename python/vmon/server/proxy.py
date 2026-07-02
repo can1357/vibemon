@@ -166,7 +166,6 @@ async def _proxy_to_peer(request: Request, peer_url: str, token: str) -> Respons
     )
 
 
-
 def _sandbox_id_in_path(path: str) -> str | None:
     match = _SANDBOX_PATH_RE.match(path)
     if match is None:
@@ -393,6 +392,7 @@ def register_proxy_middleware(app: Any, ctx: ServerRuntime, require_auth: Any) -
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox owner unreachable")
         _require_bearer(request, expected_token, client_token)
         return await _proxy_to_peer(request, peer_url, outbound_token)
+
     app.middleware("http")(_mesh_router)
 
     async def proxy_ws_owner(websocket: WebSocket, sandbox_id: str) -> bool:

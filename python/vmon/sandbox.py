@@ -1404,9 +1404,7 @@ class RemoteFunction:
         factory is ``client.sandboxes.create``, so normal server-side placement
         spreads workers across nodes.
         """
-        return self._map_items(
-            iterable, star=False, ordered=ordered, concurrency=concurrency
-        )
+        return self._map_items(iterable, star=False, ordered=ordered, concurrency=concurrency)
 
     def starmap(
         self,
@@ -1416,9 +1414,7 @@ class RemoteFunction:
         ordered: bool = True,
     ) -> list[Any]:
         """Run one remote call per argument tuple across an ephemeral sandbox pool."""
-        return self._map_items(
-            iterable, star=True, ordered=ordered, concurrency=concurrency
-        )
+        return self._map_items(iterable, star=True, ordered=ordered, concurrency=concurrency)
 
     def _map_items(
         self,

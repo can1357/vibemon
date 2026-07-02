@@ -107,9 +107,7 @@ def test_two_node_create_requires_record_majority_before_ack(monkeypatch, tmp_pa
         assert retry.json()["id"] == "majority-record"
         assert _record_count(apps) == 1
         apps["B"].state.mesh.forget_owner("majority-record")
-        replicated = clients[urls["B"]].get(
-            "/v1/mesh/locate/majority-record", headers=AUTH
-        )
+        replicated = clients[urls["B"]].get("/v1/mesh/locate/majority-record", headers=AUTH)
 
     assert replicated.status_code == 200
     assert replicated.json() == {"owner": "A", "epoch": 0}
@@ -207,18 +205,14 @@ def test_rerun_tier_reexecutes_once_after_owner_loss_without_checkpoint(
         _run_reconcile_once(apps[restorer_id], monkeypatch)
         apps[restorer_id].state.mesh._orphans.append((sid, "A"))
         _run_reconcile_once(apps[restorer_id], monkeypatch)
-        rerun_location = clients[urls[restorer_id]].get(
-            f"/v1/mesh/locate/{sid}", headers=AUTH
-        )
+        rerun_location = clients[urls[restorer_id]].get(f"/v1/mesh/locate/{sid}", headers=AUTH)
 
     assert CountingSandbox.created == [sid, sid]
     assert rerun_location.status_code == 200
     assert rerun_location.json() == {"owner": restorer_id, "epoch": 1}
 
 
-def test_rerun_tier_does_not_reexecute_when_predecessor_is_reachable(
-    monkeypatch, tmp_path
-) -> None:
+def test_rerun_tier_does_not_reexecute_when_predecessor_is_reachable(monkeypatch, tmp_path) -> None:
     CountingSandbox.created = []
     apps, urls, transport = _mesh_apps(monkeypatch, tmp_path)
     monkeypatch.setattr("vmon.core.Engine._sandbox_class", staticmethod(lambda: CountingSandbox))
@@ -244,9 +238,7 @@ def test_rerun_tier_does_not_reexecute_when_predecessor_is_reachable(
         _force_peer_reaped(apps["B"], "A")
         apps["B"].state.mesh.register(apps["A"].state.mesh.self_state())
         _run_reconcile_once(apps["B"], monkeypatch)
-        owner_after_reconcile = clients[urls["B"]].get(
-            f"/v1/mesh/locate/{sid}", headers=AUTH
-        )
+        owner_after_reconcile = clients[urls["B"]].get(f"/v1/mesh/locate/{sid}", headers=AUTH)
 
     assert CountingSandbox.created == [sid]
     assert owner_after_reconcile.status_code == 200

@@ -151,7 +151,7 @@ async def release_record_volume_leases(ctx: ServerRuntime, record_or_sid: Any) -
                     ttl=float(data["ttl"]),
                 )
             )
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             continue
     await release_leases(ctx, leases)
     await asyncio.to_thread(ctx.supervisor._engine.clear_volume_leases, record.name)

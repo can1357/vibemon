@@ -125,9 +125,9 @@ def test_sdk_connect_exec_survives_first_gateway_loss(monkeypatch: pytest.Monkey
             f"{survivor_id} to hold a replica for {sandbox_id}",
             lambda: (
                 sandbox_id
-                in api_json(
-                    "GET", survivor.url, "/v1/mesh/replica/list", token, timeout=5.0
-                ).get("sids", [])
+                in api_json("GET", survivor.url, "/v1/mesh/replica/list", token, timeout=5.0).get(
+                    "sids", []
+                )
             ),
             timeout=90.0,
             interval=1.0,
@@ -137,10 +137,12 @@ def test_sdk_connect_exec_survives_first_gateway_loss(monkeypatch: pytest.Monkey
         eventually(
             f"{sandbox_id} to be restored and running on {survivor_id}",
             lambda: (
-                (row := sandbox_row(
-                    api_json("GET", survivor.url, "/v1/sandboxes", token, timeout=5.0),
-                    sandbox_id,
-                ))
+                (
+                    row := sandbox_row(
+                        api_json("GET", survivor.url, "/v1/sandboxes", token, timeout=5.0),
+                        sandbox_id,
+                    )
+                )
                 is not None
                 and row.get("status") == "running"
                 and row.get("node") == survivor_id

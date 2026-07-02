@@ -420,9 +420,7 @@ def test_sandbox_create_routes_to_named_context(
     from vmon import Sandbox
 
     transports: dict[str, GatewayTestTransport] = {
-        "http://prod": GatewayTestTransport(
-            fake_gateway, endpoints=["http://prod"], token="tok"
-        )
+        "http://prod": GatewayTestTransport(fake_gateway, endpoints=["http://prod"], token="tok")
     }
 
     class RegisteredMeshTransport(GatewayTestTransport):
