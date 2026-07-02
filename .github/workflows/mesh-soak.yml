@@ -1,0 +1,34 @@
+name: mesh soak
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  mesh-soak:
+    name: Mesh netem soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VMON_TAP: vmon0
+      VMON_HOST_IP: 192.168.249.1
+      # Pin the guest kernel to the fetched test asset; otherwise default_kernel()
+      # falls back to the runner's own /boot/vmlinuz-*, which is root-only (0600).
+      VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare KVM host
+        uses: ./.github/actions/kvm-host
+
+      - name: Sync Python dependencies
+        working-directory: python
+        run: uv sync --locked --extra server
+
+      - name: Run mesh netem soak
+        run: demo/mesh-soak.sh
