@@ -50,7 +50,7 @@ class CreateRecord:
         }
 
     @classmethod
-    def from_wire(cls, data: dict[str, Any]) -> "CreateRecord":
+    def from_wire(cls, data: dict[str, Any]) -> CreateRecord:
         """Build and validate a record from persisted or peer-provided data."""
 
         sid = data.get("sid")
