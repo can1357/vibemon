@@ -49,12 +49,19 @@ _AUTOSTART_TIMEOUT = 10.0
 
 
 class DaemonError(Exception):
-    """A daemon-side failure or transport error; ``code`` mirrors the error frame."""
+    """A daemon-side failure or transport error.
 
-    def __init__(self, message: str, *, code: str = "internal") -> None:
+    ``code`` carries the machine-readable reason (engine/mesh code when the
+    gateway returned a structured detail, else the HTTP status as a string, or
+    a transport code like ``unreachable``). ``status`` is the raw HTTP status
+    for gateway responses, ``None`` for local/transport failures.
+    """
+
+    def __init__(self, message: str, *, code: str = "internal", status: int | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
+        self.status = status
 
 
 class _Conn:
@@ -610,12 +617,20 @@ class _Gateway:
             return urllib.request.urlopen(req, timeout=30)
         except urllib.error.HTTPError as exc:
             body = exc.read()
-            detail = body.decode("utf-8", "replace")
+            message = body.decode("utf-8", "replace")
+            code = str(exc.code)
             with contextlib.suppress(Exception):
-                parsed = json.loads(detail)
+                parsed = json.loads(message)
                 if isinstance(parsed, dict):
-                    detail = str(parsed.get("detail") or detail)
-            raise DaemonError(detail or f"gateway HTTP {exc.code}", code=str(exc.code)) from exc
+                    detail = parsed.get("detail")
+                    if isinstance(detail, dict):
+                        message = str(detail.get("message") or message)
+                        code = str(detail.get("code") or code)
+                    elif detail:
+                        message = str(detail)
+            raise DaemonError(
+                message or f"gateway HTTP {exc.code}", code=code, status=int(exc.code)
+            ) from exc
         except urllib.error.URLError as exc:
             raise DaemonError(
                 f"cannot reach gateway {self.base_url}: {exc.reason}", code="unreachable"
@@ -641,9 +656,9 @@ class _Gateway:
     @staticmethod
     def _retryable_create_error(exc: DaemonError) -> bool:
         """Return whether an idempotent create may be retried after *exc*."""
-        if exc.code in {"unreachable", "502", "503", "504"}:
+        if exc.code == "unreachable" or exc.status in {502, 503, 504}:
             return True
-        return exc.code == "409" and "idempotent create already in progress" in exc.message
+        return exc.status == 409 and "idempotent create already in progress" in exc.message
 
     def _bytes(self, method: str, path: str, raw: bytes | None = None) -> bytes:
         with self._request(method, path, raw=raw) as response:
