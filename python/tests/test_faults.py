@@ -278,8 +278,9 @@ def test_partition_during_idempotent_create_never_duplicates_after_heal(monkeypa
         )
 
     assert first.status_code == 503
-    assert "create record" in first.json()["detail"]
-    assert "replicated to 1/2 required members" in first.json()["detail"]
+    detail = first.json()["detail"]
+    assert detail["code"] == "record_unreplicated"
+    assert "replicated to 1/2 required members" in detail["message"]
     assert_idempotent_create_same_sid([second])
     assert second.json()["id"] == "partitioned"
     assert _record_count(apps) == 1

@@ -6,8 +6,6 @@ import time
 from typing import Any
 
 import pytest
-
-pytest.importorskip("fastapi")
 from fastapi.security import HTTPBearer
 
 from tests.test_faults import (
@@ -22,7 +20,6 @@ from tests.test_faults import (
 from tests.test_mesh import FakeSandbox
 from vmon.replica import ReplicaStore
 from vmon.server.runtime import ServerRuntime
-
 
 AUTH = {"Authorization": "Bearer secret"}
 
@@ -99,8 +96,9 @@ def test_two_node_create_requires_record_majority_before_ack(monkeypatch, tmp_pa
         first = clients[urls["A"]].post("/v1/sandboxes", json=payload, headers=AUTH)
 
         assert first.status_code == 503
-        assert "create record" in first.json()["detail"]
-        assert "replicated to 1/2 required members" in first.json()["detail"]
+        detail = first.json()["detail"]
+        assert detail["code"] == "record_unreplicated"
+        assert "replicated to 1/2 required members" in detail["message"]
         assert _record_count(apps) == 1
 
         transport.heal(urls["A"], urls["B"])
