@@ -404,7 +404,7 @@ pub fn setup_tap(
 		run(&argv(["ip", "tuntap", "add", "dev", name, "mode", "tap"]), true)?;
 	}
 	run(
-		&vec![
+		&[
 			"ip".to_owned(),
 			"addr".to_owned(),
 			"replace".to_owned(),
@@ -1104,7 +1104,7 @@ struct DomainRefresher {
 
 #[cfg(target_os = "linux")]
 impl DomainRefresher {
-	const INTERVAL: Duration = Duration::from_secs(60);
+	const INTERVAL: Duration = Duration::from_mins(1);
 
 	fn new(name: &str, guest_cidr: &str, domains: Vec<String>, initial_ips: Vec<String>) -> Self {
 		let (stop_tx, stop_rx) = mpsc::channel();
@@ -1225,7 +1225,7 @@ struct RunOutput {
 
 #[cfg(target_os = "linux")]
 impl RunOutput {
-	fn success(&self) -> bool {
+	const fn success(&self) -> bool {
 		self.code == 0
 	}
 }
