@@ -65,6 +65,15 @@ pub struct FsMount {
 	pub read_only: bool,
 }
 
+/// A read-only virtio-fs mount served by a per-VM object proxy.
+#[derive(Clone)]
+pub struct RemoteFsMount {
+	/// Guest-visible virtio-fs tag.
+	pub tag:  String,
+	/// Absolute host Unix socket path for the proxy.
+	pub sock: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct Config {
 	/// Kernel image. Required for a fresh boot; `None` when restoring/forking.
@@ -160,6 +169,8 @@ pub struct Config {
 	pub timeout_secs:       Option<u64>,
 	/// Named writable (or `:ro`) virtio-fs volumes; one device per entry.
 	pub volumes:            Vec<FsMount>,
+	/// Read-only virtio-fs mounts backed by per-VM object proxy sockets.
+	pub remote_fs:          Vec<RemoteFsMount>,
 }
 
 /// Raw command-line surface parsed by clap; flag tokenization only.
@@ -260,6 +271,10 @@ struct CliArgs {
 	/// Writable virtio-fs volume <tag>:<host_dir> (:ro read-only); repeatable
 	#[arg(long = "volume", value_name = "T:D[:RO]", value_parser = parse_volume)]
 	volumes: Vec<FsMount>,
+
+	/// Read-only virtio-fs mount <tag>:<absolute_proxy_socket>; repeatable
+	#[arg(long = "remote-fs", value_name = "T:SOCK", value_parser = parse_remote_fs)]
+	remote_fs: Vec<RemoteFsMount>,
 
 	/// Unix control socket (pause/resume/snapshot/quit)
 	#[arg(long, value_name = "PATH")]
@@ -521,6 +536,19 @@ impl Config {
 				}
 				seen.push(tag.as_str());
 			}
+			for m in &cli.remote_fs {
+				let tag = &m.tag;
+				if !is_valid_volume_tag(tag) {
+					bail!("--remote-fs tag {tag} must match [a-z0-9_]{{1,32}}");
+				}
+				if !m.sock.is_absolute() {
+					bail!("--remote-fs socket path must be absolute (got {})", m.sock.display());
+				}
+				if seen.contains(&tag.as_str()) {
+					bail!("--volume tags must be unique");
+				}
+				seen.push(tag.as_str());
+			}
 		}
 		if user_net && cli.tap.is_some() {
 			bail!("--net user cannot be combined with --tap");
@@ -689,6 +717,7 @@ impl Config {
 			sandbox_gid,
 			timeout_secs: cli.timeout_secs,
 			volumes: cli.volumes,
+			remote_fs: cli.remote_fs,
 		})
 	}
 }
@@ -817,6 +846,23 @@ fn parse_volume(s: &str) -> Result<FsMount> {
 		bail!("invalid --volume {s} (expected <tag>:<dir>[:ro])");
 	}
 	Ok(FsMount { tag: tag.to_string(), dir: PathBuf::from(dir), read_only })
+}
+
+fn parse_remote_fs(s: &str) -> Result<RemoteFsMount> {
+	let (tag, sock) = s
+		.split_once(':')
+		.ok_or_else(|| err(format!("invalid --remote-fs {s} (expected <tag>:<absolute-socket>)")))?;
+	if tag.is_empty() || sock.is_empty() {
+		bail!("invalid --remote-fs {s} (expected <tag>:<absolute-socket>)");
+	}
+	if !is_valid_volume_tag(tag) {
+		bail!("--remote-fs tag {tag} must match [a-z0-9_]{{1,32}}");
+	}
+	let sock = PathBuf::from(sock);
+	if !sock.is_absolute() {
+		bail!("--remote-fs socket path must be absolute (got {})", sock.display());
+	}
+	Ok(RemoteFsMount { tag: tag.to_owned(), sock })
 }
 
 fn is_valid_volume_tag(tag: &str) -> bool {

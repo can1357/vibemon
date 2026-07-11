@@ -284,6 +284,9 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 	for m in &config.volumes {
 		bind_path(chroot, &m.dir, m.read_only)?;
 	}
+	for m in &config.remote_fs {
+		bind_remote_socket(chroot, &m.sock)?;
+	}
 	bind_optional(chroot, config.netns.as_deref(), true)?;
 
 	if let Some(snapshot_root) = &config.snapshot_root {
@@ -334,6 +337,29 @@ fn bind_path(chroot: &Path, source: &Path, readonly: bool) -> Result<()> {
 		ensure_file_mountpoint(&target)?;
 	}
 	mount_bind(source, &target, readonly)
+}
+
+/// Bind a proxy socket, falling back to its parent directory on kernels that
+/// reject bind-mounting a Unix-domain socket inode.
+fn bind_remote_socket(chroot: &Path, sock: &Path) -> Result<()> {
+	match bind_path(chroot, sock, false) {
+		Ok(()) => Ok(()),
+		Err(sock_error) => {
+			let parent = sock.parent().ok_or_else(|| {
+				err(format!(
+					"remote filesystem socket {} must have a parent directory",
+					sock.display()
+				))
+			})?;
+			bind_path(chroot, parent, false).map_err(|parent_error| {
+				err(format!(
+					"binding remote filesystem socket {} failed ({sock_error}); \
+					 parent-directory fallback failed ({parent_error})",
+					sock.display()
+				))
+			})
+		},
+	}
 }
 
 fn ensure_target_parent(chroot: &Path, path: &Path) -> Result<()> {

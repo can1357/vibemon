@@ -22,6 +22,11 @@ pub mod result;
 #[cfg(target_os = "linux")]
 mod sandbox;
 pub mod snapshot;
+
+/// Remote virtio-fs proxy wire protocol shared with the server-side proxy.
+pub mod remotefs {
+	pub use crate::virtio::remotefs::proto;
+}
 mod tap;
 mod virtio;
 mod vmm;

@@ -60,6 +60,7 @@ use crate::{
 		block::Block,
 		console::OUTPUT_CAP,
 		fs::Fs,
+		remotefs::RemoteFs,
 		mmio::{MmioState, MmioTransport},
 		net::Net,
 		run_worker,
@@ -104,6 +105,20 @@ enum DeviceTransport {
 	Pci(Arc<Mutex<PciTransport>>),
 }
 
+enum FsSave {
+	Host(Arc<Mutex<Fs>>),
+	Remote(Arc<Mutex<RemoteFs>>),
+}
+
+impl FsSave {
+	fn save(&self) -> snapshot::FsStateSer {
+		match self {
+			Self::Host(device) => device.lock().save(),
+			Self::Remote(device) => device.lock().save(),
+		}
+	}
+}
+
 /// VMM-side handle to a wired virtio device: lets the lifecycle pause/resume
 /// the worker and read transport/queue/interrupt state for a snapshot.
 struct DeviceHandle {
@@ -114,7 +129,7 @@ struct DeviceHandle {
 	device:      Arc<Mutex<dyn VirtioDevice>>,
 	interrupt:   Arc<Interrupt>,
 	backend:     BackendHint,
-	fs:          Option<Arc<Mutex<Fs>>>,
+	fs:          Option<FsSave>,
 	/// Clones of the worker's control eventfds (the worker holds the originals).
 	pause_evt:   EventFd,
 	resume_evt:  EventFd,
@@ -644,7 +659,9 @@ fn bind_control_socket(
 	owner: ControlPlaneOwner,
 ) -> Result<Option<control::ControlServer>> {
 	match api_sock {
-		Some(sock) => control::bind(sock, owner.socket_owner, owner.launch_uid).map(Some),
+		Some(sock) => control::bind(sock.clone(), owner.socket_owner, owner.launch_uid)
+			.map(Some)
+			.map_err(|error| err(format!("binding control socket {} failed: {error}", sock.display()))),
 		None => Ok(None),
 	}
 }
@@ -1224,6 +1241,13 @@ fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> 
 			paths.rw_dirs.push(parent.to_path_buf());
 		}
 	}
+	for m in &config.remote_fs {
+		if let Some(parent) = m.sock.parent()
+			&& !parent.as_os_str().is_empty()
+		{
+			paths.rw_dirs.push(parent.to_path_buf());
+		}
+	}
 	Ok(paths)
 }
 
@@ -1391,6 +1415,7 @@ const fn device_kind_name(kind: DeviceKind) -> &'static str {
 		DeviceKind::Console => "console",
 		DeviceKind::Fs => "fs",
 		DeviceKind::Rng => "rng",
+		DeviceKind::RemoteFs => "remote_fs",
 	}
 }
 
@@ -1469,6 +1494,7 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 				BackendHint::Net { .. } | BackendHint::UserNet { .. } => None,
 				BackendHint::Console => None,
 				BackendHint::Fs { .. } => None,
+				BackendHint::RemoteFs { .. } => None,
 				BackendHint::Rng => None,
 			})
 		});
@@ -1897,7 +1923,7 @@ impl Vmm {
 			let shared_dir = std::fs::canonicalize(dir)
 				.map_err(|e| err(format!("virtio-fs shared dir {}: {e}", dir.display())))?;
 			let fs_dev = Arc::new(Mutex::new(Fs::new(tag.clone(), shared_dir.clone(), true)?));
-			let fs_handle = fs_dev.clone();
+			let fs_handle = FsSave::Host(fs_dev.clone());
 			let device: Arc<Mutex<dyn VirtioDevice>> = fs_dev;
 			let backend = BackendHint::Fs {
 				tag:        tag.clone(),
@@ -1958,7 +1984,7 @@ impl Vmm {
 				.map_err(|e| err(format!("virtio-fs volume dir {}: {e}", m.dir.display())))?;
 			let fs_dev =
 				Arc::new(Mutex::new(Fs::new(m.tag.clone(), shared_dir.clone(), m.read_only)?));
-			let fs_handle = fs_dev.clone();
+			let fs_handle = FsSave::Host(fs_dev.clone());
 			let device: Arc<Mutex<dyn VirtioDevice>> = fs_dev;
 			let backend = BackendHint::Fs {
 				tag:        m.tag.clone(),
@@ -1993,6 +2019,63 @@ impl Vmm {
 							pci_mmio.as_ref().expect("pci mmio"),
 							device,
 							DeviceKind::Fs,
+							backend,
+							gsi,
+							pci_slot,
+							pci_bar_base,
+							None,
+							&mut workers,
+							&mut devices,
+						)?;
+						pci_slot += 1;
+						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
+					}
+					#[cfg(not(target_arch = "x86_64"))]
+					unreachable!("--transport pci is rejected during config parsing");
+				},
+			}
+			if let Some(device) = devices.last_mut() {
+				device.fs = Some(fs_handle);
+			}
+			gsi += 1;
+		}
+
+		for m in &config.remote_fs {
+			let remote_fs = Arc::new(Mutex::new(RemoteFs::new(m.tag.clone(), m.sock.clone())));
+			let fs_handle = FsSave::Remote(remote_fs.clone());
+			let device: Arc<Mutex<dyn VirtioDevice>> = remote_fs;
+			let backend = BackendHint::RemoteFs {
+				tag:  m.tag.clone(),
+				sock: m.sock.to_string_lossy().into_owned(),
+			};
+			match config.transport {
+				Transport::Mmio => {
+					wire_device(
+						&vm,
+						&mut mmio_bus,
+						device,
+						DeviceKind::RemoteFs,
+						backend,
+						gsi,
+						mmio_base,
+						None,
+						0,
+						&mut workers,
+						&mut devices,
+					)?;
+					push_virtio_cmdline(&mut cmdline, mmio_base, gsi);
+					virtio_infos.push((mmio_base, gsi));
+					mmio_base += MMIO_DEVICE_SIZE;
+				},
+				Transport::Pci => {
+					#[cfg(target_arch = "x86_64")]
+					{
+						wire_pci_device(
+							&vm,
+							pci_root.as_ref().expect("pci root"),
+							pci_mmio.as_ref().expect("pci mmio"),
+							device,
+							DeviceKind::RemoteFs,
 							backend,
 							gsi,
 							pci_slot,
@@ -2286,8 +2369,20 @@ impl Vmm {
 						fs_state,
 						*read_only,
 					)?));
-					fs_handle = Some(fs_dev.clone());
+					fs_handle = Some(FsSave::Host(fs_dev.clone()));
 					fs_dev
+				},
+				BackendHint::RemoteFs { tag, sock } => {
+					let fs_state = ds.fs.as_ref().ok_or_else(|| {
+						err("snapshot remote virtio-fs backend is missing serialized fs state")
+					})?;
+					let remote_fs = Arc::new(Mutex::new(RemoteFs::restore(
+						tag.clone(),
+						PathBuf::from(sock.as_str()),
+						fs_state,
+					)?));
+					fs_handle = Some(FsSave::Remote(remote_fs.clone()));
+					remote_fs
 				},
 				BackendHint::Console => {
 					let console = crate::virtio::console::Console::new()?;
@@ -3231,12 +3326,11 @@ impl Vmm {
 			} else {
 				live
 			};
-			let fs = if d.kind == DeviceKind::Fs {
+			let fs = if matches!(d.kind, DeviceKind::Fs | DeviceKind::RemoteFs) {
 				Some(
 					d.fs
 						.as_ref()
 						.ok_or_else(|| err("virtio-fs handle missing from device state"))?
-						.lock()
 						.save(),
 				)
 			} else {
@@ -3525,6 +3619,14 @@ fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
 					(shared_dir.clone(), *read_only)
 				};
 			BackendHint::Fs { tag: tag.clone(), shared_dir, read_only }
+		},
+		BackendHint::RemoteFs { tag, sock } => {
+			let sock = config
+				.remote_fs
+				.iter()
+				.find(|mount| mount.tag == *tag)
+				.map_or_else(|| sock.clone(), |mount| mount.sock.to_string_lossy().into_owned());
+			BackendHint::RemoteFs { tag: tag.clone(), sock }
 		},
 		BackendHint::Console => BackendHint::Console,
 		BackendHint::Rng => BackendHint::Rng,

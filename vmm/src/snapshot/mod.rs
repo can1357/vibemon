@@ -129,6 +129,7 @@ pub enum DeviceKind {
 	Console,
 	Fs,
 	Rng,
+	RemoteFs,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,6 +163,11 @@ pub enum BackendHint {
 	},
 	/// virtio-rng entropy source; no host backend to reopen.
 	Rng,
+	/// Remote read-only virtio-fs share served through a per-VM proxy socket.
+	RemoteFs {
+		tag:  String,
+		sock: String,
+	},
 }
 
 /// Per-device transport + queue + backend state.
@@ -210,9 +216,11 @@ pub struct MsixEntrySer {
 	pub vector_ctrl: u32,
 }
 
-/// Serializable virtio-fs inode table. Paths are relative to the shared root.
+/// Serializable virtio-fs inode table. Paths are relative to the host shared
+/// root for [`BackendHint::Fs`] and to the object prefix for [`BackendHint::RemoteFs`].
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FsStateSer {
+	/// Node ID with its path relative to the backend's exported root.
 	pub inodes: Vec<(u64, String)>,
 	pub next:   u64,
 }
@@ -767,7 +775,7 @@ fn validate_device_states(devices: &[DeviceState], mem_regions: &[MemRegion]) ->
 			DeviceTransportKind::Pci => validate_pci_transport_state(idx, device)?,
 		}
 		match device.kind {
-			DeviceKind::Fs => {
+			DeviceKind::Fs | DeviceKind::RemoteFs => {
 				if device.fs.is_none() {
 					return Err(err(format!("snapshot virtio-fs device {idx} is missing fs state")));
 				}
@@ -796,6 +804,7 @@ fn validate_device_states(devices: &[DeviceState], mem_regions: &[MemRegion]) ->
 			(DeviceKind::Net, BackendHint::Net { .. } | BackendHint::UserNet { .. }) => 2,
 			(DeviceKind::Console, BackendHint::Console) => 2,
 			(DeviceKind::Fs, BackendHint::Fs { .. }) => 2,
+			(DeviceKind::RemoteFs, BackendHint::RemoteFs { .. }) => 2,
 			(DeviceKind::Rng, BackendHint::Rng) => 1,
 			(kind, _) => {
 				return Err(err(format!("snapshot device {idx} backend does not match kind {kind:?}")));

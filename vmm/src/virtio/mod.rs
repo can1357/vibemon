@@ -3,6 +3,7 @@
 pub mod block;
 pub mod console;
 pub mod fs;
+pub mod remotefs;
 pub mod mmio;
 pub mod net;
 #[cfg(target_arch = "x86_64")]

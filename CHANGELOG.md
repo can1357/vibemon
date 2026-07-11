@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `vmon run --remote-fs <tag>:<sock>` to mount read-only virtio-fs shares via host proxies
 - Added comprehensive documentation for Vibemon platform, CLI, and SDKs (Go, Python, TypeScript)
 - Added Python/TypeScript SDK support for durable function workers and stateful actors
 - Added `RemoteFunction` and `BatchCall` primitives for remote function life-cycle management

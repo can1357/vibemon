@@ -53,70 +53,70 @@ use crate::{
 	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
 };
 
-const QUEUE_SIZE: u16 = 64;
+pub(super) const QUEUE_SIZE: u16 = 64;
 /// hiprio (0) + a single request queue (1).
-const NUM_QUEUES: usize = 2;
-const HIPRIO_QUEUE: usize = 0;
-const REQUEST_QUEUE: usize = 1;
+pub(super) const NUM_QUEUES: usize = 2;
+pub(super) const HIPRIO_QUEUE: usize = 0;
+pub(super) const REQUEST_QUEUE: usize = 1;
 
 /// `virtio_fs_config`: a 36-byte NUL-padded tag followed by
 /// `num_request_queues`.
-const TAG_LEN: usize = 36;
-const CONFIG_SPACE_SIZE: usize = TAG_LEN + 4;
-const NUM_REQUEST_QUEUES: u32 = 1;
+pub(super) const TAG_LEN: usize = 36;
+pub(super) const CONFIG_SPACE_SIZE: usize = TAG_LEN + 4;
+pub(super) const NUM_REQUEST_QUEUES: u32 = 1;
 
 /// FUSE node id of the shared root directory.
-const FUSE_ROOT_ID: u64 = 1;
+pub(super) const FUSE_ROOT_ID: u64 = 1;
 /// Highest FUSE minor version whose wire layout this server advertises.
 /// Optional capabilities remain opt-in through INIT flags, which we leave unset
 /// unless the operation is implemented.
-const FUSE_PROTO_MINOR: u32 = 44;
+pub(super) const FUSE_PROTO_MINOR: u32 = 44;
 /// Cache validity (seconds) handed to the guest for attrs and dir entries.
 /// Small so host-side changes to the read-only tree are noticed reasonably
 /// promptly.
 const TIMEOUT_SEC: u64 = 1;
 /// Max bytes a single `FUSE_READ` reply body may carry, mirrored into
 /// `max_write`.
-const MAX_WRITE: u32 = 1 << 20;
+pub(super) const MAX_WRITE: u32 = 1 << 20;
 
 // FUSE opcodes (linux/fuse.h) handled here.
-const FUSE_LOOKUP: u32 = 1;
-const FUSE_FORGET: u32 = 2;
-const FUSE_GETATTR: u32 = 3;
-const FUSE_SETATTR: u32 = 4;
-const FUSE_READLINK: u32 = 5;
-const FUSE_SYMLINK: u32 = 6;
-const FUSE_MKNOD: u32 = 8;
-const FUSE_MKDIR: u32 = 9;
-const FUSE_UNLINK: u32 = 10;
-const FUSE_RMDIR: u32 = 11;
-const FUSE_RENAME: u32 = 12;
-const FUSE_LINK: u32 = 13;
-const FUSE_OPEN: u32 = 14;
-const FUSE_READ: u32 = 15;
-const FUSE_WRITE: u32 = 16;
-const FUSE_STATFS: u32 = 17;
-const FUSE_RELEASE: u32 = 18;
-const FUSE_FSYNC: u32 = 20;
-const FUSE_FLUSH: u32 = 25;
-const FUSE_INIT: u32 = 26;
-const FUSE_OPENDIR: u32 = 27;
-const FUSE_READDIR: u32 = 28;
-const FUSE_RELEASEDIR: u32 = 29;
-const FUSE_FSYNCDIR: u32 = 30;
-const FUSE_ACCESS: u32 = 34;
-const FUSE_CREATE: u32 = 35;
-const FUSE_INTERRUPT: u32 = 36;
-const FUSE_BATCH_FORGET: u32 = 42;
-const FUSE_FALLOCATE: u32 = 43;
-const FUSE_READDIRPLUS: u32 = 44;
-const FUSE_RENAME2: u32 = 45;
+pub(super) const FUSE_LOOKUP: u32 = 1;
+pub(super) const FUSE_FORGET: u32 = 2;
+pub(super) const FUSE_GETATTR: u32 = 3;
+pub(super) const FUSE_SETATTR: u32 = 4;
+pub(super) const FUSE_READLINK: u32 = 5;
+pub(super) const FUSE_SYMLINK: u32 = 6;
+pub(super) const FUSE_MKNOD: u32 = 8;
+pub(super) const FUSE_MKDIR: u32 = 9;
+pub(super) const FUSE_UNLINK: u32 = 10;
+pub(super) const FUSE_RMDIR: u32 = 11;
+pub(super) const FUSE_RENAME: u32 = 12;
+pub(super) const FUSE_LINK: u32 = 13;
+pub(super) const FUSE_OPEN: u32 = 14;
+pub(super) const FUSE_READ: u32 = 15;
+pub(super) const FUSE_WRITE: u32 = 16;
+pub(super) const FUSE_STATFS: u32 = 17;
+pub(super) const FUSE_RELEASE: u32 = 18;
+pub(super) const FUSE_FSYNC: u32 = 20;
+pub(super) const FUSE_FLUSH: u32 = 25;
+pub(super) const FUSE_INIT: u32 = 26;
+pub(super) const FUSE_OPENDIR: u32 = 27;
+pub(super) const FUSE_READDIR: u32 = 28;
+pub(super) const FUSE_RELEASEDIR: u32 = 29;
+pub(super) const FUSE_FSYNCDIR: u32 = 30;
+pub(super) const FUSE_ACCESS: u32 = 34;
+pub(super) const FUSE_CREATE: u32 = 35;
+pub(super) const FUSE_INTERRUPT: u32 = 36;
+pub(super) const FUSE_BATCH_FORGET: u32 = 42;
+pub(super) const FUSE_FALLOCATE: u32 = 43;
+pub(super) const FUSE_READDIRPLUS: u32 = 44;
+pub(super) const FUSE_RENAME2: u32 = 45;
 
-const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
-const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
+pub(super) const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
+pub(super) const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
 const MAX_REQUEST_SIZE: usize =
 	IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>() + MAX_WRITE as usize;
-const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
+pub(super) const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
 
 // ---------------------------------------------------------------------------
 // FUSE wire structures (linux/fuse.h, protocol 7.x). All `#[repr(C)]` POD with
@@ -130,16 +130,16 @@ const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseInHeader {
-	len:          u32,
-	opcode:       u32,
-	unique:       u64,
-	nodeid:       u64,
-	uid:          u32,
-	gid:          u32,
-	pid:          u32,
-	total_extlen: u16,
-	padding:      u16,
+pub(super) struct FuseInHeader {
+	pub(super) len:          u32,
+	pub(super) opcode:       u32,
+	pub(super) unique:       u64,
+	pub(super) nodeid:       u64,
+	pub(super) uid:          u32,
+	pub(super) gid:          u32,
+	pub(super) pid:          u32,
+	pub(super) total_extlen: u16,
+	pub(super) padding:      u16,
 }
 
 #[allow(
@@ -148,10 +148,10 @@ struct FuseInHeader {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseOutHeader {
-	len:    u32,
-	error:  i32,
-	unique: u64,
+pub(super) struct FuseOutHeader {
+	pub(super) len:    u32,
+	pub(super) error:  i32,
+	pub(super) unique: u64,
 }
 
 #[allow(
@@ -160,23 +160,23 @@ struct FuseOutHeader {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseAttr {
-	ino:       u64,
-	size:      u64,
-	blocks:    u64,
-	atime:     u64,
-	mtime:     u64,
-	ctime:     u64,
-	atimensec: u32,
-	mtimensec: u32,
-	ctimensec: u32,
-	mode:      u32,
-	nlink:     u32,
-	uid:       u32,
-	gid:       u32,
-	rdev:      u32,
-	blksize:   u32,
-	flags:     u32,
+pub(super) struct FuseAttr {
+	pub(super) ino:       u64,
+	pub(super) size:      u64,
+	pub(super) blocks:    u64,
+	pub(super) atime:     u64,
+	pub(super) mtime:     u64,
+	pub(super) ctime:     u64,
+	pub(super) atimensec: u32,
+	pub(super) mtimensec: u32,
+	pub(super) ctimensec: u32,
+	pub(super) mode:      u32,
+	pub(super) nlink:     u32,
+	pub(super) uid:       u32,
+	pub(super) gid:       u32,
+	pub(super) rdev:      u32,
+	pub(super) blksize:   u32,
+	pub(super) flags:     u32,
 }
 
 #[allow(
@@ -185,11 +185,11 @@ struct FuseAttr {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseAttrOut {
-	attr_valid:      u64,
-	attr_valid_nsec: u32,
-	dummy:           u32,
-	attr:            FuseAttr,
+pub(super) struct FuseAttrOut {
+	pub(super) attr_valid:      u64,
+	pub(super) attr_valid_nsec: u32,
+	pub(super) dummy:           u32,
+	pub(super) attr:            FuseAttr,
 }
 
 #[allow(
@@ -198,14 +198,14 @@ struct FuseAttrOut {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseEntryOut {
-	nodeid:           u64,
-	generation:       u64,
-	entry_valid:      u64,
-	attr_valid:       u64,
-	entry_valid_nsec: u32,
-	attr_valid_nsec:  u32,
-	attr:             FuseAttr,
+pub(super) struct FuseEntryOut {
+	pub(super) nodeid:           u64,
+	pub(super) generation:       u64,
+	pub(super) entry_valid:      u64,
+	pub(super) attr_valid:       u64,
+	pub(super) entry_valid_nsec: u32,
+	pub(super) attr_valid_nsec:  u32,
+	pub(super) attr:             FuseAttr,
 }
 
 #[allow(
@@ -214,21 +214,21 @@ struct FuseEntryOut {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseInitOut {
-	major:                u32,
-	minor:                u32,
-	max_readahead:        u32,
-	flags:                u32,
-	max_background:       u16,
-	congestion_threshold: u16,
-	max_write:            u32,
-	time_gran:            u32,
-	max_pages:            u16,
-	map_alignment:        u16,
-	flags2:               u32,
-	max_stack_depth:      u32,
-	request_timeout:      u16,
-	unused:               [u16; 11],
+pub(super) struct FuseInitOut {
+	pub(super) major:                u32,
+	pub(super) minor:                u32,
+	pub(super) max_readahead:        u32,
+	pub(super) flags:                u32,
+	pub(super) max_background:       u16,
+	pub(super) congestion_threshold: u16,
+	pub(super) max_write:            u32,
+	pub(super) time_gran:            u32,
+	pub(super) max_pages:            u16,
+	pub(super) map_alignment:        u16,
+	pub(super) flags2:               u32,
+	pub(super) max_stack_depth:      u32,
+	pub(super) request_timeout:      u16,
+	pub(super) unused:               [u16; 11],
 }
 
 #[allow(
@@ -237,10 +237,10 @@ struct FuseInitOut {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseOpenOut {
-	fh:         u64,
-	open_flags: u32,
-	backing_id: i32,
+pub(super) struct FuseOpenOut {
+	pub(super) fh:         u64,
+	pub(super) open_flags: u32,
+	pub(super) backing_id: i32,
 }
 
 #[allow(
@@ -249,14 +249,14 @@ struct FuseOpenOut {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseReadIn {
-	fh:         u64,
-	offset:     u64,
-	size:       u32,
-	read_flags: u32,
-	lock_owner: u64,
-	flags:      u32,
-	padding:    u32,
+pub(super) struct FuseReadIn {
+	pub(super) fh:         u64,
+	pub(super) offset:     u64,
+	pub(super) size:       u32,
+	pub(super) read_flags: u32,
+	pub(super) lock_owner: u64,
+	pub(super) flags:      u32,
+	pub(super) padding:    u32,
 }
 
 #[allow(
@@ -265,11 +265,11 @@ struct FuseReadIn {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseDirent {
-	ino:     u64,
-	off:     u64,
-	namelen: u32,
-	type_:   u32,
+pub(super) struct FuseDirent {
+	pub(super) ino:     u64,
+	pub(super) off:     u64,
+	pub(super) namelen: u32,
+	pub(super) type_:   u32,
 }
 
 #[allow(
@@ -278,17 +278,17 @@ struct FuseDirent {
 )]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct FuseKstatfs {
-	blocks:  u64,
-	bfree:   u64,
-	bavail:  u64,
-	files:   u64,
-	ffree:   u64,
-	bsize:   u32,
-	namelen: u32,
-	frsize:  u32,
-	padding: u32,
-	spare:   [u32; 6],
+pub(super) struct FuseKstatfs {
+	pub(super) blocks:  u64,
+	pub(super) bfree:   u64,
+	pub(super) bavail:  u64,
+	pub(super) files:   u64,
+	pub(super) ffree:   u64,
+	pub(super) bsize:   u32,
+	pub(super) namelen: u32,
+	pub(super) frsize:  u32,
+	pub(super) padding: u32,
+	pub(super) spare:   [u32; 6],
 }
 
 // Wire sizes must match the kernel structs exactly; a mismatch means a padding
@@ -458,7 +458,7 @@ const _: () = assert!(std::mem::size_of::<FuseFallocateIn>() == 32);
 
 /// Decode a POD struct from `buf` at byte offset `off`, or `None` if the buffer
 /// is too short.
-fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
+pub(super) fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
 	let size = std::mem::size_of::<T>();
 	if off.checked_add(size)? > buf.len() {
 		return None;
@@ -470,13 +470,13 @@ fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
 }
 
 /// View a POD struct as its raw little-endian bytes.
-const fn struct_bytes<T: Copy>(v: &T) -> &[u8] {
+pub(super) const fn struct_bytes<T: Copy>(v: &T) -> &[u8] {
 	// SAFETY: reads exactly `size_of::<T>()` bytes of `v`'s representation; `T`
 	// is a `#[repr(C)]` POD with no padding (asserted), so all bytes are init.
 	unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
 }
 
-const fn align8(x: usize) -> usize {
+pub(super) const fn align8(x: usize) -> usize {
 	(x + 7) & !7
 }
 
@@ -491,7 +491,7 @@ const fn align8(x: usize) -> usize {
 /// never overflow, and `out_header.len` is set to exactly what we wrote — for
 /// variable-length replies (READ/READDIR/INIT) the guest derives the payload
 /// size from this field.
-fn write_reply(
+pub(super) fn write_reply(
 	mem: &GuestMemoryMmap,
 	writable: &[(GuestAddress, u32)],
 	unique: u64,
@@ -531,11 +531,11 @@ fn write_reply(
 
 /// Concatenated readable request bytes plus the ordered writable `(addr, len)`
 /// reply targets carved out of one FUSE descriptor chain.
-type SplitChain = (Vec<u8>, Vec<(GuestAddress, u32)>);
+pub(super) type SplitChain = (Vec<u8>, Vec<(GuestAddress, u32)>);
 
 /// Split one FUSE request chain into the concatenated readable bytes (the
 /// request) and the ordered writable `(addr, len)` targets (the reply space).
-fn split_chain(
+pub(super) fn split_chain(
 	mem: &GuestMemoryMmap,
 	chain: DescriptorChain<&GuestMemoryMmap>,
 ) -> Option<SplitChain> {
