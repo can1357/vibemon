@@ -19,9 +19,16 @@ class CurrentCall:
 
     call_id: str
     function_id: str = ""
-    actor_id: str | None = None
+    definition_id: str = ""
+    request_id: str = ""
+    input_id: str = ""
     input_index: int = 0
     attempt: int = 1
+    parent_request_id: str | None = None
+    parent_call_id: str | None = None
+    execution_mode: str = ""
+    actor_id: str | None = None
+    deadline_unix_ms: int | None = None
 
 
 _current_call: contextvars.ContextVar[CurrentCall | None] = contextvars.ContextVar(

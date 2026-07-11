@@ -13,6 +13,7 @@ dependencies = [
     "grpcio>=1.66",
     "httpx>=0.28",
     "protobuf>=7.35.1",
+    "zstandard>=0.23",
 ]
 
 [project.optional-dependencies]

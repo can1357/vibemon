@@ -322,6 +322,11 @@ class MeshDriver:
     ) -> tuple[T, str]:
         """Invoke one gRPC call, retrying only failures that did not reach a daemon."""
         return self._call(fn, endpoint=endpoint, stream=stream, trigger_refresh=True)
+    def aio_endpoint(self) -> tuple[Any, tuple[tuple[str, str], ...], float]:
+        """Return native async stubs, auth metadata, and the default deadline."""
+        transport = self._transport(self._preferred)
+        return transport.aio_stubs, transport.aio_metadata, self.timeout
+
 
     def _call[T](
         self,

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import sys
-import zlib
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -33,11 +33,23 @@ class ValueCodec(StrEnum):
     CLOUDPICKLE = "cloudpickle"
 
 
+class ValueCompression(StrEnum):
+    NONE = "none"
+    GZIP = "gzip"
+    ZSTD = "zstd"
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactPayload:
     sha256: str
     size: int
     data: bytes
+
+    def __post_init__(self) -> None:
+        if self.size != len(self.data):
+            raise EnvelopeIntegrityError("artifact size does not match its stored payload")
+        if hashlib.sha256(self.data).hexdigest() != self.sha256:
+            raise EnvelopeIntegrityError("artifact stored-payload checksum mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +58,7 @@ class ValueEnvelope:
     codec: ValueCodec
     codec_version: str
     python_abi: str | None
-    compression: Literal["none", "zlib"]
+    compression: ValueCompression
     sha256: str
     uncompressed_size: int
     inline: bytes | None = None
@@ -59,11 +71,14 @@ class ValueEnvelope:
             raise ValueErrorBase("exactly one of inline or artifact is required")
         if self.uncompressed_size < 0:
             raise ValueErrorBase("uncompressed_size must be non-negative")
-        if self.artifact is not None:
-            if self.artifact.size != len(self.artifact.data):
-                raise EnvelopeIntegrityError("artifact size does not match its payload")
-            if hashlib.sha256(self.artifact.data).hexdigest() != self.artifact.sha256:
-                raise EnvelopeIntegrityError("artifact checksum mismatch")
+        try:
+            object.__setattr__(self, "codec", ValueCodec(self.codec))
+        except ValueError as exc:
+            raise ValueErrorBase(f"unsupported value codec: {self.codec}") from exc
+        try:
+            object.__setattr__(self, "compression", ValueCompression(self.compression))
+        except ValueError as exc:
+            raise ValueErrorBase(f"unsupported compression: {self.compression}") from exc
 
     @property
     def payload(self) -> bytes:
@@ -75,13 +90,17 @@ def encode_value(
     *,
     codec: ValueCodec | Literal["auto", "json", "cbor", "cloudpickle"] = "auto",
     compress: bool | None = None,
+    compression: ValueCompression | Literal["none", "gzip", "zstd"] | None = None,
     compression_threshold: int = 1024,
     inline_threshold: int = 512 * 1024,
 ) -> ValueEnvelope:
+    """Encode a value into a checksummed, optionally compressed transport envelope."""
     if compression_threshold < 0:
         raise ValueErrorBase("compression_threshold must be non-negative")
     if inline_threshold < 0:
         raise ValueErrorBase("inline_threshold must be non-negative")
+    if compress is not None and compression is not None:
+        raise ValueErrorBase("compress and compression cannot both be supplied")
     chosen: ValueCodec
     if codec == "auto":
         try:
@@ -103,25 +122,44 @@ def encode_value(
         else:
             raw = _encode_cloudpickle(value)
 
+    if compression is not None:
+        selected_compression = ValueCompression(compression)
+    elif compress is True:
+        selected_compression = ValueCompression.GZIP
+    elif compress is False:
+        selected_compression = ValueCompression.NONE
+    else:
+        selected_compression = (
+            ValueCompression.GZIP if len(raw) >= compression_threshold else ValueCompression.NONE
+        )
+    encoded = _compress(raw, selected_compression)
+    raw_digest = hashlib.sha256(raw).hexdigest()
     codec_version = _codec_version(chosen)
-    should_compress = compress is True or (compress is None and len(raw) >= compression_threshold)
-    encoded = zlib.compress(raw, level=9) if should_compress else raw
-    compression: Literal["none", "zlib"] = "zlib" if should_compress else "none"
-    payload_digest = hashlib.sha256(encoded).hexdigest()
-    common = dict(
+    python_abi = PYTHON_ABI if chosen is ValueCodec.CLOUDPICKLE else None
+    if len(encoded) <= inline_threshold:
+        return ValueEnvelope(
+            version=1,
+            codec=chosen,
+            codec_version=codec_version,
+            python_abi=python_abi,
+            compression=selected_compression,
+            sha256=raw_digest,
+            uncompressed_size=len(raw),
+            inline=encoded,
+        )
+    return ValueEnvelope(
         version=1,
         codec=chosen,
         codec_version=codec_version,
-        python_abi=PYTHON_ABI if chosen is ValueCodec.CLOUDPICKLE else None,
-        compression=compression,
-        sha256=payload_digest,
+        python_abi=python_abi,
+        compression=selected_compression,
+        sha256=raw_digest,
         uncompressed_size=len(raw),
-    )
-    if len(encoded) <= inline_threshold:
-        return ValueEnvelope(**common, inline=encoded)
-    return ValueEnvelope(
-        **common,
-        artifact=ArtifactPayload(payload_digest, len(encoded), encoded),
+        artifact=ArtifactPayload(
+            hashlib.sha256(encoded).hexdigest(),
+            len(encoded),
+            encoded,
+        ),
     )
 
 
@@ -131,25 +169,17 @@ def decode_value(
     trusted: bool = False,
     expected_codec: ValueCodec | Literal["json", "cbor", "cloudpickle"] | None = None,
 ) -> object:
+    """Verify and decode a value envelope, requiring explicit trust for cloudpickle."""
     if expected_codec is not None and envelope.codec is not ValueCodec(expected_codec):
         raise CodecMismatchError(
             f"value codec mismatch: expected={ValueCodec(expected_codec).value}, "
             f"artifact={envelope.codec.value}"
         )
-    payload = envelope.payload
-    if hashlib.sha256(payload).hexdigest() != envelope.sha256:
-        raise EnvelopeIntegrityError("value payload checksum mismatch")
-    if envelope.compression == "zlib":
-        try:
-            raw = zlib.decompress(payload)
-        except zlib.error as exc:
-            raise EnvelopeIntegrityError("invalid compressed value payload") from exc
-    elif envelope.compression == "none":
-        raw = payload
-    else:
-        raise ValueErrorBase(f"unsupported compression: {envelope.compression}")
+    raw = _decompress(envelope.payload, envelope.compression)
     if len(raw) != envelope.uncompressed_size:
         raise EnvelopeIntegrityError("uncompressed value size mismatch")
+    if hashlib.sha256(raw).hexdigest() != envelope.sha256:
+        raise EnvelopeIntegrityError("uncompressed value checksum mismatch")
 
     runtime_version = _codec_version(envelope.codec)
     if envelope.codec_version != runtime_version:
@@ -172,6 +202,32 @@ def decode_value(
     import cloudpickle
 
     return cloudpickle.loads(raw)
+
+
+def _compress(raw: bytes, compression: ValueCompression) -> bytes:
+    if compression is ValueCompression.NONE:
+        return raw
+    if compression is ValueCompression.GZIP:
+        return gzip.compress(raw, compresslevel=9, mtime=0)
+    import zstandard
+
+    return zstandard.ZstdCompressor(level=19, threads=0, write_checksum=True).compress(raw)
+
+
+def _decompress(payload: bytes, compression: ValueCompression) -> bytes:
+    if compression is ValueCompression.NONE:
+        return payload
+    if compression is ValueCompression.GZIP:
+        try:
+            return gzip.decompress(payload)
+        except (gzip.BadGzipFile, EOFError, OSError) as exc:
+            raise EnvelopeIntegrityError("invalid compressed value payload") from exc
+    import zstandard
+
+    try:
+        return zstandard.ZstdDecompressor().decompress(payload)
+    except zstandard.ZstdError as exc:
+        raise EnvelopeIntegrityError("invalid compressed value payload") from exc
 
 
 def _encode_json(value: object) -> bytes:

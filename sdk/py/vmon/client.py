@@ -24,6 +24,7 @@ from .sandbox import (
     _volume_wire,
 )
 from .secret import Secret
+from .options import FunctionOptions
 from .v1 import api_pb2
 from .volume import Volume
 
@@ -123,11 +124,36 @@ class Client:
             thread_name="vmon-shell",
         )
 
-    def function(self, function: Callable[..., Any], **sandbox_kwargs: Any) -> RemoteFunction:
-        """Bind a source-available Python function to this client."""
+    def function(
+        self,
+        function: Callable[..., Any] | None = None,
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> RemoteFunction:
+        """Bind zero-deploy code or look up a deployed function revision."""
         from .remote import RemoteFunction
 
-        return RemoteFunction(function, client=self, **sandbox_kwargs)
+        return RemoteFunction(
+            function,
+            client=self,
+            name=name,
+            namespace=namespace,
+            revision=revision,
+            options=options,
+            package_mode=package_mode,
+            package_root=package_root,
+            include=include,
+            exclude=exclude,
+            local_packages=local_packages,
+        )
 
     def close(self) -> None:
         """Close the underlying driver idempotently."""

@@ -8,12 +8,16 @@ from typing import Any
 
 from .options import FunctionOptions
 from .package import PackageArtifact, SerializedCallable
-from .values import ArtifactPayload, ValueCodec, ValueEnvelope
+from .values import ArtifactPayload, ValueCodec, ValueCompression, ValueEnvelope
 from .v1 import api_pb2 as pb
 
 _DIGEST_ALGO = pb.DIGEST_ALGORITHM_SHA256
 _CODECS = {ValueCodec.JSON: pb.VALUE_SERIALIZER_JSON, ValueCodec.CBOR: pb.VALUE_SERIALIZER_CBOR, ValueCodec.CLOUDPICKLE: pb.VALUE_SERIALIZER_CLOUDPICKLE}
-_COMPRESS = {"none": pb.VALUE_COMPRESSION_NONE, "zlib": pb.VALUE_COMPRESSION_GZIP}
+_COMPRESS = {
+    ValueCompression.NONE: pb.VALUE_COMPRESSION_NONE,
+    ValueCompression.GZIP: pb.VALUE_COMPRESSION_GZIP,
+    ValueCompression.ZSTD: pb.VALUE_COMPRESSION_ZSTD,
+}
 
 
 def digest(value: str) -> pb.Digest:
@@ -21,33 +25,63 @@ def digest(value: str) -> pb.Digest:
 
 
 def artifact_ref(sha256: str, size: int = 0) -> pb.ArtifactRef:
-    return pb.ArtifactRef(digest=digest(sha256), size_bytes=size)
-
+    del size
+    return pb.ArtifactRef(digest=digest(sha256))
 
 def value_to_proto(value: ValueEnvelope) -> pb.ValueEnvelope:
-    message = pb.ValueEnvelope(version=value.version, serializer=_CODECS[value.codec], codec_version=value.codec_version,
-        compression=_COMPRESS[value.compression], checksum=digest(value.sha256), uncompressed_size_bytes=value.uncompressed_size)
+    message = pb.ValueEnvelope(
+        schema_version=value.version,
+        serializer=_CODECS[value.codec],
+        compression=_COMPRESS[value.compression],
+        checksum=digest(value.sha256),
+        uncompressed_size_bytes=value.uncompressed_size,
+    )
     if value.inline is not None:
         message.inline_data = value.inline
     else:
         assert value.artifact is not None
         message.artifact.CopyFrom(artifact_ref(value.artifact.sha256, value.artifact.size))
     if value.python_abi is not None:
-        message.python.CopyFrom(pb.PythonCodecMetadata(implementation=platform.python_implementation(), version=platform.python_version(), abi_tag=value.python_abi))
+        message.python.CopyFrom(
+            pb.PythonCodecMetadata(
+                implementation=platform.python_implementation(),
+                abi_tag=value.python_abi,
+                python_version=platform.python_version(),
+                cloudpickle_version=value.codec_version,
+            )
+        )
     return message
 
-
 def value_from_proto(message: pb.ValueEnvelope, artifact_data: bytes | None = None) -> ValueEnvelope:
-    codecs = {v: k for k, v in _CODECS.items()}; compress = {v: k for k, v in _COMPRESS.items()}
+    codecs = {value: key for key, value in _CODECS.items()}
+    compress = {value: key for key, value in _COMPRESS.items()}
     storage = message.WhichOneof("storage")
     payload = None
     if storage == "artifact":
-        if artifact_data is None: raise ValueError("artifact-backed value requires downloaded data")
-        payload = ArtifactPayload(message.artifact.digest.value.hex(), message.artifact.size_bytes, artifact_data)
-    return ValueEnvelope(version=message.version, codec=codecs[message.serializer], codec_version=message.codec_version,
-        python_abi=message.python.abi_tag if message.HasField("python") else None, compression=compress[message.compression],
-        sha256=message.checksum.value.hex(), uncompressed_size=message.uncompressed_size_bytes,
-        inline=message.inline_data if storage == "inline_data" else None, artifact=payload)
+        if artifact_data is None:
+            raise ValueError("artifact-backed value requires downloaded data")
+        payload = ArtifactPayload(
+            message.artifact.digest.value.hex(), len(artifact_data), artifact_data
+        )
+    codec = codecs[message.serializer]
+    if codec is ValueCodec.JSON:
+        codec_version = "stdlib-json-1"
+    elif codec is ValueCodec.CBOR:
+        import cbor2
+        codec_version = getattr(cbor2, "__version__", "cbor2")
+    else:
+        codec_version = message.python.cloudpickle_version
+    return ValueEnvelope(
+        version=message.schema_version,
+        codec=codec,
+        codec_version=codec_version,
+        python_abi=message.python.abi_tag if message.HasField("python") else None,
+        compression=compress[message.compression],
+        sha256=message.checksum.value.hex(),
+        uncompressed_size=message.uncompressed_size_bytes,
+        inline=message.inline_data if storage == "inline_data" else None,
+        artifact=payload,
+    )
 
 
 def package_to_proto(
@@ -111,7 +145,7 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
         else: raise ValueError(f"image step {step.kind!r} requires artifact build support")
     return dict(image=image,
       resources=pb.ResourceSpec(cpu_millis=resources.cpu_millis, memory_bytes=resources.memory_bytes, ephemeral_disk_bytes=resources.ephemeral_disk_bytes, architecture=arch, high_availability=ha,
-        volume_mounts=[pb.FunctionVolumeMount(volume=pb.VolumeRef(id=x.volume), mount_path=x.mount_path, read_only=x.read_only) for x in resources.volume_mounts],
+        volume_mounts=[pb.FunctionVolumeMount(volume=pb.VolumeRef(name=x.volume), mount_path=x.mount_path, read_only=x.read_only) for x in resources.volume_mounts],
         network=pb.NetworkPolicy(block_network=resources.network.block_network, egress_cidrs=resources.network.egress_cidrs, egress_domains=resources.network.egress_domains, inbound_cidrs=resources.network.inbound_cidrs)),
       retry=pb.RetryPolicy(max_attempts=r.max_attempts, initial_backoff_millis=int(r.initial_backoff*1000), max_backoff_millis=int(r.max_backoff*1000), backoff_multiplier=r.backoff_multiplier, retryable_codes=r.retryable_codes),
       timeouts=pb.TimeoutSpec(execution_millis=int(t.execution*1000), queue_millis=int(t.queue*1000), startup_millis=int(t.startup*1000), graceful_shutdown_millis=int(t.graceful_shutdown*1000), result_ttl_millis=int(t.result_ttl*1000)),

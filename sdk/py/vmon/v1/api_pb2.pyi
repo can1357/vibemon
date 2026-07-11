@@ -1307,23 +1307,27 @@ class CallTarget(_message.Message):
     def __init__(self, function: _Optional[_Union[RevisionRef, _Mapping]] = ..., actor: _Optional[_Union[ActorRef, _Mapping]] = ..., actor_method: _Optional[str] = ...) -> None: ...
 
 class CallInput(_message.Message):
-    __slots__ = ("index", "value")
+    __slots__ = ("index", "value", "input_id")
     INDEX_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
     index: int
     value: ValueEnvelope
-    def __init__(self, index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ...) -> None: ...
+    input_id: str
+    def __init__(self, index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., input_id: _Optional[str] = ...) -> None: ...
 
 class CallGraph(_message.Message):
-    __slots__ = ("parent_call_ids", "root_call_id")
+    __slots__ = ("parent_call_ids", "root_call_id", "parent_input_ids")
     PARENT_CALL_IDS_FIELD_NUMBER: _ClassVar[int]
     ROOT_CALL_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     parent_call_ids: _containers.RepeatedScalarFieldContainer[str]
     root_call_id: str
-    def __init__(self, parent_call_ids: _Optional[_Iterable[str]] = ..., root_call_id: _Optional[str] = ...) -> None: ...
+    parent_input_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, parent_call_ids: _Optional[_Iterable[str]] = ..., root_call_id: _Optional[str] = ..., parent_input_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class CreateCallRequest(_message.Message):
-    __slots__ = ("type", "target", "inputs", "inputs_closed", "graph", "request_id", "labels", "client_cancellation", "result_ttl_millis")
+    __slots__ = ("type", "target", "inputs", "inputs_closed", "graph", "request_id", "labels", "client_cancellation", "result_ttl_millis", "client_session_id")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -1340,6 +1344,7 @@ class CreateCallRequest(_message.Message):
     LABELS_FIELD_NUMBER: _ClassVar[int]
     CLIENT_CANCELLATION_FIELD_NUMBER: _ClassVar[int]
     RESULT_TTL_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    CLIENT_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     type: CallType
     target: CallTarget
     inputs: _containers.RepeatedCompositeFieldContainer[CallInput]
@@ -1349,7 +1354,8 @@ class CreateCallRequest(_message.Message):
     labels: _containers.ScalarMap[str, str]
     client_cancellation: ClientCancellationPolicy
     result_ttl_millis: int
-    def __init__(self, type: _Optional[_Union[CallType, str]] = ..., target: _Optional[_Union[CallTarget, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[CallInput, _Mapping]]] = ..., inputs_closed: _Optional[bool] = ..., graph: _Optional[_Union[CallGraph, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ..., client_cancellation: _Optional[_Union[ClientCancellationPolicy, str]] = ..., result_ttl_millis: _Optional[int] = ...) -> None: ...
+    client_session_id: str
+    def __init__(self, type: _Optional[_Union[CallType, str]] = ..., target: _Optional[_Union[CallTarget, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[CallInput, _Mapping]]] = ..., inputs_closed: _Optional[bool] = ..., graph: _Optional[_Union[CallGraph, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ..., client_cancellation: _Optional[_Union[ClientCancellationPolicy, str]] = ..., result_ttl_millis: _Optional[int] = ..., client_session_id: _Optional[str] = ...) -> None: ...
 
 class CallRecord(_message.Message):
     __slots__ = ("ref", "type", "target", "status", "inputs_closed", "input_count", "result_count", "graph", "created_at_unix_millis", "updated_at_unix_millis", "error", "stats", "labels", "result_cursor")
@@ -1447,20 +1453,26 @@ class GetCallResultRequest(_message.Message):
     def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., index: _Optional[int] = ...) -> None: ...
 
 class CallResult(_message.Message):
-    __slots__ = ("call", "index", "value", "error", "created_at_unix_millis", "sequence")
+    __slots__ = ("call", "index", "value", "error", "created_at_unix_millis", "sequence", "input_id", "input_index", "yield_index")
     CALL_FIELD_NUMBER: _ClassVar[int]
     INDEX_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_INDEX_FIELD_NUMBER: _ClassVar[int]
+    YIELD_INDEX_FIELD_NUMBER: _ClassVar[int]
     call: CallRef
     index: int
     value: ValueEnvelope
     error: CallError
     created_at_unix_millis: int
     sequence: int
-    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., sequence: _Optional[int] = ...) -> None: ...
+    input_id: str
+    input_index: int
+    yield_index: int
+    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., sequence: _Optional[int] = ..., input_id: _Optional[str] = ..., input_index: _Optional[int] = ..., yield_index: _Optional[int] = ...) -> None: ...
 
 class ResultCursor(_message.Message):
     __slots__ = ("call", "after_sequence")
@@ -1479,12 +1491,14 @@ class EventCursor(_message.Message):
     def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., after_sequence: _Optional[int] = ...) -> None: ...
 
 class WatchCallRequest(_message.Message):
-    __slots__ = ("cursor", "follow")
+    __slots__ = ("cursor", "follow", "client_session_id")
     CURSOR_FIELD_NUMBER: _ClassVar[int]
     FOLLOW_FIELD_NUMBER: _ClassVar[int]
+    CLIENT_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     cursor: EventCursor
     follow: bool
-    def __init__(self, cursor: _Optional[_Union[EventCursor, _Mapping]] = ..., follow: _Optional[bool] = ...) -> None: ...
+    client_session_id: str
+    def __init__(self, cursor: _Optional[_Union[EventCursor, _Mapping]] = ..., follow: _Optional[bool] = ..., client_session_id: _Optional[str] = ...) -> None: ...
 
 class StatusEvent(_message.Message):
     __slots__ = ("status",)
@@ -1515,7 +1529,7 @@ class AttemptEvent(_message.Message):
     def __init__(self, attempt: _Optional[int] = ..., status: _Optional[_Union[AttemptStatus, str]] = ..., startup: _Optional[_Union[StartupKind, str]] = ..., worker_id: _Optional[str] = ..., error: _Optional[_Union[CallError, _Mapping]] = ...) -> None: ...
 
 class CallEvent(_message.Message):
-    __slots__ = ("call", "sequence", "created_at_unix_millis", "type", "status", "log", "result", "attempt", "error", "input_closed", "cancel_requested")
+    __slots__ = ("call", "sequence", "created_at_unix_millis", "type", "status", "log", "result", "attempt_event", "error", "input_closed", "cancel_requested", "input_id", "input_index", "attempt")
     CALL_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
@@ -1524,10 +1538,13 @@ class CallEvent(_message.Message):
     LOG_FIELD_NUMBER: _ClassVar[int]
     YIELD_FIELD_NUMBER: _ClassVar[int]
     RESULT_FIELD_NUMBER: _ClassVar[int]
-    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_EVENT_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
     INPUT_CLOSED_FIELD_NUMBER: _ClassVar[int]
     CANCEL_REQUESTED_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_INDEX_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
     call: CallRef
     sequence: int
     created_at_unix_millis: int
@@ -1535,11 +1552,14 @@ class CallEvent(_message.Message):
     status: StatusEvent
     log: LogEvent
     result: CallResult
-    attempt: AttemptEvent
+    attempt_event: AttemptEvent
     error: CallError
     input_closed: StreamCallInputsResponse
     cancel_requested: CancelCallRequest
-    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., sequence: _Optional[int] = ..., created_at_unix_millis: _Optional[int] = ..., type: _Optional[_Union[CallEventType, str]] = ..., status: _Optional[_Union[StatusEvent, _Mapping]] = ..., log: _Optional[_Union[LogEvent, _Mapping]] = ..., result: _Optional[_Union[CallResult, _Mapping]] = ..., attempt: _Optional[_Union[AttemptEvent, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., input_closed: _Optional[_Union[StreamCallInputsResponse, _Mapping]] = ..., cancel_requested: _Optional[_Union[CancelCallRequest, _Mapping]] = ..., **kwargs) -> None: ...
+    input_id: str
+    input_index: int
+    attempt: int
+    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., sequence: _Optional[int] = ..., created_at_unix_millis: _Optional[int] = ..., type: _Optional[_Union[CallEventType, str]] = ..., status: _Optional[_Union[StatusEvent, _Mapping]] = ..., log: _Optional[_Union[LogEvent, _Mapping]] = ..., result: _Optional[_Union[CallResult, _Mapping]] = ..., attempt_event: _Optional[_Union[AttemptEvent, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., input_closed: _Optional[_Union[StreamCallInputsResponse, _Mapping]] = ..., cancel_requested: _Optional[_Union[CancelCallRequest, _Mapping]] = ..., input_id: _Optional[str] = ..., input_index: _Optional[int] = ..., attempt: _Optional[int] = ..., **kwargs) -> None: ...
 
 class ErrorFrame(_message.Message):
     __slots__ = ("file", "line", "function", "code")

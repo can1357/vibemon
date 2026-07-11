@@ -20,17 +20,20 @@ class ImageSource:
     context: str | None = None
 
 
+type ImageStepKind = Literal[
+    "uv_sync",
+    "uv_install",
+    "apt_install",
+    "env",
+    "run_commands",
+    "add_local_file",
+    "add_local_python_source",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class ImageStep:
-    kind: Literal[
-        "uv_sync",
-        "uv_install",
-        "apt_install",
-        "env",
-        "run_commands",
-        "add_local_file",
-        "add_local_python_source",
-    ]
+    kind: ImageStepKind
     values: tuple[str, ...]
 
 
@@ -144,7 +147,7 @@ class Image:
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
 
-    def _step(self, kind: ImageStep.__annotations__["kind"], values: tuple[str, ...]) -> Self:
+    def _step(self, kind: ImageStepKind, values: tuple[str, ...]) -> Self:
         return replace(self, steps=(*self.steps, ImageStep(kind, values)))
 
 

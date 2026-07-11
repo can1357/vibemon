@@ -283,6 +283,18 @@ class GrpcStubs:
         self.volumes = api_pb2_grpc.VolumeServiceStub(channel)
         self.pools = api_pb2_grpc.PoolServiceStub(channel)
         self.system = api_pb2_grpc.SystemServiceStub(channel)
+        self.artifacts = api_pb2_grpc.ArtifactServiceStub(channel)
+        self.functions = api_pb2_grpc.FunctionServiceStub(channel)
+        self.calls = api_pb2_grpc.CallServiceStub(channel)
+class GrpcAioStubs:
+    """Native asynchronous service stubs sharing one grpc.aio channel."""
+
+    def __init__(self, channel: grpc.aio.Channel) -> None:
+        self.artifacts = api_pb2_grpc.ArtifactServiceStub(channel)
+        self.functions = api_pb2_grpc.FunctionServiceStub(channel)
+        self.calls = api_pb2_grpc.CallServiceStub(channel)
+
+
 
 
 class EndpointTransport:
@@ -315,6 +327,8 @@ class EndpointTransport:
         self._grpc_lock = threading.Lock()
         self._grpc_channel: grpc.Channel | None = None
         self._grpc_stubs: GrpcStubs | None = None
+        self._aio_channel: grpc.aio.Channel | None = None
+        self._aio_stubs: GrpcAioStubs | None = None
 
     def clone(self) -> EndpointTransport:
         """Return an independent transport with the same endpoint and credentials."""
@@ -375,6 +389,32 @@ class EndpointTransport:
                     grpc.intercept_channel(channel, _AuthInterceptor(self.token, self.timeout))
                 )
             return self._grpc_stubs
+    @property
+    def aio_stubs(self) -> GrpcAioStubs:
+        """Return lazily-created native grpc.aio function-service stubs."""
+        if self._aio_stubs is None:
+            options: tuple[tuple[str, Any], ...] = (
+                ("grpc.max_send_message_length", GRPC_MAX_MESSAGE),
+                ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE),
+            )
+            if self.uds is not None:
+                options = (*options, ("grpc.default_authority", "localhost"))
+            target = self._grpc_target()
+            if self.uds is None and urlsplit(self.base_url).scheme == "https":
+                channel = grpc.aio.secure_channel(
+                    target, grpc.ssl_channel_credentials(), options=options
+                )
+            else:
+                channel = grpc.aio.insecure_channel(target, options=options)
+            self._aio_channel = channel
+            self._aio_stubs = GrpcAioStubs(channel)
+        return self._aio_stubs
+
+    @property
+    def aio_metadata(self) -> tuple[tuple[str, str], ...]:
+        """Return authentication metadata for native asynchronous RPCs."""
+        return (("authorization", f"Bearer {self.token}"),) if self.token else ()
+
 
     def request(
         self,

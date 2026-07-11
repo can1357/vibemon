@@ -27,6 +27,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added durable server-native function calls with at-least-once execution and retry support
+- Added structured lifetime management for groups of durable calls via `CallGroup`
+- Added `App` and `Schedule` primitives for atomic grouping and automated task execution
 - Added Zstandard (ZSTD) compression support to SDK `ValueEnvelope` serialization
 - Added comprehensive `Function` and `BatchCall` primitives for durable remote function execution
 - Added `LookupFunction` and `LookupFunctionRevision` for resolving deployed function revisions
@@ -118,6 +121,8 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated SDK function definition to support zero-deploy code or remote revision lookups
+- Refactored SDK core to support asynchronous execution via `grpc.aio`
 - Migrated all SDKs (Go, Python, TypeScript) to native gRPC communication
 - Switched CLI to use gRPC for all daemon communication
 - Updated Python and TypeScript SDKs to use a unified `Client` interface and DSN-based connectivity
@@ -152,6 +157,7 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed durability race conditions by enforcing stable call identifiers for persistence
 - Fixed TTY-based exec session handling and stdin/stdout multiplexing consistency
 - Fixed hanging `vmon exec` commands on TTY
 - Fixed KVM vCPU run-loop transient `EAGAIN` error handling

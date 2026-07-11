@@ -13,7 +13,7 @@ from typing import Mapping
 
 from .image import Image
 from .package import PackageArtifact, SerializedCallable
-from .values import ValueCodec
+from .values import ValueCodec, ValueCompression
 
 
 class OptionsError(ValueError):
@@ -131,14 +131,16 @@ class BatchingPolicy:
 class SerializerPolicy:
     input_serializer: ValueCodec = ValueCodec.JSON
     result_serializer: ValueCodec = ValueCodec.JSON
-    compression: str = "zlib"
+    compression: ValueCompression = ValueCompression.GZIP
     allow_trusted_python: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_serializer", _codec(self.input_serializer, "input_serializer"))
         object.__setattr__(self, "result_serializer", _codec(self.result_serializer, "result_serializer"))
-        if self.compression not in ("none", "zlib"):
-            raise OptionsError("compression must be 'none' or 'zlib'")
+        try:
+            object.__setattr__(self, "compression", ValueCompression(self.compression))
+        except ValueError as exc:
+            raise OptionsError(f"invalid compression: {self.compression!r}") from exc
         _boolean("allow_trusted_python", self.allow_trusted_python)
         if ValueCodec.CLOUDPICKLE in (self.input_serializer, self.result_serializer) and not self.allow_trusted_python:
             raise OptionsError("cloudpickle serializers require allow_trusted_python=True")
@@ -223,11 +225,11 @@ class FunctionOptions:
         value = asdict(self)
         value["image"] = self.image.canonical_dict()
         serializer = value["serializer"]
-        serializer["input_serializer"] = self.serializer.input_serializer.value  # type: ignore[index]
-        serializer["result_serializer"] = self.serializer.result_serializer.value  # type: ignore[index]
+        serializer["input_serializer"] = self.serializer.input_serializer.value
+        serializer["result_serializer"] = self.serializer.result_serializer.value
         resources = value["resources"]
-        resources["architecture"] = self.resources.architecture.value  # type: ignore[index]
-        resources["high_availability"] = self.resources.high_availability.value  # type: ignore[index]
+        resources["architecture"] = self.resources.architecture.value
+        resources["high_availability"] = self.resources.high_availability.value
         return value
 
     def canonical_digest(
@@ -273,6 +275,8 @@ def _codec(value: ValueCodec | str, name: str) -> ValueCodec:
 
 
 def _enum(kind: type[StrEnum], value: object, name: str) -> StrEnum:
+    if not isinstance(value, str):
+        raise OptionsError(f"invalid {name}: {value!r}")
     try:
         return kind(value)
     except (TypeError, ValueError) as exc:

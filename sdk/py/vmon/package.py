@@ -127,6 +127,7 @@ class SerializedCallable:
 
 
 def resolve_qualname(module: ModuleType, qualname: str) -> object:
+    """Resolve an importable qualified name from a module."""
     value: object = module
     for component in qualname.split("."):
         if component == "<locals>" or not component:
@@ -139,7 +140,11 @@ def resolve_qualname(module: ModuleType, qualname: str) -> object:
 
 
 def inspect_manifest(archive: bytes | bytearray | memoryview | str | os.PathLike[str]) -> PackageManifest:
-    source: object = io.BytesIO(bytes(archive)) if isinstance(archive, (bytes, bytearray, memoryview)) else archive
+    """Read and validate the embedded manifest from package ZIP bytes or a path."""
+    if isinstance(archive, (bytes, bytearray, memoryview)):
+        source: io.BytesIO | str | os.PathLike[str] = io.BytesIO(bytes(archive))
+    else:
+        source = archive
     with zipfile.ZipFile(source) as package:
         try:
             return PackageManifest.from_bytes(package.read(MANIFEST_PATH))
@@ -156,6 +161,7 @@ def build_package(
     exclude: tuple[str, ...] = (),
     local_packages: tuple[str | os.PathLike[str], ...] = (),
 ) -> PackageArtifact:
+    """Build a deterministic ZIP artifact for an importable package tree."""
     root_path = Path(root).resolve()
     if not root_path.is_dir():
         raise PackageError(f"package root is not a directory: {root_path}")
@@ -196,6 +202,7 @@ def package_callable(
     exclude: tuple[str, ...] = (),
     local_packages: tuple[str | os.PathLike[str], ...] = (),
 ) -> PackageArtifact | SerializedCallable:
+    """Package an importable callable or explicitly serialize trusted Python code."""
     if mode == "cloudpickle":
         import cloudpickle
 

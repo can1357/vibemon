@@ -25,20 +25,31 @@ class ProtocolError(Exception):
 
 
 class RemoteFunctionError(RuntimeError):
-    """A remote function call failed in its sandbox for infrastructure reasons.
-
-    Raised for session/protocol failures and for remote exceptions that cannot
-    be reconstructed locally; reconstructable remote exceptions re-raise as
-    their original type instead.
-    """
+    """Structured durable function execution failure."""
 
     def __init__(
         self,
         message: str,
         *,
+        code: str = "remote_error",
         remote_type: str = "",
         traceback_text: str = "",
     ) -> None:
         super().__init__(message)
+        self.message = message
+        self.code = code
         self.remote_type = remote_type
         self.traceback = traceback_text
+
+
+class ActorLostError(RuntimeError):
+    """A durable actor can no longer accept calls.
+
+    This is raised only for terminal actor states (failed, stopped, or
+    deleted).  The SDK never hides actor loss by replaying its constructor.
+    """
+
+    def __init__(self, actor_id: str, status: str = "lost") -> None:
+        super().__init__(f"actor {actor_id!r} is {status}")
+        self.actor_id = actor_id
+        self.status = status
