@@ -99,7 +99,7 @@ The `http` and `time` imports in this example are from the standard library. `Wi
 
 ## Context for remote calls and stream reads
 
-Remote client and service calls, plus blocking stream reads such as `EventStream.Next`, take a `context.Context`. Local accessors and lifetime methods, including `Client.Driver`, `Client.Close`, and `EventStream.Close`, do not. Put deadline and cancellation policy at the call site:
+Pass a `context.Context` to remote client and service calls and to blocking reads such as `EventStream.Next`. Local accessors and lifetime methods, including `Client.Driver`, `Client.Close`, and `EventStream.Close`, do not take a context. Put deadline and cancellation policy at the call site:
 
 ```go
 requestCtx, cancel := context.WithTimeout(parentCtx, 15*time.Second)

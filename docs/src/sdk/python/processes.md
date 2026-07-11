@@ -73,18 +73,21 @@ finally:
 
 The SDK sends the terminal flag and lets the guest provide terminal behavior; it does not emulate a terminal locally. In particular, treat `stdout` and `stderr` as the two process streams exposed by the API rather than assuming an undocumented local terminal transformation.
 
-`Client.shell(*cmd, ref=None, image=None, cpus=1, memory=512, disk_mb=1024, timeout=300)` creates a streaming shell in an ephemeral sandbox and always requests a TTY. With no command it starts `/bin/sh`. Its returned `Process` has the same input, stream, resize, wait, and close operations; `sandbox_id` identifies the ephemeral sandbox when the server announces it.
+`Client.shell(*cmd, ref=None, image=None, cpus=1, memory=512, disk_mb=1024, timeout=300)` starts a streaming shell and always requests a TTY. With no command it starts `/bin/sh`. If `ref` resolves to an existing live sandbox, the command executes in that sandbox and is not ephemeral. Otherwise the daemon creates a fallback sandbox from `ref`, `image`, or its default shell image; that fallback sandbox is ephemeral and is removed when the shell closes. Its returned `Process` has the same input, stream, resize, wait, and close operations; `sandbox_id` identifies the sandbox when the server announces it.
 
 ```python
+from vmon import connect
+
 with connect() as client:
-    shell = client.shell(timeout=60)
+    shell = client.shell("sh", "-lc", "printf ready", timeout=60)
     try:
-        shell.stdin.write("echo hello; exit\n")
+        assert shell.stdout.read().decode("utf-8") == "ready"
         assert shell.wait(timeout=60).code == 0
-        print(shell.stdout.read().decode("utf-8"), end="")
     finally:
         shell.close()
 ```
+
+Use `SandboxAPI.create()` to configure S3 mounts before starting a shell or process in that sandbox.
 
 ## Console and logs
 

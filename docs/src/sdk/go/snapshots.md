@@ -25,6 +25,23 @@ fmt.Println(restored.ID, restored.Status)
 
 `Snapshots.List(ctx)` returns snapshot names. A restore response is decoded and bound to the daemon endpoint that served it, but application code should treat the returned sandbox metadata as a view, not as a scheduling promise. Fetch it again with `client.Sandboxes.Get` when current placement or status matters.
 
+### S3-backed snapshots
+
+When a sandbox has `SandboxCreateRequest.S3Mounts`, the daemon records its S3
+mount configuration with a full snapshot (and with the filesystem image made
+from one). The stored metadata includes the URI, endpoint, resolved region,
+read-only setting, and credential mode, but **not** inline credential values.
+Restoring that snapshot reconstructs the recorded mounts; it is not an S3
+mount override in `RestoreRequest.Overrides`.
+
+For a mount originally authenticated with inline credentials or the daemon's
+AWS credential environment, the restoring daemon must have
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` available (and may use
+`AWS_SESSION_TOKEN`). Anonymous mounts do not need credentials. Treat a
+snapshot as a record of remote mount configuration, not S3 data or secrets:
+the S3 objects remain remote, and volatile guest-overlay writes are not
+persisted to S3.
+
 ## Fork clones
 
 `Snapshots.Fork(ctx, name, vmon.ForkRequest{Count: n})` requests an ordered batch of clone views from one snapshot. `Count` is the requested positive clone count; `Overrides` accepts additional create-style fields. The method returns `[]*vmon.Sandbox`, with every returned sandbox bound for later operations.

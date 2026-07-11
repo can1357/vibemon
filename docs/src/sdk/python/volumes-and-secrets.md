@@ -35,7 +35,39 @@ finally:
     sandbox.terminate()
 ```
 
-The volume identity is persistent; the mount is part of the sandbox creation or restore/fork request. Terminating a sandbox does not request deletion of the named volume. Delete a volume only when its retained data is no longer needed.
+The volume identity is persistent; the mount is part of sandbox creation. Terminating a sandbox does not request deletion of the named volume. Delete a volume only when its retained data is no longer needed.
+
+## S3 mounts
+
+`S3Mount` mounts an S3 bucket or prefix through the daemon's remote filesystem. Pass an `s3_mounts` mapping from an **absolute guest mountpoint** to either an `s3://bucket[/prefix]` URI shorthand or a structured `S3Mount`. The URI is the only required structured field:
+
+```python
+from vmon import S3Mount, connect
+
+with connect() as client:
+    sandbox = client.sandboxes.create(
+        image="alpine",
+        s3_mounts={
+            "/assets": "s3://example-assets/public",
+            "/releases": S3Mount(
+                uri="s3://example-releases/current",
+                endpoint="https://objects.example.invalid",
+                region="us-west-2",
+                read_only=True,
+            ),
+        },
+    )
+    try:
+        assert sandbox.run("test", "-d", "/assets").returncode == 0
+    finally:
+        sandbox.terminate()
+```
+
+The structured form has `uri`, optional `endpoint` and `region`, `read_only`, and optional `access_key`, `secret_key`, and `session_token` fields. `endpoint` selects an S3-compatible endpoint and `region` selects the SigV4 region. Prefer the daemon's AWS environment credentials over inline credentials. If inline credentials are necessary, obtain them from a secure runtime source, pass them only to `S3Mount`, and never print, serialize, commit, or place them in examples. Credentials are request-only: snapshot mount metadata excludes them. Restoring a snapshot that used inline or environment credentials requires usable daemon environment credentials again; anonymous mounts do not.
+
+The Python SDK only checks that each mapping value is an `S3Mount` or URI string; it does not validate URI syntax, mountpoint absoluteness, endpoint reachability, credential pairing, or S3 access locally. The daemon validates and probes those boundaries. A daemon accepts at most eight mounts, requires absolute guest mountpoints, and requires both `access_key` and `secret_key` when any inline credential field is supplied.
+
+`read_only=True` exposes the remote filesystem read-only in the guest. The default, `read_only=False`, presents a guest-local volatile overlay above the remote data: guest writes are visible only for that running guest and are not synchronized back to S3 or retained as S3 changes. Do not use it as persistent storage.
 
 ## In-memory secret environment
 
@@ -76,4 +108,4 @@ finally:
     sandbox.terminate()
 ```
 
-Secrets can also be supplied when restoring or forking a snapshot, alongside the supported sandbox creation options. See [Snapshots](snapshots.md) and [Shared concepts](../shared-concepts.md) for resource ownership and lifecycle rules.
+Snapshot restore and fork have distinct, daemon-defined behavior; see [Snapshots](snapshots.md). See [Shared concepts](../shared-concepts.md) for resource ownership and lifecycle rules.

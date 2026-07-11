@@ -57,6 +57,42 @@ vmon vmm \
 
 `--net` accepts only `user`. Other available direct attachments are `--mac ADDR`, read-only `--fs-tag TAG --fs-dir DIR`, repeatable `--volume TAG:HOST_DIR` (append `:ro` for a read-only volume), `--rng`, and `--console-agent`. `--agent-sock PATH` bridges a host Unix socket to the virtio-console agent; `--agent-exec CMD` runs the command through that agent after boot. A cold boot using `--agent-exec` requires `--agent-sock`.
 
+### Proxy-backed remote filesystems
+
+`--remote-fs <tag>:<absolute-socket>` is a repeatable, direct VMM attachment for
+a read-only virtio-fs filesystem served by an operator-managed Unix-socket
+proxy. It is **not** an S3 client and does not create a proxy. The tag is what
+the guest mounts; it must match `[a-z0-9_]{1,32}` and share the same namespace
+as `--volume` tags, so every volume and remote-filesystem tag in one VM must be
+unique. The socket path must be absolute.
+
+```sh
+sudo vmon vmm \
+  --kernel /path/to/kernel --initrd /path/to/initramfs.cpio.gz \
+  --remote-fs assets:/run/object-proxy/assets.sock \
+  --sandbox-uid 65534 --sandbox-gid 65534 \
+  --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
+
+# In the guest:
+mount -t virtiofs assets /mnt/assets
+```
+
+The device supports only lookup, listing, metadata, and reads. Opens with
+write intent and filesystem-changing operations fail with `EROFS`; it never
+writes through the socket proxy. The VMM connects lazily when the guest issues
+a request. It retries a failed socket connection or proxy exchange once, then
+reports `EIO` to the guest; restoring a snapshot likewise reconnects on the
+next request rather than preserving a live socket connection. Start and keep
+the proxy available for the full period in which the guest needs the mount.
+
+Under `--jail`, the VMM binds the configured socket into the jail. Some kernels
+reject a Unix-socket inode bind mount, in which case the jailer binds the
+socket's parent directory instead. That fallback exposes the parent directory
+inside the jail, so use a dedicated, private socket directory with no other
+sensitive entries. Landlock and ordinary filesystem permissions must permit
+the VMM to traverse the socket parent and connect to the socket; choose the
+path and ownership accordingly.
+
 ## UEFI boot
 
 UEFI mode replaces a direct kernel with operator-provided firmware and a bootable disk. Use firmware built for the host architecture. The following x86_64 example uses PCI transport:

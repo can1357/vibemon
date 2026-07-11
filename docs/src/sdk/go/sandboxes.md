@@ -6,7 +6,7 @@ For DSN selection, connection ownership, and closing the client, see [Connect](c
 
 ## Create and inspect
 
-`SandboxCreateRequest` carries the create-time image or template selection and optional resource, environment, network, port, and storage settings. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create request timeout in seconds. `Env` is for non-secret values; use `Secrets` for request-time secret bundles as described in [Volumes and Secrets](volumes-and-secrets.md).
+`SandboxCreateRequest` carries the create-time image or template selection and optional resource, environment, network, port, and storage settings. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create request timeout in seconds. `Env` is for non-secret values; use `Secrets` for request-time secret bundles and `S3Mounts` for S3-backed guest filesystems as described in [Volumes and Secrets](volumes-and-secrets.md).
 
 ```go
 idleTimeout := uint64(900)

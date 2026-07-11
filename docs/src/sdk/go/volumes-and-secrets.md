@@ -65,6 +65,49 @@ fmt.Println(sandbox.ID)
 
 `VolumeMount.Volume()` returns the backing `vmon.Volume`, and `ReadOnly()` reports the mount flag. Do not handcraft the JSON shape: `NewVolume` and `Mount` preserve the validation and request representation used by the client.
 
+## S3 mounts
+
+`SandboxCreateRequest.S3Mounts` maps an absolute guest mountpoint to a
+`vmon.S3Mount`. Each mount's `URI` is the S3 URI shorthand
+`s3://bucket[/prefix]`; it is not a local path or a named persistent volume.
+The Go request type requires an `S3Mount` value, so use `URI` rather than a
+bare string map value.
+
+```go
+sandbox, err := client.Sandboxes.Create(ctx, vmon.SandboxCreateRequest{
+    Image: "alpine:3.21",
+    S3Mounts: map[string]vmon.S3Mount{
+        "/mnt/assets": {
+            URI:      "s3://example-assets/public",
+            ReadOnly: true,
+        },
+        "/mnt/build-input": {
+            URI:      "s3://example-builds/input",
+            Endpoint: "https://objects.example.invalid",
+            Region:   "us-east-1",
+            ReadOnly: true,
+        },
+    },
+})
+if err != nil {
+    return err
+}
+fmt.Println(sandbox.ID)
+```
+
+For an S3-compatible service, `Endpoint` selects a path-style endpoint and
+`Region` overrides the SigV4 region. `AccessKey`, `SecretKey`, and the optional
+`SessionToken` are the structured inline-credential fields. Do not place real
+credentials in source, logs, or serialized configuration: pass them only from
+your application's secret-handling path over a secured client-to-daemon
+connection. The daemon may instead use its AWS credential environment.
+
+`ReadOnly: true` mounts the remote filesystem read-only. With the zero value
+(`ReadOnly: false`), the daemon gives the guest a writable **volatile overlay**
+over the remote data. Those guest writes are not synchronized to S3 and do not
+survive sandbox removal or snapshotting as S3 objects. S3 mounts are not named
+volumes and have no `client.Volumes` lifecycle.
+
 ## Secret bundles
 
 `vmon.Secret` is an in-memory named bundle of environment values. It is request-time data: place it in `SandboxCreateRequest.Secrets` during creation. The Go SDK does not expose a secret resource service, retrieve secret values from a sandbox, or treat a secret as persisted client-side configuration.

@@ -39,6 +39,24 @@ console.log(names, restored.id);
 
 The optional restore body is `RestoreRequest`: every `SandboxCreateRequest` field is optional, plus `agent?: boolean | null`. This lets a restore supply supported creation settings such as `name`, `env`, `cpus`, `memory`, `volumes`, `tags`, or `timeout_secs`. It is sent to the daemon as JSON; validation and the resulting sandbox state are daemon-owned.
 
+### S3-backed snapshots
+
+If the captured sandbox was created with `s3_mounts`, the daemon records the
+mount configuration with the snapshot (and with a filesystem image created
+from that snapshot). On `restore`, it reconstructs those recorded mounts; do
+not use the inherited `s3_mounts` field in `RestoreRequest` as a replacement or
+override. The stored configuration includes the URI, endpoint, resolved
+region, read-only setting, and credential mode, never inline credential
+values.
+
+An S3 mount that originally used inline credentials or the daemon's AWS
+credential environment requires the restoring daemon to provide
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and, when applicable,
+`AWS_SESSION_TOKEN`). Anonymous mounts need no credentials. A snapshot records
+remote mount configuration, not S3 data or secrets; volatile guest-overlay
+writes are not persisted to S3. `fork` does not reconstruct S3 mounts from the
+snapshot, so do not rely on its inherited `s3_mounts` request field.
+
 ## Fork many sandboxes
 
 `client.snapshots.fork(name, request)` restores several independent sandboxes from one snapshot and returns `Promise<Sandbox[]>`. Its `ForkRequest` requires `count` and accepts the same optional sandbox creation fields as restore.

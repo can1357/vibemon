@@ -22,6 +22,15 @@ quota. Per-worker `ResourceSpec` declares whole vCPUs, memory bytes, ephemeral
 disk bytes, architecture, HA policy, volumes, and network policy, but the proto
 does not define global numeric caps for those fields.
 
+## S3 mount admission
+
+A sandbox create request supports at most **8** S3 mounts. At creation, the
+server validates access to each referenced bucket or prefix with a one-key
+`ListObjectsV2` request. The request must therefore be able to reach the S3 or
+S3-compatible endpoint and have permission to list the requested source; this
+is an admission check, not a guarantee that the source remains available for
+the sandbox lifetime.
+
 ## `vmon serve` defaults
 
 These settings can be overridden through the server configuration surface.

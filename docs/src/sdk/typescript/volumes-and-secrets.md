@@ -49,6 +49,47 @@ await client.volumes.delete("build-cache");
 Do not delete a volume that other sandboxes still require. The SDK does not
 track usage or garbage-collect volumes.
 
+## S3 mounts
+
+`SandboxCreateRequest.s3_mounts` maps absolute guest mountpoints to an S3
+source. Use either the URI shorthand `s3://bucket[/prefix]` or a structured
+`S3MountSpec`. The mount is a remote filesystem, not a local path or a named
+persistent volume.
+
+```ts
+import { connect, type S3MountSpec } from "@vmon/sdk";
+
+const client = connect();
+const buildInput: S3MountSpec = {
+  uri: "s3://example-builds/input",
+  endpoint: "https://objects.example.invalid",
+  region: "us-east-1",
+  read_only: true,
+};
+
+const sandbox = await client.sandboxes.create({
+  image: "alpine",
+  s3_mounts: {
+    "/mnt/assets": "s3://example-assets/public",
+    "/mnt/build-input": buildInput,
+  },
+});
+
+console.log(sandbox.id);
+```
+
+`endpoint` selects an S3-compatible path-style endpoint and `region` overrides
+the SigV4 region. The structured credential fields are `access_key`,
+`secret_key`, and optional `session_token`. Do not put real credential values
+in source, logs, or serialized configuration: supply them only through your
+application's secret-handling path over a secured client-to-daemon connection.
+The daemon may instead use its AWS credential environment.
+
+Set `read_only: true` to mount the remote filesystem read-only. When omitted
+or `false`, the daemon presents a writable **volatile overlay** to the guest.
+Those writes are not synchronized to S3 and do not survive sandbox removal or
+snapshotting as S3 objects. S3 mounts do not have a `client.volumes` lifecycle.
+
 ## Secrets
 
 `Secret` validates and holds environment-variable values. Build one with the

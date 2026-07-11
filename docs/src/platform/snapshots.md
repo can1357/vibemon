@@ -85,6 +85,8 @@ Before restoring, identify external dependencies that the snapshot refers to:
 | Linux TAP | The snapshot carries the TAP backend hint and MAC; live connectivity still depends on the named host TAP and its topology. | Recreate/maintain the operator-managed TAP environment. |
 | macOS user-mode NAT | Guest-visible libslirp state is serialized. | Expect in-flight host TCP connections to reset; new guest outbound connections can be opened after restore. |
 
+| Managed S3 mount | The daemon writes credential-free S3 mount metadata (`uri`, endpoint, region, read-only setting, generated tag, and credential provenance) into `s3-mounts.json` beside the snapshot. On restore or fork, it re-establishes a per-VM Unix proxy socket from that metadata and the restoring daemon's credentials; the live socket itself is not snapshotted. For writable mounts, the guest overlay's `upper` and `work` files reside under the guest rootfs and are captured when the VMM snapshot captures that disk. | Make the source available again. The snapshot never contains access keys, secret keys, or session tokens. A mount originally using inline or daemon-environment credentials requires `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` on the restoring daemon (and `AWS_SESSION_TOKEN` when needed); anonymous mounts restore anonymously. Restore re-probes access and fails if credentials or access are unavailable. Guest overlay writes remain guest-local and are never written back or synchronized to S3, even when preserved by the captured guest disk. |
+
 ## Compatibility rules
 
 The current VMM snapshot format version is **3**. Version 3 added serialized

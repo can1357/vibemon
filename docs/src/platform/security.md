@@ -48,6 +48,21 @@ These filters are default-on. `--no-sandbox` disables the Stage-B filters for lo
 
 Landlock applies the configured path policy on a best-effort compatibility level. It is not a substitute for choosing dedicated host directories with correct ownership and permissions. A writable named volume or writable disk image intentionally remains writable where the configuration grants it.
 
+`--remote-fs` grants the VMM access to an operator-selected Unix-socket proxy,
+not to an arbitrary guest-selected path. Keep its socket and parent directory
+private. With `--jail`, the jailer first tries to bind only that socket; if the
+kernel cannot bind-mount a Unix-socket inode, it bind-mounts the socket's
+parent directory as a fallback. Therefore, dedicate that parent directory to
+the proxy and do not place credentials, control sockets, or unrelated files
+there. The configured absolute socket path and each traversed parent must also
+remain accessible under the VMM's Landlock policy and ordinary permissions.
+
+Daemon-managed S3 mounts keep their per-VM proxy socket and S3 credentials on
+the host. The remote filesystem exposed to the guest is read-only; a
+non-read-only S3 request adds only a guest-local volatile overlay. Do not infer
+that proxy access, a guest overlay, or a snapshot gives the guest S3
+credentials or permission to write S3 objects.
+
 ## Linux jail
 
 `--jail` is the stronger Linux production path. It requires root and an `--id`; it creates a private jail tree, cgroup v2 placement, mount/PID/IPC/UTS namespaces, makes mounts private, pivots into the jail root, pre-binds operator-owned sockets, then applies the same Stage-B filters and drops to the sandbox identity.

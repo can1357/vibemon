@@ -35,34 +35,38 @@ with vmon.connect() as client:
         print(name)
 ```
 
-Restore one named full VM snapshot with `client.snapshots.restore(snapshot)`.
-It returns a bound `Sandbox`. The current daemon honors only the restore name
-and `agent` fields; do not rely on generic sandbox-creation overrides such as
-`timeout`, `tags`, or resource settings.
+Restore one named full VM snapshot with `client.snapshots.restore(snapshot, *, s3_mounts=...)`.
+It returns a bound `Sandbox`. The Python client accepts `s3_mounts` in the same URI shorthand or `S3Mount` structured form used at creation and forwards it in the request. In the current daemon, a snapshot's recorded S3 mount metadata is what restore rehydrates; it is credential-free and is not replaced by the request's create-style `s3_mounts` value. The daemon requires suitable AWS environment credentials again for snapshots created with inline or environment credentials. Do not treat `s3_mounts` as a general restore override, and do not rely on `timeout`, `tags`, resources, or other create-style keyword arguments being applied.
 
 ```python
 import vmon
 
 with vmon.connect() as client:
-    restored = client.snapshots.restore("worker-checkpoint")
+    restored = client.snapshots.restore(
+        "worker-checkpoint",
+        s3_mounts={"/assets": "s3://example-assets/public"},
+    )
     try:
         assert restored.run("cat", "/tmp/state").stdout == b"checkpoint"
     finally:
         restored.terminate()
 ```
 
+The shown `s3_mounts` argument demonstrates the supported Python request field, not a replacement for S3 mounts captured in the snapshot. Do not pass credentials in code intended for logs, source control, or documentation.
+
 ## Copy-on-write forks
 
-`client.snapshots.fork(snapshot, count=1)` produces a list of sandboxes cloned
-copy-on-write from the named full VM snapshot. `count` must be at least 1, and
-the result list has that many entries. The current daemon honors `count`; do
-not rely on generic sandbox-creation overrides such as `tags`.
+`client.snapshots.fork(snapshot, count=1, *, s3_mounts=...)` produces a list of sandboxes cloned copy-on-write from the named full VM snapshot. `count` must be at least 1, and the result list has that many entries. Like restore, the Python client accepts URI shorthand or `S3Mount` values in `s3_mounts` and forwards them. The current daemon's fork path only applies `count`; it does not rehydrate the snapshot's S3 mounts or apply the forwarded `s3_mounts` request value. Do not rely on any other create-style keyword arguments such as `tags`.
 
 ```python
 import vmon
 
 with vmon.connect() as client:
-    clones = client.snapshots.fork("worker-checkpoint", count=2)
+    clones = client.snapshots.fork(
+        "worker-checkpoint",
+        count=2,
+        s3_mounts={"/assets": "s3://example-assets/public"},
+    )
     try:
         for clone in clones:
             print(clone.id)

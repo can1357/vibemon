@@ -32,9 +32,9 @@ The shared suite runs on Linux/KVM, Apple Silicon macOS/HVF, and Linux/KVM in Li
 | PCI virtio transport | x86_64 only |
 | userfaultfd paging and seccomp audit | Linux only |
 | Namespace jail | Linux only; requires `VMON_JAIL=1` and effective root, as provided by `just smoke-jail` |
-| CLI capability matrix | No hypervisor; runs under plain `cargo test` and checks unsupported flag combinations |
+| CLI capability matrix | No hypervisor; runs under plain `cargo test` and checks unsupported flag combinations, including remote-filesystem validation. |
 
-The CLI matrix is specifically useful for flag validation without guest hardware: it covers PCI on aarch64, `--net user` outside macOS, `--net user` combined with `--tap`, and UEFI without firmware.
+The CLI matrix is specifically useful for flag validation without guest hardware: it covers PCI on aarch64, `--net user` outside macOS, `--net user` combined with `--tap`, UEFI without firmware, and invalid `--remote-fs` combinations. Remote-filesystem rows reject a tag duplicated by `--volume`, tags outside `[a-z0-9_]{1,32}`, a missing `tag:socket` separator, and a relative socket path. They do not require a running socket or S3 service; those are runtime/proxy concerns.
 
 ## Focused recipes
 

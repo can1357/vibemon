@@ -60,7 +60,7 @@ Start with [Connect](connect.md) for Go setup. The canonical syntax, environment
 
 ## Context for remote and blocking operations
 
-Remote API calls and blocking stream reads take `context.Context`. Local accessors and lifetime methods, such as `Client.Driver`, `Client.Close`, and `EventStream.Close`, do not. Use a context to bound a request, propagate cancellation, and control the lifetime of a stream:
+Pass a `context.Context` to remote API calls and to blocking reads such as `EventStream.Next`. Local accessors and lifetime methods, such as `Client.Driver`, `Client.Close`, and `EventStream.Close`, do not take a context. Use it to bound a request, propagate cancellation, and control the lifetime of a stream:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

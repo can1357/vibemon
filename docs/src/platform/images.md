@@ -48,6 +48,11 @@ After a Dockerfile-derived template is consumed, old local build layouts may
 be pruned on a best-effort basis; do not use the internal build cache as an
 archive.
 
+Local `oci:<path>` references are accepted only when the resolved OCI layout is
+under the server's own build cache (`builds/`) or pulled-image cache (`images/`).
+This check keeps local references within server-managed caches; neither cache is
+an archive or a general-purpose path-mounting mechanism.
+
 ## Commands and image defaults
 
 For an image-backed sandbox, the default process argument vector is:

@@ -66,6 +66,51 @@ Virtio-fs needs guest kernel support. The documented default aarch64 kernel
 includes it; x86_64 Firecracker kernels and custom kernels without virtio-fs
 cannot mount these shares.
 
+## Managed S3 mounts
+
+`vmon serve` can expose an S3 bucket or prefix at an absolute guest mountpoint
+through the `s3_mounts` sandbox-create field. This is daemon orchestration, not
+the direct `vmon vmm --remote-fs` interface: `vmond` validates access, starts a
+per-VM host-side Unix-socket S3 proxy, and supplies that socket to the VMM as
+an internal read-only remote filesystem. The guest never receives S3
+credentials or a host socket path.
+
+```json
+{
+  "s3_mounts": {
+    "/mnt/assets": {
+      "uri": "s3://example-assets/public",
+      "endpoint": "https://s3.example.invalid",
+      "region": "us-east-1",
+      "read_only": true
+    }
+  }
+}
+```
+
+Mountpoints must be absolute. A mount source is `s3://bucket[/prefix]`; an
+endpoint and region are optional. Before the sandbox starts, the daemon probes
+the bucket with a one-key ListObjectsV2 request, so invalid URI, configuration,
+credentials, endpoint, or bucket access fails creation instead of surfacing as
+a delayed guest mount failure. A sandbox accepts at most **8** S3 mounts.
+
+With `read_only: true`, the agent mounts the proxied virtio-fs layer directly
+and guest writes fail. With the default `read_only: false`, it mounts a
+guest-side overlayfs whose lower layer is the same read-only S3 filesystem.
+Guest changes remain guest-local: they are never uploaded or synchronized back
+to S3. The overlay's `upper` and `work` files live under the guest rootfs, so
+they can persist through a VMM snapshot or fork when that guest disk is
+captured; they are not durable S3 storage.
+
+For an authenticated source, provide both `access_key` and `secret_key` in the
+create request (with optional `session_token`), or configure the daemon with
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally
+`AWS_SESSION_TOKEN`). Supplying only part of an inline key pair is rejected;
+without either complete source the request is anonymous. Inline credentials
+are request-bound and are redacted from serialization and debug output. Do not
+put credentials in examples, sandbox metadata, or ordinary environment values
+visible to a guest.
+
 ## Named volumes
 
 A named volume is a persistent host directory created under

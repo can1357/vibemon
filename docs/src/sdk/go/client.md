@@ -26,7 +26,7 @@ The root methods are useful for probing and observing the daemon:
 | `Driver()` | `vmon.Driver` | Returns the transport backing the client. |
 | `Close()` | `error` | Releases cached gRPC connections and closes the backing driver. |
 
-All network calls take `context.Context` and return an error. Local accessor and lifetime methods do not: `Driver` returns the stored transport, while `Close` releases client resources. Check a remote-call error before consuming the returned value:
+The root network calls listed above take `context.Context` and return an error. Local accessor and lifetime methods do not: `Driver` returns the stored transport, while `Close` releases client resources. Check a remote-call error before consuming the returned value:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
