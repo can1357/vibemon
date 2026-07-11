@@ -289,15 +289,32 @@ impl MeshEngine for FakeEngine {
 		self.create_sandbox(params)
 	}
 
-	fn migrate_prepare(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
+	fn migrate_precopy(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
 		Box::pin(async move { Err(MeshError::invalid(format!("no checkpoint for {sid}"))) })
+	}
+
+	fn migrate_finalize(
+		&self,
+		sid: String,
+		_base_dir: String,
+	) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
+		Box::pin(async move { Err(MeshError::invalid(format!("no checkpoint for {sid}"))) })
+	}
+
+	fn checkpoint_discard(
+		&self,
+		_snapshot_dir: String,
+		_digest: String,
+	) -> BoxFuture<'_, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
 	}
 
 	fn migrate_abort(
 		&self,
 		_sid: String,
-		_snapshot_dir: String,
-		_digest: String,
+		_base_digest: String,
+		_delta_dir: String,
+		_delta_digest: String,
 		_params: JsonObject,
 	) -> BoxFuture<'_, MeshResult<()>> {
 		Box::pin(async { Ok(()) })
@@ -306,8 +323,10 @@ impl MeshEngine for FakeEngine {
 	fn migrate_commit(
 		&self,
 		_sid: String,
-		_snapshot_dir: String,
-		_digest: String,
+		_base_dir: String,
+		_base_digest: String,
+		_delta_dir: String,
+		_delta_digest: String,
 	) -> BoxFuture<'_, MeshResult<()>> {
 		Box::pin(async { Ok(()) })
 	}
