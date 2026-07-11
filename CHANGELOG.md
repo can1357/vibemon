@@ -27,6 +27,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Python SDK support for durable remote function definitions and execution
+- Added `@concurrent` and `@batched` decorators for configuring Python remote function policies
+- Added Python SDK image building support (e.g., Python environment, apt/uv packages, environment)
+- Added `ArtifactService` for managing content-addressed remote function artifacts
 - Added `ArtifactService` for storage and retrieval of content-addressed byte sequences
 - Added portable `ValueEnvelope` for checksummed serialization across language SDKs
 - Added support for JSON and CBOR serialization formats in SDK communication

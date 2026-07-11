@@ -2062,3 +2062,1413 @@ class SystemService:
             timeout,
             metadata,
             _registered_method=True)
+
+
+class ArtifactServiceStub:
+    """ArtifactService stores and retrieves immutable content-addressed byte sequences.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Put = channel.stream_unary(
+                '/vmon.v1.ArtifactService/Put',
+                request_serializer=vmon_dot_v1_dot_api__pb2.PutArtifactRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ArtifactRecord.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_stream(
+                '/vmon.v1.ArtifactService/Get',
+                request_serializer=vmon_dot_v1_dot_api__pb2.GetArtifactRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ArtifactChunk.FromString,
+                _registered_method=True)
+        self.Stat = channel.unary_unary(
+                '/vmon.v1.ArtifactService/Stat',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ArtifactRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ArtifactRecord.FromString,
+                _registered_method=True)
+
+
+class ArtifactServiceServicer:
+    """ArtifactService stores and retrieves immutable content-addressed byte sequences.
+    """
+
+    def Put(self, request_iterator, context):
+        """Put uploads an artifact as an ordered client stream and verifies its digest.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Get(self, request, context):
+        """Get downloads an artifact as an ordered server stream.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Stat(self, request, context):
+        """Stat returns artifact metadata without transferring its contents.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ArtifactServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Put': grpc.stream_unary_rpc_method_handler(
+                    servicer.Put,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.PutArtifactRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ArtifactRecord.SerializeToString,
+            ),
+            'Get': grpc.unary_stream_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.GetArtifactRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ArtifactChunk.SerializeToString,
+            ),
+            'Stat': grpc.unary_unary_rpc_method_handler(
+                    servicer.Stat,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ArtifactRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ArtifactRecord.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.ArtifactService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.ArtifactService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class ArtifactService:
+    """ArtifactService stores and retrieves immutable content-addressed byte sequences.
+    """
+
+    @staticmethod
+    def Put(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/vmon.v1.ArtifactService/Put',
+            vmon_dot_v1_dot_api__pb2.PutArtifactRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ArtifactRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vmon.v1.ArtifactService/Get',
+            vmon_dot_v1_dot_api__pb2.GetArtifactRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ArtifactChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Stat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ArtifactService/Stat',
+            vmon_dot_v1_dot_api__pb2.ArtifactRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ArtifactRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class FunctionServiceStub:
+    """FunctionService manages immutable function revisions, atomic application
+    activations, and durable schedule definitions.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Register = channel.unary_unary(
+                '/vmon.v1.FunctionService/Register',
+                request_serializer=vmon_dot_v1_dot_api__pb2.RegisterFunctionRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.FunctionRevision.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_unary(
+                '/vmon.v1.FunctionService/Get',
+                request_serializer=vmon_dot_v1_dot_api__pb2.GetFunctionRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.FunctionRevision.FromString,
+                _registered_method=True)
+        self.List = channel.unary_unary(
+                '/vmon.v1.FunctionService/List',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListFunctionsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ListFunctionsResponse.FromString,
+                _registered_method=True)
+        self.Activate = channel.unary_unary(
+                '/vmon.v1.FunctionService/Activate',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ActivateFunctionRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.FunctionRecord.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/vmon.v1.FunctionService/Delete',
+                request_serializer=vmon_dot_v1_dot_api__pb2.DeleteFunctionRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
+                _registered_method=True)
+        self.ActivateApp = channel.unary_unary(
+                '/vmon.v1.FunctionService/ActivateApp',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ActivateAppRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+                _registered_method=True)
+        self.GetApp = channel.unary_unary(
+                '/vmon.v1.FunctionService/GetApp',
+                request_serializer=vmon_dot_v1_dot_api__pb2.GetAppRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+                _registered_method=True)
+        self.RollbackApp = channel.unary_unary(
+                '/vmon.v1.FunctionService/RollbackApp',
+                request_serializer=vmon_dot_v1_dot_api__pb2.RollbackAppRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+                _registered_method=True)
+        self.CreateSchedule = channel.unary_unary(
+                '/vmon.v1.FunctionService/CreateSchedule',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CreateScheduleRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ScheduleRecord.FromString,
+                _registered_method=True)
+        self.GetSchedule = channel.unary_unary(
+                '/vmon.v1.FunctionService/GetSchedule',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ScheduleRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ScheduleRecord.FromString,
+                _registered_method=True)
+        self.ListSchedules = channel.unary_unary(
+                '/vmon.v1.FunctionService/ListSchedules',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListSchedulesRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ListSchedulesResponse.FromString,
+                _registered_method=True)
+        self.DeleteSchedule = channel.unary_unary(
+                '/vmon.v1.FunctionService/DeleteSchedule',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ScheduleRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
+                _registered_method=True)
+
+
+class FunctionServiceServicer:
+    """FunctionService manages immutable function revisions, atomic application
+    activations, and durable schedule definitions.
+    """
+
+    def Register(self, request, context):
+        """Register creates an immutable revision from a fully typed function specification.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Get(self, request, context):
+        """Get resolves either a pinned revision or a function's current active revision.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def List(self, request, context):
+        """List returns function revisions in stable creation order.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Activate(self, request, context):
+        """Activate atomically makes a revision current for its function.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Delete(self, request, context):
+        """Delete removes an inactive function revision.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ActivateApp(self, request, context):
+        """ActivateApp atomically publishes a complete set of pinned function revisions.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetApp(self, request, context):
+        """GetApp resolves either the current or a pinned application revision.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RollbackApp(self, request, context):
+        """RollbackApp atomically restores a prior application revision as current.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CreateSchedule(self, request, context):
+        """CreateSchedule creates or replaces a typed cron or fixed-period schedule.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSchedule(self, request, context):
+        """GetSchedule returns a schedule by its stable identifier.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListSchedules(self, request, context):
+        """ListSchedules lists schedules, optionally filtered by application or function.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteSchedule(self, request, context):
+        """DeleteSchedule permanently removes a schedule.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_FunctionServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Register': grpc.unary_unary_rpc_method_handler(
+                    servicer.Register,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.RegisterFunctionRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.FunctionRevision.SerializeToString,
+            ),
+            'Get': grpc.unary_unary_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.GetFunctionRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.FunctionRevision.SerializeToString,
+            ),
+            'List': grpc.unary_unary_rpc_method_handler(
+                    servicer.List,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListFunctionsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ListFunctionsResponse.SerializeToString,
+            ),
+            'Activate': grpc.unary_unary_rpc_method_handler(
+                    servicer.Activate,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ActivateFunctionRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.FunctionRecord.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.DeleteFunctionRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
+            ),
+            'ActivateApp': grpc.unary_unary_rpc_method_handler(
+                    servicer.ActivateApp,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ActivateAppRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.AppRevision.SerializeToString,
+            ),
+            'GetApp': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetApp,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.GetAppRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.AppRevision.SerializeToString,
+            ),
+            'RollbackApp': grpc.unary_unary_rpc_method_handler(
+                    servicer.RollbackApp,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.RollbackAppRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.AppRevision.SerializeToString,
+            ),
+            'CreateSchedule': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateSchedule,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CreateScheduleRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ScheduleRecord.SerializeToString,
+            ),
+            'GetSchedule': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSchedule,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ScheduleRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ScheduleRecord.SerializeToString,
+            ),
+            'ListSchedules': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSchedules,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListSchedulesRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ListSchedulesResponse.SerializeToString,
+            ),
+            'DeleteSchedule': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSchedule,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ScheduleRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.FunctionService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.FunctionService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class FunctionService:
+    """FunctionService manages immutable function revisions, atomic application
+    activations, and durable schedule definitions.
+    """
+
+    @staticmethod
+    def Register(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/Register',
+            vmon_dot_v1_dot_api__pb2.RegisterFunctionRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.FunctionRevision.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/Get',
+            vmon_dot_v1_dot_api__pb2.GetFunctionRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.FunctionRevision.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def List(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/List',
+            vmon_dot_v1_dot_api__pb2.ListFunctionsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ListFunctionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Activate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/Activate',
+            vmon_dot_v1_dot_api__pb2.ActivateFunctionRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.FunctionRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/Delete',
+            vmon_dot_v1_dot_api__pb2.DeleteFunctionRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ActivateApp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/ActivateApp',
+            vmon_dot_v1_dot_api__pb2.ActivateAppRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetApp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/GetApp',
+            vmon_dot_v1_dot_api__pb2.GetAppRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RollbackApp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/RollbackApp',
+            vmon_dot_v1_dot_api__pb2.RollbackAppRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.AppRevision.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateSchedule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/CreateSchedule',
+            vmon_dot_v1_dot_api__pb2.CreateScheduleRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ScheduleRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSchedule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/GetSchedule',
+            vmon_dot_v1_dot_api__pb2.ScheduleRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ScheduleRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSchedules(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/ListSchedules',
+            vmon_dot_v1_dot_api__pb2.ListSchedulesRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ListSchedulesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSchedule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.FunctionService/DeleteSchedule',
+            vmon_dot_v1_dot_api__pb2.ScheduleRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class CallServiceStub:
+    """CallService persists function invocations, batch inputs and indexed results,
+    and exposes reconnectable execution event streams.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Create = channel.unary_unary(
+                '/vmon.v1.CallService/Create',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CreateCallRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+                _registered_method=True)
+        self.StreamInputs = channel.stream_unary(
+                '/vmon.v1.CallService/StreamInputs',
+                request_serializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsResponse.FromString,
+                _registered_method=True)
+        self.CloseInputs = channel.unary_unary(
+                '/vmon.v1.CallService/CloseInputs',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CloseCallInputsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_unary(
+                '/vmon.v1.CallService/Get',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CallRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+                _registered_method=True)
+        self.List = channel.unary_unary(
+                '/vmon.v1.CallService/List',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListCallsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ListCallsResponse.FromString,
+                _registered_method=True)
+        self.GetResult = channel.unary_unary(
+                '/vmon.v1.CallService/GetResult',
+                request_serializer=vmon_dot_v1_dot_api__pb2.GetCallResultRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallResult.FromString,
+                _registered_method=True)
+        self.Watch = channel.unary_stream(
+                '/vmon.v1.CallService/Watch',
+                request_serializer=vmon_dot_v1_dot_api__pb2.WatchCallRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallEvent.FromString,
+                _registered_method=True)
+        self.Cancel = channel.unary_unary(
+                '/vmon.v1.CallService/Cancel',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CancelCallRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+                _registered_method=True)
+
+
+class CallServiceServicer:
+    """CallService persists function invocations, batch inputs and indexed results,
+    and exposes reconnectable execution event streams.
+    """
+
+    def Create(self, request, context):
+        """Create durably records a call before any execution is eligible to begin.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StreamInputs(self, request_iterator, context):
+        """StreamInputs durably appends ordered inputs to an open generator or batch call.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CloseInputs(self, request, context):
+        """CloseInputs marks an input stream complete so execution can finish.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Get(self, request, context):
+        """Get returns the latest durable state of a call.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def List(self, request, context):
+        """List returns calls in stable creation order.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetResult(self, request, context):
+        """GetResult returns one durable result by its input or yield index.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Watch(self, request, context):
+        """Watch streams events after a durable sequence cursor and may follow new events.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Cancel(self, request, context):
+        """Cancel durably requests cancellation of a call and its unfinished work.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_CallServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Create': grpc.unary_unary_rpc_method_handler(
+                    servicer.Create,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CreateCallRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallRecord.SerializeToString,
+            ),
+            'StreamInputs': grpc.stream_unary_rpc_method_handler(
+                    servicer.StreamInputs,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsResponse.SerializeToString,
+            ),
+            'CloseInputs': grpc.unary_unary_rpc_method_handler(
+                    servicer.CloseInputs,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CloseCallInputsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallRecord.SerializeToString,
+            ),
+            'Get': grpc.unary_unary_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CallRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallRecord.SerializeToString,
+            ),
+            'List': grpc.unary_unary_rpc_method_handler(
+                    servicer.List,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListCallsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ListCallsResponse.SerializeToString,
+            ),
+            'GetResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetResult,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.GetCallResultRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallResult.SerializeToString,
+            ),
+            'Watch': grpc.unary_stream_rpc_method_handler(
+                    servicer.Watch,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.WatchCallRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallEvent.SerializeToString,
+            ),
+            'Cancel': grpc.unary_unary_rpc_method_handler(
+                    servicer.Cancel,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CancelCallRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CallRecord.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.CallService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.CallService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class CallService:
+    """CallService persists function invocations, batch inputs and indexed results,
+    and exposes reconnectable execution event streams.
+    """
+
+    @staticmethod
+    def Create(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/Create',
+            vmon_dot_v1_dot_api__pb2.CreateCallRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamInputs(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/vmon.v1.CallService/StreamInputs',
+            vmon_dot_v1_dot_api__pb2.StreamCallInputsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.StreamCallInputsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CloseInputs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/CloseInputs',
+            vmon_dot_v1_dot_api__pb2.CloseCallInputsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/Get',
+            vmon_dot_v1_dot_api__pb2.CallRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def List(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/List',
+            vmon_dot_v1_dot_api__pb2.ListCallsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ListCallsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/GetResult',
+            vmon_dot_v1_dot_api__pb2.GetCallResultRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Watch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vmon.v1.CallService/Watch',
+            vmon_dot_v1_dot_api__pb2.WatchCallRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Cancel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/Cancel',
+            vmon_dot_v1_dot_api__pb2.CancelCallRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class ActorServiceStub:
+    """ActorService manages durable actor identities and immutable actor checkpoints.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Create = channel.unary_unary(
+                '/vmon.v1.ActorService/Create',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CreateActorRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_unary(
+                '/vmon.v1.ActorService/Get',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ActorRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+                _registered_method=True)
+        self.Checkpoint = channel.unary_unary(
+                '/vmon.v1.ActorService/Checkpoint',
+                request_serializer=vmon_dot_v1_dot_api__pb2.CheckpointActorRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ActorCheckpoint.FromString,
+                _registered_method=True)
+        self.Restore = channel.unary_unary(
+                '/vmon.v1.ActorService/Restore',
+                request_serializer=vmon_dot_v1_dot_api__pb2.RestoreActorRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+                _registered_method=True)
+        self.Fork = channel.unary_unary(
+                '/vmon.v1.ActorService/Fork',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ForkActorRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/vmon.v1.ActorService/Delete',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ActorRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
+                _registered_method=True)
+
+
+class ActorServiceServicer:
+    """ActorService manages durable actor identities and immutable actor checkpoints.
+    """
+
+    def Create(self, request, context):
+        """Create durably creates an actor pinned to a function revision.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Get(self, request, context):
+        """Get returns the latest durable actor state.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Checkpoint(self, request, context):
+        """Checkpoint captures the actor's state as an immutable checkpoint artifact.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Restore(self, request, context):
+        """Restore atomically restores an actor from a compatible checkpoint.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Fork(self, request, context):
+        """Fork creates a new actor identity from an immutable checkpoint.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Delete(self, request, context):
+        """Delete permanently removes an actor identity while retaining referenced artifacts.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ActorServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Create': grpc.unary_unary_rpc_method_handler(
+                    servicer.Create,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CreateActorRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ActorRecord.SerializeToString,
+            ),
+            'Get': grpc.unary_unary_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ActorRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ActorRecord.SerializeToString,
+            ),
+            'Checkpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.Checkpoint,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.CheckpointActorRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ActorCheckpoint.SerializeToString,
+            ),
+            'Restore': grpc.unary_unary_rpc_method_handler(
+                    servicer.Restore,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.RestoreActorRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ActorRecord.SerializeToString,
+            ),
+            'Fork': grpc.unary_unary_rpc_method_handler(
+                    servicer.Fork,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ForkActorRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ActorRecord.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ActorRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.ActorService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.ActorService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class ActorService:
+    """ActorService manages durable actor identities and immutable actor checkpoints.
+    """
+
+    @staticmethod
+    def Create(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Create',
+            vmon_dot_v1_dot_api__pb2.CreateActorRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Get',
+            vmon_dot_v1_dot_api__pb2.ActorRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Checkpoint(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Checkpoint',
+            vmon_dot_v1_dot_api__pb2.CheckpointActorRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ActorCheckpoint.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Restore(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Restore',
+            vmon_dot_v1_dot_api__pb2.RestoreActorRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Fork(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Fork',
+            vmon_dot_v1_dot_api__pb2.ForkActorRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ActorRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.ActorService/Delete',
+            vmon_dot_v1_dot_api__pb2.ActorRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
