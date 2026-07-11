@@ -42,12 +42,19 @@ const RUNNER: &[u8] = include_bytes!("runner.py");
 const RUNNER_PATH: &str = "/opt/vmon/runner.py";
 const PACKAGE_PATH: &str = "/opt/vmon/functions/package.zip";
 const SOCKET_PATH: &str = "/run/vmon/function-v2.sock";
-const DETACHED_RUNNER: &str = "import os,sys\npid=os.fork()\nif pid:\n \
-                               os._exit(0)\nos.setsid()\nnull=os.open('/dev/null',os.O_RDWR)\\
-                               nlog=os.open('/tmp/vmon-function-runner.log',os.O_WRONLY|os.\
-                               O_CREAT|os.O_APPEND,0o600)\nos.dup2(null,0)\nos.dup2(log,1)\nos.\
-                               dup2(log,2)\nos.closerange(3,256)\nos.execv(sys.executable,[sys.\
-                               executable,sys.argv[1],'--socket',sys.argv[2]])";
+const DETACHED_RUNNER: &str = concat!(
+	"import os,sys\n",
+	"pid=os.fork()\n",
+	"if pid:\n os._exit(0)\n",
+	"os.setsid()\n",
+	"null=os.open('/dev/null',os.O_RDWR)\n",
+	"log=os.open('/tmp/vmon-function-runner.log',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n",
+	"os.dup2(null,0)\n",
+	"os.dup2(log,1)\n",
+	"os.dup2(log,2)\n",
+	"os.closerange(3,256)\n",
+	"os.execv(sys.executable,[sys.executable,sys.argv[1],'--socket',sys.argv[2]])"
+);
 const DEFAULT_STARTUP: Duration = Duration::from_mins(1);
 const DEFAULT_EXECUTION: Duration = Duration::from_mins(5);
 const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
