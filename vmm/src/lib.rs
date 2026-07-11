@@ -21,7 +21,7 @@ mod pager;
 pub mod result;
 #[cfg(target_os = "linux")]
 mod sandbox;
-mod snapshot;
+pub mod snapshot;
 mod tap;
 mod virtio;
 mod vmm;
