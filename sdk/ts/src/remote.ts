@@ -1,10 +1,23 @@
-import type { SandboxCreateRequestWithSecrets, VmonClient } from "./client";
+import type { Client, SandboxCreateRequestWithSecrets } from "./client";
+import type { JsonValue, SessionOutputSink, WireSourceSpec } from "./remote-session";
+import { classifyFailure, RemoteFunctionError, WorkerSession } from "./remote-session";
+import type { Sandbox } from "./sandbox";
 
-/** The scalar values representable by JSON. */
-export type JsonPrimitive = boolean | number | string | null;
-
-/** A value that survives a strict JSON round trip without coercion. */
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+export type {
+  FailureKind,
+  JsonPrimitive,
+  JsonValue,
+  RemoteFailureCode,
+  RemoteFunctionErrorDetails,
+  SessionOutputSink,
+} from "./remote-session";
+export {
+  isRemoteUserFailure,
+  MISSING_NODE_HINT,
+  RemoteFunctionError,
+  SESSION_RUNNER,
+  SESSION_RUNNER_PATH,
+} from "./remote-session";
 
 /** A JavaScript function whose argument tuple and result type are retained remotely. */
 export type RemoteCallable<Arguments extends unknown[], Result> = (
@@ -17,218 +30,331 @@ export interface RemoteFunctionSourceSpec {
   exportName: string;
 }
 
-/** JSON invocation written for the guest runner. */
-export interface RemoteFunctionInvocation {
-  source: string;
-  exportName: string;
-  args: JsonValue[];
+/** Receives one chunk of live remote stdout or stderr text. */
+export type RemoteOutputHandler = (output: string) => void;
+
+/** The element type streamed by {@link RemoteFunction.remoteGen}. */
+export type RemoteYield<Result> = Result extends Generator<infer Item, unknown, unknown>
+  ? Item
+  : Result extends AsyncGenerator<infer Item, unknown>
+    ? Item
+    : Result;
+
+/** Options accepted by the {@link Retries} constructor. */
+export interface RetriesOptions {
+  maxRetries: number;
+  backoffCoefficient?: number;
+  initialDelay?: number;
+  maxDelay?: number;
 }
 
-/** A successful guest runner response. */
-export interface RemoteFunctionSuccess {
-  ok: true;
-  result: JsonValue;
-  stdout: string;
+/** Exponential-backoff retry policy for failed remote calls (Modal parity). */
+export class Retries {
+  readonly maxRetries: number;
+  readonly backoffCoefficient: number;
+  /** First retry delay in seconds. */
+  readonly initialDelay: number;
+  /** Retry delay ceiling in seconds. */
+  readonly maxDelay: number;
+
+  constructor(options: RetriesOptions) {
+    const {
+      maxRetries,
+      backoffCoefficient = 2.0,
+      initialDelay = 1.0,
+      maxDelay = 60.0,
+    } = options;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new RangeError("maxRetries must be an integer >= 0");
+    }
+    if (!(backoffCoefficient >= 1.0 && backoffCoefficient <= 10.0)) {
+      throw new RangeError("backoffCoefficient must be between 1.0 and 10.0");
+    }
+    if (!(initialDelay >= 0.0 && initialDelay <= 60.0)) {
+      throw new RangeError("initialDelay must be between 0.0 and 60.0 seconds");
+    }
+    if (!(maxDelay >= 1.0 && maxDelay <= 60.0)) {
+      throw new RangeError("maxDelay must be between 1.0 and 60.0 seconds");
+    }
+    this.maxRetries = maxRetries;
+    this.backoffCoefficient = backoffCoefficient;
+    this.initialDelay = initialDelay;
+    this.maxDelay = maxDelay;
+  }
+
+  /** Delay in seconds before 1-based retry `retryNumber`. */
+  delayFor(retryNumber: number): number {
+    return Math.min(this.initialDelay * this.backoffCoefficient ** (retryNumber - 1), this.maxDelay);
+  }
 }
 
-/** Structured failure details produced by the guest runner. */
-export interface RemoteFunctionFailureDetails {
-  type: string;
-  message: string;
-  stack: string;
-}
-
-/** A failed guest runner response. */
-export interface RemoteFunctionFailure {
-  ok: false;
-  error: RemoteFunctionFailureDetails;
-  stdout: string;
-}
-
-/** The language-neutral response envelope emitted by the guest runner. */
-export type RemoteFunctionResponse = RemoteFunctionSuccess | RemoteFunctionFailure;
-
-/** Receives stdout captured while a remote handler runs. */
-export type RemoteStdoutHandler = (output: string) => void;
-
-/** Sandbox and invocation settings for a remote function. */
+/** Sandbox, retry, and output settings for a remote function. */
 export interface RemoteFunctionOptions extends SandboxCreateRequestWithSecrets {
-  invocationTimeout?: number | null;
-  onStdout?: RemoteStdoutHandler;
+  /**
+   * Default per-call deadline in seconds; expiry kills the session and raises
+   * a timeout error. `timeout` here configures the CALL deadline — set the
+   * sandbox TTL with `timeout_secs`. Omitted = no client-side deadline.
+   */
+  timeout?: number | null;
+  /** Retry policy for guest exceptions and timeouts: a count (fixed 1s delay) or {@link Retries}. */
+  retries?: number | Retries;
+  /** Server-side warm pool size registered for the sandbox template. */
+  pool?: number;
+  /** Live remote stdout; defaults to writing through to local stdout. */
+  onStdout?: RemoteOutputHandler;
+  /** Live remote stderr; defaults to writing through to local stderr. */
+  onStderr?: RemoteOutputHandler;
+  /** Testing hook: replaces the retry-delay sleep. Seconds. */
+  retrySleep?: (seconds: number) => Promise<void>;
 }
 
-/** Controls the bounded worker pool used by {@link RemoteFunction.map}. */
+/** Controls the lazy worker pool behind {@link RemoteFunction.map}. */
 export interface RemoteMapOptions {
+  /** Worker sandbox cap; workers scale up greedily to this. Default 8. */
   concurrency?: number;
-  ordered?: boolean;
+  /** Emit results in input order (default) or completion order. */
+  orderOutputs?: boolean;
+  /** Yield failed items' errors in their slot instead of failing fast. */
+  returnExceptions?: boolean;
+  /** Per-item deadline in seconds; overrides the function default. */
+  timeout?: number;
 }
 
-/** Structured metadata attached to a {@link RemoteFunctionError}. */
-export interface RemoteFunctionErrorDetails {
-  remoteType?: string;
-  remoteStack?: string;
-  cause?: unknown;
+/** Options for {@link RemoteFunction.forEach}. */
+export interface RemoteForEachOptions {
+  concurrency?: number;
+  ignoreExceptions?: boolean;
+  timeout?: number;
+}
+
+/** Options for {@link FunctionCall.gather}. */
+export interface RemoteGatherOptions {
+  returnExceptions?: boolean;
 }
 
 /** The default image, chosen for its stable Node.js 22 runtime and small Debian base. */
 export const DEFAULT_REMOTE_FUNCTION_IMAGE = "node:22-slim";
 
-const RUNNER_PATH = "/tmp/vmon-remote-function-runner.mjs";
-const PAYLOAD_PATH_PREFIX = "/tmp/vmon-remote-function-invocation";
 const CONVENIENCE_EXPORT = "__vmon_handler";
-const NODE_CHECK_TIMEOUT_SECONDS = 10;
 const TERMINAL_SANDBOX_STATUSES = new Set(["stopped", "terminated", "failed"]);
+const MAX_INFRA_FAILURES = 3;
+const DEFAULT_MAP_CONCURRENCY = 8;
 
-const REMOTE_FUNCTION_RUNNER = String.raw`
-import { readFile } from "node:fs/promises";
+type GeneratorKind = "generator" | "value" | "unknown";
+type OutputChunk = [stream: "stdout" | "stderr", text: string];
 
-function jsonValue(value, path, active) {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return value;
+interface DispatchTarget {
+  acquire(): Promise<WorkerSession>;
+  invalidate(fresh: boolean): Promise<void>;
+}
+
+interface SpawnState {
+  cancelled: boolean;
+  session: WorkerSession | null;
+}
+
+interface MapCompletion<Result> {
+  index: number;
+  ok: boolean;
+  value: Result | undefined;
+  error: unknown;
+  output: OutputChunk[];
+}
+
+function cancelledError(): RemoteFunctionError {
+  return new RemoteFunctionError("remote function call was cancelled", { code: "cancelled" });
+}
+
+/** A handle for one spawned remote call. */
+export class FunctionCall<Result = JsonValue> {
+  /** Unique client-side identifier for this call. */
+  readonly callId: string = crypto.randomUUID();
+  readonly #outcome: Promise<Result>;
+  readonly #state: SpawnState;
+  readonly #output: OutputChunk[];
+  readonly #forward: (chunks: OutputChunk[]) => void;
+  #settled = false;
+  #replayed = false;
+
+  /** @internal Created by {@link RemoteFunction.spawn}. */
+  constructor(
+    outcome: Promise<Result>,
+    state: SpawnState,
+    output: OutputChunk[],
+    forward: (chunks: OutputChunk[]) => void,
+  ) {
+    this.#outcome = outcome;
+    this.#state = state;
+    this.#output = output;
+    this.#forward = forward;
+    const settle = () => {
+      this.#settled = true;
+    };
+    outcome.then(settle, settle);
   }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new TypeError(path + " contains a non-finite number");
+
+  /** True once the call has produced a result or failed. */
+  done(): boolean {
+    return this.#settled;
+  }
+
+  /**
+   * Cancel the call by closing its dedicated exec session; the server
+   * SIGTERMs the guest runner. A later {@link get} rejects with a
+   * cancellation error. Cancelling a settled call is a no-op.
+   */
+  cancel(): void {
+    if (this.#settled) return;
+    this.#state.cancelled = true;
+    this.#state.session?.close();
+  }
+
+  /**
+   * Wait for the result, replaying buffered remote output first. With
+   * `timeoutMs` the wait — not the call — is bounded; expiry rejects without
+   * cancelling.
+   */
+  async get(timeoutMs?: number): Promise<Result> {
+    if (timeoutMs !== undefined && !this.#settled) {
+      await this.#awaitSettled(timeoutMs);
     }
-    return value;
+    try {
+      const value = await this.#outcome;
+      this.#replay();
+      return value;
+    } catch (error) {
+      this.#replay();
+      throw error;
+    }
   }
-  if (typeof value !== "object") {
-    throw new TypeError(path + " contains a non-JSON value");
-  }
-  if (active.has(value)) {
-    throw new TypeError(path + " contains a cycle");
-  }
-  active.add(value);
-  try {
-    if (Array.isArray(value)) {
-      const result = [];
-      for (let index = 0; index < value.length; index += 1) {
-        if (!(index in value)) {
-          throw new TypeError(path + " contains a sparse array");
-        }
-        result.push(jsonValue(value[index], path + "[" + index + "]", active));
+
+  /** Wait for every call in order; failures reject unless `returnExceptions`. */
+  static async gather<Result>(
+    ...items: (FunctionCall<Result> | RemoteGatherOptions)[]
+  ): Promise<(Result | unknown)[]> {
+    const calls: FunctionCall<Result>[] = [];
+    let options: RemoteGatherOptions = {};
+    for (const item of items) {
+      if (item instanceof FunctionCall) calls.push(item);
+      else options = item;
+    }
+    const returnExceptions = options.returnExceptions ?? false;
+    const results: (Result | unknown)[] = [];
+    for (const call of calls) {
+      try {
+        results.push(await call.get());
+      } catch (error) {
+        if (!returnExceptions) throw error;
+        results.push(error);
       }
-      return result;
     }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new TypeError(path + " contains a non-plain object");
+    return results;
+  }
+
+  async #awaitSettled(timeoutMs: number): Promise<void> {
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const timer = setTimeout(
+      () =>
+        reject(
+          new RemoteFunctionError(`remote function call was not ready within ${timeoutMs}ms`, {
+            code: "timeout",
+          }),
+        ),
+      timeoutMs,
+    );
+    const settle = () => resolve();
+    this.#outcome.then(settle, settle);
+    try {
+      await promise;
+    } finally {
+      clearTimeout(timer);
     }
-    if (Object.getOwnPropertySymbols(value).length !== 0) {
-      throw new TypeError(path + " contains symbol properties");
-    }
-    const result = {};
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Object.keys(value).sort();
-    for (const key of keys) {
-      const descriptor = descriptors[key];
-      if (!("value" in descriptor)) {
-        throw new TypeError(path + "." + key + " is an accessor property");
-      }
-      result[key] = jsonValue(descriptor.value, path + "." + key, active);
-    }
-    return result;
-  } finally {
-    active.delete(value);
+  }
+
+  #replay(): void {
+    if (this.#replayed) return;
+    this.#replayed = true;
+    this.#forward(this.#output);
   }
 }
 
-function errorDetails(error) {
-  if (error !== null && typeof error === "object") {
-    const type = typeof error.name === "string" && error.name.length > 0
-      ? error.name
-      : error.constructor && typeof error.constructor.name === "string"
-        ? error.constructor.name
-        : "RemoteError";
+interface ChannelWaiter<T> {
+  resolve: (result: IteratorResult<T>) => void;
+  reject: (reason: unknown) => void;
+}
+
+class AsyncChannel<T> implements AsyncIterable<T> {
+  readonly #values: T[] = [];
+  readonly #waiters: ChannelWaiter<T>[] = [];
+  #done = false;
+  #failure: unknown = null;
+  #failed = false;
+
+  push(value: T): void {
+    if (this.#done || this.#failed) return;
+    const waiter = this.#waiters.shift();
+    if (waiter) waiter.resolve({ value, done: false });
+    else this.#values.push(value);
+  }
+
+  end(): void {
+    if (this.#done || this.#failed) return;
+    this.#done = true;
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter.resolve({ value: undefined, done: true });
+    }
+  }
+
+  fail(error: unknown): void {
+    if (this.#done || this.#failed) return;
+    this.#failed = true;
+    this.#failure = error;
+    for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
-      type,
-      message: typeof error.message === "string" ? error.message : String(error),
-      stack: typeof error.stack === "string" ? error.stack : "",
+      next: (): Promise<IteratorResult<T>> => {
+        const value = this.#values.shift();
+        if (value !== undefined) return Promise.resolve({ value, done: false });
+        if (this.#failed) return Promise.reject(this.#failure);
+        if (this.#done) return Promise.resolve({ value: undefined, done: true });
+        const { promise, resolve, reject } = Promise.withResolvers<IteratorResult<T>>();
+        this.#waiters.push({ resolve, reject });
+        return promise;
+      },
     };
   }
-  return { type: "RemoteError", message: String(error), stack: "" };
 }
 
-const originalWrite = process.stdout.write;
-let capturedStdout = "";
-process.stdout.write = function captureStdout(chunk, encoding, callback) {
-  capturedStdout += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
-  const done = typeof encoding === "function" ? encoding : callback;
-  if (typeof done === "function") {
-    queueMicrotask(done);
-  }
-  return true;
-};
-
-let response;
-try {
-  const payload = JSON.parse(await readFile(process.argv[2], "utf8"));
-  if (payload === null || typeof payload !== "object") {
-    throw new TypeError("remote function invocation must be an object");
-  }
-  if (typeof payload.source !== "string" || typeof payload.exportName !== "string") {
-    throw new TypeError("remote function source and exportName must be strings");
-  }
-  if (!Array.isArray(payload.args)) {
-    throw new TypeError("remote function args must be an array");
-  }
-  const moduleSource = payload.source + "\n//# sourceURL=vmon-remote-function.mjs\n";
-  const moduleUrl = "data:text/javascript;base64," + Buffer.from(moduleSource).toString("base64");
-  // The user module is selected from the invocation at runtime, so a static import cannot name it.
-  const namespace = await import(moduleUrl);
-  const handler = namespace[payload.exportName];
-  if (typeof handler !== "function") {
-    throw new TypeError("remote function module does not export callable " + payload.exportName);
-  }
-  const result = await handler(...payload.args);
-  response = {
-    ok: true,
-    result: jsonValue(result, "remote function result", new Set()),
-    stdout: capturedStdout,
-  };
-} catch (error) {
-  response = {
-    ok: false,
-    error: errorDetails(error),
-    stdout: capturedStdout,
-  };
-}
-process.stdout.write = originalWrite;
-originalWrite.call(process.stdout, JSON.stringify(response));
-`;
-
-/** An error raised when guest-side function evaluation fails. */
-export class RemoteFunctionError extends Error {
-  override readonly name = "RemoteFunctionError";
-  readonly remoteType: string;
-  readonly remoteStack: string;
-
-  constructor(message: string, details: RemoteFunctionErrorDetails = {}) {
-    super(message, details.cause === undefined ? undefined : { cause: details.cause });
-    this.remoteType = details.remoteType ?? "RemoteError";
-    this.remoteStack = details.remoteStack ?? "";
-  }
-}
-
-/** A reusable source-serialized function backed by vmon sandboxes. */
+/** A reusable source-serialized function backed by persistent guest sessions. */
 export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = JsonValue> {
-  readonly #client: VmonClient;
+  readonly #client: Client;
   readonly #spec: RemoteFunctionSourceSpec;
   readonly #sandboxRequest: SandboxCreateRequestWithSecrets;
-  readonly #invocationTimeout: number | null | undefined;
-  readonly #onStdout: RemoteStdoutHandler;
-  #cachedSandbox: Promise<string> | null = null;
-  #termination: Promise<void> | null = null;
-  #invocationSequence = 0;
+  readonly #retries: Retries | null;
+  readonly #timeout: number | null;
+  readonly #pool: number;
+  readonly #onStdout: RemoteOutputHandler;
+  readonly #onStderr: RemoteOutputHandler;
+  readonly #sleep: (seconds: number) => Promise<void>;
+  readonly #generatorKind: GeneratorKind;
+  readonly #spawnSessions = new Set<WorkerSession>();
+  #wireSpecPromise: Promise<WireSourceSpec> | null = null;
+  #cachedSandbox: Promise<Sandbox> | null = null;
+  #sessionPromise: Promise<WorkerSession> | null = null;
 
+  /** @internal Use {@link remoteFunction} or {@link remoteFunctionFromSource}. */
   constructor(
-    client: VmonClient,
+    client: Client,
     spec: RemoteFunctionSourceSpec,
     options: RemoteFunctionOptions = {},
+    generatorKind: GeneratorKind = "unknown",
   ) {
     this.#client = client;
     this.#spec = checkedSourceSpec(spec);
-    const { invocationTimeout, onStdout, ...sandboxRequest } = options;
+    this.#generatorKind = generatorKind;
+    const { timeout, retries, pool, onStdout, onStderr, retrySleep, ...sandboxRequest } = options;
     const reusableSecrets =
       sandboxRequest.secrets === undefined || sandboxRequest.secrets === null
         ? sandboxRequest.secrets
@@ -238,121 +364,450 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
       ...sandboxRequest,
       secrets: reusableSecrets,
     };
-    this.#invocationTimeout = invocationTimeout;
-    this.#onStdout = onStdout ?? forwardStdout;
+    if (timeout !== undefined && timeout !== null && !(timeout > 0)) {
+      throw new RangeError("timeout must be a positive number of seconds");
+    }
+    this.#timeout = timeout ?? null;
+    this.#retries = normalizeRetries(retries);
+    if (pool !== undefined && (!Number.isInteger(pool) || pool < 0)) {
+      throw new RangeError("pool must be an integer >= 0");
+    }
+    this.#pool = pool ?? 0;
+    this.#onStdout = onStdout ?? defaultStdout;
+    this.#onStderr = onStderr ?? defaultStderr;
+    this.#sleep = retrySleep ?? sleepSeconds;
   }
 
-  /** Run the handler in one lazily created, reusable sandbox. */
+  /**
+   * Run the handler on the warm cached session, streaming remote stdout and
+   * stderr live. Dead sandboxes and sessions are recreated transparently.
+   */
   async remote(...args: Arguments): Promise<Result> {
-    const jsonArgs = checkedJsonValue(args, "remote function arguments", new Set());
-    if (!Array.isArray(jsonArgs)) {
-      throw new TypeError("remote function arguments must be an array");
+    if (this.#generatorKind === "generator") {
+      throw new TypeError("a generator function cannot be called with .remote(); use .remoteGen()");
     }
-    const sandboxId = await this.#ensureSandbox();
-    return this.#invoke(sandboxId, jsonArgs);
+    const jsonArgs = this.#encodeArgs(args);
+    const spec = await this.#wireSpec();
+    return this.#callWithPolicy(
+      this.#cachedTarget(),
+      spec,
+      jsonArgs,
+      this.#timeout,
+      this.#liveSink(),
+    );
   }
 
-  /** Map unary calls over ephemeral workers, returning input order unless disabled. */
-  async map(items: Iterable<Arguments[0]>, options: RemoteMapOptions = {}): Promise<Result[]> {
-    const concurrency = options.concurrency ?? 4;
-    if (!Number.isInteger(concurrency) || concurrency < 1) {
-      throw new RangeError("concurrency must be an integer >= 1");
-    }
-
-    const argumentSets: JsonValue[][] = [];
-    for (const item of items) {
-      const jsonArgs = checkedJsonValue([item], "remote function arguments", new Set());
-      if (!Array.isArray(jsonArgs)) {
-        throw new TypeError("remote function arguments must be an array");
-      }
-      argumentSets.push(jsonArgs);
-    }
-    if (argumentSets.length === 0) {
-      return [];
-    }
-
-    const sandboxIds: string[] = [];
-    const orderedResults: Result[] = [];
-    const completionResults: Result[] = [];
-    let nextIndex = 0;
-    let stopped = false;
-    let failed = false;
-    let firstError: unknown;
-
-    try {
-      const poolSize = Math.min(concurrency, argumentSets.length);
-      for (let worker = 0; worker < poolSize; worker += 1) {
-        sandboxIds.push(await this.#provisionSandbox());
-      }
-
-      const workers = sandboxIds.map(async (sandboxId) => {
-        while (!stopped) {
-          const index = nextIndex;
-          nextIndex += 1;
-          if (index >= argumentSets.length) {
-            return;
-          }
-          try {
-            const result = await this.#invoke(sandboxId, argumentSets[index]);
-            orderedResults[index] = result;
-            completionResults.push(result);
-          } catch (error) {
-            if (!failed) {
-              failed = true;
-              firstError = error;
-              stopped = true;
-            }
-            return;
-          }
-        }
-      });
-      await Promise.all(workers);
-      if (failed) {
-        throw firstError;
-      }
-      return options.ordered === false ? completionResults : orderedResults;
-    } finally {
-      await Promise.allSettled(
-        sandboxIds.map((sandboxId) => this.#client.terminateSandbox(sandboxId)),
+  /**
+   * Stream a remote generator's yields as they are produced. Breaking out of
+   * the loop (or calling `return()`) kills that session; the next call
+   * starts a fresh one.
+   */
+  async *remoteGen(...args: Arguments): AsyncGenerator<RemoteYield<Result>, void, undefined> {
+    if (this.#generatorKind === "value") {
+      throw new TypeError(
+        "a non-generator function cannot be called with .remoteGen(); use .remote()",
       );
     }
-  }
-
-  /** Terminate the cached sandbox; repeated and concurrent calls are harmless. */
-  async terminate(): Promise<void> {
-    const sandbox = this.#cachedSandbox;
-    this.#cachedSandbox = null;
-    const previousTermination = this.#termination;
-    if (sandbox === null) {
-      if (previousTermination !== null) {
-        await previousTermination;
-      }
-      return;
-    }
-
-    const termination = (async () => {
-      if (previousTermination !== null) {
-        await previousTermination.catch(() => undefined);
-      }
-      let sandboxId: string;
+    const jsonArgs = this.#encodeArgs(args);
+    const spec = await this.#wireSpec();
+    const output = this.#liveSink();
+    let infraFailures = 0;
+    let retriesUsed = 0;
+    while (true) {
+      let yielded = false;
       try {
-        sandboxId = await sandbox;
-      } catch {
+        const session = await this.#ensureSession();
+        const stream = session.callIter({
+          spec,
+          args: jsonArgs,
+          timeout: this.#timeout,
+          output,
+        });
+        for await (const item of stream) {
+          yielded = true;
+          yield item as RemoteYield<Result>;
+        }
         return;
-      }
-      await this.#client.terminateSandbox(sandboxId);
-    })();
-    this.#termination = termination;
-    try {
-      await termination;
-    } finally {
-      if (this.#termination === termination) {
-        this.#termination = null;
+      } catch (error) {
+        if (yielded) throw error;
+        const kind = classifyFailure(error);
+        if (kind === "infra" && infraFailures < MAX_INFRA_FAILURES) {
+          infraFailures += 1;
+          await this.#invalidateCached(true);
+          continue;
+        }
+        if (
+          (kind === "user" || kind === "timeout") &&
+          this.#retries !== null &&
+          retriesUsed < this.#retries.maxRetries
+        ) {
+          retriesUsed += 1;
+          await this.#sleep(this.#retries.delayFor(retriesUsed));
+          continue;
+        }
+        throw error;
       }
     }
   }
 
-  async #ensureSandbox(): Promise<string> {
+  /**
+   * Start the call on a dedicated session of the cached sandbox and return a
+   * handle immediately. Remote output is buffered and replayed by
+   * {@link FunctionCall.get}.
+   */
+  async spawn(...args: Arguments): Promise<FunctionCall<Result>> {
+    if (this.#generatorKind === "generator") {
+      throw new TypeError("cannot spawn a generator function; use .remoteGen()");
+    }
+    const jsonArgs = this.#encodeArgs(args);
+    const spec = await this.#wireSpec();
+    const state: SpawnState = { cancelled: false, session: null };
+    const output: OutputChunk[] = [];
+    const target: DispatchTarget = {
+      acquire: async () => {
+        if (state.cancelled) throw cancelledError();
+        if (state.session !== null && state.session.alive) return state.session;
+        const sandbox = await this.#ensureSandbox();
+        const session = await WorkerSession.start(sandbox);
+        state.session = session;
+        this.#spawnSessions.add(session);
+        if (state.cancelled) {
+          session.close();
+          throw cancelledError();
+        }
+        return session;
+      },
+      invalidate: async (fresh) => {
+        if (state.session !== null) {
+          this.#spawnSessions.delete(state.session);
+          state.session.close();
+          state.session = null;
+        }
+        if (fresh) await this.#invalidateCached(true);
+      },
+    };
+    const outcome = (async () => {
+      try {
+        return await this.#callWithPolicy(target, spec, jsonArgs, this.#timeout, (stream, text) =>
+          output.push([stream, text]),
+        );
+      } catch (error) {
+        if (state.cancelled) throw cancelledError();
+        throw error;
+      } finally {
+        if (state.session !== null) {
+          this.#spawnSessions.delete(state.session);
+          state.session.close();
+          state.session = null;
+        }
+      }
+    })();
+    return new FunctionCall<Result>(outcome, state, output, (chunks) =>
+      this.#forwardOutput(chunks),
+    );
+  }
+
+  /**
+   * Lazily map unary calls over ephemeral worker sandboxes with greedy
+   * scale-up. Results stream from the returned generator; with
+   * `returnExceptions` failed items yield their error in-slot, otherwise the
+   * first exhausted-retries failure fails fast and tears every worker down.
+   */
+  map(
+    inputs: Iterable<Arguments[0]> | AsyncIterable<Arguments[0]>,
+    options: RemoteMapOptions = {},
+  ): AsyncGenerator<Result, void, undefined> {
+    if (this.#generatorKind === "generator") {
+      throw new TypeError("a generator function cannot be mapped; use .remoteGen() per input");
+    }
+    return this.#mapEngine(this.#argIterator(inputs, (item) => [item]), options);
+  }
+
+  /** {@link map} over argument tuples, spread into the handler. */
+  starmap(
+    inputs: Iterable<Arguments> | AsyncIterable<Arguments>,
+    options: RemoteMapOptions = {},
+  ): AsyncGenerator<Result, void, undefined> {
+    if (this.#generatorKind === "generator") {
+      throw new TypeError("a generator function cannot be mapped; use .remoteGen() per input");
+    }
+    return this.#mapEngine(
+      this.#argIterator(inputs, (item) => {
+        if (!Array.isArray(item)) {
+          throw new TypeError("starmap items must be argument arrays");
+        }
+        return item;
+      }),
+      options,
+    );
+  }
+
+  /** Drain {@link map} in completion order, discarding results. */
+  async forEach(
+    inputs: Iterable<Arguments[0]> | AsyncIterable<Arguments[0]>,
+    options: RemoteForEachOptions = {},
+  ): Promise<void> {
+    const results = this.map(inputs, {
+      concurrency: options.concurrency,
+      timeout: options.timeout,
+      orderOutputs: false,
+      returnExceptions: options.ignoreExceptions ?? false,
+    });
+    for await (const result of results) {
+      void result;
+    }
+  }
+
+  /** Close every session and terminate the cached sandbox; idempotent. */
+  async terminate(): Promise<void> {
+    for (const session of this.#spawnSessions) session.close();
+    this.#spawnSessions.clear();
+    await this.#invalidateCached(true);
+  }
+
+  async #callWithPolicy(
+    target: DispatchTarget,
+    spec: WireSourceSpec,
+    args: JsonValue[],
+    timeout: number | null,
+    output: SessionOutputSink,
+  ): Promise<Result> {
+    let infraFailures = 0;
+    let retriesUsed = 0;
+    while (true) {
+      try {
+        const session = await target.acquire();
+        const value = await session.callValue({ spec, args, timeout, output });
+        return value as Result;
+      } catch (error) {
+        const kind = classifyFailure(error);
+        if (kind === "infra" && infraFailures < MAX_INFRA_FAILURES) {
+          infraFailures += 1;
+          await target.invalidate(true);
+          continue;
+        }
+        if (
+          (kind === "user" || kind === "timeout") &&
+          this.#retries !== null &&
+          retriesUsed < this.#retries.maxRetries
+        ) {
+          retriesUsed += 1;
+          await this.#sleep(this.#retries.delayFor(retriesUsed));
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  async *#mapEngine(
+    items: AsyncIterator<JsonValue[]>,
+    options: RemoteMapOptions,
+  ): AsyncGenerator<Result, void, undefined> {
+    const cap = options.concurrency ?? DEFAULT_MAP_CONCURRENCY;
+    if (!Number.isInteger(cap) || cap < 1) {
+      throw new RangeError("concurrency must be an integer >= 1");
+    }
+    const orderOutputs = options.orderOutputs ?? true;
+    const returnExceptions = options.returnExceptions ?? false;
+    const timeout = options.timeout ?? this.#timeout;
+    const spec = await this.#wireSpec();
+
+    const completions = new AsyncChannel<MapCompletion<Result>>();
+    const liveSessions = new Set<WorkerSession>();
+    const workers: Promise<void>[] = [];
+    let nextIndex = 0;
+    let inputDone = false;
+    let stopped = false;
+    let active = 0;
+    let pullLock: Promise<unknown> = Promise.resolve();
+
+    const pullNext = (): Promise<{ index: number; args: JsonValue[] } | null> => {
+      const claim = pullLock.then(async () => {
+        if (stopped || inputDone) return null;
+        const step = await items.next();
+        if (step.done === true) {
+          inputDone = true;
+          return null;
+        }
+        const index = nextIndex;
+        nextIndex += 1;
+        return { index, args: step.value };
+      });
+      pullLock = claim.catch(() => null);
+      return claim;
+    };
+
+    const startWorker = (): void => {
+      active += 1;
+      const task = (async () => {
+        let sandbox: Sandbox | null = null;
+        let session: WorkerSession | null = null;
+        const target: DispatchTarget = {
+          acquire: async () => {
+            if (session !== null && session.alive) return session;
+            if (session !== null) {
+              liveSessions.delete(session);
+              session.close();
+              session = null;
+            }
+            sandbox ??= await this.#provisionSandbox();
+            session = await WorkerSession.start(sandbox);
+            liveSessions.add(session);
+            return session;
+          },
+          invalidate: async (fresh) => {
+            if (session !== null) {
+              liveSessions.delete(session);
+              session.close();
+              session = null;
+            }
+            if (fresh && sandbox !== null) {
+              const dying = sandbox;
+              sandbox = null;
+              await dying.terminate(false).catch(() => undefined);
+            }
+          },
+        };
+        try {
+          while (!stopped) {
+            const item = await pullNext();
+            if (item === null) return;
+            if (!stopped && !inputDone && active < cap) startWorker();
+            const output: OutputChunk[] = [];
+            try {
+              const value = await this.#callWithPolicy(target, spec, item.args, timeout, (stream, text) => {
+                output.push([stream, text]);
+              });
+              completions.push({ index: item.index, ok: true, value, error: undefined, output });
+            } catch (error) {
+              completions.push({
+                index: item.index,
+                ok: false,
+                value: undefined,
+                error,
+                output,
+              });
+              if (!returnExceptions) {
+                stopped = true;
+                return;
+              }
+            }
+          }
+        } catch (error) {
+          stopped = true;
+          completions.fail(error);
+        } finally {
+          if (session !== null) {
+            liveSessions.delete(session);
+            session.close();
+          }
+          if (sandbox !== null) await sandbox.terminate(false).catch(() => undefined);
+          active -= 1;
+          if (active === 0) completions.end();
+        }
+      })();
+      workers.push(task);
+      task.catch(() => undefined);
+    };
+
+    const heldBack = new Map<number, MapCompletion<Result>>();
+    let emitIndex = 0;
+    const deliver = (completion: MapCompletion<Result>): Result => {
+      this.#forwardOutput(completion.output);
+      if (!completion.ok && !returnExceptions) throw completion.error;
+      return (completion.ok ? completion.value : completion.error) as Result;
+    };
+    try {
+      startWorker();
+      for await (const completion of completions) {
+        if (!orderOutputs || (!completion.ok && !returnExceptions)) {
+          yield deliver(completion);
+          continue;
+        }
+        heldBack.set(completion.index, completion);
+        while (heldBack.has(emitIndex)) {
+          const next = heldBack.get(emitIndex) as MapCompletion<Result>;
+          heldBack.delete(emitIndex);
+          emitIndex += 1;
+          yield deliver(next);
+        }
+      }
+    } finally {
+      stopped = true;
+      for (const session of liveSessions) session.close();
+      await Promise.allSettled(workers);
+      if (typeof items.return === "function") {
+        await items.return().catch(() => undefined);
+      }
+    }
+  }
+
+  #argIterator<Item>(
+    inputs: Iterable<Item> | AsyncIterable<Item>,
+    wrap: (item: Item) => unknown[],
+  ): AsyncIterator<JsonValue[]> {
+    async function* encode(): AsyncGenerator<JsonValue[], void, undefined> {
+      for await (const item of inputs as AsyncIterable<Item>) {
+        yield checkedJsonValue(wrap(item), "remote function arguments", new Set()) as JsonValue[];
+      }
+    }
+    return encode()[Symbol.asyncIterator]();
+  }
+
+  #cachedTarget(): DispatchTarget {
+    return {
+      acquire: () => this.#ensureSession(),
+      invalidate: (fresh) => this.#invalidateCached(fresh),
+    };
+  }
+
+  async #ensureSession(): Promise<WorkerSession> {
+    while (true) {
+      const current = this.#sessionPromise;
+      if (current !== null) {
+        let session: WorkerSession;
+        try {
+          session = await current;
+        } catch (error) {
+          if (this.#sessionPromise === current) this.#sessionPromise = null;
+          throw error;
+        }
+        if (session.alive) return session;
+        if (this.#sessionPromise === current) this.#sessionPromise = null;
+        continue;
+      }
+      const creation = (async () => {
+        const sandbox = await this.#ensureSandbox();
+        return WorkerSession.start(sandbox);
+      })();
+      this.#sessionPromise = creation;
+      try {
+        return await creation;
+      } catch (error) {
+        if (this.#sessionPromise === creation) this.#sessionPromise = null;
+        throw error;
+      }
+    }
+  }
+
+  async #invalidateCached(fresh: boolean): Promise<void> {
+    const sessionPromise = this.#sessionPromise;
+    this.#sessionPromise = null;
+    if (sessionPromise !== null) {
+      const session = await sessionPromise.catch(() => null);
+      session?.close();
+    }
+    if (!fresh) return;
+    const cached = this.#cachedSandbox;
+    this.#cachedSandbox = null;
+    if (cached !== null) {
+      const sandbox = await cached.catch(() => null);
+      if (sandbox !== null) await sandbox.terminate(false).catch(() => undefined);
+    }
+  }
+
+  async #ensureSandbox(): Promise<Sandbox> {
     const cached = this.#cachedSandbox;
     if (cached === null) {
       const creation = this.#provisionSandbox();
@@ -360,54 +815,39 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
       try {
         return await creation;
       } catch (error) {
-        if (this.#cachedSandbox === creation) {
-          this.#cachedSandbox = null;
-        }
+        if (this.#cachedSandbox === creation) this.#cachedSandbox = null;
         throw error;
       }
     }
 
-    let sandboxId: string;
+    let sandbox: Sandbox;
     try {
-      sandboxId = await cached;
+      sandbox = await cached;
     } catch (error) {
-      if (this.#cachedSandbox === cached) {
-        this.#cachedSandbox = null;
-      }
+      if (this.#cachedSandbox === cached) this.#cachedSandbox = null;
       throw error;
     }
-    const live = await this.#sandboxIsLive(sandboxId);
-    if (this.#cachedSandbox !== cached) {
-      return this.#ensureSandbox();
-    }
-    if (live) {
-      return sandboxId;
-    }
+    const live = await this.#sandboxIsLive(sandbox);
+    if (this.#cachedSandbox !== cached) return this.#ensureSandbox();
+    if (live) return sandbox;
 
     const replacement = (async () => {
-      await this.#client.terminateSandbox(sandboxId).catch(() => undefined);
+      await sandbox.terminate(false).catch(() => undefined);
       return this.#provisionSandbox();
     })();
     this.#cachedSandbox = replacement;
     try {
       return await replacement;
     } catch (error) {
-      if (this.#cachedSandbox === replacement) {
-        this.#cachedSandbox = null;
-      }
+      if (this.#cachedSandbox === replacement) this.#cachedSandbox = null;
       throw error;
     }
   }
 
-  async #sandboxIsLive(sandboxId: string): Promise<boolean> {
+  async #sandboxIsLive(sandbox: Sandbox): Promise<boolean> {
     try {
-      const view: unknown = await this.#client.getSandbox(sandboxId);
-      if (!isRecord(view)) {
-        throw new RemoteFunctionError("sandbox lookup returned a non-object response", {
-          remoteType: "ProtocolError",
-        });
-      }
-      const status = typeof view.status === "string" ? view.status.toLowerCase() : "";
+      const view = await this.#client.sandboxes.get(sandbox.id);
+      const status = typeof view.info.status === "string" ? view.info.status.toLowerCase() : "";
       return !TERMINAL_SANDBOX_STATUSES.has(status);
     } catch (error) {
       if (isRecord(error) && (error.status === 404 || error.code === "not_found")) {
@@ -417,78 +857,43 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     }
   }
 
-  async #provisionSandbox(): Promise<string> {
-    let sandboxId: string | null = null;
-    try {
-      const view: unknown = await this.#client.createSandbox(this.#sandboxRequest);
-      sandboxId = sandboxIdentifier(view);
-      const check = await this.#client.execSandbox(sandboxId, {
-        cmd: ["node", "--version"],
-        timeout: NODE_CHECK_TIMEOUT_SECONDS,
-      });
-      if (check.exit !== 0) {
-        const detail = decodeBase64(check.stderr_b64).trim();
-        throw new RemoteFunctionError(
-          detail ||
-            `remote function images must provide Node.js; use ${DEFAULT_REMOTE_FUNCTION_IMAGE} or another Node-capable image`,
-          { remoteType: "RuntimeUnavailable" },
-        );
-      }
-      await this.#client.writeSandboxFile(sandboxId, RUNNER_PATH, REMOTE_FUNCTION_RUNNER);
-      return sandboxId;
-    } catch (error) {
-      if (sandboxId !== null) {
-        await this.#client.terminateSandbox(sandboxId).catch(() => undefined);
-      }
-      throw error;
-    }
+  #provisionSandbox(): Promise<Sandbox> {
+    const request = { ...this.#sandboxRequest };
+    if (this.#pool > 0) request.pool_size = this.#pool;
+    return this.#client.sandboxes.create(request);
   }
 
-  async #invoke(sandboxId: string, args: JsonValue[]): Promise<Result> {
-    this.#invocationSequence += 1;
-    const payloadPath = `${PAYLOAD_PATH_PREFIX}-${this.#invocationSequence}.json`;
-    const invocation: RemoteFunctionInvocation = {
+  #wireSpec(): Promise<WireSourceSpec> {
+    this.#wireSpecPromise ??= (async () => ({
+      hash: await sha256Hex(this.#spec.source),
       source: this.#spec.source,
       exportName: this.#spec.exportName,
-      args,
+    }))();
+    return this.#wireSpecPromise;
+  }
+
+  #encodeArgs(args: unknown[]): JsonValue[] {
+    return checkedJsonValue(args, "remote function arguments", new Set()) as JsonValue[];
+  }
+
+  #liveSink(): SessionOutputSink {
+    return (stream, text) => {
+      if (stream === "stderr") this.#onStderr(text);
+      else this.#onStdout(text);
     };
-    let uploaded = false;
-    try {
-      await this.#client.writeSandboxFile(sandboxId, payloadPath, JSON.stringify(invocation));
-      uploaded = true;
-      const capture = await this.#client.execSandbox(sandboxId, {
-        cmd: ["node", RUNNER_PATH, payloadPath],
-        timeout: this.#invocationTimeout,
-      });
-      if (capture.exit !== 0) {
-        const detail = decodeBase64(capture.stderr_b64).trim();
-        throw new RemoteFunctionError(
-          detail || `remote function runner exited with ${capture.exit}`,
-          { remoteType: "RunnerProcessError" },
-        );
-      }
-      const response = remoteResponse<Result>(decodeBase64(capture.stdout_b64));
-      if (response.stdout.length > 0) {
-        this.#onStdout(response.stdout);
-      }
-      if (!response.ok) {
-        throw new RemoteFunctionError(response.error.message, {
-          remoteType: response.error.type,
-          remoteStack: response.error.stack,
-        });
-      }
-      return response.result;
-    } finally {
-      if (uploaded) {
-        await this.#client.deleteSandboxFile(sandboxId, payloadPath).catch(() => undefined);
-      }
+  }
+
+  #forwardOutput(chunks: OutputChunk[]): void {
+    for (const [stream, text] of chunks) {
+      if (stream === "stderr") this.#onStderr(text);
+      else this.#onStdout(text);
     }
   }
 }
 
 /** Create a typed remote function from a source-serializable JavaScript closure. */
 export function remoteFunction<Arguments extends unknown[], Result>(
-  client: VmonClient,
+  client: Client,
   fn: RemoteCallable<Arguments, Result>,
   options: RemoteFunctionOptions = {},
 ): RemoteFunction<Arguments, Result> {
@@ -512,6 +917,11 @@ export function remoteFunction<Arguments extends unknown[], Result>(
       cause: error,
     });
   }
+  const tag = Object.prototype.toString.call(fn);
+  const generatorKind: GeneratorKind =
+    tag === "[object GeneratorFunction]" || tag === "[object AsyncGeneratorFunction]"
+      ? "generator"
+      : "value";
   return new RemoteFunction<Arguments, Result>(
     client,
     {
@@ -519,6 +929,7 @@ export function remoteFunction<Arguments extends unknown[], Result>(
       exportName: CONVENIENCE_EXPORT,
     },
     options,
+    generatorKind,
   );
 }
 
@@ -527,11 +938,17 @@ export function remoteFunctionFromSource<
   Arguments extends unknown[] = JsonValue[],
   Result = JsonValue,
 >(
-  client: VmonClient,
+  client: Client,
   spec: RemoteFunctionSourceSpec,
   options: RemoteFunctionOptions = {},
 ): RemoteFunction<Arguments, Result> {
-  return new RemoteFunction<Arguments, Result>(client, spec, options);
+  return new RemoteFunction<Arguments, Result>(client, spec, options, "unknown");
+}
+
+function normalizeRetries(retries: number | Retries | undefined): Retries | null {
+  if (retries === undefined) return null;
+  if (retries instanceof Retries) return retries;
+  return new Retries({ maxRetries: retries, backoffCoefficient: 1.0, initialDelay: 1.0 });
 }
 
 function checkedSourceSpec(spec: RemoteFunctionSourceSpec): RemoteFunctionSourceSpec {
@@ -596,95 +1013,35 @@ function checkedJsonValue(value: unknown, path: string, active: Set<object>): Js
   }
 }
 
-interface DecodedRemoteFunctionSuccess<Result> {
-  ok: true;
-  result: Result;
-  stdout: string;
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  let hex = "";
+  for (const byte of new Uint8Array(digest)) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
 }
 
-interface DecodedRemoteFunctionFailure {
-  ok: false;
-  error: RemoteFunctionFailureDetails;
-  stdout: string;
+function sleepSeconds(seconds: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, seconds * 1000);
+  return promise;
 }
 
-type DecodedRemoteFunctionResponse<Result> =
-  | DecodedRemoteFunctionSuccess<Result>
-  | DecodedRemoteFunctionFailure;
-
-function remoteResponse<Result>(raw: string): DecodedRemoteFunctionResponse<Result> {
-  let response: DecodedRemoteFunctionResponse<Result>;
-  try {
-    response = JSON.parse(raw);
-  } catch (error) {
-    throw new RemoteFunctionError("remote function returned invalid JSON", {
-      remoteType: "ProtocolError",
-      cause: error,
-    });
-  }
-  if (
-    !isRecord(response) ||
-    typeof response.ok !== "boolean" ||
-    typeof response.stdout !== "string"
-  ) {
-    throw new RemoteFunctionError("remote function returned an invalid response envelope", {
-      remoteType: "ProtocolError",
-    });
-  }
-  if (response.ok) {
-    checkedJsonValue(response.result, "remote function result", new Set());
-    return response;
-  }
-  if (
-    !isRecord(response.error) ||
-    typeof response.error.type !== "string" ||
-    typeof response.error.message !== "string" ||
-    typeof response.error.stack !== "string"
-  ) {
-    throw new RemoteFunctionError("remote function returned invalid error details", {
-      remoteType: "ProtocolError",
-    });
-  }
-  return response;
-}
-
-function sandboxIdentifier(view: unknown): string {
-  if (!isRecord(view)) {
-    throw new RemoteFunctionError("sandbox creation returned a non-object response", {
-      remoteType: "ProtocolError",
-    });
-  }
-  const id = typeof view.id === "string" && view.id.length > 0 ? view.id : view.name;
-  if (typeof id !== "string" || id.length === 0) {
-    throw new RemoteFunctionError("sandbox creation response did not include an id or name", {
-      remoteType: "ProtocolError",
-    });
-  }
-  return id;
-}
-
-function decodeBase64(value: string): string {
-  try {
-    const binary = atob(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return new TextDecoder().decode(bytes);
-  } catch (error) {
-    throw new RemoteFunctionError("remote function transport returned invalid base64", {
-      remoteType: "ProtocolError",
-      cause: error,
-    });
-  }
-}
-
-function forwardStdout(output: string): void {
+function defaultStdout(output: string): void {
   if (typeof process !== "undefined") {
     process.stdout.write(output);
     return;
   }
   console.log(output);
+}
+
+function defaultStderr(output: string): void {
+  if (typeof process !== "undefined") {
+    process.stderr.write(output);
+    return;
+  }
+  console.error(output);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

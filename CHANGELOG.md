@@ -27,6 +27,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `@vmon.cls` stateful remote objects with lifecycle hooks for state persistence across calls
+- Added `Gather` and `Spawn` primitives for managing parallel remote execution sessions
+- Added `connect` client factory, replacing the legacy `VmonClient` constructor
+- Added native-Go `RemoteFunction` registration for high-performance function execution
+- Added support for persistent in-guest session runners to improve remote execution performance
 - Added `vmon` single binary consolidating CLI, server, and hypervisor
 - Added Rust-native v1 HTTP API and WebSocket exec proxy
 - Added TypeScript SDK with generated OpenAPI schema
@@ -86,6 +91,9 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Migrated SDK clients to a unified `Client` interface across Go, Python, and TypeScript
+- Streamlined remote function definitions to use persistent session runners instead of per-call execution
+- Upgraded TypeScript and Go remote SDK transport logic to use session-aware dispatching
 - Renamed project from `VibeVMM` to `Vibemon`
 - Migrated CLI, daemon, and hypervisor backends to single `vmon` Rust binary
 - Switched snapshot format from bincode to postcard

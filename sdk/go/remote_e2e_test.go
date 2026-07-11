@@ -19,7 +19,7 @@ func TestRemoteFunctionE2E(t *testing.T) {
 	if serverURL == "" || token == "" {
 		t.Fatal("VMON_SERVER_URL and VMON_API_TOKEN are required")
 	}
-	client, err := NewClient(serverURL, WithToken(token))
+	client, err := Connect(serverURL, WithToken(token))
 	if err != nil {
 		t.Fatal(err)
 	}

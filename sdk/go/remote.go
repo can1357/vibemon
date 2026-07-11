@@ -359,7 +359,7 @@ func (function *RemoteFunction[Result]) Terminate(ctx context.Context) error {
 		function.terminating = termination
 		function.mu.Unlock()
 
-		_, err := function.client.TerminateSandbox(ctx, sandboxID)
+		err := function.client.Sandboxes.Ref(sandboxID).Terminate(ctx)
 		if isRemoteNotFound(err) {
 			err = nil
 		}
@@ -476,11 +476,14 @@ func (function *RemoteFunction[Result]) ensureSandbox(ctx context.Context) (stri
 		if function.sandboxID != "" {
 			sandboxID := function.sandboxID
 			function.mu.Unlock()
-			poll, err := function.client.PollSandbox(ctx, sandboxID)
+			sandbox, err := function.client.Sandboxes.Get(ctx, sandboxID)
+			if isRemoteNotFound(err) {
+				err = nil
+			}
 			if err != nil {
 				return "", err
 			}
-			if poll.Exists && !poll.Done {
+			if sandbox != nil && sandbox.Status != "stopped" && sandbox.Status != "terminated" && sandbox.Status != "failed" && sandbox.Status != "exited" {
 				return sandboxID, nil
 			}
 			function.mu.Lock()
@@ -519,11 +522,11 @@ func (function *RemoteFunction[Result]) ensureSandbox(ctx context.Context) (stri
 }
 
 func (function *RemoteFunction[Result]) provisionSandbox(ctx context.Context) (string, error) {
-	sandbox, err := function.client.CreateSandbox(ctx, function.sandboxRequest)
+	sandbox, err := function.client.Sandboxes.Create(ctx, function.sandboxRequest)
 	if err != nil {
 		return "", err
 	}
-	sandboxID := sandbox.Identifier()
+	sandboxID := sandbox.ID
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -532,7 +535,7 @@ func (function *RemoteFunction[Result]) provisionSandbox(ctx context.Context) (s
 	}()
 
 	timeout := remoteRuntimeCheckTimeout
-	check, err := function.client.ExecCapture(ctx, sandboxID, ExecRequest{
+	check, err := sandbox.Run(ctx, ExecRequest{
 		Command: []string{"node", "--version"},
 		Timeout: &timeout,
 	})
@@ -546,7 +549,7 @@ func (function *RemoteFunction[Result]) provisionSandbox(ctx context.Context) (s
 		}
 		return "", &RemoteFunctionError{RemoteType: "RuntimeUnavailable", Message: message}
 	}
-	if err := function.client.WriteFile(ctx, sandboxID, remoteFunctionRunnerPath, []byte(remoteFunctionRunner)); err != nil {
+	if err := sandbox.Files.Write(ctx, remoteFunctionRunnerPath, []byte(remoteFunctionRunner)); err != nil {
 		return "", err
 	}
 	cleanup = false
@@ -573,12 +576,12 @@ func (function *RemoteFunction[Result]) invoke(
 	if err != nil {
 		return zero, fmt.Errorf("vmon: encode remote function invocation: %w", err)
 	}
-	if err := function.client.WriteFile(ctx, sandboxID, payloadPath, payload); err != nil {
+	if err := function.client.Sandboxes.Ref(sandboxID).Files.Write(ctx, payloadPath, payload); err != nil {
 		return zero, err
 	}
 	defer function.cleanupPayload(sandboxID, payloadPath)
 
-	capture, err := function.client.ExecCapture(ctx, sandboxID, ExecRequest{
+	capture, err := function.client.Sandboxes.Ref(sandboxID).Run(ctx, ExecRequest{
 		Command: []string{"node", remoteFunctionRunnerPath, payloadPath},
 		Timeout: cloneFloatPointer(function.invocationTimeout),
 	})
@@ -656,7 +659,7 @@ func (function *RemoteFunction[Result]) invoke(
 func (function *RemoteFunction[Result]) cleanupPayload(sandboxID, path string) {
 	ctx, cancel := context.WithTimeout(context.Background(), remoteCleanupTimeout)
 	defer cancel()
-	_ = function.client.DeleteFile(ctx, sandboxID, path, false)
+	_ = function.client.Sandboxes.Ref(sandboxID).Files.Delete(ctx, path)
 }
 
 func (function *RemoteFunction[Result]) cleanupSandboxes(sandboxIDs []string) {
@@ -670,7 +673,7 @@ func (function *RemoteFunction[Result]) cleanupSandboxes(sandboxIDs []string) {
 			defer cleanups.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), remoteCleanupTimeout)
 			defer cancel()
-			_, err := function.client.TerminateSandbox(ctx, sandboxID)
+			err := function.client.Sandboxes.Ref(sandboxID).Terminate(ctx)
 			if isRemoteNotFound(err) {
 				return
 			}

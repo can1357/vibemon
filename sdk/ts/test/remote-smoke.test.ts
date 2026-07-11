@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { VmonClient } from "../src";
+import { connect } from "../src";
 
 const wantsRemoteSmoke = process.env.VMON_TS_REMOTE_SMOKE === "1";
 const serverUrl = process.env.VMON_SERVER_URL;
@@ -21,7 +21,7 @@ if (
 } else {
   test("remote function executes in a real Node guest", async () => {
     const stdout: string[] = [];
-    const remoteAdd = new VmonClient({ baseUrl: serverUrl, token: apiToken }).remoteFunction(
+    const remoteAdd = connect(serverUrl, { token: apiToken }).remoteFunction(
       function remoteAdd(left: number, right: number) {
         console.log("vmon TypeScript remote smoke");
         return { sum: left + right };

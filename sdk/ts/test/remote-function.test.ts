@@ -2,20 +2,15 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-import {
-  DEFAULT_REMOTE_FUNCTION_IMAGE,
-  RemoteFunctionError,
-  VmonApiError,
-  VmonClient,
-} from "../src";
 import type {
+  Client,
   JsonValue,
   RemoteFunctionFailureDetails,
   RemoteFunctionInvocation,
   RemoteFunctionResponse,
   VmonFetch,
 } from "../src";
+import { APIError, connect, DEFAULT_REMOTE_FUNCTION_IMAGE, RemoteFunctionError } from "../src";
 
 class Gate {
   readonly #promise: Promise<void>;
@@ -268,11 +263,11 @@ export { __vmonFakeStdout };
   }
 }
 
-function clientFor(server: FakeVmonServer): VmonClient {
-  return new VmonClient({
-    baseUrl: "https://vmon.test/root/..",
+function clientFor(server: FakeVmonServer): Client {
+  return connect("https://vmon.test/root/..", {
     token: "test-token",
     fetch: server.fetch,
+    discover: false,
   });
 }
 
@@ -413,8 +408,8 @@ test("daemon errors retain status and structured codes during provisioning", asy
     await remote.remote(1);
     throw new Error("expected sandbox provisioning to fail");
   } catch (error) {
-    expect(error).toBeInstanceOf(VmonApiError);
-    if (!(error instanceof VmonApiError)) {
+    expect(error).toBeInstanceOf(APIError);
+    if (!(error instanceof APIError)) {
       throw error;
     }
     expect(error.status).toBe(503);

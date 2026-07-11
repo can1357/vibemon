@@ -63,12 +63,19 @@ import time
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon import DaemonError, RemoteFunctionError, Sandbox, Secret, Volume, function
-from vmon._transport import VmonTransport, get_transport
-from vmon.sandbox import pool_inventory, prewarm, shutdown_all_pools
+from vmon import (
+    APIError,
+    Client,
+    RemoteFunctionError,
+    Sandbox,
+    Secret,
+    Volume,
+    connect,
+)
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
 RUN = f"e2e{os.getpid()}"
@@ -77,6 +84,7 @@ STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 
 _seq = 0
 _virtiofs: bool | None = None
+_client: Client | None = None
 
 # --------------------------------------------------------------------------- #
 # harness
@@ -89,6 +97,14 @@ class Skip(Exception):
 
 TESTS: list[Callable[[object], None]] = []
 VOLUMES: set[str] = set()
+
+
+def sdk() -> Client:
+    """Return the single object-hierarchy client used by this run."""
+    global _client
+    if _client is None:
+        _client = connect()
+    return _client
 
 
 def e2e(fn: Callable[[object], None]) -> Callable[[object], None]:
@@ -105,22 +121,25 @@ def uid(prefix: str) -> str:
 
 
 def configure_home(home: Path) -> None:
-    """Point the thin SDK and local helpers at this run's isolated server home."""
-    global STATE, _virtiofs
+    """Point the SDK and local helpers at this run's isolated server home."""
+    global STATE, _client, _virtiofs
+    if _client is not None:
+        _client.close()
+        _client = None
     STATE = home
     _virtiofs = None
     os.environ["VMON_HOME"] = str(home)
     os.environ.pop("VMON_CONTEXT", None)
 
 
-def make_sandbox(**kw: object) -> Sandbox:
+def make_sandbox(**kw: Any) -> Sandbox:
     """Create a sandbox, defaulting to no network.
 
     Feature tests boot with ``block_network=True`` since they don't need
     networking; the dedicated networking/tunnel tests opt in explicitly.
     """
     kw.setdefault("block_network", True)
-    return Sandbox.create(image=IMAGE, **kw)
+    return sdk().sandboxes.create(image=IMAGE, **kw)
 
 
 def run(
@@ -132,16 +151,17 @@ def run(
     workdir: str | None = None,
 ) -> tuple[int | None, str, str]:
     """Exec ``argv`` in ``sb``; return ``(returncode, stdout, stderr)`` as text."""
-    proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir, _track_entry=False)
+    proc = sb.exec(*argv, timeout=timeout, pty=pty, env=env, workdir=workdir)
     if not pty:
         try:
-            proc.close_stdin()
+            proc.stdin.close()
         except Exception:
             pass
     try:
-        rc = proc.wait(timeout=timeout)
+        exit_result = proc.wait(timeout=timeout)
+        rc = exit_result.code
     except TimeoutError:
-        proc.kill()
+        proc.close()
         rc = None
     out = proc.stdout.read().decode("utf-8", "replace")
     err = proc.stderr.read().decode("utf-8", "replace")
@@ -241,7 +261,7 @@ class VmonServer:
         self.log_path = home / "e2e-serve.log"
         self.config_path = home / "e2e-serve.toml"
         self.proc: subprocess.Popen[str] | None = None
-        self._log_fh = None
+        self._log_fh: io.TextIOWrapper | None = None
 
     def env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -285,12 +305,8 @@ class VmonServer:
             raise RuntimeError(f"`vmon doctor` failed:\n{check.stdout.strip()}")
 
     def healthz(self) -> dict[str, object]:
-        transport = VmonTransport.local(sock_path=self.sock)
-        try:
-            value = transport.json("GET", "/healthz")
-        finally:
-            transport.close()
-        return dict(value) if isinstance(value, dict) else {}
+        with connect(f"vmon+unix://{self.sock}", discover=False) as client:
+            return client.health()
 
     def start(self) -> None:
         self.write_config()
@@ -347,38 +363,21 @@ class VmonServer:
                 self._log_fh.close()
 
 
-def api_json(method: str, path: str, **kwargs: object) -> object:
-    transport = get_transport()
-    try:
-        return transport.json(method, path, **kwargs)
-    finally:
-        transport.close()
-
-
 def pool_stats() -> dict[str, dict[str, object]]:
-    value = api_json("GET", "/v1/pools")
-    if not isinstance(value, dict):
-        return {}
-    out: dict[str, dict[str, object]] = {}
-    for key, stats in value.items():
-        if isinstance(stats, dict):
-            out[str(key)] = dict(stats)
-    return out
+    return {pool.ref: dict(pool.stats().raw) for pool in sdk().pools.list()}
 
 
 def pool_counter(field: str) -> int:
     total = 0
     for stats in pool_stats().values():
-        with contextlib.suppress(TypeError, ValueError):
-            total += int(stats.get(field, 0))
+        value = stats.get(field, 0)
+        if isinstance(value, int | str) and not isinstance(value, bool):
+            total += int(value)
     return total
 
 
 def snapshot_names() -> set[str]:
-    value = api_json("GET", "/v1/snapshots")
-    if isinstance(value, dict) and isinstance(value.get("snapshots"), list):
-        return {str(item) for item in value["snapshots"]}
-    return set()
+    return set(sdk().snapshots.list())
 
 
 def rm_snapshot(name: str) -> None:
@@ -389,7 +388,7 @@ def rm_snapshot(name: str) -> None:
 def is_missing_error(exc: BaseException) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
-    if isinstance(exc, DaemonError):
+    if isinstance(exc, APIError):
         return exc.status == 404 or "No such file or directory" in str(exc)
     return isinstance(exc, OSError)
 
@@ -408,13 +407,13 @@ def wait_view(
     sb: Sandbox, deadline: float, predicate: Callable[[dict[str, object]], bool]
 ) -> dict[str, object]:
     end = time.time() + deadline
-    last: dict[str, object] = sb.view
+    last: dict[str, object] = dict(sb.info.raw)
     while time.time() < end:
-        last = sb.refresh()
+        last = dict(sb.refresh().raw)
         if predicate(last):
             return last
         time.sleep(0.2)
-    return sb.refresh()
+    return dict(sb.refresh().raw)
 
 
 def scan_json_for_value(root: Path, needle: str) -> list[Path]:
@@ -600,10 +599,10 @@ def t_pty(_):
         assert "TTY" in tty and "NOTTY" not in tty, f"pty stdout not a tty: {tty!r}"
         _, notty, _ = run(sb, "sh", "-lc", "test -t 1 && echo TTY || echo NOTTY")
         assert "NOTTY" in notty, f"plain exec unexpectedly a tty: {notty!r}"
-        proc = sb.exec("sh", pty=True, timeout=15, _track_entry=False)
+        proc = sb.exec("sh", pty=True, timeout=15)
         proc.resize(40, 120)
-        proc.write_stdin("exit\n")
-        assert proc.wait(timeout=15) is not None
+        proc.stdin.write("exit\n")
+        assert proc.wait(timeout=15).code == 0
     finally:
         sb.terminate()
 
@@ -613,13 +612,13 @@ def t_filesystem(_):
     """Filesystem RPC: mkdir, write/read round-trip, list, stat, remove."""
     sb = make_sandbox()
     try:
-        fs = sb.filesystem
-        fs.make_directory("/e2e/sub")
+        fs = sb.files
+        fs.mkdir("/e2e/sub")
         fs.write_text("/e2e/sub/file.txt", "hello-fs")
         assert fs.read_text("/e2e/sub/file.txt") == "hello-fs"
-        assert "file.txt" in json.dumps(fs.list_files("/e2e/sub"))
-        assert isinstance(fs.stat("/e2e/sub/file.txt"), dict)
-        fs.remove("/e2e/sub/file.txt")
+        assert any(item.name == "file.txt" for item in fs.list("/e2e/sub"))
+        assert fs.stat("/e2e/sub/file.txt").size > 0
+        fs.delete("/e2e/sub/file.txt")
         assert_missing(
             lambda: fs.read_text("/e2e/sub/file.txt"), "read of a removed file should fail"
         )
@@ -639,13 +638,12 @@ def t_suspend_resume(_):
         return int(out.strip())
 
     try:
-        sb.filesystem.write_text("/root/pre-pause", "kept")
+        sb.files.write_text("/root/pre-pause", "kept")
         heartbeat = sb.exec(
             "sh",
             "-lc",
             "while :; do printf x >> /root/pause-heartbeat; sleep 0.1; done",
             timeout=30,
-            _track_entry=False,
         )
         deadline = time.time() + 5
         start = 0
@@ -664,7 +662,7 @@ def t_suspend_resume(_):
         # A running guest adds roughly 30 beats during the host sleep. A parked
         # guest can add one expired-timer beat on resume plus RPC scheduling noise.
         assert end - start < 10, f"guest heartbeat advanced {end - start} times while paused"
-        assert sb.filesystem.read_text("/root/pre-pause") == "kept"
+        assert sb.files.read_text("/root/pre-pause") == "kept"
         rc, out, _ = run(sb, "sh", "-lc", "echo alive")
         assert rc == 0 and "alive" in out
     finally:
@@ -680,7 +678,7 @@ def t_snapshot_restore(_):
     name = uid("snap")
     restored = None
     try:
-        sb.filesystem.write_text("/root/marker", "snapshotted")
+        sb.files.write_text("/root/marker", "snapshotted")
         # Grow guest uptime well past a fresh boot so a cold reboot (uptime ~0)
         # cannot masquerade as a warm restore.
         deadline = time.time() + 20
@@ -690,8 +688,8 @@ def t_snapshot_restore(_):
             u0 = uptime(sb)
         assert u0 >= 6, f"guest uptime never reached 6s (got {u0:.1f}); cannot prove restore"
         sb.snapshot(name)
-        restored = Sandbox.from_snapshot(name, block_network=True)
-        assert restored.filesystem.read_text("/root/marker") == "snapshotted"
+        restored = sdk().snapshots.restore(name, block_network=True)
+        assert restored.files.read_text("/root/marker") == "snapshotted"
         u1 = uptime(restored)
         assert u1 >= u0 - 1, (
             f"restored uptime {u1:.1f} < pre-snapshot {u0:.1f} - 1; cold boot, not restore"
@@ -712,14 +710,14 @@ def t_fork(_):
     name = uid("forkbase")
     clones: list[Sandbox] = []
     try:
-        sb.filesystem.write_text("/root/shared", "base")
+        sb.files.write_text("/root/shared", "base")
         sb.snapshot(name)
-        clones = [Sandbox.from_snapshot(name, fork=True, block_network=True) for _ in range(2)]
+        clones = sdk().snapshots.fork(name, count=2, block_network=True)
         for c in clones:
-            assert c.filesystem.read_text("/root/shared") == "base"
-        clones[0].filesystem.write_text("/root/only0", "c0")
+            assert c.files.read_text("/root/shared") == "base"
+        clones[0].files.write_text("/root/only0", "c0")
         assert_missing(
-            lambda: clones[1].filesystem.read_text("/root/only0"),
+            lambda: clones[1].files.read_text("/root/only0"),
             "fork clones are not CoW-isolated",
         )
     finally:
@@ -740,7 +738,7 @@ def t_delta_snapshot(_):
     restored_base: Sandbox | None = None
     restored_delta: Sandbox | None = None
     try:
-        source.filesystem.write_text("/root/fill", "base")
+        source.files.write_text("/root/fill", "base")
         source.snapshot(base)
         assert base in snapshot_names(), f"base snapshot {base!r} missing from snapshot list"
         rc, _, err = run(source, "sh", "-lc", "echo post-base > /root/fill && sync")
@@ -750,12 +748,12 @@ def t_delta_snapshot(_):
         source.terminate()
         source = None
 
-        restored_base = Sandbox.from_snapshot(base, block_network=True)
-        assert restored_base.filesystem.read_text("/root/fill").strip() == "base", (
+        restored_base = sdk().snapshots.restore(base, block_network=True)
+        assert restored_base.files.read_text("/root/fill").strip() == "base", (
             "base snapshot did not preserve pre-mutation state"
         )
-        restored_delta = Sandbox.from_snapshot(delta, block_network=True)
-        assert restored_delta.filesystem.read_text("/root/fill").strip() == "post-base", (
+        restored_delta = sdk().snapshots.restore(delta, block_network=True)
+        assert restored_delta.files.read_text("/root/fill").strip() == "post-base", (
             "successive snapshot did not preserve post-mutation state"
         )
         rc, out, _ = run(restored_delta, "sh", "-lc", "echo snapshot-ok")
@@ -771,15 +769,15 @@ def t_delta_snapshot(_):
 
 @e2e
 def t_snapshot_filesystem_image(_):
-    """snapshot_filesystem yields a template that Sandbox.create(template=...) can boot."""
+    """snapshot_filesystem yields a template that client.sandboxes.create can boot."""
     sb = make_sandbox(memory=256)
     img = uid("img")
     clone = None
     try:
-        sb.filesystem.write_text("/root/img-marker", "image")
+        sb.files.write_text("/root/img-marker", "image")
         sb.snapshot_filesystem(img)
         clone = make_sandbox(template=img)
-        assert clone.filesystem.read_text("/root/img-marker") == "image"
+        assert clone.files.read_text("/root/img-marker") == "image"
     finally:
         if clone is not None:
             clone.terminate()
@@ -801,7 +799,7 @@ def t_volume_persist(_):
         sb1.terminate()
     sb2 = make_sandbox(volumes={"/data": Volume(name)})
     try:
-        assert sb2.filesystem.read_text("/data/x").strip() == "persisted"
+        assert sb2.files.read_text("/data/x").strip() == "persisted"
     finally:
         sb2.terminate()
 
@@ -819,7 +817,7 @@ def t_volume_readonly(_):
         sb.terminate()
     sb2 = make_sandbox(volumes={"/data": (Volume(name), True)})
     try:
-        assert sb2.filesystem.read_text("/data/seed").strip() == "seed"
+        assert sb2.files.read_text("/data/seed").strip() == "seed"
         rc, _, _ = run(sb2, "sh", "-lc", "echo nope > /data/seed2")
         assert rc != 0, "write to a read-only volume unexpectedly succeeded"
     finally:
@@ -835,7 +833,7 @@ def t_host_share(_):
     sb = make_sandbox(fs_dir=str(share))
     try:
         mount_virtiofs(sb, "host", "/mnt/host", ro=True)
-        assert sb.filesystem.read_text("/mnt/host/hello.txt") == "from-host"
+        assert sb.files.read_text("/mnt/host/hello.txt") == "from-host"
     finally:
         sb.terminate()
         shutil.rmtree(share, ignore_errors=True)
@@ -850,7 +848,7 @@ def t_secrets(_):
         _, out, _ = run(sb, "sh", "-lc", 'printf %s "$E2E_SECRET"')
         assert out == value, f"secret not injected: {out!r}"
         view = sb.refresh()
-        assert "secret" in (view.get("secret_names") or []), "secret bundle name not recorded"
+        assert "secret" in (view.raw.get("secret_names") or []), "secret bundle name not recorded"
         hits = scan_json_for_value(STATE, value)
         assert not hits, f"secret value leaked into persisted JSON: {hits}"
     finally:
@@ -880,7 +878,7 @@ def t_network_lease(_):
     if not net_admin():
         raise Skip("needs Linux root/CAP_NET_ADMIN for host TAP lease state")
     name = uid("net")
-    sb = Sandbox.create(image=IMAGE, name=name, block_network=False)
+    sb = sdk().sandboxes.create(image=IMAGE, name=name, block_network=False)
     try:
         entry = lease_entry(name)
         network = str(entry.get("network") or "")
@@ -899,7 +897,7 @@ def t_networking(_):
     """A networked sandbox fresh-boots with a guest IPv4 address and default route."""
     if not networking_supported():
         raise Skip("needs macOS/HVF user-net or Linux root/CAP_NET_ADMIN")
-    sb = Sandbox.create(image=IMAGE, block_network=False)
+    sb = sdk().sandboxes.create(image=IMAGE, block_network=False)
     try:
         _, addr, _ = run(sb, "ip", "-4", "addr", "show", "eth0")
         assert "inet " in addr, f"eth0 has no IPv4: {addr!r}"
@@ -914,14 +912,13 @@ def t_ports_tunnels(_):
     """An exposed guest port is reachable end-to-end through the host tunnel."""
     if not net_admin():
         raise Skip("needs Linux root/CAP_NET_ADMIN; macOS user-net has no inbound forwarding")
-    sb = Sandbox.create(image=IMAGE, ports=[18080])
+    sb = sdk().sandboxes.create(image=IMAGE, ports=[18080])
     listener = None
     try:
         tunnels = sb.tunnels()
         assert 18080 in tunnels, f"port 18080 not tunneled: {tunnels}"
         host, hport = tunnels[18080]
         assert host and int(hport) > 0, tunnels
-        assert isinstance(sb.create_connect_token(), str) and sb.create_connect_token()
         # Serve a known response inside the guest, then fetch it through the tunnel.
         listener = sb.exec(
             "sh",
@@ -929,14 +926,13 @@ def t_ports_tunnels(_):
             "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nhi'"
             " | nc -l -p 18080; done",
             timeout=60,
-            _track_entry=False,
         )
         body = wait_for_tunnel(host, int(hport), b"hi", deadline=15)
         assert b"hi" in body, f"tunnel did not deliver the guest response: {body!r}"
     finally:
         if listener is not None:
             try:
-                listener.kill()
+                listener.close()
             except Exception:
                 pass
         sb.terminate()
@@ -948,24 +944,24 @@ def t_tags_and_list(_):
     sb = make_sandbox(tags={"e2e": "yes", "run": RUN})
     try:
         view = sb.refresh()
-        assert view.get("tags", {}).get("e2e") == "yes"
-        assert view.get("tags", {}).get("run") == RUN
-        assert sb.name in [item.name for item in Sandbox.list(tag={"run": RUN})]
+        assert view.tags.get("e2e") == "yes"
+        assert view.tags.get("run") == RUN
+        assert sb.id in [item.id for item in sdk().sandboxes.list(tags={"run": RUN})]
     finally:
         sb.terminate()
 
 
 @e2e
 def t_warm_pool(_):
-    """A server-owned warm pool is stocked and consumed by Sandbox.create."""
+    """A server-owned warm pool is stocked and consumed by client.sandboxes.create."""
     handle = None
     claimed: Sandbox | None = None
     try:
-        handle = prewarm(IMAGE, count=1, memory=256)
+        handle = sdk().pools.set(IMAGE, 1, memory=256)
         end = time.time() + 180
-        while time.time() < end and sum(pool_inventory().values()) < 1:
+        while time.time() < end and pool_counter("ready") < 1:
             time.sleep(0.5)
-        ready = sum(pool_inventory().values())
+        ready = pool_counter("ready")
         assert ready >= 1, f"pool never warmed: {pool_stats()}"
         before_hits = pool_counter("hits")
         claimed = make_sandbox(memory=256)
@@ -980,7 +976,7 @@ def t_warm_pool(_):
             with contextlib.suppress(Exception):
                 claimed.remove()
         if handle is not None:
-            shutdown_all_pools()
+            sdk().pools.clear()
 
 
 @e2e
@@ -1004,11 +1000,11 @@ def t_extend(_):
     """extend moves the deadline so the sandbox survives past its original timeout."""
     sb = make_sandbox(timeout_secs=4)
     try:
-        out = sb.extend(60)
-        assert "deadline_unix" in out, f"extend did not return a deadline: {out}"
+        result = sb.extend(60)
+        assert "deadline_unix" in result.raw, f"extend did not return a deadline: {result}"
         time.sleep(7)  # past the original 4s deadline
         view = sb.refresh()
-        assert view.get("status") == "running", (
+        assert view.status == "running", (
             f"sandbox died at the original deadline despite extend: {view}"
         )
     finally:
@@ -1026,10 +1022,11 @@ def _remote_double(value: int) -> int:
 @e2e
 def t_remote_function(_):
     """Python callables execute in a cached sandbox with stdout and structured errors."""
-    remote = function(
+    remote = sdk().function(
+        _remote_double,
         image=os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"),
         block_network=True,
-    )(_remote_double)
+    )
     output = io.StringIO()
     try:
         with contextlib.redirect_stdout(output):
@@ -1055,8 +1052,8 @@ def t_async(_):
 
         async def go():
             proc = await sb.aio.exec("sh", "-lc", "printf aio")
-            rc = proc.wait(timeout=15)
-            return rc, proc.stdout.read().decode()
+            result = proc.wait(timeout=15)
+            return result.code, proc.stdout.read().decode()
 
         rc, out = asyncio.run(go())
         assert rc == 0 and out == "aio", f"rc={rc} out={out!r}"
@@ -1100,7 +1097,7 @@ def display_name(fn: Callable[[object], None]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global IMAGE
+    global IMAGE, _client
     ap = argparse.ArgumentParser(description="vmon end-to-end smoke test")
     ap.add_argument("tests", nargs="*", help="substring filters (default: run all)")
     ap.add_argument("--list", action="store_true", help="list test names and exit")
@@ -1161,6 +1158,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("failed: " + ", ".join(r[1] for r in results if r[0] == "FAIL"))
         return 1 if nfail else 0
     finally:
+        if _client is not None:
+            _client.close()
+            _client = None
         if server is not None:
             server.stop()
         if args.keep:

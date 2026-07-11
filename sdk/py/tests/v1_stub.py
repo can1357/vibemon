@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextlib
 import hashlib
-import inspect
-import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import threading
-import traceback
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,7 +39,12 @@ class StubError(Exception):
 class V1StubServer:
     """Small v1 HTTP + WebSocket server for thin-SDK behavior tests."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        node_id: str = "node-a",
+        peers: list[V1StubServer] | None = None,
+    ) -> None:
         self.requests: list[RecordedRequest] = []
         self.sandboxes: dict[str, dict[str, Any]] = {}
         self.volumes: set[str] = set()
@@ -48,6 +52,12 @@ class V1StubServer:
         self.snapshots: set[str] = set()
         self.events: list[dict[str, Any]] = [{"type": "ready", "sequence": 1}]
         self.required_token: str | None = None
+        self.drop_requests = False
+        self.node_id = node_id
+        self.mesh_peers = list(peers or [])
+        self.mesh_enabled = True
+        self._started = False
+        self._stopped = False
         self._lock = threading.RLock()
         self._next_id = 1
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
@@ -57,16 +67,30 @@ class V1StubServer:
     @property
     def url(self) -> str:
         host, port = self._server.server_address[:2]
-        return f"http://{host}:{port}"
+        rendered_host = host.decode("ascii") if isinstance(host, bytes) else host
+        return f"http://{rendered_host}:{port}"
 
-    def __enter__(self) -> V1StubServer:
-        self._thread.start()
+    def start(self) -> V1StubServer:
+        """Start serving requests and return this stub."""
+        if not self._started:
+            self._thread.start()
+            self._started = True
         return self
 
-    def __exit__(self, *_exc: object) -> None:
+    def stop(self) -> None:
+        """Stop serving requests idempotently."""
+        if not self._started or self._stopped:
+            return
+        self._stopped = True
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
+
+    def __enter__(self) -> V1StubServer:
+        return self.start()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stop()
 
     def recorded(self, method: str | None = None, path: str | None = None) -> list[RecordedRequest]:
         with self._lock:
@@ -85,7 +109,6 @@ class V1StubServer:
         return rows[-1]
 
     def _handler_class(self) -> type[BaseHTTPRequestHandler]:
-        stub_type = type(self)
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -118,7 +141,7 @@ class V1StubServer:
                 self._handle_http()
 
             def _handle_websocket(self) -> None:
-                stub: stub_type = self.server.stub  # type: ignore[attr-defined,valid-type]
+                stub: V1StubServer = self.server.stub  # type: ignore[attr-defined]
                 split = urlsplit(self.path)
                 path = split.path
                 headers = {key.lower(): value for key, value in self.headers.items()}
@@ -164,7 +187,7 @@ class V1StubServer:
                     self.close_connection = True
 
             def _handle_http(self) -> None:
-                stub: stub_type = self.server.stub  # type: ignore[attr-defined,valid-type]
+                stub: V1StubServer = self.server.stub  # type: ignore[attr-defined]
                 split = urlsplit(self.path)
                 path = split.path
                 length = int(self.headers.get("Content-Length") or "0")
@@ -183,6 +206,10 @@ class V1StubServer:
                 )
                 with stub._lock:
                     stub.requests.append(request)
+                if stub.drop_requests:
+                    self.close_connection = True
+                    self.connection.close()
+                    return
                 try:
                     status, payload, response_headers, raw = stub._dispatch(request)
                 except StubError as exc:
@@ -248,6 +275,31 @@ class V1StubServer:
         if request.path == "/v1/openapi.json" and request.method == "GET":
             return self._json_response(
                 200, {"openapi": "3.1.0", "info": {"title": "stub"}, "paths": {}}
+            )
+
+        if request.path == "/v1/mesh/status" and request.method == "GET":
+            self_node = {
+                "node_id": self.node_id,
+                "advertise": self.url,
+                "region": "test",
+                "sandboxes": [dict(sandbox["view"]) for sandbox in self.sandboxes.values()],
+            }
+            peers = [
+                {
+                    "node_id": peer.node_id,
+                    "advertise": peer.url,
+                    "region": "test",
+                }
+                for peer in self.mesh_peers
+            ]
+            return self._json_response(
+                200,
+                {
+                    "enabled": self.mesh_enabled,
+                    "self": self_node,
+                    "peers": peers,
+                    "replicas_held": 0,
+                },
             )
 
         if request.path == "/v1/pools" and request.method == "GET":
@@ -330,6 +382,15 @@ class V1StubServer:
 
         raise StubError(404, "not_found", f"unknown route {request.path}")
 
+    def _kill_procs(self, sandbox: dict[str, Any]) -> None:
+        """Kill live exec bridge processes, like vmond does when a VM dies."""
+        with self._lock:
+            procs = list(sandbox.get("procs") or ())
+            sandbox["procs"] = []
+        for proc in procs:
+            with contextlib.suppress(Exception):
+                proc.kill()
+
     def _create_sandbox(self, payload: dict[str, Any]) -> tuple[int, Any, dict[str, str], bytes]:
         with self._lock:
             sandbox_id = str(payload.get("name") or f"sb-{self._next_id}")
@@ -346,11 +407,13 @@ class V1StubServer:
                 "tags": tags,
                 "returncode": None,
                 "workdir": payload.get("workdir") or "/work",
+                "node": self.node_id,
             }
             secret_env: dict[str, str] = {}
             for item in payload.get("secrets") or []:
                 if isinstance(item, dict):
-                    values = item.get("values") if isinstance(item.get("values"), dict) else item
+                    raw_values = item.get("values")
+                    values = raw_values if isinstance(raw_values, dict) else item
                     secret_env.update({str(k): str(v) for k, v in values.items()})
             self.sandboxes[sandbox_id] = {
                 "view": view,
@@ -365,6 +428,7 @@ class V1StubServer:
                     "domain_allow": list(payload.get("egress_allow_domains") or []),
                 },
                 "tunnels": {},
+                "procs": [],
             }
         return self._json_response(201, view)
 
@@ -382,6 +446,7 @@ class V1StubServer:
             if request.method == "DELETE":
                 with self._lock:
                     self.sandboxes.pop(sandbox_id, None)
+                self._kill_procs(sandbox)
                 return self._json_response(200, {"ok": True})
         if suffix in {"stop", "terminate", "pause", "resume"} and request.method == "POST":
             statuses = {
@@ -392,6 +457,8 @@ class V1StubServer:
             }
             with self._lock:
                 sandbox["view"]["status"] = statuses[suffix]
+            if suffix in {"stop", "terminate"}:
+                self._kill_procs(sandbox)
             return self._json_response(200, dict(sandbox["view"]))
         if suffix == "extend" and request.method == "POST":
             return self._json_response(200, {"deadline_unix": 1_800_000_000})
@@ -560,6 +627,21 @@ class V1StubServer:
         if opcode != 0x1:
             return
         request = json.loads(payload.decode("utf-8"))
+        cmd = [str(part) for part in request.get("cmd") or []]
+        with self._lock:
+            sandbox = self.sandboxes.get(sandbox_id)
+            files = dict(sandbox["files"]) if sandbox is not None else {}
+        if sandbox is None:
+            self._send_ws_json(
+                sock,
+                {"error": {"code": "not_found", "message": f"unknown sandbox {sandbox_id}"}},
+            )
+            return
+        if len(cmd) >= 3 and cmd[:2] == ["python3", "-u"] and cmd[2] in files:
+            with self._lock:
+                self.requests.append(RecordedRequest("WS", path, query, headers, request, b""))
+            self._bridge_runner(sock, sandbox, request, files[cmd[2]])
+            return
         stdin = bytearray()
         while True:
             opcode, payload = read_frame_sync(sock)
@@ -587,12 +669,98 @@ class V1StubServer:
         with contextlib.suppress(Exception):
             sock.sendall(encode_frame(0x8, b""))
 
+    def _bridge_runner(
+        self, sock: Any, sandbox: dict[str, Any], request: dict[str, Any], source: bytes
+    ) -> None:
+        """Run a guest runner script as a real local subprocess, bridged full-duplex.
+
+        WS ``stdin_b64``/``eof`` frames feed the process stdin; its stdout and
+        stderr stream back as ``{"stream": ..., "b64": ...}`` frames, exit as
+        ``{"exit": code}``. Closing the WebSocket kills the process, matching
+        vmond's SIGTERM-on-disconnect behavior.
+        """
+        env = dict(os.environ)
+        env.update(sandbox["env"])
+        env.update(sandbox["secret_env"])
+        env.update({str(k): str(v) for k, v in (request.get("env") or {}).items()})
+        script = tempfile.NamedTemporaryFile("wb", suffix=".py", delete=False)
+        script.write(source)
+        script.close()
+        proc = subprocess.Popen(
+            [sys.executable, "-u", script.name],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with self._lock:
+            sandbox["procs"].append(proc)
+        send_lock = threading.Lock()
+
+        def send(value: dict[str, Any]) -> None:
+            data = json.dumps(value, separators=(",", ":")).encode("utf-8")
+            with send_lock, contextlib.suppress(Exception):
+                sock.sendall(encode_frame(0x1, data))
+
+        def pump(stream: Any, name: str) -> None:
+            fd = stream.fileno()
+            while True:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                send({"stream": name, "b64": base64.b64encode(chunk).decode("ascii")})
+
+        pumps = [
+            threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True),
+            threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True),
+        ]
+        for thread in pumps:
+            thread.start()
+
+        def waiter() -> None:
+            code = proc.wait()
+            for thread in pumps:
+                thread.join(timeout=5)
+            send({"exit": code, "signal": None})
+            with send_lock, contextlib.suppress(Exception):
+                sock.sendall(encode_frame(0x8, b""))
+
+        wait_thread = threading.Thread(target=waiter, daemon=True)
+        wait_thread.start()
+        try:
+            while True:
+                opcode, payload = read_frame_sync(sock)
+                if opcode == 0x8:
+                    return
+                if opcode != 0x1:
+                    continue
+                frame = json.loads(payload.decode("utf-8"))
+                data = frame.get("stdin_b64")
+                if isinstance(data, str) and proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.write(base64.b64decode(data))
+                        proc.stdin.flush()
+                if frame.get("eof") is True and proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+        except Exception:
+            return
+        finally:
+            proc.kill()
+            wait_thread.join(timeout=5)
+            with contextlib.suppress(OSError):
+                os.unlink(script.name)
+
     def _send_ws_json(self, sock: Any, value: dict[str, Any]) -> None:
         sock.sendall(encode_frame(0x1, json.dumps(value, separators=(",", ":")).encode("utf-8")))
 
     def _execute(
         self, sandbox_id: str, request: dict[str, Any], stdin: bytes
     ) -> tuple[bytes, bytes, int]:
+        del stdin
         with self._lock:
             sandbox = self.sandboxes[sandbox_id]
             files = sandbox["files"]
@@ -600,10 +768,6 @@ class V1StubServer:
             env.update(sandbox["secret_env"])
         env.update({str(k): str(v) for k, v in (request.get("env") or {}).items()})
         cmd = [str(part) for part in request.get("cmd") or []]
-        if cmd[:2] == ["python3", "--version"]:
-            return b"Python 3.14.0\n", b"", 0
-        if len(cmd) >= 3 and cmd[:2] == ["python3", "-u"]:
-            return self._run_remote_function(stdin), b"", 0
         if cmd == ["env"]:
             return json.dumps(env, sort_keys=True).encode("utf-8"), b"", 0
         if cmd and cmd[0] == "cat" and len(cmd) == 2:
@@ -611,32 +775,6 @@ class V1StubServer:
         if cmd and cmd[0] == "printf" and len(cmd) >= 2:
             return cmd[1].encode("utf-8"), b"", 0
         return b"", b"", 0
-
-    def _run_remote_function(self, stdin: bytes) -> bytes:
-        payload = json.loads(stdin.decode("utf-8"))
-        namespace = {"__builtins__": __builtins__, "__name__": "__vmon_stub_remote_function__"}
-        captured_stdout = io.StringIO()
-        real_stdout = sys.stdout
-        try:
-            exec(payload["source"], namespace)
-            fn = namespace[payload["name"]]
-            sys.stdout = captured_stdout
-            result = fn(*payload.get("args", ()), **payload.get("kwargs", {}))
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
-            sys.stdout = real_stdout
-            json.dumps(result)
-            response = {"ok": True, "result": result, "stdout": captured_stdout.getvalue()}
-        except BaseException as exc:
-            sys.stdout = real_stdout
-            response = {
-                "ok": False,
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-                "stdout": captured_stdout.getvalue(),
-            }
-        return json.dumps(response, separators=(",", ":")).encode("utf-8")
 
 
 def configure_context(
