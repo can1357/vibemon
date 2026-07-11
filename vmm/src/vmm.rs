@@ -188,6 +188,10 @@ pub struct Vmm {
 	timeout_secs:   Option<u64>,
 	/// Monotonic origin used for uptime and deadline math.
 	started_at:     Instant,
+	/// Snapshot name a dirty-tracking window is armed against: a delta against
+	/// exactly this base may use the hypervisor log + host-write bitmap
+	/// instead of a full RAM scan. Consumed (cleared) by that delta.
+	dirty_base:    Mutex<Option<String>>,
 	/// Active hard deadline; armed at serve start, reset live by `extend`.
 	deadline:       Option<Instant>,
 	/// Control-plane socket path; `status.json` is written beside it on exit.
@@ -2091,6 +2095,7 @@ impl Vmm {
 			console_output,
 			timeout_secs: config.timeout_secs,
 			started_at: Instant::now(),
+			dirty_base: Mutex::new(None),
 			deadline: None,
 			api_sock: config.api_sock,
 			exit_reason: Arc::new(AtomicU8::new(0)),
@@ -2102,21 +2107,35 @@ impl Vmm {
 	}
 
 	/// Restore a previously snapshotted VM (no kernel boot).
+	///
+	/// A delta snapshot (only produced by live migration) restores lazily: the
+	/// base memory file is mapped `MAP_PRIVATE` and the delta pages fault
+	/// private copies, so restore cost scales with the delta instead of guest
+	/// RAM. Lazy remote paging and pager eviction manage RAM themselves and
+	/// keep the eager path.
 	fn restore(dir: &Path, config: &Config) -> Result<Self> {
 		let image = if config.remote_page_url.is_some() {
 			snapshot::read_snapshot_metadata(dir)?
 		} else {
 			snapshot::read_snapshot(dir)?
 		};
-		let mem_bytes = image
-			.snapshot()
-			.mem_mib
-			.checked_mul(1 << 20)
-			.ok_or("snapshot memory size overflows usize")?;
-		let vm = Arc::new(Vm::new(mem_bytes)?);
-		if config.remote_page_url.is_none() {
-			snapshot::load_memory_chain(dir, &image, vm.memory())?;
-		}
+		let lazy = image.snapshot().delta.is_some()
+			&& config.remote_page_url.is_none()
+			&& config.mem_target_mib.is_none();
+		let vm = if lazy {
+			Arc::new(Vm::with_memory(snapshot::map_memory_chain_private(dir, &image)?)?)
+		} else {
+			let mem_bytes = image
+				.snapshot()
+				.mem_mib
+				.checked_mul(1 << 20)
+				.ok_or("snapshot memory size overflows usize")?;
+			let vm = Arc::new(Vm::new(mem_bytes)?);
+			if config.remote_page_url.is_none() {
+				snapshot::load_memory_chain(dir, &image, vm.memory())?;
+			}
+			vm
+		};
 		if config.ksm {
 			crate::memory::advise_mergeable(vm.memory());
 		}
@@ -2368,6 +2387,7 @@ impl Vmm {
 			console_output,
 			timeout_secs: config.timeout_secs,
 			started_at: Instant::now(),
+			dirty_base: Mutex::new(None),
 			deadline: None,
 			api_sock: config.api_sock.clone(),
 			exit_reason: Arc::new(AtomicU8::new(0)),
@@ -2778,7 +2798,7 @@ impl Vmm {
 				.resume()
 				.map(|()| json!({}))
 				.map_err(|e| control::ApiError::internal(e.to_string())),
-			ControlKind::Snapshot { name, base } => {
+			ControlKind::Snapshot { name, base, track } => {
 				if let Some(b) = &base {
 					if !snapshot::is_safe_snapshot_name(b) {
 						return Err(control::ApiError::path_denied(format!(
@@ -2796,7 +2816,7 @@ impl Vmm {
 					return Err(control::ApiError::not_paused("snapshot requires a paused VM"));
 				}
 				self
-					.snapshot(&dir, base.as_deref())
+					.snapshot(&dir, &name, base.as_deref(), track)
 					.map(|()| json!({}))
 					.map_err(|e| control::ApiError::internal(e.to_string()))
 			},
@@ -3118,7 +3138,7 @@ impl Vmm {
 	/// If `base` is `Some`, store only the pages that differ from that sibling
 	/// snapshot. User-mode NAT devices serialize libslirp's guest-visible state;
 	/// in-flight host-side sockets are intentionally not carried across restore.
-	fn snapshot(&self, dir: &Path, base: Option<&str>) -> Result<()> {
+	fn snapshot(&self, dir: &Path, name: &str, base: Option<&str>, track: bool) -> Result<()> {
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
 			RunState::Paused => {},
@@ -3260,22 +3280,46 @@ impl Vmm {
 		self.ensure_not_stopping("snapshot memory/state write")?;
 		// The pager handler remains live while paused, so reading evicted RAM
 		// through the mmap faults pages back in and snapshots the correct bytes.
-		snapshot::write_snapshot(dir, base, self.vm.memory(), move |mem_regions, delta| Snapshot {
-			version: snapshot::SNAPSHOT_VERSION,
-			arch: build_arch().to_string(),
-			backend: crate::hv::current_backend(),
-			mem_mib,
-			cpus,
-			cmdline,
-			boot_mode,
-			firmware,
-			mem_regions,
-			vcpus,
-			machine,
-			serial,
-			devices,
-			delta,
-		})?;
+		// Consume the armed dirty-tracking window when this delta chains to
+		// exactly the armed base; the fetch clears the hypervisor log, so the
+		// window is single-use either way.
+		let guest_dirty = match base {
+			Some(base_name) if self.dirty_base.lock().as_deref() == Some(base_name) => {
+				*self.dirty_base.lock() = None;
+				self.vm.take_dirty_log()?
+			},
+			_ => None,
+		};
+		snapshot::write_snapshot(
+			dir,
+			base,
+			self.vm.memory(),
+			guest_dirty,
+			move |mem_regions, delta| Snapshot {
+				version: snapshot::SNAPSHOT_VERSION,
+				arch: build_arch().to_string(),
+				backend: crate::hv::current_backend(),
+				mem_mib,
+				cpus,
+				cmdline,
+				boot_mode,
+				firmware,
+				mem_regions,
+				vcpus,
+				machine,
+				serial,
+				devices,
+				delta,
+			},
+		)?;
+		if track {
+			// Arm a fresh window against the snapshot just written, while the
+			// VM is still paused so no write can slip between dump and arm.
+			if self.vm.arm_dirty_tracking()? {
+				crate::memory::reset_dirty(self.vm.memory());
+				*self.dirty_base.lock() = Some(name.to_owned());
+			}
+		}
 		self.ensure_not_stopping("snapshot commit")?;
 		drop(serial_guard);
 		crate::metrics::record_snapshot(t0.elapsed());

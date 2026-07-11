@@ -2,14 +2,58 @@
 
 use std::{fs::File, io, os::unix::io::AsRawFd};
 
-use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap as VmGuestMemoryMmap};
+use vm_memory::{
+	Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap as VmGuestMemoryMmap,
+	bitmap::{AtomicBitmap, Bitmap},
+};
 
 use crate::result::{Result, err};
 
 const PAGE_SIZE: usize = 4096;
 
-/// Concrete guest-memory type used throughout the VMM (no dirty-page bitmap).
-pub type GuestMemoryMmap = VmGuestMemoryMmap<()>;
+/// Concrete guest-memory type used throughout the VMM.
+///
+/// Every region carries an [`vm_memory::bitmap::AtomicBitmap`] that records
+/// HOST-side writes (virtio queues and any tracked writer). Together with the
+/// hypervisor's guest-write dirty log it bounds the pages a live-migration
+/// delta must inspect; outside of an armed migration the bitmap is ignored.
+pub type GuestMemoryMmap = VmGuestMemoryMmap<AtomicBitmap>;
+
+/// Mark `[gpa, gpa + len)` dirty in the host-write bitmap.
+///
+/// Raw-pointer DMA paths (io_uring iovecs, TAP reads) write guest RAM without
+/// going through vm-memory's tracked writers and MUST call this on completion,
+/// or a live-migration delta may miss their writes.
+#[cfg_attr(
+	target_os = "macos",
+	allow(dead_code, reason = "only raw Linux DMA paths mark dirty; HVF never reads the bitmap")
+)]
+pub fn mark_dirty(mem: &GuestMemoryMmap, gpa: GuestAddress, len: usize) {
+	use vm_memory::{GuestMemoryRegion, guest_memory::GuestMemory as _};
+	let mut addr = gpa;
+	let mut remaining = len;
+	while remaining > 0 {
+		let Some(region) = mem.find_region(addr) else { return };
+		let offset = (addr.raw_value() - region.start_addr().raw_value()) as usize;
+		let region_len = usize::try_from(region.len()).unwrap_or(usize::MAX);
+		let in_region = region_len.saturating_sub(offset).min(remaining);
+		if in_region == 0 {
+			return;
+		}
+		region.bitmap().mark_dirty(offset, in_region);
+		remaining -= in_region;
+		let Some(next) = addr.checked_add(in_region as u64) else { return };
+		addr = next;
+	}
+}
+
+/// Clear every region's host-write bitmap (arming a fresh tracking window).
+pub fn reset_dirty(mem: &GuestMemoryMmap) {
+	for region in mem.iter() {
+		let mmap: &vm_memory::mmap::MmapRegion<AtomicBitmap> = region;
+		mmap.bitmap().reset();
+	}
+}
 
 /// Split a requested RAM size into guest-physical regions (`x86_64)`: all RAM
 /// below the 32-bit MMIO gap at GPA 0, the remainder relocated above 4 GiB.
@@ -250,7 +294,7 @@ pub fn create_guest_memory_private(
 			.try_clone()
 			.map_err(|e| crate::result::err(format!("cloning {}: {e}", mem_file.display())))?;
 		let fo = FileOffset::new(file, file_offset);
-		let region = MmapRegion::<()>::build(
+		let region = MmapRegion::<AtomicBitmap>::build(
 			Some(fo),
 			len,
 			libc::PROT_READ | libc::PROT_WRITE,

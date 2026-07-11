@@ -12,13 +12,16 @@
 
 use std::{
 	fs::{self, File},
-	io::{ErrorKind, Read, Seek, SeekFrom, Write},
+	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
+	num::NonZeroUsize,
+	os::unix::io::AsRawFd,
 	path::{Path, PathBuf},
+	thread,
 };
 
 use serde::{Deserialize, Serialize};
 use virtio_queue::QueueState;
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion, bitmap::Bitmap};
 use vm_superio::serial::SerialState as VmSerialState;
 
 #[cfg(target_arch = "x86_64")]
@@ -38,7 +41,13 @@ use crate::{
 pub const SNAPSHOT_VERSION: u32 = 3;
 
 const DELTA_PAGE_SIZE: u64 = 4096;
+const DELTA_PAGE_USIZE: usize = DELTA_PAGE_SIZE as usize;
 const MAX_DELTA_CHAIN_DEPTH: usize = 64;
+/// Give each diff worker at least this many pages (64 MiB) so tiny guests
+/// stay single-threaded.
+const DIFF_PAGES_PER_WORKER: u64 = 16 * 1024;
+/// Upper bound on diff worker threads.
+const DIFF_MAX_WORKERS: u64 = 16;
 
 const CURRENT_GENERATION_FILE: &str = "current-generation";
 const MANIFEST_TMP_FILE: &str = "current-generation.tmp";
@@ -325,10 +334,16 @@ pub fn is_safe_snapshot_name(name: &str) -> bool {
 }
 
 /// Transactionally write memory and state as a new generation, then publish it.
+///
+/// `guest_dirty`, when present, is the hypervisor's fetch-and-cleared
+/// guest-write dirty log (one word bitmap per RAM region); combined with the
+/// host-write bitmaps carried by `mem` it lets a delta dump inspect only pages
+/// that could have changed since `base` was captured.
 pub fn write_snapshot<F>(
 	dir: &Path,
 	base: Option<&str>,
 	mem: &GuestMemoryMmap,
+	guest_dirty: Option<Vec<Vec<u64>>>,
 	build_snapshot: F,
 ) -> Result<()>
 where
@@ -347,7 +362,8 @@ where
 		let (mem_regions, delta) = match base {
 			None => (dump_memory_file(&memory_tmp, mem)?, None),
 			Some(b) => {
-				let (r, d) = dump_delta_memory_file(&memory_tmp, dir, b, mem)?;
+				let (r, d) =
+					dump_delta_memory_file(&memory_tmp, dir, b, mem, guest_dirty.as_deref())?;
 				(r, Some(d))
 			},
 		};
@@ -1104,26 +1120,157 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
 	Ok(regions)
 }
 
+/// Read-only mmap of a whole file: lets a delta dump diff live RAM against a
+/// full base snapshot straight out of the page cache instead of copying the
+/// base into guest-sized scratch memory.
+struct FileMap {
+	ptr: *const u8,
+	len: usize,
+}
+
+// SAFETY: the mapping is immutable and privately owned; raw pointers derived
+// from it are only read by diff workers that are joined before the map drops.
+unsafe impl Send for FileMap {}
+// SAFETY: as above — concurrent readers of an immutable mapping are safe.
+unsafe impl Sync for FileMap {}
+
+impl FileMap {
+	/// Map `path` read-only, requiring it to be exactly `expected_len` bytes.
+	fn open(path: &Path, expected_len: u64) -> Result<Self> {
+		let file = File::open(path).map_err(|e| err(format!("opening {}: {e}", path.display())))?;
+		let len = file
+			.metadata()
+			.map_err(|e| err(format!("stat {}: {e}", path.display())))?
+			.len();
+		if len != expected_len {
+			return Err(err(format!(
+				"base memory file {} is {len} bytes, expected {expected_len}",
+				path.display()
+			)));
+		}
+		let len = usize::try_from(len)
+			.map_err(|_| err(format!("base memory file {} exceeds usize", path.display())))?;
+		if len == 0 {
+			return Err(err(format!("base memory file {} is empty", path.display())));
+		}
+		// SAFETY: mapping `len` readable bytes of a file we just opened; the
+		// result is checked against MAP_FAILED before use.
+		let ptr = unsafe {
+			libc::mmap(
+				std::ptr::null_mut(),
+				len,
+				libc::PROT_READ,
+				libc::MAP_PRIVATE,
+				file.as_raw_fd(),
+				0,
+			)
+		};
+		if ptr == libc::MAP_FAILED {
+			return Err(err(format!(
+				"mmap {}: {}",
+				path.display(),
+				std::io::Error::last_os_error()
+			)));
+		}
+		Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
+	}
+}
+
+impl Drop for FileMap {
+	fn drop(&mut self) {
+		// SAFETY: ptr/len came from the successful mmap in `open`, owned
+		// exclusively by this value.
+		unsafe { libc::munmap(self.ptr.cast_mut().cast::<libc::c_void>(), self.len) };
+	}
+}
+
+/// Base-snapshot RAM used for diffing: a zero-copy map of a full base's memory
+/// file, or a scratch reconstruction when the base is itself a delta chain.
+enum BaseView {
+	Mapped(FileMap),
+	Scratch(GuestMemoryMmap),
+}
+
+/// One region's live/base page pointers plus its global page window. Pointers
+/// are carried as `usize` so worker threads can capture them.
+struct RegionDiff {
+	base_ptr:   usize,
+	live_ptr:   usize,
+	pages:      u64,
+	first_page: u64,
+}
+
+fn region_diff_specs(
+	base: &BaseView,
+	live: &GuestMemoryMmap,
+	regions: &[MemRegion],
+) -> Result<Vec<RegionDiff>> {
+	let mut specs = Vec::with_capacity(regions.len());
+	let mut first_page = 0u64;
+	for region in regions {
+		let live_ptr = live
+			.get_host_address(GuestAddress(region.gpa))
+			.map_err(|e| err(format!("host address for live {gpa:#x}: {e}", gpa = region.gpa)))?
+			as usize;
+		let base_ptr = match base {
+			// In-bounds: FileMap::open checked the file covers the full region
+			// table, and region file offsets are prefix sums of region lengths.
+			BaseView::Mapped(map) => {
+				let offset = usize::try_from(region.file_offset)
+					.map_err(|_| err("region file offset exceeds usize"))?;
+				map.ptr as usize + offset
+			},
+			BaseView::Scratch(mem) => mem
+				.get_host_address(GuestAddress(region.gpa))
+				.map_err(|e| err(format!("host address for base {gpa:#x}: {e}", gpa = region.gpa)))?
+				as usize,
+		};
+		specs.push(RegionDiff {
+			base_ptr,
+			live_ptr,
+			pages: region.len / DELTA_PAGE_SIZE,
+			first_page,
+		});
+		first_page += region.len / DELTA_PAGE_SIZE;
+	}
+	Ok(specs)
+}
+
 /// Dump a delta memory file relative to `base` and return the full region table
-/// plus the delta descriptor.
+/// plus the delta descriptor. With a `guest_dirty` log, only pages flagged by
+/// the hypervisor or by the host-write bitmap are inspected; otherwise every
+/// page is compared across worker threads.
 fn dump_delta_memory_file(
 	path: &Path,
 	delta_dir: &Path,
 	base: &str,
 	live: &GuestMemoryMmap,
+	guest_dirty: Option<&[Vec<u64>]>,
 ) -> Result<(Vec<MemRegion>, DeltaMemory)> {
 	let live_regions = memory_region_table(live)?;
 	let base_dir = base_dir_of(delta_dir, base)?;
 	let base_image = read_snapshot(&base_dir)?;
 	let total_ram = regions_total_len(&live_regions)?;
-	let total_bytes =
-		usize::try_from(total_ram).map_err(|_| err("guest RAM size overflows usize"))?;
-	let scratch = memory::create_guest_memory(total_bytes)?;
-	load_layer(&base_dir, &base_image, &scratch, &live_regions, 1)?;
+	let base_view = if base_image.snapshot().delta.is_none() {
+		if !same_layout(&base_image.snapshot().mem_regions, &live_regions) {
+			return Err(err("delta base RAM layout differs from live memory"));
+		}
+		BaseView::Mapped(FileMap::open(base_image.memory_file(), total_ram)?)
+	} else {
+		let total_bytes =
+			usize::try_from(total_ram).map_err(|_| err("guest RAM size overflows usize"))?;
+		let scratch = memory::create_guest_memory(total_bytes)?;
+		load_layer(&base_dir, &base_image, &scratch, &live_regions, 1)?;
+		BaseView::Scratch(scratch)
+	};
+	let specs = region_diff_specs(&base_view, live, &live_regions)?;
 
 	let mut file =
 		File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
-	let changed = diff_pages(&scratch, live, &live_regions, &mut file)?;
+	let changed = match guest_dirty {
+		Some(log) => diff_dirty_pages(&specs, live, log, &mut file)?,
+		None => diff_pages_parallel(&specs, &mut file)?,
+	};
 	file
 		.sync_all()
 		.map_err(|e| err(format!("syncing {}: {e}", path.display())))?;
@@ -1180,48 +1327,160 @@ fn page_index_to_gpa(page: u64, regions: &[MemRegion]) -> Result<u64> {
 	Err(err(format!("delta page index {page} is outside region table")))
 }
 
-/// Compare `base` and `live` page-by-page, writing every changed live page to
-/// `out` in ascending order. Returns the LSB-first bitmap of changed pages.
-fn diff_pages(
-	base: &GuestMemoryMmap,
-	live: &GuestMemoryMmap,
-	regions: &[MemRegion],
-	out: &mut File,
-) -> Result<Vec<u8>> {
-	ensure_guest_memory_layout(base, regions, "base memory")?;
-	ensure_guest_memory_layout(live, regions, "live memory")?;
-	let total_pages = regions.iter().map(|r| r.len / DELTA_PAGE_SIZE).sum::<u64>();
+/// Compare live RAM against the base view across worker threads, then stream
+/// every changed live page to `out` in ascending page order. Returns the
+/// LSB-first changed-page bitmap.
+fn diff_pages_parallel(specs: &[RegionDiff], out: &mut File) -> Result<Vec<u8>> {
+	let total_pages: u64 = specs.iter().map(|spec| spec.pages).sum();
 	let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
-	let mut global_page: u64 = 0;
-	for region in regions {
-		let pages_in_region = region.len / DELTA_PAGE_SIZE;
-		for region_page in 0..pages_in_region {
-			let gpa = region.gpa + region_page * DELTA_PAGE_SIZE;
-			let base_ptr = base
-				.get_host_address(GuestAddress(gpa))
-				.map_err(|e| err(format!("host address for base {gpa:#x}: {e}")))?;
-			let live_ptr = live
-				.get_host_address(GuestAddress(gpa))
-				.map_err(|e| err(format!("host address for live {gpa:#x}: {e}")))?;
-			// SAFETY: both pointers were resolved from guest mappings at a
-			// page-aligned GPA produced from `regions`, and each page has
-			// exactly `DELTA_PAGE_SIZE` mapped bytes for this comparison.
-			let (base_slice, live_slice) = unsafe {
+	let hardware = thread::available_parallelism().map_or(1, NonZeroUsize::get) as u64;
+	let workers = hardware
+		.min(DIFF_MAX_WORKERS)
+		.min(total_pages.div_ceil(DIFF_PAGES_PER_WORKER))
+		.max(1);
+	// Chunks are multiples of 8 pages so each worker owns whole bitmap bytes.
+	let chunk_pages = total_pages.div_ceil(workers).div_ceil(8) * 8;
+	thread::scope(|scope| {
+		let mut rest: &mut [u8] = &mut bitmap;
+		let mut start = 0u64;
+		while start < total_pages {
+			let end = (start + chunk_pages).min(total_pages);
+			let byte_len = ((end - start).div_ceil(8)) as usize;
+			let (chunk_bits, tail) = rest.split_at_mut(byte_len);
+			rest = tail;
+			scope.spawn(move || diff_page_range(specs, start, end, chunk_bits));
+			start = end;
+		}
+	});
+	write_changed_pages(specs, &bitmap, out)?;
+	Ok(bitmap)
+}
+
+/// Fill `bits` (whose bit 0 is global page `start`) with the changed pages in
+/// `[start, end)`. Infallible: all pointers were validated by
+/// [`region_diff_specs`] and the VM is paused.
+fn diff_page_range(specs: &[RegionDiff], start: u64, end: u64, bits: &mut [u8]) {
+	for spec in specs {
+		let spec_end = spec.first_page + spec.pages;
+		if spec_end <= start {
+			continue;
+		}
+		if spec.first_page >= end {
+			break;
+		}
+		for global in start.max(spec.first_page)..end.min(spec_end) {
+			let offset = ((global - spec.first_page) * DELTA_PAGE_SIZE) as usize;
+			// SAFETY: `global` lies inside this region's page window, so both
+			// pointers address one full mapped page; base is an immutable
+			// mapping and live RAM is quiesced (VM paused) for the dump.
+			let (base_page, live_page) = unsafe {
 				(
-					std::slice::from_raw_parts(base_ptr, DELTA_PAGE_SIZE as usize),
-					std::slice::from_raw_parts(live_ptr, DELTA_PAGE_SIZE as usize),
+					std::slice::from_raw_parts((spec.base_ptr + offset) as *const u8, DELTA_PAGE_USIZE),
+					std::slice::from_raw_parts((spec.live_ptr + offset) as *const u8, DELTA_PAGE_USIZE),
 				)
 			};
-			if base_slice != live_slice {
-				let byte_idx = (global_page / 8) as usize;
-				let bit_idx = (global_page % 8) as u8;
-				bitmap[byte_idx] |= 1 << bit_idx;
-				out.write_all(live_slice)
-					.map_err(|e| err(format!("writing delta page {global_page}: {e}")))?;
+			if base_page != live_page {
+				let rel = global - start;
+				bits[(rel / 8) as usize] |= 1 << (rel % 8);
 			}
-			global_page += 1;
 		}
 	}
+}
+
+/// Stream every bitmap-flagged live page to `out` in ascending page order.
+fn write_changed_pages(specs: &[RegionDiff], bitmap: &[u8], out: &mut File) -> Result<()> {
+	let mut writer = BufWriter::with_capacity(1 << 20, out);
+	for spec in specs {
+		for page in 0..spec.pages {
+			let global = spec.first_page + page;
+			if bitmap[(global / 8) as usize] & (1 << (global % 8)) == 0 {
+				continue;
+			}
+			let offset = (page * DELTA_PAGE_SIZE) as usize;
+			// SAFETY: the page lies inside this region's live mapping (see
+			// `region_diff_specs`); the VM is paused for the dump.
+			let live_page = unsafe {
+				std::slice::from_raw_parts((spec.live_ptr + offset) as *const u8, DELTA_PAGE_USIZE)
+			};
+			writer
+				.write_all(live_page)
+				.map_err(|e| err(format!("writing delta page {global}: {e}")))?;
+		}
+	}
+	writer
+		.flush()
+		.map_err(|e| err(format!("flushing delta pages: {e}")))?;
+	Ok(())
+}
+
+/// Write only pages flagged dirty since the base was captured: the union of
+/// the hypervisor's guest-write log and the host-write bitmap that raw DMA
+/// paths mark. Every candidate is verified against the base so rewrites of
+/// identical bytes do not inflate the delta; unflagged pages are skipped
+/// entirely, making the dump O(dirty set) instead of O(guest RAM).
+fn diff_dirty_pages(
+	specs: &[RegionDiff],
+	live: &GuestMemoryMmap,
+	guest_log: &[Vec<u64>],
+	out: &mut File,
+) -> Result<Vec<u8>> {
+	if guest_log.len() != specs.len() {
+		return Err(err(format!(
+			"guest dirty log covers {} slots for {} memory regions",
+			guest_log.len(),
+			specs.len()
+		)));
+	}
+	// The hypervisor log and host-write bitmap both work at host page
+	// granularity, which may be coarser than the 4 KiB delta page.
+	// SAFETY: sysconf(_SC_PAGESIZE) has no memory-safety preconditions.
+	let host_page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+		.map_err(|_| err("host page size is not positive"))?;
+	if host_page < DELTA_PAGE_SIZE || !host_page.is_multiple_of(DELTA_PAGE_SIZE) {
+		return Err(err(format!("host page size {host_page} incompatible with delta pages")));
+	}
+	let total_pages: u64 = specs.iter().map(|spec| spec.pages).sum();
+	let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
+	let mut writer = BufWriter::with_capacity(1 << 20, out);
+	for ((spec, log), region) in specs.iter().zip(guest_log).zip(live.iter()) {
+		let host_pages = (spec.pages * DELTA_PAGE_SIZE).div_ceil(host_page);
+		if (log.len() as u64) < host_pages.div_ceil(64) {
+			return Err(err(format!(
+				"guest dirty log holds {} words for {host_pages} host pages",
+				log.len()
+			)));
+		}
+		let host_bits: &vm_memory::mmap::MmapRegion<vm_memory::bitmap::AtomicBitmap> = region;
+		let host_bitmap = host_bits.bitmap();
+		for page in 0..spec.pages {
+			let byte_offset = page * DELTA_PAGE_SIZE;
+			let host_index = byte_offset / host_page;
+			let guest_dirty = log[(host_index / 64) as usize] >> (host_index % 64) & 1 != 0;
+			let host_dirty = host_bitmap.dirty_at(byte_offset as usize);
+			if !guest_dirty && !host_dirty {
+				continue;
+			}
+			let offset = byte_offset as usize;
+			// SAFETY: the page lies inside this region's mappings (see
+			// `region_diff_specs`); base is immutable and the VM is paused.
+			let (base_page, live_page) = unsafe {
+				(
+					std::slice::from_raw_parts((spec.base_ptr + offset) as *const u8, DELTA_PAGE_USIZE),
+					std::slice::from_raw_parts((spec.live_ptr + offset) as *const u8, DELTA_PAGE_USIZE),
+				)
+			};
+			if base_page != live_page {
+				let global = spec.first_page + page;
+				bitmap[(global / 8) as usize] |= 1 << (global % 8);
+				writer
+					.write_all(live_page)
+					.map_err(|e| err(format!("writing delta page {global}: {e}")))?;
+			}
+		}
+	}
+	writer
+		.flush()
+		.map_err(|e| err(format!("flushing delta pages: {e}")))?;
 	Ok(bitmap)
 }
 
@@ -1331,6 +1590,48 @@ pub fn load_memory_chain(dir: &Path, image: &SnapshotImage, mem: &GuestMemoryMma
 	let expected = image.snapshot().mem_regions.clone();
 	ensure_guest_memory_layout(mem, &expected, "snapshot restore destination")?;
 	load_layer(dir, image, mem, &expected, 0)
+}
+
+/// Map a delta snapshot's guest RAM lazily: the deepest FULL layer's memory
+/// file becomes a `MAP_PRIVATE` mapping (clean pages shared with the host page
+/// cache) and each delta layer is applied on top, faulting private copies of
+/// only the changed pages. Restore cost scales with the delta, not guest RAM.
+///
+/// The chain directories MUST outlive the VM — the live-migration receiver
+/// keeps both installed — because unfaulted pages are read from the base file
+/// on demand.
+pub fn map_memory_chain_private(dir: &Path, image: &SnapshotImage) -> Result<GuestMemoryMmap> {
+	let expected = image.snapshot().mem_regions.clone();
+	// Walk to the deepest full layer, remembering the delta layers on the way.
+	let mut deltas: Vec<SnapshotImage> = Vec::new();
+	let mut layer_dir = dir.to_path_buf();
+	let mut layer = read_snapshot(&layer_dir)?;
+	while let Some(delta) = &layer.snapshot().delta {
+		if deltas.len() >= MAX_DELTA_CHAIN_DEPTH {
+			return Err(err(format!("snapshot delta chain exceeds max depth {MAX_DELTA_CHAIN_DEPTH}")));
+		}
+		if !same_layout(&layer.snapshot().mem_regions, &expected) {
+			return Err(err("delta chain layer RAM layout differs from top snapshot"));
+		}
+		layer_dir = base_dir_of(&layer_dir, &delta.base)?;
+		deltas.push(layer);
+		layer = read_snapshot(&layer_dir)?;
+	}
+	if !same_layout(&layer.snapshot().mem_regions, &expected) {
+		return Err(err("delta chain base RAM layout differs from top snapshot"));
+	}
+	let regions: Vec<(u64, u64, u64)> =
+		expected.iter().map(|r| (r.gpa, r.len, r.file_offset)).collect();
+	let mem = memory::create_guest_memory_private(layer.memory_file(), &regions)?;
+	for delta_layer in deltas.iter().rev() {
+		let descriptor = delta_layer
+			.snapshot()
+			.delta
+			.as_ref()
+			.expect("chain layers above the base are deltas");
+		apply_delta_pages(delta_layer.memory_file(), &mem, descriptor, &expected)?;
+	}
+	Ok(mem)
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -1940,7 +2241,9 @@ mod tests {
 		let regions = memory_region_table(&base).unwrap();
 		let tmp_path = unique_temp_path("vmon-delta-diff");
 		let mut file = File::create(&tmp_path).unwrap();
-		let bitmap = diff_pages(&base, &live, &regions, &mut file).unwrap();
+		let base_view = BaseView::Scratch(base);
+		let specs = region_diff_specs(&base_view, &live, &regions).unwrap();
+		let bitmap = diff_pages_parallel(&specs, &mut file).unwrap();
 		drop(file);
 
 		let set = bitmap.iter().map(|b| b.count_ones()).sum::<u32>();
@@ -1957,5 +2260,74 @@ mod tests {
 		// read-only comparison slice is created.
 		let restored_slice = unsafe { std::slice::from_raw_parts(restored_ptr, sz) };
 		assert_eq!(restored_slice, live_slice);
+	}
+
+	/// Contract of the dirty-window delta: flagged-but-unchanged pages are
+	/// verified against the base and dropped, unflagged pages are skipped
+	/// without inspection, and flags may arrive from either the guest-write
+	/// log or the host-write bitmap.
+	#[test]
+	fn dirty_diff_writes_only_flagged_changed_pages() {
+		let sz = 4 * 1024 * 1024usize;
+		let base = memory::create_guest_memory(sz).unwrap();
+		let live = memory::create_guest_memory(sz).unwrap();
+		let gpa = base.iter().next().unwrap().start_addr();
+
+		let base_ptr = base.get_host_address(gpa).unwrap();
+		// SAFETY: `base` owns `sz` mapped bytes starting at `gpa`; this is the
+		// only slice over it in the test.
+		let base_slice = unsafe { std::slice::from_raw_parts_mut(base_ptr, sz) };
+		for (i, b) in base_slice.iter_mut().enumerate() {
+			*b = (i % 256) as u8;
+		}
+		let live_ptr = live.get_host_address(gpa).unwrap();
+		// SAFETY: `live` owns `sz` mapped bytes starting at `gpa`; this is the
+		// only mutable slice over it in the test.
+		let live_slice = unsafe { std::slice::from_raw_parts_mut(live_ptr, sz) };
+		live_slice.copy_from_slice(base_slice);
+
+		// SAFETY: sysconf has no preconditions.
+		let host_page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+		let group = (host_page / DELTA_PAGE_SIZE).max(1) as usize;
+		// Three delta pages in three distinct host pages: `changed_host`
+		// (changed + host-flagged), `changed_guest` (changed + guest-flagged),
+		// and `silent` (changed but never flagged -> must be skipped).
+		let changed_host = group;
+		let changed_guest = 2 * group;
+		let silent = 3 * group;
+		for page in [changed_host, changed_guest, silent] {
+			live_slice[page * DELTA_PAGE_USIZE] ^= 0xff;
+		}
+		memory::mark_dirty(
+			&live,
+			GuestAddress(gpa.raw_value() + (changed_host * DELTA_PAGE_USIZE) as u64),
+			DELTA_PAGE_USIZE,
+		);
+		// Guest log flags `changed_guest`'s host page plus an unchanged host
+		// page (a false positive that verification must drop).
+		let host_pages = (sz as u64).div_ceil(host_page);
+		let mut log = vec![0u64; host_pages.div_ceil(64) as usize];
+		for host_index in [
+			(changed_guest as u64 * DELTA_PAGE_SIZE) / host_page,
+			(4 * group as u64 * DELTA_PAGE_SIZE) / host_page,
+		] {
+			log[(host_index / 64) as usize] |= 1 << (host_index % 64);
+		}
+
+		let regions = memory_region_table(&base).unwrap();
+		let base_view = BaseView::Scratch(base);
+		let specs = region_diff_specs(&base_view, &live, &regions).unwrap();
+		let tmp_path = unique_temp_path("vmon-dirty-diff");
+		let mut file = File::create(&tmp_path).unwrap();
+		let bitmap = diff_dirty_pages(&specs, &live, &[log], &mut file).unwrap();
+		drop(file);
+		let _ = fs::remove_file(&tmp_path);
+
+		let bit = |page: usize| bitmap[page / 8] & (1 << (page % 8)) != 0;
+		assert!(bit(changed_host), "host-flagged changed page must be captured");
+		assert!(bit(changed_guest), "guest-flagged changed page must be captured");
+		assert!(!bit(silent), "unflagged page is skipped by contract");
+		let set = bitmap.iter().map(|b| b.count_ones()).sum::<u32>();
+		assert_eq!(set, 2, "false positives must be verified away");
 	}
 }

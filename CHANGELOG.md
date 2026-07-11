@@ -28,6 +28,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added live-migration support with lazy RAM restoration and optimized memory delta transfers
+- Added guest-write dirty page tracking to accelerate delta snapshot generation
+- Added parallel block-level disk diffing to speed up migration synchronization
 - Added `max_inputs_outstanding` flow control to `stream_inputs` for durable functions
 - Added incremental artifact uploading with size and quota validation
 - Added `ListResults` API for paginated retrieval of durable function execution results

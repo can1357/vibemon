@@ -94,6 +94,17 @@ impl Vm {
 		map_guest_memory(memory)
 	}
 
+	/// HVF has no guest-write dirty log; live-migration deltas fall back to a
+	/// full parallel page diff on this backend.
+	pub fn arm_dirty_tracking(&self) -> Result<bool> {
+		Ok(false)
+	}
+
+	/// Always `None` on HVF (see [`Self::arm_dirty_tracking`]).
+	pub fn take_dirty_log(&self) -> Result<Option<Vec<Vec<u64>>>> {
+		Ok(None)
+	}
+
 	/// Create a vCPU on the caller's thread and report when it is inside HVF.
 	pub fn create_vcpu(&self, id: u8, hv_run: Arc<AtomicBool>) -> Result<Vcpu> {
 		create_vcpu(&self.instance, self.psci.clone(), self.ioevents.clone(), id, hv_run)

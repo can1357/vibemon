@@ -224,7 +224,7 @@ pub enum ControlKind {
 	Info,
 	Pause,
 	Resume,
-	Snapshot { name: String, base: Option<String> },
+	Snapshot { name: String, base: Option<String>, track: bool },
 	Quit,
 	Metrics,
 	Extend { secs: u64 },
@@ -937,7 +937,14 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 					return Err(ApiError::bad_request("snapshot params.base must be a string"));
 				},
 			};
-			ControlKind::Snapshot { name: name.to_owned(), base }
+			let track = match request.params.get("track") {
+				None | Some(serde_json::Value::Null) => false,
+				Some(serde_json::Value::Bool(track)) => *track,
+				Some(_) => {
+					return Err(ApiError::bad_request("snapshot params.track must be a boolean"));
+				},
+			};
+			ControlKind::Snapshot { name: name.to_owned(), base, track }
 		},
 		"quit" => ControlKind::Quit,
 		"metrics" => ControlKind::Metrics,
@@ -968,17 +975,20 @@ mod tests {
 			ControlKind::Snapshot {
 				name,
 				base: None,
+				track: false,
 			} if name == "safe"
 		));
 
-		let (_, kind) =
-			parse_request(r#"{"id":8,"method":"snapshot","params":{"name":"d","base":"base0"}}"#)
-				.unwrap();
+		let (_, kind) = parse_request(
+			r#"{"id":8,"method":"snapshot","params":{"name":"d","base":"base0","track":true}}"#,
+		)
+		.unwrap();
 		assert!(matches!(
 			kind,
 			ControlKind::Snapshot {
 				name,
 				base,
+				track: true,
 			} if name == "d" && base.as_deref() == Some("base0")
 		));
 

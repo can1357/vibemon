@@ -164,14 +164,17 @@ const DEVICE_ID_LEN: usize = 20;
 /// `writev` submitted for this request; the kernel dereferences them after we
 /// return from `process_queue_notify`, so the `Vec` must live here (its heap
 /// buffer address is stable across the moves into the table) until the matching
-/// completion arrives.
+/// completion arrives. `guest_ranges` mirrors the IN-request iovecs as GPA
+/// ranges (empty for OUT) so the reaper can mark the kernel's raw-pointer
+/// writes in the dirty bitmap (migration-delta contract).
 #[cfg(target_os = "linux")]
 struct PendingReq {
-	head:        u16,
-	status_addr: GuestAddress,
-	data_len:    u32,
-	req_type:    u32,
-	iovecs:      Vec<libc::iovec>,
+	head:         u16,
+	status_addr:  GuestAddress,
+	data_len:     u32,
+	req_type:     u32,
+	iovecs:       Vec<libc::iovec>,
+	guest_ranges: Vec<(GuestAddress, u32)>,
 }
 
 // SAFETY: each `iov_base` points into the device's guest-memory mapping, which
@@ -188,6 +191,24 @@ struct PendingReq {
 // outlives the in-flight request; only the single device worker thread accesses
 // them, so moving ownership to that worker is sound.
 unsafe impl Send for PendingReq {}
+
+/// Mark the first `written` bytes of an IN request's data descriptors dirty.
+///
+/// `io_uring` read completions land in guest RAM through the raw iovec
+/// pointers, bypassing vm-memory's tracked writers; without this a
+/// live-migration memory delta would miss the DMA and ship stale RAM.
+#[cfg(target_os = "linux")]
+fn mark_guest_ranges_dirty(mem: &GuestMemoryMmap, ranges: &[(GuestAddress, u32)], written: usize) {
+	let mut remaining = written;
+	for &(addr, len) in ranges {
+		if remaining == 0 {
+			break;
+		}
+		let n = remaining.min(len as usize);
+		crate::memory::mark_dirty(mem, addr, n);
+		remaining -= n;
+	}
+}
 
 /// What happened to one processed descriptor chain.
 enum Outcome {
@@ -325,6 +346,12 @@ impl Block {
 			let data_len = req.data_len;
 			let req_type = req.req_type;
 			let res = cqe.result();
+			// A read completion means the kernel wrote guest RAM through the raw
+			// iovec pointers, invisibly to vm-memory's bitmap; mark exactly the
+			// bytes it reported written (migration-delta contract).
+			if req_type == VIRTIO_BLK_T_IN && res > 0 {
+				mark_guest_ranges_dirty(&mem, &req.guest_ranges, res as usize);
+			}
 			// io_uring data ops must transfer the full request length; a short
 			// count means partial/stale guest data -> IOERR (the old synchronous
 			// path used read_exact_at / write_all_at).
@@ -356,10 +383,23 @@ impl Block {
 		Ok(())
 	}
 
-	/// Consume completions without touching guest memory during a device reset.
+	/// Consume completions during a device reset without completing them (no
+	/// status or used-ring writes). Read DMA is still recorded in the dirty
+	/// bitmap: the kernel already wrote guest RAM through the raw iovecs, and a
+	/// live-migration delta must not miss it (migration-delta contract).
 	fn discard_completed(&mut self) {
+		let mem = self.mem.clone();
 		for cqe in self.ring.completion() {
-			self.pending.remove(&cqe.user_data());
+			let Some(req) = self.pending.remove(&cqe.user_data()) else {
+				continue;
+			};
+			let res = cqe.result();
+			if req.req_type == VIRTIO_BLK_T_IN
+				&& res > 0
+				&& let Some(mem) = &mem
+			{
+				mark_guest_ranges_dirty(mem, &req.guest_ranges, res as usize);
+			}
 		}
 	}
 
@@ -711,8 +751,12 @@ pub(super) mod linux {
 				}
 
 				// Build iovecs pointing straight at guest-memory host addresses — no
-				// bounce buffer, no copy.
+				// bounce buffer, no copy. For reads, keep the matching GPA ranges:
+				// the kernel's completion writes bypass vm-memory's dirty tracking,
+				// so the reaper must mark them itself (migration-delta contract).
 				let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(data_descs.len());
+				let mut guest_ranges: Vec<(GuestAddress, u32)> =
+					Vec::with_capacity(if is_read { data_descs.len() } else { 0 });
 				for d in data_descs {
 					if d.len() == 0 {
 						continue;
@@ -721,10 +765,15 @@ pub(super) mod linux {
 						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 					}
 					match mem.get_host_address(d.addr()) {
-						Ok(ptr) => iovecs.push(libc::iovec {
-							iov_base: ptr as *mut libc::c_void,
-							iov_len:  d.len() as usize,
-						}),
+						Ok(ptr) => {
+							iovecs.push(libc::iovec {
+								iov_base: ptr as *mut libc::c_void,
+								iov_len:  d.len() as usize,
+							});
+							if is_read {
+								guest_ranges.push((d.addr(), d.len()));
+							}
+						},
 						Err(_) => {
 							return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 						},
@@ -743,6 +792,7 @@ pub(super) mod linux {
 					data_len: total_len,
 					req_type,
 					iovecs,
+					guest_ranges,
 				});
 
 				// Read the now-stable iovec backing back out of the table to build
@@ -1145,5 +1195,54 @@ mod tests {
 		let err = overlay_err(&base, &link_dest);
 		assert!(err.contains("already exists"), "unexpected error: {err}");
 		assert_eq!(std::fs::read(&victim).expect("read victim after rejected overlay"), b"victim");
+	}
+
+	/// A reaped IN completion must mark exactly the written prefix of its data
+	/// descriptors (migration-delta contract); ranges are marked in order and
+	/// the spill into a later range is honored.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn mark_guest_ranges_dirty_marks_only_the_written_prefix() {
+		use vm_memory::bitmap::Bitmap;
+
+		// 256 KiB ranges / margins dwarf any real host page size (4-64 KiB), so
+		// the assertions hold regardless of the bitmap's page granularity.
+		const RANGE_LEN: usize = 0x4_0000;
+		let mem =
+			GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).expect("guest memory");
+		let ranges = [(GuestAddress(0), RANGE_LEN as u32), (GuestAddress(0x8_0000), RANGE_LEN as u32)];
+
+		// One byte spills past the first range into the second.
+		mark_guest_ranges_dirty(&mem, &ranges, RANGE_LEN + 1);
+
+		let region = mem.iter().next().expect("region");
+		let bitmap: &vm_memory::bitmap::AtomicBitmap =
+			vm_memory::mmap::MmapRegion::bitmap(region);
+		assert!(bitmap.dirty_at(0), "first range start must be dirty");
+		assert!(bitmap.dirty_at(RANGE_LEN - 1), "first range end must be dirty");
+		assert!(bitmap.dirty_at(0x8_0000), "spill byte in second range must be dirty");
+		assert!(!bitmap.dirty_at(0x6_0000), "gap between the ranges must stay clean");
+		assert!(!bitmap.dirty_at(0x9_0000), "unwritten tail of the second range must stay clean");
+	}
+
+	/// A short read marks only the bytes the kernel reported written; untouched
+	/// ranges stay clean so migration deltas remain tight.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn mark_guest_ranges_dirty_stops_at_short_read() {
+		use vm_memory::bitmap::Bitmap;
+
+		let mem =
+			GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).expect("guest memory");
+		let ranges = [(GuestAddress(0), 0x4_0000), (GuestAddress(0x8_0000), 0x4_0000)];
+
+		mark_guest_ranges_dirty(&mem, &ranges, 1);
+
+		let region = mem.iter().next().expect("region");
+		let bitmap: &vm_memory::bitmap::AtomicBitmap =
+			vm_memory::mmap::MmapRegion::bitmap(region);
+		assert!(bitmap.dirty_at(0), "the single written byte must be dirty");
+		assert!(!bitmap.dirty_at(0x6_0000), "bytes past the short read must stay clean");
+		assert!(!bitmap.dirty_at(0x8_0000), "the second range must stay clean");
 	}
 }

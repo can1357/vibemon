@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{IoEventAddress, Kvm, NoDatamatch, VmFd};
@@ -94,6 +94,40 @@ impl Vm {
 			unsafe { fd.set_user_memory_region(region)? };
 		}
 		Ok(())
+	}
+
+	/// Re-register every RAM slot with KVM dirty-page logging enabled; the log
+	/// starts clean and records guest writes from this point on. Returns
+	/// `true`: the KVM backend supports guest-write tracking.
+	pub fn arm_dirty_tracking(&self) -> Result<bool> {
+		for (slot, region) in self.memory.iter().enumerate() {
+			let slot = u32::try_from(slot)?;
+			let region = kvm_userspace_memory_region {
+				slot,
+				guest_phys_addr: region.start_addr().raw_value(),
+				memory_size: region.len(),
+				userspace_addr: region.as_ptr() as u64,
+				flags: KVM_MEM_LOG_DIRTY_PAGES,
+			};
+			// SAFETY: re-registers the exact mapping installed by
+			// `register_memory` (same slot, GPA, size, and host address); only
+			// the dirty-logging flag changes.
+			unsafe { self.fd.set_user_memory_region(region)? };
+		}
+		Ok(true)
+	}
+
+	/// Fetch-and-clear the guest-write dirty bitmap of every RAM slot, one
+	/// LSB-first `u64` word bitmap per slot in region order (4 KiB pages).
+	/// Returns `None` when dirty logging is unsupported by the backend.
+	pub fn take_dirty_log(&self) -> Result<Option<Vec<Vec<u64>>>> {
+		let mut logs = Vec::new();
+		for (slot, region) in self.memory.iter().enumerate() {
+			let len = usize::try_from(region.len())
+				.map_err(|_| crate::result::err("guest memory region exceeds usize"))?;
+			logs.push(self.fd.get_dirty_log(u32::try_from(slot)?, len)?);
+		}
+		Ok(Some(logs))
 	}
 
 	/// Create a backend-owned vCPU with the given index.

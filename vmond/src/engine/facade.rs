@@ -972,13 +972,14 @@ impl Engine {
 		keep_running: bool,
 		disk_src: Option<&Path>,
 		snapshot_root: &Path,
+		track: bool,
 	) -> Result<PathBuf> {
 		let dir = snapshot_root.join(name);
 		let mut control = control_for_vm(vm)?;
 		control.pause()?;
 		// Copy the disk while still paused so the image matches the captured
 		// memory/state exactly; on APFS this is a cheap clone.
-		let snapshot_result = control.snapshot(name, None).and_then(|_| {
+		let snapshot_result = control.snapshot(name, None, track).and_then(|_| {
 			if let Some(disk_src) = disk_src.filter(|path| path.is_file()) {
 				fs::create_dir_all(&dir)?;
 				fs::copy(disk_src, dir.join("rootfs.img"))?;
@@ -1330,13 +1331,20 @@ impl Engine {
 		&self,
 		sid: &str,
 		kind: &str,
+		track: bool,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
 		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
 		let vm = MicroVm::new(sid);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let snapshot_dir =
-			Self::snapshot_machine(&vm, &snapshot, true, disk.as_deref(), &self.snapshot_root())?;
+		let snapshot_dir = Self::snapshot_machine(
+			&vm,
+			&snapshot,
+			true,
+			disk.as_deref(),
+			&self.snapshot_root(),
+			track,
+		)?;
 		stamp_checkpoint_rootfs(self.home(), &snapshot_dir, record.detail.as_object())?;
 		stamp_checkpoint_marker(&snapshot_dir, record.detail.as_object())?;
 		capture_checkpoint_volumes(self.home(), &snapshot_dir, record.detail.get("volumes"))?;
@@ -1355,7 +1363,7 @@ impl Engine {
 		&self,
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
-		let prep = self.mesh_checkpoint_for(sid, "replica")?;
+		let prep = self.mesh_checkpoint_for(sid, "replica", false)?;
 		self.mesh_update_detail_fields(
 			sid,
 			Map::from_iter([("checkpoint_ts".to_owned(), json!(unix_time()))]),
@@ -1370,7 +1378,7 @@ impl Engine {
 		&self,
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
-		self.mesh_checkpoint_for(sid, "migrate")
+		self.mesh_checkpoint_for(sid, "migrate", true)
 	}
 
 	/// Live-migration phase 2: pause the source and capture a delta
@@ -1406,7 +1414,7 @@ impl Engine {
 		let mut control = control_for_vm(&vm)?;
 		control.pause()?;
 		let captured = (|| {
-			control.snapshot(&snapshot, Some(base_name))?;
+			control.snapshot(&snapshot, Some(base_name), false)?;
 			if let Some(disk) = disk.as_deref() {
 				let base_rootfs = base_dir.join("rootfs.img");
 				if base_rootfs.is_file() {
@@ -1644,6 +1652,7 @@ impl TemplateBooter for Engine {
 				false,
 				Some(&spec.rootfs_ext4),
 				&spec.snapshot_root,
+				false,
 			)?;
 			Ok(())
 		})();
@@ -2256,7 +2265,7 @@ impl EngineApi for Engine {
 		let vm = MicroVm::new(id);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
 		let dir =
-			Self::snapshot_machine(&vm, &snapshot, !stop, disk.as_deref(), &self.snapshot_root())?;
+			Self::snapshot_machine(&vm, &snapshot, !stop, disk.as_deref(), &self.snapshot_root(), false)?;
 		if stop {
 			let rc = self.teardown(&record);
 			self.persist_status(id, "stopped", rc, None)?;

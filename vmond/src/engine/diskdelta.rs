@@ -14,6 +14,7 @@ use std::{
 	fs::{File, OpenOptions},
 	io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
 	path::Path,
+	thread,
 };
 
 use crate::error::{EngineError, Result};
@@ -28,23 +29,46 @@ const MAGIC: [u8; 8] = *b"VMONDSK1";
 const BLOCK_LEN: usize = 64 * 1024;
 /// Hard cap on a single record's data, coalescing included.
 const MAX_RECORD_LEN: usize = 4 * 1024 * 1024;
+/// Cap on compare worker threads; past this disk bandwidth, not CPU, is the
+/// bottleneck.
+const MAX_COMPARE_WORKERS: u64 = 8;
+/// Smallest per-worker compare chunk; images below this stay on the
+/// single-threaded path where thread fan-out cannot pay for itself.
+const MIN_COMPARE_CHUNK_LEN: u64 = 64 * 1024 * 1024;
+/// Read slab of the compare phase: whole blocks per read to cut syscalls;
+/// the compare grid itself stays [`BLOCK_LEN`].
+const COMPARE_BUF_LEN: usize = 16 * BLOCK_LEN;
 
 /// Diff `current` against `base` in [`BLOCK_LEN`] blocks and write the block
 /// delta to `out`; returns the total data bytes recorded (identical images
 /// produce a header-only delta and return 0).
+///
+/// The compare runs inside the live-migration blackout, so it fans out over
+/// up to [`MAX_COMPARE_WORKERS`] threads; the emitted delta stays
+/// byte-identical to a sequential scan.
 pub fn write_disk_delta(base: &Path, current: &Path, out: &Path) -> Result<u64> {
+	write_disk_delta_chunked(base, current, out, None)
+}
+
+/// [`write_disk_delta`] with an explicit compare chunk length; `None` sizes
+/// chunks via [`compare_chunk_len`]. Tests pass small chunks to exercise the
+/// parallel merge without gigabyte images.
+fn write_disk_delta_chunked(
+	base: &Path,
+	current: &Path,
+	out: &Path,
+	chunk_len: Option<u64>,
+) -> Result<u64> {
 	let base_file = open_for_delta(base)?;
-	let current_file = open_for_delta(current)?;
 	let base_len = file_len(&base_file, base)?;
+	drop(base_file);
+	let mut current_file = open_for_delta(current)?;
 	let current_len = file_len(&current_file, current)?;
 
-	let mut base_reader = BufReader::with_capacity(BLOCK_LEN, base_file);
-	let mut current_reader = BufReader::with_capacity(BLOCK_LEN, current_file);
 	let out_file = File::create(out).map_err(|err| {
 		EngineError::engine(format!("creating disk delta {}: {err}", out.display()))
 	})?;
 	let mut writer = BufWriter::with_capacity(BLOCK_LEN, out_file);
-
 	let write_err =
 		|err: io::Error| EngineError::engine(format!("writing disk delta {}: {err}", out.display()));
 	writer.write_all(&MAGIC).map_err(write_err)?;
@@ -55,37 +79,147 @@ pub fn write_disk_delta(base: &Path, current: &Path, out: &Path) -> Result<u64> 
 		.write_all(&current_len.to_le_bytes())
 		.map_err(write_err)?;
 
-	let mut base_block = vec![0u8; BLOCK_LEN];
-	let mut current_block = vec![0u8; BLOCK_LEN];
-	let mut pending: Vec<u8> = Vec::new();
-	let mut pending_offset = 0u64;
-	let mut total = 0u64;
-	let mut offset = 0u64;
-	while offset < current_len {
-		let want = (current_len - offset).min(BLOCK_LEN as u64) as usize;
-		read_block(&mut current_reader, &mut current_block[..want], current)?;
-		let base_want = base_len.saturating_sub(offset).min(BLOCK_LEN as u64) as usize;
-		read_block(&mut base_reader, &mut base_block[..base_want], base)?;
+	// Only blocks fully covered by the base need a content compare; from the
+	// first block not fully covered onward (a shorter base's ragged last
+	// block plus any grown tail) every byte counts as changed.
+	let compare_end = if current_len <= base_len {
+		current_len
+	} else {
+		base_len - base_len % BLOCK_LEN as u64
+	};
+	let chunk_len = chunk_len.unwrap_or_else(|| compare_chunk_len(compare_end));
+	let mut runs = compare_chunks(base, current, compare_end, chunk_len)?;
+	if current_len > compare_end {
+		push_run(&mut runs, compare_end, current_len - compare_end);
+	}
 
-		// A block is changed when the current bytes are not covered
-		// byte-for-byte by the base; any region past min(base_len,
-		// current_len) counts as changed.
-		let changed = want > base_want || current_block[..want] != base_block[..want];
-		if changed {
-			let contiguous = !pending.is_empty()
-				&& pending_offset + pending.len() as u64 == offset
-				&& pending.len() + want <= MAX_RECORD_LEN;
-			if !contiguous {
-				total += flush_record(&mut writer, pending_offset, &mut pending, out)?;
-				pending_offset = offset;
+	// Emit the runs as records, splitting at the cap exactly like the
+	// sequential scan did and re-reading record data from `current`.
+	let read_err = |err: io::Error| {
+		EngineError::engine(format!("reading {} for disk delta: {err}", current.display()))
+	};
+	let mut data: Vec<u8> = Vec::new();
+	let mut total = 0u64;
+	for (run_offset, run_len) in runs {
+		let mut offset = run_offset;
+		let mut remaining = run_len;
+		while remaining > 0 {
+			let len = remaining.min(MAX_RECORD_LEN as u64);
+			data.resize(len as usize, 0);
+			current_file
+				.seek(SeekFrom::Start(offset))
+				.map_err(read_err)?;
+			current_file.read_exact(&mut data).map_err(read_err)?;
+			total += flush_record(&mut writer, offset, &mut data, out)?;
+			offset += len;
+			remaining -= len;
+		}
+	}
+	writer.flush().map_err(write_err)?;
+	Ok(total)
+}
+
+/// Default compare chunk length: the compared range split over up to
+/// [`MAX_COMPARE_WORKERS`] threads in whole blocks, floored at
+/// [`MIN_COMPARE_CHUNK_LEN`] so small images stay single-threaded.
+fn compare_chunk_len(compare_end: u64) -> u64 {
+	let workers = thread::available_parallelism()
+		.map_or(1, |count| count.get() as u64)
+		.min(MAX_COMPARE_WORKERS);
+	compare_end
+		.div_ceil(workers)
+		.next_multiple_of(BLOCK_LEN as u64)
+		.max(MIN_COMPARE_CHUNK_LEN)
+}
+
+/// Changed-block runs over `[0, compare_end)`, one worker thread per
+/// `chunk_len`-sized chunk (inline for a single chunk), joined in chunk
+/// order and coalesced across chunk boundaries exactly like a sequential
+/// scan.
+fn compare_chunks(
+	base: &Path,
+	current: &Path,
+	compare_end: u64,
+	chunk_len: u64,
+) -> Result<Vec<(u64, u64)>> {
+	debug_assert!(
+		chunk_len > 0 && chunk_len.is_multiple_of(BLOCK_LEN as u64),
+		"compare chunks must be whole blocks"
+	);
+	let chunk_count = compare_end.div_ceil(chunk_len);
+	if chunk_count <= 1 {
+		return diff_chunk(base, current, 0, compare_end);
+	}
+	let per_chunk = thread::scope(|scope| {
+		let workers: Vec<_> = (0..chunk_count)
+			.map(|index| {
+				let start = index * chunk_len;
+				let end = compare_end.min(start + chunk_len);
+				scope.spawn(move || diff_chunk(base, current, start, end))
+			})
+			.collect();
+		workers
+			.into_iter()
+			.map(thread::ScopedJoinHandle::join)
+			.collect::<Vec<_>>()
+	});
+	let mut runs = Vec::new();
+	for joined in per_chunk {
+		let chunk_runs =
+			joined.map_err(|_| EngineError::engine("disk delta compare worker panicked"))??;
+		for (offset, len) in chunk_runs {
+			push_run(&mut runs, offset, len);
+		}
+	}
+	Ok(runs)
+}
+
+/// Changed-block runs (offset plus length, adjacent changed blocks coalesced
+/// without a cap) for the compare chunk `[start, end)`; `start` must be
+/// block-aligned and both images must fully cover the range.
+fn diff_chunk(base: &Path, current: &Path, start: u64, end: u64) -> Result<Vec<(u64, u64)>> {
+	if start >= end {
+		return Ok(Vec::new());
+	}
+	let mut base_file = chunk_file(base, start)?;
+	let mut current_file = chunk_file(current, start)?;
+	let mut base_buf = vec![0u8; COMPARE_BUF_LEN];
+	let mut current_buf = vec![0u8; COMPARE_BUF_LEN];
+	let mut runs = Vec::new();
+	let mut offset = start;
+	while offset < end {
+		let want = (end - offset).min(COMPARE_BUF_LEN as u64) as usize;
+		read_block(&mut current_file, &mut current_buf[..want], current)?;
+		read_block(&mut base_file, &mut base_buf[..want], base)?;
+		for at in (0..want).step_by(BLOCK_LEN) {
+			let len = want.min(at + BLOCK_LEN) - at;
+			if current_buf[at..at + len] != base_buf[at..at + len] {
+				push_run(&mut runs, offset + at as u64, len as u64);
 			}
-			pending.extend_from_slice(&current_block[..want]);
 		}
 		offset += want as u64;
 	}
-	total += flush_record(&mut writer, pending_offset, &mut pending, out)?;
-	writer.flush().map_err(write_err)?;
-	Ok(total)
+	Ok(runs)
+}
+
+/// Image file positioned at `start` for a compare chunk.
+fn chunk_file(path: &Path, start: u64) -> Result<File> {
+	let mut file = open_for_delta(path)?;
+	file.seek(SeekFrom::Start(start)).map_err(|err| {
+		EngineError::engine(format!("seeking {} for disk delta: {err}", path.display()))
+	})?;
+	Ok(file)
+}
+
+/// Append a changed run, merging it into the previous one when contiguous.
+fn push_run(runs: &mut Vec<(u64, u64)>, offset: u64, len: u64) {
+	if len == 0 {
+		return;
+	}
+	match runs.last_mut() {
+		Some((last_offset, last_len)) if *last_offset + *last_len == offset => *last_len += len,
+		_ => runs.push((offset, len)),
+	}
 }
 
 /// Apply a delta produced by [`write_disk_delta`] onto `target` in place.
@@ -364,6 +498,49 @@ mod tests {
 		fs::write(path, buf).expect("write crafted delta");
 	}
 
+	/// Byte equality with a first-divergence index instead of a byte dump.
+	fn assert_same_bytes(got: &[u8], want: &[u8], what: &str) {
+		assert_eq!(got.len(), want.len(), "{what}: length");
+		if got != want {
+			let at = got.iter().zip(want).position(|(a, b)| a != b);
+			panic!("{what}: bytes diverge at {at:?}");
+		}
+	}
+
+	/// In-memory sequential reference of the block diff: `(offset, data)`
+	/// records with the same coalescing and [`MAX_RECORD_LEN`] cap as
+	/// [`write_disk_delta`].
+	fn reference_records(base: &[u8], current: &[u8]) -> Vec<(u64, Vec<u8>)> {
+		let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
+		let mut offset = 0usize;
+		while offset < current.len() {
+			let want = (current.len() - offset).min(BLOCK_LEN);
+			let block = &current[offset..offset + want];
+			let changed = base.len() < offset + want || block != &base[offset..offset + want];
+			if changed {
+				match records.last_mut() {
+					Some((record_offset, data))
+						if *record_offset as usize + data.len() == offset
+							&& data.len() + want <= MAX_RECORD_LEN =>
+					{
+						data.extend_from_slice(block);
+					},
+					_ => records.push((offset as u64, block.to_vec())),
+				}
+			}
+			offset += want;
+		}
+		records
+	}
+
+	/// Overwrite the whole-block range with a deterministic pattern distinct
+	/// from the base.
+	fn paint_blocks(image: &mut [u8], blocks: std::ops::Range<usize>, seed: u64) {
+		let start = blocks.start * BLOCK_LEN;
+		let end = (blocks.end * BLOCK_LEN).min(image.len());
+		image[start..end].copy_from_slice(&pseudo_bytes(seed, end - start));
+	}
+
 	#[test]
 	fn scattered_changes_round_trip() -> TestResult {
 		let base = pseudo_bytes(1, 12 * MIB + 12_345);
@@ -503,6 +680,61 @@ mod tests {
 			.unwrap_err()
 			.to_string();
 		assert!(err.contains("cap"), "unexpected error: {err}");
+		Ok(())
+	}
+
+	#[test]
+	fn chunked_compare_matches_sequential_bytes() -> TestResult {
+		// Four-block compare chunks push the ~10 MiB image across dozens of
+		// worker chunks without allocating anything huge.
+		const CHUNK_LEN: u64 = 4 * BLOCK_LEN as u64;
+
+		let base = pseudo_bytes(19, 9 * MIB + 4321);
+		let mut current = base.clone();
+		// Changed runs placed against the 4-block chunk grid: crossing a
+		// boundary mid-run, filling a chunk exactly, starting on a boundary,
+		// a 5 MiB run spanning many chunks and the 4 MiB record cap, and the
+		// last compared blocks merging into the ragged-then-grown tail.
+		paint_blocks(&mut current, 2..6, 20);
+		paint_blocks(&mut current, 8..12, 21);
+		paint_blocks(&mut current, 16..17, 22);
+		paint_blocks(&mut current, 31..111, 23);
+		paint_blocks(&mut current, 142..145, 24);
+		current.extend_from_slice(&pseudo_bytes(25, 700_000));
+
+		let fx = fixture(&base, &current)?;
+		let written = write_disk_delta_chunked(&fx.base, &fx.current, &fx.delta, Some(CHUNK_LEN))?;
+		let chunked = fs::read(&fx.delta)?;
+
+		// Byte-identical to an independently computed sequential diff...
+		let records = reference_records(&base, &current);
+		let borrowed: Vec<(u64, &[u8])> = records
+			.iter()
+			.map(|(offset, data)| (*offset, data.as_slice()))
+			.collect();
+		let reference = fx.delta.with_extension("reference");
+		craft_delta(&reference, base.len() as u64, current.len() as u64, &borrowed);
+		assert_same_bytes(&chunked, &fs::read(&reference)?, "chunked delta vs reference");
+
+		// ...and to this module's own single-chunk sequential path.
+		let single = fx.delta.with_extension("single");
+		write_disk_delta_chunked(&fx.base, &fx.current, &single, Some(1 << 40))?;
+		assert_same_bytes(&chunked, &fs::read(&single)?, "chunked delta vs single chunk");
+
+		let (_, _, parsed) = parse_delta(&fx.delta);
+		let expected = vec![
+			(2 * BLOCK_LEN as u64, 4 * BLOCK_LEN as u64),
+			(8 * BLOCK_LEN as u64, 4 * BLOCK_LEN as u64),
+			(16 * BLOCK_LEN as u64, BLOCK_LEN as u64),
+			(31 * BLOCK_LEN as u64, MAX_RECORD_LEN as u64),
+			(31 * BLOCK_LEN as u64 + MAX_RECORD_LEN as u64, 16 * BLOCK_LEN as u64),
+			(142 * BLOCK_LEN as u64, current.len() as u64 - 142 * BLOCK_LEN as u64),
+		];
+		assert_eq!(parsed, expected);
+		assert_eq!(written, parsed.iter().map(|(_, len)| len).sum::<u64>());
+
+		apply_disk_delta(&fx.delta, &fx.target)?;
+		assert_same_bytes(&fs::read(&fx.target)?, &current, "applied target vs current");
 		Ok(())
 	}
 }

@@ -155,14 +155,19 @@ impl ControlClient {
 	}
 
 	/// Snapshot guest state into `name`, optionally as a delta against `base`.
+	/// `track` arms dirty-page tracking so a later delta against `name` is
+	/// O(dirty pages).
 	///
 	/// The read timeout is raised to the server's reply window for this
 	/// request only: the VMM writes the reply after dumping guest RAM.
-	pub fn snapshot(&mut self, name: &str, base: Option<&str>) -> Result<Value> {
+	pub fn snapshot(&mut self, name: &str, base: Option<&str>, track: bool) -> Result<Value> {
 		let mut params = serde_json::Map::new();
 		params.insert("name".to_owned(), json!(name));
 		if let Some(base) = base {
 			params.insert("base".to_owned(), json!(base));
+		}
+		if track {
+			params.insert("track".to_owned(), json!(true));
 		}
 		self
 			.reader
