@@ -86,8 +86,6 @@ const (
 	DigestAlgorithm_DIGEST_ALGORITHM_UNSPECIFIED DigestAlgorithm = 0
 	// DIGEST_ALGORITHM_SHA256 is SHA-256 over the uncompressed bytes.
 	DigestAlgorithm_DIGEST_ALGORITHM_SHA256 DigestAlgorithm = 1
-	// DIGEST_ALGORITHM_BLAKE3 is BLAKE3 over the uncompressed bytes.
-	DigestAlgorithm_DIGEST_ALGORITHM_BLAKE3 DigestAlgorithm = 2
 )
 
 // Enum value maps for DigestAlgorithm.
@@ -95,12 +93,10 @@ var (
 	DigestAlgorithm_name = map[int32]string{
 		0: "DIGEST_ALGORITHM_UNSPECIFIED",
 		1: "DIGEST_ALGORITHM_SHA256",
-		2: "DIGEST_ALGORITHM_BLAKE3",
 	}
 	DigestAlgorithm_value = map[string]int32{
 		"DIGEST_ALGORITHM_UNSPECIFIED": 0,
 		"DIGEST_ALGORITHM_SHA256":      1,
-		"DIGEST_ALGORITHM_BLAKE3":      2,
 	}
 )
 
@@ -137,7 +133,7 @@ type ValueSerializer int32
 const (
 	// VALUE_SERIALIZER_UNSPECIFIED indicates that no codec was selected.
 	ValueSerializer_VALUE_SERIALIZER_UNSPECIFIED ValueSerializer = 0
-	// VALUE_SERIALIZER_JSON is portable RFC 8259 JSON encoded as UTF-8.
+	// VALUE_SERIALIZER_JSON is portable I-JSON UTF-8 with integers restricted to the interoperable safe range.
 	ValueSerializer_VALUE_SERIALIZER_JSON ValueSerializer = 1
 	// VALUE_SERIALIZER_CBOR is portable RFC 8949 CBOR.
 	ValueSerializer_VALUE_SERIALIZER_CBOR ValueSerializer = 2
@@ -465,59 +461,6 @@ func (HighAvailabilityPolicy) EnumDescriptor() ([]byte, []int) {
 	return file_vmon_v1_api_proto_rawDescGZIP(), []int{7}
 }
 
-// ClientCancellationPolicy controls what happens when the creating client disconnects.
-type ClientCancellationPolicy int32
-
-const (
-	// CLIENT_CANCELLATION_POLICY_UNSPECIFIED selects the durable detached default.
-	ClientCancellationPolicy_CLIENT_CANCELLATION_POLICY_UNSPECIFIED ClientCancellationPolicy = 0
-	// CLIENT_CANCELLATION_POLICY_DETACH leaves the durable call running.
-	ClientCancellationPolicy_CLIENT_CANCELLATION_POLICY_DETACH ClientCancellationPolicy = 1
-	// CLIENT_CANCELLATION_POLICY_CANCEL requests cancellation on client disconnect.
-	ClientCancellationPolicy_CLIENT_CANCELLATION_POLICY_CANCEL ClientCancellationPolicy = 2
-)
-
-// Enum value maps for ClientCancellationPolicy.
-var (
-	ClientCancellationPolicy_name = map[int32]string{
-		0: "CLIENT_CANCELLATION_POLICY_UNSPECIFIED",
-		1: "CLIENT_CANCELLATION_POLICY_DETACH",
-		2: "CLIENT_CANCELLATION_POLICY_CANCEL",
-	}
-	ClientCancellationPolicy_value = map[string]int32{
-		"CLIENT_CANCELLATION_POLICY_UNSPECIFIED": 0,
-		"CLIENT_CANCELLATION_POLICY_DETACH":      1,
-		"CLIENT_CANCELLATION_POLICY_CANCEL":      2,
-	}
-)
-
-func (x ClientCancellationPolicy) Enum() *ClientCancellationPolicy {
-	p := new(ClientCancellationPolicy)
-	*p = x
-	return p
-}
-
-func (x ClientCancellationPolicy) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (ClientCancellationPolicy) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[8].Descriptor()
-}
-
-func (ClientCancellationPolicy) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[8]
-}
-
-func (x ClientCancellationPolicy) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use ClientCancellationPolicy.Descriptor instead.
-func (ClientCancellationPolicy) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{8}
-}
-
 // CallType identifies the execution and result-indexing model of a call.
 type CallType int32
 
@@ -563,11 +506,11 @@ func (x CallType) String() string {
 }
 
 func (CallType) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[9].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[8].Descriptor()
 }
 
 func (CallType) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[9]
+	return &file_vmon_v1_api_proto_enumTypes[8]
 }
 
 func (x CallType) Number() protoreflect.EnumNumber {
@@ -576,7 +519,7 @@ func (x CallType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CallType.Descriptor instead.
 func (CallType) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{9}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{8}
 }
 
 // CallStatus is the durable lifecycle state of a call.
@@ -636,11 +579,11 @@ func (x CallStatus) String() string {
 }
 
 func (CallStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[10].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[9].Descriptor()
 }
 
 func (CallStatus) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[10]
+	return &file_vmon_v1_api_proto_enumTypes[9]
 }
 
 func (x CallStatus) Number() protoreflect.EnumNumber {
@@ -649,7 +592,7 @@ func (x CallStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CallStatus.Descriptor instead.
 func (CallStatus) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{10}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{9}
 }
 
 // CallEventType identifies a durable event in a call's ordered event log.
@@ -713,11 +656,11 @@ func (x CallEventType) String() string {
 }
 
 func (CallEventType) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[11].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[10].Descriptor()
 }
 
 func (CallEventType) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[11]
+	return &file_vmon_v1_api_proto_enumTypes[10]
 }
 
 func (x CallEventType) Number() protoreflect.EnumNumber {
@@ -726,7 +669,7 @@ func (x CallEventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CallEventType.Descriptor instead.
 func (CallEventType) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{11}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{10}
 }
 
 // LogStream identifies the source of a call log entry.
@@ -770,11 +713,11 @@ func (x LogStream) String() string {
 }
 
 func (LogStream) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[12].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[11].Descriptor()
 }
 
 func (LogStream) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[12]
+	return &file_vmon_v1_api_proto_enumTypes[11]
 }
 
 func (x LogStream) Number() protoreflect.EnumNumber {
@@ -783,7 +726,7 @@ func (x LogStream) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LogStream.Descriptor instead.
 func (LogStream) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{12}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{11}
 }
 
 // AttemptStatus identifies the state of one execution attempt.
@@ -831,11 +774,11 @@ func (x AttemptStatus) String() string {
 }
 
 func (AttemptStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[13].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[12].Descriptor()
 }
 
 func (AttemptStatus) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[13]
+	return &file_vmon_v1_api_proto_enumTypes[12]
 }
 
 func (x AttemptStatus) Number() protoreflect.EnumNumber {
@@ -844,7 +787,7 @@ func (x AttemptStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use AttemptStatus.Descriptor instead.
 func (AttemptStatus) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{13}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{12}
 }
 
 // StartupKind describes how a worker was prepared for an attempt.
@@ -888,11 +831,11 @@ func (x StartupKind) String() string {
 }
 
 func (StartupKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[14].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[13].Descriptor()
 }
 
 func (StartupKind) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[14]
+	return &file_vmon_v1_api_proto_enumTypes[13]
 }
 
 func (x StartupKind) Number() protoreflect.EnumNumber {
@@ -901,7 +844,7 @@ func (x StartupKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use StartupKind.Descriptor instead.
 func (StartupKind) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{14}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{13}
 }
 
 // ActorStatus identifies the durable lifecycle state of an actor.
@@ -957,11 +900,11 @@ func (x ActorStatus) String() string {
 }
 
 func (ActorStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[15].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[14].Descriptor()
 }
 
 func (ActorStatus) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[15]
+	return &file_vmon_v1_api_proto_enumTypes[14]
 }
 
 func (x ActorStatus) Number() protoreflect.EnumNumber {
@@ -970,7 +913,7 @@ func (x ActorStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ActorStatus.Descriptor instead.
 func (ActorStatus) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{15}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{14}
 }
 
 // ScheduleStatus identifies whether a schedule may create calls.
@@ -1010,11 +953,11 @@ func (x ScheduleStatus) String() string {
 }
 
 func (ScheduleStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[16].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[15].Descriptor()
 }
 
 func (ScheduleStatus) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[16]
+	return &file_vmon_v1_api_proto_enumTypes[15]
 }
 
 func (x ScheduleStatus) Number() protoreflect.EnumNumber {
@@ -1023,7 +966,7 @@ func (x ScheduleStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ScheduleStatus.Descriptor instead.
 func (ScheduleStatus) EnumDescriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{16}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{15}
 }
 
 // FunctionRevisionStatus describes whether a registered revision can execute.
@@ -1063,11 +1006,11 @@ func (x FunctionRevisionStatus) String() string {
 }
 
 func (FunctionRevisionStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_vmon_v1_api_proto_enumTypes[17].Descriptor()
+	return file_vmon_v1_api_proto_enumTypes[16].Descriptor()
 }
 
 func (FunctionRevisionStatus) Type() protoreflect.EnumType {
-	return &file_vmon_v1_api_proto_enumTypes[17]
+	return &file_vmon_v1_api_proto_enumTypes[16]
 }
 
 func (x FunctionRevisionStatus) Number() protoreflect.EnumNumber {
@@ -1076,6 +1019,63 @@ func (x FunctionRevisionStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use FunctionRevisionStatus.Descriptor instead.
 func (FunctionRevisionStatus) EnumDescriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{16}
+}
+
+// AttemptFailureKind classifies why an execution attempt ended.
+type AttemptFailureKind int32
+
+const (
+	// ATTEMPT_FAILURE_KIND_UNSPECIFIED means no failure or an unknown failure class.
+	AttemptFailureKind_ATTEMPT_FAILURE_KIND_UNSPECIFIED AttemptFailureKind = 0
+	// ATTEMPT_FAILURE_KIND_USER is a policy-visible user-code failure.
+	AttemptFailureKind_ATTEMPT_FAILURE_KIND_USER AttemptFailureKind = 1
+	// ATTEMPT_FAILURE_KIND_INFRASTRUCTURE is a transparent platform failure.
+	AttemptFailureKind_ATTEMPT_FAILURE_KIND_INFRASTRUCTURE AttemptFailureKind = 2
+	// ATTEMPT_FAILURE_KIND_CANCELLED is cooperative or forced cancellation.
+	AttemptFailureKind_ATTEMPT_FAILURE_KIND_CANCELLED AttemptFailureKind = 3
+)
+
+// Enum value maps for AttemptFailureKind.
+var (
+	AttemptFailureKind_name = map[int32]string{
+		0: "ATTEMPT_FAILURE_KIND_UNSPECIFIED",
+		1: "ATTEMPT_FAILURE_KIND_USER",
+		2: "ATTEMPT_FAILURE_KIND_INFRASTRUCTURE",
+		3: "ATTEMPT_FAILURE_KIND_CANCELLED",
+	}
+	AttemptFailureKind_value = map[string]int32{
+		"ATTEMPT_FAILURE_KIND_UNSPECIFIED":    0,
+		"ATTEMPT_FAILURE_KIND_USER":           1,
+		"ATTEMPT_FAILURE_KIND_INFRASTRUCTURE": 2,
+		"ATTEMPT_FAILURE_KIND_CANCELLED":      3,
+	}
+)
+
+func (x AttemptFailureKind) Enum() *AttemptFailureKind {
+	p := new(AttemptFailureKind)
+	*p = x
+	return p
+}
+
+func (x AttemptFailureKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (AttemptFailureKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_vmon_v1_api_proto_enumTypes[17].Descriptor()
+}
+
+func (AttemptFailureKind) Type() protoreflect.EnumType {
+	return &file_vmon_v1_api_proto_enumTypes[17]
+}
+
+func (x AttemptFailureKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use AttemptFailureKind.Descriptor instead.
+func (AttemptFailureKind) EnumDescriptor() ([]byte, []int) {
 	return file_vmon_v1_api_proto_rawDescGZIP(), []int{17}
 }
 
@@ -3494,8 +3494,14 @@ type ArtifactRecord struct {
 	MediaTypePresence isArtifactRecord_MediaTypePresence `protobuf_oneof:"media_type_presence"`
 	// CreatedAtUnixMillis is the server commit time in Unix milliseconds.
 	CreatedAtUnixMillis uint64 `protobuf:"varint,5,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// ExpiresAtUnixMillis is present when the artifact has a retention deadline.
+	//
+	// Types that are valid to be assigned to ExpiresAtUnixMillisPresence:
+	//
+	//	*ArtifactRecord_ExpiresAtUnixMillis
+	ExpiresAtUnixMillisPresence isArtifactRecord_ExpiresAtUnixMillisPresence `protobuf_oneof:"expires_at_unix_millis_presence"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *ArtifactRecord) Reset() {
@@ -3572,6 +3578,22 @@ func (x *ArtifactRecord) GetCreatedAtUnixMillis() uint64 {
 	return 0
 }
 
+func (x *ArtifactRecord) GetExpiresAtUnixMillisPresence() isArtifactRecord_ExpiresAtUnixMillisPresence {
+	if x != nil {
+		return x.ExpiresAtUnixMillisPresence
+	}
+	return nil
+}
+
+func (x *ArtifactRecord) GetExpiresAtUnixMillis() uint64 {
+	if x != nil {
+		if x, ok := x.ExpiresAtUnixMillisPresence.(*ArtifactRecord_ExpiresAtUnixMillis); ok {
+			return x.ExpiresAtUnixMillis
+		}
+	}
+	return 0
+}
+
 type isArtifactRecord_MediaTypePresence interface {
 	isArtifactRecord_MediaTypePresence()
 }
@@ -3582,6 +3604,17 @@ type ArtifactRecord_MediaType struct {
 }
 
 func (*ArtifactRecord_MediaType) isArtifactRecord_MediaTypePresence() {}
+
+type isArtifactRecord_ExpiresAtUnixMillisPresence interface {
+	isArtifactRecord_ExpiresAtUnixMillisPresence()
+}
+
+type ArtifactRecord_ExpiresAtUnixMillis struct {
+	// ExpiresAtUnixMillis is the artifact expiration time in Unix milliseconds.
+	ExpiresAtUnixMillis uint64 `protobuf:"varint,6,opt,name=expires_at_unix_millis,json=expiresAtUnixMillis,proto3,oneof"`
+}
+
+func (*ArtifactRecord_ExpiresAtUnixMillis) isArtifactRecord_ExpiresAtUnixMillisPresence() {}
 
 // PutArtifactHeader declares metadata that must precede uploaded chunks.
 type PutArtifactHeader struct {
@@ -3596,6 +3629,12 @@ type PutArtifactHeader struct {
 	//
 	//	*PutArtifactHeader_MediaType
 	MediaTypePresence isPutArtifactHeader_MediaTypePresence `protobuf_oneof:"media_type_presence"`
+	// TtlMillis is present to request expiration relative to the commit time.
+	//
+	// Types that are valid to be assigned to TtlMillisPresence:
+	//
+	//	*PutArtifactHeader_TtlMillis
+	TtlMillisPresence isPutArtifactHeader_TtlMillisPresence `protobuf_oneof:"ttl_millis_presence"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -3660,6 +3699,22 @@ func (x *PutArtifactHeader) GetMediaType() string {
 	return ""
 }
 
+func (x *PutArtifactHeader) GetTtlMillisPresence() isPutArtifactHeader_TtlMillisPresence {
+	if x != nil {
+		return x.TtlMillisPresence
+	}
+	return nil
+}
+
+func (x *PutArtifactHeader) GetTtlMillis() uint64 {
+	if x != nil {
+		if x, ok := x.TtlMillisPresence.(*PutArtifactHeader_TtlMillis); ok {
+			return x.TtlMillis
+		}
+	}
+	return 0
+}
+
 type isPutArtifactHeader_MediaTypePresence interface {
 	isPutArtifactHeader_MediaTypePresence()
 }
@@ -3670,6 +3725,17 @@ type PutArtifactHeader_MediaType struct {
 }
 
 func (*PutArtifactHeader_MediaType) isPutArtifactHeader_MediaTypePresence() {}
+
+type isPutArtifactHeader_TtlMillisPresence interface {
+	isPutArtifactHeader_TtlMillisPresence()
+}
+
+type PutArtifactHeader_TtlMillis struct {
+	// TtlMillis is the requested artifact retention duration.
+	TtlMillis uint64 `protobuf:"varint,4,opt,name=ttl_millis,json=ttlMillis,proto3,oneof"`
+}
+
+func (*PutArtifactHeader_TtlMillis) isPutArtifactHeader_TtlMillisPresence() {}
 
 // PutArtifactRequest is one frame of an artifact upload.
 type PutArtifactRequest struct {
@@ -4959,8 +5025,8 @@ func (*ImageSpec_Template) isImageSpec_Source() {}
 // ResourceSpec declares per-worker resource limits.
 type ResourceSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// CpuMillis is the CPU quota in thousandths of one core.
-	CpuMillis uint32 `protobuf:"varint,1,opt,name=cpu_millis,json=cpuMillis,proto3" json:"cpu_millis,omitempty"`
+	// Cpus is the required number of whole virtual CPUs.
+	Cpus uint32 `protobuf:"varint,1,opt,name=cpus,proto3" json:"cpus,omitempty"`
 	// MemoryBytes is the worker memory limit.
 	MemoryBytes uint64 `protobuf:"varint,2,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"`
 	// EphemeralDiskBytes is the writable ephemeral disk limit.
@@ -5007,9 +5073,9 @@ func (*ResourceSpec) Descriptor() ([]byte, []int) {
 	return file_vmon_v1_api_proto_rawDescGZIP(), []int{60}
 }
 
-func (x *ResourceSpec) GetCpuMillis() uint32 {
+func (x *ResourceSpec) GetCpus() uint32 {
 	if x != nil {
-		return x.CpuMillis
+		return x.Cpus
 	}
 	return 0
 }
@@ -6668,41 +6734,29 @@ type LifecycleHooks_Restore struct {
 
 func (*LifecycleHooks_Restore) isLifecycleHooks_RestorePresence() {}
 
-// FunctionSnapshotProvenance records the immutable inputs of a worker snapshot.
-type FunctionSnapshotProvenance struct {
+// FunctionSnapshotRef identifies a persisted worker snapshot.
+type FunctionSnapshotRef struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Snapshot identifies the immutable worker snapshot artifact.
-	Snapshot *ArtifactRef `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	// ImageDigest pins the OCI image used to create the snapshot.
-	ImageDigest *Digest `protobuf:"bytes,2,opt,name=image_digest,json=imageDigest,proto3" json:"image_digest,omitempty"`
-	// PackageDigest pins the normalized function package.
-	PackageDigest *Digest `protobuf:"bytes,3,opt,name=package_digest,json=packageDigest,proto3" json:"package_digest,omitempty"`
-	// CreatedAtUnixMillis is the snapshot commit time.
-	CreatedAtUnixMillis uint64 `protobuf:"varint,4,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
-	// InitializeHook is present when snapshot creation ran an initialization hook.
-	//
-	// Types that are valid to be assigned to InitializeHookPresence:
-	//
-	//	*FunctionSnapshotProvenance_InitializeHook
-	InitializeHookPresence isFunctionSnapshotProvenance_InitializeHookPresence `protobuf_oneof:"initialize_hook_presence"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// SnapshotId is the stable server-assigned snapshot identifier.
+	SnapshotId    string `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *FunctionSnapshotProvenance) Reset() {
-	*x = FunctionSnapshotProvenance{}
+func (x *FunctionSnapshotRef) Reset() {
+	*x = FunctionSnapshotRef{}
 	mi := &file_vmon_v1_api_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *FunctionSnapshotProvenance) String() string {
+func (x *FunctionSnapshotRef) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*FunctionSnapshotProvenance) ProtoMessage() {}
+func (*FunctionSnapshotRef) ProtoMessage() {}
 
-func (x *FunctionSnapshotProvenance) ProtoReflect() protoreflect.Message {
+func (x *FunctionSnapshotRef) ProtoReflect() protoreflect.Message {
 	mi := &file_vmon_v1_api_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -6714,66 +6768,159 @@ func (x *FunctionSnapshotProvenance) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use FunctionSnapshotProvenance.ProtoReflect.Descriptor instead.
-func (*FunctionSnapshotProvenance) Descriptor() ([]byte, []int) {
+// Deprecated: Use FunctionSnapshotRef.ProtoReflect.Descriptor instead.
+func (*FunctionSnapshotRef) Descriptor() ([]byte, []int) {
 	return file_vmon_v1_api_proto_rawDescGZIP(), []int{83}
 }
 
-func (x *FunctionSnapshotProvenance) GetSnapshot() *ArtifactRef {
+func (x *FunctionSnapshotRef) GetSnapshotId() string {
 	if x != nil {
-		return x.Snapshot
+		return x.SnapshotId
+	}
+	return ""
+}
+
+// FunctionSnapshotRecord is a persisted, reloadable worker snapshot with validation provenance.
+type FunctionSnapshotRecord struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Ref identifies the persisted function snapshot.
+	Ref *FunctionSnapshotRef `protobuf:"bytes,1,opt,name=ref,proto3" json:"ref,omitempty"`
+	// Revision pins the function revision represented by the snapshot.
+	Revision *RevisionRef `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	// Artifact contains the immutable worker snapshot bytes.
+	Artifact *ArtifactRef `protobuf:"bytes,3,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	// ProtocolVersion is the snapshot protocol version required by the loader.
+	ProtocolVersion uint32 `protobuf:"varint,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	// RunnerDigest pins the runner binary or package that created and must validate the snapshot.
+	RunnerDigest *Digest `protobuf:"bytes,5,opt,name=runner_digest,json=runnerDigest,proto3" json:"runner_digest,omitempty"`
+	// ImageDigest pins the OCI image used to create the snapshot.
+	ImageDigest *Digest `protobuf:"bytes,6,opt,name=image_digest,json=imageDigest,proto3" json:"image_digest,omitempty"`
+	// PackageDigest pins the normalized function package.
+	PackageDigest *Digest `protobuf:"bytes,7,opt,name=package_digest,json=packageDigest,proto3" json:"package_digest,omitempty"`
+	// CreatedAtUnixMillis is the snapshot commit time.
+	CreatedAtUnixMillis uint64 `protobuf:"varint,8,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
+	// InitializeHook is present when snapshot creation ran an initialization hook.
+	//
+	// Types that are valid to be assigned to InitializeHookPresence:
+	//
+	//	*FunctionSnapshotRecord_InitializeHook
+	InitializeHookPresence isFunctionSnapshotRecord_InitializeHookPresence `protobuf_oneof:"initialize_hook_presence"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *FunctionSnapshotRecord) Reset() {
+	*x = FunctionSnapshotRecord{}
+	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FunctionSnapshotRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FunctionSnapshotRecord) ProtoMessage() {}
+
+func (x *FunctionSnapshotRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FunctionSnapshotRecord.ProtoReflect.Descriptor instead.
+func (*FunctionSnapshotRecord) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{84}
+}
+
+func (x *FunctionSnapshotRecord) GetRef() *FunctionSnapshotRef {
+	if x != nil {
+		return x.Ref
 	}
 	return nil
 }
 
-func (x *FunctionSnapshotProvenance) GetImageDigest() *Digest {
+func (x *FunctionSnapshotRecord) GetRevision() *RevisionRef {
+	if x != nil {
+		return x.Revision
+	}
+	return nil
+}
+
+func (x *FunctionSnapshotRecord) GetArtifact() *ArtifactRef {
+	if x != nil {
+		return x.Artifact
+	}
+	return nil
+}
+
+func (x *FunctionSnapshotRecord) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *FunctionSnapshotRecord) GetRunnerDigest() *Digest {
+	if x != nil {
+		return x.RunnerDigest
+	}
+	return nil
+}
+
+func (x *FunctionSnapshotRecord) GetImageDigest() *Digest {
 	if x != nil {
 		return x.ImageDigest
 	}
 	return nil
 }
 
-func (x *FunctionSnapshotProvenance) GetPackageDigest() *Digest {
+func (x *FunctionSnapshotRecord) GetPackageDigest() *Digest {
 	if x != nil {
 		return x.PackageDigest
 	}
 	return nil
 }
 
-func (x *FunctionSnapshotProvenance) GetCreatedAtUnixMillis() uint64 {
+func (x *FunctionSnapshotRecord) GetCreatedAtUnixMillis() uint64 {
 	if x != nil {
 		return x.CreatedAtUnixMillis
 	}
 	return 0
 }
 
-func (x *FunctionSnapshotProvenance) GetInitializeHookPresence() isFunctionSnapshotProvenance_InitializeHookPresence {
+func (x *FunctionSnapshotRecord) GetInitializeHookPresence() isFunctionSnapshotRecord_InitializeHookPresence {
 	if x != nil {
 		return x.InitializeHookPresence
 	}
 	return nil
 }
 
-func (x *FunctionSnapshotProvenance) GetInitializeHook() *LifecycleHookRef {
+func (x *FunctionSnapshotRecord) GetInitializeHook() *LifecycleHookRef {
 	if x != nil {
-		if x, ok := x.InitializeHookPresence.(*FunctionSnapshotProvenance_InitializeHook); ok {
+		if x, ok := x.InitializeHookPresence.(*FunctionSnapshotRecord_InitializeHook); ok {
 			return x.InitializeHook
 		}
 	}
 	return nil
 }
 
-type isFunctionSnapshotProvenance_InitializeHookPresence interface {
-	isFunctionSnapshotProvenance_InitializeHookPresence()
+type isFunctionSnapshotRecord_InitializeHookPresence interface {
+	isFunctionSnapshotRecord_InitializeHookPresence()
 }
 
-type FunctionSnapshotProvenance_InitializeHook struct {
+type FunctionSnapshotRecord_InitializeHook struct {
 	// InitializeHook identifies the hook used to prepare snapshot state.
-	InitializeHook *LifecycleHookRef `protobuf:"bytes,5,opt,name=initialize_hook,json=initializeHook,proto3,oneof"`
+	InitializeHook *LifecycleHookRef `protobuf:"bytes,9,opt,name=initialize_hook,json=initializeHook,proto3,oneof"`
 }
 
-func (*FunctionSnapshotProvenance_InitializeHook) isFunctionSnapshotProvenance_InitializeHookPresence() {
-}
+func (*FunctionSnapshotRecord_InitializeHook) isFunctionSnapshotRecord_InitializeHookPresence() {}
 
 // FunctionSpec fully describes an immutable executable function revision.
 type FunctionSpec struct {
@@ -6814,7 +6961,7 @@ type FunctionSpec struct {
 
 func (x *FunctionSpec) Reset() {
 	*x = FunctionSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	mi := &file_vmon_v1_api_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6826,7 +6973,7 @@ func (x *FunctionSpec) String() string {
 func (*FunctionSpec) ProtoMessage() {}
 
 func (x *FunctionSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	mi := &file_vmon_v1_api_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6839,7 +6986,7 @@ func (x *FunctionSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionSpec.ProtoReflect.Descriptor instead.
 func (*FunctionSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{84}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *FunctionSpec) GetFunction() *FunctionRef {
@@ -6962,19 +7109,19 @@ type FunctionRevision struct {
 	Status FunctionRevisionStatus `protobuf:"varint,5,opt,name=status,proto3,enum=vmon.v1.FunctionRevisionStatus" json:"status,omitempty"`
 	// UnavailableSecrets lists persisted references that currently cannot be resolved.
 	UnavailableSecrets []*SecretRef `protobuf:"bytes,6,rep,name=unavailable_secrets,json=unavailableSecrets,proto3" json:"unavailable_secrets,omitempty"`
-	// SnapshotProvenance is present when registration produced a reusable worker snapshot.
+	// Snapshot is present when registration produced a persisted reusable worker snapshot.
 	//
-	// Types that are valid to be assigned to SnapshotProvenancePresence:
+	// Types that are valid to be assigned to SnapshotPresence:
 	//
-	//	*FunctionRevision_SnapshotProvenance
-	SnapshotProvenancePresence isFunctionRevision_SnapshotProvenancePresence `protobuf_oneof:"snapshot_provenance_presence"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	//	*FunctionRevision_Snapshot
+	SnapshotPresence isFunctionRevision_SnapshotPresence `protobuf_oneof:"snapshot_presence"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *FunctionRevision) Reset() {
 	*x = FunctionRevision{}
-	mi := &file_vmon_v1_api_proto_msgTypes[85]
+	mi := &file_vmon_v1_api_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6986,7 +7133,7 @@ func (x *FunctionRevision) String() string {
 func (*FunctionRevision) ProtoMessage() {}
 
 func (x *FunctionRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[85]
+	mi := &file_vmon_v1_api_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6999,7 +7146,7 @@ func (x *FunctionRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionRevision.ProtoReflect.Descriptor instead.
 func (*FunctionRevision) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{85}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *FunctionRevision) GetRef() *RevisionRef {
@@ -7044,32 +7191,32 @@ func (x *FunctionRevision) GetUnavailableSecrets() []*SecretRef {
 	return nil
 }
 
-func (x *FunctionRevision) GetSnapshotProvenancePresence() isFunctionRevision_SnapshotProvenancePresence {
+func (x *FunctionRevision) GetSnapshotPresence() isFunctionRevision_SnapshotPresence {
 	if x != nil {
-		return x.SnapshotProvenancePresence
+		return x.SnapshotPresence
 	}
 	return nil
 }
 
-func (x *FunctionRevision) GetSnapshotProvenance() *FunctionSnapshotProvenance {
+func (x *FunctionRevision) GetSnapshot() *FunctionSnapshotRecord {
 	if x != nil {
-		if x, ok := x.SnapshotProvenancePresence.(*FunctionRevision_SnapshotProvenance); ok {
-			return x.SnapshotProvenance
+		if x, ok := x.SnapshotPresence.(*FunctionRevision_Snapshot); ok {
+			return x.Snapshot
 		}
 	}
 	return nil
 }
 
-type isFunctionRevision_SnapshotProvenancePresence interface {
-	isFunctionRevision_SnapshotProvenancePresence()
+type isFunctionRevision_SnapshotPresence interface {
+	isFunctionRevision_SnapshotPresence()
 }
 
-type FunctionRevision_SnapshotProvenance struct {
-	// SnapshotProvenance records immutable snapshot inputs.
-	SnapshotProvenance *FunctionSnapshotProvenance `protobuf:"bytes,7,opt,name=snapshot_provenance,json=snapshotProvenance,proto3,oneof"`
+type FunctionRevision_Snapshot struct {
+	// Snapshot contains reload and validation provenance.
+	Snapshot *FunctionSnapshotRecord `protobuf:"bytes,7,opt,name=snapshot,proto3,oneof"`
 }
 
-func (*FunctionRevision_SnapshotProvenance) isFunctionRevision_SnapshotProvenancePresence() {}
+func (*FunctionRevision_Snapshot) isFunctionRevision_SnapshotPresence() {}
 
 // FunctionRecord describes a logical function and its active revision.
 type FunctionRecord struct {
@@ -7086,7 +7233,7 @@ type FunctionRecord struct {
 
 func (x *FunctionRecord) Reset() {
 	*x = FunctionRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[86]
+	mi := &file_vmon_v1_api_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7098,7 +7245,7 @@ func (x *FunctionRecord) String() string {
 func (*FunctionRecord) ProtoMessage() {}
 
 func (x *FunctionRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[86]
+	mi := &file_vmon_v1_api_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7111,7 +7258,7 @@ func (x *FunctionRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionRecord.ProtoReflect.Descriptor instead.
 func (*FunctionRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{86}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *FunctionRecord) GetFunction() *FunctionRef {
@@ -7150,7 +7297,7 @@ type RegisterFunctionRequest struct {
 
 func (x *RegisterFunctionRequest) Reset() {
 	*x = RegisterFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[87]
+	mi := &file_vmon_v1_api_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7162,7 +7309,7 @@ func (x *RegisterFunctionRequest) String() string {
 func (*RegisterFunctionRequest) ProtoMessage() {}
 
 func (x *RegisterFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[87]
+	mi := &file_vmon_v1_api_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7175,7 +7322,7 @@ func (x *RegisterFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterFunctionRequest.ProtoReflect.Descriptor instead.
 func (*RegisterFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{87}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *RegisterFunctionRequest) GetSpec() *FunctionSpec {
@@ -7210,7 +7357,7 @@ type GetFunctionRequest struct {
 
 func (x *GetFunctionRequest) Reset() {
 	*x = GetFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[88]
+	mi := &file_vmon_v1_api_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7222,7 +7369,7 @@ func (x *GetFunctionRequest) String() string {
 func (*GetFunctionRequest) ProtoMessage() {}
 
 func (x *GetFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[88]
+	mi := &file_vmon_v1_api_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7235,7 +7382,7 @@ func (x *GetFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFunctionRequest.ProtoReflect.Descriptor instead.
 func (*GetFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{88}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *GetFunctionRequest) GetFunction() *FunctionSelector {
@@ -7270,7 +7417,7 @@ type ListFunctionsRequest struct {
 
 func (x *ListFunctionsRequest) Reset() {
 	*x = ListFunctionsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[89]
+	mi := &file_vmon_v1_api_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7282,7 +7429,7 @@ func (x *ListFunctionsRequest) String() string {
 func (*ListFunctionsRequest) ProtoMessage() {}
 
 func (x *ListFunctionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[89]
+	mi := &file_vmon_v1_api_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7295,7 +7442,7 @@ func (x *ListFunctionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFunctionsRequest.ProtoReflect.Descriptor instead.
 func (*ListFunctionsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{89}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *ListFunctionsRequest) GetNamespacePresence() isListFunctionsRequest_NamespacePresence {
@@ -7379,7 +7526,7 @@ type ListFunctionsResponse struct {
 
 func (x *ListFunctionsResponse) Reset() {
 	*x = ListFunctionsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[90]
+	mi := &file_vmon_v1_api_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7391,7 +7538,7 @@ func (x *ListFunctionsResponse) String() string {
 func (*ListFunctionsResponse) ProtoMessage() {}
 
 func (x *ListFunctionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[90]
+	mi := &file_vmon_v1_api_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7404,7 +7551,7 @@ func (x *ListFunctionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFunctionsResponse.ProtoReflect.Descriptor instead.
 func (*ListFunctionsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{90}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *ListFunctionsResponse) GetRevisions() []*FunctionRevision {
@@ -7438,7 +7585,7 @@ type ActivateFunctionRequest struct {
 
 func (x *ActivateFunctionRequest) Reset() {
 	*x = ActivateFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[91]
+	mi := &file_vmon_v1_api_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7450,7 +7597,7 @@ func (x *ActivateFunctionRequest) String() string {
 func (*ActivateFunctionRequest) ProtoMessage() {}
 
 func (x *ActivateFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[91]
+	mi := &file_vmon_v1_api_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7463,7 +7610,7 @@ func (x *ActivateFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivateFunctionRequest.ProtoReflect.Descriptor instead.
 func (*ActivateFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{91}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *ActivateFunctionRequest) GetRevision() *RevisionRef {
@@ -7511,7 +7658,7 @@ type DeleteFunctionRequest struct {
 
 func (x *DeleteFunctionRequest) Reset() {
 	*x = DeleteFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[92]
+	mi := &file_vmon_v1_api_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7523,7 +7670,7 @@ func (x *DeleteFunctionRequest) String() string {
 func (*DeleteFunctionRequest) ProtoMessage() {}
 
 func (x *DeleteFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[92]
+	mi := &file_vmon_v1_api_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7536,7 +7683,7 @@ func (x *DeleteFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteFunctionRequest.ProtoReflect.Descriptor instead.
 func (*DeleteFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{92}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *DeleteFunctionRequest) GetRevision() *RevisionRef {
@@ -7559,7 +7706,7 @@ type AppFunctionBinding struct {
 
 func (x *AppFunctionBinding) Reset() {
 	*x = AppFunctionBinding{}
-	mi := &file_vmon_v1_api_proto_msgTypes[93]
+	mi := &file_vmon_v1_api_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7571,7 +7718,7 @@ func (x *AppFunctionBinding) String() string {
 func (*AppFunctionBinding) ProtoMessage() {}
 
 func (x *AppFunctionBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[93]
+	mi := &file_vmon_v1_api_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7584,7 +7731,7 @@ func (x *AppFunctionBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppFunctionBinding.ProtoReflect.Descriptor instead.
 func (*AppFunctionBinding) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{93}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *AppFunctionBinding) GetName() string {
@@ -7624,7 +7771,7 @@ type AppRevision struct {
 
 func (x *AppRevision) Reset() {
 	*x = AppRevision{}
-	mi := &file_vmon_v1_api_proto_msgTypes[94]
+	mi := &file_vmon_v1_api_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7636,7 +7783,7 @@ func (x *AppRevision) String() string {
 func (*AppRevision) ProtoMessage() {}
 
 func (x *AppRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[94]
+	mi := &file_vmon_v1_api_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7649,7 +7796,7 @@ func (x *AppRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppRevision.ProtoReflect.Descriptor instead.
 func (*AppRevision) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{94}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *AppRevision) GetRef() *AppRevisionRef {
@@ -7728,7 +7875,7 @@ type ActivateAppRequest struct {
 
 func (x *ActivateAppRequest) Reset() {
 	*x = ActivateAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[95]
+	mi := &file_vmon_v1_api_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7740,7 +7887,7 @@ func (x *ActivateAppRequest) String() string {
 func (*ActivateAppRequest) ProtoMessage() {}
 
 func (x *ActivateAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[95]
+	mi := &file_vmon_v1_api_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7753,7 +7900,7 @@ func (x *ActivateAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivateAppRequest.ProtoReflect.Descriptor instead.
 func (*ActivateAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{95}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *ActivateAppRequest) GetApp() *AppRef {
@@ -7815,7 +7962,7 @@ type GetAppRequest struct {
 
 func (x *GetAppRequest) Reset() {
 	*x = GetAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[96]
+	mi := &file_vmon_v1_api_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7827,7 +7974,7 @@ func (x *GetAppRequest) String() string {
 func (*GetAppRequest) ProtoMessage() {}
 
 func (x *GetAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[96]
+	mi := &file_vmon_v1_api_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7840,7 +7987,7 @@ func (x *GetAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppRequest.ProtoReflect.Descriptor instead.
 func (*GetAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{96}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *GetAppRequest) GetApp() *AppSelector {
@@ -7869,7 +8016,7 @@ type RollbackAppRequest struct {
 
 func (x *RollbackAppRequest) Reset() {
 	*x = RollbackAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[97]
+	mi := &file_vmon_v1_api_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7881,7 +8028,7 @@ func (x *RollbackAppRequest) String() string {
 func (*RollbackAppRequest) ProtoMessage() {}
 
 func (x *RollbackAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[97]
+	mi := &file_vmon_v1_api_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7894,7 +8041,7 @@ func (x *RollbackAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackAppRequest.ProtoReflect.Descriptor instead.
 func (*RollbackAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{97}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *RollbackAppRequest) GetTarget() *AppRevisionRef {
@@ -7949,7 +8096,7 @@ type ScheduleRef struct {
 
 func (x *ScheduleRef) Reset() {
 	*x = ScheduleRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[98]
+	mi := &file_vmon_v1_api_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7961,7 +8108,7 @@ func (x *ScheduleRef) String() string {
 func (*ScheduleRef) ProtoMessage() {}
 
 func (x *ScheduleRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[98]
+	mi := &file_vmon_v1_api_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7974,7 +8121,7 @@ func (x *ScheduleRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleRef.ProtoReflect.Descriptor instead.
 func (*ScheduleRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{98}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *ScheduleRef) GetScheduleId() string {
@@ -7997,7 +8144,7 @@ type CronSchedule struct {
 
 func (x *CronSchedule) Reset() {
 	*x = CronSchedule{}
-	mi := &file_vmon_v1_api_proto_msgTypes[99]
+	mi := &file_vmon_v1_api_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8009,7 +8156,7 @@ func (x *CronSchedule) String() string {
 func (*CronSchedule) ProtoMessage() {}
 
 func (x *CronSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[99]
+	mi := &file_vmon_v1_api_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8022,7 +8169,7 @@ func (x *CronSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CronSchedule.ProtoReflect.Descriptor instead.
 func (*CronSchedule) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{99}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *CronSchedule) GetExpression() string {
@@ -8052,7 +8199,7 @@ type PeriodSchedule struct {
 
 func (x *PeriodSchedule) Reset() {
 	*x = PeriodSchedule{}
-	mi := &file_vmon_v1_api_proto_msgTypes[100]
+	mi := &file_vmon_v1_api_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8064,7 +8211,7 @@ func (x *PeriodSchedule) String() string {
 func (*PeriodSchedule) ProtoMessage() {}
 
 func (x *PeriodSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[100]
+	mi := &file_vmon_v1_api_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8077,7 +8224,7 @@ func (x *PeriodSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeriodSchedule.ProtoReflect.Descriptor instead.
 func (*PeriodSchedule) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{100}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *PeriodSchedule) GetPeriodMillis() uint64 {
@@ -8107,7 +8254,7 @@ type ScheduleTarget struct {
 
 func (x *ScheduleTarget) Reset() {
 	*x = ScheduleTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[101]
+	mi := &file_vmon_v1_api_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8119,7 +8266,7 @@ func (x *ScheduleTarget) String() string {
 func (*ScheduleTarget) ProtoMessage() {}
 
 func (x *ScheduleTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[101]
+	mi := &file_vmon_v1_api_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8132,7 +8279,7 @@ func (x *ScheduleTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleTarget.ProtoReflect.Descriptor instead.
 func (*ScheduleTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{101}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *ScheduleTarget) GetFunction() *RevisionRef {
@@ -8175,7 +8322,7 @@ type ScheduleSpec struct {
 
 func (x *ScheduleSpec) Reset() {
 	*x = ScheduleSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[102]
+	mi := &file_vmon_v1_api_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8187,7 +8334,7 @@ func (x *ScheduleSpec) String() string {
 func (*ScheduleSpec) ProtoMessage() {}
 
 func (x *ScheduleSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[102]
+	mi := &file_vmon_v1_api_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8200,7 +8347,7 @@ func (x *ScheduleSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleSpec.ProtoReflect.Descriptor instead.
 func (*ScheduleSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{102}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *ScheduleSpec) GetName() string {
@@ -8304,7 +8451,7 @@ type ScheduleRecord struct {
 
 func (x *ScheduleRecord) Reset() {
 	*x = ScheduleRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[103]
+	mi := &file_vmon_v1_api_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8316,7 +8463,7 @@ func (x *ScheduleRecord) String() string {
 func (*ScheduleRecord) ProtoMessage() {}
 
 func (x *ScheduleRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[103]
+	mi := &file_vmon_v1_api_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8329,7 +8476,7 @@ func (x *ScheduleRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleRecord.ProtoReflect.Descriptor instead.
 func (*ScheduleRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{103}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *ScheduleRecord) GetRef() *ScheduleRef {
@@ -8406,7 +8553,7 @@ type CreateScheduleRequest struct {
 
 func (x *CreateScheduleRequest) Reset() {
 	*x = CreateScheduleRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[104]
+	mi := &file_vmon_v1_api_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8418,7 +8565,7 @@ func (x *CreateScheduleRequest) String() string {
 func (*CreateScheduleRequest) ProtoMessage() {}
 
 func (x *CreateScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[104]
+	mi := &file_vmon_v1_api_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8431,7 +8578,7 @@ func (x *CreateScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{104}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *CreateScheduleRequest) GetScheduleIdPresence() isCreateScheduleRequest_ScheduleIdPresence {
@@ -8500,7 +8647,7 @@ type ListSchedulesRequest struct {
 
 func (x *ListSchedulesRequest) Reset() {
 	*x = ListSchedulesRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[105]
+	mi := &file_vmon_v1_api_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8512,7 +8659,7 @@ func (x *ListSchedulesRequest) String() string {
 func (*ListSchedulesRequest) ProtoMessage() {}
 
 func (x *ListSchedulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[105]
+	mi := &file_vmon_v1_api_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8525,7 +8672,7 @@ func (x *ListSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListSchedulesRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{105}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *ListSchedulesRequest) GetAppPresence() isListSchedulesRequest_AppPresence {
@@ -8609,7 +8756,7 @@ type ListSchedulesResponse struct {
 
 func (x *ListSchedulesResponse) Reset() {
 	*x = ListSchedulesResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[106]
+	mi := &file_vmon_v1_api_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8621,7 +8768,7 @@ func (x *ListSchedulesResponse) String() string {
 func (*ListSchedulesResponse) ProtoMessage() {}
 
 func (x *ListSchedulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[106]
+	mi := &file_vmon_v1_api_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8634,7 +8781,7 @@ func (x *ListSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListSchedulesResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{106}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *ListSchedulesResponse) GetSchedules() []*ScheduleRecord {
@@ -8662,7 +8809,7 @@ type CallRef struct {
 
 func (x *CallRef) Reset() {
 	*x = CallRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[107]
+	mi := &file_vmon_v1_api_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8674,7 +8821,7 @@ func (x *CallRef) String() string {
 func (*CallRef) ProtoMessage() {}
 
 func (x *CallRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[107]
+	mi := &file_vmon_v1_api_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8687,7 +8834,7 @@ func (x *CallRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallRef.ProtoReflect.Descriptor instead.
 func (*CallRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{107}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *CallRef) GetCallId() string {
@@ -8708,7 +8855,7 @@ type ActorRef struct {
 
 func (x *ActorRef) Reset() {
 	*x = ActorRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[108]
+	mi := &file_vmon_v1_api_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8720,7 +8867,7 @@ func (x *ActorRef) String() string {
 func (*ActorRef) ProtoMessage() {}
 
 func (x *ActorRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[108]
+	mi := &file_vmon_v1_api_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8733,7 +8880,7 @@ func (x *ActorRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorRef.ProtoReflect.Descriptor instead.
 func (*ActorRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{108}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *ActorRef) GetActorId() string {
@@ -8743,30 +8890,254 @@ func (x *ActorRef) GetActorId() string {
 	return ""
 }
 
-// CallTarget pins the executable and optionally a durable actor.
+// InvocationArguments carries typed positional and named callable arguments.
+type InvocationArguments struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Positional contains arguments in invocation order.
+	Positional []*ValueEnvelope `protobuf:"bytes,1,rep,name=positional,proto3" json:"positional,omitempty"`
+	// Named maps parameter names to typed values.
+	Named         map[string]*ValueEnvelope `protobuf:"bytes,2,rep,name=named,proto3" json:"named,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InvocationArguments) Reset() {
+	*x = InvocationArguments{}
+	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InvocationArguments) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InvocationArguments) ProtoMessage() {}
+
+func (x *InvocationArguments) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InvocationArguments.ProtoReflect.Descriptor instead.
+func (*InvocationArguments) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{110}
+}
+
+func (x *InvocationArguments) GetPositional() []*ValueEnvelope {
+	if x != nil {
+		return x.Positional
+	}
+	return nil
+}
+
+func (x *InvocationArguments) GetNamed() map[string]*ValueEnvelope {
+	if x != nil {
+		return x.Named
+	}
+	return nil
+}
+
+// ActorTarget invokes a method on an existing durable actor.
+type ActorTarget struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Actor identifies the durable actor receiver.
+	Actor *ActorRef `protobuf:"bytes,1,opt,name=actor,proto3" json:"actor,omitempty"`
+	// Method is the exported actor method name.
+	Method        string `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ActorTarget) Reset() {
+	*x = ActorTarget{}
+	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ActorTarget) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ActorTarget) ProtoMessage() {}
+
+func (x *ActorTarget) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ActorTarget.ProtoReflect.Descriptor instead.
+func (*ActorTarget) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{111}
+}
+
+func (x *ActorTarget) GetActor() *ActorRef {
+	if x != nil {
+		return x.Actor
+	}
+	return nil
+}
+
+func (x *ActorTarget) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+// ServiceTarget invokes a method on a deterministic service instance.
+type ServiceTarget struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ServiceKey deterministically identifies the service instance.
+	ServiceKey string `protobuf:"bytes,1,opt,name=service_key,json=serviceKey,proto3" json:"service_key,omitempty"`
+	// Method is the exported service method name.
+	Method string `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	// Constructor contains deterministic arguments used when the service instance is first created.
+	Constructor   *InvocationArguments `protobuf:"bytes,3,opt,name=constructor,proto3" json:"constructor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServiceTarget) Reset() {
+	*x = ServiceTarget{}
+	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServiceTarget) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServiceTarget) ProtoMessage() {}
+
+func (x *ServiceTarget) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServiceTarget.ProtoReflect.Descriptor instead.
+func (*ServiceTarget) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{112}
+}
+
+func (x *ServiceTarget) GetServiceKey() string {
+	if x != nil {
+		return x.ServiceKey
+	}
+	return ""
+}
+
+func (x *ServiceTarget) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *ServiceTarget) GetConstructor() *InvocationArguments {
+	if x != nil {
+		return x.Constructor
+	}
+	return nil
+}
+
+// ParentEdge identifies the exact parent input that created a child call.
+type ParentEdge struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// CallId identifies the direct parent call.
+	CallId string `protobuf:"bytes,1,opt,name=call_id,json=callId,proto3" json:"call_id,omitempty"`
+	// InputId identifies the direct parent input.
+	InputId       string `protobuf:"bytes,2,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ParentEdge) Reset() {
+	*x = ParentEdge{}
+	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ParentEdge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ParentEdge) ProtoMessage() {}
+
+func (x *ParentEdge) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ParentEdge.ProtoReflect.Descriptor instead.
+func (*ParentEdge) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{113}
+}
+
+func (x *ParentEdge) GetCallId() string {
+	if x != nil {
+		return x.CallId
+	}
+	return ""
+}
+
+func (x *ParentEdge) GetInputId() string {
+	if x != nil {
+		return x.InputId
+	}
+	return ""
+}
+
+// CallTarget pins the executable and optional typed receiver.
 type CallTarget struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Function pins the immutable function revision.
 	Function *RevisionRef `protobuf:"bytes,1,opt,name=function,proto3" json:"function,omitempty"`
-	// Actor is present only for actor calls.
+	// Receiver optionally targets a durable actor or deterministic service instance.
 	//
-	// Types that are valid to be assigned to ActorPresence:
+	// Types that are valid to be assigned to Receiver:
 	//
 	//	*CallTarget_Actor
-	ActorPresence isCallTarget_ActorPresence `protobuf_oneof:"actor_presence"`
-	// ActorMethod is present only for actor method dispatch.
-	//
-	// Types that are valid to be assigned to ActorMethodPresence:
-	//
-	//	*CallTarget_ActorMethod
-	ActorMethodPresence isCallTarget_ActorMethodPresence `protobuf_oneof:"actor_method_presence"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	//	*CallTarget_Service
+	Receiver      isCallTarget_Receiver `protobuf_oneof:"receiver"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CallTarget) Reset() {
 	*x = CallTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[109]
+	mi := &file_vmon_v1_api_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8778,7 +9149,7 @@ func (x *CallTarget) String() string {
 func (*CallTarget) ProtoMessage() {}
 
 func (x *CallTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[109]
+	mi := &file_vmon_v1_api_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8791,7 +9162,7 @@ func (x *CallTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallTarget.ProtoReflect.Descriptor instead.
 func (*CallTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{109}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *CallTarget) GetFunction() *RevisionRef {
@@ -8801,68 +9172,62 @@ func (x *CallTarget) GetFunction() *RevisionRef {
 	return nil
 }
 
-func (x *CallTarget) GetActorPresence() isCallTarget_ActorPresence {
+func (x *CallTarget) GetReceiver() isCallTarget_Receiver {
 	if x != nil {
-		return x.ActorPresence
+		return x.Receiver
 	}
 	return nil
 }
 
-func (x *CallTarget) GetActor() *ActorRef {
+func (x *CallTarget) GetActor() *ActorTarget {
 	if x != nil {
-		if x, ok := x.ActorPresence.(*CallTarget_Actor); ok {
+		if x, ok := x.Receiver.(*CallTarget_Actor); ok {
 			return x.Actor
 		}
 	}
 	return nil
 }
 
-func (x *CallTarget) GetActorMethodPresence() isCallTarget_ActorMethodPresence {
+func (x *CallTarget) GetService() *ServiceTarget {
 	if x != nil {
-		return x.ActorMethodPresence
+		if x, ok := x.Receiver.(*CallTarget_Service); ok {
+			return x.Service
+		}
 	}
 	return nil
 }
 
-func (x *CallTarget) GetActorMethod() string {
-	if x != nil {
-		if x, ok := x.ActorMethodPresence.(*CallTarget_ActorMethod); ok {
-			return x.ActorMethod
-		}
-	}
-	return ""
-}
-
-type isCallTarget_ActorPresence interface {
-	isCallTarget_ActorPresence()
+type isCallTarget_Receiver interface {
+	isCallTarget_Receiver()
 }
 
 type CallTarget_Actor struct {
-	// Actor identifies the durable actor receiving the call.
-	Actor *ActorRef `protobuf:"bytes,2,opt,name=actor,proto3,oneof"`
+	// Actor invokes a method on an existing durable actor.
+	Actor *ActorTarget `protobuf:"bytes,2,opt,name=actor,proto3,oneof"`
 }
 
-func (*CallTarget_Actor) isCallTarget_ActorPresence() {}
-
-type isCallTarget_ActorMethodPresence interface {
-	isCallTarget_ActorMethodPresence()
+type CallTarget_Service struct {
+	// Service invokes a method on a deterministic service instance.
+	Service *ServiceTarget `protobuf:"bytes,3,opt,name=service,proto3,oneof"`
 }
 
-type CallTarget_ActorMethod struct {
-	// ActorMethod is the exported actor method name.
-	ActorMethod string `protobuf:"bytes,3,opt,name=actor_method,json=actorMethod,proto3,oneof"`
-}
+func (*CallTarget_Actor) isCallTarget_Receiver() {}
 
-func (*CallTarget_ActorMethod) isCallTarget_ActorMethodPresence() {}
+func (*CallTarget_Service) isCallTarget_Receiver() {}
 
 // CallInput is one durable, indexed call input.
 type CallInput struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Index is zero for unary calls and monotonically increasing for batch inputs.
 	Index uint64 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
-	// Value is the typed input envelope.
-	Value *ValueEnvelope `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	// InputId is a stable identifier; the server assigns one when the client leaves it empty.
+	// Payload contains one scalar value or structured invocation arguments.
+	//
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*CallInput_Value
+	//	*CallInput_Arguments
+	Payload isCallInput_Payload `protobuf_oneof:"payload"`
+	// InputId is a required stable identifier generated by the client.
 	InputId       string `protobuf:"bytes,3,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -8870,7 +9235,7 @@ type CallInput struct {
 
 func (x *CallInput) Reset() {
 	*x = CallInput{}
-	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	mi := &file_vmon_v1_api_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8882,7 +9247,7 @@ func (x *CallInput) String() string {
 func (*CallInput) ProtoMessage() {}
 
 func (x *CallInput) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	mi := &file_vmon_v1_api_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8895,7 +9260,7 @@ func (x *CallInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallInput.ProtoReflect.Descriptor instead.
 func (*CallInput) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{110}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *CallInput) GetIndex() uint64 {
@@ -8905,9 +9270,27 @@ func (x *CallInput) GetIndex() uint64 {
 	return 0
 }
 
+func (x *CallInput) GetPayload() isCallInput_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
 func (x *CallInput) GetValue() *ValueEnvelope {
 	if x != nil {
-		return x.Value
+		if x, ok := x.Payload.(*CallInput_Value); ok {
+			return x.Value
+		}
+	}
+	return nil
+}
+
+func (x *CallInput) GetArguments() *InvocationArguments {
+	if x != nil {
+		if x, ok := x.Payload.(*CallInput_Arguments); ok {
+			return x.Arguments
+		}
 	}
 	return nil
 }
@@ -8919,26 +9302,97 @@ func (x *CallInput) GetInputId() string {
 	return ""
 }
 
+type isCallInput_Payload interface {
+	isCallInput_Payload()
+}
+
+type CallInput_Value struct {
+	// Value is one serialized positional value.
+	Value *ValueEnvelope `protobuf:"bytes,2,opt,name=value,proto3,oneof"`
+}
+
+type CallInput_Arguments struct {
+	// Arguments contains positional and named invocation arguments.
+	Arguments *InvocationArguments `protobuf:"bytes,4,opt,name=arguments,proto3,oneof"`
+}
+
+func (*CallInput_Value) isCallInput_Payload() {}
+
+func (*CallInput_Arguments) isCallInput_Payload() {}
+
+// InputRef identifies one durable call input by stable ID and index.
+type InputRef struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// InputId is the required client-generated stable identifier.
+	InputId string `protobuf:"bytes,1,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
+	// InputIndex is the input's zero-based index within the call.
+	InputIndex    uint64 `protobuf:"varint,2,opt,name=input_index,json=inputIndex,proto3" json:"input_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InputRef) Reset() {
+	*x = InputRef{}
+	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InputRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InputRef) ProtoMessage() {}
+
+func (x *InputRef) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InputRef.ProtoReflect.Descriptor instead.
+func (*InputRef) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{116}
+}
+
+func (x *InputRef) GetInputId() string {
+	if x != nil {
+		return x.InputId
+	}
+	return ""
+}
+
+func (x *InputRef) GetInputIndex() uint64 {
+	if x != nil {
+		return x.InputIndex
+	}
+	return 0
+}
+
 // CallGraph records durable parent relationships between calls.
 type CallGraph struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// ParentCallIds contains direct parent calls in deterministic order.
-	ParentCallIds []string `protobuf:"bytes,1,rep,name=parent_call_ids,json=parentCallIds,proto3" json:"parent_call_ids,omitempty"`
+	// Parents contains typed parent call/input edges in deterministic order.
+	Parents []*ParentEdge `protobuf:"bytes,1,rep,name=parents,proto3" json:"parents,omitempty"`
 	// RootCallId is present for a descendant in a call graph.
 	//
 	// Types that are valid to be assigned to RootCallIdPresence:
 	//
 	//	*CallGraph_RootCallId
 	RootCallIdPresence isCallGraph_RootCallIdPresence `protobuf_oneof:"root_call_id_presence"`
-	// ParentInputIds aligns with ParentCallIds and identifies the parent input that created each edge.
-	ParentInputIds []string `protobuf:"bytes,3,rep,name=parent_input_ids,json=parentInputIds,proto3" json:"parent_input_ids,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *CallGraph) Reset() {
 	*x = CallGraph{}
-	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	mi := &file_vmon_v1_api_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8950,7 +9404,7 @@ func (x *CallGraph) String() string {
 func (*CallGraph) ProtoMessage() {}
 
 func (x *CallGraph) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	mi := &file_vmon_v1_api_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8963,12 +9417,12 @@ func (x *CallGraph) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallGraph.ProtoReflect.Descriptor instead.
 func (*CallGraph) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{111}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{117}
 }
 
-func (x *CallGraph) GetParentCallIds() []string {
+func (x *CallGraph) GetParents() []*ParentEdge {
 	if x != nil {
-		return x.ParentCallIds
+		return x.Parents
 	}
 	return nil
 }
@@ -8987,13 +9441,6 @@ func (x *CallGraph) GetRootCallId() string {
 		}
 	}
 	return ""
-}
-
-func (x *CallGraph) GetParentInputIds() []string {
-	if x != nil {
-		return x.ParentInputIds
-	}
-	return nil
 }
 
 type isCallGraph_RootCallIdPresence interface {
@@ -9024,27 +9471,19 @@ type CreateCallRequest struct {
 	RequestId string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	// Labels are user-defined lookup metadata.
 	Labels map[string]string `protobuf:"bytes,7,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// ClientCancellation controls whether creator disconnect cancels the durable call.
-	ClientCancellation ClientCancellationPolicy `protobuf:"varint,8,opt,name=client_cancellation,json=clientCancellation,proto3,enum=vmon.v1.ClientCancellationPolicy" json:"client_cancellation,omitempty"`
 	// ResultTtlMillis overrides the function result retention only when present.
 	//
 	// Types that are valid to be assigned to ResultTtlMillisPresence:
 	//
 	//	*CreateCallRequest_ResultTtlMillis
 	ResultTtlMillisPresence isCreateCallRequest_ResultTtlMillisPresence `protobuf_oneof:"result_ttl_millis_presence"`
-	// ClientSessionId is required and nonempty when ClientCancellation is CANCEL.
-	//
-	// Types that are valid to be assigned to ClientSessionIdPresence:
-	//
-	//	*CreateCallRequest_ClientSessionId
-	ClientSessionIdPresence isCreateCallRequest_ClientSessionIdPresence `protobuf_oneof:"client_session_id_presence"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
 
 func (x *CreateCallRequest) Reset() {
 	*x = CreateCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	mi := &file_vmon_v1_api_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9056,7 +9495,7 @@ func (x *CreateCallRequest) String() string {
 func (*CreateCallRequest) ProtoMessage() {}
 
 func (x *CreateCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	mi := &file_vmon_v1_api_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9069,7 +9508,7 @@ func (x *CreateCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCallRequest.ProtoReflect.Descriptor instead.
 func (*CreateCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{112}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *CreateCallRequest) GetType() CallType {
@@ -9121,13 +9560,6 @@ func (x *CreateCallRequest) GetLabels() map[string]string {
 	return nil
 }
 
-func (x *CreateCallRequest) GetClientCancellation() ClientCancellationPolicy {
-	if x != nil {
-		return x.ClientCancellation
-	}
-	return ClientCancellationPolicy_CLIENT_CANCELLATION_POLICY_UNSPECIFIED
-}
-
 func (x *CreateCallRequest) GetResultTtlMillisPresence() isCreateCallRequest_ResultTtlMillisPresence {
 	if x != nil {
 		return x.ResultTtlMillisPresence
@@ -9144,22 +9576,6 @@ func (x *CreateCallRequest) GetResultTtlMillis() uint64 {
 	return 0
 }
 
-func (x *CreateCallRequest) GetClientSessionIdPresence() isCreateCallRequest_ClientSessionIdPresence {
-	if x != nil {
-		return x.ClientSessionIdPresence
-	}
-	return nil
-}
-
-func (x *CreateCallRequest) GetClientSessionId() string {
-	if x != nil {
-		if x, ok := x.ClientSessionIdPresence.(*CreateCallRequest_ClientSessionId); ok {
-			return x.ClientSessionId
-		}
-	}
-	return ""
-}
-
 type isCreateCallRequest_ResultTtlMillisPresence interface {
 	isCreateCallRequest_ResultTtlMillisPresence()
 }
@@ -9170,17 +9586,6 @@ type CreateCallRequest_ResultTtlMillis struct {
 }
 
 func (*CreateCallRequest_ResultTtlMillis) isCreateCallRequest_ResultTtlMillisPresence() {}
-
-type isCreateCallRequest_ClientSessionIdPresence interface {
-	isCreateCallRequest_ClientSessionIdPresence()
-}
-
-type CreateCallRequest_ClientSessionId struct {
-	// ClientSessionId is the creator capability persisted for authenticated watch-drop cancellation.
-	ClientSessionId string `protobuf:"bytes,10,opt,name=client_session_id,json=clientSessionId,proto3,oneof"`
-}
-
-func (*CreateCallRequest_ClientSessionId) isCreateCallRequest_ClientSessionIdPresence() {}
 
 // CallRecord is the latest durable state of a call.
 type CallRecord struct {
@@ -9223,7 +9628,7 @@ type CallRecord struct {
 
 func (x *CallRecord) Reset() {
 	*x = CallRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	mi := &file_vmon_v1_api_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9235,7 +9640,7 @@ func (x *CallRecord) String() string {
 func (*CallRecord) ProtoMessage() {}
 
 func (x *CallRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	mi := &file_vmon_v1_api_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9248,7 +9653,7 @@ func (x *CallRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallRecord.ProtoReflect.Descriptor instead.
 func (*CallRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{113}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *CallRecord) GetRef() *CallRef {
@@ -9385,7 +9790,7 @@ type StreamCallInputsRequest struct {
 
 func (x *StreamCallInputsRequest) Reset() {
 	*x = StreamCallInputsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[114]
+	mi := &file_vmon_v1_api_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9397,7 +9802,7 @@ func (x *StreamCallInputsRequest) String() string {
 func (*StreamCallInputsRequest) ProtoMessage() {}
 
 func (x *StreamCallInputsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[114]
+	mi := &file_vmon_v1_api_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9410,7 +9815,7 @@ func (x *StreamCallInputsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamCallInputsRequest.ProtoReflect.Descriptor instead.
 func (*StreamCallInputsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{114}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *StreamCallInputsRequest) GetFrame() isStreamCallInputsRequest_Frame {
@@ -9463,13 +9868,21 @@ type StreamCallInputsResponse struct {
 	Call *CallRef `protobuf:"bytes,1,opt,name=call,proto3" json:"call,omitempty"`
 	// CommittedInputCount is the number of contiguous committed inputs.
 	CommittedInputCount uint64 `protobuf:"varint,2,opt,name=committed_input_count,json=committedInputCount,proto3" json:"committed_input_count,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// LastInput is absent on the opener acknowledgement and present after an input commit.
+	//
+	// Types that are valid to be assigned to LastInputPresence:
+	//
+	//	*StreamCallInputsResponse_LastInput
+	LastInputPresence isStreamCallInputsResponse_LastInputPresence `protobuf_oneof:"last_input_presence"`
+	// MaxInputsOutstanding is the server-advertised bound for sent but unacknowledged inputs.
+	MaxInputsOutstanding uint32 `protobuf:"varint,4,opt,name=max_inputs_outstanding,json=maxInputsOutstanding,proto3" json:"max_inputs_outstanding,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *StreamCallInputsResponse) Reset() {
 	*x = StreamCallInputsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[115]
+	mi := &file_vmon_v1_api_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9481,7 +9894,7 @@ func (x *StreamCallInputsResponse) String() string {
 func (*StreamCallInputsResponse) ProtoMessage() {}
 
 func (x *StreamCallInputsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[115]
+	mi := &file_vmon_v1_api_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9494,7 +9907,7 @@ func (x *StreamCallInputsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamCallInputsResponse.ProtoReflect.Descriptor instead.
 func (*StreamCallInputsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{115}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *StreamCallInputsResponse) GetCall() *CallRef {
@@ -9511,6 +9924,40 @@ func (x *StreamCallInputsResponse) GetCommittedInputCount() uint64 {
 	return 0
 }
 
+func (x *StreamCallInputsResponse) GetLastInputPresence() isStreamCallInputsResponse_LastInputPresence {
+	if x != nil {
+		return x.LastInputPresence
+	}
+	return nil
+}
+
+func (x *StreamCallInputsResponse) GetLastInput() *InputRef {
+	if x != nil {
+		if x, ok := x.LastInputPresence.(*StreamCallInputsResponse_LastInput); ok {
+			return x.LastInput
+		}
+	}
+	return nil
+}
+
+func (x *StreamCallInputsResponse) GetMaxInputsOutstanding() uint32 {
+	if x != nil {
+		return x.MaxInputsOutstanding
+	}
+	return 0
+}
+
+type isStreamCallInputsResponse_LastInputPresence interface {
+	isStreamCallInputsResponse_LastInputPresence()
+}
+
+type StreamCallInputsResponse_LastInput struct {
+	// LastInput identifies the input acknowledged by this response.
+	LastInput *InputRef `protobuf:"bytes,3,opt,name=last_input,json=lastInput,proto3,oneof"`
+}
+
+func (*StreamCallInputsResponse_LastInput) isStreamCallInputsResponse_LastInputPresence() {}
+
 // CloseCallInputsRequest closes a durable generator or batch input stream.
 type CloseCallInputsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -9524,7 +9971,7 @@ type CloseCallInputsRequest struct {
 
 func (x *CloseCallInputsRequest) Reset() {
 	*x = CloseCallInputsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	mi := &file_vmon_v1_api_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9536,7 +9983,7 @@ func (x *CloseCallInputsRequest) String() string {
 func (*CloseCallInputsRequest) ProtoMessage() {}
 
 func (x *CloseCallInputsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	mi := &file_vmon_v1_api_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9549,7 +9996,7 @@ func (x *CloseCallInputsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseCallInputsRequest.ProtoReflect.Descriptor instead.
 func (*CloseCallInputsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{116}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *CloseCallInputsRequest) GetCall() *CallRef {
@@ -9603,7 +10050,7 @@ type ListCallsRequest struct {
 
 func (x *ListCallsRequest) Reset() {
 	*x = ListCallsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[117]
+	mi := &file_vmon_v1_api_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9615,7 +10062,7 @@ func (x *ListCallsRequest) String() string {
 func (*ListCallsRequest) ProtoMessage() {}
 
 func (x *ListCallsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[117]
+	mi := &file_vmon_v1_api_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9628,7 +10075,7 @@ func (x *ListCallsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallsRequest.ProtoReflect.Descriptor instead.
 func (*ListCallsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{117}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *ListCallsRequest) GetFunctionPresence() isListCallsRequest_FunctionPresence {
@@ -9766,7 +10213,7 @@ type ListCallsResponse struct {
 
 func (x *ListCallsResponse) Reset() {
 	*x = ListCallsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[118]
+	mi := &file_vmon_v1_api_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9778,7 +10225,7 @@ func (x *ListCallsResponse) String() string {
 func (*ListCallsResponse) ProtoMessage() {}
 
 func (x *ListCallsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[118]
+	mi := &file_vmon_v1_api_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9791,7 +10238,7 @@ func (x *ListCallsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallsResponse.ProtoReflect.Descriptor instead.
 func (*ListCallsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{118}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *ListCallsResponse) GetCalls() []*CallRecord {
@@ -9821,7 +10268,7 @@ type GetCallResultRequest struct {
 
 func (x *GetCallResultRequest) Reset() {
 	*x = GetCallResultRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[119]
+	mi := &file_vmon_v1_api_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9833,7 +10280,7 @@ func (x *GetCallResultRequest) String() string {
 func (*GetCallResultRequest) ProtoMessage() {}
 
 func (x *GetCallResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[119]
+	mi := &file_vmon_v1_api_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9846,7 +10293,7 @@ func (x *GetCallResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCallResultRequest.ProtoReflect.Descriptor instead.
 func (*GetCallResultRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{119}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *GetCallResultRequest) GetCall() *CallRef {
@@ -9897,7 +10344,7 @@ type CallResult struct {
 
 func (x *CallResult) Reset() {
 	*x = CallResult{}
-	mi := &file_vmon_v1_api_proto_msgTypes[120]
+	mi := &file_vmon_v1_api_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9909,7 +10356,7 @@ func (x *CallResult) String() string {
 func (*CallResult) ProtoMessage() {}
 
 func (x *CallResult) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[120]
+	mi := &file_vmon_v1_api_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9922,7 +10369,7 @@ func (x *CallResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallResult.ProtoReflect.Descriptor instead.
 func (*CallResult) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{120}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *CallResult) GetCall() *CallRef {
@@ -10050,7 +10497,7 @@ type ResultCursor struct {
 
 func (x *ResultCursor) Reset() {
 	*x = ResultCursor{}
-	mi := &file_vmon_v1_api_proto_msgTypes[121]
+	mi := &file_vmon_v1_api_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10062,7 +10509,7 @@ func (x *ResultCursor) String() string {
 func (*ResultCursor) ProtoMessage() {}
 
 func (x *ResultCursor) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[121]
+	mi := &file_vmon_v1_api_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10075,7 +10522,7 @@ func (x *ResultCursor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResultCursor.ProtoReflect.Descriptor instead.
 func (*ResultCursor) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{121}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *ResultCursor) GetCall() *CallRef {
@@ -10105,7 +10552,7 @@ type EventCursor struct {
 
 func (x *EventCursor) Reset() {
 	*x = EventCursor{}
-	mi := &file_vmon_v1_api_proto_msgTypes[122]
+	mi := &file_vmon_v1_api_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10117,7 +10564,7 @@ func (x *EventCursor) String() string {
 func (*EventCursor) ProtoMessage() {}
 
 func (x *EventCursor) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[122]
+	mi := &file_vmon_v1_api_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10130,7 +10577,7 @@ func (x *EventCursor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventCursor.ProtoReflect.Descriptor instead.
 func (*EventCursor) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{122}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *EventCursor) GetCall() *CallRef {
@@ -10147,26 +10594,139 @@ func (x *EventCursor) GetAfterSequence() uint64 {
 	return 0
 }
 
+// ListCallResultsRequest requests a bounded durable result page.
+type ListCallResultsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Cursor identifies the call and last consumed result sequence.
+	Cursor *ResultCursor `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	// PageSize is bounded by the server; zero selects the server default.
+	PageSize      uint32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListCallResultsRequest) Reset() {
+	*x = ListCallResultsRequest{}
+	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListCallResultsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListCallResultsRequest) ProtoMessage() {}
+
+func (x *ListCallResultsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListCallResultsRequest.ProtoReflect.Descriptor instead.
+func (*ListCallResultsRequest) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{129}
+}
+
+func (x *ListCallResultsRequest) GetCursor() *ResultCursor {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *ListCallResultsRequest) GetPageSize() uint32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+// ListCallResultsResponse contains one bounded durable result page.
+type ListCallResultsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Results are ordered by strictly increasing result sequence.
+	Results []*CallResult `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	// NextCursor resumes after the final returned result.
+	NextCursor *ResultCursor `protobuf:"bytes,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	// End is true when no committed result follows NextCursor at response time.
+	End           bool `protobuf:"varint,3,opt,name=end,proto3" json:"end,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListCallResultsResponse) Reset() {
+	*x = ListCallResultsResponse{}
+	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListCallResultsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListCallResultsResponse) ProtoMessage() {}
+
+func (x *ListCallResultsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListCallResultsResponse.ProtoReflect.Descriptor instead.
+func (*ListCallResultsResponse) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{130}
+}
+
+func (x *ListCallResultsResponse) GetResults() []*CallResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
+func (x *ListCallResultsResponse) GetNextCursor() *ResultCursor {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+func (x *ListCallResultsResponse) GetEnd() bool {
+	if x != nil {
+		return x.End
+	}
+	return false
+}
+
 // WatchCallRequest resumes an ordered call event stream.
 type WatchCallRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Cursor identifies the call and last processed sequence.
 	Cursor *EventCursor `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	// Follow waits for new events after replaying committed history.
-	Follow bool `protobuf:"varint,2,opt,name=follow,proto3" json:"follow,omitempty"`
-	// ClientSessionId is omitted by observers and reattached consumers.
-	//
-	// Types that are valid to be assigned to ClientSessionIdPresence:
-	//
-	//	*WatchCallRequest_ClientSessionId
-	ClientSessionIdPresence isWatchCallRequest_ClientSessionIdPresence `protobuf_oneof:"client_session_id_presence"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	Follow        bool `protobuf:"varint,2,opt,name=follow,proto3" json:"follow,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WatchCallRequest) Reset() {
 	*x = WatchCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[123]
+	mi := &file_vmon_v1_api_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10178,7 +10738,7 @@ func (x *WatchCallRequest) String() string {
 func (*WatchCallRequest) ProtoMessage() {}
 
 func (x *WatchCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[123]
+	mi := &file_vmon_v1_api_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10191,7 +10751,7 @@ func (x *WatchCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchCallRequest.ProtoReflect.Descriptor instead.
 func (*WatchCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{123}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *WatchCallRequest) GetCursor() *EventCursor {
@@ -10208,33 +10768,6 @@ func (x *WatchCallRequest) GetFollow() bool {
 	return false
 }
 
-func (x *WatchCallRequest) GetClientSessionIdPresence() isWatchCallRequest_ClientSessionIdPresence {
-	if x != nil {
-		return x.ClientSessionIdPresence
-	}
-	return nil
-}
-
-func (x *WatchCallRequest) GetClientSessionId() string {
-	if x != nil {
-		if x, ok := x.ClientSessionIdPresence.(*WatchCallRequest_ClientSessionId); ok {
-			return x.ClientSessionId
-		}
-	}
-	return ""
-}
-
-type isWatchCallRequest_ClientSessionIdPresence interface {
-	isWatchCallRequest_ClientSessionIdPresence()
-}
-
-type WatchCallRequest_ClientSessionId struct {
-	// ClientSessionId may trigger drop cancellation only for a follow watch when it exactly matches the creator session.
-	ClientSessionId string `protobuf:"bytes,3,opt,name=client_session_id,json=clientSessionId,proto3,oneof"`
-}
-
-func (*WatchCallRequest_ClientSessionId) isWatchCallRequest_ClientSessionIdPresence() {}
-
 // StatusEvent records a durable lifecycle transition.
 type StatusEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -10246,7 +10779,7 @@ type StatusEvent struct {
 
 func (x *StatusEvent) Reset() {
 	*x = StatusEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[124]
+	mi := &file_vmon_v1_api_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10258,7 +10791,7 @@ func (x *StatusEvent) String() string {
 func (*StatusEvent) ProtoMessage() {}
 
 func (x *StatusEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[124]
+	mi := &file_vmon_v1_api_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10271,7 +10804,7 @@ func (x *StatusEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusEvent.ProtoReflect.Descriptor instead.
 func (*StatusEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{124}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *StatusEvent) GetStatus() CallStatus {
@@ -10294,7 +10827,7 @@ type LogEvent struct {
 
 func (x *LogEvent) Reset() {
 	*x = LogEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[125]
+	mi := &file_vmon_v1_api_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10306,7 +10839,7 @@ func (x *LogEvent) String() string {
 func (*LogEvent) ProtoMessage() {}
 
 func (x *LogEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[125]
+	mi := &file_vmon_v1_api_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10319,7 +10852,7 @@ func (x *LogEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEvent.ProtoReflect.Descriptor instead.
 func (*LogEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{125}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *LogEvent) GetStream() LogStream {
@@ -10339,27 +10872,33 @@ func (x *LogEvent) GetData() []byte {
 // AttemptEvent records an execution attempt transition.
 type AttemptEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Attempt is one-based and increases for each retry.
-	Attempt uint32 `protobuf:"varint,1,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	// AttemptId is the stable identifier shared by all events and stats for this attempt.
+	AttemptId string `protobuf:"bytes,1,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	// UserAttempt counts policy-visible retries caused by user execution failures.
+	UserAttempt uint32 `protobuf:"varint,2,opt,name=user_attempt,json=userAttempt,proto3" json:"user_attempt,omitempty"`
+	// InfraAttempt counts transparent retries caused by infrastructure failures.
+	InfraAttempt uint32 `protobuf:"varint,3,opt,name=infra_attempt,json=infraAttempt,proto3" json:"infra_attempt,omitempty"`
 	// Status is the attempt transition.
-	Status AttemptStatus `protobuf:"varint,2,opt,name=status,proto3,enum=vmon.v1.AttemptStatus" json:"status,omitempty"`
+	Status AttemptStatus `protobuf:"varint,4,opt,name=status,proto3,enum=vmon.v1.AttemptStatus" json:"status,omitempty"`
 	// Startup identifies cold, warm, or snapshot preparation.
-	Startup StartupKind `protobuf:"varint,3,opt,name=startup,proto3,enum=vmon.v1.StartupKind" json:"startup,omitempty"`
+	Startup StartupKind `protobuf:"varint,5,opt,name=startup,proto3,enum=vmon.v1.StartupKind" json:"startup,omitempty"`
 	// WorkerId is the diagnostic worker identity.
-	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	// Error is present when the attempt failed.
 	//
 	// Types that are valid to be assigned to ErrorPresence:
 	//
 	//	*AttemptEvent_Error
 	ErrorPresence isAttemptEvent_ErrorPresence `protobuf_oneof:"error_presence"`
+	// FailureKind distinguishes user failures from transparent infrastructure failures.
+	FailureKind   AttemptFailureKind `protobuf:"varint,8,opt,name=failure_kind,json=failureKind,proto3,enum=vmon.v1.AttemptFailureKind" json:"failure_kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AttemptEvent) Reset() {
 	*x = AttemptEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[126]
+	mi := &file_vmon_v1_api_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10371,7 +10910,7 @@ func (x *AttemptEvent) String() string {
 func (*AttemptEvent) ProtoMessage() {}
 
 func (x *AttemptEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[126]
+	mi := &file_vmon_v1_api_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10384,12 +10923,26 @@ func (x *AttemptEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptEvent.ProtoReflect.Descriptor instead.
 func (*AttemptEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{126}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{134}
 }
 
-func (x *AttemptEvent) GetAttempt() uint32 {
+func (x *AttemptEvent) GetAttemptId() string {
 	if x != nil {
-		return x.Attempt
+		return x.AttemptId
+	}
+	return ""
+}
+
+func (x *AttemptEvent) GetUserAttempt() uint32 {
+	if x != nil {
+		return x.UserAttempt
+	}
+	return 0
+}
+
+func (x *AttemptEvent) GetInfraAttempt() uint32 {
+	if x != nil {
+		return x.InfraAttempt
 	}
 	return 0
 }
@@ -10431,13 +10984,20 @@ func (x *AttemptEvent) GetError() *CallError {
 	return nil
 }
 
+func (x *AttemptEvent) GetFailureKind() AttemptFailureKind {
+	if x != nil {
+		return x.FailureKind
+	}
+	return AttemptFailureKind_ATTEMPT_FAILURE_KIND_UNSPECIFIED
+}
+
 type isAttemptEvent_ErrorPresence interface {
 	isAttemptEvent_ErrorPresence()
 }
 
 type AttemptEvent_Error struct {
 	// Error is the attempt's structured failure.
-	Error *CallError `protobuf:"bytes,5,opt,name=error,proto3,oneof"`
+	Error *CallError `protobuf:"bytes,7,opt,name=error,proto3,oneof"`
 }
 
 func (*AttemptEvent_Error) isAttemptEvent_ErrorPresence() {}
@@ -10459,7 +11019,7 @@ type CallEvent struct {
 	//
 	//	*CallEvent_Status
 	//	*CallEvent_Log
-	//	*CallEvent_Yield
+	//	*CallEvent_YieldResult
 	//	*CallEvent_Result
 	//	*CallEvent_AttemptEvent
 	//	*CallEvent_Error
@@ -10478,19 +11038,19 @@ type CallEvent struct {
 	//
 	//	*CallEvent_InputIndex
 	InputIndexPresence isCallEvent_InputIndexPresence `protobuf_oneof:"input_index_presence"`
-	// Attempt is present when the event is attributable to one execution attempt.
+	// AttemptId is present when the event is attributable to one execution attempt.
 	//
-	// Types that are valid to be assigned to AttemptPresence:
+	// Types that are valid to be assigned to AttemptIdPresence:
 	//
-	//	*CallEvent_Attempt
-	AttemptPresence isCallEvent_AttemptPresence `protobuf_oneof:"attempt_presence"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	//	*CallEvent_AttemptId
+	AttemptIdPresence isCallEvent_AttemptIdPresence `protobuf_oneof:"attempt_id_presence"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CallEvent) Reset() {
 	*x = CallEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[127]
+	mi := &file_vmon_v1_api_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10502,7 +11062,7 @@ func (x *CallEvent) String() string {
 func (*CallEvent) ProtoMessage() {}
 
 func (x *CallEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[127]
+	mi := &file_vmon_v1_api_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10515,7 +11075,7 @@ func (x *CallEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallEvent.ProtoReflect.Descriptor instead.
 func (*CallEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{127}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *CallEvent) GetCall() *CallRef {
@@ -10571,10 +11131,10 @@ func (x *CallEvent) GetLog() *LogEvent {
 	return nil
 }
 
-func (x *CallEvent) GetYield() *CallResult {
+func (x *CallEvent) GetYieldResult() *CallResult {
 	if x != nil {
-		if x, ok := x.Payload.(*CallEvent_Yield); ok {
-			return x.Yield
+		if x, ok := x.Payload.(*CallEvent_YieldResult); ok {
+			return x.YieldResult
 		}
 	}
 	return nil
@@ -10657,20 +11217,20 @@ func (x *CallEvent) GetInputIndex() uint64 {
 	return 0
 }
 
-func (x *CallEvent) GetAttemptPresence() isCallEvent_AttemptPresence {
+func (x *CallEvent) GetAttemptIdPresence() isCallEvent_AttemptIdPresence {
 	if x != nil {
-		return x.AttemptPresence
+		return x.AttemptIdPresence
 	}
 	return nil
 }
 
-func (x *CallEvent) GetAttempt() uint32 {
+func (x *CallEvent) GetAttemptId() string {
 	if x != nil {
-		if x, ok := x.AttemptPresence.(*CallEvent_Attempt); ok {
-			return x.Attempt
+		if x, ok := x.AttemptIdPresence.(*CallEvent_AttemptId); ok {
+			return x.AttemptId
 		}
 	}
-	return 0
+	return ""
 }
 
 type isCallEvent_Payload interface {
@@ -10687,9 +11247,9 @@ type CallEvent_Log struct {
 	Log *LogEvent `protobuf:"bytes,6,opt,name=log,proto3,oneof"`
 }
 
-type CallEvent_Yield struct {
-	// Yield records an indexed generator yield.
-	Yield *CallResult `protobuf:"bytes,7,opt,name=yield,proto3,oneof"`
+type CallEvent_YieldResult struct {
+	// YieldResult records an indexed generator yield.
+	YieldResult *CallResult `protobuf:"bytes,7,opt,name=yield_result,json=yieldResult,proto3,oneof"`
 }
 
 type CallEvent_Result struct {
@@ -10698,7 +11258,7 @@ type CallEvent_Result struct {
 }
 
 type CallEvent_AttemptEvent struct {
-	// Attempt records an attempt transition.
+	// AttemptEvent records an attempt transition.
 	AttemptEvent *AttemptEvent `protobuf:"bytes,9,opt,name=attempt_event,json=attemptEvent,proto3,oneof"`
 }
 
@@ -10721,7 +11281,7 @@ func (*CallEvent_Status) isCallEvent_Payload() {}
 
 func (*CallEvent_Log) isCallEvent_Payload() {}
 
-func (*CallEvent_Yield) isCallEvent_Payload() {}
+func (*CallEvent_YieldResult) isCallEvent_Payload() {}
 
 func (*CallEvent_Result) isCallEvent_Payload() {}
 
@@ -10755,16 +11315,16 @@ type CallEvent_InputIndex struct {
 
 func (*CallEvent_InputIndex) isCallEvent_InputIndexPresence() {}
 
-type isCallEvent_AttemptPresence interface {
-	isCallEvent_AttemptPresence()
+type isCallEvent_AttemptIdPresence interface {
+	isCallEvent_AttemptIdPresence()
 }
 
-type CallEvent_Attempt struct {
-	// Attempt is the one-based execution attempt number.
-	Attempt uint32 `protobuf:"varint,15,opt,name=attempt,proto3,oneof"`
+type CallEvent_AttemptId struct {
+	// AttemptId is the stable execution attempt identifier.
+	AttemptId string `protobuf:"bytes,15,opt,name=attempt_id,json=attemptId,proto3,oneof"`
 }
 
-func (*CallEvent_Attempt) isCallEvent_AttemptPresence() {}
+func (*CallEvent_AttemptId) isCallEvent_AttemptIdPresence() {}
 
 // ErrorFrame is one structured stack frame.
 type ErrorFrame struct {
@@ -10787,7 +11347,7 @@ type ErrorFrame struct {
 
 func (x *ErrorFrame) Reset() {
 	*x = ErrorFrame{}
-	mi := &file_vmon_v1_api_proto_msgTypes[128]
+	mi := &file_vmon_v1_api_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10799,7 +11359,7 @@ func (x *ErrorFrame) String() string {
 func (*ErrorFrame) ProtoMessage() {}
 
 func (x *ErrorFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[128]
+	mi := &file_vmon_v1_api_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10812,7 +11372,7 @@ func (x *ErrorFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorFrame.ProtoReflect.Descriptor instead.
 func (*ErrorFrame) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{128}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *ErrorFrame) GetFile() string {
@@ -10890,7 +11450,7 @@ type CallError struct {
 
 func (x *CallError) Reset() {
 	*x = CallError{}
-	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	mi := &file_vmon_v1_api_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10902,7 +11462,7 @@ func (x *CallError) String() string {
 func (*CallError) ProtoMessage() {}
 
 func (x *CallError) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	mi := &file_vmon_v1_api_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10915,7 +11475,7 @@ func (x *CallError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallError.ProtoReflect.Descriptor instead.
 func (*CallError) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{129}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *CallError) GetCode() string {
@@ -10990,27 +11550,33 @@ func (*CallError_Cause) isCallError_CausePresence() {}
 // AttemptStats contains timing and resource usage for one attempt.
 type AttemptStats struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Attempt is the one-based attempt number.
-	Attempt uint32 `protobuf:"varint,1,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	// AttemptId is the stable identifier shared with attempt events.
+	AttemptId string `protobuf:"bytes,1,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	// UserAttempt counts policy-visible user-code retries.
+	UserAttempt uint32 `protobuf:"varint,2,opt,name=user_attempt,json=userAttempt,proto3" json:"user_attempt,omitempty"`
+	// InfraAttempt counts transparent infrastructure retries.
+	InfraAttempt uint32 `protobuf:"varint,3,opt,name=infra_attempt,json=infraAttempt,proto3" json:"infra_attempt,omitempty"`
 	// Startup identifies cold, warm, or snapshot preparation.
-	Startup StartupKind `protobuf:"varint,2,opt,name=startup,proto3,enum=vmon.v1.StartupKind" json:"startup,omitempty"`
+	Startup StartupKind `protobuf:"varint,4,opt,name=startup,proto3,enum=vmon.v1.StartupKind" json:"startup,omitempty"`
+	// FailureKind classifies the failure that ended this attempt, if any.
+	FailureKind AttemptFailureKind `protobuf:"varint,5,opt,name=failure_kind,json=failureKind,proto3,enum=vmon.v1.AttemptFailureKind" json:"failure_kind,omitempty"`
 	// QueuedMillis is time spent awaiting worker assignment.
-	QueuedMillis uint64 `protobuf:"varint,3,opt,name=queued_millis,json=queuedMillis,proto3" json:"queued_millis,omitempty"`
+	QueuedMillis uint64 `protobuf:"varint,6,opt,name=queued_millis,json=queuedMillis,proto3" json:"queued_millis,omitempty"`
 	// StartupMillis is time spent preparing the worker.
-	StartupMillis uint64 `protobuf:"varint,4,opt,name=startup_millis,json=startupMillis,proto3" json:"startup_millis,omitempty"`
+	StartupMillis uint64 `protobuf:"varint,7,opt,name=startup_millis,json=startupMillis,proto3" json:"startup_millis,omitempty"`
 	// ExecutionMillis is time spent running user code.
-	ExecutionMillis uint64 `protobuf:"varint,5,opt,name=execution_millis,json=executionMillis,proto3" json:"execution_millis,omitempty"`
+	ExecutionMillis uint64 `protobuf:"varint,8,opt,name=execution_millis,json=executionMillis,proto3" json:"execution_millis,omitempty"`
 	// CpuMillis is metered CPU time.
-	CpuMillis uint64 `protobuf:"varint,6,opt,name=cpu_millis,json=cpuMillis,proto3" json:"cpu_millis,omitempty"`
+	CpuMillis uint64 `protobuf:"varint,9,opt,name=cpu_millis,json=cpuMillis,proto3" json:"cpu_millis,omitempty"`
 	// PeakMemoryBytes is peak resident memory.
-	PeakMemoryBytes uint64 `protobuf:"varint,7,opt,name=peak_memory_bytes,json=peakMemoryBytes,proto3" json:"peak_memory_bytes,omitempty"`
+	PeakMemoryBytes uint64 `protobuf:"varint,10,opt,name=peak_memory_bytes,json=peakMemoryBytes,proto3" json:"peak_memory_bytes,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AttemptStats) Reset() {
 	*x = AttemptStats{}
-	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	mi := &file_vmon_v1_api_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11022,7 +11588,7 @@ func (x *AttemptStats) String() string {
 func (*AttemptStats) ProtoMessage() {}
 
 func (x *AttemptStats) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	mi := &file_vmon_v1_api_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11035,12 +11601,26 @@ func (x *AttemptStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptStats.ProtoReflect.Descriptor instead.
 func (*AttemptStats) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{130}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{138}
 }
 
-func (x *AttemptStats) GetAttempt() uint32 {
+func (x *AttemptStats) GetAttemptId() string {
 	if x != nil {
-		return x.Attempt
+		return x.AttemptId
+	}
+	return ""
+}
+
+func (x *AttemptStats) GetUserAttempt() uint32 {
+	if x != nil {
+		return x.UserAttempt
+	}
+	return 0
+}
+
+func (x *AttemptStats) GetInfraAttempt() uint32 {
+	if x != nil {
+		return x.InfraAttempt
 	}
 	return 0
 }
@@ -11050,6 +11630,13 @@ func (x *AttemptStats) GetStartup() StartupKind {
 		return x.Startup
 	}
 	return StartupKind_STARTUP_KIND_UNSPECIFIED
+}
+
+func (x *AttemptStats) GetFailureKind() AttemptFailureKind {
+	if x != nil {
+		return x.FailureKind
+	}
+	return AttemptFailureKind_ATTEMPT_FAILURE_KIND_UNSPECIFIED
 }
 
 func (x *AttemptStats) GetQueuedMillis() uint64 {
@@ -11110,7 +11697,7 @@ type CallStats struct {
 
 func (x *CallStats) Reset() {
 	*x = CallStats{}
-	mi := &file_vmon_v1_api_proto_msgTypes[131]
+	mi := &file_vmon_v1_api_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11122,7 +11709,7 @@ func (x *CallStats) String() string {
 func (*CallStats) ProtoMessage() {}
 
 func (x *CallStats) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[131]
+	mi := &file_vmon_v1_api_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11135,7 +11722,7 @@ func (x *CallStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallStats.ProtoReflect.Descriptor instead.
 func (*CallStats) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{131}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *CallStats) GetQueueMillis() uint64 {
@@ -11202,7 +11789,7 @@ type CancelCallRequest struct {
 
 func (x *CancelCallRequest) Reset() {
 	*x = CancelCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[132]
+	mi := &file_vmon_v1_api_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11214,7 +11801,7 @@ func (x *CancelCallRequest) String() string {
 func (*CancelCallRequest) ProtoMessage() {}
 
 func (x *CancelCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[132]
+	mi := &file_vmon_v1_api_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11227,7 +11814,7 @@ func (x *CancelCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelCallRequest.ProtoReflect.Descriptor instead.
 func (*CancelCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{132}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *CancelCallRequest) GetCall() *CallRef {
@@ -11262,7 +11849,7 @@ type ActorCheckpointRef struct {
 
 func (x *ActorCheckpointRef) Reset() {
 	*x = ActorCheckpointRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[133]
+	mi := &file_vmon_v1_api_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11274,7 +11861,7 @@ func (x *ActorCheckpointRef) String() string {
 func (*ActorCheckpointRef) ProtoMessage() {}
 
 func (x *ActorCheckpointRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[133]
+	mi := &file_vmon_v1_api_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11287,7 +11874,7 @@ func (x *ActorCheckpointRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorCheckpointRef.ProtoReflect.Descriptor instead.
 func (*ActorCheckpointRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{133}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *ActorCheckpointRef) GetCheckpointId() string {
@@ -11324,7 +11911,7 @@ type ActorRecord struct {
 
 func (x *ActorRecord) Reset() {
 	*x = ActorRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[134]
+	mi := &file_vmon_v1_api_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11336,7 +11923,7 @@ func (x *ActorRecord) String() string {
 func (*ActorRecord) ProtoMessage() {}
 
 func (x *ActorRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[134]
+	mi := &file_vmon_v1_api_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11349,7 +11936,7 @@ func (x *ActorRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorRecord.ProtoReflect.Descriptor instead.
 func (*ActorRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{134}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *ActorRecord) GetRef() *ActorRef {
@@ -11442,7 +12029,7 @@ type ActorCheckpoint struct {
 
 func (x *ActorCheckpoint) Reset() {
 	*x = ActorCheckpoint{}
-	mi := &file_vmon_v1_api_proto_msgTypes[135]
+	mi := &file_vmon_v1_api_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11454,7 +12041,7 @@ func (x *ActorCheckpoint) String() string {
 func (*ActorCheckpoint) ProtoMessage() {}
 
 func (x *ActorCheckpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[135]
+	mi := &file_vmon_v1_api_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11467,7 +12054,7 @@ func (x *ActorCheckpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorCheckpoint.ProtoReflect.Descriptor instead.
 func (*ActorCheckpoint) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{135}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *ActorCheckpoint) GetRef() *ActorCheckpointRef {
@@ -11517,12 +12104,13 @@ type CreateActorRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Function pins an actor-lifecycle function revision.
 	Function *RevisionRef `protobuf:"bytes,1,opt,name=function,proto3" json:"function,omitempty"`
-	// InitialState is present when actor construction receives serialized state.
+	// InitialPayload is absent for a no-argument constructor.
 	//
-	// Types that are valid to be assigned to InitialStatePresence:
+	// Types that are valid to be assigned to InitialPayload:
 	//
-	//	*CreateActorRequest_InitialState
-	InitialStatePresence isCreateActorRequest_InitialStatePresence `protobuf_oneof:"initial_state_presence"`
+	//	*CreateActorRequest_InitialValue
+	//	*CreateActorRequest_InitialArguments
+	InitialPayload isCreateActorRequest_InitialPayload `protobuf_oneof:"initial_payload"`
 	// RequestId provides idempotency for retried creation.
 	RequestId string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	// Labels are user-defined lookup metadata.
@@ -11533,7 +12121,7 @@ type CreateActorRequest struct {
 
 func (x *CreateActorRequest) Reset() {
 	*x = CreateActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[136]
+	mi := &file_vmon_v1_api_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11545,7 +12133,7 @@ func (x *CreateActorRequest) String() string {
 func (*CreateActorRequest) ProtoMessage() {}
 
 func (x *CreateActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[136]
+	mi := &file_vmon_v1_api_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11558,7 +12146,7 @@ func (x *CreateActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateActorRequest.ProtoReflect.Descriptor instead.
 func (*CreateActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{136}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *CreateActorRequest) GetFunction() *RevisionRef {
@@ -11568,17 +12156,26 @@ func (x *CreateActorRequest) GetFunction() *RevisionRef {
 	return nil
 }
 
-func (x *CreateActorRequest) GetInitialStatePresence() isCreateActorRequest_InitialStatePresence {
+func (x *CreateActorRequest) GetInitialPayload() isCreateActorRequest_InitialPayload {
 	if x != nil {
-		return x.InitialStatePresence
+		return x.InitialPayload
 	}
 	return nil
 }
 
-func (x *CreateActorRequest) GetInitialState() *ValueEnvelope {
+func (x *CreateActorRequest) GetInitialValue() *ValueEnvelope {
 	if x != nil {
-		if x, ok := x.InitialStatePresence.(*CreateActorRequest_InitialState); ok {
-			return x.InitialState
+		if x, ok := x.InitialPayload.(*CreateActorRequest_InitialValue); ok {
+			return x.InitialValue
+		}
+	}
+	return nil
+}
+
+func (x *CreateActorRequest) GetInitialArguments() *InvocationArguments {
+	if x != nil {
+		if x, ok := x.InitialPayload.(*CreateActorRequest_InitialArguments); ok {
+			return x.InitialArguments
 		}
 	}
 	return nil
@@ -11598,16 +12195,23 @@ func (x *CreateActorRequest) GetLabels() map[string]string {
 	return nil
 }
 
-type isCreateActorRequest_InitialStatePresence interface {
-	isCreateActorRequest_InitialStatePresence()
+type isCreateActorRequest_InitialPayload interface {
+	isCreateActorRequest_InitialPayload()
 }
 
-type CreateActorRequest_InitialState struct {
-	// InitialState is the actor's initial serialized state.
-	InitialState *ValueEnvelope `protobuf:"bytes,2,opt,name=initial_state,json=initialState,proto3,oneof"`
+type CreateActorRequest_InitialValue struct {
+	// InitialValue is one serialized constructor value.
+	InitialValue *ValueEnvelope `protobuf:"bytes,2,opt,name=initial_value,json=initialValue,proto3,oneof"`
 }
 
-func (*CreateActorRequest_InitialState) isCreateActorRequest_InitialStatePresence() {}
+type CreateActorRequest_InitialArguments struct {
+	// InitialArguments contains positional and named constructor arguments.
+	InitialArguments *InvocationArguments `protobuf:"bytes,5,opt,name=initial_arguments,json=initialArguments,proto3,oneof"`
+}
+
+func (*CreateActorRequest_InitialValue) isCreateActorRequest_InitialPayload() {}
+
+func (*CreateActorRequest_InitialArguments) isCreateActorRequest_InitialPayload() {}
 
 // CheckpointActorRequest requests an immutable actor checkpoint.
 type CheckpointActorRequest struct {
@@ -11622,7 +12226,7 @@ type CheckpointActorRequest struct {
 
 func (x *CheckpointActorRequest) Reset() {
 	*x = CheckpointActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[137]
+	mi := &file_vmon_v1_api_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11634,7 +12238,7 @@ func (x *CheckpointActorRequest) String() string {
 func (*CheckpointActorRequest) ProtoMessage() {}
 
 func (x *CheckpointActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[137]
+	mi := &file_vmon_v1_api_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11647,7 +12251,7 @@ func (x *CheckpointActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointActorRequest.ProtoReflect.Descriptor instead.
 func (*CheckpointActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{137}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *CheckpointActorRequest) GetActor() *ActorRef {
@@ -11679,7 +12283,7 @@ type RestoreActorRequest struct {
 
 func (x *RestoreActorRequest) Reset() {
 	*x = RestoreActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[138]
+	mi := &file_vmon_v1_api_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11691,7 +12295,7 @@ func (x *RestoreActorRequest) String() string {
 func (*RestoreActorRequest) ProtoMessage() {}
 
 func (x *RestoreActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[138]
+	mi := &file_vmon_v1_api_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11704,7 +12308,7 @@ func (x *RestoreActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreActorRequest.ProtoReflect.Descriptor instead.
 func (*RestoreActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{138}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *RestoreActorRequest) GetActor() *ActorRef {
@@ -11743,7 +12347,7 @@ type ForkActorRequest struct {
 
 func (x *ForkActorRequest) Reset() {
 	*x = ForkActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[139]
+	mi := &file_vmon_v1_api_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11755,7 +12359,7 @@ func (x *ForkActorRequest) String() string {
 func (*ForkActorRequest) ProtoMessage() {}
 
 func (x *ForkActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[139]
+	mi := &file_vmon_v1_api_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11768,7 +12372,7 @@ func (x *ForkActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkActorRequest.ProtoReflect.Descriptor instead.
 func (*ForkActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{139}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *ForkActorRequest) GetCheckpoint() *ActorCheckpointRef {
@@ -11939,7 +12543,7 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\talgorithm\x18\x01 \x01(\x0e2\x18.vmon.v1.DigestAlgorithmR\talgorithm\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"6\n" +
 	"\vArtifactRef\x12'\n" +
-	"\x06digest\x18\x01 \x01(\v2\x0f.vmon.v1.DigestR\x06digest\"\xf0\x01\n" +
+	"\x06digest\x18\x01 \x01(\v2\x0f.vmon.v1.DigestR\x06digest\"\xca\x02\n" +
 	"\x0eArtifactRecord\x12&\n" +
 	"\x03ref\x18\x01 \x01(\v2\x14.vmon.v1.ArtifactRefR\x03ref\x12\x1d\n" +
 	"\n" +
@@ -11947,14 +12551,19 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x11stored_size_bytes\x18\x03 \x01(\x04R\x0fstoredSizeBytes\x12\x1f\n" +
 	"\n" +
 	"media_type\x18\x04 \x01(\tH\x00R\tmediaType\x123\n" +
-	"\x16created_at_unix_millis\x18\x05 \x01(\x04R\x13createdAtUnixMillisB\x15\n" +
-	"\x13media_type_presence\"\xb5\x01\n" +
+	"\x16created_at_unix_millis\x18\x05 \x01(\x04R\x13createdAtUnixMillis\x125\n" +
+	"\x16expires_at_unix_millis\x18\x06 \x01(\x04H\x01R\x13expiresAtUnixMillisB\x15\n" +
+	"\x13media_type_presenceB!\n" +
+	"\x1fexpires_at_unix_millis_presence\"\xed\x01\n" +
 	"\x11PutArtifactHeader\x128\n" +
 	"\x0fexpected_digest\x18\x01 \x01(\v2\x0f.vmon.v1.DigestR\x0eexpectedDigest\x12.\n" +
 	"\x13expected_size_bytes\x18\x02 \x01(\x04R\x11expectedSizeBytes\x12\x1f\n" +
 	"\n" +
-	"media_type\x18\x03 \x01(\tH\x00R\tmediaTypeB\x15\n" +
-	"\x13media_type_presence\"i\n" +
+	"media_type\x18\x03 \x01(\tH\x00R\tmediaType\x12\x1f\n" +
+	"\n" +
+	"ttl_millis\x18\x04 \x01(\x04H\x01R\tttlMillisB\x15\n" +
+	"\x13media_type_presenceB\x15\n" +
+	"\x13ttl_millis_presence\"i\n" +
 	"\x12PutArtifactRequest\x124\n" +
 	"\x06header\x18\x01 \x01(\v2\x1a.vmon.v1.PutArtifactHeaderH\x00R\x06header\x12\x14\n" +
 	"\x04data\x18\x02 \x01(\fH\x00R\x04dataB\a\n" +
@@ -12045,10 +12654,9 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
-	"\x06source\"\x83\x03\n" +
-	"\fResourceSpec\x12\x1d\n" +
-	"\n" +
-	"cpu_millis\x18\x01 \x01(\rR\tcpuMillis\x12!\n" +
+	"\x06source\"\xf8\x02\n" +
+	"\fResourceSpec\x12\x12\n" +
+	"\x04cpus\x18\x01 \x01(\rR\x04cpus\x12!\n" +
 	"\fmemory_bytes\x18\x02 \x01(\x04R\vmemoryBytes\x120\n" +
 	"\x14ephemeral_disk_bytes\x18\x03 \x01(\x04R\x12ephemeralDiskBytes\x12<\n" +
 	"\farchitecture\x18\x04 \x01(\x0e2\x18.vmon.v1.CpuArchitectureR\farchitecture\x12L\n" +
@@ -12164,13 +12772,20 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x13initialize_presenceB\x13\n" +
 	"\x11shutdown_presenceB\x13\n" +
 	"\x11snapshot_presenceB\x12\n" +
-	"\x10restore_presence\"\xd1\x02\n" +
-	"\x1aFunctionSnapshotProvenance\x120\n" +
-	"\bsnapshot\x18\x01 \x01(\v2\x14.vmon.v1.ArtifactRefR\bsnapshot\x122\n" +
-	"\fimage_digest\x18\x02 \x01(\v2\x0f.vmon.v1.DigestR\vimageDigest\x126\n" +
-	"\x0epackage_digest\x18\x03 \x01(\v2\x0f.vmon.v1.DigestR\rpackageDigest\x123\n" +
-	"\x16created_at_unix_millis\x18\x04 \x01(\x04R\x13createdAtUnixMillis\x12D\n" +
-	"\x0finitialize_hook\x18\x05 \x01(\v2\x19.vmon.v1.LifecycleHookRefH\x00R\x0einitializeHookB\x1a\n" +
+	"\x10restore_presence\"6\n" +
+	"\x13FunctionSnapshotRef\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\"\x90\x04\n" +
+	"\x16FunctionSnapshotRecord\x12.\n" +
+	"\x03ref\x18\x01 \x01(\v2\x1c.vmon.v1.FunctionSnapshotRefR\x03ref\x120\n" +
+	"\brevision\x18\x02 \x01(\v2\x14.vmon.v1.RevisionRefR\brevision\x120\n" +
+	"\bartifact\x18\x03 \x01(\v2\x14.vmon.v1.ArtifactRefR\bartifact\x12)\n" +
+	"\x10protocol_version\x18\x04 \x01(\rR\x0fprotocolVersion\x124\n" +
+	"\rrunner_digest\x18\x05 \x01(\v2\x0f.vmon.v1.DigestR\frunnerDigest\x122\n" +
+	"\fimage_digest\x18\x06 \x01(\v2\x0f.vmon.v1.DigestR\vimageDigest\x126\n" +
+	"\x0epackage_digest\x18\a \x01(\v2\x0f.vmon.v1.DigestR\rpackageDigest\x123\n" +
+	"\x16created_at_unix_millis\x18\b \x01(\x04R\x13createdAtUnixMillis\x12D\n" +
+	"\x0finitialize_hook\x18\t \x01(\v2\x19.vmon.v1.LifecycleHookRefH\x00R\x0einitializeHookB\x1a\n" +
 	"\x18initialize_hook_presence\"\xec\x06\n" +
 	"\fFunctionSpec\x120\n" +
 	"\bfunction\x18\x01 \x01(\v2\x14.vmon.v1.FunctionRefR\bfunction\x12.\n" +
@@ -12193,7 +12808,7 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x0flifecycle_hooks\x18\x0f \x01(\v2\x17.vmon.v1.LifecycleHooksR\x0elifecycleHooks\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc2\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9e\x03\n" +
 	"\x10FunctionRevision\x12&\n" +
 	"\x03ref\x18\x01 \x01(\v2\x14.vmon.v1.RevisionRefR\x03ref\x12)\n" +
 	"\x04spec\x18\x02 \x01(\v2\x15.vmon.v1.FunctionSpecR\x04spec\x120\n" +
@@ -12201,9 +12816,9 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"specDigest\x123\n" +
 	"\x16created_at_unix_millis\x18\x04 \x01(\x04R\x13createdAtUnixMillis\x127\n" +
 	"\x06status\x18\x05 \x01(\x0e2\x1f.vmon.v1.FunctionRevisionStatusR\x06status\x12C\n" +
-	"\x13unavailable_secrets\x18\x06 \x03(\v2\x12.vmon.v1.SecretRefR\x12unavailableSecrets\x12V\n" +
-	"\x13snapshot_provenance\x18\a \x01(\v2#.vmon.v1.FunctionSnapshotProvenanceH\x00R\x12snapshotProvenanceB\x1e\n" +
-	"\x1csnapshot_provenance_presence\"\xa7\x01\n" +
+	"\x13unavailable_secrets\x18\x06 \x03(\v2\x12.vmon.v1.SecretRefR\x12unavailableSecrets\x12=\n" +
+	"\bsnapshot\x18\a \x01(\v2\x1f.vmon.v1.FunctionSnapshotRecordH\x00R\bsnapshotB\x13\n" +
+	"\x11snapshot_presence\"\xa7\x01\n" +
 	"\x0eFunctionRecord\x120\n" +
 	"\bfunction\x18\x01 \x01(\v2\x14.vmon.v1.FunctionRefR\bfunction\x12.\n" +
 	"\acurrent\x18\x02 \x01(\v2\x14.vmon.v1.RevisionRefR\acurrent\x123\n" +
@@ -12311,24 +12926,50 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\aCallRef\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\tR\x06callId\"%\n" +
 	"\bActorRef\x12\x19\n" +
-	"\bactor_id\x18\x01 \x01(\tR\aactorId\"\xb9\x01\n" +
+	"\bactor_id\x18\x01 \x01(\tR\aactorId\"\xde\x01\n" +
+	"\x13InvocationArguments\x126\n" +
+	"\n" +
+	"positional\x18\x01 \x03(\v2\x16.vmon.v1.ValueEnvelopeR\n" +
+	"positional\x12=\n" +
+	"\x05named\x18\x02 \x03(\v2'.vmon.v1.InvocationArguments.NamedEntryR\x05named\x1aP\n" +
+	"\n" +
+	"NamedEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12,\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeR\x05value:\x028\x01\"N\n" +
+	"\vActorTarget\x12'\n" +
+	"\x05actor\x18\x01 \x01(\v2\x11.vmon.v1.ActorRefR\x05actor\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\"\x88\x01\n" +
+	"\rServiceTarget\x12\x1f\n" +
+	"\vservice_key\x18\x01 \x01(\tR\n" +
+	"serviceKey\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12>\n" +
+	"\vconstructor\x18\x03 \x01(\v2\x1c.vmon.v1.InvocationArgumentsR\vconstructor\"@\n" +
+	"\n" +
+	"ParentEdge\x12\x17\n" +
+	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x19\n" +
+	"\binput_id\x18\x02 \x01(\tR\ainputId\"\xac\x01\n" +
 	"\n" +
 	"CallTarget\x120\n" +
-	"\bfunction\x18\x01 \x01(\v2\x14.vmon.v1.RevisionRefR\bfunction\x12)\n" +
-	"\x05actor\x18\x02 \x01(\v2\x11.vmon.v1.ActorRefH\x00R\x05actor\x12#\n" +
-	"\factor_method\x18\x03 \x01(\tH\x01R\vactorMethodB\x10\n" +
-	"\x0eactor_presenceB\x17\n" +
-	"\x15actor_method_presence\"j\n" +
+	"\bfunction\x18\x01 \x01(\v2\x14.vmon.v1.RevisionRefR\bfunction\x12,\n" +
+	"\x05actor\x18\x02 \x01(\v2\x14.vmon.v1.ActorTargetH\x00R\x05actor\x122\n" +
+	"\aservice\x18\x03 \x01(\v2\x16.vmon.v1.ServiceTargetH\x00R\aserviceB\n" +
+	"\n" +
+	"\breceiver\"\xb5\x01\n" +
 	"\tCallInput\x12\x14\n" +
-	"\x05index\x18\x01 \x01(\x04R\x05index\x12,\n" +
-	"\x05value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeR\x05value\x12\x19\n" +
-	"\binput_id\x18\x03 \x01(\tR\ainputId\"\x9a\x01\n" +
-	"\tCallGraph\x12&\n" +
-	"\x0fparent_call_ids\x18\x01 \x03(\tR\rparentCallIds\x12\"\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\x12.\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeH\x00R\x05value\x12<\n" +
+	"\targuments\x18\x04 \x01(\v2\x1c.vmon.v1.InvocationArgumentsH\x00R\targuments\x12\x19\n" +
+	"\binput_id\x18\x03 \x01(\tR\ainputIdB\t\n" +
+	"\apayload\"F\n" +
+	"\bInputRef\x12\x19\n" +
+	"\binput_id\x18\x01 \x01(\tR\ainputId\x12\x1f\n" +
+	"\vinput_index\x18\x02 \x01(\x04R\n" +
+	"inputIndex\"w\n" +
+	"\tCallGraph\x12-\n" +
+	"\aparents\x18\x01 \x03(\v2\x13.vmon.v1.ParentEdgeR\aparents\x12\"\n" +
 	"\froot_call_id\x18\x02 \x01(\tH\x00R\n" +
-	"rootCallId\x12(\n" +
-	"\x10parent_input_ids\x18\x03 \x03(\tR\x0eparentInputIdsB\x17\n" +
-	"\x15root_call_id_presence\"\xe8\x04\n" +
+	"rootCallIdB\x17\n" +
+	"\x15root_call_id_presence\"\xc8\x03\n" +
 	"\x11CreateCallRequest\x12%\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x11.vmon.v1.CallTypeR\x04type\x12+\n" +
 	"\x06target\x18\x02 \x01(\v2\x13.vmon.v1.CallTargetR\x06target\x12*\n" +
@@ -12337,16 +12978,12 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x05graph\x18\x05 \x01(\v2\x12.vmon.v1.CallGraphR\x05graph\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x06 \x01(\tR\trequestId\x12>\n" +
-	"\x06labels\x18\a \x03(\v2&.vmon.v1.CreateCallRequest.LabelsEntryR\x06labels\x12R\n" +
-	"\x13client_cancellation\x18\b \x01(\x0e2!.vmon.v1.ClientCancellationPolicyR\x12clientCancellation\x12,\n" +
-	"\x11result_ttl_millis\x18\t \x01(\x04H\x00R\x0fresultTtlMillis\x12,\n" +
-	"\x11client_session_id\x18\n" +
-	" \x01(\tH\x01R\x0fclientSessionId\x1a9\n" +
+	"\x06labels\x18\a \x03(\v2&.vmon.v1.CreateCallRequest.LabelsEntryR\x06labels\x12,\n" +
+	"\x11result_ttl_millis\x18\t \x01(\x04H\x00R\x0fresultTtlMillis\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x1c\n" +
-	"\x1aresult_ttl_millis_presenceB\x1c\n" +
-	"\x1aclient_session_id_presence\"\xc6\x05\n" +
+	"\x1aresult_ttl_millis_presence\"\xc6\x05\n" +
 	"\n" +
 	"CallRecord\x12\"\n" +
 	"\x03ref\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x03ref\x12%\n" +
@@ -12372,10 +13009,14 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x17StreamCallInputsRequest\x12&\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefH\x00R\x04call\x12*\n" +
 	"\x05input\x18\x02 \x01(\v2\x12.vmon.v1.CallInputH\x00R\x05inputB\a\n" +
-	"\x05frame\"t\n" +
+	"\x05frame\"\xf5\x01\n" +
 	"\x18StreamCallInputsResponse\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x122\n" +
-	"\x15committed_input_count\x18\x02 \x01(\x04R\x13committedInputCount\"p\n" +
+	"\x15committed_input_count\x18\x02 \x01(\x04R\x13committedInputCount\x122\n" +
+	"\n" +
+	"last_input\x18\x03 \x01(\v2\x11.vmon.v1.InputRefH\x00R\tlastInput\x124\n" +
+	"\x16max_inputs_outstanding\x18\x04 \x01(\rR\x14maxInputsOutstandingB\x15\n" +
+	"\x13last_input_presence\"p\n" +
 	"\x16CloseCallInputsRequest\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x120\n" +
 	"\x14expected_input_count\x18\x02 \x01(\x04R\x12expectedInputCount\"\xed\x02\n" +
@@ -12417,32 +13058,42 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"Z\n" +
 	"\vEventCursor\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12%\n" +
-	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"\xa4\x01\n" +
+	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"d\n" +
+	"\x16ListCallResultsRequest\x12-\n" +
+	"\x06cursor\x18\x01 \x01(\v2\x15.vmon.v1.ResultCursorR\x06cursor\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\rR\bpageSize\"\x92\x01\n" +
+	"\x17ListCallResultsResponse\x12-\n" +
+	"\aresults\x18\x01 \x03(\v2\x13.vmon.v1.CallResultR\aresults\x126\n" +
+	"\vnext_cursor\x18\x02 \x01(\v2\x15.vmon.v1.ResultCursorR\n" +
+	"nextCursor\x12\x10\n" +
+	"\x03end\x18\x03 \x01(\bR\x03end\"X\n" +
 	"\x10WatchCallRequest\x12,\n" +
 	"\x06cursor\x18\x01 \x01(\v2\x14.vmon.v1.EventCursorR\x06cursor\x12\x16\n" +
-	"\x06follow\x18\x02 \x01(\bR\x06follow\x12,\n" +
-	"\x11client_session_id\x18\x03 \x01(\tH\x00R\x0fclientSessionIdB\x1c\n" +
-	"\x1aclient_session_id_presence\":\n" +
+	"\x06follow\x18\x02 \x01(\bR\x06follow\":\n" +
 	"\vStatusEvent\x12+\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x13.vmon.v1.CallStatusR\x06status\"J\n" +
 	"\bLogEvent\x12*\n" +
 	"\x06stream\x18\x01 \x01(\x0e2\x12.vmon.v1.LogStreamR\x06stream\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"\xe3\x01\n" +
-	"\fAttemptEvent\x12\x18\n" +
-	"\aattempt\x18\x01 \x01(\rR\aattempt\x12.\n" +
-	"\x06status\x18\x02 \x01(\x0e2\x16.vmon.v1.AttemptStatusR\x06status\x12.\n" +
-	"\astartup\x18\x03 \x01(\x0e2\x14.vmon.v1.StartupKindR\astartup\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12*\n" +
-	"\x05error\x18\x05 \x01(\v2\x12.vmon.v1.CallErrorH\x00R\x05errorB\x10\n" +
-	"\x0eerror_presence\"\x84\x06\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\"\xf0\x02\n" +
+	"\fAttemptEvent\x12\x1d\n" +
+	"\n" +
+	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12!\n" +
+	"\fuser_attempt\x18\x02 \x01(\rR\vuserAttempt\x12#\n" +
+	"\rinfra_attempt\x18\x03 \x01(\rR\finfraAttempt\x12.\n" +
+	"\x06status\x18\x04 \x01(\x0e2\x16.vmon.v1.AttemptStatusR\x06status\x12.\n" +
+	"\astartup\x18\x05 \x01(\x0e2\x14.vmon.v1.StartupKindR\astartup\x12\x1b\n" +
+	"\tworker_id\x18\x06 \x01(\tR\bworkerId\x12*\n" +
+	"\x05error\x18\a \x01(\v2\x12.vmon.v1.CallErrorH\x00R\x05error\x12>\n" +
+	"\ffailure_kind\x18\b \x01(\x0e2\x1b.vmon.v1.AttemptFailureKindR\vfailureKindB\x10\n" +
+	"\x0eerror_presence\"\x99\x06\n" +
 	"\tCallEvent\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x123\n" +
 	"\x16created_at_unix_millis\x18\x03 \x01(\x04R\x13createdAtUnixMillis\x12*\n" +
 	"\x04type\x18\x04 \x01(\x0e2\x16.vmon.v1.CallEventTypeR\x04type\x12.\n" +
 	"\x06status\x18\x05 \x01(\v2\x14.vmon.v1.StatusEventH\x00R\x06status\x12%\n" +
-	"\x03log\x18\x06 \x01(\v2\x11.vmon.v1.LogEventH\x00R\x03log\x12+\n" +
-	"\x05yield\x18\a \x01(\v2\x13.vmon.v1.CallResultH\x00R\x05yield\x12-\n" +
+	"\x03log\x18\x06 \x01(\v2\x11.vmon.v1.LogEventH\x00R\x03log\x128\n" +
+	"\fyield_result\x18\a \x01(\v2\x13.vmon.v1.CallResultH\x00R\vyieldResult\x12-\n" +
 	"\x06result\x18\b \x01(\v2\x13.vmon.v1.CallResultH\x00R\x06result\x12<\n" +
 	"\rattempt_event\x18\t \x01(\v2\x15.vmon.v1.AttemptEventH\x00R\fattemptEvent\x12*\n" +
 	"\x05error\x18\n" +
@@ -12451,12 +13102,13 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x10cancel_requested\x18\f \x01(\v2\x1a.vmon.v1.CancelCallRequestH\x00R\x0fcancelRequested\x12\x1b\n" +
 	"\binput_id\x18\r \x01(\tH\x01R\ainputId\x12!\n" +
 	"\vinput_index\x18\x0e \x01(\x04H\x02R\n" +
-	"inputIndex\x12\x1a\n" +
-	"\aattempt\x18\x0f \x01(\rH\x03R\aattemptB\t\n" +
+	"inputIndex\x12\x1f\n" +
+	"\n" +
+	"attempt_id\x18\x0f \x01(\tH\x03R\tattemptIdB\t\n" +
 	"\apayloadB\x13\n" +
 	"\x11input_id_presenceB\x16\n" +
-	"\x14input_index_presenceB\x12\n" +
-	"\x10attempt_presence\"w\n" +
+	"\x14input_index_presenceB\x15\n" +
+	"\x13attempt_id_presence\"w\n" +
 	"\n" +
 	"ErrorFrame\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\tR\x04file\x12\x12\n" +
@@ -12475,16 +13127,21 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\fDetailsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x10\n" +
-	"\x0ecause_presence\"\x9a\x02\n" +
-	"\fAttemptStats\x12\x18\n" +
-	"\aattempt\x18\x01 \x01(\rR\aattempt\x12.\n" +
-	"\astartup\x18\x02 \x01(\x0e2\x14.vmon.v1.StartupKindR\astartup\x12#\n" +
-	"\rqueued_millis\x18\x03 \x01(\x04R\fqueuedMillis\x12%\n" +
-	"\x0estartup_millis\x18\x04 \x01(\x04R\rstartupMillis\x12)\n" +
-	"\x10execution_millis\x18\x05 \x01(\x04R\x0fexecutionMillis\x12\x1d\n" +
+	"\x0ecause_presence\"\xa7\x03\n" +
+	"\fAttemptStats\x12\x1d\n" +
 	"\n" +
-	"cpu_millis\x18\x06 \x01(\x04R\tcpuMillis\x12*\n" +
-	"\x11peak_memory_bytes\x18\a \x01(\x04R\x0fpeakMemoryBytes\"\x9f\x02\n" +
+	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12!\n" +
+	"\fuser_attempt\x18\x02 \x01(\rR\vuserAttempt\x12#\n" +
+	"\rinfra_attempt\x18\x03 \x01(\rR\finfraAttempt\x12.\n" +
+	"\astartup\x18\x04 \x01(\x0e2\x14.vmon.v1.StartupKindR\astartup\x12>\n" +
+	"\ffailure_kind\x18\x05 \x01(\x0e2\x1b.vmon.v1.AttemptFailureKindR\vfailureKind\x12#\n" +
+	"\rqueued_millis\x18\x06 \x01(\x04R\fqueuedMillis\x12%\n" +
+	"\x0estartup_millis\x18\a \x01(\x04R\rstartupMillis\x12)\n" +
+	"\x10execution_millis\x18\b \x01(\x04R\x0fexecutionMillis\x12\x1d\n" +
+	"\n" +
+	"cpu_millis\x18\t \x01(\x04R\tcpuMillis\x12*\n" +
+	"\x11peak_memory_bytes\x18\n" +
+	" \x01(\x04R\x0fpeakMemoryBytes\"\x9f\x02\n" +
 	"\tCallStats\x12!\n" +
 	"\fqueue_millis\x18\x01 \x01(\x04R\vqueueMillis\x12%\n" +
 	"\x0estartup_millis\x18\x02 \x01(\x04R\rstartupMillis\x12)\n" +
@@ -12520,17 +13177,18 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\bfunction\x18\x03 \x01(\v2\x14.vmon.v1.RevisionRefR\bfunction\x12,\n" +
 	"\x05state\x18\x04 \x01(\v2\x16.vmon.v1.ValueEnvelopeR\x05state\x12\x1a\n" +
 	"\bsequence\x18\x05 \x01(\x04R\bsequence\x123\n" +
-	"\x16created_at_unix_millis\x18\x06 \x01(\x04R\x13createdAtUnixMillis\"\xba\x02\n" +
+	"\x16created_at_unix_millis\x18\x06 \x01(\x04R\x13createdAtUnixMillis\"\x80\x03\n" +
 	"\x12CreateActorRequest\x120\n" +
 	"\bfunction\x18\x01 \x01(\v2\x14.vmon.v1.RevisionRefR\bfunction\x12=\n" +
-	"\rinitial_state\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeH\x00R\finitialState\x12\x1d\n" +
+	"\rinitial_value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeH\x00R\finitialValue\x12K\n" +
+	"\x11initial_arguments\x18\x05 \x01(\v2\x1c.vmon.v1.InvocationArgumentsH\x00R\x10initialArguments\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x03 \x01(\tR\trequestId\x12?\n" +
 	"\x06labels\x18\x04 \x03(\v2'.vmon.v1.CreateActorRequest.LabelsEntryR\x06labels\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x18\n" +
-	"\x16initial_state_presence\"`\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
+	"\x0finitial_payload\"`\n" +
 	"\x16CheckpointActorRequest\x12'\n" +
 	"\x05actor\x18\x01 \x01(\v2\x11.vmon.v1.ActorRefR\x05actor\x12\x1d\n" +
 	"\n" +
@@ -12556,11 +13214,10 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x12STREAM_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rSTREAM_STDOUT\x10\x01\x12\x11\n" +
 	"\rSTREAM_STDERR\x10\x02\x12\x12\n" +
-	"\x0eSTREAM_CONSOLE\x10\x03*m\n" +
+	"\x0eSTREAM_CONSOLE\x10\x03*P\n" +
 	"\x0fDigestAlgorithm\x12 \n" +
 	"\x1cDIGEST_ALGORITHM_UNSPECIFIED\x10\x00\x12\x1b\n" +
-	"\x17DIGEST_ALGORITHM_SHA256\x10\x01\x12\x1b\n" +
-	"\x17DIGEST_ALGORITHM_BLAKE3\x10\x02*\x8b\x01\n" +
+	"\x17DIGEST_ALGORITHM_SHA256\x10\x01*\x8b\x01\n" +
 	"\x0fValueSerializer\x12 \n" +
 	"\x1cVALUE_SERIALIZER_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15VALUE_SERIALIZER_JSON\x10\x01\x12\x19\n" +
@@ -12588,11 +13245,7 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"$HIGH_AVAILABILITY_POLICY_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dHIGH_AVAILABILITY_POLICY_NONE\x10\x01\x12!\n" +
 	"\x1dHIGH_AVAILABILITY_POLICY_HOST\x10\x02\x12!\n" +
-	"\x1dHIGH_AVAILABILITY_POLICY_ZONE\x10\x03*\x94\x01\n" +
-	"\x18ClientCancellationPolicy\x12*\n" +
-	"&CLIENT_CANCELLATION_POLICY_UNSPECIFIED\x10\x00\x12%\n" +
-	"!CLIENT_CANCELLATION_POLICY_DETACH\x10\x01\x12%\n" +
-	"!CLIENT_CANCELLATION_POLICY_CANCEL\x10\x02*}\n" +
+	"\x1dHIGH_AVAILABILITY_POLICY_ZONE\x10\x03*}\n" +
 	"\bCallType\x12\x19\n" +
 	"\x15CALL_TYPE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fCALL_TYPE_UNARY\x10\x01\x12\x17\n" +
@@ -12650,7 +13303,12 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x16FunctionRevisionStatus\x12(\n" +
 	"$FUNCTION_REVISION_STATUS_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eFUNCTION_REVISION_STATUS_READY\x10\x01\x12(\n" +
-	"$FUNCTION_REVISION_STATUS_UNAVAILABLE\x10\x022\xbe\v\n" +
+	"$FUNCTION_REVISION_STATUS_UNAVAILABLE\x10\x02*\xa6\x01\n" +
+	"\x12AttemptFailureKind\x12$\n" +
+	" ATTEMPT_FAILURE_KIND_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19ATTEMPT_FAILURE_KIND_USER\x10\x01\x12'\n" +
+	"#ATTEMPT_FAILURE_KIND_INFRASTRUCTURE\x10\x02\x12\"\n" +
+	"\x1eATTEMPT_FAILURE_KIND_CANCELLED\x10\x032\xbe\v\n" +
 	"\x0eSandboxService\x12:\n" +
 	"\x06Create\x12\x1d.vmon.v1.CreateSandboxRequest\x1a\x11.vmon.v1.JsonView\x12E\n" +
 	"\x04List\x12\x1d.vmon.v1.ListSandboxesRequest\x1a\x1e.vmon.v1.ListSandboxesResponse\x12-\n" +
@@ -12715,14 +13373,15 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x0eCreateSchedule\x12\x1e.vmon.v1.CreateScheduleRequest\x1a\x17.vmon.v1.ScheduleRecord\x12<\n" +
 	"\vGetSchedule\x12\x14.vmon.v1.ScheduleRef\x1a\x17.vmon.v1.ScheduleRecord\x12N\n" +
 	"\rListSchedules\x12\x1d.vmon.v1.ListSchedulesRequest\x1a\x1e.vmon.v1.ListSchedulesResponse\x123\n" +
-	"\x0eDeleteSchedule\x12\x14.vmon.v1.ScheduleRef\x1a\v.vmon.v1.Ok2\x87\x04\n" +
+	"\x0eDeleteSchedule\x12\x14.vmon.v1.ScheduleRef\x1a\v.vmon.v1.Ok2\xdb\x04\n" +
 	"\vCallService\x129\n" +
-	"\x06Create\x12\x1a.vmon.v1.CreateCallRequest\x1a\x13.vmon.v1.CallRecord\x12U\n" +
-	"\fStreamInputs\x12 .vmon.v1.StreamCallInputsRequest\x1a!.vmon.v1.StreamCallInputsResponse(\x01\x12C\n" +
+	"\x06Create\x12\x1a.vmon.v1.CreateCallRequest\x1a\x13.vmon.v1.CallRecord\x12W\n" +
+	"\fStreamInputs\x12 .vmon.v1.StreamCallInputsRequest\x1a!.vmon.v1.StreamCallInputsResponse(\x010\x01\x12C\n" +
 	"\vCloseInputs\x12\x1f.vmon.v1.CloseCallInputsRequest\x1a\x13.vmon.v1.CallRecord\x12,\n" +
 	"\x03Get\x12\x10.vmon.v1.CallRef\x1a\x13.vmon.v1.CallRecord\x12=\n" +
 	"\x04List\x12\x19.vmon.v1.ListCallsRequest\x1a\x1a.vmon.v1.ListCallsResponse\x12?\n" +
-	"\tGetResult\x12\x1d.vmon.v1.GetCallResultRequest\x1a\x13.vmon.v1.CallResult\x128\n" +
+	"\tGetResult\x12\x1d.vmon.v1.GetCallResultRequest\x1a\x13.vmon.v1.CallResult\x12P\n" +
+	"\vListResults\x12\x1f.vmon.v1.ListCallResultsRequest\x1a .vmon.v1.ListCallResultsResponse\x128\n" +
 	"\x05Watch\x12\x19.vmon.v1.WatchCallRequest\x1a\x12.vmon.v1.CallEvent0\x01\x129\n" +
 	"\x06Cancel\x12\x1a.vmon.v1.CancelCallRequest\x1a\x13.vmon.v1.CallRecord2\xe6\x02\n" +
 	"\fActorService\x12;\n" +
@@ -12747,180 +13406,189 @@ func file_vmon_v1_api_proto_rawDescGZIP() []byte {
 }
 
 var file_vmon_v1_api_proto_enumTypes = make([]protoimpl.EnumInfo, 18)
-var file_vmon_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 151)
+var file_vmon_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 160)
 var file_vmon_v1_api_proto_goTypes = []any{
-	(Stream)(0),                        // 0: vmon.v1.Stream
-	(DigestAlgorithm)(0),               // 1: vmon.v1.DigestAlgorithm
-	(ValueSerializer)(0),               // 2: vmon.v1.ValueSerializer
-	(ValueCompression)(0),              // 3: vmon.v1.ValueCompression
-	(FunctionLifecycle)(0),             // 4: vmon.v1.FunctionLifecycle
-	(PackageMode)(0),                   // 5: vmon.v1.PackageMode
-	(CpuArchitecture)(0),               // 6: vmon.v1.CpuArchitecture
-	(HighAvailabilityPolicy)(0),        // 7: vmon.v1.HighAvailabilityPolicy
-	(ClientCancellationPolicy)(0),      // 8: vmon.v1.ClientCancellationPolicy
-	(CallType)(0),                      // 9: vmon.v1.CallType
-	(CallStatus)(0),                    // 10: vmon.v1.CallStatus
-	(CallEventType)(0),                 // 11: vmon.v1.CallEventType
-	(LogStream)(0),                     // 12: vmon.v1.LogStream
-	(AttemptStatus)(0),                 // 13: vmon.v1.AttemptStatus
-	(StartupKind)(0),                   // 14: vmon.v1.StartupKind
-	(ActorStatus)(0),                   // 15: vmon.v1.ActorStatus
-	(ScheduleStatus)(0),                // 16: vmon.v1.ScheduleStatus
-	(FunctionRevisionStatus)(0),        // 17: vmon.v1.FunctionRevisionStatus
-	(*JsonView)(nil),                   // 18: vmon.v1.JsonView
-	(*Ok)(nil),                         // 19: vmon.v1.Ok
-	(*SandboxRef)(nil),                 // 20: vmon.v1.SandboxRef
-	(*CreateSandboxRequest)(nil),       // 21: vmon.v1.CreateSandboxRequest
-	(*ListSandboxesRequest)(nil),       // 22: vmon.v1.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),      // 23: vmon.v1.ListSandboxesResponse
-	(*StopSandboxRequest)(nil),         // 24: vmon.v1.StopSandboxRequest
-	(*ExtendSandboxRequest)(nil),       // 25: vmon.v1.ExtendSandboxRequest
-	(*LogsRequest)(nil),                // 26: vmon.v1.LogsRequest
-	(*LogChunk)(nil),                   // 27: vmon.v1.LogChunk
-	(*ExecStart)(nil),                  // 28: vmon.v1.ExecStart
-	(*ExecCaptureRequest)(nil),         // 29: vmon.v1.ExecCaptureRequest
-	(*ExecCaptureResponse)(nil),        // 30: vmon.v1.ExecCaptureResponse
-	(*ExecInput)(nil),                  // 31: vmon.v1.ExecInput
-	(*ExecOutput)(nil),                 // 32: vmon.v1.ExecOutput
-	(*FilePathRequest)(nil),            // 33: vmon.v1.FilePathRequest
-	(*FileContent)(nil),                // 34: vmon.v1.FileContent
-	(*FileWriteRequest)(nil),           // 35: vmon.v1.FileWriteRequest
-	(*FileDeleteRequest)(nil),          // 36: vmon.v1.FileDeleteRequest
-	(*StringList)(nil),                 // 37: vmon.v1.StringList
-	(*NetworkSetRequest)(nil),          // 38: vmon.v1.NetworkSetRequest
-	(*MigrateRequest)(nil),             // 39: vmon.v1.MigrateRequest
-	(*SnapshotRequest)(nil),            // 40: vmon.v1.SnapshotRequest
-	(*SnapshotFsRequest)(nil),          // 41: vmon.v1.SnapshotFsRequest
-	(*ListSnapshotsRequest)(nil),       // 42: vmon.v1.ListSnapshotsRequest
-	(*SnapshotList)(nil),               // 43: vmon.v1.SnapshotList
-	(*RestoreSnapshotRequest)(nil),     // 44: vmon.v1.RestoreSnapshotRequest
-	(*ForkSnapshotRequest)(nil),        // 45: vmon.v1.ForkSnapshotRequest
-	(*ListVolumesRequest)(nil),         // 46: vmon.v1.ListVolumesRequest
-	(*VolumeList)(nil),                 // 47: vmon.v1.VolumeList
-	(*VolumeRef)(nil),                  // 48: vmon.v1.VolumeRef
-	(*ListPoolsRequest)(nil),           // 49: vmon.v1.ListPoolsRequest
-	(*PoolSetRequest)(nil),             // 50: vmon.v1.PoolSetRequest
-	(*PoolRef)(nil),                    // 51: vmon.v1.PoolRef
-	(*InfoRequest)(nil),                // 52: vmon.v1.InfoRequest
-	(*MeshStatusRequest)(nil),          // 53: vmon.v1.MeshStatusRequest
-	(*EventsRequest)(nil),              // 54: vmon.v1.EventsRequest
-	(*Eof)(nil),                        // 55: vmon.v1.Eof
-	(*Resize)(nil),                     // 56: vmon.v1.Resize
-	(*Output)(nil),                     // 57: vmon.v1.Output
-	(*Exit)(nil),                       // 58: vmon.v1.Exit
-	(*Ready)(nil),                      // 59: vmon.v1.Ready
-	(*Digest)(nil),                     // 60: vmon.v1.Digest
-	(*ArtifactRef)(nil),                // 61: vmon.v1.ArtifactRef
-	(*ArtifactRecord)(nil),             // 62: vmon.v1.ArtifactRecord
-	(*PutArtifactHeader)(nil),          // 63: vmon.v1.PutArtifactHeader
-	(*PutArtifactRequest)(nil),         // 64: vmon.v1.PutArtifactRequest
-	(*GetArtifactRequest)(nil),         // 65: vmon.v1.GetArtifactRequest
-	(*ByteRange)(nil),                  // 66: vmon.v1.ByteRange
-	(*ArtifactChunk)(nil),              // 67: vmon.v1.ArtifactChunk
-	(*PythonCodecMetadata)(nil),        // 68: vmon.v1.PythonCodecMetadata
-	(*ValueEnvelope)(nil),              // 69: vmon.v1.ValueEnvelope
-	(*FunctionRef)(nil),                // 70: vmon.v1.FunctionRef
-	(*RevisionRef)(nil),                // 71: vmon.v1.RevisionRef
-	(*FunctionSelector)(nil),           // 72: vmon.v1.FunctionSelector
-	(*AppRef)(nil),                     // 73: vmon.v1.AppRef
-	(*AppRevisionRef)(nil),             // 74: vmon.v1.AppRevisionRef
-	(*AppSelector)(nil),                // 75: vmon.v1.AppSelector
-	(*PackageSpec)(nil),                // 76: vmon.v1.PackageSpec
-	(*ImageSpec)(nil),                  // 77: vmon.v1.ImageSpec
-	(*ResourceSpec)(nil),               // 78: vmon.v1.ResourceSpec
-	(*PythonCodeMetadata)(nil),         // 79: vmon.v1.PythonCodeMetadata
-	(*PythonImageSource)(nil),          // 80: vmon.v1.PythonImageSource
-	(*RegistryImageSource)(nil),        // 81: vmon.v1.RegistryImageSource
-	(*DockerfileImageSource)(nil),      // 82: vmon.v1.DockerfileImageSource
-	(*TemplateImageSource)(nil),        // 83: vmon.v1.TemplateImageSource
-	(*AptPackage)(nil),                 // 84: vmon.v1.AptPackage
-	(*UvPackage)(nil),                  // 85: vmon.v1.UvPackage
-	(*ImageBuildCommand)(nil),          // 86: vmon.v1.ImageBuildCommand
-	(*LocalArtifactMount)(nil),         // 87: vmon.v1.LocalArtifactMount
-	(*FunctionVolumeMount)(nil),        // 88: vmon.v1.FunctionVolumeMount
-	(*NetworkPolicy)(nil),              // 89: vmon.v1.NetworkPolicy
-	(*RetryPolicy)(nil),                // 90: vmon.v1.RetryPolicy
-	(*TimeoutSpec)(nil),                // 91: vmon.v1.TimeoutSpec
-	(*WorkerSpec)(nil),                 // 92: vmon.v1.WorkerSpec
-	(*ConcurrencySpec)(nil),            // 93: vmon.v1.ConcurrencySpec
-	(*BatchingSpec)(nil),               // 94: vmon.v1.BatchingSpec
-	(*SerializerSpec)(nil),             // 95: vmon.v1.SerializerSpec
-	(*ReproducibilitySpec)(nil),        // 96: vmon.v1.ReproducibilitySpec
-	(*SecretRef)(nil),                  // 97: vmon.v1.SecretRef
-	(*TransientSecretMaterial)(nil),    // 98: vmon.v1.TransientSecretMaterial
-	(*LifecycleHookRef)(nil),           // 99: vmon.v1.LifecycleHookRef
-	(*LifecycleHooks)(nil),             // 100: vmon.v1.LifecycleHooks
-	(*FunctionSnapshotProvenance)(nil), // 101: vmon.v1.FunctionSnapshotProvenance
-	(*FunctionSpec)(nil),               // 102: vmon.v1.FunctionSpec
-	(*FunctionRevision)(nil),           // 103: vmon.v1.FunctionRevision
-	(*FunctionRecord)(nil),             // 104: vmon.v1.FunctionRecord
-	(*RegisterFunctionRequest)(nil),    // 105: vmon.v1.RegisterFunctionRequest
-	(*GetFunctionRequest)(nil),         // 106: vmon.v1.GetFunctionRequest
-	(*ListFunctionsRequest)(nil),       // 107: vmon.v1.ListFunctionsRequest
-	(*ListFunctionsResponse)(nil),      // 108: vmon.v1.ListFunctionsResponse
-	(*ActivateFunctionRequest)(nil),    // 109: vmon.v1.ActivateFunctionRequest
-	(*DeleteFunctionRequest)(nil),      // 110: vmon.v1.DeleteFunctionRequest
-	(*AppFunctionBinding)(nil),         // 111: vmon.v1.AppFunctionBinding
-	(*AppRevision)(nil),                // 112: vmon.v1.AppRevision
-	(*ActivateAppRequest)(nil),         // 113: vmon.v1.ActivateAppRequest
-	(*GetAppRequest)(nil),              // 114: vmon.v1.GetAppRequest
-	(*RollbackAppRequest)(nil),         // 115: vmon.v1.RollbackAppRequest
-	(*ScheduleRef)(nil),                // 116: vmon.v1.ScheduleRef
-	(*CronSchedule)(nil),               // 117: vmon.v1.CronSchedule
-	(*PeriodSchedule)(nil),             // 118: vmon.v1.PeriodSchedule
-	(*ScheduleTarget)(nil),             // 119: vmon.v1.ScheduleTarget
-	(*ScheduleSpec)(nil),               // 120: vmon.v1.ScheduleSpec
-	(*ScheduleRecord)(nil),             // 121: vmon.v1.ScheduleRecord
-	(*CreateScheduleRequest)(nil),      // 122: vmon.v1.CreateScheduleRequest
-	(*ListSchedulesRequest)(nil),       // 123: vmon.v1.ListSchedulesRequest
-	(*ListSchedulesResponse)(nil),      // 124: vmon.v1.ListSchedulesResponse
-	(*CallRef)(nil),                    // 125: vmon.v1.CallRef
-	(*ActorRef)(nil),                   // 126: vmon.v1.ActorRef
-	(*CallTarget)(nil),                 // 127: vmon.v1.CallTarget
-	(*CallInput)(nil),                  // 128: vmon.v1.CallInput
-	(*CallGraph)(nil),                  // 129: vmon.v1.CallGraph
-	(*CreateCallRequest)(nil),          // 130: vmon.v1.CreateCallRequest
-	(*CallRecord)(nil),                 // 131: vmon.v1.CallRecord
-	(*StreamCallInputsRequest)(nil),    // 132: vmon.v1.StreamCallInputsRequest
-	(*StreamCallInputsResponse)(nil),   // 133: vmon.v1.StreamCallInputsResponse
-	(*CloseCallInputsRequest)(nil),     // 134: vmon.v1.CloseCallInputsRequest
-	(*ListCallsRequest)(nil),           // 135: vmon.v1.ListCallsRequest
-	(*ListCallsResponse)(nil),          // 136: vmon.v1.ListCallsResponse
-	(*GetCallResultRequest)(nil),       // 137: vmon.v1.GetCallResultRequest
-	(*CallResult)(nil),                 // 138: vmon.v1.CallResult
-	(*ResultCursor)(nil),               // 139: vmon.v1.ResultCursor
-	(*EventCursor)(nil),                // 140: vmon.v1.EventCursor
-	(*WatchCallRequest)(nil),           // 141: vmon.v1.WatchCallRequest
-	(*StatusEvent)(nil),                // 142: vmon.v1.StatusEvent
-	(*LogEvent)(nil),                   // 143: vmon.v1.LogEvent
-	(*AttemptEvent)(nil),               // 144: vmon.v1.AttemptEvent
-	(*CallEvent)(nil),                  // 145: vmon.v1.CallEvent
-	(*ErrorFrame)(nil),                 // 146: vmon.v1.ErrorFrame
-	(*CallError)(nil),                  // 147: vmon.v1.CallError
-	(*AttemptStats)(nil),               // 148: vmon.v1.AttemptStats
-	(*CallStats)(nil),                  // 149: vmon.v1.CallStats
-	(*CancelCallRequest)(nil),          // 150: vmon.v1.CancelCallRequest
-	(*ActorCheckpointRef)(nil),         // 151: vmon.v1.ActorCheckpointRef
-	(*ActorRecord)(nil),                // 152: vmon.v1.ActorRecord
-	(*ActorCheckpoint)(nil),            // 153: vmon.v1.ActorCheckpoint
-	(*CreateActorRequest)(nil),         // 154: vmon.v1.CreateActorRequest
-	(*CheckpointActorRequest)(nil),     // 155: vmon.v1.CheckpointActorRequest
-	(*RestoreActorRequest)(nil),        // 156: vmon.v1.RestoreActorRequest
-	(*ForkActorRequest)(nil),           // 157: vmon.v1.ForkActorRequest
-	nil,                                // 158: vmon.v1.ExecStart.EnvEntry
-	nil,                                // 159: vmon.v1.ImageSpec.EnvironmentEntry
-	nil,                                // 160: vmon.v1.ReproducibilitySpec.EnvironmentEntry
-	nil,                                // 161: vmon.v1.FunctionSpec.LabelsEntry
-	nil,                                // 162: vmon.v1.ScheduleSpec.LabelsEntry
-	nil,                                // 163: vmon.v1.CreateCallRequest.LabelsEntry
-	nil,                                // 164: vmon.v1.CallRecord.LabelsEntry
-	nil,                                // 165: vmon.v1.CallError.DetailsEntry
-	nil,                                // 166: vmon.v1.ActorRecord.LabelsEntry
-	nil,                                // 167: vmon.v1.CreateActorRequest.LabelsEntry
-	nil,                                // 168: vmon.v1.ForkActorRequest.LabelsEntry
+	(Stream)(0),                      // 0: vmon.v1.Stream
+	(DigestAlgorithm)(0),             // 1: vmon.v1.DigestAlgorithm
+	(ValueSerializer)(0),             // 2: vmon.v1.ValueSerializer
+	(ValueCompression)(0),            // 3: vmon.v1.ValueCompression
+	(FunctionLifecycle)(0),           // 4: vmon.v1.FunctionLifecycle
+	(PackageMode)(0),                 // 5: vmon.v1.PackageMode
+	(CpuArchitecture)(0),             // 6: vmon.v1.CpuArchitecture
+	(HighAvailabilityPolicy)(0),      // 7: vmon.v1.HighAvailabilityPolicy
+	(CallType)(0),                    // 8: vmon.v1.CallType
+	(CallStatus)(0),                  // 9: vmon.v1.CallStatus
+	(CallEventType)(0),               // 10: vmon.v1.CallEventType
+	(LogStream)(0),                   // 11: vmon.v1.LogStream
+	(AttemptStatus)(0),               // 12: vmon.v1.AttemptStatus
+	(StartupKind)(0),                 // 13: vmon.v1.StartupKind
+	(ActorStatus)(0),                 // 14: vmon.v1.ActorStatus
+	(ScheduleStatus)(0),              // 15: vmon.v1.ScheduleStatus
+	(FunctionRevisionStatus)(0),      // 16: vmon.v1.FunctionRevisionStatus
+	(AttemptFailureKind)(0),          // 17: vmon.v1.AttemptFailureKind
+	(*JsonView)(nil),                 // 18: vmon.v1.JsonView
+	(*Ok)(nil),                       // 19: vmon.v1.Ok
+	(*SandboxRef)(nil),               // 20: vmon.v1.SandboxRef
+	(*CreateSandboxRequest)(nil),     // 21: vmon.v1.CreateSandboxRequest
+	(*ListSandboxesRequest)(nil),     // 22: vmon.v1.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),    // 23: vmon.v1.ListSandboxesResponse
+	(*StopSandboxRequest)(nil),       // 24: vmon.v1.StopSandboxRequest
+	(*ExtendSandboxRequest)(nil),     // 25: vmon.v1.ExtendSandboxRequest
+	(*LogsRequest)(nil),              // 26: vmon.v1.LogsRequest
+	(*LogChunk)(nil),                 // 27: vmon.v1.LogChunk
+	(*ExecStart)(nil),                // 28: vmon.v1.ExecStart
+	(*ExecCaptureRequest)(nil),       // 29: vmon.v1.ExecCaptureRequest
+	(*ExecCaptureResponse)(nil),      // 30: vmon.v1.ExecCaptureResponse
+	(*ExecInput)(nil),                // 31: vmon.v1.ExecInput
+	(*ExecOutput)(nil),               // 32: vmon.v1.ExecOutput
+	(*FilePathRequest)(nil),          // 33: vmon.v1.FilePathRequest
+	(*FileContent)(nil),              // 34: vmon.v1.FileContent
+	(*FileWriteRequest)(nil),         // 35: vmon.v1.FileWriteRequest
+	(*FileDeleteRequest)(nil),        // 36: vmon.v1.FileDeleteRequest
+	(*StringList)(nil),               // 37: vmon.v1.StringList
+	(*NetworkSetRequest)(nil),        // 38: vmon.v1.NetworkSetRequest
+	(*MigrateRequest)(nil),           // 39: vmon.v1.MigrateRequest
+	(*SnapshotRequest)(nil),          // 40: vmon.v1.SnapshotRequest
+	(*SnapshotFsRequest)(nil),        // 41: vmon.v1.SnapshotFsRequest
+	(*ListSnapshotsRequest)(nil),     // 42: vmon.v1.ListSnapshotsRequest
+	(*SnapshotList)(nil),             // 43: vmon.v1.SnapshotList
+	(*RestoreSnapshotRequest)(nil),   // 44: vmon.v1.RestoreSnapshotRequest
+	(*ForkSnapshotRequest)(nil),      // 45: vmon.v1.ForkSnapshotRequest
+	(*ListVolumesRequest)(nil),       // 46: vmon.v1.ListVolumesRequest
+	(*VolumeList)(nil),               // 47: vmon.v1.VolumeList
+	(*VolumeRef)(nil),                // 48: vmon.v1.VolumeRef
+	(*ListPoolsRequest)(nil),         // 49: vmon.v1.ListPoolsRequest
+	(*PoolSetRequest)(nil),           // 50: vmon.v1.PoolSetRequest
+	(*PoolRef)(nil),                  // 51: vmon.v1.PoolRef
+	(*InfoRequest)(nil),              // 52: vmon.v1.InfoRequest
+	(*MeshStatusRequest)(nil),        // 53: vmon.v1.MeshStatusRequest
+	(*EventsRequest)(nil),            // 54: vmon.v1.EventsRequest
+	(*Eof)(nil),                      // 55: vmon.v1.Eof
+	(*Resize)(nil),                   // 56: vmon.v1.Resize
+	(*Output)(nil),                   // 57: vmon.v1.Output
+	(*Exit)(nil),                     // 58: vmon.v1.Exit
+	(*Ready)(nil),                    // 59: vmon.v1.Ready
+	(*Digest)(nil),                   // 60: vmon.v1.Digest
+	(*ArtifactRef)(nil),              // 61: vmon.v1.ArtifactRef
+	(*ArtifactRecord)(nil),           // 62: vmon.v1.ArtifactRecord
+	(*PutArtifactHeader)(nil),        // 63: vmon.v1.PutArtifactHeader
+	(*PutArtifactRequest)(nil),       // 64: vmon.v1.PutArtifactRequest
+	(*GetArtifactRequest)(nil),       // 65: vmon.v1.GetArtifactRequest
+	(*ByteRange)(nil),                // 66: vmon.v1.ByteRange
+	(*ArtifactChunk)(nil),            // 67: vmon.v1.ArtifactChunk
+	(*PythonCodecMetadata)(nil),      // 68: vmon.v1.PythonCodecMetadata
+	(*ValueEnvelope)(nil),            // 69: vmon.v1.ValueEnvelope
+	(*FunctionRef)(nil),              // 70: vmon.v1.FunctionRef
+	(*RevisionRef)(nil),              // 71: vmon.v1.RevisionRef
+	(*FunctionSelector)(nil),         // 72: vmon.v1.FunctionSelector
+	(*AppRef)(nil),                   // 73: vmon.v1.AppRef
+	(*AppRevisionRef)(nil),           // 74: vmon.v1.AppRevisionRef
+	(*AppSelector)(nil),              // 75: vmon.v1.AppSelector
+	(*PackageSpec)(nil),              // 76: vmon.v1.PackageSpec
+	(*ImageSpec)(nil),                // 77: vmon.v1.ImageSpec
+	(*ResourceSpec)(nil),             // 78: vmon.v1.ResourceSpec
+	(*PythonCodeMetadata)(nil),       // 79: vmon.v1.PythonCodeMetadata
+	(*PythonImageSource)(nil),        // 80: vmon.v1.PythonImageSource
+	(*RegistryImageSource)(nil),      // 81: vmon.v1.RegistryImageSource
+	(*DockerfileImageSource)(nil),    // 82: vmon.v1.DockerfileImageSource
+	(*TemplateImageSource)(nil),      // 83: vmon.v1.TemplateImageSource
+	(*AptPackage)(nil),               // 84: vmon.v1.AptPackage
+	(*UvPackage)(nil),                // 85: vmon.v1.UvPackage
+	(*ImageBuildCommand)(nil),        // 86: vmon.v1.ImageBuildCommand
+	(*LocalArtifactMount)(nil),       // 87: vmon.v1.LocalArtifactMount
+	(*FunctionVolumeMount)(nil),      // 88: vmon.v1.FunctionVolumeMount
+	(*NetworkPolicy)(nil),            // 89: vmon.v1.NetworkPolicy
+	(*RetryPolicy)(nil),              // 90: vmon.v1.RetryPolicy
+	(*TimeoutSpec)(nil),              // 91: vmon.v1.TimeoutSpec
+	(*WorkerSpec)(nil),               // 92: vmon.v1.WorkerSpec
+	(*ConcurrencySpec)(nil),          // 93: vmon.v1.ConcurrencySpec
+	(*BatchingSpec)(nil),             // 94: vmon.v1.BatchingSpec
+	(*SerializerSpec)(nil),           // 95: vmon.v1.SerializerSpec
+	(*ReproducibilitySpec)(nil),      // 96: vmon.v1.ReproducibilitySpec
+	(*SecretRef)(nil),                // 97: vmon.v1.SecretRef
+	(*TransientSecretMaterial)(nil),  // 98: vmon.v1.TransientSecretMaterial
+	(*LifecycleHookRef)(nil),         // 99: vmon.v1.LifecycleHookRef
+	(*LifecycleHooks)(nil),           // 100: vmon.v1.LifecycleHooks
+	(*FunctionSnapshotRef)(nil),      // 101: vmon.v1.FunctionSnapshotRef
+	(*FunctionSnapshotRecord)(nil),   // 102: vmon.v1.FunctionSnapshotRecord
+	(*FunctionSpec)(nil),             // 103: vmon.v1.FunctionSpec
+	(*FunctionRevision)(nil),         // 104: vmon.v1.FunctionRevision
+	(*FunctionRecord)(nil),           // 105: vmon.v1.FunctionRecord
+	(*RegisterFunctionRequest)(nil),  // 106: vmon.v1.RegisterFunctionRequest
+	(*GetFunctionRequest)(nil),       // 107: vmon.v1.GetFunctionRequest
+	(*ListFunctionsRequest)(nil),     // 108: vmon.v1.ListFunctionsRequest
+	(*ListFunctionsResponse)(nil),    // 109: vmon.v1.ListFunctionsResponse
+	(*ActivateFunctionRequest)(nil),  // 110: vmon.v1.ActivateFunctionRequest
+	(*DeleteFunctionRequest)(nil),    // 111: vmon.v1.DeleteFunctionRequest
+	(*AppFunctionBinding)(nil),       // 112: vmon.v1.AppFunctionBinding
+	(*AppRevision)(nil),              // 113: vmon.v1.AppRevision
+	(*ActivateAppRequest)(nil),       // 114: vmon.v1.ActivateAppRequest
+	(*GetAppRequest)(nil),            // 115: vmon.v1.GetAppRequest
+	(*RollbackAppRequest)(nil),       // 116: vmon.v1.RollbackAppRequest
+	(*ScheduleRef)(nil),              // 117: vmon.v1.ScheduleRef
+	(*CronSchedule)(nil),             // 118: vmon.v1.CronSchedule
+	(*PeriodSchedule)(nil),           // 119: vmon.v1.PeriodSchedule
+	(*ScheduleTarget)(nil),           // 120: vmon.v1.ScheduleTarget
+	(*ScheduleSpec)(nil),             // 121: vmon.v1.ScheduleSpec
+	(*ScheduleRecord)(nil),           // 122: vmon.v1.ScheduleRecord
+	(*CreateScheduleRequest)(nil),    // 123: vmon.v1.CreateScheduleRequest
+	(*ListSchedulesRequest)(nil),     // 124: vmon.v1.ListSchedulesRequest
+	(*ListSchedulesResponse)(nil),    // 125: vmon.v1.ListSchedulesResponse
+	(*CallRef)(nil),                  // 126: vmon.v1.CallRef
+	(*ActorRef)(nil),                 // 127: vmon.v1.ActorRef
+	(*InvocationArguments)(nil),      // 128: vmon.v1.InvocationArguments
+	(*ActorTarget)(nil),              // 129: vmon.v1.ActorTarget
+	(*ServiceTarget)(nil),            // 130: vmon.v1.ServiceTarget
+	(*ParentEdge)(nil),               // 131: vmon.v1.ParentEdge
+	(*CallTarget)(nil),               // 132: vmon.v1.CallTarget
+	(*CallInput)(nil),                // 133: vmon.v1.CallInput
+	(*InputRef)(nil),                 // 134: vmon.v1.InputRef
+	(*CallGraph)(nil),                // 135: vmon.v1.CallGraph
+	(*CreateCallRequest)(nil),        // 136: vmon.v1.CreateCallRequest
+	(*CallRecord)(nil),               // 137: vmon.v1.CallRecord
+	(*StreamCallInputsRequest)(nil),  // 138: vmon.v1.StreamCallInputsRequest
+	(*StreamCallInputsResponse)(nil), // 139: vmon.v1.StreamCallInputsResponse
+	(*CloseCallInputsRequest)(nil),   // 140: vmon.v1.CloseCallInputsRequest
+	(*ListCallsRequest)(nil),         // 141: vmon.v1.ListCallsRequest
+	(*ListCallsResponse)(nil),        // 142: vmon.v1.ListCallsResponse
+	(*GetCallResultRequest)(nil),     // 143: vmon.v1.GetCallResultRequest
+	(*CallResult)(nil),               // 144: vmon.v1.CallResult
+	(*ResultCursor)(nil),             // 145: vmon.v1.ResultCursor
+	(*EventCursor)(nil),              // 146: vmon.v1.EventCursor
+	(*ListCallResultsRequest)(nil),   // 147: vmon.v1.ListCallResultsRequest
+	(*ListCallResultsResponse)(nil),  // 148: vmon.v1.ListCallResultsResponse
+	(*WatchCallRequest)(nil),         // 149: vmon.v1.WatchCallRequest
+	(*StatusEvent)(nil),              // 150: vmon.v1.StatusEvent
+	(*LogEvent)(nil),                 // 151: vmon.v1.LogEvent
+	(*AttemptEvent)(nil),             // 152: vmon.v1.AttemptEvent
+	(*CallEvent)(nil),                // 153: vmon.v1.CallEvent
+	(*ErrorFrame)(nil),               // 154: vmon.v1.ErrorFrame
+	(*CallError)(nil),                // 155: vmon.v1.CallError
+	(*AttemptStats)(nil),             // 156: vmon.v1.AttemptStats
+	(*CallStats)(nil),                // 157: vmon.v1.CallStats
+	(*CancelCallRequest)(nil),        // 158: vmon.v1.CancelCallRequest
+	(*ActorCheckpointRef)(nil),       // 159: vmon.v1.ActorCheckpointRef
+	(*ActorRecord)(nil),              // 160: vmon.v1.ActorRecord
+	(*ActorCheckpoint)(nil),          // 161: vmon.v1.ActorCheckpoint
+	(*CreateActorRequest)(nil),       // 162: vmon.v1.CreateActorRequest
+	(*CheckpointActorRequest)(nil),   // 163: vmon.v1.CheckpointActorRequest
+	(*RestoreActorRequest)(nil),      // 164: vmon.v1.RestoreActorRequest
+	(*ForkActorRequest)(nil),         // 165: vmon.v1.ForkActorRequest
+	nil,                              // 166: vmon.v1.ExecStart.EnvEntry
+	nil,                              // 167: vmon.v1.ImageSpec.EnvironmentEntry
+	nil,                              // 168: vmon.v1.ReproducibilitySpec.EnvironmentEntry
+	nil,                              // 169: vmon.v1.FunctionSpec.LabelsEntry
+	nil,                              // 170: vmon.v1.ScheduleSpec.LabelsEntry
+	nil,                              // 171: vmon.v1.InvocationArguments.NamedEntry
+	nil,                              // 172: vmon.v1.CreateCallRequest.LabelsEntry
+	nil,                              // 173: vmon.v1.CallRecord.LabelsEntry
+	nil,                              // 174: vmon.v1.CallError.DetailsEntry
+	nil,                              // 175: vmon.v1.ActorRecord.LabelsEntry
+	nil,                              // 176: vmon.v1.CreateActorRequest.LabelsEntry
+	nil,                              // 177: vmon.v1.ForkActorRequest.LabelsEntry
 }
 var file_vmon_v1_api_proto_depIdxs = []int32{
-	158, // 0: vmon.v1.ExecStart.env:type_name -> vmon.v1.ExecStart.EnvEntry
+	166, // 0: vmon.v1.ExecStart.env:type_name -> vmon.v1.ExecStart.EnvEntry
 	28,  // 1: vmon.v1.ExecCaptureRequest.exec:type_name -> vmon.v1.ExecStart
 	28,  // 2: vmon.v1.ExecInput.start:type_name -> vmon.v1.ExecStart
 	55,  // 3: vmon.v1.ExecInput.eof:type_name -> vmon.v1.Eof
@@ -12961,7 +13629,7 @@ var file_vmon_v1_api_proto_depIdxs = []int32{
 	84,  // 38: vmon.v1.ImageSpec.apt_packages:type_name -> vmon.v1.AptPackage
 	85,  // 39: vmon.v1.ImageSpec.uv_packages:type_name -> vmon.v1.UvPackage
 	86,  // 40: vmon.v1.ImageSpec.commands:type_name -> vmon.v1.ImageBuildCommand
-	159, // 41: vmon.v1.ImageSpec.environment:type_name -> vmon.v1.ImageSpec.EnvironmentEntry
+	167, // 41: vmon.v1.ImageSpec.environment:type_name -> vmon.v1.ImageSpec.EnvironmentEntry
 	87,  // 42: vmon.v1.ImageSpec.local_artifact_mounts:type_name -> vmon.v1.LocalArtifactMount
 	60,  // 43: vmon.v1.ImageSpec.resolved_oci_digest:type_name -> vmon.v1.Digest
 	6,   // 44: vmon.v1.ResourceSpec.architecture:type_name -> vmon.v1.CpuArchitecture
@@ -12975,282 +13643,301 @@ var file_vmon_v1_api_proto_depIdxs = []int32{
 	2,   // 52: vmon.v1.SerializerSpec.result_serializer:type_name -> vmon.v1.ValueSerializer
 	3,   // 53: vmon.v1.SerializerSpec.compression:type_name -> vmon.v1.ValueCompression
 	60,  // 54: vmon.v1.ReproducibilitySpec.build_inputs_digest:type_name -> vmon.v1.Digest
-	160, // 55: vmon.v1.ReproducibilitySpec.environment:type_name -> vmon.v1.ReproducibilitySpec.EnvironmentEntry
+	168, // 55: vmon.v1.ReproducibilitySpec.environment:type_name -> vmon.v1.ReproducibilitySpec.EnvironmentEntry
 	97,  // 56: vmon.v1.TransientSecretMaterial.secret:type_name -> vmon.v1.SecretRef
 	99,  // 57: vmon.v1.LifecycleHooks.initialize:type_name -> vmon.v1.LifecycleHookRef
 	99,  // 58: vmon.v1.LifecycleHooks.shutdown:type_name -> vmon.v1.LifecycleHookRef
 	99,  // 59: vmon.v1.LifecycleHooks.snapshot:type_name -> vmon.v1.LifecycleHookRef
 	99,  // 60: vmon.v1.LifecycleHooks.restore:type_name -> vmon.v1.LifecycleHookRef
-	61,  // 61: vmon.v1.FunctionSnapshotProvenance.snapshot:type_name -> vmon.v1.ArtifactRef
-	60,  // 62: vmon.v1.FunctionSnapshotProvenance.image_digest:type_name -> vmon.v1.Digest
-	60,  // 63: vmon.v1.FunctionSnapshotProvenance.package_digest:type_name -> vmon.v1.Digest
-	99,  // 64: vmon.v1.FunctionSnapshotProvenance.initialize_hook:type_name -> vmon.v1.LifecycleHookRef
-	70,  // 65: vmon.v1.FunctionSpec.function:type_name -> vmon.v1.FunctionRef
-	76,  // 66: vmon.v1.FunctionSpec.package:type_name -> vmon.v1.PackageSpec
-	77,  // 67: vmon.v1.FunctionSpec.image:type_name -> vmon.v1.ImageSpec
-	78,  // 68: vmon.v1.FunctionSpec.resources:type_name -> vmon.v1.ResourceSpec
-	90,  // 69: vmon.v1.FunctionSpec.retry:type_name -> vmon.v1.RetryPolicy
-	91,  // 70: vmon.v1.FunctionSpec.timeouts:type_name -> vmon.v1.TimeoutSpec
-	92,  // 71: vmon.v1.FunctionSpec.workers:type_name -> vmon.v1.WorkerSpec
-	93,  // 72: vmon.v1.FunctionSpec.concurrency:type_name -> vmon.v1.ConcurrencySpec
-	94,  // 73: vmon.v1.FunctionSpec.batching:type_name -> vmon.v1.BatchingSpec
-	95,  // 74: vmon.v1.FunctionSpec.serializer:type_name -> vmon.v1.SerializerSpec
-	4,   // 75: vmon.v1.FunctionSpec.lifecycle:type_name -> vmon.v1.FunctionLifecycle
-	96,  // 76: vmon.v1.FunctionSpec.reproducibility:type_name -> vmon.v1.ReproducibilitySpec
-	161, // 77: vmon.v1.FunctionSpec.labels:type_name -> vmon.v1.FunctionSpec.LabelsEntry
-	97,  // 78: vmon.v1.FunctionSpec.secrets:type_name -> vmon.v1.SecretRef
-	100, // 79: vmon.v1.FunctionSpec.lifecycle_hooks:type_name -> vmon.v1.LifecycleHooks
-	71,  // 80: vmon.v1.FunctionRevision.ref:type_name -> vmon.v1.RevisionRef
-	102, // 81: vmon.v1.FunctionRevision.spec:type_name -> vmon.v1.FunctionSpec
-	60,  // 82: vmon.v1.FunctionRevision.spec_digest:type_name -> vmon.v1.Digest
-	17,  // 83: vmon.v1.FunctionRevision.status:type_name -> vmon.v1.FunctionRevisionStatus
-	97,  // 84: vmon.v1.FunctionRevision.unavailable_secrets:type_name -> vmon.v1.SecretRef
-	101, // 85: vmon.v1.FunctionRevision.snapshot_provenance:type_name -> vmon.v1.FunctionSnapshotProvenance
-	70,  // 86: vmon.v1.FunctionRecord.function:type_name -> vmon.v1.FunctionRef
-	71,  // 87: vmon.v1.FunctionRecord.current:type_name -> vmon.v1.RevisionRef
-	102, // 88: vmon.v1.RegisterFunctionRequest.spec:type_name -> vmon.v1.FunctionSpec
-	98,  // 89: vmon.v1.RegisterFunctionRequest.transient_secrets:type_name -> vmon.v1.TransientSecretMaterial
-	72,  // 90: vmon.v1.GetFunctionRequest.function:type_name -> vmon.v1.FunctionSelector
-	70,  // 91: vmon.v1.ListFunctionsRequest.function:type_name -> vmon.v1.FunctionRef
-	103, // 92: vmon.v1.ListFunctionsResponse.revisions:type_name -> vmon.v1.FunctionRevision
-	71,  // 93: vmon.v1.ActivateFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
-	71,  // 94: vmon.v1.ActivateFunctionRequest.expected_current:type_name -> vmon.v1.RevisionRef
-	71,  // 95: vmon.v1.DeleteFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
-	71,  // 96: vmon.v1.AppFunctionBinding.revision:type_name -> vmon.v1.RevisionRef
-	74,  // 97: vmon.v1.AppRevision.ref:type_name -> vmon.v1.AppRevisionRef
-	111, // 98: vmon.v1.AppRevision.functions:type_name -> vmon.v1.AppFunctionBinding
-	60,  // 99: vmon.v1.AppRevision.content_digest:type_name -> vmon.v1.Digest
-	74,  // 100: vmon.v1.AppRevision.previous:type_name -> vmon.v1.AppRevisionRef
-	73,  // 101: vmon.v1.ActivateAppRequest.app:type_name -> vmon.v1.AppRef
-	111, // 102: vmon.v1.ActivateAppRequest.functions:type_name -> vmon.v1.AppFunctionBinding
-	74,  // 103: vmon.v1.ActivateAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
-	75,  // 104: vmon.v1.GetAppRequest.app:type_name -> vmon.v1.AppSelector
-	74,  // 105: vmon.v1.RollbackAppRequest.target:type_name -> vmon.v1.AppRevisionRef
-	74,  // 106: vmon.v1.RollbackAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
-	71,  // 107: vmon.v1.ScheduleTarget.function:type_name -> vmon.v1.RevisionRef
-	69,  // 108: vmon.v1.ScheduleTarget.input:type_name -> vmon.v1.ValueEnvelope
-	74,  // 109: vmon.v1.ScheduleSpec.app:type_name -> vmon.v1.AppRevisionRef
-	119, // 110: vmon.v1.ScheduleSpec.target:type_name -> vmon.v1.ScheduleTarget
-	117, // 111: vmon.v1.ScheduleSpec.cron:type_name -> vmon.v1.CronSchedule
-	118, // 112: vmon.v1.ScheduleSpec.period:type_name -> vmon.v1.PeriodSchedule
-	16,  // 113: vmon.v1.ScheduleSpec.status:type_name -> vmon.v1.ScheduleStatus
-	162, // 114: vmon.v1.ScheduleSpec.labels:type_name -> vmon.v1.ScheduleSpec.LabelsEntry
-	116, // 115: vmon.v1.ScheduleRecord.ref:type_name -> vmon.v1.ScheduleRef
-	120, // 116: vmon.v1.ScheduleRecord.spec:type_name -> vmon.v1.ScheduleSpec
-	120, // 117: vmon.v1.CreateScheduleRequest.spec:type_name -> vmon.v1.ScheduleSpec
-	73,  // 118: vmon.v1.ListSchedulesRequest.app:type_name -> vmon.v1.AppRef
-	70,  // 119: vmon.v1.ListSchedulesRequest.function:type_name -> vmon.v1.FunctionRef
-	121, // 120: vmon.v1.ListSchedulesResponse.schedules:type_name -> vmon.v1.ScheduleRecord
-	71,  // 121: vmon.v1.CallTarget.function:type_name -> vmon.v1.RevisionRef
-	126, // 122: vmon.v1.CallTarget.actor:type_name -> vmon.v1.ActorRef
-	69,  // 123: vmon.v1.CallInput.value:type_name -> vmon.v1.ValueEnvelope
-	9,   // 124: vmon.v1.CreateCallRequest.type:type_name -> vmon.v1.CallType
-	127, // 125: vmon.v1.CreateCallRequest.target:type_name -> vmon.v1.CallTarget
-	128, // 126: vmon.v1.CreateCallRequest.inputs:type_name -> vmon.v1.CallInput
-	129, // 127: vmon.v1.CreateCallRequest.graph:type_name -> vmon.v1.CallGraph
-	163, // 128: vmon.v1.CreateCallRequest.labels:type_name -> vmon.v1.CreateCallRequest.LabelsEntry
-	8,   // 129: vmon.v1.CreateCallRequest.client_cancellation:type_name -> vmon.v1.ClientCancellationPolicy
-	125, // 130: vmon.v1.CallRecord.ref:type_name -> vmon.v1.CallRef
-	9,   // 131: vmon.v1.CallRecord.type:type_name -> vmon.v1.CallType
-	127, // 132: vmon.v1.CallRecord.target:type_name -> vmon.v1.CallTarget
-	10,  // 133: vmon.v1.CallRecord.status:type_name -> vmon.v1.CallStatus
-	129, // 134: vmon.v1.CallRecord.graph:type_name -> vmon.v1.CallGraph
-	147, // 135: vmon.v1.CallRecord.error:type_name -> vmon.v1.CallError
-	149, // 136: vmon.v1.CallRecord.stats:type_name -> vmon.v1.CallStats
-	164, // 137: vmon.v1.CallRecord.labels:type_name -> vmon.v1.CallRecord.LabelsEntry
-	139, // 138: vmon.v1.CallRecord.result_cursor:type_name -> vmon.v1.ResultCursor
-	125, // 139: vmon.v1.StreamCallInputsRequest.call:type_name -> vmon.v1.CallRef
-	128, // 140: vmon.v1.StreamCallInputsRequest.input:type_name -> vmon.v1.CallInput
-	125, // 141: vmon.v1.StreamCallInputsResponse.call:type_name -> vmon.v1.CallRef
-	125, // 142: vmon.v1.CloseCallInputsRequest.call:type_name -> vmon.v1.CallRef
-	70,  // 143: vmon.v1.ListCallsRequest.function:type_name -> vmon.v1.FunctionRef
-	10,  // 144: vmon.v1.ListCallsRequest.status:type_name -> vmon.v1.CallStatus
-	126, // 145: vmon.v1.ListCallsRequest.actor:type_name -> vmon.v1.ActorRef
-	131, // 146: vmon.v1.ListCallsResponse.calls:type_name -> vmon.v1.CallRecord
-	125, // 147: vmon.v1.GetCallResultRequest.call:type_name -> vmon.v1.CallRef
-	125, // 148: vmon.v1.CallResult.call:type_name -> vmon.v1.CallRef
-	69,  // 149: vmon.v1.CallResult.value:type_name -> vmon.v1.ValueEnvelope
-	147, // 150: vmon.v1.CallResult.error:type_name -> vmon.v1.CallError
-	125, // 151: vmon.v1.ResultCursor.call:type_name -> vmon.v1.CallRef
-	125, // 152: vmon.v1.EventCursor.call:type_name -> vmon.v1.CallRef
-	140, // 153: vmon.v1.WatchCallRequest.cursor:type_name -> vmon.v1.EventCursor
-	10,  // 154: vmon.v1.StatusEvent.status:type_name -> vmon.v1.CallStatus
-	12,  // 155: vmon.v1.LogEvent.stream:type_name -> vmon.v1.LogStream
-	13,  // 156: vmon.v1.AttemptEvent.status:type_name -> vmon.v1.AttemptStatus
-	14,  // 157: vmon.v1.AttemptEvent.startup:type_name -> vmon.v1.StartupKind
-	147, // 158: vmon.v1.AttemptEvent.error:type_name -> vmon.v1.CallError
-	125, // 159: vmon.v1.CallEvent.call:type_name -> vmon.v1.CallRef
-	11,  // 160: vmon.v1.CallEvent.type:type_name -> vmon.v1.CallEventType
-	142, // 161: vmon.v1.CallEvent.status:type_name -> vmon.v1.StatusEvent
-	143, // 162: vmon.v1.CallEvent.log:type_name -> vmon.v1.LogEvent
-	138, // 163: vmon.v1.CallEvent.yield:type_name -> vmon.v1.CallResult
-	138, // 164: vmon.v1.CallEvent.result:type_name -> vmon.v1.CallResult
-	144, // 165: vmon.v1.CallEvent.attempt_event:type_name -> vmon.v1.AttemptEvent
-	147, // 166: vmon.v1.CallEvent.error:type_name -> vmon.v1.CallError
-	133, // 167: vmon.v1.CallEvent.input_closed:type_name -> vmon.v1.StreamCallInputsResponse
-	150, // 168: vmon.v1.CallEvent.cancel_requested:type_name -> vmon.v1.CancelCallRequest
-	146, // 169: vmon.v1.CallError.frames:type_name -> vmon.v1.ErrorFrame
-	147, // 170: vmon.v1.CallError.cause:type_name -> vmon.v1.CallError
-	165, // 171: vmon.v1.CallError.details:type_name -> vmon.v1.CallError.DetailsEntry
-	14,  // 172: vmon.v1.AttemptStats.startup:type_name -> vmon.v1.StartupKind
-	148, // 173: vmon.v1.CallStats.attempts:type_name -> vmon.v1.AttemptStats
-	125, // 174: vmon.v1.CancelCallRequest.call:type_name -> vmon.v1.CallRef
-	126, // 175: vmon.v1.ActorRecord.ref:type_name -> vmon.v1.ActorRef
-	71,  // 176: vmon.v1.ActorRecord.function:type_name -> vmon.v1.RevisionRef
-	15,  // 177: vmon.v1.ActorRecord.status:type_name -> vmon.v1.ActorStatus
-	151, // 178: vmon.v1.ActorRecord.latest_checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	166, // 179: vmon.v1.ActorRecord.labels:type_name -> vmon.v1.ActorRecord.LabelsEntry
-	151, // 180: vmon.v1.ActorCheckpoint.ref:type_name -> vmon.v1.ActorCheckpointRef
-	126, // 181: vmon.v1.ActorCheckpoint.actor:type_name -> vmon.v1.ActorRef
-	71,  // 182: vmon.v1.ActorCheckpoint.function:type_name -> vmon.v1.RevisionRef
-	69,  // 183: vmon.v1.ActorCheckpoint.state:type_name -> vmon.v1.ValueEnvelope
-	71,  // 184: vmon.v1.CreateActorRequest.function:type_name -> vmon.v1.RevisionRef
-	69,  // 185: vmon.v1.CreateActorRequest.initial_state:type_name -> vmon.v1.ValueEnvelope
-	167, // 186: vmon.v1.CreateActorRequest.labels:type_name -> vmon.v1.CreateActorRequest.LabelsEntry
-	126, // 187: vmon.v1.CheckpointActorRequest.actor:type_name -> vmon.v1.ActorRef
-	126, // 188: vmon.v1.RestoreActorRequest.actor:type_name -> vmon.v1.ActorRef
-	151, // 189: vmon.v1.RestoreActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	151, // 190: vmon.v1.ForkActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	168, // 191: vmon.v1.ForkActorRequest.labels:type_name -> vmon.v1.ForkActorRequest.LabelsEntry
-	21,  // 192: vmon.v1.SandboxService.Create:input_type -> vmon.v1.CreateSandboxRequest
-	22,  // 193: vmon.v1.SandboxService.List:input_type -> vmon.v1.ListSandboxesRequest
-	20,  // 194: vmon.v1.SandboxService.Get:input_type -> vmon.v1.SandboxRef
-	24,  // 195: vmon.v1.SandboxService.Stop:input_type -> vmon.v1.StopSandboxRequest
-	20,  // 196: vmon.v1.SandboxService.Remove:input_type -> vmon.v1.SandboxRef
-	20,  // 197: vmon.v1.SandboxService.Terminate:input_type -> vmon.v1.SandboxRef
-	20,  // 198: vmon.v1.SandboxService.Pause:input_type -> vmon.v1.SandboxRef
-	20,  // 199: vmon.v1.SandboxService.Resume:input_type -> vmon.v1.SandboxRef
-	25,  // 200: vmon.v1.SandboxService.Extend:input_type -> vmon.v1.ExtendSandboxRequest
-	20,  // 201: vmon.v1.SandboxService.Metrics:input_type -> vmon.v1.SandboxRef
-	26,  // 202: vmon.v1.SandboxService.Logs:input_type -> vmon.v1.LogsRequest
-	29,  // 203: vmon.v1.SandboxService.ExecCapture:input_type -> vmon.v1.ExecCaptureRequest
-	31,  // 204: vmon.v1.SandboxService.Exec:input_type -> vmon.v1.ExecInput
-	31,  // 205: vmon.v1.SandboxService.Shell:input_type -> vmon.v1.ExecInput
-	20,  // 206: vmon.v1.SandboxService.Attach:input_type -> vmon.v1.SandboxRef
-	33,  // 207: vmon.v1.SandboxService.FileRead:input_type -> vmon.v1.FilePathRequest
-	35,  // 208: vmon.v1.SandboxService.FileWrite:input_type -> vmon.v1.FileWriteRequest
-	36,  // 209: vmon.v1.SandboxService.FileDelete:input_type -> vmon.v1.FileDeleteRequest
-	33,  // 210: vmon.v1.SandboxService.FileList:input_type -> vmon.v1.FilePathRequest
-	33,  // 211: vmon.v1.SandboxService.FileStat:input_type -> vmon.v1.FilePathRequest
-	20,  // 212: vmon.v1.SandboxService.NetworkGet:input_type -> vmon.v1.SandboxRef
-	38,  // 213: vmon.v1.SandboxService.NetworkSet:input_type -> vmon.v1.NetworkSetRequest
-	20,  // 214: vmon.v1.SandboxService.Tunnels:input_type -> vmon.v1.SandboxRef
-	39,  // 215: vmon.v1.SandboxService.Migrate:input_type -> vmon.v1.MigrateRequest
-	40,  // 216: vmon.v1.SandboxService.Snapshot:input_type -> vmon.v1.SnapshotRequest
-	41,  // 217: vmon.v1.SandboxService.SnapshotFs:input_type -> vmon.v1.SnapshotFsRequest
-	42,  // 218: vmon.v1.SnapshotService.List:input_type -> vmon.v1.ListSnapshotsRequest
-	44,  // 219: vmon.v1.SnapshotService.Restore:input_type -> vmon.v1.RestoreSnapshotRequest
-	45,  // 220: vmon.v1.SnapshotService.Fork:input_type -> vmon.v1.ForkSnapshotRequest
-	46,  // 221: vmon.v1.VolumeService.List:input_type -> vmon.v1.ListVolumesRequest
-	48,  // 222: vmon.v1.VolumeService.Create:input_type -> vmon.v1.VolumeRef
-	48,  // 223: vmon.v1.VolumeService.Delete:input_type -> vmon.v1.VolumeRef
-	49,  // 224: vmon.v1.PoolService.List:input_type -> vmon.v1.ListPoolsRequest
-	50,  // 225: vmon.v1.PoolService.Set:input_type -> vmon.v1.PoolSetRequest
-	51,  // 226: vmon.v1.PoolService.Delete:input_type -> vmon.v1.PoolRef
-	52,  // 227: vmon.v1.SystemService.Info:input_type -> vmon.v1.InfoRequest
-	54,  // 228: vmon.v1.SystemService.Events:input_type -> vmon.v1.EventsRequest
-	53,  // 229: vmon.v1.SystemService.MeshStatus:input_type -> vmon.v1.MeshStatusRequest
-	64,  // 230: vmon.v1.ArtifactService.Put:input_type -> vmon.v1.PutArtifactRequest
-	65,  // 231: vmon.v1.ArtifactService.Get:input_type -> vmon.v1.GetArtifactRequest
-	61,  // 232: vmon.v1.ArtifactService.Stat:input_type -> vmon.v1.ArtifactRef
-	105, // 233: vmon.v1.FunctionService.Register:input_type -> vmon.v1.RegisterFunctionRequest
-	106, // 234: vmon.v1.FunctionService.Get:input_type -> vmon.v1.GetFunctionRequest
-	107, // 235: vmon.v1.FunctionService.List:input_type -> vmon.v1.ListFunctionsRequest
-	109, // 236: vmon.v1.FunctionService.Activate:input_type -> vmon.v1.ActivateFunctionRequest
-	110, // 237: vmon.v1.FunctionService.Delete:input_type -> vmon.v1.DeleteFunctionRequest
-	113, // 238: vmon.v1.FunctionService.ActivateApp:input_type -> vmon.v1.ActivateAppRequest
-	114, // 239: vmon.v1.FunctionService.GetApp:input_type -> vmon.v1.GetAppRequest
-	115, // 240: vmon.v1.FunctionService.RollbackApp:input_type -> vmon.v1.RollbackAppRequest
-	122, // 241: vmon.v1.FunctionService.CreateSchedule:input_type -> vmon.v1.CreateScheduleRequest
-	116, // 242: vmon.v1.FunctionService.GetSchedule:input_type -> vmon.v1.ScheduleRef
-	123, // 243: vmon.v1.FunctionService.ListSchedules:input_type -> vmon.v1.ListSchedulesRequest
-	116, // 244: vmon.v1.FunctionService.DeleteSchedule:input_type -> vmon.v1.ScheduleRef
-	130, // 245: vmon.v1.CallService.Create:input_type -> vmon.v1.CreateCallRequest
-	132, // 246: vmon.v1.CallService.StreamInputs:input_type -> vmon.v1.StreamCallInputsRequest
-	134, // 247: vmon.v1.CallService.CloseInputs:input_type -> vmon.v1.CloseCallInputsRequest
-	125, // 248: vmon.v1.CallService.Get:input_type -> vmon.v1.CallRef
-	135, // 249: vmon.v1.CallService.List:input_type -> vmon.v1.ListCallsRequest
-	137, // 250: vmon.v1.CallService.GetResult:input_type -> vmon.v1.GetCallResultRequest
-	141, // 251: vmon.v1.CallService.Watch:input_type -> vmon.v1.WatchCallRequest
-	150, // 252: vmon.v1.CallService.Cancel:input_type -> vmon.v1.CancelCallRequest
-	154, // 253: vmon.v1.ActorService.Create:input_type -> vmon.v1.CreateActorRequest
-	126, // 254: vmon.v1.ActorService.Get:input_type -> vmon.v1.ActorRef
-	155, // 255: vmon.v1.ActorService.Checkpoint:input_type -> vmon.v1.CheckpointActorRequest
-	156, // 256: vmon.v1.ActorService.Restore:input_type -> vmon.v1.RestoreActorRequest
-	157, // 257: vmon.v1.ActorService.Fork:input_type -> vmon.v1.ForkActorRequest
-	126, // 258: vmon.v1.ActorService.Delete:input_type -> vmon.v1.ActorRef
-	18,  // 259: vmon.v1.SandboxService.Create:output_type -> vmon.v1.JsonView
-	23,  // 260: vmon.v1.SandboxService.List:output_type -> vmon.v1.ListSandboxesResponse
-	18,  // 261: vmon.v1.SandboxService.Get:output_type -> vmon.v1.JsonView
-	18,  // 262: vmon.v1.SandboxService.Stop:output_type -> vmon.v1.JsonView
-	18,  // 263: vmon.v1.SandboxService.Remove:output_type -> vmon.v1.JsonView
-	18,  // 264: vmon.v1.SandboxService.Terminate:output_type -> vmon.v1.JsonView
-	18,  // 265: vmon.v1.SandboxService.Pause:output_type -> vmon.v1.JsonView
-	18,  // 266: vmon.v1.SandboxService.Resume:output_type -> vmon.v1.JsonView
-	18,  // 267: vmon.v1.SandboxService.Extend:output_type -> vmon.v1.JsonView
-	18,  // 268: vmon.v1.SandboxService.Metrics:output_type -> vmon.v1.JsonView
-	27,  // 269: vmon.v1.SandboxService.Logs:output_type -> vmon.v1.LogChunk
-	30,  // 270: vmon.v1.SandboxService.ExecCapture:output_type -> vmon.v1.ExecCaptureResponse
-	32,  // 271: vmon.v1.SandboxService.Exec:output_type -> vmon.v1.ExecOutput
-	32,  // 272: vmon.v1.SandboxService.Shell:output_type -> vmon.v1.ExecOutput
-	32,  // 273: vmon.v1.SandboxService.Attach:output_type -> vmon.v1.ExecOutput
-	34,  // 274: vmon.v1.SandboxService.FileRead:output_type -> vmon.v1.FileContent
-	19,  // 275: vmon.v1.SandboxService.FileWrite:output_type -> vmon.v1.Ok
-	19,  // 276: vmon.v1.SandboxService.FileDelete:output_type -> vmon.v1.Ok
-	18,  // 277: vmon.v1.SandboxService.FileList:output_type -> vmon.v1.JsonView
-	18,  // 278: vmon.v1.SandboxService.FileStat:output_type -> vmon.v1.JsonView
-	18,  // 279: vmon.v1.SandboxService.NetworkGet:output_type -> vmon.v1.JsonView
-	18,  // 280: vmon.v1.SandboxService.NetworkSet:output_type -> vmon.v1.JsonView
-	18,  // 281: vmon.v1.SandboxService.Tunnels:output_type -> vmon.v1.JsonView
-	18,  // 282: vmon.v1.SandboxService.Migrate:output_type -> vmon.v1.JsonView
-	18,  // 283: vmon.v1.SandboxService.Snapshot:output_type -> vmon.v1.JsonView
-	18,  // 284: vmon.v1.SandboxService.SnapshotFs:output_type -> vmon.v1.JsonView
-	43,  // 285: vmon.v1.SnapshotService.List:output_type -> vmon.v1.SnapshotList
-	18,  // 286: vmon.v1.SnapshotService.Restore:output_type -> vmon.v1.JsonView
-	18,  // 287: vmon.v1.SnapshotService.Fork:output_type -> vmon.v1.JsonView
-	47,  // 288: vmon.v1.VolumeService.List:output_type -> vmon.v1.VolumeList
-	19,  // 289: vmon.v1.VolumeService.Create:output_type -> vmon.v1.Ok
-	19,  // 290: vmon.v1.VolumeService.Delete:output_type -> vmon.v1.Ok
-	18,  // 291: vmon.v1.PoolService.List:output_type -> vmon.v1.JsonView
-	18,  // 292: vmon.v1.PoolService.Set:output_type -> vmon.v1.JsonView
-	19,  // 293: vmon.v1.PoolService.Delete:output_type -> vmon.v1.Ok
-	18,  // 294: vmon.v1.SystemService.Info:output_type -> vmon.v1.JsonView
-	18,  // 295: vmon.v1.SystemService.Events:output_type -> vmon.v1.JsonView
-	18,  // 296: vmon.v1.SystemService.MeshStatus:output_type -> vmon.v1.JsonView
-	62,  // 297: vmon.v1.ArtifactService.Put:output_type -> vmon.v1.ArtifactRecord
-	67,  // 298: vmon.v1.ArtifactService.Get:output_type -> vmon.v1.ArtifactChunk
-	62,  // 299: vmon.v1.ArtifactService.Stat:output_type -> vmon.v1.ArtifactRecord
-	103, // 300: vmon.v1.FunctionService.Register:output_type -> vmon.v1.FunctionRevision
-	103, // 301: vmon.v1.FunctionService.Get:output_type -> vmon.v1.FunctionRevision
-	108, // 302: vmon.v1.FunctionService.List:output_type -> vmon.v1.ListFunctionsResponse
-	104, // 303: vmon.v1.FunctionService.Activate:output_type -> vmon.v1.FunctionRecord
-	19,  // 304: vmon.v1.FunctionService.Delete:output_type -> vmon.v1.Ok
-	112, // 305: vmon.v1.FunctionService.ActivateApp:output_type -> vmon.v1.AppRevision
-	112, // 306: vmon.v1.FunctionService.GetApp:output_type -> vmon.v1.AppRevision
-	112, // 307: vmon.v1.FunctionService.RollbackApp:output_type -> vmon.v1.AppRevision
-	121, // 308: vmon.v1.FunctionService.CreateSchedule:output_type -> vmon.v1.ScheduleRecord
-	121, // 309: vmon.v1.FunctionService.GetSchedule:output_type -> vmon.v1.ScheduleRecord
-	124, // 310: vmon.v1.FunctionService.ListSchedules:output_type -> vmon.v1.ListSchedulesResponse
-	19,  // 311: vmon.v1.FunctionService.DeleteSchedule:output_type -> vmon.v1.Ok
-	131, // 312: vmon.v1.CallService.Create:output_type -> vmon.v1.CallRecord
-	133, // 313: vmon.v1.CallService.StreamInputs:output_type -> vmon.v1.StreamCallInputsResponse
-	131, // 314: vmon.v1.CallService.CloseInputs:output_type -> vmon.v1.CallRecord
-	131, // 315: vmon.v1.CallService.Get:output_type -> vmon.v1.CallRecord
-	136, // 316: vmon.v1.CallService.List:output_type -> vmon.v1.ListCallsResponse
-	138, // 317: vmon.v1.CallService.GetResult:output_type -> vmon.v1.CallResult
-	145, // 318: vmon.v1.CallService.Watch:output_type -> vmon.v1.CallEvent
-	131, // 319: vmon.v1.CallService.Cancel:output_type -> vmon.v1.CallRecord
-	152, // 320: vmon.v1.ActorService.Create:output_type -> vmon.v1.ActorRecord
-	152, // 321: vmon.v1.ActorService.Get:output_type -> vmon.v1.ActorRecord
-	153, // 322: vmon.v1.ActorService.Checkpoint:output_type -> vmon.v1.ActorCheckpoint
-	152, // 323: vmon.v1.ActorService.Restore:output_type -> vmon.v1.ActorRecord
-	152, // 324: vmon.v1.ActorService.Fork:output_type -> vmon.v1.ActorRecord
-	19,  // 325: vmon.v1.ActorService.Delete:output_type -> vmon.v1.Ok
-	259, // [259:326] is the sub-list for method output_type
-	192, // [192:259] is the sub-list for method input_type
-	192, // [192:192] is the sub-list for extension type_name
-	192, // [192:192] is the sub-list for extension extendee
-	0,   // [0:192] is the sub-list for field type_name
+	101, // 61: vmon.v1.FunctionSnapshotRecord.ref:type_name -> vmon.v1.FunctionSnapshotRef
+	71,  // 62: vmon.v1.FunctionSnapshotRecord.revision:type_name -> vmon.v1.RevisionRef
+	61,  // 63: vmon.v1.FunctionSnapshotRecord.artifact:type_name -> vmon.v1.ArtifactRef
+	60,  // 64: vmon.v1.FunctionSnapshotRecord.runner_digest:type_name -> vmon.v1.Digest
+	60,  // 65: vmon.v1.FunctionSnapshotRecord.image_digest:type_name -> vmon.v1.Digest
+	60,  // 66: vmon.v1.FunctionSnapshotRecord.package_digest:type_name -> vmon.v1.Digest
+	99,  // 67: vmon.v1.FunctionSnapshotRecord.initialize_hook:type_name -> vmon.v1.LifecycleHookRef
+	70,  // 68: vmon.v1.FunctionSpec.function:type_name -> vmon.v1.FunctionRef
+	76,  // 69: vmon.v1.FunctionSpec.package:type_name -> vmon.v1.PackageSpec
+	77,  // 70: vmon.v1.FunctionSpec.image:type_name -> vmon.v1.ImageSpec
+	78,  // 71: vmon.v1.FunctionSpec.resources:type_name -> vmon.v1.ResourceSpec
+	90,  // 72: vmon.v1.FunctionSpec.retry:type_name -> vmon.v1.RetryPolicy
+	91,  // 73: vmon.v1.FunctionSpec.timeouts:type_name -> vmon.v1.TimeoutSpec
+	92,  // 74: vmon.v1.FunctionSpec.workers:type_name -> vmon.v1.WorkerSpec
+	93,  // 75: vmon.v1.FunctionSpec.concurrency:type_name -> vmon.v1.ConcurrencySpec
+	94,  // 76: vmon.v1.FunctionSpec.batching:type_name -> vmon.v1.BatchingSpec
+	95,  // 77: vmon.v1.FunctionSpec.serializer:type_name -> vmon.v1.SerializerSpec
+	4,   // 78: vmon.v1.FunctionSpec.lifecycle:type_name -> vmon.v1.FunctionLifecycle
+	96,  // 79: vmon.v1.FunctionSpec.reproducibility:type_name -> vmon.v1.ReproducibilitySpec
+	169, // 80: vmon.v1.FunctionSpec.labels:type_name -> vmon.v1.FunctionSpec.LabelsEntry
+	97,  // 81: vmon.v1.FunctionSpec.secrets:type_name -> vmon.v1.SecretRef
+	100, // 82: vmon.v1.FunctionSpec.lifecycle_hooks:type_name -> vmon.v1.LifecycleHooks
+	71,  // 83: vmon.v1.FunctionRevision.ref:type_name -> vmon.v1.RevisionRef
+	103, // 84: vmon.v1.FunctionRevision.spec:type_name -> vmon.v1.FunctionSpec
+	60,  // 85: vmon.v1.FunctionRevision.spec_digest:type_name -> vmon.v1.Digest
+	16,  // 86: vmon.v1.FunctionRevision.status:type_name -> vmon.v1.FunctionRevisionStatus
+	97,  // 87: vmon.v1.FunctionRevision.unavailable_secrets:type_name -> vmon.v1.SecretRef
+	102, // 88: vmon.v1.FunctionRevision.snapshot:type_name -> vmon.v1.FunctionSnapshotRecord
+	70,  // 89: vmon.v1.FunctionRecord.function:type_name -> vmon.v1.FunctionRef
+	71,  // 90: vmon.v1.FunctionRecord.current:type_name -> vmon.v1.RevisionRef
+	103, // 91: vmon.v1.RegisterFunctionRequest.spec:type_name -> vmon.v1.FunctionSpec
+	98,  // 92: vmon.v1.RegisterFunctionRequest.transient_secrets:type_name -> vmon.v1.TransientSecretMaterial
+	72,  // 93: vmon.v1.GetFunctionRequest.function:type_name -> vmon.v1.FunctionSelector
+	70,  // 94: vmon.v1.ListFunctionsRequest.function:type_name -> vmon.v1.FunctionRef
+	104, // 95: vmon.v1.ListFunctionsResponse.revisions:type_name -> vmon.v1.FunctionRevision
+	71,  // 96: vmon.v1.ActivateFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
+	71,  // 97: vmon.v1.ActivateFunctionRequest.expected_current:type_name -> vmon.v1.RevisionRef
+	71,  // 98: vmon.v1.DeleteFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
+	71,  // 99: vmon.v1.AppFunctionBinding.revision:type_name -> vmon.v1.RevisionRef
+	74,  // 100: vmon.v1.AppRevision.ref:type_name -> vmon.v1.AppRevisionRef
+	112, // 101: vmon.v1.AppRevision.functions:type_name -> vmon.v1.AppFunctionBinding
+	60,  // 102: vmon.v1.AppRevision.content_digest:type_name -> vmon.v1.Digest
+	74,  // 103: vmon.v1.AppRevision.previous:type_name -> vmon.v1.AppRevisionRef
+	73,  // 104: vmon.v1.ActivateAppRequest.app:type_name -> vmon.v1.AppRef
+	112, // 105: vmon.v1.ActivateAppRequest.functions:type_name -> vmon.v1.AppFunctionBinding
+	74,  // 106: vmon.v1.ActivateAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
+	75,  // 107: vmon.v1.GetAppRequest.app:type_name -> vmon.v1.AppSelector
+	74,  // 108: vmon.v1.RollbackAppRequest.target:type_name -> vmon.v1.AppRevisionRef
+	74,  // 109: vmon.v1.RollbackAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
+	71,  // 110: vmon.v1.ScheduleTarget.function:type_name -> vmon.v1.RevisionRef
+	69,  // 111: vmon.v1.ScheduleTarget.input:type_name -> vmon.v1.ValueEnvelope
+	74,  // 112: vmon.v1.ScheduleSpec.app:type_name -> vmon.v1.AppRevisionRef
+	120, // 113: vmon.v1.ScheduleSpec.target:type_name -> vmon.v1.ScheduleTarget
+	118, // 114: vmon.v1.ScheduleSpec.cron:type_name -> vmon.v1.CronSchedule
+	119, // 115: vmon.v1.ScheduleSpec.period:type_name -> vmon.v1.PeriodSchedule
+	15,  // 116: vmon.v1.ScheduleSpec.status:type_name -> vmon.v1.ScheduleStatus
+	170, // 117: vmon.v1.ScheduleSpec.labels:type_name -> vmon.v1.ScheduleSpec.LabelsEntry
+	117, // 118: vmon.v1.ScheduleRecord.ref:type_name -> vmon.v1.ScheduleRef
+	121, // 119: vmon.v1.ScheduleRecord.spec:type_name -> vmon.v1.ScheduleSpec
+	121, // 120: vmon.v1.CreateScheduleRequest.spec:type_name -> vmon.v1.ScheduleSpec
+	73,  // 121: vmon.v1.ListSchedulesRequest.app:type_name -> vmon.v1.AppRef
+	70,  // 122: vmon.v1.ListSchedulesRequest.function:type_name -> vmon.v1.FunctionRef
+	122, // 123: vmon.v1.ListSchedulesResponse.schedules:type_name -> vmon.v1.ScheduleRecord
+	69,  // 124: vmon.v1.InvocationArguments.positional:type_name -> vmon.v1.ValueEnvelope
+	171, // 125: vmon.v1.InvocationArguments.named:type_name -> vmon.v1.InvocationArguments.NamedEntry
+	127, // 126: vmon.v1.ActorTarget.actor:type_name -> vmon.v1.ActorRef
+	128, // 127: vmon.v1.ServiceTarget.constructor:type_name -> vmon.v1.InvocationArguments
+	71,  // 128: vmon.v1.CallTarget.function:type_name -> vmon.v1.RevisionRef
+	129, // 129: vmon.v1.CallTarget.actor:type_name -> vmon.v1.ActorTarget
+	130, // 130: vmon.v1.CallTarget.service:type_name -> vmon.v1.ServiceTarget
+	69,  // 131: vmon.v1.CallInput.value:type_name -> vmon.v1.ValueEnvelope
+	128, // 132: vmon.v1.CallInput.arguments:type_name -> vmon.v1.InvocationArguments
+	131, // 133: vmon.v1.CallGraph.parents:type_name -> vmon.v1.ParentEdge
+	8,   // 134: vmon.v1.CreateCallRequest.type:type_name -> vmon.v1.CallType
+	132, // 135: vmon.v1.CreateCallRequest.target:type_name -> vmon.v1.CallTarget
+	133, // 136: vmon.v1.CreateCallRequest.inputs:type_name -> vmon.v1.CallInput
+	135, // 137: vmon.v1.CreateCallRequest.graph:type_name -> vmon.v1.CallGraph
+	172, // 138: vmon.v1.CreateCallRequest.labels:type_name -> vmon.v1.CreateCallRequest.LabelsEntry
+	126, // 139: vmon.v1.CallRecord.ref:type_name -> vmon.v1.CallRef
+	8,   // 140: vmon.v1.CallRecord.type:type_name -> vmon.v1.CallType
+	132, // 141: vmon.v1.CallRecord.target:type_name -> vmon.v1.CallTarget
+	9,   // 142: vmon.v1.CallRecord.status:type_name -> vmon.v1.CallStatus
+	135, // 143: vmon.v1.CallRecord.graph:type_name -> vmon.v1.CallGraph
+	155, // 144: vmon.v1.CallRecord.error:type_name -> vmon.v1.CallError
+	157, // 145: vmon.v1.CallRecord.stats:type_name -> vmon.v1.CallStats
+	173, // 146: vmon.v1.CallRecord.labels:type_name -> vmon.v1.CallRecord.LabelsEntry
+	145, // 147: vmon.v1.CallRecord.result_cursor:type_name -> vmon.v1.ResultCursor
+	126, // 148: vmon.v1.StreamCallInputsRequest.call:type_name -> vmon.v1.CallRef
+	133, // 149: vmon.v1.StreamCallInputsRequest.input:type_name -> vmon.v1.CallInput
+	126, // 150: vmon.v1.StreamCallInputsResponse.call:type_name -> vmon.v1.CallRef
+	134, // 151: vmon.v1.StreamCallInputsResponse.last_input:type_name -> vmon.v1.InputRef
+	126, // 152: vmon.v1.CloseCallInputsRequest.call:type_name -> vmon.v1.CallRef
+	70,  // 153: vmon.v1.ListCallsRequest.function:type_name -> vmon.v1.FunctionRef
+	9,   // 154: vmon.v1.ListCallsRequest.status:type_name -> vmon.v1.CallStatus
+	127, // 155: vmon.v1.ListCallsRequest.actor:type_name -> vmon.v1.ActorRef
+	137, // 156: vmon.v1.ListCallsResponse.calls:type_name -> vmon.v1.CallRecord
+	126, // 157: vmon.v1.GetCallResultRequest.call:type_name -> vmon.v1.CallRef
+	126, // 158: vmon.v1.CallResult.call:type_name -> vmon.v1.CallRef
+	69,  // 159: vmon.v1.CallResult.value:type_name -> vmon.v1.ValueEnvelope
+	155, // 160: vmon.v1.CallResult.error:type_name -> vmon.v1.CallError
+	126, // 161: vmon.v1.ResultCursor.call:type_name -> vmon.v1.CallRef
+	126, // 162: vmon.v1.EventCursor.call:type_name -> vmon.v1.CallRef
+	145, // 163: vmon.v1.ListCallResultsRequest.cursor:type_name -> vmon.v1.ResultCursor
+	144, // 164: vmon.v1.ListCallResultsResponse.results:type_name -> vmon.v1.CallResult
+	145, // 165: vmon.v1.ListCallResultsResponse.next_cursor:type_name -> vmon.v1.ResultCursor
+	146, // 166: vmon.v1.WatchCallRequest.cursor:type_name -> vmon.v1.EventCursor
+	9,   // 167: vmon.v1.StatusEvent.status:type_name -> vmon.v1.CallStatus
+	11,  // 168: vmon.v1.LogEvent.stream:type_name -> vmon.v1.LogStream
+	12,  // 169: vmon.v1.AttemptEvent.status:type_name -> vmon.v1.AttemptStatus
+	13,  // 170: vmon.v1.AttemptEvent.startup:type_name -> vmon.v1.StartupKind
+	155, // 171: vmon.v1.AttemptEvent.error:type_name -> vmon.v1.CallError
+	17,  // 172: vmon.v1.AttemptEvent.failure_kind:type_name -> vmon.v1.AttemptFailureKind
+	126, // 173: vmon.v1.CallEvent.call:type_name -> vmon.v1.CallRef
+	10,  // 174: vmon.v1.CallEvent.type:type_name -> vmon.v1.CallEventType
+	150, // 175: vmon.v1.CallEvent.status:type_name -> vmon.v1.StatusEvent
+	151, // 176: vmon.v1.CallEvent.log:type_name -> vmon.v1.LogEvent
+	144, // 177: vmon.v1.CallEvent.yield_result:type_name -> vmon.v1.CallResult
+	144, // 178: vmon.v1.CallEvent.result:type_name -> vmon.v1.CallResult
+	152, // 179: vmon.v1.CallEvent.attempt_event:type_name -> vmon.v1.AttemptEvent
+	155, // 180: vmon.v1.CallEvent.error:type_name -> vmon.v1.CallError
+	139, // 181: vmon.v1.CallEvent.input_closed:type_name -> vmon.v1.StreamCallInputsResponse
+	158, // 182: vmon.v1.CallEvent.cancel_requested:type_name -> vmon.v1.CancelCallRequest
+	154, // 183: vmon.v1.CallError.frames:type_name -> vmon.v1.ErrorFrame
+	155, // 184: vmon.v1.CallError.cause:type_name -> vmon.v1.CallError
+	174, // 185: vmon.v1.CallError.details:type_name -> vmon.v1.CallError.DetailsEntry
+	13,  // 186: vmon.v1.AttemptStats.startup:type_name -> vmon.v1.StartupKind
+	17,  // 187: vmon.v1.AttemptStats.failure_kind:type_name -> vmon.v1.AttemptFailureKind
+	156, // 188: vmon.v1.CallStats.attempts:type_name -> vmon.v1.AttemptStats
+	126, // 189: vmon.v1.CancelCallRequest.call:type_name -> vmon.v1.CallRef
+	127, // 190: vmon.v1.ActorRecord.ref:type_name -> vmon.v1.ActorRef
+	71,  // 191: vmon.v1.ActorRecord.function:type_name -> vmon.v1.RevisionRef
+	14,  // 192: vmon.v1.ActorRecord.status:type_name -> vmon.v1.ActorStatus
+	159, // 193: vmon.v1.ActorRecord.latest_checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	175, // 194: vmon.v1.ActorRecord.labels:type_name -> vmon.v1.ActorRecord.LabelsEntry
+	159, // 195: vmon.v1.ActorCheckpoint.ref:type_name -> vmon.v1.ActorCheckpointRef
+	127, // 196: vmon.v1.ActorCheckpoint.actor:type_name -> vmon.v1.ActorRef
+	71,  // 197: vmon.v1.ActorCheckpoint.function:type_name -> vmon.v1.RevisionRef
+	69,  // 198: vmon.v1.ActorCheckpoint.state:type_name -> vmon.v1.ValueEnvelope
+	71,  // 199: vmon.v1.CreateActorRequest.function:type_name -> vmon.v1.RevisionRef
+	69,  // 200: vmon.v1.CreateActorRequest.initial_value:type_name -> vmon.v1.ValueEnvelope
+	128, // 201: vmon.v1.CreateActorRequest.initial_arguments:type_name -> vmon.v1.InvocationArguments
+	176, // 202: vmon.v1.CreateActorRequest.labels:type_name -> vmon.v1.CreateActorRequest.LabelsEntry
+	127, // 203: vmon.v1.CheckpointActorRequest.actor:type_name -> vmon.v1.ActorRef
+	127, // 204: vmon.v1.RestoreActorRequest.actor:type_name -> vmon.v1.ActorRef
+	159, // 205: vmon.v1.RestoreActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	159, // 206: vmon.v1.ForkActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	177, // 207: vmon.v1.ForkActorRequest.labels:type_name -> vmon.v1.ForkActorRequest.LabelsEntry
+	69,  // 208: vmon.v1.InvocationArguments.NamedEntry.value:type_name -> vmon.v1.ValueEnvelope
+	21,  // 209: vmon.v1.SandboxService.Create:input_type -> vmon.v1.CreateSandboxRequest
+	22,  // 210: vmon.v1.SandboxService.List:input_type -> vmon.v1.ListSandboxesRequest
+	20,  // 211: vmon.v1.SandboxService.Get:input_type -> vmon.v1.SandboxRef
+	24,  // 212: vmon.v1.SandboxService.Stop:input_type -> vmon.v1.StopSandboxRequest
+	20,  // 213: vmon.v1.SandboxService.Remove:input_type -> vmon.v1.SandboxRef
+	20,  // 214: vmon.v1.SandboxService.Terminate:input_type -> vmon.v1.SandboxRef
+	20,  // 215: vmon.v1.SandboxService.Pause:input_type -> vmon.v1.SandboxRef
+	20,  // 216: vmon.v1.SandboxService.Resume:input_type -> vmon.v1.SandboxRef
+	25,  // 217: vmon.v1.SandboxService.Extend:input_type -> vmon.v1.ExtendSandboxRequest
+	20,  // 218: vmon.v1.SandboxService.Metrics:input_type -> vmon.v1.SandboxRef
+	26,  // 219: vmon.v1.SandboxService.Logs:input_type -> vmon.v1.LogsRequest
+	29,  // 220: vmon.v1.SandboxService.ExecCapture:input_type -> vmon.v1.ExecCaptureRequest
+	31,  // 221: vmon.v1.SandboxService.Exec:input_type -> vmon.v1.ExecInput
+	31,  // 222: vmon.v1.SandboxService.Shell:input_type -> vmon.v1.ExecInput
+	20,  // 223: vmon.v1.SandboxService.Attach:input_type -> vmon.v1.SandboxRef
+	33,  // 224: vmon.v1.SandboxService.FileRead:input_type -> vmon.v1.FilePathRequest
+	35,  // 225: vmon.v1.SandboxService.FileWrite:input_type -> vmon.v1.FileWriteRequest
+	36,  // 226: vmon.v1.SandboxService.FileDelete:input_type -> vmon.v1.FileDeleteRequest
+	33,  // 227: vmon.v1.SandboxService.FileList:input_type -> vmon.v1.FilePathRequest
+	33,  // 228: vmon.v1.SandboxService.FileStat:input_type -> vmon.v1.FilePathRequest
+	20,  // 229: vmon.v1.SandboxService.NetworkGet:input_type -> vmon.v1.SandboxRef
+	38,  // 230: vmon.v1.SandboxService.NetworkSet:input_type -> vmon.v1.NetworkSetRequest
+	20,  // 231: vmon.v1.SandboxService.Tunnels:input_type -> vmon.v1.SandboxRef
+	39,  // 232: vmon.v1.SandboxService.Migrate:input_type -> vmon.v1.MigrateRequest
+	40,  // 233: vmon.v1.SandboxService.Snapshot:input_type -> vmon.v1.SnapshotRequest
+	41,  // 234: vmon.v1.SandboxService.SnapshotFs:input_type -> vmon.v1.SnapshotFsRequest
+	42,  // 235: vmon.v1.SnapshotService.List:input_type -> vmon.v1.ListSnapshotsRequest
+	44,  // 236: vmon.v1.SnapshotService.Restore:input_type -> vmon.v1.RestoreSnapshotRequest
+	45,  // 237: vmon.v1.SnapshotService.Fork:input_type -> vmon.v1.ForkSnapshotRequest
+	46,  // 238: vmon.v1.VolumeService.List:input_type -> vmon.v1.ListVolumesRequest
+	48,  // 239: vmon.v1.VolumeService.Create:input_type -> vmon.v1.VolumeRef
+	48,  // 240: vmon.v1.VolumeService.Delete:input_type -> vmon.v1.VolumeRef
+	49,  // 241: vmon.v1.PoolService.List:input_type -> vmon.v1.ListPoolsRequest
+	50,  // 242: vmon.v1.PoolService.Set:input_type -> vmon.v1.PoolSetRequest
+	51,  // 243: vmon.v1.PoolService.Delete:input_type -> vmon.v1.PoolRef
+	52,  // 244: vmon.v1.SystemService.Info:input_type -> vmon.v1.InfoRequest
+	54,  // 245: vmon.v1.SystemService.Events:input_type -> vmon.v1.EventsRequest
+	53,  // 246: vmon.v1.SystemService.MeshStatus:input_type -> vmon.v1.MeshStatusRequest
+	64,  // 247: vmon.v1.ArtifactService.Put:input_type -> vmon.v1.PutArtifactRequest
+	65,  // 248: vmon.v1.ArtifactService.Get:input_type -> vmon.v1.GetArtifactRequest
+	61,  // 249: vmon.v1.ArtifactService.Stat:input_type -> vmon.v1.ArtifactRef
+	106, // 250: vmon.v1.FunctionService.Register:input_type -> vmon.v1.RegisterFunctionRequest
+	107, // 251: vmon.v1.FunctionService.Get:input_type -> vmon.v1.GetFunctionRequest
+	108, // 252: vmon.v1.FunctionService.List:input_type -> vmon.v1.ListFunctionsRequest
+	110, // 253: vmon.v1.FunctionService.Activate:input_type -> vmon.v1.ActivateFunctionRequest
+	111, // 254: vmon.v1.FunctionService.Delete:input_type -> vmon.v1.DeleteFunctionRequest
+	114, // 255: vmon.v1.FunctionService.ActivateApp:input_type -> vmon.v1.ActivateAppRequest
+	115, // 256: vmon.v1.FunctionService.GetApp:input_type -> vmon.v1.GetAppRequest
+	116, // 257: vmon.v1.FunctionService.RollbackApp:input_type -> vmon.v1.RollbackAppRequest
+	123, // 258: vmon.v1.FunctionService.CreateSchedule:input_type -> vmon.v1.CreateScheduleRequest
+	117, // 259: vmon.v1.FunctionService.GetSchedule:input_type -> vmon.v1.ScheduleRef
+	124, // 260: vmon.v1.FunctionService.ListSchedules:input_type -> vmon.v1.ListSchedulesRequest
+	117, // 261: vmon.v1.FunctionService.DeleteSchedule:input_type -> vmon.v1.ScheduleRef
+	136, // 262: vmon.v1.CallService.Create:input_type -> vmon.v1.CreateCallRequest
+	138, // 263: vmon.v1.CallService.StreamInputs:input_type -> vmon.v1.StreamCallInputsRequest
+	140, // 264: vmon.v1.CallService.CloseInputs:input_type -> vmon.v1.CloseCallInputsRequest
+	126, // 265: vmon.v1.CallService.Get:input_type -> vmon.v1.CallRef
+	141, // 266: vmon.v1.CallService.List:input_type -> vmon.v1.ListCallsRequest
+	143, // 267: vmon.v1.CallService.GetResult:input_type -> vmon.v1.GetCallResultRequest
+	147, // 268: vmon.v1.CallService.ListResults:input_type -> vmon.v1.ListCallResultsRequest
+	149, // 269: vmon.v1.CallService.Watch:input_type -> vmon.v1.WatchCallRequest
+	158, // 270: vmon.v1.CallService.Cancel:input_type -> vmon.v1.CancelCallRequest
+	162, // 271: vmon.v1.ActorService.Create:input_type -> vmon.v1.CreateActorRequest
+	127, // 272: vmon.v1.ActorService.Get:input_type -> vmon.v1.ActorRef
+	163, // 273: vmon.v1.ActorService.Checkpoint:input_type -> vmon.v1.CheckpointActorRequest
+	164, // 274: vmon.v1.ActorService.Restore:input_type -> vmon.v1.RestoreActorRequest
+	165, // 275: vmon.v1.ActorService.Fork:input_type -> vmon.v1.ForkActorRequest
+	127, // 276: vmon.v1.ActorService.Delete:input_type -> vmon.v1.ActorRef
+	18,  // 277: vmon.v1.SandboxService.Create:output_type -> vmon.v1.JsonView
+	23,  // 278: vmon.v1.SandboxService.List:output_type -> vmon.v1.ListSandboxesResponse
+	18,  // 279: vmon.v1.SandboxService.Get:output_type -> vmon.v1.JsonView
+	18,  // 280: vmon.v1.SandboxService.Stop:output_type -> vmon.v1.JsonView
+	18,  // 281: vmon.v1.SandboxService.Remove:output_type -> vmon.v1.JsonView
+	18,  // 282: vmon.v1.SandboxService.Terminate:output_type -> vmon.v1.JsonView
+	18,  // 283: vmon.v1.SandboxService.Pause:output_type -> vmon.v1.JsonView
+	18,  // 284: vmon.v1.SandboxService.Resume:output_type -> vmon.v1.JsonView
+	18,  // 285: vmon.v1.SandboxService.Extend:output_type -> vmon.v1.JsonView
+	18,  // 286: vmon.v1.SandboxService.Metrics:output_type -> vmon.v1.JsonView
+	27,  // 287: vmon.v1.SandboxService.Logs:output_type -> vmon.v1.LogChunk
+	30,  // 288: vmon.v1.SandboxService.ExecCapture:output_type -> vmon.v1.ExecCaptureResponse
+	32,  // 289: vmon.v1.SandboxService.Exec:output_type -> vmon.v1.ExecOutput
+	32,  // 290: vmon.v1.SandboxService.Shell:output_type -> vmon.v1.ExecOutput
+	32,  // 291: vmon.v1.SandboxService.Attach:output_type -> vmon.v1.ExecOutput
+	34,  // 292: vmon.v1.SandboxService.FileRead:output_type -> vmon.v1.FileContent
+	19,  // 293: vmon.v1.SandboxService.FileWrite:output_type -> vmon.v1.Ok
+	19,  // 294: vmon.v1.SandboxService.FileDelete:output_type -> vmon.v1.Ok
+	18,  // 295: vmon.v1.SandboxService.FileList:output_type -> vmon.v1.JsonView
+	18,  // 296: vmon.v1.SandboxService.FileStat:output_type -> vmon.v1.JsonView
+	18,  // 297: vmon.v1.SandboxService.NetworkGet:output_type -> vmon.v1.JsonView
+	18,  // 298: vmon.v1.SandboxService.NetworkSet:output_type -> vmon.v1.JsonView
+	18,  // 299: vmon.v1.SandboxService.Tunnels:output_type -> vmon.v1.JsonView
+	18,  // 300: vmon.v1.SandboxService.Migrate:output_type -> vmon.v1.JsonView
+	18,  // 301: vmon.v1.SandboxService.Snapshot:output_type -> vmon.v1.JsonView
+	18,  // 302: vmon.v1.SandboxService.SnapshotFs:output_type -> vmon.v1.JsonView
+	43,  // 303: vmon.v1.SnapshotService.List:output_type -> vmon.v1.SnapshotList
+	18,  // 304: vmon.v1.SnapshotService.Restore:output_type -> vmon.v1.JsonView
+	18,  // 305: vmon.v1.SnapshotService.Fork:output_type -> vmon.v1.JsonView
+	47,  // 306: vmon.v1.VolumeService.List:output_type -> vmon.v1.VolumeList
+	19,  // 307: vmon.v1.VolumeService.Create:output_type -> vmon.v1.Ok
+	19,  // 308: vmon.v1.VolumeService.Delete:output_type -> vmon.v1.Ok
+	18,  // 309: vmon.v1.PoolService.List:output_type -> vmon.v1.JsonView
+	18,  // 310: vmon.v1.PoolService.Set:output_type -> vmon.v1.JsonView
+	19,  // 311: vmon.v1.PoolService.Delete:output_type -> vmon.v1.Ok
+	18,  // 312: vmon.v1.SystemService.Info:output_type -> vmon.v1.JsonView
+	18,  // 313: vmon.v1.SystemService.Events:output_type -> vmon.v1.JsonView
+	18,  // 314: vmon.v1.SystemService.MeshStatus:output_type -> vmon.v1.JsonView
+	62,  // 315: vmon.v1.ArtifactService.Put:output_type -> vmon.v1.ArtifactRecord
+	67,  // 316: vmon.v1.ArtifactService.Get:output_type -> vmon.v1.ArtifactChunk
+	62,  // 317: vmon.v1.ArtifactService.Stat:output_type -> vmon.v1.ArtifactRecord
+	104, // 318: vmon.v1.FunctionService.Register:output_type -> vmon.v1.FunctionRevision
+	104, // 319: vmon.v1.FunctionService.Get:output_type -> vmon.v1.FunctionRevision
+	109, // 320: vmon.v1.FunctionService.List:output_type -> vmon.v1.ListFunctionsResponse
+	105, // 321: vmon.v1.FunctionService.Activate:output_type -> vmon.v1.FunctionRecord
+	19,  // 322: vmon.v1.FunctionService.Delete:output_type -> vmon.v1.Ok
+	113, // 323: vmon.v1.FunctionService.ActivateApp:output_type -> vmon.v1.AppRevision
+	113, // 324: vmon.v1.FunctionService.GetApp:output_type -> vmon.v1.AppRevision
+	113, // 325: vmon.v1.FunctionService.RollbackApp:output_type -> vmon.v1.AppRevision
+	122, // 326: vmon.v1.FunctionService.CreateSchedule:output_type -> vmon.v1.ScheduleRecord
+	122, // 327: vmon.v1.FunctionService.GetSchedule:output_type -> vmon.v1.ScheduleRecord
+	125, // 328: vmon.v1.FunctionService.ListSchedules:output_type -> vmon.v1.ListSchedulesResponse
+	19,  // 329: vmon.v1.FunctionService.DeleteSchedule:output_type -> vmon.v1.Ok
+	137, // 330: vmon.v1.CallService.Create:output_type -> vmon.v1.CallRecord
+	139, // 331: vmon.v1.CallService.StreamInputs:output_type -> vmon.v1.StreamCallInputsResponse
+	137, // 332: vmon.v1.CallService.CloseInputs:output_type -> vmon.v1.CallRecord
+	137, // 333: vmon.v1.CallService.Get:output_type -> vmon.v1.CallRecord
+	142, // 334: vmon.v1.CallService.List:output_type -> vmon.v1.ListCallsResponse
+	144, // 335: vmon.v1.CallService.GetResult:output_type -> vmon.v1.CallResult
+	148, // 336: vmon.v1.CallService.ListResults:output_type -> vmon.v1.ListCallResultsResponse
+	153, // 337: vmon.v1.CallService.Watch:output_type -> vmon.v1.CallEvent
+	137, // 338: vmon.v1.CallService.Cancel:output_type -> vmon.v1.CallRecord
+	160, // 339: vmon.v1.ActorService.Create:output_type -> vmon.v1.ActorRecord
+	160, // 340: vmon.v1.ActorService.Get:output_type -> vmon.v1.ActorRecord
+	161, // 341: vmon.v1.ActorService.Checkpoint:output_type -> vmon.v1.ActorCheckpoint
+	160, // 342: vmon.v1.ActorService.Restore:output_type -> vmon.v1.ActorRecord
+	160, // 343: vmon.v1.ActorService.Fork:output_type -> vmon.v1.ActorRecord
+	19,  // 344: vmon.v1.ActorService.Delete:output_type -> vmon.v1.Ok
+	277, // [277:345] is the sub-list for method output_type
+	209, // [209:277] is the sub-list for method input_type
+	209, // [209:209] is the sub-list for extension type_name
+	209, // [209:209] is the sub-list for extension extendee
+	0,   // [0:209] is the sub-list for field type_name
 }
 
 func init() { file_vmon_v1_api_proto_init() }
@@ -13280,9 +13967,11 @@ func file_vmon_v1_api_proto_init() {
 	file_vmon_v1_api_proto_msgTypes[40].OneofWrappers = []any{}
 	file_vmon_v1_api_proto_msgTypes[44].OneofWrappers = []any{
 		(*ArtifactRecord_MediaType)(nil),
+		(*ArtifactRecord_ExpiresAtUnixMillis)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[45].OneofWrappers = []any{
 		(*PutArtifactHeader_MediaType)(nil),
+		(*PutArtifactHeader_TtlMillis)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[46].OneofWrappers = []any{
 		(*PutArtifactRequest_Header)(nil),
@@ -13329,81 +14018,84 @@ func file_vmon_v1_api_proto_init() {
 		(*LifecycleHooks_Snapshot)(nil),
 		(*LifecycleHooks_Restore)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[83].OneofWrappers = []any{
-		(*FunctionSnapshotProvenance_InitializeHook)(nil),
+	file_vmon_v1_api_proto_msgTypes[84].OneofWrappers = []any{
+		(*FunctionSnapshotRecord_InitializeHook)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[85].OneofWrappers = []any{
-		(*FunctionRevision_SnapshotProvenance)(nil),
+	file_vmon_v1_api_proto_msgTypes[86].OneofWrappers = []any{
+		(*FunctionRevision_Snapshot)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[89].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[90].OneofWrappers = []any{
 		(*ListFunctionsRequest_Namespace)(nil),
 		(*ListFunctionsRequest_Function)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[91].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[92].OneofWrappers = []any{
 		(*ActivateFunctionRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[94].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[95].OneofWrappers = []any{
 		(*AppRevision_Previous)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[95].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[96].OneofWrappers = []any{
 		(*ActivateAppRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[97].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[98].OneofWrappers = []any{
 		(*RollbackAppRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[102].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[103].OneofWrappers = []any{
 		(*ScheduleSpec_Cron)(nil),
 		(*ScheduleSpec_Period)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[103].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[104].OneofWrappers = []any{
 		(*ScheduleRecord_NextRunUnixMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[104].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[105].OneofWrappers = []any{
 		(*CreateScheduleRequest_ScheduleId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[105].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[106].OneofWrappers = []any{
 		(*ListSchedulesRequest_App)(nil),
 		(*ListSchedulesRequest_Function)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[109].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[114].OneofWrappers = []any{
 		(*CallTarget_Actor)(nil),
-		(*CallTarget_ActorMethod)(nil),
+		(*CallTarget_Service)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[111].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[115].OneofWrappers = []any{
+		(*CallInput_Value)(nil),
+		(*CallInput_Arguments)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[117].OneofWrappers = []any{
 		(*CallGraph_RootCallId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[112].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[118].OneofWrappers = []any{
 		(*CreateCallRequest_ResultTtlMillis)(nil),
-		(*CreateCallRequest_ClientSessionId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[113].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[119].OneofWrappers = []any{
 		(*CallRecord_Error)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[114].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[120].OneofWrappers = []any{
 		(*StreamCallInputsRequest_Call)(nil),
 		(*StreamCallInputsRequest_Input)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[117].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[121].OneofWrappers = []any{
+		(*StreamCallInputsResponse_LastInput)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[123].OneofWrappers = []any{
 		(*ListCallsRequest_Function)(nil),
 		(*ListCallsRequest_Status)(nil),
 		(*ListCallsRequest_Actor)(nil),
 		(*ListCallsRequest_CreatedAfterUnixMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[120].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[126].OneofWrappers = []any{
 		(*CallResult_Value)(nil),
 		(*CallResult_Error)(nil),
 		(*CallResult_YieldIndex)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[123].OneofWrappers = []any{
-		(*WatchCallRequest_ClientSessionId)(nil),
-	}
-	file_vmon_v1_api_proto_msgTypes[126].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[134].OneofWrappers = []any{
 		(*AttemptEvent_Error)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[127].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[135].OneofWrappers = []any{
 		(*CallEvent_Status)(nil),
 		(*CallEvent_Log)(nil),
-		(*CallEvent_Yield)(nil),
+		(*CallEvent_YieldResult)(nil),
 		(*CallEvent_Result)(nil),
 		(*CallEvent_AttemptEvent)(nil),
 		(*CallEvent_Error)(nil),
@@ -13411,19 +14103,20 @@ func file_vmon_v1_api_proto_init() {
 		(*CallEvent_CancelRequested)(nil),
 		(*CallEvent_InputId)(nil),
 		(*CallEvent_InputIndex)(nil),
-		(*CallEvent_Attempt)(nil),
-	}
-	file_vmon_v1_api_proto_msgTypes[128].OneofWrappers = []any{
-		(*ErrorFrame_Code)(nil),
-	}
-	file_vmon_v1_api_proto_msgTypes[129].OneofWrappers = []any{
-		(*CallError_Cause)(nil),
-	}
-	file_vmon_v1_api_proto_msgTypes[134].OneofWrappers = []any{
-		(*ActorRecord_LatestCheckpoint)(nil),
+		(*CallEvent_AttemptId)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[136].OneofWrappers = []any{
-		(*CreateActorRequest_InitialState)(nil),
+		(*ErrorFrame_Code)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[137].OneofWrappers = []any{
+		(*CallError_Cause)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[142].OneofWrappers = []any{
+		(*ActorRecord_LatestCheckpoint)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[144].OneofWrappers = []any{
+		(*CreateActorRequest_InitialValue)(nil),
+		(*CreateActorRequest_InitialArguments)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -13431,7 +14124,7 @@ func file_vmon_v1_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vmon_v1_api_proto_rawDesc), len(file_vmon_v1_api_proto_rawDesc)),
 			NumEnums:      18,
-			NumMessages:   151,
+			NumMessages:   160,
 			NumExtensions: 0,
 			NumServices:   9,
 		},

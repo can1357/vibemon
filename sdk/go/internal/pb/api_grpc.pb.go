@@ -2955,6 +2955,7 @@ const (
 	CallService_Get_FullMethodName          = "/vmon.v1.CallService/Get"
 	CallService_List_FullMethodName         = "/vmon.v1.CallService/List"
 	CallService_GetResult_FullMethodName    = "/vmon.v1.CallService/GetResult"
+	CallService_ListResults_FullMethodName  = "/vmon.v1.CallService/ListResults"
 	CallService_Watch_FullMethodName        = "/vmon.v1.CallService/Watch"
 	CallService_Cancel_FullMethodName       = "/vmon.v1.CallService/Cancel"
 )
@@ -2968,8 +2969,8 @@ const (
 type CallServiceClient interface {
 	// Create durably records a call before any execution is eligible to begin.
 	Create(ctx context.Context, in *CreateCallRequest, opts ...grpc.CallOption) (*CallRecord, error)
-	// StreamInputs durably appends ordered inputs to an open generator or batch call.
-	StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error)
+	// StreamInputs bidirectionally appends ordered inputs and acknowledges the opener and every committed input.
+	StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error)
 	// CloseInputs marks an input stream complete so execution can finish.
 	CloseInputs(ctx context.Context, in *CloseCallInputsRequest, opts ...grpc.CallOption) (*CallRecord, error)
 	// Get returns the latest durable state of a call.
@@ -2978,6 +2979,8 @@ type CallServiceClient interface {
 	List(ctx context.Context, in *ListCallsRequest, opts ...grpc.CallOption) (*ListCallsResponse, error)
 	// GetResult returns one durable result by its input or yield index.
 	GetResult(ctx context.Context, in *GetCallResultRequest, opts ...grpc.CallOption) (*CallResult, error)
+	// ListResults returns a bounded page after a durable result sequence cursor.
+	ListResults(ctx context.Context, in *ListCallResultsRequest, opts ...grpc.CallOption) (*ListCallResultsResponse, error)
 	// Watch streams events after a durable sequence cursor and may follow new events.
 	Watch(ctx context.Context, in *WatchCallRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CallEvent], error)
 	// Cancel durably requests cancellation of a call and its unfinished work.
@@ -3002,7 +3005,7 @@ func (c *callServiceClient) Create(ctx context.Context, in *CreateCallRequest, o
 	return out, nil
 }
 
-func (c *callServiceClient) StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error) {
+func (c *callServiceClient) StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &CallService_ServiceDesc.Streams[0], CallService_StreamInputs_FullMethodName, cOpts...)
 	if err != nil {
@@ -3013,7 +3016,7 @@ func (c *callServiceClient) StreamInputs(ctx context.Context, opts ...grpc.CallO
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type CallService_StreamInputsClient = grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse]
+type CallService_StreamInputsClient = grpc.BidiStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse]
 
 func (c *callServiceClient) CloseInputs(ctx context.Context, in *CloseCallInputsRequest, opts ...grpc.CallOption) (*CallRecord, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -3049,6 +3052,16 @@ func (c *callServiceClient) GetResult(ctx context.Context, in *GetCallResultRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CallResult)
 	err := c.cc.Invoke(ctx, CallService_GetResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) ListResults(ctx context.Context, in *ListCallResultsRequest, opts ...grpc.CallOption) (*ListCallResultsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListCallResultsResponse)
+	err := c.cc.Invoke(ctx, CallService_ListResults_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3093,8 +3106,8 @@ func (c *callServiceClient) Cancel(ctx context.Context, in *CancelCallRequest, o
 type CallServiceServer interface {
 	// Create durably records a call before any execution is eligible to begin.
 	Create(context.Context, *CreateCallRequest) (*CallRecord, error)
-	// StreamInputs durably appends ordered inputs to an open generator or batch call.
-	StreamInputs(grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error
+	// StreamInputs bidirectionally appends ordered inputs and acknowledges the opener and every committed input.
+	StreamInputs(grpc.BidiStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error
 	// CloseInputs marks an input stream complete so execution can finish.
 	CloseInputs(context.Context, *CloseCallInputsRequest) (*CallRecord, error)
 	// Get returns the latest durable state of a call.
@@ -3103,6 +3116,8 @@ type CallServiceServer interface {
 	List(context.Context, *ListCallsRequest) (*ListCallsResponse, error)
 	// GetResult returns one durable result by its input or yield index.
 	GetResult(context.Context, *GetCallResultRequest) (*CallResult, error)
+	// ListResults returns a bounded page after a durable result sequence cursor.
+	ListResults(context.Context, *ListCallResultsRequest) (*ListCallResultsResponse, error)
 	// Watch streams events after a durable sequence cursor and may follow new events.
 	Watch(*WatchCallRequest, grpc.ServerStreamingServer[CallEvent]) error
 	// Cancel durably requests cancellation of a call and its unfinished work.
@@ -3120,7 +3135,7 @@ type UnimplementedCallServiceServer struct{}
 func (UnimplementedCallServiceServer) Create(context.Context, *CreateCallRequest) (*CallRecord, error) {
 	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
 }
-func (UnimplementedCallServiceServer) StreamInputs(grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error {
+func (UnimplementedCallServiceServer) StreamInputs(grpc.BidiStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamInputs not implemented")
 }
 func (UnimplementedCallServiceServer) CloseInputs(context.Context, *CloseCallInputsRequest) (*CallRecord, error) {
@@ -3134,6 +3149,9 @@ func (UnimplementedCallServiceServer) List(context.Context, *ListCallsRequest) (
 }
 func (UnimplementedCallServiceServer) GetResult(context.Context, *GetCallResultRequest) (*CallResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetResult not implemented")
+}
+func (UnimplementedCallServiceServer) ListResults(context.Context, *ListCallResultsRequest) (*ListCallResultsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListResults not implemented")
 }
 func (UnimplementedCallServiceServer) Watch(*WatchCallRequest, grpc.ServerStreamingServer[CallEvent]) error {
 	return status.Error(codes.Unimplemented, "method Watch not implemented")
@@ -3185,7 +3203,7 @@ func _CallService_StreamInputs_Handler(srv interface{}, stream grpc.ServerStream
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type CallService_StreamInputsServer = grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]
+type CallService_StreamInputsServer = grpc.BidiStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]
 
 func _CallService_CloseInputs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CloseCallInputsRequest)
@@ -3259,6 +3277,24 @@ func _CallService_GetResult_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CallService_ListResults_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListCallResultsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).ListResults(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_ListResults_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).ListResults(ctx, req.(*ListCallResultsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _CallService_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(WatchCallRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -3316,6 +3352,10 @@ var CallService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _CallService_GetResult_Handler,
 		},
 		{
+			MethodName: "ListResults",
+			Handler:    _CallService_ListResults_Handler,
+		},
+		{
 			MethodName: "Cancel",
 			Handler:    _CallService_Cancel_Handler,
 		},
@@ -3324,6 +3364,7 @@ var CallService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamInputs",
 			Handler:       _CallService_StreamInputs_Handler,
+			ServerStreams: true,
 			ClientStreams: true,
 		},
 		{

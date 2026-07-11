@@ -143,6 +143,7 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Upgraded `StreamInputs` from client-streaming to bidirectional streaming
 - Updated durable function HTTP gateway to require `application/json` content type
 - Refactored `stream_inputs` to support bidirectional streaming and progress acknowledgments
 - Switched durable function storage schema to version 3
