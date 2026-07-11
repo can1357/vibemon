@@ -1416,7 +1416,6 @@ fn temp_file_in(dir: &Path, prefix: &str) -> Result<PathBuf> {
 	Err(EngineError::engine("failed to create temporary file"))
 }
 
-
 fn digest_prefix(digest: &str, len: usize) -> &str {
 	digest.get(..len).unwrap_or(digest)
 }

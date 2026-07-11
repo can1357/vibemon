@@ -79,15 +79,13 @@ impl Backend for SystemBackend {
 		tag: &str,
 		arch: &str,
 	) -> Result<ResolvedOciImage> {
-		let reference =
-			image::build::build_image_in(builds, dockerfile, context, tag, Some(arch)).map_err(
-				|error| {
-					EngineError::engine(format!(
-						"function image build failed; verify pinned apt/uv packages and build \
-						 commands: {error}"
-					))
-				},
-			)?;
+		let reference = image::build::build_image_in(builds, dockerfile, context, tag, Some(arch))
+			.map_err(|error| {
+				EngineError::engine(format!(
+					"function image build failed; verify pinned apt/uv packages and build commands: \
+					 {error}"
+				))
+			})?;
 		image::resolve_oci_reference(&reference, Some(arch))
 	}
 
@@ -369,13 +367,8 @@ fn build_cached(
 			platform:  cached.platform,
 		});
 	}
-	let built = backend.build(
-		&home.root().join("builds"),
-		&plan.dockerfile,
-		&plan.context,
-		tag,
-		arch,
-	)?;
+	let built =
+		backend.build(&home.root().join("builds"), &plan.dockerfile, &plan.context, tag, arch)?;
 	validate_sha256_hex(&built.digest, "built image digest")?;
 	if built.platform != format!("linux/{arch}") {
 		return Err(EngineError::unsupported(format!(
@@ -765,14 +758,19 @@ fn validate_local_oci_reference(home: &Home, reference: &str) -> Result<()> {
 	let body = reference
 		.strip_prefix("oci:")
 		.ok_or_else(|| EngineError::invalid("resolved local OCI reference is malformed"))?;
-	let direct = Path::new(body).canonicalize().ok().filter(|path| path.is_dir());
-	let canonical = direct.or_else(|| {
-		body.match_indices(':')
-			.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok())
-			.filter(|path| path.is_dir())
-			.next_back()
-	})
-	.ok_or_else(|| EngineError::not_found("resolved local OCI cache entry is missing"))?;
+	let direct = Path::new(body)
+		.canonicalize()
+		.ok()
+		.filter(|path| path.is_dir());
+	let canonical = direct
+		.or_else(|| {
+			body
+				.match_indices(':')
+				.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok())
+				.filter(|path| path.is_dir())
+				.next_back()
+		})
+		.ok_or_else(|| EngineError::not_found("resolved local OCI cache entry is missing"))?;
 	let owned = [home.root().join("builds"), home.images_dir()]
 		.into_iter()
 		.filter_map(|root| root.canonicalize().ok())
@@ -1184,15 +1182,15 @@ fn tar_octal(field: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
-	use parking_lot::Mutex;
 
+	use parking_lot::Mutex;
 
 	use super::*;
 
 	struct FakeBackend {
-		digest: String,
-		arch:   &'static str,
-		builds: AtomicUsize,
+		digest:      String,
+		arch:        &'static str,
+		builds:      AtomicUsize,
 		build_roots: Mutex<Vec<PathBuf>>,
 	}
 	impl FakeBackend {
@@ -1248,9 +1246,9 @@ mod tests {
 		let (_temp, home) = home();
 		let arch = architecture_name(pb::CpuArchitecture::Unspecified).unwrap();
 		let backend = FakeBackend {
-			digest:      hex::encode([7u8; 32]),
+			digest: hex::encode([7u8; 32]),
 			arch,
-			builds:      AtomicUsize::new(0),
+			builds: AtomicUsize::new(0),
 			build_roots: Mutex::new(Vec::new()),
 		};
 		let spec = pb::ImageSpec {
@@ -1561,16 +1559,8 @@ mod tests {
 		let built = home.root().join("builds/built");
 		fs::create_dir_all(&pulled).unwrap();
 		fs::create_dir_all(&built).unwrap();
-		validate_local_oci_reference(
-			&home,
-			&format!("oci:{}:latest", pulled.display()),
-		)
-		.unwrap();
-		validate_local_oci_reference(
-			&home,
-			&format!("oci:{}:latest", built.display()),
-		)
-		.unwrap();
+		validate_local_oci_reference(&home, &format!("oci:{}:latest", pulled.display())).unwrap();
+		validate_local_oci_reference(&home, &format!("oci:{}:latest", built.display())).unwrap();
 		validate_local_oci_reference(
 			&home,
 			&format!("oci:{}:vmon-function:{}", built.display(), "a".repeat(64)),
@@ -1578,12 +1568,14 @@ mod tests {
 		.unwrap();
 
 		let outside = tempfile::tempdir().unwrap();
-		let error = validate_local_oci_reference(
-			&home,
-			&format!("oci:{}:latest", outside.path().display()),
-		)
-		.unwrap_err();
-		assert!(error.to_string().contains("escapes the server image caches"));
+		let error =
+			validate_local_oci_reference(&home, &format!("oci:{}:latest", outside.path().display()))
+				.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("escapes the server image caches")
+		);
 	}
 
 	#[test]

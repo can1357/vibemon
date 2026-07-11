@@ -27,8 +27,8 @@ use crate::{
 		agent::{AgentConn, ExecHandle},
 		control::ControlClient,
 		diskdelta,
-		spawn::{LaunchSpec, MicroVm, RemoteFsShare, VolumeMount},
 		s3proxy::S3Proxy,
+		spawn::{LaunchSpec, MicroVm, RemoteFsShare, VolumeMount},
 	},
 	error::{EngineError, Result},
 	home::Home,
@@ -37,8 +37,8 @@ use crate::{
 	net::{self, SandboxNetwork},
 	pools::{PoolRegistry, WarmPool, template_key},
 	registry::{Registry, VmRecord},
-	volumes::{self, Secret, Volume, VolumeLock},
 	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
+	volumes::{self, Secret, Volume, VolumeLock},
 };
 
 const DEFAULT_SHELL_IMAGE: &str = "debian:stable-slim";
@@ -85,7 +85,7 @@ struct RuntimeState {
 	network_policy: NetworkPolicy,
 	network_spec:   Option<Value>,
 	timeout_stop:   Option<Sender<()>>,
-	s3_proxy:      Option<S3Proxy>,
+	s3_proxy:       Option<S3Proxy>,
 }
 
 #[derive(Default, Clone)]
@@ -129,7 +129,7 @@ struct CreatePlan {
 	secret_env:           BTreeMap<String, String>,
 	timeout_secs:         Option<u64>,
 	volume_specs:         Vec<ResolvedVolume>,
-	s3_specs:            Vec<ResolvedS3Mount>,
+	s3_specs:             Vec<ResolvedS3Mount>,
 	template_dir:         PathBuf,
 	image_spec:           Option<image::ImageConfig>,
 	image_ref:            Option<String>,
@@ -497,7 +497,8 @@ impl Engine {
 		Ok(out)
 	}
 
-	/// Rebuild remote filesystem clients from a snapshot's credential-free mount metadata.
+	/// Rebuild remote filesystem clients from a snapshot's credential-free mount
+	/// metadata.
 	fn snapshot_s3_mounts(&self, snapshot_dir: &Path) -> Result<Vec<ResolvedS3Mount>> {
 		let path = snapshot_dir.join(S3_MOUNTS_FILE);
 		if !path.is_file() {
@@ -525,7 +526,6 @@ impl Engine {
 		Ok(mounts)
 	}
 
-
 	/// Start a per-VM proxy before its remote virtio-fs devices connect.
 	fn with_s3_proxy(
 		&self,
@@ -543,10 +543,7 @@ impl Engine {
 			.collect();
 		let proxy = S3Proxy::start(&self.inner.net_runtime, &sock, routes)?;
 		for mount in mounts {
-			spec = spec.with_remote_fs(RemoteFsShare {
-				tag:  mount.tag.clone(),
-				sock: sock.clone(),
-			});
+			spec = spec.with_remote_fs(RemoteFsShare { tag: mount.tag.clone(), sock: sock.clone() });
 		}
 		Ok((spec, Some(proxy)))
 	}
@@ -556,19 +553,14 @@ impl Engine {
 		for mount in mounts {
 			let mountpoint = Path::new(&mount.mountpoint);
 			if mount.read_only {
-				agent.mount(
-					&mount.tag,
-					mountpoint,
-					true,
-					"virtiofs",
-					AGENT_REQUEST_TIMEOUT,
-				)?;
+				agent.mount(&mount.tag, mountpoint, true, "virtiofs", AGENT_REQUEST_TIMEOUT)?;
 			} else {
 				agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
 			}
 		}
 		Ok(())
 	}
+
 	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(MicroVm, RuntimeState)> {
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
@@ -2550,13 +2542,14 @@ impl EngineApi for Engine {
 			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
 		}
 		if let Some(s3_proxy) = s3_proxy {
-			self.inner.runtimes.lock().insert(
-				name.clone(),
-				RuntimeState {
+			self
+				.inner
+				.runtimes
+				.lock()
+				.insert(name.clone(), RuntimeState {
 					s3_proxy: Some(s3_proxy),
 					..RuntimeState::default()
-				},
-			);
+				});
 		}
 		let record = VmRecord {
 			id: name.clone(),
@@ -2612,13 +2605,14 @@ impl EngineApi for Engine {
 				meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
 			}
 			if let Some(s3_proxy) = s3_proxy {
-				self.inner.runtimes.lock().insert(
-					name.clone(),
-					RuntimeState {
+				self
+					.inner
+					.runtimes
+					.lock()
+					.insert(name.clone(), RuntimeState {
 						s3_proxy: Some(s3_proxy),
 						..RuntimeState::default()
-					},
-				);
+					});
 			}
 			let record = VmRecord {
 				id:            name.clone(),
@@ -2920,10 +2914,7 @@ fn parse_volume_spec(value: &Value) -> Result<(String, bool)> {
 	))
 }
 
-fn s3_credentials(
-	mountpoint: &str,
-	spec: &S3MountSpec,
-) -> Result<(Option<S3Credentials>, S3Auth)> {
+fn s3_credentials(mountpoint: &str, spec: &S3MountSpec) -> Result<(Option<S3Credentials>, S3Auth)> {
 	let inline_requested =
 		spec.access_key.is_some() || spec.secret_key.is_some() || spec.session_token.is_some();
 	let access_key = spec.access_key.as_deref().filter(|value| !value.is_empty());
@@ -3014,16 +3005,16 @@ fn valid_virtiofs_tag(tag: &str) -> bool {
 			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-fn restore_s3_mount_params(params: &mut Map<String, Value>) -> Result<Option<HashMap<String, String>>> {
+fn restore_s3_mount_params(
+	params: &mut Map<String, Value>,
+) -> Result<Option<HashMap<String, String>>> {
 	let Some(source) = params.get("s3_mounts").cloned() else {
 		return Ok(None);
 	};
 	let mounts = source
 		.as_object()
 		.ok_or_else(|| EngineError::invalid("restored S3 mounts must be an object"))?;
-	let has_metadata = mounts
-		.values()
-		.any(|mount| mount.get("auth").is_some());
+	let has_metadata = mounts.values().any(|mount| mount.get("auth").is_some());
 	if !has_metadata {
 		return Ok(None);
 	}
@@ -3037,30 +3028,33 @@ fn restore_s3_mount_params(params: &mut Map<String, Value>) -> Result<Option<Has
 			.get("uri")
 			.and_then(Value::as_str)
 			.filter(|uri| !uri.is_empty())
-			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing uri")))?;
+			.ok_or_else(|| {
+				EngineError::invalid(format!("restored S3 mount {mountpoint} is missing uri"))
+			})?;
 		let tag = object
 			.get("tag")
 			.and_then(Value::as_str)
 			.filter(|tag| !tag.is_empty())
-			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing tag")))?;
-		let auth = object
-			.get("auth")
-			.and_then(Value::as_str)
-			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing auth")))?;
+			.ok_or_else(|| {
+				EngineError::invalid(format!("restored S3 mount {mountpoint} is missing tag"))
+			})?;
+		let auth = object.get("auth").and_then(Value::as_str).ok_or_else(|| {
+			EngineError::invalid(format!("restored S3 mount {mountpoint} is missing auth"))
+		})?;
 		match auth {
 			"inline" => {
 				if environment_s3_credentials().is_none() {
 					return Err(EngineError::invalid(format!(
-						"S3 mount {mountpoint} was created with inline credentials; \
-						 set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to restore"
+						"S3 mount {mountpoint} was created with inline credentials; set \
+						 AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to restore"
 					)));
 				}
 			},
 			"env" => {
 				if environment_s3_credentials().is_none() {
 					return Err(EngineError::invalid(format!(
-						"S3 mount {mountpoint} requires AWS_ACCESS_KEY_ID and \
-						 AWS_SECRET_ACCESS_KEY to restore"
+						"S3 mount {mountpoint} requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to \
+						 restore"
 					)));
 				}
 			},
@@ -3073,17 +3067,16 @@ fn restore_s3_mount_params(params: &mut Map<String, Value>) -> Result<Option<Has
 		}
 		let spec = Map::from_iter([
 			("uri".to_owned(), json!(uri)),
-			(
-				"endpoint".to_owned(),
-				object.get("endpoint").cloned().unwrap_or(Value::Null),
-			),
-			(
-				"region".to_owned(),
-				object.get("region").cloned().unwrap_or(Value::Null),
-			),
+			("endpoint".to_owned(), object.get("endpoint").cloned().unwrap_or(Value::Null)),
+			("region".to_owned(), object.get("region").cloned().unwrap_or(Value::Null)),
 			(
 				"read_only".to_owned(),
-				json!(object.get("read_only").and_then(Value::as_bool).unwrap_or(false)),
+				json!(
+					object
+						.get("read_only")
+						.and_then(Value::as_bool)
+						.unwrap_or(false)
+				),
 			),
 		]);
 		if let Some(endpoint) = spec.get("endpoint")

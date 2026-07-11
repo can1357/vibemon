@@ -37,7 +37,7 @@ pub struct SandboxCreate {
 	/// Mountpoint -> volume name or `{name, read_only}`.
 	pub volumes:                Option<HashMap<String, Value>>,
 	/// Mountpoint -> lazy S3 mount specification.
-	pub s3_mounts:                Option<HashMap<String, S3MountSpec>>,
+	pub s3_mounts:              Option<HashMap<String, S3MountSpec>>,
 	pub tags:                   Option<HashMap<String, String>>,
 	pub fs_dir:                 Option<String>,
 	#[serde(default)]
@@ -122,12 +122,12 @@ impl<'de> Deserialize<'de> for S3MountSpec {
 				session_token: None,
 			}),
 			S3MountWire::Fields(fields) => Ok(Self {
-				uri: fields.uri,
-				endpoint: fields.endpoint,
-				region: fields.region,
-				read_only: fields.read_only,
-				access_key: fields.access_key,
-				secret_key: fields.secret_key,
+				uri:           fields.uri,
+				endpoint:      fields.endpoint,
+				region:        fields.region,
+				read_only:     fields.read_only,
+				access_key:    fields.access_key,
+				secret_key:    fields.secret_key,
 				session_token: fields.session_token,
 			}),
 		}

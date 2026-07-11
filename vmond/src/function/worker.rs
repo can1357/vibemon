@@ -2974,12 +2974,12 @@ mod tests {
 		let spec = revision.spec.as_mut().unwrap();
 		spec.resources.as_mut().unwrap().high_availability = pb::HighAvailabilityPolicy::None as i32;
 		let image = image::RealizedImage {
-			image: Some("local-test-image".into()),
-			template: None,
-			dockerfile: None,
-			context: None,
-			environment: BTreeMap::new(),
-			resolved_spec: spec.image.clone().unwrap(),
+			image:             Some("local-test-image".into()),
+			template:          None,
+			dockerfile:        None,
+			context:           None,
+			environment:       BTreeMap::new(),
+			resolved_spec:     spec.image.clone().unwrap(),
 			provenance_digest: "07".repeat(32),
 		};
 		let create =
@@ -2992,20 +2992,15 @@ mod tests {
 	#[test]
 	fn worker_names_are_short_stable_and_collision_resistant() {
 		let first = worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX);
-		assert_eq!(
-			first,
-			worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX)
-		);
-		assert_ne!(
-			first,
-			worker_name("revision-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", u64::MAX)
-		);
-		assert_ne!(
-			first,
-			worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX - 1)
-		);
+		assert_eq!(first, worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX));
+		assert_ne!(first, worker_name("revision-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", u64::MAX));
+		assert_ne!(first, worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX - 1));
 		assert!(first.len() <= 31);
-		assert!(first.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
+		assert!(
+			first
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+		);
 	}
 
 	#[test]

@@ -87,19 +87,13 @@ fn duplicate_volume_tag_rejected() {
 #[test]
 fn remote_fs_duplicate_tag_rejected() {
 	assert_cli_rejects(
-		&[
-			"--kernel",
-			"k",
-			"--volume",
-			"data:/srv/data",
-			"--remote-fs",
-			"data:/tmp/vmon-s3.sock",
-		],
+		&["--kernel", "k", "--volume", "data:/srv/data", "--remote-fs", "data:/tmp/vmon-s3.sock"],
 		"--volume tags must be unique",
 	);
 }
 
-/// Proxy-backed virtio-fs tags follow the same restricted tag syntax as volumes.
+/// Proxy-backed virtio-fs tags follow the same restricted tag syntax as
+/// volumes.
 #[test]
 fn remote_fs_bad_tag_rejected() {
 	assert_cli_rejects(

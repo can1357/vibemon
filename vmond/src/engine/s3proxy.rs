@@ -5,8 +5,7 @@
 
 use std::{
 	collections::HashMap,
-	fs,
-	io,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -38,8 +37,8 @@ impl S3Proxy {
 	///
 	/// # Errors
 	///
-	/// Returns an engine error when the socket parent cannot be prepared, a stale
-	/// socket cannot be removed, or the listener fails to bind.
+	/// Returns an engine error when the socket parent cannot be prepared, a
+	/// stale socket cannot be removed, or the listener fails to bind.
 	pub fn start(
 		runtime: &Runtime,
 		sock: &Path,
@@ -54,7 +53,9 @@ impl S3Proxy {
 		let parent = sock
 			.parent()
 			.filter(|parent| !parent.as_os_str().is_empty())
-			.ok_or_else(|| EngineError::invalid(format!("S3 proxy socket has no parent: {}", sock.display())))?;
+			.ok_or_else(|| {
+				EngineError::invalid(format!("S3 proxy socket has no parent: {}", sock.display()))
+			})?;
 		fs::create_dir_all(parent)
 			.map_err(|error| EngineError::engine(format!("creating S3 proxy directory: {error}")))?;
 		match fs::remove_file(sock) {
@@ -145,8 +146,13 @@ async fn serve_connection(
 			Err(error)
 				if matches!(
 					error.kind(),
-					io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-				) => return Ok(()),
+					io::ErrorKind::UnexpectedEof
+						| io::ErrorKind::ConnectionReset
+						| io::ErrorKind::BrokenPipe
+				) =>
+			{
+				return Ok(());
+			},
 			Err(error) => return Err(error),
 		};
 		let (response_ty, response) = if ty != proto::REQ {
@@ -154,7 +160,9 @@ async fn serve_connection(
 		} else {
 			match serde_json::from_slice::<proto::Request>(&payload) {
 				Ok(request) => dispatch(request, &mounts).await?,
-				Err(error) => error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?,
+				Err(error) => {
+					error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?
+				},
 			}
 		};
 		write_frame(&mut stream, response_ty, id, &response).await?;
@@ -172,10 +180,10 @@ async fn dispatch(
 			};
 			match client.stat(&path).await {
 				Ok(stat) => json_response(&proto::StatReply {
-					kind: obj_kind(stat.kind),
-					size: stat.size,
+					kind:  obj_kind(stat.kind),
+					size:  stat.size,
 					mtime: stat.mtime,
-					etag: stat.etag,
+					etag:  stat.etag,
 				}),
 				Err(error) => s3_error_response(error),
 			}
@@ -189,9 +197,9 @@ async fn dispatch(
 					entries: entries
 						.iter()
 						.map(|entry| proto::Entry {
-							name: entry.name.clone(),
-							kind: obj_kind(entry.kind),
-							size: entry.size,
+							name:  entry.name.clone(),
+							kind:  obj_kind(entry.kind),
+							size:  entry.size,
 							mtime: entry.mtime,
 						})
 						.collect(),
@@ -228,10 +236,7 @@ fn json_response<T: Serialize>(value: &T) -> io::Result<(u8, Vec<u8>)> {
 }
 
 fn error_response(code: &str, msg: &str) -> io::Result<(u8, Vec<u8>)> {
-	Ok((
-		proto::ERR,
-		json(&proto::ErrReply { code: code.to_owned(), msg: msg.to_owned() })?,
-	))
+	Ok((proto::ERR, json(&proto::ErrReply { code: code.to_owned(), msg: msg.to_owned() })?))
 }
 
 fn json<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
@@ -241,7 +246,8 @@ fn json<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
 async fn read_frame(stream: &mut UnixStream) -> io::Result<(u8, u32, Vec<u8>)> {
 	let mut header = [0u8; proto::HEADER_LEN];
 	stream.read_exact(&mut header).await?;
-	let payload_len = u32::from_le_bytes(header[..4].try_into().expect("fixed frame header")) as usize;
+	let payload_len =
+		u32::from_le_bytes(header[..4].try_into().expect("fixed frame header")) as usize;
 	if payload_len > proto::MAX_FRAME {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidData,
@@ -297,7 +303,9 @@ mod tests {
 	impl StubS3 {
 		fn start() -> Self {
 			let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind S3 stub");
-			listener.set_nonblocking(true).expect("set S3 stub nonblocking");
+			listener
+				.set_nonblocking(true)
+				.expect("set S3 stub nonblocking");
 			let addr = listener.local_addr().expect("S3 stub address");
 			let stop = Arc::new(AtomicBool::new(false));
 			let thread_stop = Arc::clone(&stop);
@@ -350,7 +358,11 @@ mod tests {
 		let _ = stream.write_all(body);
 	}
 
-	fn request(stream: &mut std::os::unix::net::UnixStream, id: u32, request: proto::Request) -> (u8, u32, Vec<u8>) {
+	fn request(
+		stream: &mut std::os::unix::net::UnixStream,
+		id: u32,
+		request: proto::Request,
+	) -> (u8, u32, Vec<u8>) {
 		let payload = serde_json::to_vec(&request).expect("serialize proxy request");
 		proto::write_frame(stream, proto::REQ, id, &payload).expect("write proxy request");
 		proto::read_frame(stream).expect("read proxy response")
@@ -363,13 +375,13 @@ mod tests {
 		let endpoint = format!("http://{}", server.addr);
 		let client = Arc::new(
 			S3Client::new(S3MountConfig {
-				bucket: "bucket".to_owned(),
-				prefix: String::new(),
-				region: "us-east-1".to_owned(),
-				endpoint: Some(endpoint),
+				bucket:    "bucket".to_owned(),
+				prefix:    String::new(),
+				region:    "us-east-1".to_owned(),
+				endpoint:  Some(endpoint),
 				read_only: false,
-				creds: None,
-				auth: S3Auth::Anonymous,
+				creds:     None,
+				auth:      S3Auth::Anonymous,
 			})
 			.expect("S3 client"),
 		);
@@ -380,45 +392,38 @@ mod tests {
 		let proxy = S3Proxy::start(&runtime, &sock, mounts).expect("start S3 proxy");
 		let mut stream = std::os::unix::net::UnixStream::connect(&sock).expect("connect to S3 proxy");
 
-		let (ty, id, payload) = request(
-			&mut stream,
-			7,
-			proto::Request::Stat { tag: "data".to_owned(), path: "a.txt".to_owned() },
-		);
+		let (ty, id, payload) = request(&mut stream, 7, proto::Request::Stat {
+			tag:  "data".to_owned(),
+			path: "a.txt".to_owned(),
+		});
 		assert_eq!((ty, id), (proto::OK_JSON, 7));
 		let stat: proto::StatReply = serde_json::from_slice(&payload).expect("stat reply");
 		assert_eq!(stat.kind, proto::Kind::File);
 		assert_eq!(stat.size, 5);
 		assert_eq!(stat.etag.as_deref(), Some("\"etag\""));
 
-		let (ty, id, payload) = request(
-			&mut stream,
-			8,
-			proto::Request::List { tag: "data".to_owned(), path: String::new() },
-		);
+		let (ty, id, payload) = request(&mut stream, 8, proto::Request::List {
+			tag:  "data".to_owned(),
+			path: String::new(),
+		});
 		assert_eq!((ty, id), (proto::OK_JSON, 8));
 		let list: proto::ListReply = serde_json::from_slice(&payload).expect("list reply");
 		assert_eq!(list.entries.len(), 1);
 		assert_eq!(list.entries[0].name, "a.txt");
 
-		let (ty, id, payload) = request(
-			&mut stream,
-			9,
-			proto::Request::Read {
-				tag: "data".to_owned(),
-				path: "a.txt".to_owned(),
-				offset: 0,
-				len: 5,
-			},
-		);
+		let (ty, id, payload) = request(&mut stream, 9, proto::Request::Read {
+			tag:    "data".to_owned(),
+			path:   "a.txt".to_owned(),
+			offset: 0,
+			len:    5,
+		});
 		assert_eq!((ty, id), (proto::OK_DATA, 9));
 		assert_eq!(payload, b"hello");
 
-		let (ty, id, payload) = request(
-			&mut stream,
-			10,
-			proto::Request::Stat { tag: "data".to_owned(), path: "missing".to_owned() },
-		);
+		let (ty, id, payload) = request(&mut stream, 10, proto::Request::Stat {
+			tag:  "data".to_owned(),
+			path: "missing".to_owned(),
+		});
 		assert_eq!((ty, id), (proto::ERR, 10));
 		let error: proto::ErrReply = serde_json::from_slice(&payload).expect("error reply");
 		assert_eq!(error.code, "not_found");

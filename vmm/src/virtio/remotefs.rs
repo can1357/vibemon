@@ -30,12 +30,7 @@ pub mod proto {
 		/// List direct children of one directory path.
 		List { tag: String, path: String },
 		/// Read a byte range from one file path.
-		Read {
-			tag:    String,
-			path:   String,
-			offset: u64,
-			len:    u32,
-		},
+		Read { tag: String, path: String, offset: u64, len: u32 },
 	}
 
 	/// Object kind returned by the proxy.
@@ -118,7 +113,8 @@ pub mod proto {
 	///
 	/// # Errors
 	///
-	/// Returns an error when `payload` exceeds [`MAX_FRAME`] or the output fails.
+	/// Returns an error when `payload` exceeds [`MAX_FRAME`] or the output
+	/// fails.
 	pub fn write_frame<W: Write>(writer: &mut W, ty: u8, id: u32, payload: &[u8]) -> io::Result<()> {
 		if payload.len() > MAX_FRAME {
 			return Err(io::Error::new(
@@ -163,24 +159,19 @@ pub mod proto {
 }
 
 use std::{
-	collections::HashMap,
-	os::unix::net::UnixStream,
-	path::PathBuf,
-	sync::Arc,
-	time::Duration,
+	collections::HashMap, os::unix::net::UnixStream, path::PathBuf, sync::Arc, time::Duration,
 };
 
 use virtio_bindings::{bindings::virtio_config::VIRTIO_F_VERSION_1, virtio_ids::VIRTIO_ID_FS};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestAddress;
 
+use super::{Interrupt, VirtioDevice, fs};
 use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	snapshot::FsStateSer,
 };
-
-use super::{Interrupt, VirtioDevice, fs};
 
 const REMOTE_TIMEOUT_SEC: u64 = 5;
 const PROXY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -292,8 +283,8 @@ impl RemoteFsState {
 				proto::OK_JSON => return Ok(ProxyReply::Json(payload)),
 				proto::OK_DATA => return Ok(ProxyReply::Data(payload)),
 				proto::ERR => {
-					let reply = serde_json::from_slice::<proto::ErrReply>(&payload)
-						.map_err(|_| -libc::EIO)?;
+					let reply =
+						serde_json::from_slice::<proto::ErrReply>(&payload).map_err(|_| -libc::EIO)?;
 					return Err(proxy_errno(&reply.code));
 				},
 				_ => {
@@ -321,18 +312,9 @@ impl RemoteFsState {
 		}
 	}
 
-	fn read(
-		&mut self,
-		path: &str,
-		offset: u64,
-		len: u32,
-	) -> std::result::Result<Vec<u8>, i32> {
-		let request = proto::Request::Read {
-			tag: self.tag.clone(),
-			path: path.to_owned(),
-			offset,
-			len,
-		};
+	fn read(&mut self, path: &str, offset: u64, len: u32) -> std::result::Result<Vec<u8>, i32> {
+		let request =
+			proto::Request::Read { tag: self.tag.clone(), path: path.to_owned(), offset, len };
 		match self.call(&request)? {
 			ProxyReply::Data(payload) => Ok(payload),
 			ProxyReply::Json(_) => Err(-libc::EIO),
@@ -347,17 +329,17 @@ impl RemoteFsState {
 
 		let mut entries = vec![
 			DirentInfo {
-				name: b".".to_vec(),
-				ino: current,
-				kind: proto::Kind::Dir,
-				size: 0,
+				name:  b".".to_vec(),
+				ino:   current,
+				kind:  proto::Kind::Dir,
+				size:  0,
 				mtime: 0,
 			},
 			DirentInfo {
-				name: b"..".to_vec(),
-				ino: parent,
-				kind: proto::Kind::Dir,
-				size: 0,
+				name:  b"..".to_vec(),
+				ino:   parent,
+				kind:  proto::Kind::Dir,
+				size:  0,
 				mtime: 0,
 			},
 		];
@@ -441,13 +423,13 @@ impl RemoteFsState {
 				continue;
 			};
 			let entry_out = fs::FuseEntryOut {
-				nodeid: entry.ino,
-				generation: 0,
-				entry_valid: REMOTE_TIMEOUT_SEC,
-				attr_valid: REMOTE_TIMEOUT_SEC,
+				nodeid:           entry.ino,
+				generation:       0,
+				entry_valid:      REMOTE_TIMEOUT_SEC,
+				attr_valid:       REMOTE_TIMEOUT_SEC,
 				entry_valid_nsec: 0,
-				attr_valid_nsec: 0,
-				attr: attr(entry.ino, entry.kind, entry.size, entry.mtime),
+				attr_valid_nsec:  0,
+				attr:             attr(entry.ino, entry.kind, entry.size, entry.mtime),
 			};
 			let dirent = fs::FuseDirent {
 				ino: entry.ino,
@@ -459,7 +441,9 @@ impl RemoteFsState {
 			out.extend_from_slice(fs::struct_bytes(&dirent));
 			out.extend_from_slice(&entry.name);
 			out.resize(
-				out.len() + reclen - std::mem::size_of::<fs::FuseEntryOut>() - fs::DIRENT_HEADER
+				out.len() + reclen
+					- std::mem::size_of::<fs::FuseEntryOut>()
+					- fs::DIRENT_HEADER
 					- entry.name.len(),
 				0,
 			);
@@ -496,8 +480,7 @@ impl RemoteFsState {
 				let out = fs::FuseInitOut {
 					major: 7,
 					minor: client_minor.min(fs::FUSE_PROTO_MINOR),
-					max_readahead: fs::read_struct::<u32>(req, fs::IN_HEADER_SIZE + 8)
-						.unwrap_or(0),
+					max_readahead: fs::read_struct::<u32>(req, fs::IN_HEADER_SIZE + 8).unwrap_or(0),
 					max_write: fs::MAX_WRITE,
 					time_gran: 1,
 					..Default::default()
@@ -533,24 +516,20 @@ impl RemoteFsState {
 			},
 			fs::FUSE_GETATTR => {
 				let stat = if header.nodeid == fs::FUSE_ROOT_ID {
-					Ok(proto::StatReply {
-						kind: proto::Kind::Dir,
-						size: 0,
-						mtime: 0,
-						etag: None,
-					})
+					Ok(proto::StatReply { kind: proto::Kind::Dir, size: 0, mtime: 0, etag: None })
 				} else {
-					self.path(header.nodeid)
+					self
+						.path(header.nodeid)
 						.ok_or(-libc::ENOENT)
 						.and_then(|path| self.stat(&path))
 				};
 				match stat {
 					Ok(stat) => {
 						let out = fs::FuseAttrOut {
-							attr_valid: REMOTE_TIMEOUT_SEC,
+							attr_valid:      REMOTE_TIMEOUT_SEC,
 							attr_valid_nsec: 0,
-							dummy: 0,
-							attr: attr(header.nodeid, stat.kind, stat.size, stat.mtime),
+							dummy:           0,
+							attr:            attr(header.nodeid, stat.kind, stat.size, stat.mtime),
 						};
 						fs::write_reply(mem, writable, header.unique, 0, fs::struct_bytes(&out))
 					},
@@ -608,19 +587,19 @@ impl RemoteFsState {
 				}
 			},
 			fs::FUSE_STATFS => {
-				let out = fs::FuseKstatfs {
-					bsize: 4096,
-					namelen: 255,
-					frsize: 4096,
-					..Default::default()
-				};
+				let out =
+					fs::FuseKstatfs { bsize: 4096, namelen: 255, frsize: 4096, ..Default::default() };
 				fs::write_reply(mem, writable, header.unique, 0, fs::struct_bytes(&out))
 			},
 			fs::FUSE_ACCESS => {
 				let Some(mask) = fs::read_struct::<u32>(req, fs::IN_HEADER_SIZE) else {
 					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
 				};
-				let error = if mask & libc::W_OK as u32 != 0 { -libc::EROFS } else { 0 };
+				let error = if mask & libc::W_OK as u32 != 0 {
+					-libc::EROFS
+				} else {
+					0
+				};
 				fs::write_reply(mem, writable, header.unique, error, &[])
 			},
 			fs::FUSE_RELEASE
@@ -868,9 +847,9 @@ impl VirtioDevice for RemoteFs {
 				if let Some((req, _)) = fs::split_chain(&mem, chain) {
 					state.dispatch(&mem, &req, &[]);
 				}
-				queue
-					.add_used(&mem, head, 0)
-					.map_err(|error| err(format!("remote virtio-fs hiprio used-ring update failed: {error}")))?;
+				queue.add_used(&mem, head, 0).map_err(|error| {
+					err(format!("remote virtio-fs hiprio used-ring update failed: {error}"))
+				})?;
 				used = true;
 			}
 		}
@@ -882,9 +861,9 @@ impl VirtioDevice for RemoteFs {
 					Some((req, writable)) => state.dispatch(&mem, &req, &writable),
 					None => 0,
 				};
-				queue
-					.add_used(&mem, head, written)
-					.map_err(|error| err(format!("remote virtio-fs request used-ring update failed: {error}")))?;
+				queue.add_used(&mem, head, written).map_err(|error| {
+					err(format!("remote virtio-fs request used-ring update failed: {error}"))
+				})?;
 				used = true;
 			}
 		}
@@ -918,9 +897,9 @@ mod tests {
 	};
 
 	use vm_memory::{Bytes, GuestAddress};
-	use crate::memory::GuestMemoryMmap;
 
 	use super::*;
+	use crate::memory::GuestMemoryMmap;
 
 	fn temp_dir(prefix: &str) -> PathBuf {
 		let nanos = SystemTime::now()
@@ -937,10 +916,7 @@ mod tests {
 	}
 
 	fn err(code: &str) -> (u8, Vec<u8>) {
-		(
-			proto::ERR,
-			json(&proto::ErrReply { code: code.to_owned(), msg: code.to_owned() }),
-		)
+		(proto::ERR, json(&proto::ErrReply { code: code.to_owned(), msg: code.to_owned() }))
 	}
 
 	fn tree_reply(request: proto::Request) -> (u8, Vec<u8>) {
@@ -948,23 +924,20 @@ mod tests {
 			proto::Request::Stat { tag, path } => {
 				assert_eq!(tag, "data");
 				let stat = match path.as_str() {
-					"" | "dir" => proto::StatReply {
-						kind: proto::Kind::Dir,
-						size: 0,
-						mtime: 100,
-						etag: None,
+					"" | "dir" => {
+						proto::StatReply { kind: proto::Kind::Dir, size: 0, mtime: 100, etag: None }
 					},
 					"a.txt" => proto::StatReply {
-						kind: proto::Kind::File,
-						size: 5,
+						kind:  proto::Kind::File,
+						size:  5,
 						mtime: 101,
-						etag: Some("\"a\"".to_owned()),
+						etag:  Some("\"a\"".to_owned()),
 					},
 					"dir/b.txt" => proto::StatReply {
-						kind: proto::Kind::File,
-						size: 6,
+						kind:  proto::Kind::File,
+						size:  6,
 						mtime: 102,
-						etag: Some("\"b\"".to_owned()),
+						etag:  Some("\"b\"".to_owned()),
 					},
 					_ => return err("not_found"),
 				};
@@ -975,34 +948,29 @@ mod tests {
 				let entries = match path.as_str() {
 					"" => vec![
 						proto::Entry {
-							name: "a.txt".to_owned(),
-							kind: proto::Kind::File,
-							size: 5,
+							name:  "a.txt".to_owned(),
+							kind:  proto::Kind::File,
+							size:  5,
 							mtime: 101,
 						},
 						proto::Entry {
-							name: "dir".to_owned(),
-							kind: proto::Kind::Dir,
-							size: 0,
+							name:  "dir".to_owned(),
+							kind:  proto::Kind::Dir,
+							size:  0,
 							mtime: 100,
 						},
 					],
 					"dir" => vec![proto::Entry {
-						name: "b.txt".to_owned(),
-						kind: proto::Kind::File,
-						size: 6,
+						name:  "b.txt".to_owned(),
+						kind:  proto::Kind::File,
+						size:  6,
 						mtime: 102,
 					}],
 					_ => return err("not_found"),
 				};
 				(proto::OK_JSON, json(&proto::ListReply { entries }))
 			},
-			proto::Request::Read {
-				tag,
-				path,
-				offset,
-				len,
-			} => {
+			proto::Request::Read { tag, path, offset, len } => {
 				assert_eq!(tag, "data");
 				let data = match path.as_str() {
 					"a.txt" => b"hello".as_slice(),
@@ -1044,13 +1012,8 @@ mod tests {
 
 	fn fuse_request(opcode: u32, nodeid: u64, payload: &[u8]) -> Vec<u8> {
 		let len = fs::IN_HEADER_SIZE + payload.len();
-		let header = fs::FuseInHeader {
-			len: len as u32,
-			opcode,
-			unique: 1,
-			nodeid,
-			..Default::default()
-		};
+		let header =
+			fs::FuseInHeader { len: len as u32, opcode, unique: 1, nodeid, ..Default::default() };
 		let mut request = Vec::with_capacity(len);
 		request.extend_from_slice(fs::struct_bytes(&header));
 		request.extend_from_slice(payload);
@@ -1070,11 +1033,8 @@ mod tests {
 		let body_len = (out.len as usize).saturating_sub(fs::OUT_HEADER_SIZE);
 		let mut body = vec![0; body_len];
 		if !body.is_empty() {
-			mem.read_slice(
-				&mut body,
-				GuestAddress(reply_at.0 + fs::OUT_HEADER_SIZE as u64),
-			)
-			.expect("reply body");
+			mem.read_slice(&mut body, GuestAddress(reply_at.0 + fs::OUT_HEADER_SIZE as u64))
+				.expect("reply body");
 		}
 		(out.error, body)
 	}
@@ -1094,28 +1054,18 @@ mod tests {
 		init.extend_from_slice(&7u32.to_le_bytes());
 		init.extend_from_slice(&44u32.to_le_bytes());
 		init.extend_from_slice(&0u32.to_le_bytes());
-		assert_eq!(
-			run_op(&mut device, &fuse_request(fs::FUSE_INIT, fs::FUSE_ROOT_ID, &init)).0,
-			0
-		);
+		assert_eq!(run_op(&mut device, &fuse_request(fs::FUSE_INIT, fs::FUSE_ROOT_ID, &init)).0, 0);
 
-		let (error, body) = run_op(
-			&mut device,
-			&fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"a.txt\0"),
-		);
+		let (error, body) =
+			run_op(&mut device, &fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"a.txt\0"));
 		assert_eq!(error, 0);
 		let entry: fs::FuseEntryOut = fs::read_struct(&body, 0).expect("lookup entry");
 		assert_eq!(entry.attr.mode, 0o100444);
 
 		let open = (libc::O_RDONLY as u32).to_le_bytes();
-		assert_eq!(
-			run_op(&mut device, &fuse_request(fs::FUSE_OPEN, entry.nodeid, &open)).0,
-			0
-		);
-		let (error, body) = run_op(
-			&mut device,
-			&fuse_request(fs::FUSE_READ, entry.nodeid, &read_request(0, 5)),
-		);
+		assert_eq!(run_op(&mut device, &fuse_request(fs::FUSE_OPEN, entry.nodeid, &open)).0, 0);
+		let (error, body) =
+			run_op(&mut device, &fuse_request(fs::FUSE_READ, entry.nodeid, &read_request(0, 5)));
 		assert_eq!(error, 0);
 		assert_eq!(body, b"hello");
 
@@ -1124,7 +1074,11 @@ mod tests {
 			&fuse_request(fs::FUSE_READDIR, fs::FUSE_ROOT_ID, &read_request(0, 4096)),
 		);
 		assert_eq!(error, 0);
-		assert!(body.windows(b"a.txt".len()).any(|window| window == b"a.txt"));
+		assert!(
+			body
+				.windows(b"a.txt".len())
+				.any(|window| window == b"a.txt")
+		);
 		assert!(body.windows(b"dir".len()).any(|window| window == b"dir"));
 
 		let (error, body) = run_op(
@@ -1133,12 +1087,14 @@ mod tests {
 		);
 		assert_eq!(error, 0);
 		assert!(body.len() >= std::mem::size_of::<fs::FuseEntryOut>());
-		assert!(body.windows(b"a.txt".len()).any(|window| window == b"a.txt"));
-
-		let (error, body) = run_op(
-			&mut device,
-			&fuse_request(fs::FUSE_GETATTR, fs::FUSE_ROOT_ID, &[]),
+		assert!(
+			body
+				.windows(b"a.txt".len())
+				.any(|window| window == b"a.txt")
 		);
+
+		let (error, body) =
+			run_op(&mut device, &fuse_request(fs::FUSE_GETATTR, fs::FUSE_ROOT_ID, &[]));
 		assert_eq!(error, 0);
 		let root: fs::FuseAttrOut = fs::read_struct(&body, 0).expect("root attr");
 		assert_eq!(root.attr.mode, 0o040555);
@@ -1156,28 +1112,16 @@ mod tests {
 	fn remote_fs_rejects_mutating_requests() {
 		let mut device = RemoteFs::new("data".to_owned(), PathBuf::from("/missing/proxy.sock"));
 		assert_eq!(
-			run_op(
-				&mut device,
-				&fuse_request(fs::FUSE_WRITE, fs::FUSE_ROOT_ID, &[])
-			)
-			.0,
+			run_op(&mut device, &fuse_request(fs::FUSE_WRITE, fs::FUSE_ROOT_ID, &[])).0,
 			-libc::EROFS
 		);
 		assert_eq!(
-			run_op(
-				&mut device,
-				&fuse_request(fs::FUSE_MKDIR, fs::FUSE_ROOT_ID, b"new\0")
-			)
-			.0,
+			run_op(&mut device, &fuse_request(fs::FUSE_MKDIR, fs::FUSE_ROOT_ID, b"new\0")).0,
 			-libc::EROFS
 		);
 		let write_open = (libc::O_WRONLY as u32).to_le_bytes();
 		assert_eq!(
-			run_op(
-				&mut device,
-				&fuse_request(fs::FUSE_OPEN, fs::FUSE_ROOT_ID, &write_open)
-			)
-			.0,
+			run_op(&mut device, &fuse_request(fs::FUSE_OPEN, fs::FUSE_ROOT_ID, &write_open)).0,
 			-libc::EROFS
 		);
 	}
@@ -1190,20 +1134,12 @@ mod tests {
 		let mut device = RemoteFs::new("data".to_owned(), sock);
 
 		assert_eq!(
-			run_op(
-				&mut device,
-				&fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"a.txt\0")
-			)
-			.0,
+			run_op(&mut device, &fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"a.txt\0")).0,
 			0
 		);
 		proxy.join().expect("proxy stopped after first request");
 		assert_eq!(
-			run_op(
-				&mut device,
-				&fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"dir\0")
-			)
-			.0,
+			run_op(&mut device, &fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"dir\0")).0,
 			-libc::EIO
 		);
 		drop(device);

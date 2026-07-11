@@ -60,9 +60,9 @@ use crate::{
 		block::Block,
 		console::OUTPUT_CAP,
 		fs::Fs,
-		remotefs::RemoteFs,
 		mmio::{MmioState, MmioTransport},
 		net::Net,
+		remotefs::RemoteFs,
 		run_worker,
 	},
 };
@@ -661,7 +661,9 @@ fn bind_control_socket(
 	match api_sock {
 		Some(sock) => control::bind(sock.clone(), owner.socket_owner, owner.launch_uid)
 			.map(Some)
-			.map_err(|error| err(format!("binding control socket {} failed: {error}", sock.display()))),
+			.map_err(|error| {
+				err(format!("binding control socket {} failed: {error}", sock.display()))
+			}),
 		None => Ok(None),
 	}
 }

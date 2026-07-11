@@ -217,7 +217,8 @@ pub struct MsixEntrySer {
 }
 
 /// Serializable virtio-fs inode table. Paths are relative to the host shared
-/// root for [`BackendHint::Fs`] and to the object prefix for [`BackendHint::RemoteFs`].
+/// root for [`BackendHint::Fs`] and to the object prefix for
+/// [`BackendHint::RemoteFs`].
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FsStateSer {
 	/// Node ID with its path relative to the backend's exported root.

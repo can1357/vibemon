@@ -170,7 +170,7 @@ pub struct ObjStat {
 pub struct S3Client {
 	http:       reqwest::Client,
 	cfg:        S3MountConfig,
-	list_cache: Mutex<HashMap<String, (Instant, Arc<Vec<ObjEntry>>) >>,
+	list_cache: Mutex<HashMap<String, (Instant, Arc<Vec<ObjEntry>>)>>,
 	chunks:     Mutex<ChunkLru>,
 }
 
@@ -222,7 +222,9 @@ impl ChunkLru {
 		}
 		self.clock = self.clock.wrapping_add(1);
 		self.bytes += data.len();
-		self.entries.insert(key, CachedChunk { data, last_used: self.clock });
+		self
+			.entries
+			.insert(key, CachedChunk { data, last_used: self.clock });
 	}
 }
 
@@ -258,7 +260,8 @@ impl S3Client {
 		self.list_page(&prefix, None, 1).await.map(|_| ())
 	}
 
-	/// Lists direct children of `dir`, caching the normalized result for five seconds.
+	/// Lists direct children of `dir`, caching the normalized result for five
+	/// seconds.
 	pub async fn list_dir(&self, dir: &str) -> std::result::Result<Arc<Vec<ObjEntry>>, S3Error> {
 		if !valid_relative_path(dir) {
 			return Err(S3Error::BadRequest);
@@ -273,7 +276,9 @@ impl S3Client {
 		let mut entries = BTreeMap::new();
 		let mut continuation = None;
 		loop {
-			let mut page = self.list_page(&prefix, continuation.as_deref(), 1000).await?;
+			let mut page = self
+				.list_page(&prefix, continuation.as_deref(), 1000)
+				.await?;
 			let truncated = page.is_truncated;
 			let next_continuation = page.next_continuation_token.take();
 			merge_listing(&mut entries, &prefix, page)?;
@@ -300,7 +305,8 @@ impl S3Client {
 		Ok(entries)
 	}
 
-	/// Resolves metadata from the parent listing instead of issuing a HEAD request.
+	/// Resolves metadata from the parent listing instead of issuing a HEAD
+	/// request.
 	pub async fn stat(&self, path: &str) -> std::result::Result<ObjStat, S3Error> {
 		if !valid_relative_path(path) {
 			return Err(S3Error::BadRequest);
@@ -308,22 +314,29 @@ impl S3Client {
 		if path.is_empty() {
 			return Ok(ObjStat { kind: ObjKind::Dir, size: 0, mtime: 0, etag: None });
 		}
-		let (parent, name) = path.rsplit_once('/').map_or(("", path), |(parent, name)| (parent, name));
+		let (parent, name) = path
+			.rsplit_once('/')
+			.map_or(("", path), |(parent, name)| (parent, name));
 		let entries = self.list_dir(parent).await?;
 		let entry = entries
 			.iter()
 			.find(|entry| entry.name == name)
 			.ok_or(S3Error::NotFound)?;
 		Ok(ObjStat {
-			kind: entry.kind,
-			size: entry.size,
+			kind:  entry.kind,
+			size:  entry.size,
 			mtime: entry.mtime,
-			etag: entry.etag.clone(),
+			etag:  entry.etag.clone(),
 		})
 	}
 
 	/// Reads up to `len` bytes using cached one-mebibyte ranged GETs.
-	pub async fn read(&self, path: &str, offset: u64, len: u32) -> std::result::Result<Bytes, S3Error> {
+	pub async fn read(
+		&self,
+		path: &str,
+		offset: u64,
+		len: u32,
+	) -> std::result::Result<Bytes, S3Error> {
 		if len as usize > CHUNK_SIZE {
 			return Err(S3Error::BadRequest);
 		}
@@ -399,7 +412,9 @@ impl S3Client {
 	) -> std::result::Result<Bytes, S3Error> {
 		let key = self.object_key(path)?;
 		let range = format!("bytes={start}-{end}");
-		let response = self.request(Method::GET, &key, &[], Some(&range), Some(etag)).await?;
+		let response = self
+			.request(Method::GET, &key, &[], Some(&range), Some(etag))
+			.await?;
 		if response.status() == StatusCode::PRECONDITION_FAILED {
 			return Err(S3Error::Stale);
 		}
@@ -518,10 +533,7 @@ impl S3Client {
 			let base = endpoint.trim_end_matches('/');
 			format!("{base}{canonical_uri}")
 		} else {
-			format!(
-				"https://{}.s3.{}.amazonaws.com{canonical_uri}",
-				self.cfg.bucket, self.cfg.region
-			)
+			format!("https://{}.s3.{}.amazonaws.com{canonical_uri}", self.cfg.bucket, self.cfg.region)
 		};
 		let url = if canonical_query.is_empty() {
 			url
@@ -546,20 +558,28 @@ impl S3Client {
 
 	fn list_prefix(&self, dir: &str) -> std::result::Result<String, S3Error> {
 		let key = self.object_key(dir)?;
-		Ok(if key.is_empty() { key } else { format!("{key}/") })
+		Ok(if key.is_empty() {
+			key
+		} else {
+			format!("{key}/")
+		})
 	}
 }
 
-/// Parses an `s3://bucket[/prefix]` mount URI into bucket and normalized prefix.
+/// Parses an `s3://bucket[/prefix]` mount URI into bucket and normalized
+/// prefix.
 ///
 /// # Errors
 ///
-/// Returns [`EngineError::invalid`] when the URI lacks an `s3://` scheme or a bucket.
+/// Returns [`EngineError::invalid`] when the URI lacks an `s3://` scheme or a
+/// bucket.
 pub fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
 	let value = uri
 		.strip_prefix("s3://")
 		.ok_or_else(|| EngineError::invalid(format!("S3 URI must start with s3:// (got {uri:?})")))?;
-	let (bucket, prefix) = value.split_once('/').map_or((value, ""), |(bucket, prefix)| (bucket, prefix));
+	let (bucket, prefix) = value
+		.split_once('/')
+		.map_or((value, ""), |(bucket, prefix)| (bucket, prefix));
 	if bucket.is_empty() {
 		return Err(EngineError::invalid("S3 URI must include a bucket"));
 	}
@@ -586,7 +606,9 @@ fn endpoint_url(endpoint: &str) -> std::result::Result<Url, S3Error> {
 
 fn request_host(url: &Url) -> std::result::Result<String, S3Error> {
 	let host = url.host_str().ok_or(S3Error::BadRequest)?;
-	Ok(url.port().map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))
+	Ok(url
+		.port()
+		.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))
 }
 
 fn response_error(status: StatusCode) -> S3Error {
@@ -607,21 +629,35 @@ fn valid_relative_path(path: &str) -> bool {
 
 fn direct_file_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 	let name = key.strip_prefix(prefix)?;
-	if valid_segment(name) { Some(name) } else { None }
+	if valid_segment(name) {
+		Some(name)
+	} else {
+		None
+	}
 }
 
 fn direct_dir_name<'a>(prefix_value: &'a str, prefix: &str) -> Option<&'a str> {
 	let name = prefix_value.strip_prefix(prefix)?.strip_suffix('/')?;
-	if valid_segment(name) { Some(name) } else { None }
+	if valid_segment(name) {
+		Some(name)
+	} else {
+		None
+	}
 }
 
 fn valid_segment(segment: &str) -> bool {
-	!segment.is_empty() && segment != "." && segment != ".." && !segment.contains('/') && !segment.contains('\0')
+	!segment.is_empty()
+		&& segment != "."
+		&& segment != ".."
+		&& !segment.contains('/')
+		&& !segment.contains('\0')
 }
 
 fn parse_mtime(value: &str) -> std::result::Result<u64, S3Error> {
 	let timestamp = DateTime::parse_from_rfc3339(value)
-		.map_err(|error| S3Error::Io(format!("invalid S3 LastModified timestamp {value:?}: {error}")))?
+		.map_err(|error| {
+			S3Error::Io(format!("invalid S3 LastModified timestamp {value:?}: {error}"))
+		})?
 		.timestamp();
 	u64::try_from(timestamp)
 		.map_err(|_| S3Error::Io(format!("S3 LastModified timestamp predates Unix epoch: {value:?}")))
@@ -636,34 +672,31 @@ fn merge_listing(
 		let Some(name) = direct_file_name(&object.key, prefix) else {
 			continue;
 		};
-		if entries.get(name).is_some_and(|entry| entry.kind == ObjKind::Dir) {
+		if entries
+			.get(name)
+			.is_some_and(|entry| entry.kind == ObjKind::Dir)
+		{
 			continue;
 		}
-		entries.insert(
-			name.to_owned(),
-			ObjEntry {
-				name: name.to_owned(),
-				kind: ObjKind::File,
-				size: object.size,
-				mtime: parse_mtime(&object.last_modified)?,
-				etag: object.etag,
-			},
-		);
+		entries.insert(name.to_owned(), ObjEntry {
+			name:  name.to_owned(),
+			kind:  ObjKind::File,
+			size:  object.size,
+			mtime: parse_mtime(&object.last_modified)?,
+			etag:  object.etag,
+		});
 	}
 	for prefix_value in page.common_prefixes {
 		let Some(name) = direct_dir_name(&prefix_value.prefix, prefix) else {
 			continue;
 		};
-		entries.insert(
-			name.to_owned(),
-			ObjEntry {
-				name: name.to_owned(),
-				kind: ObjKind::Dir,
-				size: 0,
-				mtime: 0,
-				etag: None,
-			},
-		);
+		entries.insert(name.to_owned(), ObjEntry {
+			name:  name.to_owned(),
+			kind:  ObjKind::Dir,
+			size:  0,
+			mtime: 0,
+			etag:  None,
+		});
 	}
 	Ok(())
 }
@@ -682,7 +715,11 @@ fn canonical_query(query: &[(String, String)]) -> String {
 }
 
 fn encode_path(path: &str) -> String {
-	path.split('/').map(encode_component).collect::<Vec<_>>().join("/")
+	path
+		.split('/')
+		.map(encode_component)
+		.collect::<Vec<_>>()
+		.join("/")
 }
 
 fn encode_component(value: &str) -> String {
@@ -760,7 +797,8 @@ mod sigv4 {
 			.collect::<Vec<_>>()
 			.join(";");
 		let canonical_request = format!(
-			"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+			"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\\
+			 n{payload_hash}"
 		);
 		let date = timestamp.format("%Y%m%d").to_string();
 		let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
@@ -775,7 +813,8 @@ mod sigv4 {
 		let signing_key = hmac(&service_key, "aws4_request");
 		let signature = hex::encode(hmac(&signing_key, &string_to_sign));
 		format!(
-			"AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+			"AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, \
+			 Signature={signature}",
 			credentials.access_key
 		)
 	}
@@ -814,8 +853,8 @@ mod tests {
 	#[test]
 	fn signs_published_s3_get_object_vector() {
 		let credentials = S3Credentials {
-			access_key: "AKIAIOSFODNN7EXAMPLE".to_owned(),
-			secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
+			access_key:    "AKIAIOSFODNN7EXAMPLE".to_owned(),
+			secret_key:    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
 			session_token: None,
 		};
 		let headers = vec![
@@ -838,9 +877,11 @@ mod tests {
 			"us-east-1",
 			&credentials,
 		);
-		assert!(authorization.ends_with(
-			"Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
-		));
+		assert!(
+			authorization.ends_with(
+				"Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+			)
+		);
 	}
 
 	#[test]
@@ -866,8 +907,8 @@ mod tests {
 	#[test]
 	fn credential_debug_output_is_redacted() {
 		let credentials = S3Credentials {
-			access_key: "access-secret".to_owned(),
-			secret_key: "secret-secret".to_owned(),
+			access_key:    "access-secret".to_owned(),
+			secret_key:    "secret-secret".to_owned(),
 			session_token: Some("session-secret".to_owned()),
 		};
 		let debug = format!("{credentials:?}");

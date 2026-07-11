@@ -236,7 +236,9 @@ struct FakeS3 {
 impl FakeS3 {
 	fn start() -> Self {
 		let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake S3");
-		listener.set_nonblocking(true).expect("make fake S3 listener nonblocking");
+		listener
+			.set_nonblocking(true)
+			.expect("make fake S3 listener nonblocking");
 		let endpoint = format!("http://{}", listener.local_addr().expect("fake S3 address"));
 		let range_reads = Arc::new(AtomicUsize::new(0));
 		let stop = Arc::new(AtomicBool::new(false));
@@ -293,7 +295,8 @@ fn serve_s3_fixture(mut stream: TcpStream, range_reads: &AtomicUsize) {
 	let method = parts.next().expect("fake S3 method");
 	let target = parts.next().expect("fake S3 target");
 	let ranged = lines.any(|line| {
-		line.split_once(':')
+		line
+			.split_once(':')
 			.is_some_and(|(name, _)| name.eq_ignore_ascii_case("range"))
 	});
 	if method == "GET" && target.starts_with("/testbucket/hello.txt") {
@@ -312,11 +315,11 @@ fn serve_s3_fixture(mut stream: TcpStream, range_reads: &AtomicUsize) {
 }
 
 fn write_s3_fixture_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
-	let head = format!(
-		"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-		body.len()
-	);
-	stream.write_all(head.as_bytes()).expect("write fake S3 headers");
+	let head =
+		format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+	stream
+		.write_all(head.as_bytes())
+		.expect("write fake S3 headers");
 	stream.write_all(body).expect("write fake S3 body");
 }
 
@@ -685,11 +688,11 @@ fn s3_mount_lazy_read_and_volatile_write() {
 	assert_eq!(stdout, "hello s3\n");
 	assert!(fixture.range_reads() > 0, "guest read did not issue a ranged S3 request");
 
-	let (exit, ..) = exec(
-		&server,
-		&id,
-		&["/bin/sh", "-c", "printf volatile > /mnt/s3/guest.txt && test -f /mnt/s3/guest.txt"],
-	);
+	let (exit, ..) = exec(&server, &id, &[
+		"/bin/sh",
+		"-c",
+		"printf volatile > /mnt/s3/guest.txt && test -f /mnt/s3/guest.txt",
+	]);
 	assert_eq!(exit, 0, "guest overlay write failed");
 	remove_sandbox(&server, &id);
 }

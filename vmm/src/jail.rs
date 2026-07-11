@@ -346,15 +346,12 @@ fn bind_remote_socket(chroot: &Path, sock: &Path) -> Result<()> {
 		Ok(()) => Ok(()),
 		Err(sock_error) => {
 			let parent = sock.parent().ok_or_else(|| {
-				err(format!(
-					"remote filesystem socket {} must have a parent directory",
-					sock.display()
-				))
+				err(format!("remote filesystem socket {} must have a parent directory", sock.display()))
 			})?;
 			bind_path(chroot, parent, false).map_err(|parent_error| {
 				err(format!(
-					"binding remote filesystem socket {} failed ({sock_error}); \
-					 parent-directory fallback failed ({parent_error})",
+					"binding remote filesystem socket {} failed ({sock_error}); parent-directory \
+					 fallback failed ({parent_error})",
 					sock.display()
 				))
 			})

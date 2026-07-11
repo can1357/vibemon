@@ -2928,6 +2928,23 @@ impl Store {
 			.ok_or_else(|| EngineError::not_found("artifact not found"))
 	}
 
+	/// Return locally available artifacts that can reduce function worker
+	/// startup.
+	pub fn placement_artifact_digests(&self, limit: u32) -> Result<Vec<String>> {
+		let connection = self.connection.lock().map_err(lock_error)?;
+		let mut statement = connection
+			.prepare(
+				"SELECT DISTINCT a.digest FROM artifacts a JOIN artifact_refs r ON r.digest=a.digest \
+				 WHERE r.owner_kind IN ('revision','function_snapshot') ORDER BY a.digest LIMIT ?",
+			)
+			.map_err(sql_error)?;
+		statement
+			.query_map([i64::from(limit.clamp(1, 4096))], |row| row.get(0))
+			.map_err(sql_error)?
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.map_err(sql_error)
+	}
+
 	/// Return expired artifacts with no durable metadata references.
 	pub fn unreferenced_expired_artifacts(
 		&self,
@@ -4727,6 +4744,20 @@ mod tests {
 		record_package(&store);
 		let revision = store.register_function(&spec(), "register-1", 10).unwrap();
 		(temp, home, store, revision)
+	}
+
+	#[test]
+	fn placement_inventory_excludes_call_payloads() {
+		let (_temp, _home, store, _revision) = setup();
+		let result_digest = hex::encode([8_u8; 32]);
+		store
+			.record_artifact(&result_digest, 1, None, "/result", 2, None)
+			.unwrap();
+		{
+			let connection = store.connection.lock().unwrap();
+			add_artifact_ref(&connection, &result_digest, "result", "call:0").unwrap();
+		}
+		assert_eq!(store.placement_artifact_digests(100).unwrap(), vec![hex::encode([7_u8; 32])]);
 	}
 
 	#[test]
