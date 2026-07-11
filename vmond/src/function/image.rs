@@ -55,6 +55,7 @@ trait Backend {
 	fn resolve_oci(&self, reference: &str, arch: &str) -> Result<ResolvedOciImage>;
 	fn build(
 		&self,
+		builds: &Path,
 		dockerfile: &Path,
 		context: &Path,
 		tag: &str,
@@ -72,18 +73,21 @@ impl Backend for SystemBackend {
 
 	fn build(
 		&self,
+		builds: &Path,
 		dockerfile: &Path,
 		context: &Path,
 		tag: &str,
 		arch: &str,
 	) -> Result<ResolvedOciImage> {
 		let reference =
-			image::build::build_image(dockerfile, context, tag, Some(arch)).map_err(|error| {
-				EngineError::engine(format!(
-					"function image build failed; verify pinned apt/uv packages and build commands: \
-					 {error}"
-				))
-			})?;
+			image::build::build_image_in(builds, dockerfile, context, tag, Some(arch)).map_err(
+				|error| {
+					EngineError::engine(format!(
+						"function image build failed; verify pinned apt/uv packages and build \
+						 commands: {error}"
+					))
+				},
+			)?;
 		image::resolve_oci_reference(&reference, Some(arch))
 	}
 
@@ -237,7 +241,7 @@ fn resolve_source(
 			ensure_confined_regular(&root, &dockerfile, "Dockerfile")?;
 			let plan = prepare_build_context(home, artifacts, spec, Some((&root, &dockerfile)), None)?;
 			let tag = format!("vmon-function:{}", plan.digest);
-			let built = build_cached(backend, &plan, &tag, arch)?;
+			let built = build_cached(backend, home, &plan, &tag, arch)?;
 			Ok(SourceResolution {
 				launch:   Launch::Image(built.reference),
 				digest:   built.digest,
@@ -290,7 +294,7 @@ fn resolve_layered(
 	}
 	let plan = prepare_build_context(home, artifacts, spec, None, Some(&base.reference))?;
 	let tag = format!("vmon-function:{}", plan.digest);
-	let built = build_cached(backend, &plan, &tag, arch)?;
+	let built = build_cached(backend, home, &plan, &tag, arch)?;
 	Ok(SourceResolution {
 		launch:   Launch::Image(built.reference),
 		digest:   built.digest,
@@ -339,6 +343,7 @@ impl Drop for CacheLock {
 
 fn build_cached(
 	backend: &impl Backend,
+	home: &Home,
 	plan: &BuildPlan,
 	tag: &str,
 	arch: &str,
@@ -364,7 +369,13 @@ fn build_cached(
 			platform:  cached.platform,
 		});
 	}
-	let built = backend.build(&plan.dockerfile, &plan.context, tag, arch)?;
+	let built = backend.build(
+		&home.root().join("builds"),
+		&plan.dockerfile,
+		&plan.context,
+		tag,
+		arch,
+	)?;
 	validate_sha256_hex(&built.digest, "built image digest")?;
 	if built.platform != format!("linux/{arch}") {
 		return Err(EngineError::unsupported(format!(
@@ -1171,6 +1182,8 @@ fn tar_octal(field: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use parking_lot::Mutex;
+
 
 	use super::*;
 
@@ -1178,10 +1191,16 @@ mod tests {
 		digest: String,
 		arch:   &'static str,
 		builds: AtomicUsize,
+		build_roots: Mutex<Vec<PathBuf>>,
 	}
 	impl FakeBackend {
 		fn new(byte: u8) -> Self {
-			Self { digest: hex::encode([byte; 32]), arch: "amd64", builds: AtomicUsize::new(0) }
+			Self {
+				digest:      hex::encode([byte; 32]),
+				arch:        "amd64",
+				builds:      AtomicUsize::new(0),
+				build_roots: Mutex::new(Vec::new()),
+			}
 		}
 	}
 	impl Backend for FakeBackend {
@@ -1195,11 +1214,13 @@ mod tests {
 
 		fn build(
 			&self,
+			builds: &Path,
 			_dockerfile: &Path,
 			_context: &Path,
 			_tag: &str,
 			_arch: &str,
 		) -> Result<ResolvedOciImage> {
+			self.build_roots.lock().push(builds.to_path_buf());
 			self.builds.fetch_add(1, Ordering::SeqCst);
 			Ok(ResolvedOciImage {
 				reference: format!("build@sha256:{}", self.digest),
@@ -1224,8 +1245,12 @@ mod tests {
 	fn sdk_defaults_use_host_architecture_and_accept_major_minor_python() {
 		let (_temp, home) = home();
 		let arch = architecture_name(pb::CpuArchitecture::Unspecified).unwrap();
-		let backend =
-			FakeBackend { digest: hex::encode([7u8; 32]), arch, builds: AtomicUsize::new(0) };
+		let backend = FakeBackend {
+			digest:      hex::encode([7u8; 32]),
+			arch,
+			builds:      AtomicUsize::new(0),
+			build_roots: Mutex::new(Vec::new()),
+		};
 		let spec = pb::ImageSpec {
 			source: Some(pb::image_spec::Source::Python(pb::PythonImageSource {
 				python_version: "3.14".into(),
@@ -1386,6 +1411,7 @@ mod tests {
 			.count();
 		assert_eq!(contexts, 1);
 		assert_eq!(backend.builds.load(Ordering::SeqCst), 1);
+		assert_eq!(backend.build_roots.lock().as_slice(), &[home.root().join("builds")]);
 		let context = fs::read_dir(home.images_dir().join("function-builds"))
 			.unwrap()
 			.next()
@@ -1503,9 +1529,10 @@ mod tests {
 		let realized = realize_with(&FakeBackend::new(5), &home, &template, architecture).unwrap();
 		assert_eq!(realized.template.as_deref(), Some(format!("warm@{revision}").as_str()));
 		let wrong = FakeBackend {
-			digest: hex::encode([1u8; 32]),
-			arch:   "arm64",
-			builds: AtomicUsize::new(0),
+			digest:      hex::encode([1u8; 32]),
+			arch:        "arm64",
+			builds:      AtomicUsize::new(0),
+			build_roots: Mutex::new(Vec::new()),
 		};
 		assert!(
 			realize_with(&wrong, &home, &registry(), pb::CpuArchitecture::Amd64)

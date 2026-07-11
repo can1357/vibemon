@@ -42,13 +42,23 @@ pub fn build_image(
 	tag: &str,
 	arch: Option<&str>,
 ) -> Result<String> {
+	build_image_in(&builds_dir(), dockerfile, context, tag, arch)
+}
+
+/// Build a Dockerfile into an explicitly owned content-addressed OCI directory.
+pub(crate) fn build_image_in(
+	builds: &Path,
+	dockerfile: &Path,
+	context: &Path,
+	tag: &str,
+	arch: Option<&str>,
+) -> Result<String> {
 	if tag.trim().is_empty() {
 		return Err(EngineError::invalid("image tag must not be empty"));
 	}
 	let backend = detect_backend()?;
-	let builds = builds_dir();
-	fs::create_dir_all(&builds)?;
-	let tmp = TempDir::new_in(&builds, ".tmp-")?;
+	fs::create_dir_all(builds)?;
+	let tmp = TempDir::new_in(builds, ".tmp-")?;
 	let layout = tmp.path().join("layout");
 	match backend {
 		Backend::Buildah(binary) => {
