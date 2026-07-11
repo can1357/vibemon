@@ -14,12 +14,32 @@ permissions:
   contents: read
 
 jobs:
-  bench-unavailable:
-    name: Benchmark driver unavailable
+  function-workers:
+    name: Function worker startup benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VMON_TAP: vmon0
+      VMON_HOST_IP: 192.168.249.1
+      VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
     steps:
-      # The former p50 benchmark driver was removed during the Rust-server
-      # cutover. Keep this workflow parseable, but do not run a fake benchmark
-      # until a Rust benchmark driver lands.
-      - name: Skip removed benchmark driver
-        run: echo "::notice::p50 benchmark driver removed; no Rust replacement exists yet."
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare KVM host
+        uses: ./.github/actions/kvm-host
+
+      - name: Run function worker benchmark
+        run: |
+          mkdir -p benchmark-artifacts
+          VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/function_benchmark.py \
+            --iterations '${{ github.event.inputs.iters || '10' }}' \
+            --output benchmark-artifacts/function-workers.json
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: function-worker-benchmark-${{ github.run_id }}
+          path: benchmark-artifacts/
+          if-no-files-found: error

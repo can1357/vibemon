@@ -591,14 +591,26 @@ primitives; `python/README.md` has the full SDK reference.
 
 ### Remote functions
 
-`@vmon.function(...)` wraps a source-defined Python function with
-`RemoteFunction.remote()`, `.map()`, and `.starmap()`. Calls run in a
-`python:3.14-slim` sandbox by default; the function source is shipped with the
-module-level imports, helpers, and literal constants it references. Arguments and
-return values must be JSON-serializable, and the function must not close over
-local variables. Guest `print()` output is forwarded back to the host. `.map()`
-and `.starmap()` run work items in parallel across a temporary sandbox pool and
-return ordered results by default.
+`@vmon.function(...)` registers an immutable, content-addressed Python revision
+and returns a typed `RemoteFunction`. `vmond` owns the durable call record,
+input queue, worker pool, retries, cancellation, results, and logs. The Python
+process may exit after `.spawn()`; another process can reconstruct the call with
+`FunctionCall.from_id()`.
+
+Normal package mode uploads the defining module or package tree and imports the
+callable by module and qualified name. Use explicit include/exclude patterns for
+local source files. Interactive functions and closures require trusted
+`package_mode="cloudpickle"` execution and an exact Python/cloudpickle ABI
+match.
+
+Portable arguments and results use I-JSON or CBOR. Cloudpickle is available
+only when `SerializerPolicy(..., allow_trusted_python=True)` is set; do not use
+it as a cross-language or untrusted boundary. Large values spill into the
+content-addressed artifact store instead of remaining in a worker filesystem.
+
+Calls have **at-least-once** execution semantics. A worker can fail after an
+external side effect but before its result is committed, so retryable functions
+must use idempotency keys or otherwise make side effects safe to repeat.
 
 ```python
 import math
@@ -606,17 +618,23 @@ import vmon
 
 RF_CONST = 7
 
+
 def triple(n: int) -> int:
     return n * 3
 
-@vmon.function(block_network=True)
+
+@vmon.function(block_network=True, execution_timeout=120)
 def compute(x: int) -> dict[str, int]:
-    print(f"remote x={x}")
     return {"isqrt": math.isqrt(x), "tripled": triple(x), "const": RF_CONST}
 
-print(compute.remote(16))      # {'isqrt': 4, 'tripled': 48, 'const': 7}
-print(compute.map([1, 4, 9]))  # ordered results from parallel sandboxes
-compute.terminate()            # optional: stop the cached .remote() sandbox
+
+print(compute.remote(16))  # {'isqrt': 4, 'tripled': 48, 'const': 7}
+print(list(compute.map([1, 4, 9], max_in_flight=2)))
+
+call = compute.spawn(25)
+saved_id = call.id
+same_call = vmon.FunctionCall.from_id(saved_id)
+print(same_call.get(timeout=120))
 ```
 
 ---

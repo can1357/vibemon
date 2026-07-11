@@ -236,6 +236,8 @@ The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine,
 
 The Python, TypeScript, and Go packages are thin clients for the Rust API. Each exposes the same object hierarchy: a root client, resource namespaces (`sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh`), and sandbox-bound process, file, and port objects. They do not ship a CLI, daemon, server, web bundle, guest-agent bundle, or VMM implementation.
 
+SDK resource operations use the generated `vmon.v1` gRPC services. Browser and TypeScript clients carry the same protobuf calls over the server's `/grpc` WebSocket bridge; only health, Prometheus metrics, and sandbox port proxying remain HTTP. Public responses are exported model types, and malformed response envelopes raise each SDK's `ProtocolError`.
+
 All three SDKs accept the network forms below. Python and Go additionally support the local UDS form; browser builds of the TypeScript SDK are deliberately network-only.
 
 | DSN | Meaning |
@@ -277,7 +279,7 @@ Named volumes persist outside snapshots and are protected by the Rust server's s
 
 Exposed ports are available through each sandbox's `tunnels` and `ports` APIs. Runtime deadlines can be extended through the bound sandbox object; polling reports the entry-process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for termination.
 
-Remote functions remain client-side packaging helpers layered over sandbox create, file-write, exec, and terminate. Python exposes source-aware `@vmon.function` callables (plus stateful `@vmon.cls` classes) running against a persistent in-guest session with spawn handles, streaming generators, lazy maps, and retries; TypeScript exposes `client.remoteFunction(fn)` plus `remoteFunctionFromSource(...)`; Go exposes typed `vmon.NewRemoteFunction[Result](...)` over explicit JavaScript module source, and native Go dispatch via `vmon.Register`/`vmon.Takeover()` self-binary re-exec. TypeScript and Go enforce JSON-serializable arguments/results; Python auto-upgrades to stdlib-pickle for richer types. Every SDK forwards guest stdout, preserves structured remote errors, reuses one warm sandbox for direct calls, and uses bounded ephemeral workers for maps.
+Durable functions are server-native calls recorded before execution, with stable call IDs, resumable events/results, server-owned retries, and at-least-once attempt semantics. Python packages source-aware `@vmon.function` definitions and applications through `vmon.App`; TypeScript resolves pinned deployments through `client.functions.fromName()` and `client.apps.fromName()`; Go uses `vmon.LookupFunction` and reconstructs calls with `vmon.FunctionCallFromID`. Portable inputs and results use checksummed JSON or CBOR envelopes, while Python additionally supports explicitly trusted Python serialization.
 
 The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for its live API smoke. The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`; run `just sdk-go` for its gRPC, HTTP, and WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
 
