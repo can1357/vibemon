@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import re
-
 from dataclasses import dataclass
-
 
 _NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
 

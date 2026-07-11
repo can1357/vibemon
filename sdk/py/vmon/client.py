@@ -30,9 +30,9 @@ from .sandbox import (
     _clone_create_extra,
     _coerce_cmd,
     _drop_none,
+    _s3_mount_wire,
     _secret_wire,
     _volume_wire,
-    _s3_mount_wire,
 )
 from .secret import Secret
 from .v1 import api_pb2
