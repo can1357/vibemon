@@ -176,9 +176,15 @@ pub trait HeartbeatView {
 }
 
 /// Reqwest-backed node-to-node client.
+///
+/// `client` carries the control-plane deadline (every JSON exchange must
+/// finish within it); `bulk` has only a connect timeout, because template
+/// archive pulls stream multi-GiB bodies whose duration scales with image
+/// size, not network health.
 #[derive(Clone)]
 pub struct PeerHttpClient {
 	client:          reqwest::Client,
+	bulk:            reqwest::Client,
 	token:           Arc<str>,
 	default_timeout: Duration,
 }
@@ -193,7 +199,11 @@ impl PeerHttpClient {
 			.timeout(default_timeout)
 			.build()
 			.map_err(|err| MeshError::invalid(format!("mesh HTTP client init failed: {err}")))?;
-		Ok(Self { client, token: Arc::from(token.into()), default_timeout })
+		let bulk = reqwest::Client::builder()
+			.connect_timeout(default_timeout)
+			.build()
+			.map_err(|err| MeshError::invalid(format!("mesh bulk client init failed: {err}")))?;
+		Ok(Self { client, bulk, token: Arc::from(token.into()), default_timeout })
 	}
 
 	pub fn with_client(
@@ -201,11 +211,17 @@ impl PeerHttpClient {
 		token: impl Into<String>,
 		default_timeout: Duration,
 	) -> Self {
-		Self { client, token: Arc::from(token.into()), default_timeout }
+		let bulk = client.clone();
+		Self { client, bulk, token: Arc::from(token.into()), default_timeout }
 	}
 
 	pub const fn client(&self) -> &reqwest::Client {
 		&self.client
+	}
+
+	/// Deadline-free client for streaming template archive pulls.
+	pub const fn bulk_client(&self) -> &reqwest::Client {
+		&self.bulk
 	}
 
 	pub fn token(&self) -> &str {

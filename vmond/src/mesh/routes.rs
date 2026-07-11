@@ -734,7 +734,12 @@ async fn mesh_migrate_precopy(
 	}
 	state
 		.transfer
-		.pull_template(state.transport.client(), source_url, digest, state.outbound_token.to_string())
+		.pull_template(
+			state.transport.bulk_client(),
+			source_url,
+			digest,
+			state.outbound_token.to_string(),
+		)
 		.await
 		.map_err(|err| {
 			MeshRouteError::coded(
@@ -787,7 +792,7 @@ async fn mesh_migrate_receive(
 	let installed = state
 		.transfer
 		.pull_template(
-			state.transport.client(),
+			state.transport.bulk_client(),
 			source_url,
 			digest.clone(),
 			state.outbound_token.to_string(),
@@ -913,7 +918,7 @@ async fn mesh_replica_receive(
 	let installed = state
 		.transfer
 		.pull_template(
-			state.transport.client(),
+			state.transport.bulk_client(),
 			source_url,
 			digest.clone(),
 			state.outbound_token.to_string(),
@@ -1300,7 +1305,7 @@ async fn local_create_view(
 				match state
 					.transfer
 					.pull_template_metadata(
-						state.transport.client(),
+						state.transport.bulk_client(),
 						peer_url.clone(),
 						digest.clone(),
 						state.outbound_token.to_string(),
@@ -1323,7 +1328,7 @@ async fn local_create_view(
 						if let Ok(installed) = state
 							.transfer
 							.pull_template(
-								state.transport.client(),
+								state.transport.bulk_client(),
 								peer_url,
 								digest,
 								state.outbound_token.to_string(),
