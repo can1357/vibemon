@@ -1,0 +1,12 @@
+[book]
+title = "Vibemon Documentation"
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/can1357/vibemon"
+site-url = "https://can1357.github.io/vibemon/"

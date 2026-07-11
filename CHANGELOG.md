@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added comprehensive documentation for Vibemon platform, CLI, and SDKs (Go, Python, TypeScript)
 - Added Python/TypeScript SDK support for durable function workers and stateful actors
 - Added `RemoteFunction` and `BatchCall` primitives for remote function life-cycle management
 - Added support for rich-type arguments, streaming generators, and lazy-map remote execution

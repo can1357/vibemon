@@ -40,3 +40,6 @@ sdk/py/build
 
 # Workstation-specific agent instructions
 AGENTS.local.md
+
+# Generated mdBook site
+docs/book/
