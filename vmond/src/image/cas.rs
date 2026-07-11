@@ -196,10 +196,15 @@ fn marker_bytes(path: &Path) -> Result<Vec<u8>> {
 	Ok(serde_json::to_vec(&stable)?)
 }
 
+/// A pullable directory holds the marker plus either a full `rootfs.img` or
+/// a live-migration block delta standing in for it.
 fn template_present(template_dir: &Path) -> bool {
 	template_dir.is_dir()
-		&& template_dir.join("rootfs.img").is_file()
 		&& template_dir.join(MARKER_NAME).is_file()
+		&& (template_dir.join("rootfs.img").is_file()
+			|| template_dir
+				.join(crate::engine::diskdelta::DISK_DELTA_FILE)
+				.is_file())
 }
 
 fn read_pointer_file(path: &Path) -> Result<CasPointer> {
@@ -295,6 +300,21 @@ mod tests {
 		fs::remove_file(tpl.join("rootfs.img"))?;
 		assert_eq!(lookup(&digest)?, None);
 		assert!(!pointer.exists());
+		Ok(())
+	}
+
+	#[test]
+	fn lookup_accepts_delta_checkpoint_without_rootfs() -> TestResult {
+		let tmp = tempfile::tempdir()?;
+		let home = tmp.path().join("home");
+		let _home = crate::home::test_home::set(&home);
+		let tpl = tmp.path().join("migrate-delta");
+		fs::create_dir(&tpl)?;
+		fs::write(tpl.join(MARKER_NAME), b"{}")?;
+		fs::write(tpl.join(crate::engine::diskdelta::DISK_DELTA_FILE), b"VMONDSK1")?;
+
+		let digest = index_template(&tpl, None)?;
+		assert_eq!(lookup(&digest)?, Some(tpl));
 		Ok(())
 	}
 

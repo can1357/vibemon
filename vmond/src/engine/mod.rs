@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod control;
+pub(crate) mod diskdelta;
 mod facade;
 pub mod spawn;
 
