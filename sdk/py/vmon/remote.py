@@ -57,9 +57,22 @@ def _client(client: Any | None) -> Any:
     return connect()
 
 
-def _call(client: Any, operation: Callable[[Any], Any], *, stream: bool = False) -> Any:
-    value = client.driver.call(operation, stream=stream)
+def _call(
+    client: Any,
+    operation: Callable[[Any], Any],
+    *,
+    stream: bool = False,
+    endpoint: str | None = None,
+) -> Any:
+    value = client.driver.call(operation, stream=stream, endpoint=endpoint)
     return value[0] if isinstance(value, tuple) and len(value) == 2 else value
+
+
+def _call_owner(
+    client: Any, operation: Callable[[Any], Any], *, endpoint: str | None = None
+) -> tuple[Any, str | None]:
+    value = client.driver.call(operation, endpoint=endpoint)
+    return value if isinstance(value, tuple) and len(value) == 2 else (value, endpoint)
 def _compose_function_options(
     options: FunctionOptions | None = None,
     *,
@@ -192,6 +205,15 @@ def _raise(error: pb.CallError) -> None:
     raise exc
 
 
+def _invocation(args: Iterable[Any], kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Encode the versioned Python-only callable invocation ABI."""
+    return {
+        "__vmon_python_call__": 1,
+        "args": list(args),
+        "kwargs": dict(kwargs),
+    }
+
+
 def _result_value(client: Any, result: pb.CallResult, *, trusted: bool) -> Any:
     if result.WhichOneof("outcome") == "error": _raise(result.error)
     envelope = result.value
@@ -220,7 +242,6 @@ def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.Artifa
     except APIError as exc:
         if exc.code != "not_found" and exc.status != 404:
             raise
-
     def frames() -> Iterator[pb.PutArtifactRequest]:
         yield pb.PutArtifactRequest(
             header=pb.PutArtifactHeader(
@@ -231,9 +252,43 @@ def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.Artifa
         )
         for offset in range(0, len(data), 256 * 1024):
             yield pb.PutArtifactRequest(data=data[offset : offset + 256 * 1024])
-
     record = _call(client, lambda stubs: stubs.artifacts.Put(frames()))
     return record.ref
+
+
+def _arguments(
+    client: Any,
+    args: Iterable[Any],
+    kwargs: Mapping[str, Any],
+    *,
+    codec: ValueCodec,
+    trusted: bool,
+    compression: Any,
+) -> pb.InvocationArguments:
+    message = pb.InvocationArguments()
+    for value in args:
+        envelope, artifact = _encode_input(
+            value, codec, trusted=trusted, compression=compression
+        )
+        if artifact is not None:
+            ref = _upload(
+                client, artifact, envelope.artifact.digest.value.hex(),
+                "application/vnd.vmon.value",
+            )
+            envelope.artifact.CopyFrom(ref)
+        message.positional.append(envelope)
+    for name, value in kwargs.items():
+        envelope, artifact = _encode_input(
+            value, codec, trusted=trusted, compression=compression
+        )
+        if artifact is not None:
+            ref = _upload(
+                client, artifact, envelope.artifact.digest.value.hex(),
+                "application/vnd.vmon.value",
+            )
+            envelope.artifact.CopyFrom(ref)
+        message.named[name].CopyFrom(envelope)
+    return message
 
 
 async def _async_result_value(
@@ -287,22 +342,69 @@ async def _async_upload(
         frames(), metadata=metadata, timeout=deadline
     )
     return record.ref
+async def _async_arguments(
+    stubs: Any,
+    metadata: Any,
+    deadline: float,
+    args: Iterable[Any],
+    kwargs: Mapping[str, Any],
+    *,
+    codec: ValueCodec,
+    trusted: bool,
+    compression: Any,
+) -> pb.InvocationArguments:
+    message = pb.InvocationArguments()
+    for name, value in [
+        *((None, value) for value in args),
+        *((key, value) for key, value in kwargs.items()),
+    ]:
+        envelope, artifact = _encode_input(
+            value, codec, trusted=trusted, compression=compression
+        )
+        if artifact is not None:
+            ref = await _async_upload(
+                stubs, metadata, deadline, artifact,
+                envelope.artifact.digest.value.hex(),
+                "application/vnd.vmon.value",
+            )
+            envelope.artifact.CopyFrom(ref)
+        if name is None:
+            message.positional.append(envelope)
+        else:
+            message.named[name].CopyFrom(envelope)
+    return message
+
+
 
 
 
 
 class FunctionCall(Generic[R]):
     """A durable unary or generator call handle."""
-    def __init__(self, call_id: str, client: Any, *, trusted: bool = False, generator: bool = False) -> None:
-        self.call_id, self._client, self._trusted, self._generator = call_id, client, trusted, generator
-
+    def __init__(
+        self,
+        call_id: str,
+        client: Any,
+        *,
+        trusted: bool = False,
+        generator: bool = False,
+        endpoint: str | None = None,
+    ) -> None:
+        self.call_id = call_id
+        self._client = client
+        self._trusted = trusted
+        self._generator = generator
+        self._endpoint = endpoint
     @classmethod
     def from_id(cls, call_id: str, *, client: Any | None = None, trusted: bool = False) -> "FunctionCall[Any]":
-        if not call_id: raise ValueError("call_id must be non-empty")
-        return cls(call_id, _client(client), trusted=trusted)
-
-    @property
-    def id(self) -> str: return self.call_id
+        if not call_id:
+            raise ValueError("call_id must be non-empty")
+        bound_client = _client(client)
+        record, endpoint = _call_owner(
+            bound_client,
+            lambda stubs: stubs.calls.Get(pb.CallRef(call_id=call_id)),
+        )
+        return cls(call_id, bound_client, trusted=trusted, endpoint=endpoint)
     @property
     def aio(self) -> "_AsyncCall[R]":
         """Return the native asynchronous facade for this durable call."""
@@ -312,12 +414,27 @@ class FunctionCall(Generic[R]):
     def done(self) -> bool:
         """Return whether the durable call has reached a terminal state."""
         return self.status() in _TERMINAL
-    def get_record(self) -> pb.CallRecord: return _call(self._client, lambda s: s.calls.Get(pb.CallRef(call_id=self.call_id)))
+    def get_record(self) -> pb.CallRecord:
+        return _call(
+            self._client,
+            lambda stubs: stubs.calls.Get(pb.CallRef(call_id=self.call_id)),
+            endpoint=self._endpoint,
+        )
     def stats(self) -> pb.CallStats: return self.get_record().stats
     def graph(self) -> pb.CallGraph: return self.get_record().graph
 
     def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
-        return _call(self._client, lambda s: s.calls.Cancel(pb.CancelCallRequest(call=pb.CallRef(call_id=self.call_id), reason=reason, request_id=str(uuid.uuid4()))))
+        return _call(
+            self._client,
+            lambda stubs: stubs.calls.Cancel(
+                pb.CancelCallRequest(
+                    call=pb.CallRef(call_id=self.call_id),
+                    reason=reason,
+                    request_id=str(uuid.uuid4()),
+                )
+            ),
+            endpoint=self._endpoint,
+        )
 
     def events(self, *, after_sequence: int = 0, follow: bool = True) -> Iterator[pb.CallEvent]:
         cursor = after_sequence
@@ -336,6 +453,7 @@ class FunctionCall(Generic[R]):
                         )
                     ),
                     stream=True,
+                    endpoint=self._endpoint,
                 )
                 failures = 0
                 for event in stream:
@@ -357,8 +475,8 @@ class FunctionCall(Generic[R]):
 
     def iter_yields(self, *, after_sequence: int = 0) -> Iterator[R]:
         for event in self.events(after_sequence=after_sequence):
-            if event.WhichOneof("payload") == "yield":
-                yield cast(R, _result_value(self._client, getattr(event, "yield"), trusted=self._trusted))
+            if event.WhichOneof("payload") == "yield_result":
+                yield cast(R, _result_value(self._client, event.yield_result, trusted=self._trusted))
 
     def get(self, timeout: float | None = None) -> R:
         """Wait locally up to ``timeout`` without changing server execution."""
@@ -442,29 +560,43 @@ class BatchCall(Generic[R]):
     ) -> Iterator[R]:
         pending: dict[int, Any] = {}
         next_index = 0
+        after_sequence = 0
         try:
-            for event in self._call.events():
-                if event.WhichOneof("payload") != "result":
-                    continue
-                item = event.result
-                try:
-                    value = _result_value(
-                        self._call._client, item, trusted=self._call._trusted
-                    )
-                except Exception as exc:
-                    if not return_exceptions:
-                        raise
-                    value = exc
-                if not order_outputs:
-                    yield value
-                    continue
-                input_index = item.input_index if item.input_id else item.index
-                pending[input_index] = value
-                while next_index in pending:
-                    yield pending.pop(next_index)
-                    next_index += 1
-            if self._feeder_errors:
-                raise self._feeder_errors[0]
+            while True:
+                page = _call(
+                    self._call._client,
+                    lambda stubs: stubs.calls.ListResults(
+                        pb.ListCallResultsRequest(
+                            cursor=pb.ResultCursor(
+                                call=pb.CallRef(call_id=self.id),
+                                after_sequence=after_sequence,
+                            ),
+                            page_size=128,
+                        )
+                    ),
+                )
+                for item in page.results:
+                    after_sequence = max(after_sequence, item.sequence)
+                    try:
+                        value = _result_value(
+                            self._call._client, item, trusted=self._call._trusted
+                        )
+                    except Exception as exc:
+                        if not return_exceptions:
+                            raise
+                        value = exc
+                    if not order_outputs:
+                        yield value
+                        continue
+                    pending[item.input_index] = value
+                    while next_index in pending:
+                        yield pending.pop(next_index)
+                        next_index += 1
+                if self._feeder_errors:
+                    raise self._feeder_errors[0]
+                if page.end and self.done():
+                    return
+                time.sleep(0.02)
         except GeneratorExit:
             self.cancel("batch result consumer closed")
             raise
@@ -580,30 +712,23 @@ class _AsyncRemoteFunction(Generic[P, R]):
         stubs, metadata, deadline = endpoint
         revision = await function._resolve_async(stubs, metadata, deadline)
         trusted = function.options.serializer.allow_trusted_python
-        envelope, artifact = _encode_input(
-            {"args": args, "kwargs": kwargs},
-            function.options.serializer.input_serializer,
+        arguments = await _async_arguments(
+            stubs,
+            metadata,
+            deadline,
+            args,
+            kwargs,
+            codec=function.options.serializer.input_serializer,
             trusted=trusted,
             compression=function.options.serializer.compression,
         )
-        if artifact is not None:
-            ref = await _async_upload(
-                stubs,
-                metadata,
-                deadline,
-                artifact,
-                envelope.artifact.digest.value.hex(),
-                "application/vnd.vmon.value",
-            )
-            envelope.artifact.CopyFrom(ref)
-        stubs, metadata, deadline = endpoint
         record = await stubs.calls.Create(
             pb.CreateCallRequest(
                 type=pb.CALL_TYPE_GENERATOR
                 if function._is_generator
                 else pb.CALL_TYPE_UNARY,
                 target=pb.CallTarget(function=revision.ref),
-                inputs=[pb.CallInput(index=0, value=envelope)],
+                inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
                 inputs_closed=True,
                 request_id=str(uuid.uuid4()),
             ),
@@ -662,11 +787,11 @@ class _AsyncRemoteFunction(Generic[P, R]):
                 async for event in stream:
                     cursor = max(cursor, event.sequence)
                     kind = event.WhichOneof("payload")
-                    if kind == "yield":
+                    if kind == "yield_result":
                         yield await _async_result_value(
                             stubs,
                             metadata,
-                            getattr(event, "yield"),
+                            event.yield_result,
                             trusted=call._trusted,
                         )
                     elif kind == "error":
@@ -731,29 +856,30 @@ class _AsyncRemoteFunction(Generic[P, R]):
                 args = (item,)
                 if function._signature:
                     function._signature.bind(*args)
-                envelope, artifact = _encode_input(
-                    {"args": args, "kwargs": {}},
-                    function.options.serializer.input_serializer,
+                arguments = await _async_arguments(
+                    stubs,
+                    metadata,
+                    deadline,
+                    args,
+                    {},
+                    codec=function.options.serializer.input_serializer,
                     trusted=function.options.serializer.allow_trusted_python,
                     compression=function.options.serializer.compression,
                 )
-                if artifact is not None:
-                    ref = await _async_upload(
-                        stubs,
-                        metadata,
-                        deadline,
-                        artifact,
-                        envelope.artifact.digest.value.hex(),
-                        "application/vnd.vmon.value",
-                    )
-                    envelope.artifact.CopyFrom(ref)
                 yield pb.StreamCallInputsRequest(
-                    input=pb.CallInput(index=count, value=envelope)
+                    input=pb.CallInput(
+                        index=count,
+                        input_id=str(uuid.uuid4()),
+                        arguments=arguments,
+                    )
                 )
                 count += 1
 
         async def feed() -> None:
-            await stubs.calls.StreamInputs(inputs(), metadata=metadata, timeout=deadline)
+            async for _ in stubs.calls.StreamInputs(
+                inputs(), metadata=metadata, timeout=deadline
+            ):
+                pass
             await stubs.calls.CloseInputs(
                 pb.CloseCallInputsRequest(
                     call=record.ref, expected_input_count=count
@@ -884,7 +1010,7 @@ class RemoteFunction(Generic[P, R]):
             else pb.FUNCTION_LIFECYCLE_STATELESS
         )
         hooks = pb.LifecycleHooks()
-        if metadata is not None:
+        if metadata is not None and lifecycle_name != "service":
             assert self._function is not None
             module = self._function.__module__
             owner = self._function.__qualname__
@@ -986,18 +1112,20 @@ class RemoteFunction(Generic[P, R]):
     def spawn(self, *args: P.args, **kwargs: P.kwargs) -> FunctionCall[R]:
         if self._signature: self._signature.bind(*args, **kwargs)
         revision = self._resolve(); client = _client(self._client)
-        codec = self.options.serializer.input_serializer; trusted = self.options.serializer.allow_trusted_python
-        envelope, artifact = _encode_input(
-            {"args": args, "kwargs": kwargs},
-            codec,
-            trusted=trusted,
+        codec = self.options.serializer.input_serializer
+        trusted = self.options.serializer.allow_trusted_python
+        arguments = _arguments(
+            client, args, kwargs, codec=codec, trusted=trusted,
             compression=self.options.serializer.compression,
         )
-        if artifact is not None:
-            ref = _upload(client, artifact, envelope.artifact.digest.value.hex(), "application/vnd.vmon.value")
-            envelope.artifact.CopyFrom(ref)
         call_type = pb.CALL_TYPE_GENERATOR if self._is_generator else pb.CALL_TYPE_UNARY
-        request = pb.CreateCallRequest(type=call_type, target=pb.CallTarget(function=revision.ref), inputs=[pb.CallInput(index=0, value=envelope)], inputs_closed=True, request_id=str(uuid.uuid4()))
+        request = pb.CreateCallRequest(
+            type=call_type,
+            target=pb.CallTarget(function=revision.ref),
+            inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
+            inputs_closed=True,
+            request_id=str(uuid.uuid4()),
+        )
         record = _call(client, lambda s: s.calls.Create(request))
         return FunctionCall(record.ref.call_id, client, trusted=trusted, generator=self._is_generator)
 
@@ -1009,33 +1137,75 @@ class RemoteFunction(Generic[P, R]):
         revision = self._resolve()
         client = _client(self._client)
         trusted = self.options.serializer.allow_trusted_python
-        envelope, artifact = _encode_input(
-            {"args": args, "kwargs": kwargs},
-            self.options.serializer.input_serializer,
+        arguments = _arguments(
+            client, args, kwargs,
+            codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
         )
-        if artifact is not None:
-            ref = _upload(
-                client,
-                artifact,
-                envelope.artifact.digest.value.hex(),
-                "application/vnd.vmon.value",
-            )
-            envelope.artifact.CopyFrom(ref)
         request = pb.CreateCallRequest(
             type=pb.CALL_TYPE_ACTOR,
             target=pb.CallTarget(
                 function=revision.ref,
-                actor=pb.ActorRef(actor_id=actor_id),
-                actor_method=method,
+                actor=pb.ActorTarget(
+                    actor=pb.ActorRef(actor_id=actor_id), method=method
+                ),
             ),
-            inputs=[pb.CallInput(index=0, value=envelope)],
+            inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
             inputs_closed=True,
             request_id=str(uuid.uuid4()),
         )
         record = _call(client, lambda stubs: stubs.calls.Create(request))
         return FunctionCall(record.ref.call_id, client, trusted=trusted)
+    def _spawn_service(
+        self,
+        service_key: str,
+        constructor_args: tuple[Any, ...],
+        constructor_kwargs: dict[str, Any],
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> FunctionCall[Any]:
+        if not service_key or not method:
+            raise ValueError("service_key and method must be non-empty")
+        revision = self._resolve()
+        client = _client(self._client)
+        trusted = self.options.serializer.allow_trusted_python
+        constructor = _arguments(
+            client, constructor_args, constructor_kwargs,
+            codec=self.options.serializer.input_serializer,
+            trusted=trusted,
+            compression=self.options.serializer.compression,
+        )
+        arguments = _arguments(
+            client, args, kwargs,
+            codec=self.options.serializer.input_serializer,
+            trusted=trusted,
+            compression=self.options.serializer.compression,
+        )
+        record = _call(
+            client,
+            lambda stubs: stubs.calls.Create(
+                pb.CreateCallRequest(
+                    type=pb.CALL_TYPE_UNARY,
+                    target=pb.CallTarget(
+                        function=revision.ref,
+                        service=pb.ServiceTarget(
+                            service_key=service_key,
+                            method=method,
+                            constructor=constructor,
+                        ),
+                    ),
+                    inputs=[pb.CallInput(
+                        index=0, input_id=str(uuid.uuid4()), arguments=arguments
+                    )],
+                    inputs_closed=True,
+                    request_id=str(uuid.uuid4()),
+                )
+            ),
+        )
+        return FunctionCall(record.ref.call_id, client, trusted=trusted)
+
 
     def remote(
         self, *args: Any, timeout: float | None = None, **kwargs: Any
@@ -1105,25 +1275,28 @@ class RemoteFunction(Generic[P, R]):
                         call_kwargs = dict(kwargs or {})
                         if self._signature:
                             self._signature.bind(*args, **call_kwargs)
-                        envelope, artifact = _encode_input(
-                            {"args": args, "kwargs": call_kwargs},
-                            self.options.serializer.input_serializer,
+                        arguments = _arguments(
+                            client, args, call_kwargs,
+                            codec=self.options.serializer.input_serializer,
                             trusted=trusted,
                             compression=self.options.serializer.compression,
                         )
-                        if artifact is not None:
-                            ref = _upload(
-                                client,
-                                artifact,
-                                envelope.artifact.digest.value.hex(),
-                                "application/vnd.vmon.value",
-                            )
-                            envelope.artifact.CopyFrom(ref)
                         yield pb.StreamCallInputsRequest(
-                            input=pb.CallInput(index=count, value=envelope)
+                            input=pb.CallInput(
+                                index=count,
+                                input_id=str(uuid.uuid4()),
+                                arguments=arguments,
+                            )
                         )
                         count += 1
-                _call(client, lambda stubs: stubs.calls.StreamInputs(frames()))
+                responses = _call(
+                    client,
+                    lambda stubs: stubs.calls.StreamInputs(frames()),
+                    stream=True,
+                )
+                for _ in responses:
+                    if stop.is_set():
+                        break
                 if not stop.is_set():
                     _call(
                         client,

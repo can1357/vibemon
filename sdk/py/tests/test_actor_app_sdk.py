@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import vmon
+from vmon._function_proto import value_from_proto
 from vmon.decorators import CurrentCall, _use_current_call
 from vmon.v1 import api_pb2 as pb
 
@@ -13,7 +14,7 @@ class Driver:
     def __init__(self, stubs):
         self.stubs = stubs
 
-    def call(self, fn):
+    def call(self, fn, **_):
         return fn(self.stubs), "fake"
 
 
@@ -237,6 +238,7 @@ class FakeFunction:
     def __init__(self, client):
         self._client = client
         self.targets = []
+        self.services = []
 
     def _resolve(self):
         return pb.FunctionRevision(ref=pb.RevisionRef(
@@ -246,6 +248,14 @@ class FakeFunction:
     def _spawn_actor(self, actor_id, method, args, kwargs):
         self.targets.append((actor_id, method, args, kwargs))
         return Call("call-1", 9)
+
+    def _spawn_service(
+        self, service_key, constructor_args, constructor_kwargs, method, args, kwargs
+    ):
+        self.services.append(
+            (service_key, constructor_args, constructor_kwargs, method, args, kwargs)
+        )
+        return Call("service-call", 11)
 
     def with_options(self, options=None):
         return self
@@ -281,6 +291,11 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     definition = vmon.RemoteClass(Counter, client=client, namespace="ns", _function=function)
     actor = definition(1)
     assert actor.id == "actor-1"
+    create_request = actors.calls[0][1]
+    assert create_request.WhichOneof("initial_payload") == "initial_arguments"
+    assert vmon.decode_value(
+        value_from_proto(create_request.initial_arguments.positional[0])
+    ) == 1
     assert definition.metadata.snapshot_enter == ("before_snapshot",)
     assert definition.metadata.enter == ("initialize",)
     assert definition.metadata.enter_order == (
@@ -298,10 +313,74 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     assert fork.id == "actor-2"
     assert [name for name, _ in actors.calls].count("create") == 1
 
-    scalable = vmon.RemoteClass(Counter, client=client, service=True, _function=FakeFunction(client))
+    service_function = FakeFunction(client)
+    scalable = vmon.RemoteClass(Counter, client=client, service=True, _function=service_function)
     assert scalable.lifecycle == "service"
+    first = scalable(4)
+    second = scalable(4)
+    different = scalable(5)
     with pytest.raises(TypeError):
-        scalable().id
+        first.id
+    assert first.add.remote(6) == 11
+    assert second.add.remote(7) == 11
+    assert different.add.remote(8) == 11
+    assert service_function.services[0][0] == service_function.services[1][0]
+    assert service_function.services[0][0] != service_function.services[2][0]
+    assert service_function.services[0][1:] == ((4,), {}, "add", (6,), {})
+
+
+def test_service_spawn_uses_native_typed_target_and_arguments():
+    class Calls:
+        request = None
+
+        def Create(self, request):
+            self.request = request
+            return pb.CallRecord(ref=pb.CallRef(call_id="service-call"))
+
+    calls = Calls()
+    client = SimpleNamespace(driver=Driver(SimpleNamespace(calls=calls)))
+    function = vmon.RemoteFunction.from_name(
+        "Counter", namespace="ns", revision="r1", client=client
+    )
+    function._registered = pb.FunctionRevision(
+        ref=pb.RevisionRef(
+            function=pb.FunctionRef(namespace="ns", name="Counter"),
+            revision_id="r1",
+        )
+    )
+
+    handle = function._spawn_service(
+        "stable-key", (4,), {"start": True}, "add", (6,), {"step": 2}
+    )
+
+    request = calls.request
+    assert handle.id == "service-call"
+    assert request.type == pb.CALL_TYPE_UNARY
+    assert request.target.WhichOneof("receiver") == "service"
+    assert request.target.service.service_key == "stable-key"
+    assert request.target.service.method == "add"
+    assert vmon.decode_value(
+        value_from_proto(request.target.service.constructor.positional[0])
+    ) == 4
+    assert vmon.decode_value(
+        value_from_proto(request.target.service.constructor.named["start"])
+    ) is True
+    assert vmon.decode_value(
+        value_from_proto(request.inputs[0].arguments.positional[0])
+    ) == 6
+    assert vmon.decode_value(
+        value_from_proto(request.inputs[0].arguments.named["step"])
+    ) == 2
+
+    function._spawn_actor("actor-7", "add", (9,), {"step": 3})
+    actor_request = calls.request
+    assert actor_request.type == pb.CALL_TYPE_ACTOR
+    assert actor_request.target.WhichOneof("receiver") == "actor"
+    assert actor_request.target.actor.actor.actor_id == "actor-7"
+    assert actor_request.target.actor.method == "add"
+    assert vmon.decode_value(
+        value_from_proto(actor_request.inputs[0].arguments.positional[0])
+    ) == 9
 
 
 def test_actor_lost_is_explicit_not_constructor_replay():

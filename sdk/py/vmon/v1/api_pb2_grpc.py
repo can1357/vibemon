@@ -2807,7 +2807,7 @@ class CallServiceStub:
                 request_serializer=vmon_dot_v1_dot_api__pb2.CreateCallRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.CallRecord.FromString,
                 _registered_method=True)
-        self.StreamInputs = channel.stream_unary(
+        self.StreamInputs = channel.stream_stream(
                 '/vmon.v1.CallService/StreamInputs',
                 request_serializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsResponse.FromString,
@@ -2831,6 +2831,11 @@ class CallServiceStub:
                 '/vmon.v1.CallService/GetResult',
                 request_serializer=vmon_dot_v1_dot_api__pb2.GetCallResultRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.CallResult.FromString,
+                _registered_method=True)
+        self.ListResults = channel.unary_unary(
+                '/vmon.v1.CallService/ListResults',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListCallResultsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ListCallResultsResponse.FromString,
                 _registered_method=True)
         self.Watch = channel.unary_stream(
                 '/vmon.v1.CallService/Watch',
@@ -2857,7 +2862,7 @@ class CallServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def StreamInputs(self, request_iterator, context):
-        """StreamInputs durably appends ordered inputs to an open generator or batch call.
+        """StreamInputs bidirectionally appends ordered inputs and acknowledges the opener and every committed input.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2891,6 +2896,13 @@ class CallServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListResults(self, request, context):
+        """ListResults returns a bounded page after a durable result sequence cursor.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Watch(self, request, context):
         """Watch streams events after a durable sequence cursor and may follow new events.
         """
@@ -2913,7 +2925,7 @@ def add_CallServiceServicer_to_server(servicer, server):
                     request_deserializer=vmon_dot_v1_dot_api__pb2.CreateCallRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.CallRecord.SerializeToString,
             ),
-            'StreamInputs': grpc.stream_unary_rpc_method_handler(
+            'StreamInputs': grpc.stream_stream_rpc_method_handler(
                     servicer.StreamInputs,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.StreamCallInputsResponse.SerializeToString,
@@ -2937,6 +2949,11 @@ def add_CallServiceServicer_to_server(servicer, server):
                     servicer.GetResult,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.GetCallResultRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.CallResult.SerializeToString,
+            ),
+            'ListResults': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListResults,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListCallResultsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ListCallResultsResponse.SerializeToString,
             ),
             'Watch': grpc.unary_stream_rpc_method_handler(
                     servicer.Watch,
@@ -2999,7 +3016,7 @@ class CallService:
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.stream_unary(
+        return grpc.experimental.stream_stream(
             request_iterator,
             target,
             '/vmon.v1.CallService/StreamInputs',
@@ -3113,6 +3130,33 @@ class CallService:
             '/vmon.v1.CallService/GetResult',
             vmon_dot_v1_dot_api__pb2.GetCallResultRequest.SerializeToString,
             vmon_dot_v1_dot_api__pb2.CallResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListResults(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CallService/ListResults',
+            vmon_dot_v1_dot_api__pb2.ListCallResultsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ListCallResultsResponse.FromString,
             options,
             channel_credentials,
             insecure,

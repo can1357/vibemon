@@ -5,7 +5,7 @@ import inspect
 import pytest
 
 from vmon._function_proto import value_from_proto, value_to_proto
-from vmon.remote import FunctionCall, RemoteFunction, function
+from vmon.remote import FunctionCall, RemoteFunction, _invocation, function
 from vmon.values import ValueCodec, decode_value, encode_value
 
 
@@ -46,3 +46,21 @@ def test_cloudpickle_remains_explicitly_trusted() -> None:
     with pytest.raises(PermissionError, match="trusted"):
         decode_value(restored)
     assert decode_value(restored, trusted=True) == {1, 2}
+
+def test_python_invocation_abi_is_versioned_and_collision_safe() -> None:
+    ordinary = {"args": [1], "kwargs": {"named": 2}}
+    assert _invocation((ordinary,), {}) == {
+        "__vmon_python_call__": 1,
+        "args": [ordinary],
+        "kwargs": {},
+    }
+    assert _invocation((), {}) == {
+        "__vmon_python_call__": 1,
+        "args": [],
+        "kwargs": {},
+    }
+    assert _invocation((1, 2), {"named": 3}) == {
+        "__vmon_python_call__": 1,
+        "args": [1, 2],
+        "kwargs": {"named": 3},
+    }

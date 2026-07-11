@@ -1,5 +1,6 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import type { Client } from "./client";
+import { AsyncQueue } from "./async-queue";
 import type {
   AppRevision,
   ArtifactRef,
@@ -22,7 +23,6 @@ import {
   CallService,
   CallStatus,
   CallType,
-  ClientCancellationPolicy,
   FunctionService,
   LogStream,
 } from "./gen/vmon/v1/api_pb";
@@ -42,8 +42,6 @@ export interface FunctionValueAdapter<Value> {
 export interface FunctionCallOptions extends EncodeValueOptions {
   labels?: Readonly<Record<string, string>>;
   resultTtlMillis?: number;
-  cancelOnDisconnect?: boolean;
-  clientSessionId?: string;
   signal?: AbortSignal;
 }
 /** Function lookup settings. */
@@ -64,8 +62,8 @@ export interface FunctionLog {
   data: Uint8Array;
   text: string;
   inputId?: string;
+  attemptId?: string;
   inputIndex?: bigint;
-  attempt?: number;
 }
 /** One decoded durable result with stable input/yield correlation metadata. */
 export interface FunctionResult<Value> {
@@ -182,13 +180,11 @@ export class FunctionCall<Result = PortableValue> {
   readonly id: string;
   readonly #client: Client;
   readonly #codec: BoundValueCodec<Result>;
-  readonly #clientSessionId?: string;
-  constructor(client: Client, id: string, codec: BoundValueCodec<Result>, clientSessionId?: string) {
+  constructor(client: Client, id: string, codec: BoundValueCodec<Result>) {
     if (!id) throw new TypeError("call id cannot be empty");
     this.#client = client;
     this.id = id;
     this.#codec = codec;
-    this.#clientSessionId = clientSessionId;
   }
   /** Reconnect to a durable call from another process. */
   static fromId(client: Client, id: string): FunctionCall<PortableValue> {
@@ -227,13 +223,9 @@ export class FunctionCall<Result = PortableValue> {
   }
   /** Stream reconnectable durable events after the supplied sequence. */
   async *events(cursor: EventCursor = {}): AsyncGenerator<CallEvent> {
-    const follow = cursor.follow ?? true;
     const handle = await this.#client.driver.serverStream(CallService.method.watch, {
       cursor: { call: { callId: this.id }, afterSequence: cursor.afterSequence ?? 0n },
-      follow,
-      clientSessionIdPresence: follow && this.#clientSessionId
-        ? { case: "clientSessionId", value: this.#clientSessionId }
-        : { case: undefined },
+      follow: cursor.follow ?? true,
     });
     try { for await (const event of handle.stream) yield event; }
     finally { handle.cancel(); }
@@ -247,13 +239,13 @@ export class FunctionCall<Result = PortableValue> {
           : event.payload.value.stream === LogStream.STRUCTURED ? "structured" : "unknown";
       yield {
         sequence: event.sequence,
+        attemptId: event.attemptIdPresence.case === "attemptId" ? event.attemptIdPresence.value : undefined,
         createdAtUnixMillis: event.createdAtUnixMillis,
         stream,
         data: event.payload.value.data,
         text: new TextDecoder().decode(event.payload.value.data),
         inputId: event.inputIdPresence.case === "inputId" ? event.inputIdPresence.value : undefined,
         inputIndex: event.inputIndexPresence.case === "inputIndex" ? event.inputIndexPresence.value : undefined,
-        attempt: event.attemptPresence.case === "attempt" ? event.attemptPresence.value : undefined,
       };
     }
   }
@@ -314,8 +306,8 @@ export class FunctionCall<Result = PortableValue> {
 /** Durable handle for an indexed batch call. */
 export class BatchCall<Result = PortableValue> extends FunctionCall<Result> implements AsyncIterable<Result> {
   readonly #submitted: Promise<void>;
-  constructor(client: Client, id: string, codec: BoundValueCodec<Result>, submitted: Promise<void> = Promise.resolve(), clientSessionId?: string) {
-    super(client, id, codec, clientSessionId);
+  constructor(client: Client, id: string, codec: BoundValueCodec<Result>, submitted: Promise<void> = Promise.resolve()) {
+    super(client, id, codec);
     this.#submitted = submitted;
   }
   /** Reconnect to a durable batch from another process. */
@@ -366,14 +358,11 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
   /** Create a durable unary call and return immediately. */
   async spawn(input: Input, options: FunctionCallOptions = {}): Promise<FunctionCall<Result>> {
     const merged = mergeOptions(this.#options, options);
-    const clientSessionId = merged.cancelOnDisconnect
-      ? merged.clientSessionId || crypto.randomUUID()
-      : undefined;
     const envelope = await this.#input.encode(input);
     rejectCloudpickle(envelope);
-    const record = (await this.#client.driver.call(CallService.method.create, createRequest(this.revision, CallType.UNARY, [{ index: 0n, value: envelope, inputId: "" }], true, merged, clientSessionId))).message;
+    const record = (await this.#client.driver.call(CallService.method.create, createRequest(this.revision, CallType.UNARY, [{ index: 0n, payload: { case: "value", value: envelope }, inputId: crypto.randomUUID() }], true, merged))).message;
     if (!record.ref) throw new Error("call creation returned no durable id");
-    const call = new FunctionCall(this.#client, record.ref.callId, this.#result, clientSessionId);
+    const call = new FunctionCall(this.#client, record.ref.callId, this.#result);
     bindAbort(call, merged.signal);
     return call;
   }
@@ -385,14 +374,11 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
   /** Create a streamed durable batch. Input encoding and submission remain lazy. */
   async spawnMap(inputs: AsyncIterable<Input> | Iterable<Input>, options: FunctionCallOptions = {}): Promise<BatchCall<Result>> {
     const merged = mergeOptions(this.#options, options);
-    const clientSessionId = merged.cancelOnDisconnect
-      ? merged.clientSessionId || crypto.randomUUID()
-      : undefined;
-    const record = (await this.#client.driver.call(CallService.method.create, createRequest(this.revision, CallType.BATCH, [], false, merged, clientSessionId))).message;
+    const record = (await this.#client.driver.call(CallService.method.create, createRequest(this.revision, CallType.BATCH, [], false, merged))).message;
     if (!record.ref) throw new Error("batch creation returned no durable id");
     const id = record.ref.callId;
     const submitted = this.#submitInputs(id, inputs, merged.signal);
-    const call = new BatchCall(this.#client, id, this.#result, submitted, clientSessionId);
+    const call = new BatchCall(this.#client, id, this.#result, submitted);
     bindAbort(call, merged.signal);
     return call;
   }
@@ -401,22 +387,47 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
     yield* await this.spawnMap(inputs, options);
   }
   async #submitInputs(id: string, inputs: AsyncIterable<Input> | Iterable<Input>, signal?: AbortSignal): Promise<void> {
-    if (!this.#client.driver.clientStream) throw new Error("driver does not support streamed batch inputs");
-    const codec = this.#input;
-    await this.#client.driver.clientStream(CallService.method.streamInputs, (async function* (): AsyncGenerator<MessageInitShape<typeof StreamCallInputsRequestSchema>> {
-      yield { frame: { case: "call", value: { callId: id } } };
-      let index = 0;
+    const requests = new AsyncQueue<MessageInitShape<typeof StreamCallInputsRequestSchema>>();
+    requests.push({ frame: { case: "call", value: { callId: id } } });
+    const handle = await this.#client.driver.duplex(CallService.method.streamInputs, requests);
+    const acknowledgements = handle.stream[Symbol.asyncIterator]();
+    let acknowledged = 0n;
+    let sent = 0n;
+    let maximum = 1n;
+    const receiveAck = async (): Promise<void> => {
+      const next = await acknowledgements.next();
+      if (next.done) throw new Error("batch input stream closed before final acknowledgement");
+      acknowledged = next.value.committedInputCount;
+      maximum = BigInt(Math.max(1, next.value.maxInputsOutstanding));
+    };
+    await receiveAck();
+    try {
       for await (const input of inputs) {
         if (signal?.aborted) break;
-        const value = await codec.encode(input);
+        while (sent - acknowledged >= maximum) await receiveAck();
+        const value = await this.#input.encode(input);
         rejectCloudpickle(value);
-        yield { frame: { case: "input", value: { index: BigInt(index), value, inputId: "" } } };
-        index += 1;
+        requests.push({
+          frame: {
+            case: "input",
+            value: {
+              index: sent,
+              payload: { case: "value", value },
+              inputId: crypto.randomUUID(),
+            },
+          },
+        });
+        sent += 1n;
       }
-    })());
-    const status = await this.#client.driver.call(CallService.method.get, { callId: id });
+      requests.end();
+      while (acknowledged < sent) await receiveAck();
+    } finally {
+      requests.end();
+      handle.cancel();
+    }
     await this.#client.driver.call(CallService.method.closeInputs, {
-      call: { callId: id }, expectedInputCount: status.message.inputCount,
+      call: { callId: id },
+      expectedInputCount: sent,
     });
   }
 }
@@ -443,21 +454,17 @@ export class App {
   }
 }
 
-function createRequest(revision: RevisionRef, type: CallType, inputs: { index: bigint; value: ValueEnvelope; inputId: string }[], inputsClosed: boolean, options: FunctionCallOptions, clientSessionId?: string): MessageInitShape<typeof CreateCallRequestSchema> {
+function createRequest(revision: RevisionRef, type: CallType, inputs: { index: bigint; payload: { case: "value"; value: ValueEnvelope }; inputId: string }[], inputsClosed: boolean, options: FunctionCallOptions): MessageInitShape<typeof CreateCallRequestSchema> {
   return {
     type,
-    target: { function: revision, actorPresence: { case: undefined }, actorMethodPresence: { case: undefined } },
+    target: { function: revision, receiver: { case: undefined } },
     inputs,
     inputsClosed,
     requestId: crypto.randomUUID(),
     labels: options.labels ? { ...options.labels } : {},
-    clientCancellation: options.cancelOnDisconnect ? ClientCancellationPolicy.CANCEL : ClientCancellationPolicy.DETACH,
     resultTtlMillisPresence: options.resultTtlMillis === undefined
       ? { case: undefined }
       : { case: "resultTtlMillis", value: BigInt(options.resultTtlMillis) },
-    clientSessionIdPresence: clientSessionId
-      ? { case: "clientSessionId", value: clientSessionId }
-      : { case: undefined },
   };
 }
 function mergeOptions(base: FunctionCallOptions, override: FunctionCallOptions): FunctionCallOptions {

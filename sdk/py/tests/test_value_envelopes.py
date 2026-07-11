@@ -12,6 +12,7 @@ from vmon.values import (
     CodecMismatchError,
     EnvelopeIntegrityError,
     ArtifactPayload,
+    JSONProfileError,
     ValueCodec,
     ValueCompression,
     decode_value,
@@ -22,7 +23,7 @@ from vmon.values import (
 def test_auto_is_json_first_and_preserves_json_values():
     value = {
         "bool": True,
-        "int": 2**53 + 1,
+        "int": 2**53 - 1,
         "list": [None, "héllo", 1.25],
         "nested": {"key": "value"},
     }
@@ -92,3 +93,41 @@ def test_compressed_inline_tampering_and_zstd_round_trip():
     zstd_envelope = encode_value({"portable": [1, 2, 3]}, compression="zstd")
     assert zstd_envelope.compression is ValueCompression.ZSTD
     assert decode_value(zstd_envelope) == {"portable": [1, 2, 3]}
+
+
+def test_ijson_safe_integer_boundaries_and_non_string_keys():
+    maximum = 2**53 - 1
+    assert decode_value(encode_value({"low": -maximum, "high": maximum}, codec="json")) == {
+        "high": maximum,
+        "low": -maximum,
+    }
+    with pytest.raises(JSONProfileError, match="safe range"):
+        encode_value({"too_big": maximum + 1}, codec="json")
+    with pytest.raises(JSONProfileError, match="safe range"):
+        encode_value({"nested": [-(maximum + 1)]}, codec="json")
+    with pytest.raises(JSONProfileError, match="must be a string"):
+        encode_value({1: "integer key"}, codec="json")
+
+    automatic = encode_value({"full_integer": maximum + 1})
+    assert automatic.codec is ValueCodec.CBOR
+    assert decode_value(automatic) == {"full_integer": maximum + 1}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"value":9007199254740992}',
+        b'{"duplicate":1,"duplicate":2}',
+        b'{"nonfinite":1e400}',
+    ],
+)
+def test_json_decode_rejects_values_outside_ijson_profile(raw):
+    base = encode_value({}, codec="json", compress=False)
+    envelope = replace(
+        base,
+        inline=raw,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        uncompressed_size=len(raw),
+    )
+    with pytest.raises(JSONProfileError):
+        decode_value(envelope)

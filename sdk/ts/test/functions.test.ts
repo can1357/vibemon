@@ -39,8 +39,6 @@ interface HarnessState {
   cancelCount: number;
   cancelled: Promise<void>;
   createCount: number;
-  creatorSessionId?: string;
-  watchSessionId?: string;
   lastAfterSequence: bigint;
   inputs: Map<string, PortableValue[]>;
   results: Map<string, ValueEnvelope[]>;
@@ -74,8 +72,6 @@ function makeClient(): { client: Client; state: HarnessState } {
     cancelCount: 0,
     cancelled,
     createCount: 0,
-    creatorSessionId: undefined,
-    watchSessionId: undefined,
     lastAfterSequence: 0n,
     inputs: new Map(),
     results: new Map(),
@@ -107,15 +103,12 @@ function makeClient(): { client: Client; state: HarnessState } {
     service(CallService, {
       async create(request) {
         state.createCount += 1;
-        state.creatorSessionId = request.clientSessionIdPresence.case === "clientSessionId"
-          ? request.clientSessionIdPresence.value
-          : undefined;
         const id = `call-${state.nextId++}`;
         state.inputs.set(id, []);
         state.results.set(id, []);
         for (const input of request.inputs) {
-          if (!input.value) throw new Error("missing input envelope");
-          const value = await decodeValue(input.value);
+          if (input.payload.case !== "value") throw new Error("missing scalar input envelope");
+          const value = await decodeValue(input.payload.value);
           state.inputs.get(id)?.push(value);
           if (value === "error") state.failures.set(id, callError("bad input"));
           else if (typeof value === "number") state.results.get(id)?.push(await encodeValue(value * 2));
@@ -135,16 +128,27 @@ function makeClient(): { client: Client; state: HarnessState } {
           labels: request.labels,
         };
       },
-      async streamInputs(requests) {
+      async *streamInputs(requests) {
         let id = "";
+        let count = 0n;
         for await (const request of requests) {
-          if (request.frame.case === "call") { id = request.frame.value.callId; continue; }
-          if (request.frame.case !== "input" || !request.frame.value.value) throw new Error("invalid input frame");
-          const value = await decodeValue(request.frame.value.value);
+          if (request.frame.case === "call") {
+            id = request.frame.value.callId;
+            yield { call: { callId: id }, committedInputCount: count, lastInputPresence: { case: undefined }, maxInputsOutstanding: 2 };
+            continue;
+          }
+          if (request.frame.case !== "input" || request.frame.value.payload.case !== "value") throw new Error("invalid input frame");
+          const value = await decodeValue(request.frame.value.payload.value);
           state.inputs.get(id)?.push(value);
           state.results.get(id)?.push(await encodeValue(typeof value === "number" ? value * 2 : value));
+          count += 1n;
+          yield {
+            call: { callId: id },
+            committedInputCount: count,
+            lastInputPresence: { case: "lastInput", value: { inputId: request.frame.value.inputId, inputIndex: request.frame.value.index } },
+            maxInputsOutstanding: 2,
+          };
         }
-        return { call: { callId: id }, committedInputCount: BigInt(state.inputs.get(id)?.length ?? 0) };
       },
       closeInputs(request) {
         const id = request.call?.callId ?? "";
@@ -165,7 +169,7 @@ function makeClient(): { client: Client; state: HarnessState } {
           status: failure ? CallStatus.FAILED : CallStatus.SUCCEEDED,
           inputsClosed: true, inputCount: count,
           resultCount: BigInt(state.results.get(id)?.length ?? 0),
-          graph: { parentCallIds: ["parent-1"], rootCallIdPresence: { case: "rootCallId", value: "root-1" }, parentInputIds: ["input-1"] },
+          graph: { parents: [{ callId: "parent-1", inputId: "input-1" }], rootCallIdPresence: { case: "rootCallId", value: "root-1" } },
           createdAtUnixMillis: 1n, updatedAtUnixMillis: 2n,
           errorPresence: failure ? { case: "error", value: failure } : { case: undefined },
           stats: { queueMillis: 1n, startupMillis: 2n, executionMillis: 3n, wallMillis: 6n, cpuMillis: 2n, peakMemoryBytes: 1024n, attempts: [] },
@@ -188,23 +192,20 @@ function makeClient(): { client: Client; state: HarnessState } {
       },
       async *watch(request) {
         state.lastAfterSequence = request.cursor?.afterSequence ?? 0n;
-        state.watchSessionId = request.clientSessionIdPresence.case === "clientSessionId"
-          ? request.clientSessionIdPresence.value
-          : undefined;
         const id = request.cursor?.call?.callId ?? "";
         const failure = state.failures.get(id);
         if (state.lastAfterSequence < 8n) {
           yield {
             call: { callId: id }, sequence: 8n, createdAtUnixMillis: 2n, type: 2,
             payload: { case: "log", value: { stream: LogStream.STDOUT, data: new TextEncoder().encode("hello\n") } },
-            inputIdPresence: { case: undefined }, inputIndexPresence: { case: undefined }, attemptPresence: { case: undefined },
+            inputIdPresence: { case: undefined }, inputIndexPresence: { case: undefined }, attemptIdPresence: { case: undefined },
           };
         }
         if (failure) {
           yield {
             call: { callId: id }, sequence: 9n, createdAtUnixMillis: 2n, type: 6,
             payload: { case: "error", value: failure },
-            inputIdPresence: { case: undefined }, inputIndexPresence: { case: undefined }, attemptPresence: { case: undefined },
+            inputIdPresence: { case: undefined }, inputIndexPresence: { case: undefined }, attemptIdPresence: { case: undefined },
           };
           return;
         }
@@ -216,7 +217,7 @@ function makeClient(): { client: Client; state: HarnessState } {
             createdAtUnixMillis: 2n, sequence: 1n, inputId: "input-0", inputIndex: 0n,
             yieldIndexPresence: { case: undefined },
           } },
-          inputIdPresence: { case: "inputId", value: "input-0" }, inputIndexPresence: { case: "inputIndex", value: 0n }, attemptPresence: { case: undefined },
+          inputIdPresence: { case: "inputId", value: "input-0" }, inputIndexPresence: { case: "inputIndex", value: 0n }, attemptIdPresence: { case: undefined },
         };
       },
       cancel(request) {
@@ -280,18 +281,6 @@ test("streamed batches preserve input order and indexed access", async () => {
   });
 });
 
-test("disconnect cancellation uses a matching creator/watch session capability", async () => {
-  const { client, state } = makeClient();
-  const fn = await client.functions.fromName("double");
-  const call = await fn.spawn(2, { cancelOnDisconnect: true, clientSessionId: "session-1" });
-  expect(await call.get()).toBe(4);
-  expect(state.creatorSessionId).toBe("session-1");
-  expect(state.watchSessionId).toBe("session-1");
-
-  const observer = FunctionCall.fromId(client, call.id);
-  for await (const _event of observer.events({ follow: false })) break;
-  expect(state.watchSessionId).toBeUndefined();
-});
 
 test("AbortSignal reaches durable cancellation and structured errors decode", async () => {
   const { client, state } = makeClient();
@@ -337,7 +326,7 @@ test("function lookup and invocation traverse the binary WebSocket bridge withou
       onMessage(conn, payload) {
         methods.push("CallService.Create");
         const request = fromBinary(CreateCallRequestSchema, payload);
-        createdInput = request.inputs[0]?.value;
+        createdInput = request.inputs[0]?.payload.case === "value" ? request.inputs[0].payload.value : undefined;
         conn.sendMessage(toBinary(CallRecordSchema, create(CallRecordSchema, {
           ref: { callId: "bridge-call" },
           type: CallType.UNARY,

@@ -3,15 +3,20 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
 PYTHON_ABI = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
+JSON_SAFE_INTEGER_MAX = 2**53 - 1
 
 
 class ValueErrorBase(ValueError):
+    pass
+
+class JSONProfileError(ValueErrorBase):
     pass
 
 
@@ -188,7 +193,13 @@ def decode_value(
             f"runtime={runtime_version}"
         )
     if envelope.codec is ValueCodec.JSON:
-        return json.loads(raw)
+        value = json.loads(
+            raw,
+            object_pairs_hook=_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_ijson(value)
+        return value
     if envelope.codec is ValueCodec.CBOR:
         import cbor2
 
@@ -231,6 +242,7 @@ def _decompress(payload: bytes, compression: ValueCompression) -> bytes:
 
 
 def _encode_json(value: object) -> bytes:
+    _validate_ijson(value)
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -238,6 +250,43 @@ def _encode_json(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _validate_ijson(value: object, path: str = "$") -> None:
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int):
+        if not -JSON_SAFE_INTEGER_MAX <= value <= JSON_SAFE_INTEGER_MAX:
+            raise JSONProfileError(f"integer at {path} exceeds the I-JSON safe range")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise JSONProfileError(f"non-finite number at {path} is not valid I-JSON")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_ijson(item, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise JSONProfileError(f"object key at {path} must be a string")
+            _validate_ijson(item, f"{path}.{key}")
+        return
+    raise JSONProfileError(f"value at {path} is not JSON-compatible")
+
+
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise JSONProfileError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise JSONProfileError(f"non-finite JSON number is not allowed: {value}")
 
 
 def _encode_cbor(value: object) -> bytes:

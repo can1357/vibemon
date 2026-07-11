@@ -144,7 +144,7 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
             for command in step.values: image.commands.append(pb.ImageBuildCommand(argv=["/bin/sh", "-c", command]))
         else: raise ValueError(f"image step {step.kind!r} requires artifact build support")
     return dict(image=image,
-      resources=pb.ResourceSpec(cpu_millis=resources.cpu_millis, memory_bytes=resources.memory_bytes, ephemeral_disk_bytes=resources.ephemeral_disk_bytes, architecture=arch, high_availability=ha,
+      resources=pb.ResourceSpec(cpus=max(1, (resources.cpu_millis + 999) // 1000), memory_bytes=resources.memory_bytes, ephemeral_disk_bytes=resources.ephemeral_disk_bytes, architecture=arch, high_availability=ha,
         volume_mounts=[pb.FunctionVolumeMount(volume=pb.VolumeRef(name=x.volume), mount_path=x.mount_path, read_only=x.read_only) for x in resources.volume_mounts],
         network=pb.NetworkPolicy(block_network=resources.network.block_network, egress_cidrs=resources.network.egress_cidrs, egress_domains=resources.network.egress_domains, inbound_cidrs=resources.network.inbound_cidrs)),
       retry=pb.RetryPolicy(max_attempts=r.max_attempts, initial_backoff_millis=int(r.initial_backoff*1000), max_backoff_millis=int(r.max_backoff*1000), backoff_multiplier=r.backoff_multiplier, retryable_codes=r.retryable_codes),

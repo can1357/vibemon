@@ -12,7 +12,8 @@ from typing import Any, Generic, TypeVar, overload
 
 from .errors import ActorLostError
 from .options import ConcurrencyPolicy, FunctionOptions
-from .remote import FunctionCall, RemoteFunction, _encode_input, _upload
+from .remote import FunctionCall, RemoteFunction, _arguments
+from .values import encode_value
 from .v1 import api_pb2
 
 R = TypeVar("R")
@@ -165,26 +166,22 @@ class RemoteClass:
             return RemoteObject(self, None, service_init=(args, kwargs))
         client = self._bound_client()
         revision = self._function._resolve().ref
-        envelope, artifact = _encode_input(
-            {"args": args, "kwargs": kwargs},
-            self.options.serializer.input_serializer,
-            compression=self.options.serializer.compression,
-            trusted=self.options.serializer.allow_trusted_python,
-        )
-        if artifact is not None:
-            ref = _upload(
-                client,
-                artifact,
-                envelope.artifact.digest.value.hex(),
-                "application/vnd.vmon.value",
-            )
-            envelope.artifact.CopyFrom(ref)
         request = api_pb2.CreateActorRequest(
             function=revision,
-            initial_state=envelope,
             request_id=str(uuid.uuid4()),
             labels=dict(labels or {}),
         )
+        if args or kwargs:
+            request.initial_arguments.CopyFrom(
+                _arguments(
+                    client,
+                    args,
+                    kwargs,
+                    codec=self.options.serializer.input_serializer,
+                    compression=self.options.serializer.compression,
+                    trusted=self.options.serializer.allow_trusted_python,
+                )
+            )
         record, _ = client.driver.call(lambda stubs: stubs.actors.Create(request))
         return RemoteObject(self, record.ref.actor_id, record=record)
 
@@ -247,6 +244,15 @@ class RemoteObject:
         self._actor_id = actor_id
         self._cached_record = record
         self._service_init = service_init
+        self._service_key = (
+            encode_value(
+                {"args": service_init[0], "kwargs": dict(service_init[1])},
+                codec=remote_cls.options.serializer.input_serializer,
+                compression="none",
+            ).sha256
+            if service_init is not None
+            else None
+        )
 
     @property
     def id(self) -> str:
@@ -360,7 +366,20 @@ class _BoundRemoteMethod(Generic[R]):
 
         function = self._obj._remote_cls._function
         if self._obj._actor_id is None:
-            return function.spawn(self._name, *args, **kwargs)
+            if self._obj._service_init is None or self._obj._service_key is None:
+                raise RuntimeError("service handle has no constructor metadata")
+            spawn_service = getattr(function, "_spawn_service", None)
+            if not callable(spawn_service):
+                raise RuntimeError("RemoteFunction does not support service call envelopes")
+            constructor_args, constructor_kwargs = self._obj._service_init
+            return spawn_service(
+                self._obj._service_key,
+                constructor_args,
+                dict(constructor_kwargs),
+                self._name,
+                args,
+                kwargs,
+            )
         self._obj._record()
         spawn_actor = getattr(function, "_spawn_actor", None)
         if not callable(spawn_actor):

@@ -27,6 +27,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `ListResults` API for paginated retrieval of durable function execution results
+- Added `AttemptFailureKind` categorization to distinguish between user and infrastructure errors
+- Added `AttemptStats` for granular tracking of user-triggered versus infrastructure retries
 - Added `CompletionResults` stream for batch calls to receive results in order of completion
 - Added `App` handle and `AppFunction` to retrieve pinned functions from deployed applications
 - Added I-JSON safety validation for JSON-encoded values, rejecting integers outside IEEE-754 range
@@ -137,6 +140,10 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated `ResourceSpec` to define CPU requirements in absolute vCPUs (`cpus`) instead of `cpu_millis`
+- Updated I-JSON serialization to enforce strict IEEE-754 range and object key constraints
+- Migrated `StreamInputs` from unary to bidirectional streaming for improved result synchronization
+- Removed client-side session ID management for call cancellations
 - Updated `CallStats` to include granular `UserAttempt` and `InfraAttempt` counters
 - Refactored `CallGraph` to use `ParentEdge` structures for call ancestry tracking
 - Simplified `FunctionCall` API by removing deprecated client-side cancellation sessions
@@ -186,6 +193,9 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Resolved JSON decoding issues by rejecting non-finite numbers and duplicate object keys
+- Fixed race conditions in `vmon exec` stdin/stdout forwarding on TTY streams
+- Corrected `CreateCallRequest` payload handling for structured function arguments
 - Resolved race conditions in actor state recovery and checkpointing
 - Fixed durability race conditions by enforcing stable call identifiers for persistence
 - Fixed TTY-based exec session handling and stdin/stdout multiplexing consistency

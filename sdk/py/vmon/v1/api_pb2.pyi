@@ -18,7 +18,6 @@ class DigestAlgorithm(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     DIGEST_ALGORITHM_UNSPECIFIED: _ClassVar[DigestAlgorithm]
     DIGEST_ALGORITHM_SHA256: _ClassVar[DigestAlgorithm]
-    DIGEST_ALGORITHM_BLAKE3: _ClassVar[DigestAlgorithm]
 
 class ValueSerializer(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -59,12 +58,6 @@ class HighAvailabilityPolicy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     HIGH_AVAILABILITY_POLICY_NONE: _ClassVar[HighAvailabilityPolicy]
     HIGH_AVAILABILITY_POLICY_HOST: _ClassVar[HighAvailabilityPolicy]
     HIGH_AVAILABILITY_POLICY_ZONE: _ClassVar[HighAvailabilityPolicy]
-
-class ClientCancellationPolicy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-    __slots__ = ()
-    CLIENT_CANCELLATION_POLICY_UNSPECIFIED: _ClassVar[ClientCancellationPolicy]
-    CLIENT_CANCELLATION_POLICY_DETACH: _ClassVar[ClientCancellationPolicy]
-    CLIENT_CANCELLATION_POLICY_CANCEL: _ClassVar[ClientCancellationPolicy]
 
 class CallType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -140,13 +133,19 @@ class FunctionRevisionStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FUNCTION_REVISION_STATUS_UNSPECIFIED: _ClassVar[FunctionRevisionStatus]
     FUNCTION_REVISION_STATUS_READY: _ClassVar[FunctionRevisionStatus]
     FUNCTION_REVISION_STATUS_UNAVAILABLE: _ClassVar[FunctionRevisionStatus]
+
+class AttemptFailureKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    ATTEMPT_FAILURE_KIND_UNSPECIFIED: _ClassVar[AttemptFailureKind]
+    ATTEMPT_FAILURE_KIND_USER: _ClassVar[AttemptFailureKind]
+    ATTEMPT_FAILURE_KIND_INFRASTRUCTURE: _ClassVar[AttemptFailureKind]
+    ATTEMPT_FAILURE_KIND_CANCELLED: _ClassVar[AttemptFailureKind]
 STREAM_UNSPECIFIED: Stream
 STREAM_STDOUT: Stream
 STREAM_STDERR: Stream
 STREAM_CONSOLE: Stream
 DIGEST_ALGORITHM_UNSPECIFIED: DigestAlgorithm
 DIGEST_ALGORITHM_SHA256: DigestAlgorithm
-DIGEST_ALGORITHM_BLAKE3: DigestAlgorithm
 VALUE_SERIALIZER_UNSPECIFIED: ValueSerializer
 VALUE_SERIALIZER_JSON: ValueSerializer
 VALUE_SERIALIZER_CBOR: ValueSerializer
@@ -169,9 +168,6 @@ HIGH_AVAILABILITY_POLICY_UNSPECIFIED: HighAvailabilityPolicy
 HIGH_AVAILABILITY_POLICY_NONE: HighAvailabilityPolicy
 HIGH_AVAILABILITY_POLICY_HOST: HighAvailabilityPolicy
 HIGH_AVAILABILITY_POLICY_ZONE: HighAvailabilityPolicy
-CLIENT_CANCELLATION_POLICY_UNSPECIFIED: ClientCancellationPolicy
-CLIENT_CANCELLATION_POLICY_DETACH: ClientCancellationPolicy
-CLIENT_CANCELLATION_POLICY_CANCEL: ClientCancellationPolicy
 CALL_TYPE_UNSPECIFIED: CallType
 CALL_TYPE_UNARY: CallType
 CALL_TYPE_GENERATOR: CallType
@@ -220,6 +216,10 @@ SCHEDULE_STATUS_PAUSED: ScheduleStatus
 FUNCTION_REVISION_STATUS_UNSPECIFIED: FunctionRevisionStatus
 FUNCTION_REVISION_STATUS_READY: FunctionRevisionStatus
 FUNCTION_REVISION_STATUS_UNAVAILABLE: FunctionRevisionStatus
+ATTEMPT_FAILURE_KIND_UNSPECIFIED: AttemptFailureKind
+ATTEMPT_FAILURE_KIND_USER: AttemptFailureKind
+ATTEMPT_FAILURE_KIND_INFRASTRUCTURE: AttemptFailureKind
+ATTEMPT_FAILURE_KIND_CANCELLED: AttemptFailureKind
 
 class JsonView(_message.Message):
     __slots__ = ("json",)
@@ -553,28 +553,32 @@ class ArtifactRef(_message.Message):
     def __init__(self, digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class ArtifactRecord(_message.Message):
-    __slots__ = ("ref", "size_bytes", "stored_size_bytes", "media_type", "created_at_unix_millis")
+    __slots__ = ("ref", "size_bytes", "stored_size_bytes", "media_type", "created_at_unix_millis", "expires_at_unix_millis")
     REF_FIELD_NUMBER: _ClassVar[int]
     SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
     STORED_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
     MEDIA_TYPE_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     ref: ArtifactRef
     size_bytes: int
     stored_size_bytes: int
     media_type: str
     created_at_unix_millis: int
-    def __init__(self, ref: _Optional[_Union[ArtifactRef, _Mapping]] = ..., size_bytes: _Optional[int] = ..., stored_size_bytes: _Optional[int] = ..., media_type: _Optional[str] = ..., created_at_unix_millis: _Optional[int] = ...) -> None: ...
+    expires_at_unix_millis: int
+    def __init__(self, ref: _Optional[_Union[ArtifactRef, _Mapping]] = ..., size_bytes: _Optional[int] = ..., stored_size_bytes: _Optional[int] = ..., media_type: _Optional[str] = ..., created_at_unix_millis: _Optional[int] = ..., expires_at_unix_millis: _Optional[int] = ...) -> None: ...
 
 class PutArtifactHeader(_message.Message):
-    __slots__ = ("expected_digest", "expected_size_bytes", "media_type")
+    __slots__ = ("expected_digest", "expected_size_bytes", "media_type", "ttl_millis")
     EXPECTED_DIGEST_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
     MEDIA_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TTL_MILLIS_FIELD_NUMBER: _ClassVar[int]
     expected_digest: Digest
     expected_size_bytes: int
     media_type: str
-    def __init__(self, expected_digest: _Optional[_Union[Digest, _Mapping]] = ..., expected_size_bytes: _Optional[int] = ..., media_type: _Optional[str] = ...) -> None: ...
+    ttl_millis: int
+    def __init__(self, expected_digest: _Optional[_Union[Digest, _Mapping]] = ..., expected_size_bytes: _Optional[int] = ..., media_type: _Optional[str] = ..., ttl_millis: _Optional[int] = ...) -> None: ...
 
 class PutArtifactRequest(_message.Message):
     __slots__ = ("header", "data")
@@ -750,22 +754,22 @@ class ImageSpec(_message.Message):
     def __init__(self, python: _Optional[_Union[PythonImageSource, _Mapping]] = ..., registry: _Optional[_Union[RegistryImageSource, _Mapping]] = ..., dockerfile: _Optional[_Union[DockerfileImageSource, _Mapping]] = ..., template: _Optional[_Union[TemplateImageSource, _Mapping]] = ..., apt_packages: _Optional[_Iterable[_Union[AptPackage, _Mapping]]] = ..., uv_packages: _Optional[_Iterable[_Union[UvPackage, _Mapping]]] = ..., commands: _Optional[_Iterable[_Union[ImageBuildCommand, _Mapping]]] = ..., environment: _Optional[_Mapping[str, str]] = ..., local_artifact_mounts: _Optional[_Iterable[_Union[LocalArtifactMount, _Mapping]]] = ..., resolved_oci_digest: _Optional[_Union[Digest, _Mapping]] = ..., platform: _Optional[str] = ...) -> None: ...
 
 class ResourceSpec(_message.Message):
-    __slots__ = ("cpu_millis", "memory_bytes", "ephemeral_disk_bytes", "architecture", "high_availability", "volume_mounts", "network")
-    CPU_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("cpus", "memory_bytes", "ephemeral_disk_bytes", "architecture", "high_availability", "volume_mounts", "network")
+    CPUS_FIELD_NUMBER: _ClassVar[int]
     MEMORY_BYTES_FIELD_NUMBER: _ClassVar[int]
     EPHEMERAL_DISK_BYTES_FIELD_NUMBER: _ClassVar[int]
     ARCHITECTURE_FIELD_NUMBER: _ClassVar[int]
     HIGH_AVAILABILITY_FIELD_NUMBER: _ClassVar[int]
     VOLUME_MOUNTS_FIELD_NUMBER: _ClassVar[int]
     NETWORK_FIELD_NUMBER: _ClassVar[int]
-    cpu_millis: int
+    cpus: int
     memory_bytes: int
     ephemeral_disk_bytes: int
     architecture: CpuArchitecture
     high_availability: HighAvailabilityPolicy
     volume_mounts: _containers.RepeatedCompositeFieldContainer[FunctionVolumeMount]
     network: NetworkPolicy
-    def __init__(self, cpu_millis: _Optional[int] = ..., memory_bytes: _Optional[int] = ..., ephemeral_disk_bytes: _Optional[int] = ..., architecture: _Optional[_Union[CpuArchitecture, str]] = ..., high_availability: _Optional[_Union[HighAvailabilityPolicy, str]] = ..., volume_mounts: _Optional[_Iterable[_Union[FunctionVolumeMount, _Mapping]]] = ..., network: _Optional[_Union[NetworkPolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, cpus: _Optional[int] = ..., memory_bytes: _Optional[int] = ..., ephemeral_disk_bytes: _Optional[int] = ..., architecture: _Optional[_Union[CpuArchitecture, str]] = ..., high_availability: _Optional[_Union[HighAvailabilityPolicy, str]] = ..., volume_mounts: _Optional[_Iterable[_Union[FunctionVolumeMount, _Mapping]]] = ..., network: _Optional[_Union[NetworkPolicy, _Mapping]] = ...) -> None: ...
 
 class PythonCodeMetadata(_message.Message):
     __slots__ = ("implementation", "version", "abi_tag", "bytecode_magic", "cloudpickle_version")
@@ -1002,19 +1006,33 @@ class LifecycleHooks(_message.Message):
     snapshot_on_worker_retire: bool
     def __init__(self, initialize: _Optional[_Union[LifecycleHookRef, _Mapping]] = ..., shutdown: _Optional[_Union[LifecycleHookRef, _Mapping]] = ..., snapshot: _Optional[_Union[LifecycleHookRef, _Mapping]] = ..., restore: _Optional[_Union[LifecycleHookRef, _Mapping]] = ..., snapshot_after_initialize: _Optional[bool] = ..., snapshot_on_worker_retire: _Optional[bool] = ...) -> None: ...
 
-class FunctionSnapshotProvenance(_message.Message):
-    __slots__ = ("snapshot", "image_digest", "package_digest", "created_at_unix_millis", "initialize_hook")
-    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+class FunctionSnapshotRef(_message.Message):
+    __slots__ = ("snapshot_id",)
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: str
+    def __init__(self, snapshot_id: _Optional[str] = ...) -> None: ...
+
+class FunctionSnapshotRecord(_message.Message):
+    __slots__ = ("ref", "revision", "artifact", "protocol_version", "runner_digest", "image_digest", "package_digest", "created_at_unix_millis", "initialize_hook")
+    REF_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    RUNNER_DIGEST_FIELD_NUMBER: _ClassVar[int]
     IMAGE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     INITIALIZE_HOOK_FIELD_NUMBER: _ClassVar[int]
-    snapshot: ArtifactRef
+    ref: FunctionSnapshotRef
+    revision: RevisionRef
+    artifact: ArtifactRef
+    protocol_version: int
+    runner_digest: Digest
     image_digest: Digest
     package_digest: Digest
     created_at_unix_millis: int
     initialize_hook: LifecycleHookRef
-    def __init__(self, snapshot: _Optional[_Union[ArtifactRef, _Mapping]] = ..., image_digest: _Optional[_Union[Digest, _Mapping]] = ..., package_digest: _Optional[_Union[Digest, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., initialize_hook: _Optional[_Union[LifecycleHookRef, _Mapping]] = ...) -> None: ...
+    def __init__(self, ref: _Optional[_Union[FunctionSnapshotRef, _Mapping]] = ..., revision: _Optional[_Union[RevisionRef, _Mapping]] = ..., artifact: _Optional[_Union[ArtifactRef, _Mapping]] = ..., protocol_version: _Optional[int] = ..., runner_digest: _Optional[_Union[Digest, _Mapping]] = ..., image_digest: _Optional[_Union[Digest, _Mapping]] = ..., package_digest: _Optional[_Union[Digest, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., initialize_hook: _Optional[_Union[LifecycleHookRef, _Mapping]] = ...) -> None: ...
 
 class FunctionSpec(_message.Message):
     __slots__ = ("function", "package", "image", "resources", "retry", "timeouts", "workers", "concurrency", "batching", "serializer", "lifecycle", "reproducibility", "labels", "secrets", "lifecycle_hooks")
@@ -1058,22 +1076,22 @@ class FunctionSpec(_message.Message):
     def __init__(self, function: _Optional[_Union[FunctionRef, _Mapping]] = ..., package: _Optional[_Union[PackageSpec, _Mapping]] = ..., image: _Optional[_Union[ImageSpec, _Mapping]] = ..., resources: _Optional[_Union[ResourceSpec, _Mapping]] = ..., retry: _Optional[_Union[RetryPolicy, _Mapping]] = ..., timeouts: _Optional[_Union[TimeoutSpec, _Mapping]] = ..., workers: _Optional[_Union[WorkerSpec, _Mapping]] = ..., concurrency: _Optional[_Union[ConcurrencySpec, _Mapping]] = ..., batching: _Optional[_Union[BatchingSpec, _Mapping]] = ..., serializer: _Optional[_Union[SerializerSpec, _Mapping]] = ..., lifecycle: _Optional[_Union[FunctionLifecycle, str]] = ..., reproducibility: _Optional[_Union[ReproducibilitySpec, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ..., secrets: _Optional[_Iterable[_Union[SecretRef, _Mapping]]] = ..., lifecycle_hooks: _Optional[_Union[LifecycleHooks, _Mapping]] = ...) -> None: ...
 
 class FunctionRevision(_message.Message):
-    __slots__ = ("ref", "spec", "spec_digest", "created_at_unix_millis", "status", "unavailable_secrets", "snapshot_provenance")
+    __slots__ = ("ref", "spec", "spec_digest", "created_at_unix_millis", "status", "unavailable_secrets", "snapshot")
     REF_FIELD_NUMBER: _ClassVar[int]
     SPEC_FIELD_NUMBER: _ClassVar[int]
     SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     UNAVAILABLE_SECRETS_FIELD_NUMBER: _ClassVar[int]
-    SNAPSHOT_PROVENANCE_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
     ref: RevisionRef
     spec: FunctionSpec
     spec_digest: Digest
     created_at_unix_millis: int
     status: FunctionRevisionStatus
     unavailable_secrets: _containers.RepeatedCompositeFieldContainer[SecretRef]
-    snapshot_provenance: FunctionSnapshotProvenance
-    def __init__(self, ref: _Optional[_Union[RevisionRef, _Mapping]] = ..., spec: _Optional[_Union[FunctionSpec, _Mapping]] = ..., spec_digest: _Optional[_Union[Digest, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., status: _Optional[_Union[FunctionRevisionStatus, str]] = ..., unavailable_secrets: _Optional[_Iterable[_Union[SecretRef, _Mapping]]] = ..., snapshot_provenance: _Optional[_Union[FunctionSnapshotProvenance, _Mapping]] = ...) -> None: ...
+    snapshot: FunctionSnapshotRecord
+    def __init__(self, ref: _Optional[_Union[RevisionRef, _Mapping]] = ..., spec: _Optional[_Union[FunctionSpec, _Mapping]] = ..., spec_digest: _Optional[_Union[Digest, _Mapping]] = ..., created_at_unix_millis: _Optional[int] = ..., status: _Optional[_Union[FunctionRevisionStatus, str]] = ..., unavailable_secrets: _Optional[_Iterable[_Union[SecretRef, _Mapping]]] = ..., snapshot: _Optional[_Union[FunctionSnapshotRecord, _Mapping]] = ...) -> None: ...
 
 class FunctionRecord(_message.Message):
     __slots__ = ("function", "current", "updated_at_unix_millis")
@@ -1296,38 +1314,87 @@ class ActorRef(_message.Message):
     actor_id: str
     def __init__(self, actor_id: _Optional[str] = ...) -> None: ...
 
+class InvocationArguments(_message.Message):
+    __slots__ = ("positional", "named")
+    class NamedEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: ValueEnvelope
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ...) -> None: ...
+    POSITIONAL_FIELD_NUMBER: _ClassVar[int]
+    NAMED_FIELD_NUMBER: _ClassVar[int]
+    positional: _containers.RepeatedCompositeFieldContainer[ValueEnvelope]
+    named: _containers.MessageMap[str, ValueEnvelope]
+    def __init__(self, positional: _Optional[_Iterable[_Union[ValueEnvelope, _Mapping]]] = ..., named: _Optional[_Mapping[str, ValueEnvelope]] = ...) -> None: ...
+
+class ActorTarget(_message.Message):
+    __slots__ = ("actor", "method")
+    ACTOR_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    actor: ActorRef
+    method: str
+    def __init__(self, actor: _Optional[_Union[ActorRef, _Mapping]] = ..., method: _Optional[str] = ...) -> None: ...
+
+class ServiceTarget(_message.Message):
+    __slots__ = ("service_key", "method", "constructor")
+    SERVICE_KEY_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    CONSTRUCTOR_FIELD_NUMBER: _ClassVar[int]
+    service_key: str
+    method: str
+    constructor: InvocationArguments
+    def __init__(self, service_key: _Optional[str] = ..., method: _Optional[str] = ..., constructor: _Optional[_Union[InvocationArguments, _Mapping]] = ...) -> None: ...
+
+class ParentEdge(_message.Message):
+    __slots__ = ("call_id", "input_id")
+    CALL_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    call_id: str
+    input_id: str
+    def __init__(self, call_id: _Optional[str] = ..., input_id: _Optional[str] = ...) -> None: ...
+
 class CallTarget(_message.Message):
-    __slots__ = ("function", "actor", "actor_method")
+    __slots__ = ("function", "actor", "service")
     FUNCTION_FIELD_NUMBER: _ClassVar[int]
     ACTOR_FIELD_NUMBER: _ClassVar[int]
-    ACTOR_METHOD_FIELD_NUMBER: _ClassVar[int]
+    SERVICE_FIELD_NUMBER: _ClassVar[int]
     function: RevisionRef
-    actor: ActorRef
-    actor_method: str
-    def __init__(self, function: _Optional[_Union[RevisionRef, _Mapping]] = ..., actor: _Optional[_Union[ActorRef, _Mapping]] = ..., actor_method: _Optional[str] = ...) -> None: ...
+    actor: ActorTarget
+    service: ServiceTarget
+    def __init__(self, function: _Optional[_Union[RevisionRef, _Mapping]] = ..., actor: _Optional[_Union[ActorTarget, _Mapping]] = ..., service: _Optional[_Union[ServiceTarget, _Mapping]] = ...) -> None: ...
 
 class CallInput(_message.Message):
-    __slots__ = ("index", "value", "input_id")
+    __slots__ = ("index", "value", "arguments", "input_id")
     INDEX_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
+    ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     INPUT_ID_FIELD_NUMBER: _ClassVar[int]
     index: int
     value: ValueEnvelope
+    arguments: InvocationArguments
     input_id: str
-    def __init__(self, index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., input_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, index: _Optional[int] = ..., value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., arguments: _Optional[_Union[InvocationArguments, _Mapping]] = ..., input_id: _Optional[str] = ...) -> None: ...
+
+class InputRef(_message.Message):
+    __slots__ = ("input_id", "input_index")
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_INDEX_FIELD_NUMBER: _ClassVar[int]
+    input_id: str
+    input_index: int
+    def __init__(self, input_id: _Optional[str] = ..., input_index: _Optional[int] = ...) -> None: ...
 
 class CallGraph(_message.Message):
-    __slots__ = ("parent_call_ids", "root_call_id", "parent_input_ids")
-    PARENT_CALL_IDS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("parents", "root_call_id")
+    PARENTS_FIELD_NUMBER: _ClassVar[int]
     ROOT_CALL_ID_FIELD_NUMBER: _ClassVar[int]
-    PARENT_INPUT_IDS_FIELD_NUMBER: _ClassVar[int]
-    parent_call_ids: _containers.RepeatedScalarFieldContainer[str]
+    parents: _containers.RepeatedCompositeFieldContainer[ParentEdge]
     root_call_id: str
-    parent_input_ids: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, parent_call_ids: _Optional[_Iterable[str]] = ..., root_call_id: _Optional[str] = ..., parent_input_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, parents: _Optional[_Iterable[_Union[ParentEdge, _Mapping]]] = ..., root_call_id: _Optional[str] = ...) -> None: ...
 
 class CreateCallRequest(_message.Message):
-    __slots__ = ("type", "target", "inputs", "inputs_closed", "graph", "request_id", "labels", "client_cancellation", "result_ttl_millis", "client_session_id")
+    __slots__ = ("type", "target", "inputs", "inputs_closed", "graph", "request_id", "labels", "result_ttl_millis")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -1342,9 +1409,7 @@ class CreateCallRequest(_message.Message):
     GRAPH_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     LABELS_FIELD_NUMBER: _ClassVar[int]
-    CLIENT_CANCELLATION_FIELD_NUMBER: _ClassVar[int]
     RESULT_TTL_MILLIS_FIELD_NUMBER: _ClassVar[int]
-    CLIENT_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     type: CallType
     target: CallTarget
     inputs: _containers.RepeatedCompositeFieldContainer[CallInput]
@@ -1352,10 +1417,8 @@ class CreateCallRequest(_message.Message):
     graph: CallGraph
     request_id: str
     labels: _containers.ScalarMap[str, str]
-    client_cancellation: ClientCancellationPolicy
     result_ttl_millis: int
-    client_session_id: str
-    def __init__(self, type: _Optional[_Union[CallType, str]] = ..., target: _Optional[_Union[CallTarget, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[CallInput, _Mapping]]] = ..., inputs_closed: _Optional[bool] = ..., graph: _Optional[_Union[CallGraph, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ..., client_cancellation: _Optional[_Union[ClientCancellationPolicy, str]] = ..., result_ttl_millis: _Optional[int] = ..., client_session_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, type: _Optional[_Union[CallType, str]] = ..., target: _Optional[_Union[CallTarget, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[CallInput, _Mapping]]] = ..., inputs_closed: _Optional[bool] = ..., graph: _Optional[_Union[CallGraph, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ..., result_ttl_millis: _Optional[int] = ...) -> None: ...
 
 class CallRecord(_message.Message):
     __slots__ = ("ref", "type", "target", "status", "inputs_closed", "input_count", "result_count", "graph", "created_at_unix_millis", "updated_at_unix_millis", "error", "stats", "labels", "result_cursor")
@@ -1405,12 +1468,16 @@ class StreamCallInputsRequest(_message.Message):
     def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., input: _Optional[_Union[CallInput, _Mapping]] = ...) -> None: ...
 
 class StreamCallInputsResponse(_message.Message):
-    __slots__ = ("call", "committed_input_count")
+    __slots__ = ("call", "committed_input_count", "last_input", "max_inputs_outstanding")
     CALL_FIELD_NUMBER: _ClassVar[int]
     COMMITTED_INPUT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    LAST_INPUT_FIELD_NUMBER: _ClassVar[int]
+    MAX_INPUTS_OUTSTANDING_FIELD_NUMBER: _ClassVar[int]
     call: CallRef
     committed_input_count: int
-    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., committed_input_count: _Optional[int] = ...) -> None: ...
+    last_input: InputRef
+    max_inputs_outstanding: int
+    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., committed_input_count: _Optional[int] = ..., last_input: _Optional[_Union[InputRef, _Mapping]] = ..., max_inputs_outstanding: _Optional[int] = ...) -> None: ...
 
 class CloseCallInputsRequest(_message.Message):
     __slots__ = ("call", "expected_input_count")
@@ -1490,15 +1557,31 @@ class EventCursor(_message.Message):
     after_sequence: int
     def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., after_sequence: _Optional[int] = ...) -> None: ...
 
+class ListCallResultsRequest(_message.Message):
+    __slots__ = ("cursor", "page_size")
+    CURSOR_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    cursor: ResultCursor
+    page_size: int
+    def __init__(self, cursor: _Optional[_Union[ResultCursor, _Mapping]] = ..., page_size: _Optional[int] = ...) -> None: ...
+
+class ListCallResultsResponse(_message.Message):
+    __slots__ = ("results", "next_cursor", "end")
+    RESULTS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    END_FIELD_NUMBER: _ClassVar[int]
+    results: _containers.RepeatedCompositeFieldContainer[CallResult]
+    next_cursor: ResultCursor
+    end: bool
+    def __init__(self, results: _Optional[_Iterable[_Union[CallResult, _Mapping]]] = ..., next_cursor: _Optional[_Union[ResultCursor, _Mapping]] = ..., end: _Optional[bool] = ...) -> None: ...
+
 class WatchCallRequest(_message.Message):
-    __slots__ = ("cursor", "follow", "client_session_id")
+    __slots__ = ("cursor", "follow")
     CURSOR_FIELD_NUMBER: _ClassVar[int]
     FOLLOW_FIELD_NUMBER: _ClassVar[int]
-    CLIENT_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     cursor: EventCursor
     follow: bool
-    client_session_id: str
-    def __init__(self, cursor: _Optional[_Union[EventCursor, _Mapping]] = ..., follow: _Optional[bool] = ..., client_session_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, cursor: _Optional[_Union[EventCursor, _Mapping]] = ..., follow: _Optional[bool] = ...) -> None: ...
 
 class StatusEvent(_message.Message):
     __slots__ = ("status",)
@@ -1515,28 +1598,34 @@ class LogEvent(_message.Message):
     def __init__(self, stream: _Optional[_Union[LogStream, str]] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class AttemptEvent(_message.Message):
-    __slots__ = ("attempt", "status", "startup", "worker_id", "error")
-    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("attempt_id", "user_attempt", "infra_attempt", "status", "startup", "worker_id", "error", "failure_kind")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    USER_ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    INFRA_ATTEMPT_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     STARTUP_FIELD_NUMBER: _ClassVar[int]
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
-    attempt: int
+    FAILURE_KIND_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: str
+    user_attempt: int
+    infra_attempt: int
     status: AttemptStatus
     startup: StartupKind
     worker_id: str
     error: CallError
-    def __init__(self, attempt: _Optional[int] = ..., status: _Optional[_Union[AttemptStatus, str]] = ..., startup: _Optional[_Union[StartupKind, str]] = ..., worker_id: _Optional[str] = ..., error: _Optional[_Union[CallError, _Mapping]] = ...) -> None: ...
+    failure_kind: AttemptFailureKind
+    def __init__(self, attempt_id: _Optional[str] = ..., user_attempt: _Optional[int] = ..., infra_attempt: _Optional[int] = ..., status: _Optional[_Union[AttemptStatus, str]] = ..., startup: _Optional[_Union[StartupKind, str]] = ..., worker_id: _Optional[str] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., failure_kind: _Optional[_Union[AttemptFailureKind, str]] = ...) -> None: ...
 
 class CallEvent(_message.Message):
-    __slots__ = ("call", "sequence", "created_at_unix_millis", "type", "status", "log", "result", "attempt_event", "error", "input_closed", "cancel_requested", "input_id", "input_index", "attempt")
+    __slots__ = ("call", "sequence", "created_at_unix_millis", "type", "status", "log", "yield_result", "result", "attempt_event", "error", "input_closed", "cancel_requested", "input_id", "input_index", "attempt_id")
     CALL_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     TYPE_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     LOG_FIELD_NUMBER: _ClassVar[int]
-    YIELD_FIELD_NUMBER: _ClassVar[int]
+    YIELD_RESULT_FIELD_NUMBER: _ClassVar[int]
     RESULT_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_EVENT_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
@@ -1544,13 +1633,14 @@ class CallEvent(_message.Message):
     CANCEL_REQUESTED_FIELD_NUMBER: _ClassVar[int]
     INPUT_ID_FIELD_NUMBER: _ClassVar[int]
     INPUT_INDEX_FIELD_NUMBER: _ClassVar[int]
-    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
     call: CallRef
     sequence: int
     created_at_unix_millis: int
     type: CallEventType
     status: StatusEvent
     log: LogEvent
+    yield_result: CallResult
     result: CallResult
     attempt_event: AttemptEvent
     error: CallError
@@ -1558,8 +1648,8 @@ class CallEvent(_message.Message):
     cancel_requested: CancelCallRequest
     input_id: str
     input_index: int
-    attempt: int
-    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., sequence: _Optional[int] = ..., created_at_unix_millis: _Optional[int] = ..., type: _Optional[_Union[CallEventType, str]] = ..., status: _Optional[_Union[StatusEvent, _Mapping]] = ..., log: _Optional[_Union[LogEvent, _Mapping]] = ..., result: _Optional[_Union[CallResult, _Mapping]] = ..., attempt_event: _Optional[_Union[AttemptEvent, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., input_closed: _Optional[_Union[StreamCallInputsResponse, _Mapping]] = ..., cancel_requested: _Optional[_Union[CancelCallRequest, _Mapping]] = ..., input_id: _Optional[str] = ..., input_index: _Optional[int] = ..., attempt: _Optional[int] = ..., **kwargs) -> None: ...
+    attempt_id: str
+    def __init__(self, call: _Optional[_Union[CallRef, _Mapping]] = ..., sequence: _Optional[int] = ..., created_at_unix_millis: _Optional[int] = ..., type: _Optional[_Union[CallEventType, str]] = ..., status: _Optional[_Union[StatusEvent, _Mapping]] = ..., log: _Optional[_Union[LogEvent, _Mapping]] = ..., yield_result: _Optional[_Union[CallResult, _Mapping]] = ..., result: _Optional[_Union[CallResult, _Mapping]] = ..., attempt_event: _Optional[_Union[AttemptEvent, _Mapping]] = ..., error: _Optional[_Union[CallError, _Mapping]] = ..., input_closed: _Optional[_Union[StreamCallInputsResponse, _Mapping]] = ..., cancel_requested: _Optional[_Union[CancelCallRequest, _Mapping]] = ..., input_id: _Optional[str] = ..., input_index: _Optional[int] = ..., attempt_id: _Optional[str] = ...) -> None: ...
 
 class ErrorFrame(_message.Message):
     __slots__ = ("file", "line", "function", "code")
@@ -1599,22 +1689,28 @@ class CallError(_message.Message):
     def __init__(self, code: _Optional[str] = ..., message: _Optional[str] = ..., type: _Optional[str] = ..., retryable: _Optional[bool] = ..., frames: _Optional[_Iterable[_Union[ErrorFrame, _Mapping]]] = ..., cause: _Optional[_Union[CallError, _Mapping]] = ..., details: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class AttemptStats(_message.Message):
-    __slots__ = ("attempt", "startup", "queued_millis", "startup_millis", "execution_millis", "cpu_millis", "peak_memory_bytes")
-    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("attempt_id", "user_attempt", "infra_attempt", "startup", "failure_kind", "queued_millis", "startup_millis", "execution_millis", "cpu_millis", "peak_memory_bytes")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    USER_ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    INFRA_ATTEMPT_FIELD_NUMBER: _ClassVar[int]
     STARTUP_FIELD_NUMBER: _ClassVar[int]
+    FAILURE_KIND_FIELD_NUMBER: _ClassVar[int]
     QUEUED_MILLIS_FIELD_NUMBER: _ClassVar[int]
     STARTUP_MILLIS_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_MILLIS_FIELD_NUMBER: _ClassVar[int]
     CPU_MILLIS_FIELD_NUMBER: _ClassVar[int]
     PEAK_MEMORY_BYTES_FIELD_NUMBER: _ClassVar[int]
-    attempt: int
+    attempt_id: str
+    user_attempt: int
+    infra_attempt: int
     startup: StartupKind
+    failure_kind: AttemptFailureKind
     queued_millis: int
     startup_millis: int
     execution_millis: int
     cpu_millis: int
     peak_memory_bytes: int
-    def __init__(self, attempt: _Optional[int] = ..., startup: _Optional[_Union[StartupKind, str]] = ..., queued_millis: _Optional[int] = ..., startup_millis: _Optional[int] = ..., execution_millis: _Optional[int] = ..., cpu_millis: _Optional[int] = ..., peak_memory_bytes: _Optional[int] = ...) -> None: ...
+    def __init__(self, attempt_id: _Optional[str] = ..., user_attempt: _Optional[int] = ..., infra_attempt: _Optional[int] = ..., startup: _Optional[_Union[StartupKind, str]] = ..., failure_kind: _Optional[_Union[AttemptFailureKind, str]] = ..., queued_millis: _Optional[int] = ..., startup_millis: _Optional[int] = ..., execution_millis: _Optional[int] = ..., cpu_millis: _Optional[int] = ..., peak_memory_bytes: _Optional[int] = ...) -> None: ...
 
 class CallStats(_message.Message):
     __slots__ = ("queue_millis", "startup_millis", "execution_millis", "wall_millis", "cpu_millis", "peak_memory_bytes", "attempts")
@@ -1692,7 +1788,7 @@ class ActorCheckpoint(_message.Message):
     def __init__(self, ref: _Optional[_Union[ActorCheckpointRef, _Mapping]] = ..., actor: _Optional[_Union[ActorRef, _Mapping]] = ..., function: _Optional[_Union[RevisionRef, _Mapping]] = ..., state: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., sequence: _Optional[int] = ..., created_at_unix_millis: _Optional[int] = ...) -> None: ...
 
 class CreateActorRequest(_message.Message):
-    __slots__ = ("function", "initial_state", "request_id", "labels")
+    __slots__ = ("function", "initial_value", "initial_arguments", "request_id", "labels")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -1701,14 +1797,16 @@ class CreateActorRequest(_message.Message):
         value: str
         def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     FUNCTION_FIELD_NUMBER: _ClassVar[int]
-    INITIAL_STATE_FIELD_NUMBER: _ClassVar[int]
+    INITIAL_VALUE_FIELD_NUMBER: _ClassVar[int]
+    INITIAL_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     LABELS_FIELD_NUMBER: _ClassVar[int]
     function: RevisionRef
-    initial_state: ValueEnvelope
+    initial_value: ValueEnvelope
+    initial_arguments: InvocationArguments
     request_id: str
     labels: _containers.ScalarMap[str, str]
-    def __init__(self, function: _Optional[_Union[RevisionRef, _Mapping]] = ..., initial_state: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    def __init__(self, function: _Optional[_Union[RevisionRef, _Mapping]] = ..., initial_value: _Optional[_Union[ValueEnvelope, _Mapping]] = ..., initial_arguments: _Optional[_Union[InvocationArguments, _Mapping]] = ..., request_id: _Optional[str] = ..., labels: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class CheckpointActorRequest(_message.Message):
     __slots__ = ("actor", "request_id")

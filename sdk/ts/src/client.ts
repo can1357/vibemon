@@ -118,8 +118,6 @@ export class FunctionAPI {
       typeName: options.typeName,
       labels: options.labels,
       resultTtlMillis: options.resultTtlMillis,
-      cancelOnDisconnect: options.cancelOnDisconnect,
-      clientSessionId: options.clientSessionId,
       signal: options.signal,
     });
   }
