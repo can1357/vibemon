@@ -1377,11 +1377,11 @@ impl MeshEngine for MeshEngineAdapter {
 		.boxed()
 	}
 
-	fn migrate_prepare(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
+	fn migrate_precopy(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
 		let engine = self.engine.clone();
 		async move {
 			spawn_engine(move || {
-				let prep = engine.mesh_migrate_prepare(&sid)?;
+				let prep = engine.mesh_migrate_precopy(&sid)?;
 				Ok(MigratePrepareWire {
 					digest:       prep.digest,
 					snapshot_dir: prep.snapshot_dir.to_string_lossy().into_owned(),
@@ -1393,18 +1393,52 @@ impl MeshEngine for MeshEngineAdapter {
 		.boxed()
 	}
 
+	fn migrate_finalize(
+		&self,
+		sid: String,
+		base_dir: String,
+	) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
+		let engine = self.engine.clone();
+		async move {
+			spawn_engine(move || {
+				let prep = engine.mesh_migrate_finalize(&sid, Path::new(&base_dir))?;
+				Ok(MigratePrepareWire {
+					digest:       prep.digest,
+					snapshot_dir: prep.snapshot_dir.to_string_lossy().into_owned(),
+					params:       params_object(&prep.params)?,
+				})
+			})
+			.await
+		}
+		.boxed()
+	}
+
+	fn checkpoint_discard(
+		&self,
+		snapshot_dir: String,
+		digest: String,
+	) -> BoxFuture<'_, MeshResult<()>> {
+		let engine = self.engine.clone();
+		async move {
+			spawn_engine(move || engine.mesh_replicate_cleanup(&digest, Path::new(&snapshot_dir)))
+				.await
+		}
+		.boxed()
+	}
+
 	fn migrate_abort(
 		&self,
 		sid: String,
-		snapshot_dir: String,
-		digest: String,
+		base_digest: String,
+		delta_dir: String,
+		delta_digest: String,
 		params: Map<String, Value>,
 	) -> BoxFuture<'_, MeshResult<()>> {
 		let engine = self.engine.clone();
 		async move {
 			spawn_engine(move || {
 				engine
-					.mesh_migrate_abort(&sid, Path::new(&snapshot_dir), &digest, params)
+					.mesh_migrate_abort(&sid, &base_digest, Path::new(&delta_dir), &delta_digest, params)
 					.map(|_| ())
 			})
 			.await
@@ -1415,13 +1449,23 @@ impl MeshEngine for MeshEngineAdapter {
 	fn migrate_commit(
 		&self,
 		sid: String,
-		snapshot_dir: String,
-		digest: String,
+		base_dir: String,
+		base_digest: String,
+		delta_dir: String,
+		delta_digest: String,
 	) -> BoxFuture<'_, MeshResult<()>> {
 		let engine = self.engine.clone();
 		async move {
-			spawn_engine(move || engine.mesh_migrate_commit(&sid, Path::new(&snapshot_dir), &digest))
-				.await
+			spawn_engine(move || {
+				engine.mesh_migrate_commit(
+					&sid,
+					Path::new(&base_dir),
+					&base_digest,
+					Path::new(&delta_dir),
+					&delta_digest,
+				)
+			})
+			.await
 		}
 		.boxed()
 	}

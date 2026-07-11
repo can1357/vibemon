@@ -6,6 +6,9 @@
 //! stores are provided by sibling modules through the traits below.
 
 use std::{
+	ffi::OsStr,
+	fs,
+	path::{Path as FsPath, PathBuf},
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +27,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::gossip::{self, JsonObject, MeshError, MeshResult, PeerHttpClient};
+use crate::{engine::diskdelta, error::EngineError, image::cas};
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
 const ALLOWED_HA: &[&str] = &["async", "async+rerun", "off", "rerun"];
@@ -290,19 +294,32 @@ pub trait MeshEngine: Send + Sync {
 		template_dir: String,
 		quorum_ok: bool,
 	) -> BoxFuture<'_, MeshResult<Value>>;
-	fn migrate_prepare(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>>;
+	fn migrate_precopy(&self, sid: String) -> BoxFuture<'_, MeshResult<MigratePrepareWire>>;
+	fn migrate_finalize(
+		&self,
+		sid: String,
+		base_dir: String,
+	) -> BoxFuture<'_, MeshResult<MigratePrepareWire>>;
+	fn checkpoint_discard(
+		&self,
+		snapshot_dir: String,
+		digest: String,
+	) -> BoxFuture<'_, MeshResult<()>>;
 	fn migrate_abort(
 		&self,
 		sid: String,
-		snapshot_dir: String,
-		digest: String,
+		base_digest: String,
+		delta_dir: String,
+		delta_digest: String,
 		params: JsonObject,
 	) -> BoxFuture<'_, MeshResult<()>>;
 	fn migrate_commit(
 		&self,
 		sid: String,
-		snapshot_dir: String,
-		digest: String,
+		base_dir: String,
+		base_digest: String,
+		delta_dir: String,
+		delta_digest: String,
 	) -> BoxFuture<'_, MeshResult<()>>;
 }
 
@@ -462,6 +479,7 @@ pub fn router(state: MeshRouteState) -> Router {
 		.route("/v1/mesh/lease/grant", post(mesh_lease_grant))
 		.route("/v1/mesh/lease/renew", post(mesh_lease_renew))
 		.route("/v1/mesh/lease/release", post(mesh_lease_release))
+		.route("/v1/mesh/migrate/precopy", post(mesh_migrate_precopy))
 		.route("/v1/mesh/migrate/receive", post(mesh_migrate_receive))
 		.route("/v1/mesh/replica/receive", post(mesh_replica_receive))
 		.route("/v1/mesh/replica/list", get(mesh_replica_list))
@@ -682,7 +700,10 @@ async fn mesh_lease_release(
 	lease_vote(state, request, LeaseOp::Release).await
 }
 
-async fn mesh_migrate_receive(
+/// Live-migration phase 1 receiver: pull the bulk pre-copy checkpoint while
+/// the source VM keeps running. Restore params and the final delta arrive
+/// later via `/v1/mesh/migrate/receive`.
+async fn mesh_migrate_precopy(
 	State(state): State<MeshRouteState>,
 	request: Request<Body>,
 ) -> RouteResult<Json<Value>> {
@@ -691,15 +712,11 @@ async fn mesh_migrate_receive(
 	let mut body = json_object(request).await?;
 	let digest = take_string(&mut body, "digest");
 	let source_url = take_string(&mut body, "source_url");
-	let params = match body.remove("params") {
-		Some(Value::Object(params)) => params,
-		_ => JsonObject::new(),
-	};
-	let name = string_or(params.get("name"), String::new());
+	let name = take_string(&mut body, "name");
 	if digest.is_empty() || source_url.is_empty() || name.is_empty() {
 		return Err(MeshRouteError::detail(
 			StatusCode::UNPROCESSABLE_ENTITY,
-			"digest, source_url, and params.name are required",
+			"digest, source_url, and name are required",
 		));
 	}
 	if state.engine.has_sandbox(&name) {
@@ -709,7 +726,7 @@ async fn mesh_migrate_receive(
 			format!("sandbox {} already exists on the target node", py_repr(&name)),
 		));
 	}
-	let installed = state
+	state
 		.transfer
 		.pull_template(state.transport.client(), source_url, digest, state.outbound_token.to_string())
 		.await
@@ -717,9 +734,80 @@ async fn mesh_migrate_receive(
 			MeshRouteError::coded(
 				StatusCode::BAD_GATEWAY,
 				"unreachable",
-				format!("failed to pull migration checkpoint: {err}"),
+				format!("failed to pull migration pre-copy checkpoint: {err}"),
 			)
 		})?;
+	Ok(Json(json!({"ok": true})))
+}
+
+/// Live-migration phase 2 receiver: pull the final delta checkpoint, splice
+/// it onto the locally installed pre-copy base, then restore and take
+/// ownership of the sandbox.
+async fn mesh_migrate_receive(
+	State(state): State<MeshRouteState>,
+	request: Request<Body>,
+) -> RouteResult<Json<Value>> {
+	let headers = request.headers().clone();
+	require_mesh_auth(&state, &headers, true)?;
+	let mut body = json_object(request).await?;
+	let digest = take_string(&mut body, "digest");
+	let base_digest = take_string(&mut body, "base_digest");
+	let source_url = take_string(&mut body, "source_url");
+	let params = match body.remove("params") {
+		Some(Value::Object(params)) => params,
+		_ => JsonObject::new(),
+	};
+	let name = string_or(params.get("name"), String::new());
+	if digest.is_empty() || base_digest.is_empty() || source_url.is_empty() || name.is_empty() {
+		return Err(MeshRouteError::detail(
+			StatusCode::UNPROCESSABLE_ENTITY,
+			"digest, base_digest, source_url, and params.name are required",
+		));
+	}
+	if state.engine.has_sandbox(&name) {
+		return Err(MeshRouteError::coded(
+			StatusCode::CONFLICT,
+			"conflict",
+			format!("sandbox {} already exists on the target node", py_repr(&name)),
+		));
+	}
+	let base_dir = cas::lookup(&base_digest).ok().flatten().ok_or_else(|| {
+		MeshRouteError::coded(
+			StatusCode::CONFLICT,
+			"missing_base",
+			"pre-copy checkpoint is not installed on this node; restart the migration",
+		)
+	})?;
+	let installed = state
+		.transfer
+		.pull_template(
+			state.transport.client(),
+			source_url,
+			digest.clone(),
+			state.outbound_token.to_string(),
+		)
+		.await
+		.map_err(|err| {
+			MeshRouteError::coded(
+				StatusCode::BAD_GATEWAY,
+				"unreachable",
+				format!("failed to pull migration delta checkpoint: {err}"),
+			)
+		})?;
+	let delta_dir = PathBuf::from(&installed);
+	tokio::task::spawn_blocking(move || splice_delta_checkpoint(&delta_dir, &base_dir))
+		.await
+		.map_err(|err| {
+			MeshRouteError::coded(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"internal",
+				format!("delta splice task failed: {err}"),
+			)
+		})?
+		.map_err(|err| MeshRouteError::coded(StatusCode::CONFLICT, "bad_delta", err.to_string()))?;
+	// The installed delta dir gained the materialized rootfs, so its CAS
+	// pointer no longer matches the directory content.
+	let _ = cas::drop_pointer(&digest);
 	let epoch = to_i64(body.remove("epoch")).unwrap_or(0);
 	let lease_records = map_mesh(
 		state
@@ -742,6 +830,49 @@ async fn mesh_migrate_receive(
 	map_mesh(state.engine.record_volume_leases(&sid, lease_records))?;
 	state.mesh.record_owner(&name, &state.mesh.node_id(), epoch);
 	Ok(Json(restored))
+}
+
+/// Validate a pulled delta checkpoint against its locally installed pre-copy
+/// base and materialize the final `rootfs.img` (base image + block delta).
+///
+/// The RAM delta needs no splicing: the VMM restore walks the delta's `base`
+/// chain, which resolves to the installed base as a sibling of the delta
+/// directory.
+fn splice_delta_checkpoint(delta_dir: &FsPath, base_dir: &FsPath) -> Result<(), EngineError> {
+	let snapshot = vmm::snapshot::read_state(delta_dir)
+		.map_err(|err| EngineError::invalid(format!("unreadable delta checkpoint: {err}")))?;
+	let Some(delta) = snapshot.delta else {
+		return Err(EngineError::invalid("migration checkpoint carries no memory delta"));
+	};
+	let base_name = base_dir.file_name().and_then(OsStr::to_str).unwrap_or("");
+	if delta.base != base_name {
+		return Err(EngineError::invalid(format!(
+			"delta checkpoint chains to {:?} but the installed pre-copy base is {base_name:?}",
+			delta.base
+		)));
+	}
+	if delta_dir.parent() != base_dir.parent() {
+		return Err(EngineError::invalid(
+			"delta checkpoint and pre-copy base are not installed side by side",
+		));
+	}
+	let rootfs = delta_dir.join("rootfs.img");
+	let base_rootfs = base_dir.join("rootfs.img");
+	if !rootfs.is_file() {
+		if !base_rootfs.is_file() {
+			return Err(EngineError::invalid(format!(
+				"pre-copy base {} carries no rootfs.img",
+				base_dir.display()
+			)));
+		}
+		fs::copy(&base_rootfs, &rootfs)?;
+	}
+	let block_delta = delta_dir.join(diskdelta::DISK_DELTA_FILE);
+	if block_delta.is_file() {
+		diskdelta::apply_disk_delta(&block_delta, &rootfs)?;
+		fs::remove_file(&block_delta)?;
+	}
+	Ok(())
 }
 
 async fn mesh_replica_receive(
@@ -1295,25 +1426,70 @@ async fn replicate_record(
 	Ok(())
 }
 
+/// Live ("teleport") migration: stream the bulk checkpoint while the source
+/// keeps running, then suspend, ship only the RAM/disk delta, and resume on
+/// the target. Downtime is bounded by the delta size, not the full image.
 pub(crate) async fn migrate_sandbox_to(
 	state: &MeshRouteState,
 	sandbox_id: String,
 	target: String,
 ) -> RouteResult<Value> {
 	let peer = map_mesh(state.mesh.migration_target(&target))?;
-	let prep = map_mesh(state.engine.migrate_prepare(sandbox_id.clone()).await)?;
+	// Phase 1 (pre-copy): checkpoint the running sandbox and let the target
+	// pull the bulk RAM+disk image; the source resumes right after the dump.
+	let precopy = map_mesh(state.engine.migrate_precopy(sandbox_id.clone()).await)?;
+	let precopy_body = json!({
+		"digest": precopy.digest,
+		"source_url": state.mesh.advertise(),
+		"name": sandbox_id,
+	});
+	if let Err(err) = state
+		.transport
+		.post(
+			&peer.advertise,
+			"/v1/mesh/migrate/precopy",
+			&precopy_body,
+			Some(state.config.create_timeout),
+		)
+		.await
+	{
+		let _ = state
+			.engine
+			.checkpoint_discard(precopy.snapshot_dir.clone(), precopy.digest.clone())
+			.await;
+		return Err(MeshRouteError::coded(
+			StatusCode::BAD_GATEWAY,
+			"unreachable",
+			format!("migration pre-copy to {target} failed (source unaffected): {}", err.message),
+		));
+	}
+	// Phase 2 (suspend + delta): pause the source, capture what changed since
+	// the pre-copy, and stop it exactly at the delta. A finalize failure
+	// leaves the source running.
+	let fin = match state
+		.engine
+		.migrate_finalize(sandbox_id.clone(), precopy.snapshot_dir.clone())
+		.await
+	{
+		Ok(fin) => fin,
+		Err(err) => {
+			let _ = state
+				.engine
+				.checkpoint_discard(precopy.snapshot_dir.clone(), precopy.digest.clone())
+				.await;
+			return Err(MeshRouteError::from(err));
+		},
+	};
 	let epoch = state
 		.mesh
 		.authoritative_owner(&sandbox_id)
 		.map_or(0, |(_, epoch)| epoch)
 		+ 1;
-	let digest = prep.digest.clone();
-	let snapshot_dir = prep.snapshot_dir.clone();
-	let params = prep.params.clone();
 	let receive = json!({
-		"digest": digest,
+		"digest": fin.digest,
+		"base_digest": precopy.digest,
 		"source_url": state.mesh.advertise(),
-		"params": params,
+		"params": fin.params.clone(),
 		"epoch": epoch,
 	});
 	let view = match state
@@ -1330,7 +1506,13 @@ pub(crate) async fn migrate_sandbox_to(
 		Err(err) => {
 			let _ = state
 				.engine
-				.migrate_abort(sandbox_id.clone(), snapshot_dir.clone(), digest.clone(), params.clone())
+				.migrate_abort(
+					sandbox_id.clone(),
+					precopy.digest.clone(),
+					fin.snapshot_dir.clone(),
+					fin.digest.clone(),
+					fin.params.clone(),
+				)
 				.await;
 			return Err(MeshRouteError::coded(
 				StatusCode::BAD_GATEWAY,
@@ -1354,7 +1536,13 @@ pub(crate) async fn migrate_sandbox_to(
 	map_mesh(
 		state
 			.engine
-			.migrate_commit(sandbox_id, snapshot_dir, digest)
+			.migrate_commit(
+				sandbox_id,
+				precopy.snapshot_dir,
+				precopy.digest,
+				fin.snapshot_dir,
+				fin.digest,
+			)
 			.await,
 	)?;
 	Ok(view)
