@@ -181,6 +181,12 @@ impl WarmPool {
 		} else {
 			LaunchSpec::restore(vm.api_sock(), &self.template)
 		};
+		// Pool VMs must not share the template's writable image: overlay it so
+		// each claimed sandbox owns a checkpointable per-VM disk.
+		let base_disk = self.template.join("rootfs.img");
+		if base_disk.is_file() {
+			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
+		}
 		if self.agent {
 			spec = spec.with_agent_sock(vm.dir().join("agent.sock"));
 		}
