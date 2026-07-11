@@ -1,108 +1,71 @@
+from __future__ import annotations
+
 import re
-import stat
 
 import pytest
+from v1_stub import V1StubServer, configure_context
+
+from vmon.sandbox import Sandbox
+from vmon.volume import Volume
 
 
-def test_volume_name_validation():
-    from vmon.volume import Volume
-
+def test_volume_name_validation_and_wire_shape() -> None:
     for name in ["a", "abc123", "a-b", "a.b", "a_b", "a" * 64]:
-        assert Volume(name).name == name
+        volume = Volume(name)
+        assert volume.name == name
+        assert volume.to_wire() == name
+        assert volume.to_wire(read_only=True) == {"name": name, "read_only": True}
 
     for name in ["", "A", "-a", ".a", "a/b", "a b", "a" * 65, None]:
         with pytest.raises(ValueError):
-            Volume(name)
+            Volume(name)  # type: ignore[arg-type]
 
 
-def test_volume_paths_ensure_lock_context_and_list(mvm_home):
-    from vmon.volume import Volume
+def test_volume_create_list_delete_use_v1_volume_resource(monkeypatch, mvm_home) -> None:
+    with V1StubServer() as server:
+        configure_context(monkeypatch, mvm_home, server)
 
-    vol = Volume("data")
-    assert vol.host_dir == mvm_home / "volumes" / "data"
-    assert not vol.host_dir.exists()
-    assert vol.ensure() == vol.host_dir
-    assert vol.host_dir.is_dir()
-    assert stat.S_IMODE(vol.host_dir.stat().st_mode) == 0o700
+        path = Volume("data").ensure()
+        assert path.name == "data"
+        assert server.last("PUT", "/v1/volumes/data").json is None
+        assert Volume.list() == ["data"]
+        assert server.last("GET", "/v1/volumes").headers["authorization"] == "Bearer test-token"
 
-    vol.acquire()
-    assert stat.S_IMODE((vol.host_dir / ".lock").stat().st_mode) == 0o600
-    try:
-        with pytest.raises(RuntimeError):
-            Volume("data").acquire()
-    finally:
-        vol.release()
+        Volume("cache").create()
+        assert Volume.list() == ["cache", "data"]
 
-    second = Volume("data")
-    second.acquire()
-    second.release()
-
-    with Volume("ctx") as ctx:
-        assert ctx.host_dir.is_dir()
-        with pytest.raises(RuntimeError):
-            Volume("ctx").acquire()
-    after_context = Volume("ctx")
-    after_context.acquire()
-    after_context.release()
-
-    Volume("other").ensure()
-    assert Volume.list() == ["ctx", "data", "other"]
+        Volume("data").delete()
+        assert Volume.list() == ["cache"]
+        Volume("cache").rm()
+        assert Volume.list() == []
 
 
-def test_volume_rejects_symlink_paths_and_filters_invalid_entries(mvm_home):
-    from vmon.volume import VOLUME_DIR, Volume
+def test_sandbox_create_mounts_named_volumes_without_host_paths(monkeypatch, mvm_home) -> None:
+    with V1StubServer() as server:
+        configure_context(monkeypatch, mvm_home, server)
 
-    VOLUME_DIR.mkdir()
-    outside = mvm_home / "outside"
-    outside.mkdir()
-    (VOLUME_DIR / "safe").mkdir()
-    (VOLUME_DIR / "bad name").mkdir()
-    (VOLUME_DIR / "link").symlink_to(outside, target_is_directory=True)
+        Sandbox.create(
+            image="python:3.14-slim",
+            context="prod",
+            name="with-volumes",
+            volumes={
+                "/data": Volume("data"),
+                "/readonly": (Volume("snap"), True),
+                "/cache": "cache",
+            },
+        )
 
-    assert Volume.list() == ["safe"]
-    with pytest.raises(ValueError):
-        Volume("link").ensure()
-
-
-def test_warm_pool_teardown_does_not_remove_unowned_vm_dir(tmp_path):
-    import vmon.pool as pool_mod
-
-    outside = tmp_path / "outside"
-    outside.mkdir()
-
-    class FakeVM:
-        dir = outside
-
-        def __init__(self) -> None:
-            self.stopped = False
-            self.removed = False
-
-        def stop(self) -> None:
-            self.stopped = True
-
-        def remove(self) -> None:
-            self.removed = True
-
-    vm = FakeVM()
-    pool_mod.WarmPool._teardown(vm)
-
-    assert vm.stopped
-    assert not vm.removed
-    assert outside.exists()
-
-    root_vm = FakeVM()
-    root_vm.dir = pool_mod._vmm_mod.STATE / "vms"
-    root_vm.dir.mkdir(parents=True)
-    pool_mod.WarmPool._teardown(root_vm)
-    assert root_vm.stopped
-    assert not root_vm.removed
+        create = server.last("POST", "/v1/sandboxes")
+        assert create.json["volumes"] == {
+            "/data": "data",
+            "/readonly": {"name": "snap", "read_only": True},
+            "/cache": "cache",
+        }
+        assert "host_dir" not in str(create.json["volumes"])
+        assert "host_path" not in str(create.json["volumes"])
 
 
-def test_volume_tag_sanitizes_truncates_and_uses_vmm_charset():
-    from vmon.volume import Volume
+def test_volume_tag_sanitizes_truncates_and_uses_vmm_charset() -> None:
+    long_tag = Volume("abc.def-ghi_jkl" * 4).tag
 
-    assert Volume("a-b").tag == "a_b"
-    assert Volume("MiXeD".lower()).tag == "mixed"
-    long_tag = Volume("a" * 64).tag
-    assert len(long_tag) <= 32
     assert re.fullmatch(r"[a-z0-9_]{1,32}", long_tag)

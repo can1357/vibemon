@@ -1,0 +1,72 @@
+//! vmm — the per-VM monitor core: boots a Linux guest with a serial console
+//! and virtio IO. The hypervisor backend is selected at compile time: KVM on
+//! Linux (`x86_64`/aarch64), Apple Hypervisor.framework on macOS (aarch64 /
+//! Apple Silicon).
+//!
+//! The `vmon` binary re-execs itself as `vmon vmm …` for each microVM and
+//! hands the remaining flags to [`run_cli`].
+
+mod arch;
+mod config;
+mod control;
+mod devices;
+mod hv;
+#[cfg(target_os = "linux")]
+mod jail;
+mod layout;
+mod memory;
+mod metrics;
+mod os;
+mod pager;
+pub mod result;
+#[cfg(target_os = "linux")]
+mod sandbox;
+mod snapshot;
+mod tap;
+mod virtio;
+mod vmm;
+
+use config::{Config, LogFormat};
+use tracing_subscriber::EnvFilter;
+
+/// Run the per-VM monitor: parse `args` (flags only, no argv[0]), init
+/// tracing, boot or restore, block until shutdown.
+pub fn run_cli(args: Vec<String>) -> result::Result<()> {
+	if args.first().map(String::as_str) == Some("--print-cpu-baseline") {
+		// Probe only the restore-relevant CPU surface for mesh placement; skip
+		// normal CLI parsing.
+		println!("{}", arch::state::cpu_baseline()?);
+		return Ok(());
+	}
+	let config = Config::from_args(args)?;
+	init_logging(&config)?;
+	vmm::run(config)
+}
+
+/// Probe the restore-relevant CPU baseline for mesh placement and restore
+/// compatibility checks.
+pub fn cpu_baseline() -> result::Result<String> {
+	arch::state::cpu_baseline()
+}
+
+fn init_logging(config: &Config) -> result::Result<()> {
+	let filter = EnvFilter::try_new(&config.log_level)
+		.map_err(|e| result::err(format!("invalid --log-level {}: {e}", config.log_level)))?;
+
+	match config.log_format {
+		LogFormat::Text => {
+			let _ = tracing_subscriber::fmt()
+				.with_env_filter(filter)
+				.with_writer(std::io::stderr)
+				.try_init();
+		},
+		LogFormat::Json => {
+			let _ = tracing_subscriber::fmt()
+				.json()
+				.with_env_filter(filter)
+				.with_writer(std::io::stderr)
+				.try_init();
+		},
+	}
+	Ok(())
+}

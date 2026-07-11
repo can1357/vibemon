@@ -72,7 +72,7 @@ jobs:
         run: cargo test --locked --no-run
 
   python:
-    name: Python
+    name: Python SDK
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -87,20 +87,17 @@ jobs:
       - name: Install Python 3.14
         run: uv python install 3.14
 
-      - name: Install dependencies (dev + server extra)
-        run: uv sync --locked --extra server
-
-      - name: Check formatting
-        run: uv run --no-sync ruff format --check .
+      - name: Install dependencies
+        run: uv sync --locked
 
       - name: Lint
-        run: uv run --no-sync ruff check .
+        run: uv run ruff check
 
       - name: Type check
-        run: uv run --no-sync mypy
+        run: uv run mypy
 
       - name: Test
-        run: uv run --no-sync pytest
+        run: uv run pytest
 
   ui:
     name: Web UI
@@ -126,3 +123,25 @@ jobs:
 
       - name: Type check
         run: bun run typecheck
+
+  sdk-ts:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/ts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test

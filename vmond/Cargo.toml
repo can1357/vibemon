@@ -1,0 +1,37 @@
+[package]
+name = "vmond"
+version = "0.1.0"
+edition = "2024"
+description = "Vibemon server core: engine, image pipeline, v1 HTTP API, mesh"
+
+[lib]
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+flume = { version = "0.11", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+hex = "0.4"
+include_dir = "0.7"
+libc = "0.2"
+parking_lot = "0.12.5"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "signal", "io-util", "time", "sync", "fs", "macros"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+utoipa = "5"
+vmm = { path = "../vmm" }
+vmon-agent = { path = "../agent" }
+
+[dev-dependencies]
+tempfile = "3"

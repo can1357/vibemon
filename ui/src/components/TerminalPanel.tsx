@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { execWsUrl } from "../api.ts";
+import { b64ToBytes, eofFrame, execStartFrame, execWsUrl, resizeFrame, stdinFrame } from "../api.ts";
 
 type XtermDisposable = { dispose: () => void };
 
@@ -74,7 +74,7 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
       ws.onclose = null;
       if (sendCloseStdin && ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(JSON.stringify({ close_stdin: true }));
+          ws.send(eofFrame());
         } catch {
           /* closing */
         }
@@ -87,13 +87,12 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
   }
 
   function writeStdin(ws: WebSocket, data: string): void {
-    if (wsRef.current === ws && ws.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify({ stdin: data }));
+    if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) ws.send(stdinFrame(data));
   }
 
   function sendResize(term: Terminal, ws = wsRef.current): void {
     if (ws && wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ resize: { rows: term.rows, cols: term.cols } }));
+      ws.send(resizeFrame(term.rows, term.cols));
     }
   }
 
@@ -111,7 +110,7 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
     term.reset();
     term.writeln(`\x1b[36m[vmon] connecting to ${sandboxId} …\x1b[0m`);
 
-    const ws = new WebSocket(execWsUrl(sandboxId, argv));
+    const ws = new WebSocket(execWsUrl(sandboxId));
     let reportedError = false;
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
@@ -121,6 +120,7 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
         ws.close();
         return;
       }
+      ws.send(execStartFrame(argv, true));
       setConnected(true);
       term.writeln("\x1b[36m[vmon] connected\x1b[0m");
       term.focus();
@@ -132,7 +132,7 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
     ws.onmessage = (ev) => {
       if (wsRef.current !== ws || !mountedRef.current) return;
       if (ev.data instanceof ArrayBuffer) {
-        term.write(new TextDecoder().decode(new Uint8Array(ev.data)));
+        term.write(new Uint8Array(ev.data));
         return;
       }
       let payload: Record<string, unknown>;
@@ -141,10 +141,22 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
       } catch {
         return;
       }
-      if (typeof payload.stream === "string") term.write(String(payload.data ?? ""));
-      else if (typeof payload.exit === "number") {
+      if (typeof payload.stream === "string" && typeof payload.b64 === "string") {
+        term.write(b64ToBytes(payload.b64));
+      } else if (typeof payload.exit === "number") {
         term.writeln(`\x1b[36m[vmon] process exited with code ${payload.exit}\x1b[0m`);
         setConnected(false);
+      } else if (typeof payload.error === "object" && payload.error !== null) {
+        const err = payload.error as { code?: unknown; message?: unknown };
+        const message =
+          typeof err.message === "string"
+            ? typeof err.code === "string"
+              ? `${err.code}: ${err.message}`
+              : err.message
+            : JSON.stringify(payload.error);
+        reportedError = true;
+        term.writeln(`\x1b[31m[vmon] ${message}\x1b[0m`);
+        setError(message);
       } else if (typeof payload.error === "string") {
         reportedError = true;
         term.writeln(`\x1b[31m[vmon] ${payload.error}\x1b[0m`);

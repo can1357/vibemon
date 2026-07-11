@@ -10,12 +10,13 @@ permissions:
 
 jobs:
   mesh-soak:
-    name: Mesh netem soak
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    name: Rust cluster netem soak
+    runs-on: [self-hosted, kvm, x64]
+    timeout-minutes: 180
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
+      SOAK_ITERATIONS: "10"
       # Pin the guest kernel to the fetched test asset; otherwise default_kernel()
       # falls back to the runner's own /boot/vmlinuz-*, which is root-only (0600).
       VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
@@ -26,9 +27,5 @@ jobs:
       - name: Prepare KVM host
         uses: ./.github/actions/kvm-host
 
-      - name: Sync Python dependencies
-        working-directory: python
-        run: uv sync --locked --extra server
-
-      - name: Run mesh netem soak
+      - name: Run Rust cluster netem soak
         run: demo/mesh-soak.sh

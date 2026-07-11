@@ -56,7 +56,8 @@ else
 fi
 
 KERNEL_PATH=${KERNEL_PATH:-"$ASSET_DIR/$KERNEL_NAME"}
-INITRAMFS_VERSION=${INITRAMFS_VERSION:-"2026-07-02.1-$ARCH"}
+# The guest agent baked into the initramfs (agent smoke tests skip when absent).
+SMOKE_AGENT=${VMON_SMOKE_AGENT:-"$ASSET_DIR/vmon-agent-$ARCH"}
 ROOTFS_SIZE=${ROOTFS_SIZE:-"64M"}
 ROOTFS_VERSION=${ROOTFS_VERSION:-"2026-06-26.2-$ARCH"}
 
@@ -113,6 +114,15 @@ calc_sha256() {
   fi
   printf '%s\n' "$sum"
 }
+
+# The initramfs bakes in the guest agent when present, so the agent content
+# participates in the cache key: rebuilding the agent regenerates the image.
+if [ -z "${INITRAMFS_VERSION:-}" ]; then
+  INITRAMFS_VERSION="2026-07-06.2-$ARCH"
+  if [ -f "$SMOKE_AGENT" ]; then
+    INITRAMFS_VERSION="$INITRAMFS_VERSION-a$(calc_sha256 "$SMOKE_AGENT" | cut -c1-12)"
+  fi
+fi
 
 verify_sha256() {  # verify_sha256 <path> <expected-sha256> <label>
   local path=$1 expected=$2 label=$3 actual
@@ -431,6 +441,98 @@ case "$mode" in
     exec /bin/sh
     ;;
 
+  rootfs_ro)
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -e /dev/vda ] && break
+      sleep 1
+    done
+    [ -e /dev/vda ] || fail "wait for /dev/vda"
+    # The kernel silently downgrades a rw mount of a read-only virtio-blk
+    # device to ro, so assert the device-level RO flag and a failing write
+    # instead of a failing mount.
+    ro=$(cat /sys/block/vda/ro 2>/dev/null)
+    [ "$ro" = 1 ] || fail "/sys/block/vda/ro is '$ro', expected 1"
+    mount -t ext4 /dev/vda /mnt || fail "mount /dev/vda"
+    marker=$(cat /mnt/MARKER.txt 2>/dev/null) || fail "read /mnt/MARKER.txt"
+    [ "$marker" = "vmon rootfs fixture" ] || fail "unexpected MARKER.txt: $marker"
+    if echo deny > /mnt/DENY.txt 2>/dev/null; then
+      fail "write to read-only rootfs unexpectedly succeeded"
+    fi
+    umount /mnt || fail "umount ro rootfs"
+    echo "ROOTFS_RO_OK"
+    finish
+    ;;
+
+  mac)
+    iface=
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      for dev in /sys/class/net/*; do
+        [ -d "$dev" ] || continue
+        name=${dev##*/}
+        [ "$name" = lo ] && continue
+        iface=$name
+        break
+      done
+      [ -n "$iface" ] && break
+      sleep 1
+    done
+    [ -n "$iface" ] || fail "no non-loopback network interface"
+    ip link set "$iface" up || fail "bring up $iface"
+    mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null) || fail "read $iface MAC"
+    echo "MAC=$mac"
+    finish
+    ;;
+
+  fsshare)
+    tag=$(cmdline_get vmon.fs_tag host)
+    if ! out=$(mount -t virtiofs "$tag" /mnt 2>&1); then
+      case "$out" in
+        *"No such device"*) echo "FSSHARE_NODEV"; finish ;;
+      esac
+      fail "mount virtiofs $tag: $out"
+    fi
+    share=$(cat /mnt/SHARE.txt 2>/dev/null) || fail "read /mnt/SHARE.txt"
+    [ "$share" = "vmon share fixture" ] || fail "unexpected SHARE.txt: $share"
+    if echo deny > /mnt/DENY.txt 2>/dev/null; then
+      fail "write to read-only virtiofs share unexpectedly succeeded"
+    fi
+    echo "FSSHARE_OK"
+    finish
+    ;;
+
+  volume)
+    mkdir -p /data /ro
+    if ! out=$(mount -t virtiofs data /data 2>&1); then
+      case "$out" in
+        *"No such device"*) echo "VOLUME_NODEV"; finish ;;
+      esac
+      fail "mount virtiofs data: $out"
+    fi
+    printf 'hello' > /data/OUT.txt || fail "write /data/OUT.txt"
+    sync || fail "sync volume write"
+    echo "VOLUME_OK"
+    mount -t virtiofs snap /ro || fail "mount virtiofs snap"
+    if echo deny > /ro/DENY.txt 2>/dev/null; then
+      fail "write to read-only volume unexpectedly succeeded"
+    fi
+    echo "VOLUME_RO_OK"
+    finish
+    ;;
+
+  agent)
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -c /dev/hvc0 ] && break
+      sleep 1
+    done
+    [ -c /dev/hvc0 ] || fail "wait for /dev/hvc0"
+    if [ ! -x /usr/bin/vmon-agent ]; then
+      echo "AGENT_MISSING"
+      finish
+    fi
+    echo "AGENT_INIT_OK"
+    exec /usr/bin/vmon-agent
+    ;;
+
   *)
     fail "unknown vmon.test mode: $mode"
     ;;
@@ -508,6 +610,14 @@ build_initramfs() {
     root="$TMP_DIR/root"
     install_busybox_tree "$root"
     write_test_init "$root/init"
+    if [ -f "$SMOKE_AGENT" ]; then
+      echo "[assets] initramfs: embedding guest agent $SMOKE_AGENT"
+      mkdir -p "$root/usr/bin"
+      cp "$SMOKE_AGENT" "$root/usr/bin/vmon-agent"
+      chmod 0755 "$root/usr/bin/vmon-agent"
+    else
+      echo "[assets] notice: no guest agent at $SMOKE_AGENT; agent smoke tests will skip (build with 'just agent-musl')"
+    fi
     # Make the cpio stable enough that a rebuild changes only when contents do.
     find "$root" -exec touch -h -d '@0' {} + 2>/dev/null || true
     tmp_img="$ASSET_DIR/.initramfs.cpio.gz.$$"

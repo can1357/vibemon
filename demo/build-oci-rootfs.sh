@@ -21,9 +21,9 @@
 #   build-oci-rootfs.sh                                    # busybox -> default
 #   build-oci-rootfs.sh docker://alpine:3.20 /tmp/alpine.img 512M
 #
-# The produced image is meant to be handed to vmon as the root disk:
-#   vmon --kernel <Image> --rootfs <out-img> \
-#           --cmdline "console=ttyS0 root=/dev/vda rw rdinit=/init"
+# The produced image is meant to be handed to the low-level VMM subcommand:
+#   vmon vmm --kernel <Image> --rootfs <out-img> \
+#            --cmdline "console=ttyS0 root=/dev/vda rw rdinit=/init"
 #
 # Warm-boot fast path (Phase 4): boot a microVM on this image to
 # "userspace up, guest-agent waiting", `snapshot` that VM as the template, then
@@ -135,4 +135,4 @@ rm -f "$OUT_IMG"
 # 5) report the result
 echo "[oci] done:"
 ls -lh "$OUT_IMG"
-echo "[oci] serve it with: vmon --rootfs $OUT_IMG --cmdline \"console=ttyS0 root=/dev/vda rw rdinit=/init\""
+echo "[oci] serve it with: vmon vmm --rootfs $OUT_IMG --cmdline \"console=ttyS0 root=/dev/vda rw rdinit=/init\""

@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .core import state_dir
-
 __all__ = [
     "LOCAL",
     "Context",
@@ -26,6 +24,11 @@ LOCAL = "local"
 
 #: Context names double as credential filenames; keep them path-safe.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def state_dir() -> Path:
+    """Return the vmon state directory without importing server internals."""
+    return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 
 
 def _require_safe_name(name: str) -> str:

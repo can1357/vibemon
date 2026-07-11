@@ -60,3 +60,54 @@ fn user_net_rejected_off_macos() {
 fn pci_transport_rejected_off_x86_64() {
 	assert_cli_rejects(&["--kernel", "k", "--transport", "pci"], "only supported on x86_64");
 }
+
+/// The volume fanout is hard-capped at 8 mounts.
+#[test]
+fn ninth_volume_rejected() {
+	let volumes: Vec<String> = (1..=9).map(|i| format!("tag{i}:/srv/v{i}")).collect();
+	let mut args = vec!["--kernel".to_string(), "k".to_string()];
+	for volume in &volumes {
+		args.push("--volume".to_string());
+		args.push(volume.clone());
+	}
+	let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+	assert_cli_rejects(&refs, "at most 8 --volume mounts are supported");
+}
+
+/// Volume tags are guest mount tags and must be unique.
+#[test]
+fn duplicate_volume_tag_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--volume", "dup:/srv/a", "--volume", "dup:/srv/b"],
+		"--volume tags must be unique",
+	);
+}
+
+/// A virtio-fs share needs both the guest tag and the host directory.
+#[test]
+fn fs_tag_without_dir_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--fs-tag", "host"],
+		"--fs-tag and --fs-dir must be used together",
+	);
+}
+
+/// cgroup limits only exist inside the jail.
+#[test]
+fn cgroup_flag_without_jail_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--cgroup-pids-max", "64"],
+		"--cgroup-cpu-max/--cgroup-mem-max/--cgroup-pids-max require --jail",
+	);
+}
+
+/// A cold-boot `--agent-exec` hand-off waits for agent readiness on the agent
+/// channel, so it needs `--agent-sock`; warm boots (`--restore`/`--fork-from`)
+/// deliver immediately and are exempt.
+#[test]
+fn cold_agent_exec_without_agent_sock_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--agent-exec", "id"],
+		"--agent-exec on a cold boot requires --agent-sock",
+	);
+}

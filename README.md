@@ -4,7 +4,7 @@
 
 # Vibemon
 
-`vmon` is a small KVM/HVF-based virtual machine monitor for Linux guests. It boots containers as hardware-isolated microVMs, snapshots them to disk, and forks copy-on-write clones in milliseconds — pairing a Rust VMM core with a Docker-like Python CLI, a Modal-style sandbox SDK, a daemon, a REST/WebSocket server, and a React web panel.
+`vmon` is a small KVM/HVF-based virtual machine monitor for Linux guests. It boots containers as hardware-isolated microVMs, snapshots them to disk, and forks copy-on-write clones in milliseconds — now owned end-to-end by a single Rust binary: the user CLI, `vmon serve` server, and low-level `vmon vmm` monitor.
 
 <p align="center">
   <img src="assets/lifecycle.png" alt="Snapshot, restore, and fork lifecycle" width="100%" />
@@ -13,27 +13,24 @@
 ## Quickstart
 
 ```sh
-# Build the Rust VMM binary
-just release                      # target/release/vmm
-
-# Install the Python CLI + SDK
-pip install -e python/
+# Build the single Rust binary
+just release                      # target/release/vmon
 
 # Run a container as a microVM (Linux/KVM, or Apple-silicon macOS/HVF)
-vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
+./target/release/vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
 # Snapshot, warm-boot, and fork
-vmon snapshot myvm tpl --stop
-vmon restore tpl --name warm      # ~120 ms
-vmon fork tpl --count 5           # ~3 ms per CoW clone
+./target/release/vmon snapshot myvm tpl --stop
+./target/release/vmon restore tpl --name warm      # ~120 ms
+./target/release/vmon fork tpl --count 5           # ~3 ms per CoW clone
 ```
 
-The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch just the web panel + REST API (any platform):
+The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch the embedded web panel + REST API (any platform):
 
 ```sh
-cd ui && bun install && bun run build
-cd ../python && pip install -e '.[server]'
-vmon serve --host 127.0.0.1 --port 8000 --token secret
+cd ui && bun install && bun run build   # writes vmond/web/
+cd ..
+./target/release/vmon serve --host 127.0.0.1 --port 8000 --token secret
 # open http://127.0.0.1:8000
 ```
 
@@ -43,16 +40,15 @@ vmon serve --host 127.0.0.1 --port 8000 --token secret
   <img src="assets/architecture.png" alt="Vibemon runtime architecture" width="100%" />
 </p>
 
-Five runtime layers. The Python daemon spawns one Rust `vmon` process per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
+The single Rust `vmon` binary has three roles: the user-facing CLI, `vmon serve` (the Rust server from the `vmond` crate), and `vmon vmm` (the per-VM monitor from the `vmm` crate). The server owns the sandbox registry and spawns one `vmon vmm` child per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
 
 ```
-Web UI (React SPA)
-   │ HTTP / WebSocket
-vmon serve (FastAPI, server/ package)
-   │ Unix socket  $VMON_HOME/vmond.sock
-vmond (daemon.py) ──> Engine (core.py, single registry owner)
-   │ spawns subprocess per VM, --api-sock JSON control socket
-vmm binary (Rust VMM)
+Web UI / Rust CLI / Python SDK / TypeScript SDK
+   │ HTTP / WebSocket (or local HTTP-over-UDS)
+vmon serve (Rust axum API, vmond crate)
+   │ Engine registry, image pipeline, pools, mesh, volumes
+   │ spawns `vmon vmm ... --api-sock <sock>` per VM
+vmon vmm (Rust VMM crate)
    │ virtio-console, length-prefixed binary frames
 vmon-agent (guest agent, Linux guest only)
 ```
@@ -73,7 +69,7 @@ vmon-agent (guest agent, Linux guest only)
 | UEFI firmware | QEMU/EDK2 firmware supplied by the operator | Pass `--boot-mode uefi --firmware <path>`; vmon does not vendor firmware blobs. |
 | Devices | serial console, virtio-blk, virtio-net, virtio-console agent, virtio-rng, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. The default aarch64 kernel includes virtio-fs; x86_64/firecracker and custom non-virtiofs kernels lack it. Snapshot/restore covers MMIO/PCI virtio state, virtio-fs inode/mode state, and macOS user-net libslirp state; host-side TCP flows reset after user-net restore. Named volumes are re-attached by host path locally and are lease-protected on mesh writable mounts. |
 
-Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. KVM and HVF guest-boot coverage live in the self-hosted integration workflow, and `mesh-soak.yml` runs the nightly three-node tc-netem soak.
+Fast CI runs Rust formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. It also checks the thin Python SDK, the web UI, and the TypeScript SDK. KVM and HVF guest-boot coverage live in the integration workflow, and `mesh-soak.yml` loops the Rust cluster e2e suite under host-level netem.
 
 ## Build
 
@@ -81,11 +77,11 @@ Fast CI runs formatting, check, clippy, tests, aarch64 check/clippy, and `cargo 
 just release
 ```
 
-The resulting binary is `target/release/vmm` unless `CARGO_TARGET_DIR` or Cargo `build.target-dir` redirects the target directory. On macOS 15+ Apple Silicon, `just build` and `just release` automatically ad-hoc codesign the binary with `hvf.entitlements`, which grants `com.apple.security.hypervisor` (the only entitlement ad-hoc signing can carry; restricted entitlements such as `com.apple.vm.networking` cause the kernel to refuse to launch an ad-hoc-signed binary). The entitlement-free `--net user` backend also needs native `libslirp` + `pkg-config` installed locally, for example `brew install libslirp pkg-config`. If building by hand on macOS, run:
+The resulting binary is `target/release/vmon` unless `CARGO_TARGET_DIR` or Cargo `build.target-dir` redirects the target directory. On macOS 15+ Apple Silicon, `just build` and `just release` automatically ad-hoc codesign the binary with `hvf.entitlements`, which grants `com.apple.security.hypervisor` (the only entitlement ad-hoc signing can carry; restricted entitlements such as `com.apple.vm.networking` cause the kernel to refuse to launch an ad-hoc-signed binary). The entitlement-free `--net user` backend also needs native `libslirp` + `pkg-config` installed locally, for example `brew install libslirp pkg-config`. If building by hand on macOS, run:
 
 ```sh
 cargo build --release
-codesign --sign - --entitlements hvf.entitlements --force target/release/vmm
+codesign --sign - --entitlements hvf.entitlements --force target/release/vmon
 ```
 
 `--net user` works on macOS/HVF without `com.apple.vm.networking`; `--tap` still requires host vmnet-style networking support and fails clearly on the ad-hoc-signed binary.
@@ -95,7 +91,7 @@ codesign --sign - --entitlements hvf.entitlements --force target/release/vmm
 Boot a Linux kernel with an initramfs:
 
 ```sh
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
@@ -104,7 +100,7 @@ sudo ./target/release/vmm \
 Boot with a virtio-blk root disk:
 
 ```sh
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --rootfs <disk.img> \
   --cmdline "console=ttyS0 root=/dev/vda rw"
@@ -113,7 +109,7 @@ sudo ./target/release/vmm \
 Add a virtio-net device after creating a Linux TAP interface (Linux/KVM only for `--tap`):
 
 ```sh
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --tap tap0 \
@@ -123,7 +119,7 @@ sudo ./target/release/vmm \
 On macOS/HVF without `com.apple.vm.networking`, use entitlement-free user-mode NAT instead:
 
 ```sh
-./target/release/vmm \
+./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --net user \
@@ -133,7 +129,7 @@ On macOS/HVF without `com.apple.vm.networking`, use entitlement-free user-mode N
 Use the JSON control socket for pause/resume/snapshot/quit:
 
 ```sh
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --api-sock /tmp/vmon/control.sock \
@@ -153,14 +149,14 @@ printf '%s\n' \
 Restore or fork a snapshot:
 
 ```sh
-sudo ./target/release/vmm --restore /tmp/vmon-snapshots/demo
-sudo ./target/release/vmm --fork-from /tmp/vmon-snapshots/demo --count 4
+sudo ./target/release/vmon vmm --restore /tmp/vmon-snapshots/demo
+sudo ./target/release/vmon vmm --fork-from /tmp/vmon-snapshots/demo --count 4
 ```
 
 Use PCI virtio transport on x86_64 only:
 
 ```sh
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --transport pci \
@@ -176,7 +172,7 @@ VMON_AARCH64_UEFI=/path/to/QEMU_EFI.fd
 # x86_64: point this at an OVMF_CODE.fd/EDK2 firmware image.
 VMON_X86_UEFI=/path/to/OVMF_CODE.fd
 
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --boot-mode uefi \
   --firmware "$VMON_X86_UEFI" \
   --rootfs <uefi-bootable-disk.img> \
@@ -191,14 +187,14 @@ Expose host directories with virtio-fs:
 
 ```sh
 # Read-only shared directory.
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --fs-tag shared --fs-dir /path/to/share \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 
 # Named volume, writable by default. Add :ro for a read-only volume.
-sudo ./target/release/vmm \
+sudo ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
   --volume data:/var/lib/vmon-volumes/data \
@@ -210,7 +206,7 @@ Snapshots record the virtio-fs mode in the v2 snapshot format and are tagged wit
 
 ### Production platform flags
 
-The CLI accepts the production lifecycle, agent, jail, networking, and logging flags used by the SDK and server:
+The low-level `vmon vmm` subcommand accepts the production lifecycle, agent, jail, networking, and logging flags used by the SDK and server:
 
 - `--snapshot-root <dir>`: root for named JSON lifecycle snapshots.
 - `--timeout-secs <n>`: VMM-enforced wall-clock deadline, from 1 second to 24 hours. On timeout the VMM writes `status.json` with `reason:"timeout"` and return code `124`.
@@ -231,22 +227,21 @@ The CLI accepts the production lifecycle, agent, jail, networking, and logging f
 
 ## Self-hosted sandbox API
 
-The Python package adds a Modal-style `Sandbox` SDK and a FastAPI server on top of the VMM. The SDK keeps the VMM features available directly.
-
-The user-facing `vmon` CLI is a thin Docker-like client: it talks to a zero-config local daemon (`vmond`) over a Unix socket at `~/.vmon/vmond.sock`, auto-started on first use. The daemon is the single owner of `~/.vmon` — it holds the VM registry, rehydrates VMs from disk on restart, and spawns one VMM process per microVM, so you never type the VMM's flags by hand (`vmon run`/`ps`/`logs`/`exec`/`stop` route through the daemon, like `docker` ↔ `dockerd` ↔ `runc`). `vmon serve` is the same single-owner process plus a FastAPI HTTP/web gateway over the **same** engine, so the CLI and the REST API share one registry. The engine, daemon, and client are stdlib-only (`pip install vmon`); FastAPI/uvicorn stay in the optional `[server]` extra used only by `vmon serve`.
+The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine, serves the v1 HTTP/WebSocket API, embeds the React panel from `vmond/web/`, and also exposes the local HTTP-over-UDS endpoint the CLI and SDKs use. The top-level CLI (`vmon run`, `ps`, `logs`, `exec`, `stop`, `mesh`, `context`, and friends) is Rust code in the same binary; `vmon vmm` remains the low-level escape hatch for direct kernel/rootfs boots.
 
 | Command | What it does |
 | --- | --- |
-| `vmon doctor` | Prints the local prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
-| `vmon completion [bash|zsh|fish]` | Prints a sourceable Click shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
+| `vmon doctor` | Prints the local prerequisite checklist (vmon binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, guest agent, daemon, and host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
+| `vmon completion [bash|zsh|fish]` | Prints a sourceable shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
+| `vmon openapi` | Prints the generated OpenAPI document used by SDK generation and API smoke tests. |
+
+The Python package is now only a thin client SDK for that Rust API. It contains transport, context, sandbox, secret, volume, and WebSocket frame helpers; it does not ship a CLI, daemon, server, web bundle, guest-agent bundle, or Python VMM implementation.
 
 ```python
-from vmon.sandbox import Sandbox
-from vmon.secret import Secret
-from vmon.volume import Volume
+from vmon import Sandbox, Secret, Volume
 
 sb = Sandbox.create(
-    template="base",
+    image="alpine",
     timeout_secs=300,
     volumes={"/data": Volume("agent_data")},
     secrets=[Secret.from_env("TOKEN"), Secret.from_dict({"MODE": "ci"})],
@@ -256,42 +251,22 @@ sb = Sandbox.create(
     pool_size=2,
 )
 
-proc = sb.exec("bash", pty=True)
-proc.resize(40, 120)
+proc = sb.exec("sh", "-c", "echo hello from the guest", pty=True)
+rc = proc.wait()
+print(proc.stdout.read().decode(), rc)
 
 image = sb.snapshot_filesystem("img1")      # default TTL: 30 days
 clone = Sandbox.create(template=image)
 same = Sandbox.from_id(sb.name)
 ```
 
-Named volumes persist outside snapshots and are protected by a single-writer host lock. Secrets are merged into exec environments and are not written to VM metadata. `Sandbox.create` also accepts `block_network`, CIDR `egress_allow`, DNS-pinned `egress_allow_domains`, and `inbound_cidr_allowlist`; the domain allowlist is resolved to IP rules and is not live TLS-SNI filtering.
+Named volumes persist outside snapshots and are protected by the Rust server's single-writer host lock (or mesh lease on clustered writable mounts). Secrets are merged into exec environments and are not written to VM metadata. `Sandbox.create` also accepts `block_network`, CIDR `egress_allow`, DNS-pinned `egress_allow_domains`, `inbound_cidr_allowlist`, `ha`, and `arch`; the domain allowlist is resolved to IP rules and is not live TLS-SNI filtering.
 
 Exposed ports are available through `sb.tunnels()`. `sb.create_connect_token()` creates a bearer token for the REST proxy at `/v1/sandboxes/{id}/ports/{port}/...`. Runtime deadlines can be extended through `Sandbox.extend(secs)` or `POST /v1/sandboxes/{id}/extend`; `poll()` and `returncode` report the entry process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for terminate.
 
-`Sandbox.create(template=..., pool_size=N)` keeps pre-forked copy-on-write clones ready and falls back to cold restore when the pool is empty. `Sandbox.aio.*` mirrors the synchronous SDK with thread-backed async methods. The REST API covers create/list/filter by tag (`GET /v1/sandboxes?tag=k:v`), exec and pty WebSocket exec, snapshots, network policy, tunnels, lifecycle events (`GET /v1/events` as SSE), metrics, and OpenAPI docs through FastAPI.
+`Sandbox.create(template=..., pool_size=N)` keeps pre-forked copy-on-write clones ready and falls back to cold restore when the pool is empty. `Sandbox.aio.*` mirrors the synchronous SDK with thread-backed async methods. Remote functions (`@vmon.function`) are client-side packaging helpers layered over the same create/exec API: arguments and return values must be JSON-serializable, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
 
-Remote functions use `@vmon.function(...)` to ship a source-defined Python function, plus the module-level imports, helpers, and literal constants it references, into a `python:3.14-slim` guest. Use `.remote(...)` for one call or `.map(iterable, concurrency=N)` / `.starmap(..., concurrency=N)` for parallel calls across a temporary sandbox pool; arguments and return values must be JSON-serializable, the function must not close over local variables, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
-
-```python
-import math
-import vmon
-
-RF_CONST = 7
-
-def triple(n: int) -> int:
-    return n * 3
-
-@vmon.function(block_network=True)
-def compute(x: int) -> dict[str, int]:
-    print(f"remote x={x}")
-    return {"isqrt": math.isqrt(x), "tripled": triple(x), "const": RF_CONST}
-
-print(compute.remote(16))
-print(compute.map([1, 4, 9]))
-compute.terminate()
-```
-
-The Python `vmon` wrapper has separate usage notes in [`python/README.md`](python/README.md), and a practical copy-paste guide is in [`MANUAL.md`](MANUAL.md).
+The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install + typecheck and `just sdk-ts-smoke` for the smoke tests.
 
 ## Cluster
 
@@ -441,7 +416,7 @@ Run `vmon serve --tls-cert PATH --tls-key PATH` (or set `VMON_TLS_CERT` and `VMO
 
 ### Testing the cluster
 
-`just cluster-e2e` runs the gated cluster end-to-end suite on KVM/HVF hosts; `VMON_CLUSTER_E2E=1` enables the Python cluster tests. The nightly `mesh-soak.yml` workflow runs a three-node tc-netem soak, and the fault/invariant tests cover the failure-mode contracts without booting guests.
+`just cluster-e2e` runs the gated Rust cluster end-to-end suite on KVM/HVF hosts (`VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1`). The nightly `mesh-soak.yml` workflow loops the same Rust suite under host-level tc-netem, and the fault/invariant tests cover the failure-mode contracts without booting guests.
 
 ### Security
 
@@ -463,7 +438,7 @@ The same Rust integration suite under `tests/` runs end-to-end against each supp
 | macOS host | HVF, aarch64 (Apple Silicon) | `just integration` | user-mode NAT (`--net user`) |
 | Lima on macOS | KVM, aarch64 (nested) | `just lima-integration` | TAP (`--tap`) |
 
-Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The recipes set it for you, fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `vmlinux` or aarch64 `Image` for the host), and on macOS route each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmm` with the hypervisor entitlement immediately before it runs (Cargo re-copies the unsigned binary on every invocation, so signing earlier is lost). Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
+Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The recipes set it for you, fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `vmlinux` or aarch64 `Image` for the host), and on macOS route each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmon` with the hypervisor entitlement immediately before it runs (Cargo re-copies the unsigned binary on every invocation, so signing earlier is lost). Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
 
 What each environment exercises:
 
@@ -481,7 +456,7 @@ The checked-in demos are host-side scripts. They expect Linux tooling listed in 
 
 ```sh
 # On an arm64 Linux host with /dev/kvm: boot a busybox initramfs with virtio-blk and virtio-net.
-VMON_BIN=./target/release/vmm demo/run-arm64-demo.sh [arm64-Image]
+VMON_BIN=./target/release/vmon demo/run-arm64-demo.sh [arm64-Image]
 
 # From macOS/Apple silicon: run the arm64 demo inside a Lima VM with nested KVM enabled.
 limactl start --vm-type=vz --set='.nestedVirtualization=true' --name=kvm template:default

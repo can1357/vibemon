@@ -28,43 +28,43 @@ find_vmm() {
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
   # Resolve cargo's target dir (honors .cargo/config build.target-dir and
-  # $CARGO_TARGET_DIR), mirroring python/vmon/vmm.py::_cargo_target_dir so the
-  # demo finds the same binary find_binary() does.
+  # $CARGO_TARGET_DIR), matching the places the Rust CLI and just recipes use
+  # so the demo finds the same vmon binary.
   td="${CARGO_TARGET_DIR:-}"
   [ -n "$td" ] || td=$(cd "$proj" && cargo metadata --no-deps --format-version 1 2>/dev/null \
     | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null || true)
   [ -n "$td" ] || td="$proj/target"
   if [ "$HOST_OS" = "Darwin" ]; then
     for c in \
-      "$td"/release/vmm "$td"/debug/vmm \
-      "$td"/aarch64-apple-darwin/release/vmm "$td"/aarch64-apple-darwin/debug/vmm \
-      "$proj"/target/*/vmm \
-      "$(command -v vmm 2>/dev/null || true)"; do
+      "$td"/release/vmon "$td"/debug/vmon \
+      "$td"/aarch64-apple-darwin/release/vmon "$td"/aarch64-apple-darwin/debug/vmon \
+      "$proj"/target/*/vmon \
+      "$(command -v vmon 2>/dev/null || true)"; do
       [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
     done
     return 1
   fi
   for c in \
-    "$proj/target/aarch64-unknown-linux-gnu/release/vmm" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmm" \
-    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
-    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
-    "$(command -v vmm 2>/dev/null || true)"; do
+    "$proj/target/aarch64-unknown-linux-gnu/release/vmon" \
+    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmon" \
+    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
+    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
+    "$(command -v vmon 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
 BIN=$(find_vmm) || {
   if [ "$HOST_OS" = "Darwin" ]; then
-    echo "error: vmm binary not found. Build the ad-hoc-signed HVF binary with:" >&2
+    echo "error: vmon binary not found. Build the ad-hoc-signed HVF binary with:" >&2
     echo "  just build" >&2
   else
-    echo "error: vmm binary not found. Build it with:" >&2
+    echo "error: vmon binary not found. Build it with:" >&2
     echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
   fi
-  echo "or set VMON_BIN=/path/to/vmm" >&2; exit 1
+  echo "or set VMON_BIN=/path/to/vmon" >&2; exit 1
 }
-echo "[demo] vmm: $BIN"
+echo "[demo] vmon: $BIN"
 
 KERNEL=${1:-${VMON_KERNEL:-}}
 if [ -z "$KERNEL" ]; then
@@ -167,18 +167,18 @@ set +e
 if [ "$HOST_OS" = "Darwin" ]; then
   CMDLINE="console=ttyS0 earlycon=uart8250,mmio,0x9000000 root=/dev/vda rw init=/vmon-init.sh reboot=t panic=-1 sysrq_always_enabled=1"
   if command -v timeout >/dev/null 2>&1; then
-    timeout 90 "$BIN" \
+    timeout 90 "$BIN" vmm \
       --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
       --cmdline "$CMDLINE" 2>&1 | tee "$LOG"
     status=${PIPESTATUS[0]}
   else
-    "$BIN" \
+    "$BIN" vmm \
       --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
       --cmdline "$CMDLINE" 2>&1 | tee "$LOG"
     status=${PIPESTATUS[0]}
   fi
 else
-  sudo timeout 90 "$BIN" \
+  sudo timeout 90 "$BIN" vmm \
     --kernel "$KERNEL" --rootfs "$WORK/ubuntu.img" --mem 1024 --cpus 2 \
     --cmdline "console=ttyS0 root=/dev/vda rw init=/vmon-init.sh reboot=t panic=-1 sysrq_always_enabled=1" 2>&1 | tee "$LOG"
   status=${PIPESTATUS[0]}

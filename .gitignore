@@ -25,15 +25,11 @@ rustc-ice-*.txt
 
 __pycache__
 
-# web UI — source in ui/; built assets in python/vmon/web/ are committed
-# so `pip install vmon[server]` ships a UI without requiring node.
-ui/node_modules/
+# Node deps for the web UI (ui/) and TypeScript SDK (sdk/ts/); built UI
+# assets are committed into vmond/web/ for Rust embedding.
+node_modules/
 python/vmon.egg-info/
 python/build
-
-# guest agent (musl) staged into the package by `just agent-musl`; built per
-# host arch, shipped in release wheels — not committed.
-python/vmon/_agent/
 
 # Python tooling caches and virtualenvs
 .pytest_cache/

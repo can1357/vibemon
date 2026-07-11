@@ -1,4 +1,4 @@
-"""vmon — a friendly Python SDK + CLI for vmon microVMs.
+"""vmon — thin Python SDK for the Rust vmon API.
 
 Example
 -------
@@ -12,28 +12,31 @@ Example
 
 __version__ = "0.2.0"
 
-from .control import Control
-from .image import ImageSpec
+from ._transport import DaemonError
+from .context import (
+    LOCAL,
+    Context,
+    ContextStore,
+    context_token_path,
+    contexts_path,
+    roster_from_status,
+)
 from .sandbox import RemoteFunction, RemoteFunctionError, Sandbox, function
-from .vmm import MicroVM, default_kernel, find_binary
+from .secret import Secret
+from .volume import Volume
 
 __all__ = [
     "Sandbox",
-    "MicroVM",
-    "Control",
-    "ImageSpec",
+    "Secret",
+    "Volume",
+    "Context",
+    "ContextStore",
+    "LOCAL",
+    "contexts_path",
+    "context_token_path",
+    "roster_from_status",
+    "DaemonError",
     "RemoteFunction",
     "RemoteFunctionError",
     "function",
-    "connect",
-    "find_binary",
-    "default_kernel",
 ]
-
-
-def __getattr__(name: str):
-    if name == "connect":
-        from .remote import connect
-
-        return connect
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

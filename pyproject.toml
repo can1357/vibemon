@@ -1,8 +1,5 @@
-# Repo-root uv workspace. The Python package lives in `python/`, but this root
+# Repo-root uv workspace. The Python SDK lives in `python/`, but this root
 # table makes `uv` resolve that project from the repository root, so a single
-# `.venv` at the root serves both `uv run <cmd>` from here (e.g.
-# `uv run python/cli_e2e.py`) and `cd python && uv run <cmd>`. Without it, a bare
-# `uv run` at the root gets a dependency-less interpreter (no click/rich), which
-# breaks the CLI e2e's `python -m vmon` subprocesses.
+# `.venv` serves both `uv run <cmd>` here and `cd python && uv run <cmd>`.
 [tool.uv.workspace]
 members = ["python"]

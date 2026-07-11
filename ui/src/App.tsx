@@ -69,7 +69,15 @@ export function App(): React.ReactElement {
               )}
             </div>
           ) : (
-            <DetailView sandbox={selected} notify={push} />
+            <DetailView
+              sandbox={selected}
+              notify={push}
+              onChanged={() => void refresh()}
+              onRemoved={() => {
+                setSelectedId(null);
+                void refresh();
+              }}
+            />
           )}
         </main>
       </div>

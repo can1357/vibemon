@@ -1,0 +1,212 @@
+use std::{
+	collections::HashMap, fs, hash::BuildHasher, net::IpAddr, os::unix::fs::PermissionsExt,
+	sync::Arc,
+};
+
+use tokio::{net::TcpListener, sync::broadcast};
+
+use super::{
+	routes,
+	state::{ApiState, Transport, UdsPeerListener},
+};
+use crate::{
+	EngineError, Result,
+	config::{ServeConfig, resolve_serve_config},
+	engine::{Engine, EngineApi},
+	home::{Home, OwnerLock},
+	mesh::runtime::MeshRuntime,
+};
+
+pub fn serve<S>(overrides: HashMap<String, String, S>) -> Result<()>
+where
+	S: BuildHasher,
+{
+	let overrides = overrides.into_iter().collect::<HashMap<_, _>>();
+	init_logging();
+	let config = resolve_serve_config(&overrides)?;
+	validate_tcp_auth(&config)?;
+	let home = Home::new(config.home.clone());
+	let owner = OwnerLock::acquire(&home)?;
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()
+		.map_err(EngineError::from)?;
+	let engine = Arc::new(Engine::new(config.clone())?);
+	let mesh = MeshRuntime::new(config.clone(), home.clone(), engine.clone())?;
+	let engine_api: Arc<dyn EngineApi> = engine.clone();
+	let result = runtime.block_on(async {
+		prepare_home(&home)?;
+		write_pid(&home)?;
+		let result = run_listeners(home.clone(), config.clone(), engine_api, mesh).await;
+		cleanup_files(&home);
+		result
+	});
+	engine.shutdown();
+	drop(owner);
+	result
+}
+
+async fn run_listeners(
+	home: Home,
+	config: ServeConfig,
+	engine: Arc<dyn EngineApi>,
+	mesh: Arc<MeshRuntime>,
+) -> Result<()> {
+	let uds = bind_uds(&home)?;
+	let server_uid = current_uid();
+	let uds_listener = UdsPeerListener::new(uds, server_uid);
+	let base_state = ApiState::new(engine, config.clone(), Transport::Unix).with_mesh(mesh.clone());
+	let uds_router = routes::router(base_state.with_transport(Transport::Unix));
+	let (shutdown_tx, _) = broadcast::channel::<()>(4);
+	let signal_tx = shutdown_tx.clone();
+	tokio::spawn(async move {
+		wait_for_shutdown_signal().await;
+		let _ = signal_tx.send(());
+	});
+	let _background_tasks = mesh.start_background(&shutdown_tx);
+	let mut tasks = Vec::new();
+	let mut uds_shutdown = shutdown_tx.subscribe();
+	tasks.push(tokio::spawn(async move {
+		axum::serve(uds_listener, uds_router)
+			.with_graceful_shutdown(async move {
+				let _ = uds_shutdown.recv().await;
+			})
+			.await
+	}));
+	if tcp_enabled(&config) {
+		let addr = format!("{}:{}", config.host, config.port);
+		let listener = TcpListener::bind(&addr).await.map_err(EngineError::from)?;
+		let tcp_router = routes::router(base_state.with_transport(Transport::Tcp));
+		let mut tcp_shutdown = shutdown_tx.subscribe();
+		tasks.push(tokio::spawn(async move {
+			axum::serve(listener, tcp_router)
+				.with_graceful_shutdown(async move {
+					let _ = tcp_shutdown.recv().await;
+				})
+				.await
+		}));
+	}
+	let mut first_error = None;
+	for task in tasks {
+		match task.await {
+			Ok(Ok(())) => {},
+			Ok(Err(err)) => {
+				if first_error.is_none() {
+					first_error = Some(EngineError::from(err));
+				}
+			},
+			Err(err) => {
+				if first_error.is_none() {
+					first_error = Some(EngineError::engine(format!("server task failed: {err}")));
+				}
+			},
+		}
+	}
+	if let Some(err) = first_error {
+		Err(err)
+	} else {
+		Ok(())
+	}
+}
+
+/// Install the process-wide tracing subscriber for `vmon serve`.
+///
+/// Defaults to `info` (mesh replication and reconcile events log at
+/// `info`/`warn`); `RUST_LOG` overrides. `try_init` keeps embedded/test
+/// callers that already installed a subscriber working.
+fn init_logging() {
+	let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+	let _ = tracing_subscriber::fmt()
+		.with_env_filter(filter)
+		.with_writer(std::io::stderr)
+		.try_init();
+}
+
+fn validate_tcp_auth(config: &ServeConfig) -> Result<()> {
+	if tcp_enabled(config)
+		&& config
+			.token
+			.as_deref()
+			.unwrap_or_default()
+			.trim()
+			.is_empty()
+		&& !is_loopback_host(&config.host)
+	{
+		return Err(EngineError::invalid(
+			"refusing non-loopback TCP bind without --token or VMON_API_TOKEN",
+		));
+	}
+	if config.tls_cert.is_some() != config.tls_key.is_some() {
+		return Err(EngineError::invalid("vmon serve TLS requires both tls_cert and tls_key"));
+	}
+	Ok(())
+}
+
+fn tcp_enabled(config: &ServeConfig) -> bool {
+	!config.host.trim().is_empty()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+	let host = host.trim();
+	if host.eq_ignore_ascii_case("localhost") {
+		return true;
+	}
+	host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+fn bind_uds(home: &Home) -> Result<tokio::net::UnixListener> {
+	let sock = home.vmond_sock();
+	match fs::remove_file(&sock) {
+		Ok(()) => {},
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+		Err(err) => return Err(err.into()),
+	}
+	let listener = tokio::net::UnixListener::bind(&sock).map_err(EngineError::from)?;
+	let mut perms = fs::metadata(&sock)?.permissions();
+	perms.set_mode(0o600);
+	fs::set_permissions(&sock, perms)?;
+	Ok(listener)
+}
+
+fn prepare_home(home: &Home) -> Result<()> {
+	fs::create_dir_all(home.root())?;
+	let mut perms = fs::metadata(home.root())?.permissions();
+	perms.set_mode(0o700);
+	fs::set_permissions(home.root(), perms)?;
+	Ok(())
+}
+
+fn write_pid(home: &Home) -> Result<()> {
+	fs::write(home.vmond_pid(), format!("{}\n", std::process::id())).map_err(EngineError::from)
+}
+
+fn cleanup_files(home: &Home) {
+	for path in [home.vmond_sock(), home.vmond_pid()] {
+		match fs::remove_file(path) {
+			Ok(()) => {},
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+			Err(err) => tracing::warn!("failed to remove server file: {err}"),
+		}
+	}
+}
+
+async fn wait_for_shutdown_signal() {
+	#[cfg(unix)]
+	{
+		let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+		if let Ok(mut term) = term {
+			tokio::select! {
+				_ = tokio::signal::ctrl_c() => {},
+				_ = term.recv() => {},
+			}
+			return;
+		}
+	}
+	let _ = tokio::signal::ctrl_c().await;
+}
+
+fn current_uid() -> u32 {
+	// SAFETY: `geteuid` takes no pointers and cannot violate Rust memory safety.
+	unsafe { libc::geteuid() }
+}

@@ -3,10 +3,12 @@ use std::io::{self, Read, Write};
 pub const MAX_PAYLOAD_LEN: usize = 1 << 20;
 pub const HEADER_LEN: usize = 9;
 
-/// Channel resync marker the host writes on connect. Its first four bytes are
-/// `0xFFFF_FFFF` — an impossible payload length (> `MAX_PAYLOAD_LEN`) — so it
-/// can never be confused with a real frame header, letting the reader recover
-/// frame alignment after pre-protocol console noise or a reconnect.
+/// Channel resync marker the host writes on connect.
+///
+/// Its first four bytes are `0xFFFF_FFFF` — an impossible payload length
+/// (> `MAX_PAYLOAD_LEN`) — so it can never be confused with a real frame
+/// header, letting the reader recover frame alignment after pre-protocol
+/// console noise or a reconnect.
 pub const SYNC: [u8; HEADER_LEN] = [0xff, 0xff, 0xff, 0xff, 0xff, b'v', b'm', b'o', b'n'];
 
 pub const FRAME_REQ: u8 = 1;
@@ -70,10 +72,11 @@ pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<Frame>> {
 	}
 }
 
-/// Read and discard bytes until the [`SYNC`] marker is seen, recovering frame
-/// alignment past arbitrary pre-protocol noise (e.g. guest-kernel console
-/// output some kernels emit on the virtio-console before the agent owns it).
-/// Returns `Ok(false)` on EOF before a marker is found.
+/// Read and discard bytes until the [`SYNC`] marker is seen.
+///
+/// Recovers frame alignment past arbitrary pre-protocol noise (e.g.
+/// guest-kernel console output some kernels emit on the virtio-console before
+/// the agent owns it). Returns `Ok(false)` on EOF before a marker is found.
 pub fn resync_to_marker<R: Read>(reader: &mut R) -> io::Result<bool> {
 	let mut window = [0u8; HEADER_LEN];
 	let mut filled = 0usize;

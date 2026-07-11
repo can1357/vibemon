@@ -14,90 +14,12 @@ permissions:
   contents: read
 
 jobs:
-  kvm-bench:
-    name: KVM p50 benchmark
-    runs-on: [self-hosted, kvm, x64]
+  bench-unavailable:
+    name: Benchmark driver unavailable
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install pinned Rust toolchain
-        run: rustup show
-
-      - name: Install just
-        uses: taiki-e/install-action@just
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install Python 3.14
-        run: uv python install 3.14
-
-      - name: Build vmm
-        run: cargo build --locked
-
-      - name: Build static guest agent
-        run: just agent-musl
-
-      - name: Fetch test assets
-        run: just fetch-assets
-
-      - name: Run p50 benchmark
-        run: just bench --iters "${{ github.event.inputs.iters || '10' }}" --json bench-p50-kvm.json
-
-      - name: Upload benchmark JSON
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-p50-kvm
-          path: python/bench-p50-kvm.json
-
-  hvf-bench:
-    name: HVF p50 benchmark
-    # Needs a bare-metal Apple Silicon self-hosted runner: GitHub-hosted macOS
-    # runners are themselves VMs and cannot create an HVF guest (HV_DENIED).
-    runs-on: [self-hosted, macos, arm64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install pinned Rust toolchain
-        run: rustup show
-
-      - name: Install just
-        uses: taiki-e/install-action@just
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install Python 3.14
-        run: uv python install 3.14
-
-      - name: Install native dependencies
-        run: brew install libslirp pkg-config e2fsprogs cpio
-
-      - name: Install Zig linker
-        uses: goto-bus-stop/setup-zig@v2
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@cargo-zigbuild
-
-      - name: Build vmm
-        run: cargo build --locked
-
-      - name: Codesign vmm for HVF
-        run: just codesign
-
-      - name: Build static guest agent
-        run: just agent-musl
-
-      - name: Fetch test assets
-        run: just fetch-assets
-
-      - name: Run p50 benchmark
-        run: just bench --iters "${{ github.event.inputs.iters || '10' }}" --json bench-p50-hvf.json
-
-      - name: Upload benchmark JSON
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-p50-hvf
-          path: python/bench-p50-hvf.json
+      # The former p50 benchmark driver was removed during the Rust-server
+      # cutover. Keep this workflow parseable, but do not run a fake benchmark
+      # until a Rust benchmark driver lands.
+      - name: Skip removed benchmark driver
+        run: echo "::notice::p50 benchmark driver removed; no Rust replacement exists yet."

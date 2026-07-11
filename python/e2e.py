@@ -9,7 +9,7 @@ user-facing feature in a single run:
   * suspend + resume (vCPU parking proven via guest-clock continuity)
   * snapshot + warm restore (disk + memory state)
   * copy-on-write fork (shared base, isolated writes)
-  * delta / incremental snapshots (smaller memory file, base+delta restore)
+  * successive public v1 snapshots (snapshot listing + independent restore)
   * writable and read-only virtio-fs volumes that persist across sandboxes
   * read-only host directory shares (``fs_dir``)
   * secrets (injected into exec env, never written to meta.json)
@@ -17,7 +17,7 @@ user-facing feature in a single run:
     exposed-port tunnels, and host-side IP lease allocation
   * tags + listing
   * warm pools (pre-forked clones)
-  * VMM-enforced timeouts (return code 124) and live deadline ``extend``
+  * server-enforced timeouts (return code 124) and live deadline ``extend``
   * the async (``aio``) facade
 
 This complements the pytest suite in ``tests/test_e2e.py`` with a single
@@ -27,12 +27,9 @@ non-zero exit code if anything fails.
 Prerequisites (a Linux/KVM or macOS/HVF host; e.g. bare metal, an Apple-silicon
 Mac, or a nested-KVM Lima VM):
   * a usable hypervisor          (Linux ``/dev/kvm`` or macOS Hypervisor.framework)
-  * a built vmm binary           (``cargo build --release`` or ``VMON_BIN``)
-  * a static guest agent         (``just agent-musl`` or ``VMON_AGENT``)
-  * a guest kernel               (``/boot/vmlinuz-$(uname -r)``, ``VMON_KERNEL``,
-                                  or auto-downloaded into ``$VMON_HOME`` on macOS)
-  * ``skopeo`` + ``umoci``     (to fetch and unpack OCI image rootfs layers)
-  * ``mkfs.ext4`` / ``mke2fs`` (e2fsprogs; ``brew install e2fsprogs`` on macOS)
+  * a built ``vmon`` binary       (``cargo build --release`` or ``VMON_BIN``)
+  * a startable Rust API server   (this driver spawns ``vmon serve --port 0``)
+  * server-side image/kernel/agent/tooling checks reported by ``vmon doctor``
 
 Note: feature sandboxes below boot with ``block_network=True`` (no NIC, no root).
 The dedicated networking test opts into user-mode NAT on macOS/HVF or a host TAP
@@ -43,17 +40,22 @@ Usage:
   python3.14 python/e2e.py                 # run everything
   python3.14 python/e2e.py exec snapshot   # run a subset (substring match)
   python3.14 python/e2e.py --list          # list test names
-  python3.14 python/e2e.py --keep          # leave volumes/snapshots in place
+  python3.14 python/e2e.py --keep          # leave the temp VMON_HOME in place
   VMON_E2E_IMAGE=alpine:latest python3.14 python/e2e.py
 """
 
 import argparse
 import asyncio
+import contextlib
+import hashlib
+import ipaddress
 import json
 import os
 import platform
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -63,21 +65,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon.agent_client import AgentError
-from vmon.image import _find_mkfs_ext4, cached_template, detect_image_tools, find_agent_binary
-from vmon.pool import WarmPool
-from vmon.sandbox import Sandbox
-from vmon.secret import Secret
-from vmon.vmm import STATE, MicroVM, default_kernel, find_binary, hypervisor_present
-from vmon.volume import Volume
+from vmon import DaemonError, Sandbox, Secret, Volume
+from vmon._transport import VmonTransport, get_transport
+from vmon.sandbox import pool_inventory, prewarm, shutdown_all_pools
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
 RUN = f"e2e{os.getpid()}"
+REPO = Path(__file__).resolve().parents[1]
+STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 
 _seq = 0
-_template: Path | None = None
 _virtiofs: bool | None = None
-
 
 # --------------------------------------------------------------------------- #
 # harness
@@ -105,12 +103,13 @@ def uid(prefix: str) -> str:
     return f"{prefix}-{RUN}-{_seq}"
 
 
-def template_dir() -> Path:
-    """Build (once) and return the cached image template snapshot directory."""
-    global _template
-    if _template is None:
-        _template = cached_template(image=IMAGE).snapshot_dir
-    return _template
+def configure_home(home: Path) -> None:
+    """Point the thin SDK and local helpers at this run's isolated server home."""
+    global STATE, _virtiofs
+    STATE = home
+    _virtiofs = None
+    os.environ["VMON_HOME"] = str(home)
+    os.environ.pop("VMON_CONTEXT", None)
 
 
 def make_sandbox(**kw: object) -> Sandbox:
@@ -154,6 +153,57 @@ def uptime(sb: Sandbox) -> float:
     return float(out.split()[0])
 
 
+def _is_executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def find_vmon_binary() -> Path:
+    """Resolve the Rust ``vmon`` binary from VMON_BIN, target dirs, or PATH."""
+    candidates: list[Path] = []
+    if os.environ.get("VMON_BIN"):
+        candidates.append(Path(os.environ["VMON_BIN"]).expanduser())
+
+    target = Path(os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))).expanduser()
+    for profile in ("release", "debug"):
+        candidates.append(target / profile / "vmon")
+        if target.exists():
+            candidates.extend(sorted(target.glob(f"*/{profile}/vmon")))
+
+    if found := shutil.which("vmon"):
+        candidates.append(Path(found))
+
+    seen: set[Path] = set()
+    for path in candidates:
+        path = path.resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        if _is_executable(path):
+            return path
+    raise RuntimeError("vmon binary not found; run `cargo build --release` or set VMON_BIN")
+
+
+def hypervisor_present() -> bool:
+    """True when the host can launch real microVMs."""
+    system = platform.system()
+    if system == "Linux":
+        return Path("/dev/kvm").exists()
+    if system == "Darwin":
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.hv_support"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            return out.stdout.strip() == "1"
+        except OSError, subprocess.SubprocessError:
+            return False
+    return False
+
+
 def host_is_virtualized() -> bool:
     """True when the e2e host itself runs under a hypervisor (nested virt).
 
@@ -170,31 +220,176 @@ def host_is_virtualized() -> bool:
         return False
 
 
-def snapshot_memory_bytes(snap_dir: Path) -> int:
-    """Size of the current generation's memory file (delta vs full comparison)."""
-    gen = (snap_dir / "current-generation").read_text().strip()
-    return (snap_dir / f"memory.{gen}.bin").stat().st_size
+def _run_host(
+    argv: Sequence[object], *, env: dict[str, str] | None = None, timeout: float = 30
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(part) for part in argv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
 
 
-def read_status(vm: MicroVM) -> dict[str, object] | None:
-    """The VMM's exit ``status.json`` (beside the control socket), or None."""
-    for p in (Path(vm.control_sock).parent / "status.json", vm.dir / "status.json"):
+def _toml_string(value: Path | str) -> str:
+    return json.dumps(str(value))
+
+
+def _tail(path: Path, lines: int = 80) -> str:
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(data[-lines:])
+
+
+class VmonServer:
+    """A local ``vmon serve`` process scoped to this e2e run's VMON_HOME."""
+
+    def __init__(self, binary: Path, home: Path) -> None:
+        self.binary = binary
+        self.home = home
+        self.sock = home / "vmond.sock"
+        self.log_path = home / "e2e-serve.log"
+        self.config_path = home / "e2e-serve.toml"
+        self.proc: subprocess.Popen[str] | None = None
+        self._log_fh = None
+
+    def env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["VMON_HOME"] = str(self.home)
+        env["VMON_BIN"] = str(self.binary)
+        env.pop("VMON_CONTEXT", None)
+        env.pop("VMON_CONFIG", None)
+        return env
+
+    def write_config(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text(
+            "\n".join(
+                [
+                    "[serve]",
+                    f"home = {_toml_string(self.home)}",
+                    'host = "127.0.0.1"',
+                    "port = 0",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def run_doctor_serve(self) -> None:
+        check = _run_host(
+            [self.binary, "doctor", "--serve", "--config", self.config_path],
+            env=self.env(),
+            timeout=30,
+        )
+        if check.returncode != 0:
+            raise RuntimeError(f"`vmon doctor --serve` failed:\n{check.stdout.strip()}")
+
+    def run_doctor(self) -> None:
+        check = _run_host([self.binary, "doctor"], env=self.env(), timeout=30)
+        if check.returncode != 0:
+            raise RuntimeError(f"`vmon doctor` failed:\n{check.stdout.strip()}")
+
+    def healthz(self) -> dict[str, object]:
+        transport = VmonTransport.local(sock_path=self.sock)
         try:
-            return json.loads(p.read_text())
-        except FileNotFoundError, json.JSONDecodeError, OSError:
-            continue
-    return None
+            value = transport.json("GET", "/healthz")
+        finally:
+            transport.close()
+        return dict(value) if isinstance(value, dict) else {}
+
+    def start(self) -> None:
+        self.write_config()
+        self.run_doctor_serve()
+        self._log_fh = self.log_path.open("w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [
+                str(self.binary),
+                "serve",
+                "--home",
+                str(self.home),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+            ],
+            stdout=self._log_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=self.env(),
+            start_new_session=True,
+        )
+        deadline = time.time() + 20
+        last: BaseException | None = None
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"`vmon serve` exited with {self.proc.returncode}; log:\n{_tail(self.log_path)}"
+                )
+            try:
+                if self.healthz().get("ok") is True:
+                    self.run_doctor()
+                    return
+            except BaseException as exc:
+                last = exc
+            time.sleep(0.1)
+        raise RuntimeError(
+            f"`vmon serve` never became healthy ({last}); log:\n{_tail(self.log_path)}"
+        )
+
+    def stop(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        if self._log_fh is not None:
+            with contextlib.suppress(Exception):
+                self._log_fh.close()
 
 
-def wait_status(vm: MicroVM, deadline: float) -> dict[str, object] | None:
-    """Poll for a finished ``status.json`` (one with a ``reason``) until deadline."""
-    end = time.time() + deadline
-    while time.time() < end:
-        s = read_status(vm)
-        if s is not None and s.get("reason"):
-            return s
-        time.sleep(0.2)
-    return read_status(vm)
+def api_json(method: str, path: str, **kwargs: object) -> object:
+    transport = get_transport()
+    try:
+        return transport.json(method, path, **kwargs)
+    finally:
+        transport.close()
+
+
+def pool_stats() -> dict[str, dict[str, object]]:
+    value = api_json("GET", "/v1/pools")
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for key, stats in value.items():
+        if isinstance(stats, dict):
+            out[str(key)] = dict(stats)
+    return out
+
+
+def pool_counter(field: str) -> int:
+    total = 0
+    for stats in pool_stats().values():
+        with contextlib.suppress(TypeError, ValueError):
+            total += int(stats.get(field, 0))
+    return total
+
+
+def snapshot_names() -> set[str]:
+    value = api_json("GET", "/v1/snapshots")
+    if isinstance(value, dict) and isinstance(value.get("snapshots"), list):
+        return {str(item) for item in value["snapshots"]}
+    return set()
 
 
 def rm_snapshot(name: str) -> None:
@@ -202,16 +397,72 @@ def rm_snapshot(name: str) -> None:
         shutil.rmtree(root / name, ignore_errors=True)
 
 
+def is_missing_error(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if isinstance(exc, DaemonError):
+        return exc.status == 404 or "No such file or directory" in str(exc)
+    return isinstance(exc, OSError)
+
+
+def assert_missing(fn: Callable[[], object], message: str) -> None:
+    try:
+        fn()
+    except BaseException as exc:
+        if is_missing_error(exc):
+            return
+        raise
+    raise AssertionError(message)
+
+
+def wait_view(
+    sb: Sandbox, deadline: float, predicate: Callable[[dict[str, object]], bool]
+) -> dict[str, object]:
+    end = time.time() + deadline
+    last: dict[str, object] = sb.view
+    while time.time() < end:
+        last = sb.refresh()
+        if predicate(last):
+            return last
+        time.sleep(0.2)
+    return sb.refresh()
+
+
+def scan_json_for_value(root: Path, needle: str) -> list[Path]:
+    hits: list[Path] = []
+    skip_dirs = {"assets", "images"}
+    for path in root.rglob("*.json"):
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        try:
+            if path.stat().st_size > 1_000_000:
+                continue
+            if needle in path.read_text(encoding="utf-8", errors="replace"):
+                hits.append(path)
+        except OSError:
+            continue
+    return hits
+
+
+def vm_meta(name: str) -> dict[str, object]:
+    path = STATE / "vms" / name / "meta.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def net_admin() -> bool:
     """True if the host can create TAP devices (Linux + root/CAP_NET_ADMIN)."""
     if platform.system() != "Linux":
         return False
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True
     try:
-        from vmon import net
-
-        return bool(net.has_net_admin())
-    except Exception:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("CapEff:"):
+                mask = int(line.split()[1], 16)
+                return bool(mask & (1 << 12))  # CAP_NET_ADMIN
+    except OSError, ValueError, IndexError:
         return False
+    return False
 
 
 def networking_supported() -> bool:
@@ -219,32 +470,91 @@ def networking_supported() -> bool:
     return platform.system() == "Darwin" or net_admin()
 
 
-def virtiofs_supported() -> bool:
-    """True if the guest kernel can mount virtio-fs (cached one-shot probe).
+def tap_name(name: str) -> str:
+    return "tv" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
 
-    The pinned default kernels on both supported arches ship ``CONFIG_VIRTIO_FS``
-    (macOS/HVF uses the aarch64 image; Linux/KVM uses the matching arch). Some
-    custom ``VMON_KERNEL`` builds still lack it, so mounts fail with ENODEV
-    there. Probed by attaching a throwaway host share and trying to mount it.
-    """
+
+def lease_entry(name: str) -> dict[str, object]:
+    path = STATE / "network" / "leases.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    value = data.get(name)
+    if not isinstance(value, dict):
+        raise AssertionError(f"lease for {name!r} missing from {path}: {data}")
+    return value
+
+
+def guest_ip_from_network(network: str) -> str:
+    net = ipaddress.ip_network(network, strict=False)
+    return str(net.network_address + 2)
+
+
+def _fetch_once(host: str, port: int) -> bytes:
+    with socket.create_connection((host, port), timeout=2) as conn:
+        conn.sendall(b"GET / HTTP/1.0\r\n\r\n")
+        conn.settimeout(2)
+        body = b""
+        while True:
+            try:
+                chunk = conn.recv(256)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            body += chunk
+        return body
+
+
+def wait_for_tunnel(host: str, port: int, marker: bytes, *, deadline: float) -> bytes:
+    end = time.time() + deadline
+    last = b""
+    while time.time() < end:
+        try:
+            last = _fetch_once(host, port)
+            if marker in last:
+                return last
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return last
+
+
+class VirtiofsUnavailable(RuntimeError):
+    pass
+
+
+def mount_virtiofs(sb: Sandbox, tag: str, mountpoint: str, *, ro: bool = True) -> None:
+    rc, _, err = run(sb, "mkdir", "-p", mountpoint, timeout=15)
+    assert rc == 0, f"mkdir {mountpoint} failed: {err!r}"
+    argv = ["mount", "-t", "virtiofs"]
+    if ro:
+        argv.extend(["-o", "ro"])
+    argv.extend([tag, mountpoint])
+    rc, out, err = run(sb, *argv, timeout=20)
+    if rc == 0:
+        return
+    msg = f"{out}\n{err}".lower()
+    if "no such device" in msg or "unknown filesystem" in msg or "invalid argument" in msg:
+        raise VirtiofsUnavailable(msg.strip())
+    raise AssertionError(f"virtio-fs mount failed: rc={rc} out={out!r} err={err!r}")
+
+
+def virtiofs_supported() -> bool:
+    """True if the guest kernel can mount virtio-fs (cached one-shot probe)."""
     global _virtiofs
     if _virtiofs is not None:
         return _virtiofs
     share = Path(tempfile.mkdtemp(prefix="vmon-vfs-probe-"))
-    sb = make_sandbox(fs_dir=str(share))
+    sb: Sandbox | None = None
     try:
-        sb.agent().mount("host", "/mnt/_vfs_probe", ro=True)
+        sb = make_sandbox(fs_dir=str(share))
+        mount_virtiofs(sb, "host", "/mnt/_vfs_probe", ro=True)
         _virtiofs = True
-    except AgentError as exc:
-        # ENODEV ("no such device") == the guest kernel registers no virtiofs
-        # filesystem type. Only that means "unsupported"; surface any other
-        # failure so a real mount/agent regression is not masked as a skip.
-        msg = str(exc).lower()
-        if "os error 19" not in msg and "no such device" not in msg:
-            raise
+    except VirtiofsUnavailable:
         _virtiofs = False
     finally:
-        sb.terminate()
+        if sb is not None:
+            with contextlib.suppress(Exception):
+                sb.terminate()
         shutil.rmtree(share, ignore_errors=True)
     return _virtiofs
 
@@ -321,11 +631,9 @@ def t_filesystem(_):
         assert "file.txt" in json.dumps(fs.list_files("/e2e/sub"))
         assert isinstance(fs.stat("/e2e/sub/file.txt"), dict)
         fs.remove("/e2e/sub/file.txt")
-        try:
-            fs.read_text("/e2e/sub/file.txt")
-            raise AssertionError("read of a removed file should fail")
-        except OSError:
-            pass
+        assert_missing(
+            lambda: fs.read_text("/e2e/sub/file.txt"), "read of a removed file should fail"
+        )
     finally:
         sb.terminate()
 
@@ -338,9 +646,9 @@ def t_suspend_resume(_):
         sb.filesystem.write_text("/root/pre-pause", "kept")
         u0 = uptime(sb)
         t0 = time.time()
-        sb.vm.pause()
+        sb.pause()
         time.sleep(3)
-        sb.vm.resume()
+        sb.resume()
         host = time.time() - t0
         guest = uptime(sb) - u0
         # Functional: resume continues execution and preserves guest state.
@@ -406,11 +714,10 @@ def t_fork(_):
         for c in clones:
             assert c.filesystem.read_text("/root/shared") == "base"
         clones[0].filesystem.write_text("/root/only0", "c0")
-        try:
-            clones[1].filesystem.read_text("/root/only0")
-            raise AssertionError("fork clones are not CoW-isolated")
-        except OSError:
-            pass
+        assert_missing(
+            lambda: clones[1].filesystem.read_text("/root/only0"),
+            "fork clones are not CoW-isolated",
+        )
     finally:
         for c in clones:
             try:
@@ -423,29 +730,37 @@ def t_fork(_):
 
 @e2e
 def t_delta_snapshot(_):
-    """A delta snapshot stores only changed pages (smaller) and restores base+delta."""
-    sb = make_sandbox(memory=256)
+    """Successive public v1 snapshots are listed and restore independent states."""
+    source: Sandbox | None = make_sandbox(memory=256)
     base, delta = uid("dbase"), uid("ddelta")
-    restored = None
+    restored_base: Sandbox | None = None
+    restored_delta: Sandbox | None = None
     try:
-        base_dir = sb.vm.snapshot(base, keep_running=True, disk_src=sb.vm.rootfs_img)
-        # Mutate state after the base snapshot so the delta carries real content.
-        rc, _, err = run(sb, "sh", "-lc", "echo post-base > /root/fill && sync")
+        source.filesystem.write_text("/root/fill", "base")
+        source.snapshot(base)
+        assert base in snapshot_names(), f"base snapshot {base!r} missing from snapshot list"
+        rc, _, err = run(source, "sh", "-lc", "echo post-base > /root/fill && sync")
         assert rc == 0, f"post-base mutation failed: {err!r}"
-        delta_dir = sb.vm.snapshot(delta, keep_running=True, disk_src=sb.vm.rootfs_img, base=base)
-        base_bytes = snapshot_memory_bytes(base_dir)
-        delta_bytes = snapshot_memory_bytes(delta_dir)
-        assert delta_bytes < base_bytes, f"delta memory {delta_bytes} not < base {base_bytes}"
-        restored = Sandbox.from_snapshot(delta, block_network=True)
-        assert restored.filesystem.read_text("/root/fill").strip() == "post-base", (
-            "post-base state not visible after delta restore"
+        source.snapshot(delta)
+        assert delta in snapshot_names(), f"delta snapshot {delta!r} missing from snapshot list"
+        source.terminate()
+        source = None
+
+        restored_base = Sandbox.from_snapshot(base, block_network=True)
+        assert restored_base.filesystem.read_text("/root/fill").strip() == "base", (
+            "base snapshot did not preserve pre-mutation state"
         )
-        rc, out, _ = run(restored, "sh", "-lc", "echo delta-ok")
-        assert rc == 0 and "delta-ok" in out
+        restored_delta = Sandbox.from_snapshot(delta, block_network=True)
+        assert restored_delta.filesystem.read_text("/root/fill").strip() == "post-base", (
+            "successive snapshot did not preserve post-mutation state"
+        )
+        rc, out, _ = run(restored_delta, "sh", "-lc", "echo snapshot-ok")
+        assert rc == 0 and "snapshot-ok" in out
     finally:
-        if restored is not None:
-            restored.terminate()
-        sb.terminate()
+        for item in (restored_delta, restored_base, source):
+            if item is not None:
+                with contextlib.suppress(Exception):
+                    item.terminate()
         rm_snapshot(delta)
         rm_snapshot(base)
 
@@ -515,7 +830,7 @@ def t_host_share(_):
     (share / "hello.txt").write_text("from-host")
     sb = make_sandbox(fs_dir=str(share))
     try:
-        sb.agent().mount("host", "/mnt/host", ro=True)
+        mount_virtiofs(sb, "host", "/mnt/host", ro=True)
         assert sb.filesystem.read_text("/mnt/host/hello.txt") == "from-host"
     finally:
         sb.terminate()
@@ -530,8 +845,10 @@ def t_secrets(_):
     try:
         _, out, _ = run(sb, "sh", "-lc", 'printf %s "$E2E_SECRET"')
         assert out == value, f"secret not injected: {out!r}"
-        assert value not in sb.vm.meta_path.read_text(), "secret value leaked into meta.json"
-        assert "E2E_SECRET" in (sb.vm.meta.get("secret_names") or []), "secret name not recorded"
+        view = sb.refresh()
+        assert "secret" in (view.get("secret_names") or []), "secret bundle name not recorded"
+        hits = scan_json_for_value(STATE, value)
+        assert not hits, f"secret value leaked into persisted JSON: {hits}"
     finally:
         sb.terminate()
 
@@ -555,17 +872,22 @@ def t_network_block(_):
 
 @e2e
 def t_network_lease(_):
-    """Host-side networking allocates a deterministic, non-overlapping guest lease."""
-    from vmon import net
-
+    """Host-side TAP networking records a deterministic, non-overlapping lease."""
+    if not net_admin():
+        raise Skip("needs Linux root/CAP_NET_ADMIN for host TAP lease state")
     name = uid("net")
-    cfg = net.allocate_guest_config(name)
+    sb = Sandbox.create(image=IMAGE, name=name, block_network=False)
     try:
-        for key in ("tap", "guest_ip", "host_ip", "prefix"):
-            assert key in cfg, f"lease missing {key}: {cfg}"
-        assert cfg["guest_ip"] != cfg["host_ip"], f"guest/host IP collision: {cfg}"
+        entry = lease_entry(name)
+        network = str(entry.get("network") or "")
+        assert network.endswith("/30"), f"lease network is not /30: {entry}"
+        assert entry.get("tap") == tap_name(name), f"unexpected TAP name: {entry}"
+        guest_ip = guest_ip_from_network(network)
+        rc, addr, err = run(sb, "ip", "-4", "addr", "show", "eth0", timeout=15)
+        assert rc == 0, f"ip addr failed: {err!r}"
+        assert guest_ip in addr, f"guest did not receive leased IP {guest_ip}: {addr!r}"
     finally:
-        net.release_guest_config(name)
+        sb.remove()
 
 
 @e2e
@@ -605,22 +927,7 @@ def t_ports_tunnels(_):
             timeout=60,
             _track_entry=False,
         )
-        deadline = time.time() + 10
-        while time.time() < deadline and not sb.agent().tcp_probe(18080):
-            time.sleep(0.3)
-        assert sb.agent().tcp_probe(18080), "guest listener never bound :18080"
-        with socket.create_connection((host, int(hport)), timeout=5) as conn:
-            conn.sendall(b"GET / HTTP/1.0\r\n\r\n")
-            conn.settimeout(5)
-            body = b""
-            try:
-                while True:
-                    chunk = conn.recv(256)
-                    if not chunk:
-                        break
-                    body += chunk
-            except TimeoutError:
-                pass
+        body = wait_for_tunnel(host, int(hport), b"hi", deadline=15)
         assert b"hi" in body, f"tunnel did not deliver the guest response: {body!r}"
     finally:
         if listener is not None:
@@ -633,71 +940,76 @@ def t_ports_tunnels(_):
 
 @e2e
 def t_tags_and_list(_):
-    """Tags persist on the sandbox/meta and the VM appears in MicroVM.list()."""
+    """Tags persist on the sandbox view and the sandbox appears in v1 listing."""
     sb = make_sandbox(tags={"e2e": "yes", "run": RUN})
     try:
-        assert sb.tags.get("e2e") == "yes"
-        assert sb.vm.meta.get("tags", {}).get("run") == RUN
-        assert sb.name in [vm.name for vm in MicroVM.list()]
+        view = sb.refresh()
+        assert view.get("tags", {}).get("e2e") == "yes"
+        assert view.get("tags", {}).get("run") == RUN
+        assert sb.name in [item.name for item in Sandbox.list(tag={"run": RUN})]
     finally:
         sb.terminate()
 
 
 @e2e
 def t_warm_pool(_):
-    """A warm pool pre-forks clones that claim instantly and run exec."""
-    pool = WarmPool(template_dir(), 2)
-    claimed = None
+    """A server-owned warm pool is stocked and consumed by Sandbox.create."""
+    handle = None
+    claimed: Sandbox | None = None
     try:
-        end = time.time() + 60
-        while time.time() < end and pool.stats()["ready_count"] < 2:
-            time.sleep(0.1)
-        assert pool.stats()["ready_count"] >= 1, f"pool never warmed: {pool.stats()}"
-        vm = pool.claim()
-        assert vm is not None, "claim returned None despite ready clones"
-        assert pool.stats()["hits"] >= 1
-        claimed = Sandbox(vm)
+        handle = prewarm(IMAGE, count=1, memory=256)
+        end = time.time() + 180
+        while time.time() < end and sum(pool_inventory().values()) < 1:
+            time.sleep(0.5)
+        ready = sum(pool_inventory().values())
+        assert ready >= 1, f"pool never warmed: {pool_stats()}"
+        before_hits = pool_counter("hits")
+        claimed = make_sandbox(memory=256)
         rc, out, _ = run(claimed, "sh", "-lc", "echo pooled")
         assert rc == 0 and "pooled" in out
+        after_hits = pool_counter("hits")
+        assert after_hits > before_hits, (
+            f"pool hit counter did not increase: {before_hits}->{after_hits}"
+        )
     finally:
         if claimed is not None:
-            claimed.terminate()
-        pool.shutdown()
+            with contextlib.suppress(Exception):
+                claimed.remove()
+        if handle is not None:
+            shutdown_all_pools()
 
 
 @e2e
 def t_timeout(_):
-    """A VMM-enforced deadline self-terminates with reason=timeout, return code 124."""
-    vm = MicroVM.restore(template_dir(), name=uid("timeout"), agent=False, timeout_secs=3)
+    """A server-enforced deadline self-terminates with return code 124."""
+    sb = make_sandbox(timeout_secs=3)
     try:
-        status = wait_status(vm, deadline=20)
-        assert status is not None, "no status.json after the deadline"
-        assert status.get("reason") == "timeout", f"reason={status.get('reason')!r}"
-        assert status.get("vmm_returncode") == 124, f"return code={status.get('vmm_returncode')!r}"
+        view = wait_view(
+            sb,
+            30,
+            lambda value: value.get("status") != "running" and value.get("returncode") == 124,
+        )
+        assert view.get("returncode") == 124, f"timeout returncode not observed: {view}"
     finally:
-        try:
-            vm.stop()
-        except Exception:
-            pass
-        vm.remove()
+        with contextlib.suppress(Exception):
+            sb.remove()
 
 
 @e2e
 def t_extend(_):
-    """extend moves the deadline so the VM survives past its original timeout."""
-    vm = MicroVM.restore(template_dir(), name=uid("extend"), agent=False, timeout_secs=4)
+    """extend moves the deadline so the sandbox survives past its original timeout."""
+    sb = make_sandbox(timeout_secs=4)
     try:
-        vm.control.extend(60)
+        out = sb.extend(60)
+        assert "deadline_unix" in out, f"extend did not return a deadline: {out}"
         time.sleep(7)  # past the original 4s deadline
-        assert vm.is_running(), "VM died at the original deadline despite extend"
-        status = read_status(vm)
-        assert status is None or status.get("reason") != "timeout", f"unexpected timeout: {status}"
+        view = sb.refresh()
+        assert view.get("status") == "running", (
+            f"sandbox died at the original deadline despite extend: {view}"
+        )
     finally:
-        try:
-            vm.stop()
-        except Exception:
-            pass
-        vm.remove()
+        with contextlib.suppress(Exception):
+            sb.remove()
 
 
 @e2e
@@ -722,31 +1034,30 @@ def t_async(_):
 # --------------------------------------------------------------------------- #
 
 
-def preflight() -> str | None:
-    """Return a human-readable reason the e2e cannot run, or None when ready."""
+def preflight(home: Path) -> tuple[VmonServer | None, str | None]:
+    """Start ``vmon serve`` for this run, or return a human-readable skip reason."""
     system = platform.system()
     if system not in ("Linux", "Darwin"):
-        return f"needs Linux + /dev/kvm or macOS + Hypervisor.framework; this is {system}"
+        return None, f"needs Linux + /dev/kvm or macOS + Hypervisor.framework; this is {system}"
     if not hypervisor_present():
         return (
+            None,
             "/dev/kvm not present; run on a KVM host (or a nested-KVM Lima VM)"
             if system == "Linux"
             else "no usable hypervisor; needs an Apple-silicon Mac with "
-            "Hypervisor.framework (kern.hv_support=1)"
+            "Hypervisor.framework (kern.hv_support=1)",
         )
-    for probe, hint in (
-        (find_binary, "vmm binary"),
-        (default_kernel, "guest kernel"),
-        (detect_image_tools, "OCI image tools"),
-        (find_agent_binary, "static guest agent"),
-    ):
-        try:
-            probe()
-        except RuntimeError as exc:
-            return f"{hint}: {exc}"
-    if _find_mkfs_ext4() is None:
-        return "mkfs.ext4/mke2fs not found (install e2fsprogs; on macOS: `brew install e2fsprogs`)"
-    return None
+    try:
+        binary = find_vmon_binary()
+    except RuntimeError as exc:
+        return None, str(exc)
+    server = VmonServer(binary, home)
+    try:
+        server.start()
+    except RuntimeError as exc:
+        server.stop()
+        return None, str(exc)
+    return server, None
 
 
 def display_name(fn: Callable[[object], None]) -> str:
@@ -755,10 +1066,10 @@ def display_name(fn: Callable[[object], None]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global IMAGE
-    ap = argparse.ArgumentParser(description="vmon / vmon end-to-end smoke test")
+    ap = argparse.ArgumentParser(description="vmon end-to-end smoke test")
     ap.add_argument("tests", nargs="*", help="substring filters (default: run all)")
     ap.add_argument("--list", action="store_true", help="list test names and exit")
-    ap.add_argument("--keep", action="store_true", help="leave volumes/snapshots on exit")
+    ap.add_argument("--keep", action="store_true", help="leave the temp VMON_HOME in place")
     ap.add_argument("--image", help="container image (default $VMON_E2E_IMAGE or alpine:latest)")
     args = ap.parse_args(argv)
 
@@ -773,41 +1084,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         fn for fn in TESTS if not args.tests or any(f in display_name(fn) for f in args.tests)
     ]
 
-    reason = preflight()
-    if reason:
-        print(f"SKIP: {reason}")
-        return 0
+    tmp_parent = Path(
+        os.environ.get(
+            "VMON_E2E_TMPDIR", "/tmp" if Path("/tmp").is_dir() else tempfile.gettempdir()
+        )
+    )
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    home = Path(tempfile.mkdtemp(prefix=f"ve2e{os.getpid()}-", dir=tmp_parent))
+    configure_home(home)
+    server: VmonServer | None = None
+    try:
+        server, reason = preflight(home)
+        if reason:
+            print(f"SKIP: {reason}")
+            return 0
 
-    print(f"e2e: image={IMAGE} state={STATE} tests={len(selected)}")
+        print(f"e2e: image={IMAGE} state={STATE} tests={len(selected)}")
 
-    results: list[tuple[str, str, float, str]] = []
-    for fn in selected:
-        name = display_name(fn)
-        t0 = time.time()
-        try:
-            fn(None)
-            dt = time.time() - t0
-            results.append(("PASS", name, dt, ""))
-            print(f"  PASS  {name}  ({dt:.1f}s)")
-        except Skip as exc:
-            results.append(("SKIP", name, time.time() - t0, str(exc)))
-            print(f"  SKIP  {name}: {exc}")
-        except BaseException as exc:  # noqa: BLE001 - report and continue
-            results.append(("FAIL", name, time.time() - t0, repr(exc)))
-            print(f"  FAIL  {name}: {exc}")
-            traceback.print_exc()
+        results: list[tuple[str, str, float, str]] = []
+        for fn in selected:
+            name = display_name(fn)
+            t0 = time.time()
+            try:
+                fn(None)
+                dt = time.time() - t0
+                results.append(("PASS", name, dt, ""))
+                print(f"  PASS  {name}  ({dt:.1f}s)")
+            except Skip as exc:
+                results.append(("SKIP", name, time.time() - t0, str(exc)))
+                print(f"  SKIP  {name}: {exc}")
+            except BaseException as exc:  # noqa: BLE001 - report and continue
+                results.append(("FAIL", name, time.time() - t0, repr(exc)))
+                print(f"  FAIL  {name}: {exc}")
+                traceback.print_exc()
 
-    if not args.keep:
-        for name in VOLUMES:
-            shutil.rmtree(STATE / "volumes" / name, ignore_errors=True)
-
-    npass = sum(r[0] == "PASS" for r in results)
-    nfail = sum(r[0] == "FAIL" for r in results)
-    nskip = sum(r[0] == "SKIP" for r in results)
-    print(f"\n{'=' * 52}\n{npass} passed, {nfail} failed, {nskip} skipped")
-    if nfail:
-        print("failed: " + ", ".join(r[1] for r in results if r[0] == "FAIL"))
-    return 1 if nfail else 0
+        npass = sum(r[0] == "PASS" for r in results)
+        nfail = sum(r[0] == "FAIL" for r in results)
+        nskip = sum(r[0] == "SKIP" for r in results)
+        print(f"\n{'=' * 52}\n{npass} passed, {nfail} failed, {nskip} skipped")
+        if nfail:
+            print("failed: " + ", ".join(r[1] for r in results if r[0] == "FAIL"))
+        return 1 if nfail else 0
+    finally:
+        if server is not None:
+            server.stop()
+        if args.keep:
+            print(f"kept VMON_HOME={home}")
+        else:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":

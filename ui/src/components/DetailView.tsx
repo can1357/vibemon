@@ -11,19 +11,34 @@ type Tab = "terminal" | "files" | "metrics";
 export function DetailView({
   sandbox,
   notify,
+  onChanged,
+  onRemoved,
 }: {
   sandbox: SandboxView;
   notify: (msg: string, kind?: "info" | "err") => void;
+  onChanged: () => void;
+  onRemoved: () => void;
 }): React.ReactElement {
   const [tab, setTab] = useState<Tab>("terminal");
   const [busy, setBusy] = useState(false);
 
   const running = sandbox.status === "running";
+  const source = sandbox.image ?? sandbox.template ?? sandbox.source ?? "no image";
+  const cpus = typeof sandbox.cpus === "number" ? `${sandbox.cpus} vCPU` : "vCPU n/a";
+  const memory =
+    typeof sandbox.memory === "number" ? fmtBytes(sandbox.memory * 1024 * 1024) : "memory n/a";
+  const disk =
+    typeof sandbox.disk_mb === "number" ? `${fmtBytes(sandbox.disk_mb * 1024 * 1024)} disk` : "disk n/a";
 
-  async function act(label: string, fn: () => Promise<unknown>): Promise<void> {
+  async function act(
+    label: string,
+    fn: () => Promise<unknown>,
+    after: (() => void) | null = onChanged,
+  ): Promise<void> {
     setBusy(true);
     try {
       await fn();
+      after?.();
       notify(`${label} — done`);
     } catch (e) {
       notify(`${label} failed: ${e instanceof Error ? e.message : String(e)}`, "err");
@@ -38,9 +53,7 @@ export function DetailView({
         <div>
           <h1 className="detail__title">{sandbox.name}</h1>
           <div className="detail__sub">
-            {sandbox.image ?? "no image"} · {sandbox.cpus} vCPU ·{" "}
-            {fmtBytes(sandbox.memory * 1024 * 1024)} · {fmtBytes(sandbox.disk_mb * 1024 * 1024)}{" "}
-            disk
+            {source} · {cpus} · {memory} · {disk}
           </div>
         </div>
         <div className="detail__actions">
@@ -56,11 +69,20 @@ export function DetailView({
             Snapshot
           </button>
           <button
-            className="btn btn--sm btn--danger"
+            className="btn btn--sm"
             disabled={!running || busy}
-            onClick={() => void act("terminate", () => api.terminateSandbox(sandbox.id))}
+            onClick={() => void act("stop", () => api.stopSandbox(sandbox.id))}
           >
-            Terminate
+            Stop
+          </button>
+          <button
+            className="btn btn--sm btn--danger"
+            disabled={busy}
+            onClick={() => {
+              if (confirm(`Remove ${sandbox.name}?`)) void act("remove", () => api.removeSandbox(sandbox.id), onRemoved);
+            }}
+          >
+            Remove
           </button>
         </div>
       </div>

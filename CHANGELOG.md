@@ -6,10 +6,15 @@ All notable changes to this project are recorded here.
 
 ### Breaking Changes
 
+- Removed raw TCP transport; HTTP gateway is the only supported remote protocol
+- Removed `mesh.json` client configuration; named contexts are now required
+- Removed legacy snapshot format support (v1/v2); existing snapshots must be recaptured
+- Replaced container engine dependencies with daemonless OCI tools (`skopeo`/`umoci`)
+- Renamed hypervisor binary from `vmon` to `vmm` (internal-only naming resolution)
+- Reorganized Python package layout for `vmon.server` components
 - Removed support for raw TCP transport (`VMON_REMOTE`/`VMON_DAEMON_TCP`) in favor of HTTP gateways
 - Dropped fallback to `mesh.json` client configuration files
 - Replaced `docker`/`podman` with `skopeo`/`umoci` and `buildah`/`buildx` requirements
-
 - Removed the raw remote-daemon TCP transport: `VMON_REMOTE` (client) and `VMON_DAEMON_TCP` (listener) are gone; the HTTP gateway (`vmon serve`) is the only remote protocol. `vmond` now serves the local Unix socket only.
 - Removed the `VMON_SERVER` transport selector and the `mesh.json` client fallback in the CLI; a named context (`vmon context create/use`) is the only non-local transport, and mesh-admin commands resolve the selected context's gateway (local gateway when none is selected).
 - Removed Rust/Python `allow_user_net`; macOS user-net snapshots now always serialize libslirp NAT state, snapshot format version is 3, and v1/v2 snapshots are rejected with recapture required.
@@ -22,12 +27,19 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `vmon` single binary consolidating CLI, server, and hypervisor
+- Added Rust-native v1 HTTP API and WebSocket exec proxy
+- Added TypeScript SDK with generated OpenAPI schema
+- Added macOS user-mode networking (libslirp) support
+- Added virtio-fs read-only host-share support
+- Added virtio-rng entropy device feeding from host CSPRNG
+- Added `vmon doctor` prerequisite diagnostics
+- Added `vmon completion` for shell tab-completion
 - Added `vmon build -f Dockerfile -t tag` to build OCI images locally
 - Added per-sandbox `ha` tier selection (`off|async|rerun|async+rerun`)
 - Added cluster-wide placement architecture selection via `--arch`
 - Added `--save-token` to `vmon context create` for persistent credential storage
 - Added `vmon doctor --serve` to validate daemon configuration
-
 - Added `vmon_three_node_writable_volume_quorum_ha` e2e test covering quorum-gated crash restore of writable volumes
 - Added per-sandbox durability tiers `ha=off|async|rerun|async+rerun`; mesh creates default to `async`, durable create records are replicated before acknowledgement, and `rerun` can re-execute an acknowledged record at a higher epoch when no checkpoint exists.
 - Added quorum-granted, epoch-fenced, TTL self-fencing writable-volume leases for mesh contexts; writable volumes require at least three expected members, while read-only volumes remain unrestricted.
@@ -74,11 +86,15 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Renamed project from `VibeVMM` to `Vibemon`
+- Migrated CLI, daemon, and hypervisor backends to single `vmon` Rust binary
+- Switched snapshot format from bincode to postcard
+- Replaced Python-based FastAPI gateway with Rust-native axum server (`vmond`)
+- Updated build system to use `cargo zigbuild` and `just`
 - Updated local image building to use daemonless `skopeo` and `umoci`
 - Defaulted mesh-enabled nodes to `ha=async` durability
 - Switched CLI/SDK transport to use named contexts exclusively for remote connections
 - Streamlined `vmon serve` configuration into a unified `ServeConfig` surface
-
 - Replaced container engine dependencies (`docker`/`podman`) with daemonless OCI image tools (`skopeo` and `umoci`) for image pulling, inspection, and rootfs extraction
 - Updated `vmon doctor` prerequisite checks to collect and verify `skopeo` and `umoci` availability instead of checking for a local container engine
 - Flattened nested VMM counter groups into `group.field` rows in `vmon stats` and Dashboard
@@ -95,10 +111,14 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed hanging `vmon exec` commands on TTY
+- Fixed KVM vCPU run-loop transient `EAGAIN` error handling
+- Improved `vmon stats` output by flattening VMM counter groups
+- Fixed template resolution for virtio-fs volumes
+- Resolved network default inconsistency on macOS
 - Fixed hanging `vmon exec` commands and stdin forwarding on TTY
 - Improved `vmon stats` output by flattening nested VMM counter groups
 - Resolved `vmon run` network default inconsistency on macOS
-
 - Fixed the remote page-source URL builder (`_remote_page_url`) to coerce the resolved host to `str`, fixing a type error and guarding the IPv6-bracketing check against non-string `getaddrinfo` results.
 - Fixed the KVM vCPU loop to treat a `KVM_RUN` `EAGAIN` as a transient retry (re-enter the run loop) like `EINTR` rather than a fatal vCPU error, matching Cloud Hypervisor / Firecracker; `EAGAIN` occurs notably under nested virtualization (e.g. KVM-on-cloud-VM, Lima).
 - Restored a green AArch64 Linux clippy CI gate: the FUSE_MKNOD/`FUSE_CREATE` mode checks now suppress `unnecessary_cast` for the `libc::S_IF*` constants (signed `c_int` on macOS, `c_uint` on Linux), `PagerFatal::new` is `const fn`, and the remote-pager test server takes its 4 KiB page by reference.

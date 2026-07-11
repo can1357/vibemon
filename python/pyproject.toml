@@ -5,20 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vmon"
 version = "0.2.0"
-description = "Vibemon — friendly Python SDK + CLI for microVMs (run containers, suspend/resume, snapshot, fork)"
+description = "Thin Python SDK for the Rust vmon API"
 requires-python = ">=3.14"
 dependencies = [
-    "click~=8.1",
-    "rich>=12.0.0",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
-server = [
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "pydantic>=2",
-    "httpx>=0.28",
-]
 test = [
     "pytest",
 ]
@@ -28,18 +21,11 @@ dev = [
     "ruff>=0.15",
     "mypy>=1.13",
     "pytest>=8",
-    "httpx>=0.28",       # starlette TestClient, used by tests/test_server.py
 ]
 
-[project.scripts]
-vmon = "vmon.cli:main"
 
 [tool.setuptools]
 packages = ["vmon"]
-include-package-data = true
-
-[tool.setuptools.package-data]
-vmon = ["web/**/*", "_agent/*"]
 
 [tool.ruff]
 line-length = 100
@@ -55,14 +41,11 @@ ignore = [
     "C408",
 ]
 
-[tool.ruff.lint.per-file-ignores]
-# FastAPI's dependency-injection idiom puts Query()/Depends() calls in argument
-# defaults, which B008 (function-call-in-default-argument) flags as a bug.
-"vmon/server.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.14"
 files = ["vmon"]
+exclude = ["^e2e\\.py$", "^tests/"]
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true

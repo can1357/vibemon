@@ -1,9 +1,9 @@
-// Same-origin client for the `vmon serve` HTTP+WS API.
-// In dev, vite.config.ts proxies /v1 and /healthz to 127.0.0.1:8000.
+// Same-origin client for the `vmon serve` HTTP+WebSocket v1 API.
+// In dev, vite.config.ts proxies /v1, /healthz, and /metrics to 127.0.0.1:8000.
 // In production the UI is served by `vmon serve` itself, so relative URLs are
 // correct regardless of host/port/proxy in front of it.
 
-export type SandboxStatus = "running" | "terminated" | "paused";
+export type SandboxStatus = "running" | "stopped" | "terminated" | "paused" | "failed";
 
 export interface SandboxView {
   id: string;
@@ -14,14 +14,20 @@ export interface SandboxView {
   expires_at: number | null;
   terminated_at: number | null;
   error: string | null;
-  image: string | null;
-  cpus: number;
-  memory: number;
-  disk_mb: number;
+  tags: Record<string, string>;
+  returncode: number | null;
+  image?: string | null;
+  template?: string | null;
+  source?: string | null;
+  cpus?: number | null;
+  memory?: number | null;
+  disk_mb?: number | null;
+  [key: string]: unknown;
 }
 
 export interface SandboxCreate {
   image?: string | null;
+  template?: string | null;
   dockerfile?: string | null;
   context?: string;
   name?: string | null;
@@ -33,10 +39,21 @@ export interface SandboxCreate {
   timeout_secs?: number | null;
   workdir?: string | null;
   env?: Record<string, string> | null;
+  secrets?: unknown[] | null;
+  volumes?: Record<string, unknown> | null;
+  tags?: Record<string, string> | null;
   fs_dir?: string | null;
   block_network?: boolean;
   ports?: number[] | null;
   egress_allow?: string[] | null;
+  egress_allow_domains?: string[] | null;
+  inbound_cidr_allowlist?: string[] | null;
+  readiness_probe?: unknown;
+  pool_size?: number;
+  ha?: string | null;
+  arch?: string | null;
+  idempotency_key?: string | null;
+  command?: string[] | null;
 }
 
 export interface FsEntry {
@@ -97,7 +114,11 @@ async function responseErrorDetail(res: Response): Promise<string> {
   try {
     if (ct.includes("application/json")) {
       const body = await res.json();
-      return typeof body?.detail === "string" ? body.detail : JSON.stringify(body);
+      if (typeof body?.message === "string") {
+        return typeof body?.code === "string" ? `${body.code}: ${body.message}` : body.message;
+      }
+      if (typeof body?.detail === "string") return body.detail;
+      return JSON.stringify(body);
     }
     const text = await res.text();
     return text || fallback;
@@ -135,21 +156,25 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  stopSandbox: (id: string) =>
+    req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   terminateSandbox: (id: string) =>
+    req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}/terminate`, { method: "POST" }),
+  removeSandbox: (id: string) =>
     req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}`, { method: "DELETE" }),
   snapshotSandbox: (id: string, name?: string) =>
-    req<{ name: string }>(`/v1/sandboxes/${encodeURIComponent(id)}/snapshot`, {
+    req<{ snapshot: string; dir: string }>(`/v1/sandboxes/${encodeURIComponent(id)}/snapshots`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name ?? null }),
     }),
 
   fsList: (id: string, path: string) =>
-    req<{ entries: FsEntry[] }>(
-      `/v1/sandboxes/${encodeURIComponent(id)}/fs/list?path=${encodeURIComponent(path)}`,
-    ).then((r) => r.entries),
+    req<{ entries: FsEntry[] } | FsEntry[]>(
+      `/v1/sandboxes/${encodeURIComponent(id)}/files/list?path=${encodeURIComponent(path)}`,
+    ).then((r) => (Array.isArray(r) ? r : r.entries)),
   fsStat: (id: string, path: string) =>
-    req<FsStat>(`/v1/sandboxes/${encodeURIComponent(id)}/fs/stat?path=${encodeURIComponent(path)}`),
+    req<FsStat>(`/v1/sandboxes/${encodeURIComponent(id)}/files/stat?path=${encodeURIComponent(path)}`),
 
   // file blob I/O — uses fetch directly to preserve binary.
   readFile: async (id: string, path: string): Promise<Blob> => {
@@ -178,14 +203,46 @@ export const api = {
 
 // Build an exec WebSocket URL from the current page origin (so wss:// is used
 // automatically when the page is served over HTTPS), appending the token as a
-// query param when set.
-export function execWsUrl(id: string, cmd: string[], tty = true): string {
+// query param because browsers cannot attach Authorization headers to WebSocket
+// constructors. The first message carries the exec request body.
+export function execWsUrl(id: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const base = `${proto}//${window.location.host}/v1/sandboxes/${encodeURIComponent(id)}/exec/ws`;
+  const base = `${proto}//${window.location.host}/v1/sandboxes/${encodeURIComponent(id)}/exec`;
   const params = new URLSearchParams();
-  for (const c of cmd) params.append("cmd", c);
-  if (tty) params.append("tty", "true");
   const t = getToken();
   if (t) params.append("token", t);
-  return `${base}?${params.toString()}`;
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
+}
+
+export function execStartFrame(cmd: string[], tty = true): string {
+  return JSON.stringify({ cmd, tty });
+}
+
+export function stdinFrame(data: string): string {
+  return JSON.stringify({ stdin_b64: bytesToB64(new TextEncoder().encode(data)) });
+}
+
+export function eofFrame(): string {
+  return JSON.stringify({ eof: true });
+}
+
+export function resizeFrame(rows: number, cols: number): string {
+  return JSON.stringify({ resize: [rows, cols] });
+}
+
+export function b64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }

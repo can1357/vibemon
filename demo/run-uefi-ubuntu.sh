@@ -124,7 +124,7 @@ fetch_verified() {  # fetch_verified <label> <url> <path> <sha256>
   mv "$tmp" "$path"
 }
 
-# --- locate the vmm binary for the host architecture --------------------
+# --- locate the vmon binary for the host architecture -------------------
 case "$HOST_MACHINE" in
   x86_64|amd64)
     if [ "$HOST_OS" = Darwin ]; then
@@ -150,25 +150,25 @@ find_vmm() {
   proj=$(cd "$HERE/.." && pwd)
   base=$(printf '%s' "$proj" | sed -E 's#^(/Users/[^/]+|/home/[^/]+).*#\1#')
   # Resolve cargo's target dir (honors .cargo/config build.target-dir and
-  # $CARGO_TARGET_DIR), mirroring python/vmon/vmm.py::_cargo_target_dir.
+  # $CARGO_TARGET_DIR), matching the Rust CLI and just recipes.
   td="${CARGO_TARGET_DIR:-}"
   [ -n "$td" ] || td=$(cd "$proj" && cargo metadata --no-deps --format-version 1 2>/dev/null \
     | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null || true)
   [ -n "$td" ] || td="$proj/target"
   for c in \
-    "$td/$TRIPLE/release/vmm" "$td/$TRIPLE/debug/vmm" \
-    "$td/release/vmm" "$td/debug/vmm" \
-    "$proj/target/$TRIPLE/release/vmm" "$proj/target/release/vmm" \
-    "$proj/target/$TRIPLE/debug/vmm" "$proj/target/debug/vmm" \
-    "$base/.cache/cargo-target/$TRIPLE/release/vmm" \
-    "$HOME/.cache/cargo-target/$TRIPLE/release/vmm" \
-    "$(command -v vmm 2>/dev/null || true)"; do
+    "$td/$TRIPLE/release/vmon" "$td/$TRIPLE/debug/vmon" \
+    "$td/release/vmon" "$td/debug/vmon" \
+    "$proj/target/$TRIPLE/release/vmon" "$proj/target/release/vmon" \
+    "$proj/target/$TRIPLE/debug/vmon" "$proj/target/debug/vmon" \
+    "$base/.cache/cargo-target/$TRIPLE/release/vmon" \
+    "$HOME/.cache/cargo-target/$TRIPLE/release/vmon" \
+    "$(command -v vmon 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
 BIN=$(find_vmm) || {
-  echo "error: vmm binary not found. Build it for $TRIPLE (on macOS: just build) or set VMON_BIN=/path/to/vmm" >&2
+  echo "error: vmon binary not found. Build it for $TRIPLE (on macOS: just build) or set VMON_BIN=/path/to/vmon" >&2
   exit 1
 }
 echo "[uefi] vmm: $BIN  (arch: $ARCH)"
@@ -304,7 +304,7 @@ echo "[uefi] launching vmm: --boot-mode uefi --firmware <fw> --rootfs <img>${TRA
 LOG="$WORK/uefi-ubuntu-$ARCH.log"
 rm -f "$LOG"
 set +e
-"${SUDO[@]}" "$TIMEOUT_BIN" "$TIMEOUT" "$BIN" \
+"${SUDO[@]}" "$TIMEOUT_BIN" "$TIMEOUT" "$BIN" vmm \
   --boot-mode uefi \
   --firmware "$FIRMWARE" \
   --rootfs "$RAW" \

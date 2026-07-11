@@ -292,3 +292,40 @@ fn drain_one(listener: &TcpListener, deadline: Duration) -> usize {
 	}
 	total
 }
+
+/// `--mac`: the guest NIC reports the operator-supplied MAC. Uses TAP on
+/// Linux (skips without `VMON_TAP`) and user-mode NAT on macOS.
+#[test]
+fn nic_honors_mac_override() {
+	if !common::require_hv() || !(common::supports_tap() || common::supports_user_net()) {
+		return;
+	}
+
+	const MAC: &str = "aa:bb:cc:de:ad:01";
+	let mut args = common::base_args("mac");
+	if common::supports_tap() {
+		let tap = match std::env::var("VMON_TAP") {
+			Ok(tap) if !tap.is_empty() => tap,
+			_ => {
+				eprintln!("SKIP nic_honors_mac_override: VMON_TAP not set");
+				return;
+			},
+		};
+		args.push("--tap".into());
+		args.push(tap);
+	} else {
+		args.push("--net".into());
+		args.push("user".into());
+	}
+	args.push("--mac".into());
+	args.push(MAC.into());
+
+	let refs = common::as_refs(&args);
+	let output = common::boot_capture(&refs, "MAC=", Duration::from_secs(90));
+
+	assert!(
+		output.contains(&format!("MAC={MAC}")),
+		"guest NIC does not report the MAC override:\n{output}"
+	);
+	common::assert_no_panic(&output);
+}

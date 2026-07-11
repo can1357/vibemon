@@ -1,120 +1,56 @@
-"""Persistent named-volume host-side abstraction for sandbox microVMs.
-
-A :class:`Volume` is a host directory shared into a guest (via virtio-fs) that
-persists across sandbox lifetimes. Volumes are excluded from memory snapshots
-and re-attached by name. The ``flock`` here is host-local; mesh deployments add
-quorum leases above it when a writable volume may move across nodes.
-"""
+"""Persistent named-volume SDK abstraction for the Rust v1 API."""
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import os
 import re
-import stat
-import threading
 from pathlib import Path
 from types import TracebackType
+
+from ._transport import get_transport, path_segment, state_dir
 
 STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
 VOLUME_DIR = STATE / "volumes"
 
 _NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
 
-_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-
-
-def _ensure_private_dir(path: Path, *, parents: bool) -> None:
-    """Create/open ``path`` as a real private directory, rejecting symlinks."""
-    try:
-        path.mkdir(mode=0o700, parents=parents, exist_ok=True)
-    except FileExistsError as exc:
-        raise ValueError(f"unsafe volume path {path!s}: not a directory") from exc
-    try:
-        fd = os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
-    except OSError as exc:
-        raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
-    try:
-        os.fchmod(fd, 0o700)
-    finally:
-        os.close(fd)
-
-
-def _open_volume_dir(path: Path) -> int:
-    """Open an existing volume directory without following a final symlink."""
-    try:
-        return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
-    except OSError as exc:
-        raise ValueError(f"unsafe volume path {path!s}: not a real directory") from exc
-
 
 class Volume:
-    """A persistent, single-writer named host directory shared into a guest."""
+    """A persistent named volume mounted into sandboxes by name.
+
+    The Rust daemon owns creation, deletion, locking, and mesh lease policy.
+    The Python object is intentionally small: it validates names, carries the
+    mount identity used by :meth:`vmon.Sandbox.create`, and exposes the v1
+    volume resource helpers.
+    """
 
     def __init__(self, name: str) -> None:
         if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
             raise ValueError(f"invalid volume name {name!r}: must match {_NAME_RE.pattern}")
         self.name = name
-        self.host_dir = VOLUME_DIR / name
-        self._lock_fd: int | None = None
-        self._guard = threading.Lock()
+        # Compatibility for callers that used the old local path as a display
+        # value. The path is only meaningful for local-daemon contexts.
+        self.host_dir = state_dir() / "volumes" / name
 
     def ensure(self) -> Path:
-        """Create the host directory (idempotent) and return it."""
-        _ensure_private_dir(VOLUME_DIR, parents=True)
-        _ensure_private_dir(self.host_dir, parents=False)
+        """Create the server-side volume if needed and return the legacy path."""
+        get_transport().json("PUT", f"/v1/volumes/{path_segment(self.name)}")
         return self.host_dir
 
+    create = ensure
+
+    def delete(self) -> None:
+        """Delete the server-side volume."""
+        get_transport().json("DELETE", f"/v1/volumes/{path_segment(self.name)}")
+
+    rm = delete
+
     def acquire(self) -> None:
-        """Take the exclusive single-writer lock; raise if held by another VM."""
-        with self._guard:
-            if self._lock_fd is not None:
-                return
-            self.ensure()
-            dir_fd = _open_volume_dir(self.host_dir)
-            fd = None
-            try:
-                fd = os.open(
-                    ".lock",
-                    os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                    0o600,
-                    dir_fd=dir_fd,
-                )
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise OSError(errno.EINVAL, "not a regular file", ".lock")
-                os.fchmod(fd, 0o600)
-            except OSError as exc:
-                if fd is not None:
-                    os.close(fd)
-                raise ValueError(
-                    f"unsafe volume lock for {self.name!r}: not a regular file"
-                ) from exc
-            finally:
-                os.close(dir_fd)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                os.close(fd)
-                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise RuntimeError(
-                        f"volume {self.name!r} is already in use by another VM"
-                    ) from exc
-                raise
-            self._lock_fd = fd
+        """Compatibility no-op: the daemon now enforces writer locks."""
+        self.ensure()
 
     def release(self) -> None:
-        """Release the single-writer lock if held (idempotent)."""
-        with self._guard:
-            fd = self._lock_fd
-            if fd is None:
-                return
-            self._lock_fd = None
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+        """Compatibility no-op: locks are held by daemon-managed sandboxes."""
 
     def __enter__(self) -> Volume:
         self.acquire()
@@ -133,13 +69,13 @@ class Volume:
         """virtio-fs tag derived from the name (Rust charset ``[a-z0-9_]{1,32}``)."""
         return re.sub(r"[^a-z0-9_]", "_", self.name.lower())[:32] or "vol"
 
+    def to_wire(self, *, read_only: bool = False) -> str | dict[str, object]:
+        """Return the v1 create-body volume shape."""
+        return {"name": self.name, "read_only": True} if read_only else self.name
+
     @classmethod
     def list(cls) -> list[str]:
-        """Names of existing volumes under :data:`VOLUME_DIR` (``[]`` if none)."""
-        if not VOLUME_DIR.is_dir() or VOLUME_DIR.is_symlink():
-            return []
-        return sorted(
-            p.name
-            for p in VOLUME_DIR.iterdir()
-            if not p.is_symlink() and p.is_dir() and _NAME_RE.fullmatch(p.name)
-        )
+        """Names of volumes known to the selected vmon API context."""
+        value = get_transport().json("GET", "/v1/volumes")
+        volumes = value.get("volumes") if isinstance(value, dict) else None
+        return sorted(str(name) for name in volumes) if isinstance(volumes, list) else []

@@ -1,8 +1,3 @@
-// `proto` is consumed only by the Linux-gated `linux_agent` below; the guest
-// agent only ever runs inside Linux guests, so on other hosts it is unused.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the guest agent is Linux-only"))]
-mod proto;
-
 #[cfg(target_os = "linux")]
 fn main() {
 	if let Err(err) = linux_agent::run() {
@@ -39,8 +34,7 @@ mod linux_agent {
 
 	use serde::Deserialize;
 	use serde_json::{Value, json};
-
-	use crate::proto::{self, Frame};
+	use vmon_agent::proto::{self, Frame};
 
 	type SharedWriter = Arc<Mutex<File>>;
 	type Sessions = Arc<Mutex<HashMap<u32, Session>>>;
@@ -157,6 +151,18 @@ mod linux_agent {
 			.open(HVC0)
 			.map_err(|err| format!("open {HVC0}: {err}"))?;
 		set_hvc_raw(&device)?;
+		// Announce readiness on the channel: input queued before the agent owns
+		// /dev/hvc0 is dropped by the guest tty layer (and set_hvc_raw flushes
+		// the rest), so the host defers a boot-time `--agent-exec` hand-off
+		// until this marker appears. The SYNC prefix realigns any frame reader;
+		// the ready frame is ignored by clients (no pending request id 0).
+		{
+			let mut out = &device;
+			out.write_all(&proto::SYNC)
+				.map_err(|err| format!("write ready marker to {HVC0}: {err}"))?;
+			proto::write_frame(&mut out, proto::FRAME_RESP, 0, br#"{"ready":true}"#)
+				.map_err(|err| format!("write ready frame to {HVC0}: {err}"))?;
+		}
 		let mut reader = device
 			.try_clone()
 			.map_err(|err| format!("clone {HVC0}: {err}"))?;

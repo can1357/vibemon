@@ -49,11 +49,11 @@ build: _compile
 release:
     @{{just_executable()}} profile=release build
 
-# Resolve the host path to the vmm binary for a profile (debug|release).
+# Resolve the host path to the vmon binary for a profile (debug|release).
 _bin prof:
-    @printf '%s/%s/vmm\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
+    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
 
-# Print the path to the built vmm binary (honors `profile`).
+# Print the path to the built vmon binary (honors `profile`).
 bin:
     @{{just_executable()}} _bin {{profile}}
 
@@ -102,6 +102,32 @@ integration: fetch-assets
     VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
     VMON_E2E=1 cargo test --tests -- --test-threads=1
 
+# Full VMM smoke matrix: every CLI flag and control verb exercised at least
+# once (`integration` + the musl guest agent baked into the initramfs, so the
+# agent rows run instead of skipping). Linux-only rows (TAP/pager/jail)
+# auto-skip on macOS — run `just lima-smoke` for those.
+[linux]
+smoke: agent-musl fetch-assets
+    rm -rf target/test-runs
+    VMON_E2E=1 cargo test --tests -- --test-threads=1
+
+[macos]
+smoke: agent-musl fetch-assets
+    rm -rf target/test-runs
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
+    VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
+    VMON_E2E=1 cargo test --tests -- --test-threads=1
+
+# Root-gated jail smoke rows (cgroup limits, cgroup-mode off, netns). The
+# isolated target dir keeps root-owned artifacts out of target/.
+[linux]
+smoke-jail: fetch-assets
+    sudo env VMON_E2E=1 VMON_JAIL=1 CARGO_TARGET_DIR=target/sudo HOME="$HOME" PATH="$PATH" cargo test --test jail -- --test-threads=1
+
+[macos]
+smoke-jail:
+    @echo "smoke-jail: --jail is Linux-only; run it on a Linux host or inside Lima"
+
 # Long-running soak test on Linux/KVM.
 [linux]
 soak: fetch-assets
@@ -129,9 +155,9 @@ seccomp-audit:
 
 # ------------------------------------------------------- format / lint / check
 #
-# Umbrella recipes fan out across all three toolchains: the web UI (biome), the
-# Python SDK/CLI (ruff + mypy), and the Rust workspace (cargo fmt/clippy/check).
-# Per-language recipes (`*-rust`, `*-py`, `*-ui`) run one toolchain in isolation.
+# Umbrella recipes fan out across the web UI (biome), the Python SDK
+# (ruff + mypy), and the Rust workspace (cargo fmt/clippy/check). Dedicated
+# TypeScript SDK recipes live under `sdk-ts` and `sdk-ts-smoke`.
 
 # Format every language in place.
 format: fmt-rust fmt-py fmt-ui
@@ -171,18 +197,20 @@ lint-py:
 check-py:
     cd python && uv run mypy
 
-# Python test suite (server extra pulls in the FastAPI gateway tests).
+# Python SDK test suite.
 test-py:
-    cd python && uv run --extra server pytest
+    cd python && uv run pytest
 
-# Gated two-node cluster e2e (real hypervisor required; skips otherwise).
-cluster-e2e:
-    cd python && VMON_CLUSTER_E2E=1 VMON_E2E=1 uv run --extra server pytest tests/test_cluster_e2e.py -q -s
+# Gated cluster e2e (real hypervisor required; skips otherwise).
+[linux]
+cluster-e2e: fetch-assets
+    VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
 
-# Real-VM create-to-first-useful-byte benchmark (KVM/HVF-gated; skips elsewhere).
-[positional-arguments]
-bench *args: fetch-assets
-    cd python && VMON_BENCH=1 uv run python -m bench.p50 "$@"
+[macos]
+cluster-e2e: fetch-assets
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
+    VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
+    VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
 
 # -- Web UI (ui/) --
 fmt-ui:
@@ -197,18 +225,25 @@ lint-ui:
 check-ui:
     cd ui && bun run typecheck
 
+# -- TypeScript SDK (sdk/ts) --
+sdk-ts:
+    cd sdk/ts && bun install && bun run typecheck
+
+sdk-ts-smoke:
+    cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
+
 # ----------------------------------------------------------------------- assets
 
 # Download pinned UEFI firmware + guest images used by the integration suite.
 fetch-assets:
     ./demo/fetch-test-assets.sh
 
-# Build the React/Vite web UI into python/vmon/web.
+# Build the React/Vite web UI into vmond/web for embedding in vmon serve.
 ui:
     cd ui && bun install && bun run build
 
-# Build the statically linked (musl) guest agent for the host arch and bundle it
-# into the Python package (python/vmon/_agent) so `vmon run` finds it unflagged.
+# Build the statically linked (musl) guest agent for the host arch into
+# target/test-assets so e2e initramfs builders can embed it when present.
 agent-musl:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -221,10 +256,10 @@ agent-musl:
         cargo build --release -p vmon-agent --target "$triple"
     fi
     target_dir="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}"
-    dest="{{justfile_directory()}}/python/vmon/_agent"
+    dest="{{justfile_directory()}}/target/test-assets"
     mkdir -p "$dest"
     cp "$target_dir/$triple/release/vmon-agent" "$dest/vmon-agent-$arch"
-    echo "bundled guest agent -> $dest/vmon-agent-$arch"
+    echo "guest agent -> $dest/vmon-agent-$arch"
 
 # Remove build artifacts.
 clean:
@@ -254,7 +289,7 @@ lima-build: _lima-check
 # Run vmon inside the guest (sudo for /dev/kvm + TAP); forwards args verbatim.
 [positional-arguments]
 lima-run *args: lima-build
-    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}exec sudo target/release/vmm "$@"' lima '{{lima_repo}}' "$@"
+    @exec limactl shell '{{lima_vm}}' -- bash -lc '{{lima_sh}}exec sudo target/release/vmon vmm "$@"' lima '{{lima_repo}}' "$@"
 
 # Cargo tests inside the guest.
 lima-test:
@@ -263,6 +298,11 @@ lima-test:
 # KVM integration suite inside the guest (fetches assets first).
 lima-integration:
     @{{just_executable()}} _lima './demo/fetch-test-assets.sh && VMON_E2E=1 cargo test --tests -- --test-threads=1'
+
+# Smoke matrix inside the Lima guest (nested KVM): covers the Linux-only rows
+# (TAP, pager, remote-pager, jail gates) that auto-skip on the macOS host.
+lima-smoke:
+    @{{just_executable()}} _lima 'rm -rf target/test-runs && ./demo/fetch-test-assets.sh && VMON_E2E=1 cargo test --tests -- --test-threads=1'
 
 # Soak test inside the guest.
 lima-soak:

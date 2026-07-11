@@ -49,32 +49,32 @@ find_vmm() {
   [ -n "$td" ] || td="$proj/target"
   if [ "$IS_DARWIN" -eq 1 ]; then
     for c in \
-      "$td"/release/vmm "$td"/debug/vmm \
-      "$td"/aarch64-apple-darwin/release/vmm "$td"/aarch64-apple-darwin/debug/vmm \
-      "$proj/target/release/vmm" "$proj/target/debug/vmm" \
-      "$(command -v vmm 2>/dev/null || true)"; do
+      "$td"/release/vmon "$td"/debug/vmon \
+      "$td"/aarch64-apple-darwin/release/vmon "$td"/aarch64-apple-darwin/debug/vmon \
+      "$proj/target/release/vmon" "$proj/target/debug/vmon" \
+      "$(command -v vmon 2>/dev/null || true)"; do
       [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
     done
     return 1
   fi
   for c in \
-    "$proj/target/aarch64-unknown-linux-gnu/release/vmm" \
-    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmm" \
-    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
-    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmm" \
-    "$(command -v vmm 2>/dev/null || true)"; do
+    "$proj/target/aarch64-unknown-linux-gnu/release/vmon" \
+    "${CARGO_TARGET_DIR:-/nonexistent}/aarch64-unknown-linux-gnu/release/vmon" \
+    "$base/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
+    "$HOME/.cache/cargo-target/aarch64-unknown-linux-gnu/release/vmon" \
+    "$(command -v vmon 2>/dev/null || true)"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
 }
 BIN=$(find_vmm) || {
-  echo "error: vmm binary not found. Build it with:" >&2
+  echo "error: vmon binary not found. Build it with:" >&2
   if [ "$IS_DARWIN" -eq 1 ]; then
     echo "  just build" >&2
   else
     echo "  RUSTFLAGS=\"-C linker=<zig-cc-wrapper>\" cargo build --release --target aarch64-unknown-linux-gnu" >&2
   fi
-  echo "or set VMON_BIN=/path/to/vmm" >&2; exit 1
+  echo "or set VMON_BIN=/path/to/vmon" >&2; exit 1
 }
 echo "[demo] vmm: $BIN"
 
@@ -231,7 +231,7 @@ if [ "$IS_DARWIN" -eq 1 ]; then
     echo "[demo] warning: timeout/gtimeout not found; running vmm without a host-side timeout" >&2
   fi
   set +e
-  "${TIMEOUT[@]}" "$BIN" \
+  "${TIMEOUT[@]}" "$BIN" vmm \
     --kernel "$KERNEL" --initrd "$WORK/initramfs.cpio.gz" \
     --rootfs "$WORK/disk.img" --net user --mem 1024 --cpus 4 \
     --cmdline "console=ttyS0 reboot=t panic=-1 earlycon=uart8250,mmio,0x9000000 rdinit=/init" 2>&1 | tee "$LOG"
@@ -246,7 +246,7 @@ else
 
   echo "[demo] launching vmm (4 vCPUs, 1 GiB, virtio-blk + virtio-net)"
   set +e
-  sudo timeout 60 "$BIN" \
+  sudo timeout 60 "$BIN" vmm \
     --kernel "$KERNEL" --initrd "$WORK/initramfs.cpio.gz" \
     --rootfs "$WORK/disk.img" --tap "$TAP" --mem 1024 --cpus 4 \
     --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init" 2>&1 | tee "$LOG"

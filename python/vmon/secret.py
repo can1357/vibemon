@@ -29,30 +29,34 @@ def _coerce_env_value(value: object) -> str:
 
 @dataclass(repr=False)
 class Secret:
-    """A bundle of environment variables injected into the guest at exec time."""
+    """A bundle of environment variables injected into sandbox exec sessions."""
 
     env: dict[str, str] = field(default_factory=dict)
+    name: str = "secret"
 
     def __post_init__(self) -> None:
+        self.name = _coerce_env_name(self.name)
         self.env = {_coerce_env_name(k): _coerce_env_value(v) for k, v in self.env.items()}
 
     def __repr__(self) -> str:
         names = ", ".join(self.names())
-        return f"Secret(names=[{names}])"
+        return f"Secret(name={self.name!r}, names=[{names}])"
 
     @classmethod
-    def from_dict(cls, values: Mapping[str, object]) -> Secret:
+    def from_dict(cls, values: Mapping[str, object], *, name: str = "secret") -> Secret:
         """Build a Secret from an explicit name->value mapping."""
-        return cls({_coerce_env_name(k): _coerce_env_value(v) for k, v in values.items()})
+        return cls(
+            {_coerce_env_name(k): _coerce_env_value(v) for k, v in values.items()}, name=name
+        )
 
     @classmethod
-    def from_env(cls, *names: str) -> Secret:
+    def from_env(cls, *names: str, name: str = "env") -> Secret:
         """Capture the named variables from the host process environment.
 
         Missing names are skipped; the host value is never echoed elsewhere.
         """
-        wanted = [_coerce_env_name(name) for name in names]
-        return cls({name: os.environ[name] for name in wanted if name in os.environ})
+        wanted = [_coerce_env_name(item) for item in names]
+        return cls({item: os.environ[item] for item in wanted if item in os.environ}, name=name)
 
     def names(self) -> list[str]:
         """Sorted variable names (safe to persist; values are not)."""
@@ -61,6 +65,10 @@ class Secret:
     def as_env(self) -> dict[str, str]:
         """A copy of the variable map for injection into an exec env."""
         return {_coerce_env_name(k): _coerce_env_value(v) for k, v in self.env.items()}
+
+    def to_wire(self) -> dict[str, object]:
+        """Return the v1 request shape; values are only sent in-memory."""
+        return {"name": self.name, "values": self.as_env()}
 
 
 def merge_secrets(secrets: Iterable[object] | None) -> dict[str, str]:

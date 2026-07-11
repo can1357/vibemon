@@ -3,9 +3,9 @@
 # via `limactl shell`. The project dir is visible at the same path in the guest
 # (Lima home mount), so the in-guest scripts auto-locate the binary and kernel.
 #
-# Native macOS/HVF support is now available on Apple silicon for aarch64 guests:
-# build the local `vmm` with `just build`, then prefer the native demo scripts
-# when you do not need Lima. Keep this wrapper for x86_64 guests, nested Linux
+# Native macOS/HVF support is available on Apple silicon for aarch64 guests:
+# build the local `vmon` binary with `just build`, then prefer the native demo
+# scripts when you do not need Lima. Keep this wrapper for x86_64 guests,
 # KVM coverage, or Linux-only features such as TAP networking.
 #
 # Usage:  run-on-lima.sh [demo|ubuntu] [vm-name] [extra args -> guest script]
@@ -37,13 +37,13 @@ if ! limactl list -q 2>/dev/null | grep -qx "$VM"; then
 fi
 
 # Build the aarch64 binary on the host if it's missing and zig is available.
-BIN="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}/aarch64-unknown-linux-gnu/release/vmm"
-BIN_PROJ="$PROJ/target/aarch64-unknown-linux-gnu/release/vmm"
+BIN="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}/aarch64-unknown-linux-gnu/release/vmon"
+BIN_PROJ="$PROJ/target/aarch64-unknown-linux-gnu/release/vmon"
 [ -x "$BIN" ] || BIN="$BIN_PROJ"
 if [ ! -x "$BIN" ]; then
   ZIGBIN=${ZIG:-$(command -v zig 2>/dev/null || true)}
   if [ -n "$ZIGBIN" ]; then
-    echo "[lima] building aarch64 vmm with zig as cross-linker"
+    echo "[lima] building aarch64 vmon with zig as cross-linker"
     WRAP=$(mktemp)
     printf '#!/bin/sh\nexec %s cc -target aarch64-linux-gnu "$@"\n' "$ZIGBIN" > "$WRAP"
     chmod +x "$WRAP"

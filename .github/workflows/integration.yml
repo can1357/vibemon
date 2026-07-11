@@ -12,13 +12,10 @@ permissions:
   contents: read
 
 jobs:
-  # The Python real-VM e2e and the Rust integration suite each boot real
-  # microVMs on a GitHub-hosted Linux runner (/dev/kvm). They run as parallel
-  # jobs (shared build + asset caches) so the whole check finishes in ~5 min.
   kvm-integration:
     name: KVM integration
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       VMON_TAP: vmon0
       VMON_HOST_IP: 192.168.249.1
@@ -32,34 +29,14 @@ jobs:
       - name: Prepare KVM host
         uses: ./.github/actions/kvm-host
 
-      - name: Run Python real-VM e2e
-        working-directory: python
-        run: |
-          uv run e2e.py
-          uv run cli_e2e.py
-          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
+      - name: Run Rust gated integration suite
+        run: VMON_E2E=1 cargo test --tests -- --test-threads=1
 
-  kvm-rust:
-    name: KVM Rust integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      VMON_TAP: vmon0
-      VMON_HOST_IP: 192.168.249.1
-      VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Run Python SDK real-VM e2e
+        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py
 
-      - name: Prepare KVM host
-        uses: ./.github/actions/kvm-host
-
-      - name: Run integration tests
-        run: just integration
-
-      - name: Run soak tests
-        if: github.event_name == 'schedule'
-        run: just soak
+      - name: Run Rust cluster e2e
+        run: VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
 
   hvf-integration:
     name: HVF integration
@@ -69,6 +46,7 @@ jobs:
     # schedule once such a runner is online.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: [self-hosted, macos, arm64]
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,8 +72,11 @@ jobs:
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
 
-      - name: Build vmm
+      - name: Build vmon
         run: cargo build --locked
+
+      - name: Codesign vmon for HVF
+        run: just codesign
 
       - name: Build static guest agent
         run: just agent-musl
@@ -103,21 +84,20 @@ jobs:
       - name: Fetch test assets
         run: just fetch-assets
 
-      - name: Run Python real-VM e2e
-        working-directory: python
-        run: |
-          uv run e2e.py
-          uv run cli_e2e.py
-          VMON_KVM_E2E=1 uv run pytest tests/test_e2e.py -q
-
-      - name: Run cluster e2e
+      - name: Run Rust gated integration suite
         env:
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: ${{ github.workspace }}/demo/hvf-test-runner.sh
+          VMON_ENTITLEMENTS: ${{ github.workspace }}/hvf.entitlements
+          VMON_E2E: "1"
+        run: cargo test --tests -- --test-threads=1
+
+      - name: Run Python SDK real-VM e2e
+        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py
+
+      - name: Run Rust cluster e2e
+        env:
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: ${{ github.workspace }}/demo/hvf-test-runner.sh
+          VMON_ENTITLEMENTS: ${{ github.workspace }}/hvf.entitlements
           VMON_CLUSTER_E2E: "1"
-        run: just cluster-e2e
-
-      - name: Run HVF integration tests
-        run: just integration
-
-      - name: Run soak tests
-        if: github.event_name == 'schedule'
-        run: just soak
+          VMON_E2E: "1"
+        run: cargo test --test cluster_e2e -- --test-threads=1

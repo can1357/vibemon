@@ -1,5 +1,7 @@
 #![allow(dead_code, reason = "common test helpers may not be used by all test targets")]
 
+pub mod agent;
+
 use std::{
 	fs,
 	io::{self, BufRead, BufReader, Read, Write},
@@ -15,11 +17,18 @@ use flume::{Receiver, Sender};
 use serde_json::{Value, json};
 
 const TEST_ASSETS: &str = "target/test-assets";
-const TEST_RUNS: &str = "target/test-runs";
+
+/// Per-run scratch root. Follows `CARGO_TARGET_DIR` so a sudo run with an
+/// isolated target dir (`just smoke-jail`) never leaves root-owned dirs in
+/// the default `target/test-runs`.
+fn test_runs_dir() -> PathBuf {
+	let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
+	Path::new(&target).join("test-runs")
+}
 const DEFAULT_MEM_MIB: &str = "256";
 
 pub fn vmm() -> Command {
-	let mut cmd = Command::new(env!("CARGO_BIN_EXE_vmm"));
+	let mut cmd = vmm_raw();
 	if let Ok(action) = std::env::var("VMON_SECCOMP_ACTION") {
 		cmd.arg("--seccomp-action").arg(action);
 	}
@@ -30,7 +39,7 @@ pub fn vmm() -> Command {
 			.unwrap()
 			.as_nanos();
 		let id = format!("vm-{nanos}");
-		let jail_root = Path::new(TEST_RUNS).join(format!("jail-{nanos}"));
+		let jail_root = test_runs_dir().join(format!("jail-{nanos}"));
 		fs::create_dir_all(&jail_root).unwrap_or_else(|e| panic!("creating jail root: {e}"));
 		let jail_root =
 			fs::canonicalize(&jail_root).unwrap_or_else(|e| panic!("canonicalizing jail root: {e}"));
@@ -45,6 +54,15 @@ pub fn vmm() -> Command {
 		cmd.arg("--sandbox-uid").arg(uid);
 		cmd.arg("--sandbox-gid").arg(gid);
 	}
+	cmd
+}
+
+/// The `vmon` binary invoked with the `vmm` subcommand and NO env-derived
+/// extra flags, for tests that construct jail/seccomp arguments themselves
+/// (a duplicate flag is a clap error).
+pub fn vmm_raw() -> Command {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_vmon"));
+	cmd.arg("vmm");
 	cmd
 }
 
@@ -102,6 +120,21 @@ fn hv_present() -> bool {
 /// Soak runs additionally require `VMON_SOAK=1`.
 pub fn require_soak() -> bool {
 	require_hv() && env_flag("VMON_SOAK")
+}
+
+/// Jail smoke tests need Linux, a hypervisor, and root: `--jail` refuses to
+/// launch without euid 0. Skips noisily when `VMON_JAIL=1` asked for jail
+/// coverage but the run is unprivileged.
+pub fn require_jail() -> bool {
+	if !require_hv() || !supports_linux_isolation() {
+		return false;
+	}
+	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
+	let root = unsafe { libc::geteuid() } == 0;
+	if !root && env_flag("VMON_JAIL") {
+		eprintln!("SKIP jail tests: VMON_JAIL=1 but not running as root");
+	}
+	root
 }
 
 /// Linux TAP host networking (`--tap`); KVM only.
@@ -177,7 +210,7 @@ pub fn test_dir(name: &str) -> PathBuf {
 		.duration_since(UNIX_EPOCH)
 		.expect("system clock before Unix epoch")
 		.as_nanos();
-	let dir = Path::new(TEST_RUNS).join(format!("{name}-{}-{nanos}", std::process::id()));
+	let dir = test_runs_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
 	// Private mode so control/agent sockets created here satisfy vmon's
 	// 0700-or-stricter parent-directory requirement on every host.
 	fs::DirBuilder::new()
@@ -291,7 +324,25 @@ pub fn spawn_vmm(args: &[&str]) -> VmmProcess {
 }
 
 pub fn spawn_vmm_with_input(args: &[&str], serial_input: &[u8]) -> VmmProcess {
+	spawn_command_with_input(vmm(), args, serial_input)
+}
+
+/// Spawn with extra environment variables (e.g. `VMON_REMOTE_PAGE_TOKEN`).
+pub fn spawn_vmm_with_env(args: &[&str], envs: &[(&str, &str)]) -> VmmProcess {
 	let mut cmd = vmm();
+	for (key, value) in envs {
+		cmd.env(key, value);
+	}
+	spawn_command_with_input(cmd, args, b"")
+}
+
+/// Spawn `cmd` (a vmm invocation, e.g. [`vmm`] or [`vmm_raw`]) with `args`,
+/// wiring serial stdin plus stdout/stderr capture readers.
+pub fn spawn_command_with_input(
+	mut cmd: Command,
+	args: &[&str],
+	serial_input: &[u8],
+) -> VmmProcess {
 	cmd.args(args)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
@@ -371,8 +422,13 @@ impl VmmProcess {
 				.try_wait()
 				.unwrap_or_else(|e| panic!("polling vmon status: {e}"))
 			{
+				// Join readers first: a guest that emits the marker and powers off
+				// immediately can be reaped before the capture threads drained it.
 				self.join_readers();
 				let output = self.output();
+				if output.contains(marker) {
+					return output;
+				}
 				panic!("vmon exited with {status} before marker {marker:?}; output:\n{output}");
 			}
 			let now = Instant::now();
