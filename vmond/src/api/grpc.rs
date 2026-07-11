@@ -49,8 +49,10 @@ pub fn status_from(err: &ApiError) -> Status {
 		"not_found" => Code::NotFound,
 		"invalid" => Code::InvalidArgument,
 		"unauthorized" => Code::Unauthenticated,
-		"not_running" => Code::FailedPrecondition,
+		"not_running" | "actor_lost" | "unavailable_secret" => Code::FailedPrecondition,
 		"busy" | "conflict" => Code::Aborted,
+		"checksum" => Code::DataLoss,
+		"deadline" => Code::DeadlineExceeded,
 		"unsupported" => Code::Unimplemented,
 		// engine_error plus mesh transport codes (unreachable, ambiguous, …).
 		_ => Code::Unavailable,
@@ -1142,6 +1144,25 @@ mod tests {
 		}
 	}
 
+
+	#[test]
+	fn function_errors_have_stable_grpc_codes_and_metadata() {
+		for (stable, expected) in [
+			("actor_lost", Code::FailedPrecondition),
+			("unavailable_secret", Code::FailedPrecondition),
+			("checksum", Code::DataLoss),
+			("conflict", Code::Aborted),
+			("deadline", Code::DeadlineExceeded),
+		] {
+			let status =
+				status_from(&ApiError::new(axum::http::StatusCode::CONFLICT, stable, "boom"));
+			assert_eq!(status.code(), expected, "{stable}");
+			assert_eq!(
+				status.metadata().get("vmon-code").and_then(|value| value.to_str().ok()),
+				Some(stable)
+			);
+		}
+	}
 	#[test]
 	fn mesh_transport_codes_map_to_unavailable_or_aborted() {
 		let unreachable = status_from(&mesh_api_error(MeshError::unreachable("gone")));

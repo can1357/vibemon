@@ -82,6 +82,21 @@ impl Home {
 		self.root.join("cas")
 	}
 
+	/// Return `$VMON_HOME/functions`, the durable function runtime root.
+	pub fn functions_dir(&self) -> PathBuf {
+		self.root.join("functions")
+	}
+
+	/// Return the durable function metadata database.
+	pub fn functions_db(&self) -> PathBuf {
+		self.functions_dir().join("state.sqlite3")
+	}
+
+	/// Return the content-addressed function artifact directory.
+	pub fn function_artifacts_dir(&self) -> PathBuf {
+		self.functions_dir().join("artifacts")
+	}
+
 	/// Return `$VMON_HOME/records`.
 	pub fn records_dir(&self) -> PathBuf {
 		self.root.join("records")

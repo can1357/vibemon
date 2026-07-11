@@ -156,8 +156,9 @@ pub fn is_admin_path(path: &str) -> bool {
 	if path.starts_with("/v1/mesh/") {
 		return true;
 	}
-	// Admin-only gRPC methods (the former PUT/DELETE pool & volume routes and
-	// POST migrate).
+	// Client credentials may invoke functions and observe/cancel calls, but
+	// deployment, secret-bearing registration, artifact upload, and durable
+	// schedule mutations require an administrator credential.
 	if let Some(rest) = path.strip_prefix("/vmon.v1.") {
 		return matches!(
 			rest,
@@ -166,6 +167,14 @@ pub fn is_admin_path(path: &str) -> bool {
 				| "PoolService/Set"
 				| "PoolService/Delete"
 				| "SandboxService/Migrate"
+				| "ArtifactService/Put"
+				| "FunctionService/Register"
+				| "FunctionService/Activate"
+				| "FunctionService/Delete"
+				| "FunctionService/ActivateApp"
+				| "FunctionService/RollbackApp"
+				| "FunctionService/CreateSchedule"
+				| "FunctionService/DeleteSchedule"
 		);
 	}
 	false
@@ -340,6 +349,42 @@ mod tests {
 
 		let non_upgrade_bridge = request(Method::GET, "/grpc?token=tok", false);
 		assert_eq!(request_bearer_token(&non_upgrade_bridge), None);
+	}
+
+	#[test]
+	fn function_admin_policy_preserves_client_invocation_access() {
+		for path in [
+			"/vmon.v1.ArtifactService/Put",
+			"/vmon.v1.FunctionService/Register",
+			"/vmon.v1.FunctionService/Activate",
+			"/vmon.v1.FunctionService/Delete",
+			"/vmon.v1.FunctionService/ActivateApp",
+			"/vmon.v1.FunctionService/RollbackApp",
+			"/vmon.v1.FunctionService/CreateSchedule",
+			"/vmon.v1.FunctionService/DeleteSchedule",
+		] {
+			assert!(is_admin_path(path), "{path}");
+		}
+		for path in [
+			"/vmon.v1.ArtifactService/Get",
+			"/vmon.v1.ArtifactService/Stat",
+			"/vmon.v1.FunctionService/Get",
+			"/vmon.v1.FunctionService/List",
+			"/vmon.v1.FunctionService/GetApp",
+			"/vmon.v1.FunctionService/GetSchedule",
+			"/vmon.v1.FunctionService/ListSchedules",
+			"/vmon.v1.CallService/Create",
+			"/vmon.v1.CallService/Get",
+			"/vmon.v1.CallService/Watch",
+			"/vmon.v1.CallService/Cancel",
+			"/vmon.v1.ActorService/Create",
+			"/vmon.v1.ActorService/Checkpoint",
+			"/vmon.v1.ActorService/Restore",
+			"/vmon.v1.ActorService/Fork",
+			"/vmon.v1.ActorService/Delete",
+		] {
+			assert!(!is_admin_path(path), "{path}");
+		}
 	}
 }
 

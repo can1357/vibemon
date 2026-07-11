@@ -27,6 +27,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `FunctionService` for remote function registration, management, and scheduling
+- Added `ArtifactService` for immutable content-addressed function payload storage
+- Added protocol-v2 guest runner for high-performance function execution
+- Added durable scheduling and actor state management for persistent remote objects
 - Added Python SDK support for durable remote function definitions and execution
 - Added `@concurrent` and `@batched` decorators for configuring Python remote function policies
 - Added Python SDK image building support (e.g., Python environment, apt/uv packages, environment)
