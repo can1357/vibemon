@@ -3,8 +3,7 @@ from __future__ import annotations
 import pytest
 from v1_stub import V1StubServer, configure_context
 
-from vmon.sandbox import Sandbox
-from vmon.volume import Volume
+from vmon import Volume, connect
 
 
 def test_volume_name_validation_and_wire_shape() -> None:
@@ -14,50 +13,54 @@ def test_volume_name_validation_and_wire_shape() -> None:
         assert volume.to_wire() == name
         assert volume.to_wire(read_only=True) == {"name": name, "read_only": True}
 
-    for name in ["", "A", "-a", ".a", "a/b", "a b", "a" * 65, None]:
+    for invalid_name in ["", "A", "-a", ".a", "a/b", "a b", "a" * 65, None]:
         with pytest.raises(ValueError):
-            Volume(name)  # type: ignore[arg-type]
+            Volume(invalid_name)  # type: ignore[arg-type]
 
 
-def test_volume_create_list_delete_use_v1_volume_resource(monkeypatch, mvm_home) -> None:
+def test_volume_namespace_create_list_and_delete(monkeypatch, mvm_home) -> None:
     with V1StubServer() as server:
         configure_context(monkeypatch, mvm_home, server)
 
-        volume = Volume("data")
-        assert volume.create() is volume
-        assert server.last("PUT", "/v1/volumes/data").json is None
-        assert Volume.list() == ["data"]
-        assert server.last("GET", "/v1/volumes").headers["authorization"] == "Bearer test-token"
+        with connect() as client:
+            volume = client.volumes.create("data")
+            assert volume.name == "data"
+            assert server.last("PUT", "/v1/volumes/data").json is None
+            assert [item.name for item in client.volumes.list()] == ["data"]
+            assert server.last("GET", "/v1/volumes").headers["authorization"] == (
+                "Bearer test-token"
+            )
 
-        Volume("cache").create()
-        assert Volume.list() == ["cache", "data"]
+            client.volumes.create("cache")
+            assert [item.name for item in client.volumes.list()] == ["cache", "data"]
 
-        Volume("data").delete()
-        assert Volume.list() == ["cache"]
-        Volume("cache").delete()
-        assert Volume.list() == []
+            client.volumes.delete(volume)
+            assert [item.name for item in client.volumes.list()] == ["cache"]
+            client.volumes.delete("cache")
+            assert client.volumes.list() == []
 
 
 def test_sandbox_create_mounts_named_volumes_without_host_paths(monkeypatch, mvm_home) -> None:
     with V1StubServer() as server:
         configure_context(monkeypatch, mvm_home, server)
 
-        Sandbox.create(
-            image="python:3.14-slim",
-            context="prod",
-            name="with-volumes",
-            volumes={
-                "/data": Volume("data"),
-                "/readonly": (Volume("snap"), True),
-                "/cache": "cache",
-            },
-        )
+        with connect() as client:
+            client.sandboxes.create(
+                image="python:3.14-slim",
+                context=".",
+                name="with-volumes",
+                volumes={
+                    "/data": Volume("data"),
+                    "/readonly": (Volume("snap"), True),
+                    "/cache": "cache",
+                },
+            )
 
-        create = server.last("POST", "/v1/sandboxes")
-        assert create.json["volumes"] == {
+        create_request = server.last("POST", "/v1/sandboxes")
+        assert create_request.json["volumes"] == {
             "/data": "data",
             "/readonly": {"name": "snap", "read_only": True},
             "/cache": "cache",
         }
-        assert "host_dir" not in str(create.json["volumes"])
-        assert "host_path" not in str(create.json["volumes"])
+        assert "host_dir" not in str(create_request.json["volumes"])
+        assert "host_path" not in str(create_request.json["volumes"])

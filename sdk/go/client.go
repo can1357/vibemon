@@ -1,7 +1,6 @@
 package vmon
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,8 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -19,118 +18,144 @@ const (
 	maxErrorMessageBytes          = 8 << 10
 )
 
-// Option configures a Client during construction.
-type Option func(*clientConfig) error
+// Option configures Connect or NewClient.
+type Option func(*clientConfig)
 
 type clientConfig struct {
 	httpClient       *http.Client
 	token            string
 	userAgent        string
 	maxResponseBytes int64
+	discovery        *bool
+	timeout          time.Duration
 }
 
-// WithToken adds an Authorization: Bearer header to HTTP and WebSocket requests.
-func WithToken(token string) Option {
-	return func(config *clientConfig) error {
-		config.token = token
-		return nil
-	}
-}
+// WithToken sets the bearer token.
+func WithToken(token string) Option { return func(c *clientConfig) { c.token = token } }
 
-// WithHTTPClient makes the client use the supplied HTTP client for HTTP and WebSocket handshakes.
-func WithHTTPClient(httpClient *http.Client) Option {
-	return func(config *clientConfig) error {
-		if httpClient == nil {
-			return errors.New("vmon: HTTP client must not be nil")
+// WithHTTPClient sets the HTTP client used by the mesh driver.
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *clientConfig) {
+		if client != nil {
+			c.httpClient = client
 		}
-		config.httpClient = httpClient
-		return nil
 	}
 }
 
-// WithUserAgent sets the User-Agent header sent by the client.
-func WithUserAgent(userAgent string) Option {
-	return func(config *clientConfig) error {
-		config.userAgent = userAgent
-		return nil
-	}
-}
+// WithUserAgent sets the HTTP User-Agent header.
+func WithUserAgent(value string) Option { return func(c *clientConfig) { c.userAgent = value } }
 
-// WithMaxResponseBytes sets the maximum size of a buffered successful response.
-func WithMaxResponseBytes(limit int64) Option {
-	return func(config *clientConfig) error {
-		if limit <= 0 {
-			return errors.New("vmon: maximum response size must be positive")
+// WithMaxResponseBytes limits buffered successful response bodies.
+func WithMaxResponseBytes(value int64) Option {
+	return func(c *clientConfig) {
+		if value > 0 {
+			c.maxResponseBytes = value
 		}
-		config.maxResponseBytes = limit
-		return nil
 	}
 }
 
-// Client is a client for one vmon API endpoint.
-type Client struct {
-	baseURL          *url.URL
-	httpClient       *http.Client
-	token            string
-	userAgent        string
-	maxResponseBytes int64
+// WithDiscovery overrides DSN mesh discovery.
+func WithDiscovery(enabled bool) Option { return func(c *clientConfig) { c.discovery = &enabled } }
+
+// WithTimeout overrides the DSN request timeout.
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *clientConfig) {
+		if timeout > 0 {
+			c.timeout = timeout
+		}
+	}
 }
 
-// NewClient constructs a client for an absolute HTTP or HTTPS API base URL.
-func NewClient(baseURL string, options ...Option) (*Client, error) {
-	parsed, err := url.Parse(baseURL)
+func defaultClientConfig() clientConfig {
+	return clientConfig{httpClient: &http.Client{}, maxResponseBytes: defaultMaxResponseBytes}
+}
+
+// Connect parses dsn, constructs its mesh driver, and returns a ready client.
+func Connect(dsn string, options ...Option) (*Client, error) {
+	config, err := ParseDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("vmon: parse base URL: %w", err)
+		return nil, err
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("vmon: unsupported base URL scheme %q", parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return nil, errors.New("vmon: base URL must include a host")
-	}
-	if parsed.User != nil {
-		return nil, errors.New("vmon: base URL must not include user information")
-	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("vmon: base URL must not include a query or fragment")
-	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
-
-	config := clientConfig{
-		httpClient:       &http.Client{},
-		maxResponseBytes: defaultMaxResponseBytes,
-	}
+	settings := defaultClientConfig()
 	for _, option := range options {
-		if option == nil {
-			return nil, errors.New("vmon: nil client option")
-		}
-		if err := option(&config); err != nil {
-			return nil, err
+		if option != nil {
+			option(&settings)
 		}
 	}
-	return &Client{
-		baseURL:          parsed,
-		httpClient:       config.httpClient,
-		token:            config.token,
-		userAgent:        config.userAgent,
-		maxResponseBytes: config.maxResponseBytes,
-	}, nil
+	if settings.discovery != nil {
+		config.Discover = *settings.discovery
+	}
+	if settings.timeout > 0 {
+		config.Timeout = settings.timeout
+	}
+	driver, err := newMeshDriver(config, withMeshHTTPClient(settings.httpClient), withMeshToken(firstNonempty(settings.token, config.Token)), withMeshUserAgent(settings.userAgent), withMeshMaxResponseBytes(settings.maxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+	return newClient(driver, settings), nil
 }
 
-// APIError is a structured error returned by the vmon API or a WebSocket protocol frame.
+func firstNonempty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// Client is a driver-backed vmon API client.
+type Client struct {
+	driver           Driver
+	maxResponseBytes int64
+	Sandboxes        *SandboxService
+	Snapshots        *SnapshotService
+	Volumes          *VolumeService
+	Pools            *PoolService
+	Mesh             *MeshService
+}
+
+// NewClient binds the service object model to an existing driver.
+func NewClient(driver Driver, options ...Option) *Client {
+	settings := defaultClientConfig()
+	for _, option := range options {
+		if option != nil {
+			option(&settings)
+		}
+	}
+	return newClient(driver, settings)
+}
+
+func newClient(driver Driver, settings clientConfig) *Client {
+	client := &Client{driver: driver, maxResponseBytes: settings.maxResponseBytes}
+	client.Sandboxes = &SandboxService{client: client}
+	client.Snapshots = &SnapshotService{client: client}
+	client.Volumes = &VolumeService{client: client}
+	client.Pools = &PoolService{client: client}
+	client.Mesh = &MeshService{client: client}
+	return client
+}
+
+// Driver returns the transport backing this client.
+func (client *Client) Driver() Driver { return client.driver }
+
+// Close releases all resources associated with the client.
+func (client *Client) Close() error {
+	if client == nil || client.driver == nil {
+		return nil
+	}
+	return client.driver.Close()
+}
+
+// APIError is a structured daemon or WebSocket error.
 type APIError struct {
-	// StatusCode is the HTTP status, or zero for an error delivered after a WebSocket upgrade.
 	StatusCode int
-	// Code is the daemon's machine-readable error code.
-	Code string
-	// Message is the daemon's human-readable error message.
-	Message string
-	// Truncated reports whether the HTTP error body exceeded the bounded read limit.
-	Truncated bool
+	Code       string
+	Message    string
+	Truncated  bool
 }
 
-// Error implements error.
+// Error returns the string representation of the API error.
 func (err *APIError) Error() string {
 	if err == nil {
 		return "<nil>"
@@ -141,17 +166,14 @@ func (err *APIError) Error() string {
 	return fmt.Sprintf("vmon API error (%s): %s", err.Code, err.Message)
 }
 
-// ProtocolError reports a response that did not conform to the vmon protocol.
+// ProtocolError represents a failure to communicate with the daemon or parse its response.
 type ProtocolError struct {
-	// Operation identifies the operation whose response was invalid.
 	Operation string
-	// Message describes the protocol violation.
-	Message string
-	// Err is an optional underlying decoding error.
-	Err error
+	Message   string
+	Err       error
 }
 
-// Error implements error.
+// Error returns the string representation of the protocol error.
 func (err *ProtocolError) Error() string {
 	if err == nil {
 		return "<nil>"
@@ -162,7 +184,7 @@ func (err *ProtocolError) Error() string {
 	return "vmon protocol error during " + err.Operation + ": " + err.Message
 }
 
-// Unwrap exposes the underlying decoding error, if any.
+// Unwrap returns the underlying error, if any.
 func (err *ProtocolError) Unwrap() error {
 	if err == nil {
 		return nil
@@ -170,68 +192,41 @@ func (err *ProtocolError) Unwrap() error {
 	return err.Err
 }
 
-// ResponseTooLargeError reports that a buffered successful response exceeded its configured limit.
-type ResponseTooLargeError struct {
-	// Limit is the configured response limit in bytes.
-	Limit int64
-}
+// ResponseTooLargeError indicates that the server response exceeded the configured byte limit.
+type ResponseTooLargeError struct{ Limit int64 }
 
-// Error implements error.
+// Error returns the string representation of the ResponseTooLargeError.
 func (err *ResponseTooLargeError) Error() string {
 	return fmt.Sprintf("vmon: response exceeds %d-byte limit", err.Limit)
 }
 
-func (client *Client) endpoint(escapedPath string, query url.Values) (string, error) {
-	if !strings.HasPrefix(escapedPath, "/") {
-		return "", errors.New("vmon: endpoint path must be absolute")
-	}
-	endpoint := *client.baseURL
-	basePath := strings.TrimRight(endpoint.EscapedPath(), "/")
-	fullPath := basePath + escapedPath
-	decodedPath, err := url.PathUnescape(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("vmon: build endpoint URL: %w", err)
-	}
-	endpoint.Path = decodedPath
-	endpoint.RawPath = fullPath
-	endpoint.RawQuery = query.Encode()
-	return endpoint.String(), nil
-}
-
 func escapePathSegment(value string) string {
-	switch value {
-	case ".":
+	if value == "." {
 		return "%2E"
-	case "..":
-		return "%2E%2E"
-	default:
-		return url.PathEscape(value)
 	}
+	if value == ".." {
+		return "%2E%2E"
+	}
+	return url.PathEscape(value)
 }
-
 func escapeRestPath(value string) string {
 	value = strings.TrimLeft(value, "/")
 	if value == "" {
 		return ""
 	}
 	parts := strings.Split(value, "/")
-	for index := range parts {
-		parts[index] = escapePathSegment(parts[index])
+	for i := range parts {
+		parts[i] = escapePathSegment(parts[i])
 	}
 	return strings.Join(parts, "/")
 }
-
 func cloneValues(values url.Values) url.Values {
-	if values == nil {
-		return make(url.Values)
-	}
-	cloned := make(url.Values, len(values))
+	result := make(url.Values, len(values))
 	for key, entries := range values {
-		cloned[key] = append([]string(nil), entries...)
+		result[key] = append([]string(nil), entries...)
 	}
-	return cloned
+	return result
 }
-
 func requireIdentifier(kind, value string) error {
 	if value == "" {
 		return fmt.Errorf("vmon: %s must not be empty", kind)
@@ -239,193 +234,84 @@ func requireIdentifier(kind, value string) error {
 	return nil
 }
 
-func (client *Client) newRequest(
-	ctx context.Context,
-	method string,
-	escapedPath string,
-	query url.Values,
-	body io.Reader,
-	contentType string,
-) (*http.Request, error) {
-	endpoint, err := client.endpoint(escapedPath, query)
+func (client *Client) request(ctx context.Context, request DriverRequest) (*http.Response, string, error) {
+	if client == nil || client.driver == nil {
+		return nil, "", errors.New("vmon: client has no driver")
+	}
+	response, endpoint, err := client.driver.Do(ctx, request)
 	if err != nil {
-		return nil, err
-	}
-	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
-	if err != nil {
-		return nil, fmt.Errorf("vmon: create HTTP request: %w", err)
-	}
-	request.Header.Set("Accept", "application/json")
-	if contentType != "" {
-		request.Header.Set("Content-Type", contentType)
-	}
-	client.applyHeaders(request.Header)
-	return request, nil
-}
-
-func (client *Client) applyHeaders(header http.Header) {
-	if client.token != "" {
-		header.Set("Authorization", "Bearer "+client.token)
-	}
-	if client.userAgent != "" {
-		header.Set("User-Agent", client.userAgent)
-	}
-}
-
-func (client *Client) do(request *http.Request) (*http.Response, error) {
-	response, err := client.httpClient.Do(request)
-	if err != nil && response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	if err != nil {
-		if contextErr := request.Context().Err(); contextErr != nil {
-			return nil, contextErr
-		}
-		return nil, fmt.Errorf("vmon: HTTP request failed: %w", err)
+		return nil, "", err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, apiErrorFromResponse(response)
+		return nil, endpoint, apiErrorFromResponse(response)
 	}
-	return response, nil
+	return response, endpoint, nil
 }
-
-func (client *Client) doJSON(
-	ctx context.Context,
-	method string,
-	escapedPath string,
-	query url.Values,
-	body any,
-	out any,
-) error {
-	var reader io.Reader
-	contentType := ""
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("vmon: encode request body: %w", err)
-		}
-		reader = bytes.NewReader(encoded)
-		contentType = "application/json"
-	}
-	request, err := client.newRequest(ctx, method, escapedPath, query, reader, contentType)
-	if err != nil {
-		return err
-	}
-	response, err := client.do(request)
+func (client *Client) doJSON(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	response, _, err := client.request(ctx, DriverRequest{Method: method, Path: path, Query: query, JSON: body})
 	if err != nil {
 		return err
 	}
 	if out == nil {
-		defer response.Body.Close()
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 32<<10))
-		return nil
+		_, err = client.readResponse(response)
+		return err
 	}
-	encoded, err := client.readResponse(response)
+	return client.decodeJSONResponse(response, method+" "+path, out)
+}
+func (client *Client) decodeJSONResponse(response *http.Response, operation string, out any) error {
+	body, err := client.readResponse(response)
 	if err != nil {
 		return err
 	}
-	if len(encoded) == 0 {
-		return &ProtocolError{Operation: method + " " + escapedPath, Message: "empty JSON response"}
+	if len(body) == 0 {
+		return &ProtocolError{Operation: operation, Message: "empty JSON response"}
 	}
-	if err := json.Unmarshal(encoded, out); err != nil {
-		return &ProtocolError{
-			Operation: method + " " + escapedPath,
-			Message:   "invalid JSON response",
-			Err:       err,
-		}
+	if err := json.Unmarshal(body, out); err != nil {
+		return &ProtocolError{Operation: operation, Message: "invalid JSON response", Err: err}
 	}
 	return nil
 }
-
 func (client *Client) readResponse(response *http.Response) ([]byte, error) {
-	defer response.Body.Close()
-	return readLimited(response.Body, client.maxResponseBytes)
-}
-
-func readLimited(reader io.Reader, limit int64) ([]byte, error) {
-	limited := &io.LimitedReader{R: reader, N: limit + 1}
-	data, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, fmt.Errorf("vmon: read response body: %w", err)
+	if response == nil || response.Body == nil {
+		return nil, &ProtocolError{Operation: "read response", Message: "response has no body"}
 	}
-	if int64(len(data)) > limit {
+	defer response.Body.Close()
+	limit := client.maxResponseBytes
+	if limit <= 0 {
+		limit = defaultMaxResponseBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
 		return nil, &ResponseTooLargeError{Limit: limit}
 	}
-	return data, nil
+	return body, nil
 }
-
 func apiErrorFromResponse(response *http.Response) error {
-	if response.Body == nil {
-		return parseAPIError(response.StatusCode, nil, false)
+	if response == nil {
+		return &APIError{Message: "empty response"}
 	}
 	defer response.Body.Close()
-	limited := &io.LimitedReader{R: response.Body, N: maxErrorResponseBytes + 1}
-	body, readErr := io.ReadAll(limited)
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxErrorResponseBytes+1))
 	truncated := int64(len(body)) > maxErrorResponseBytes
 	if truncated {
 		body = body[:maxErrorResponseBytes]
 	}
-	apiErr := parseAPIError(response.StatusCode, body, truncated)
-	if readErr != nil && apiErr.Message == "" {
-		apiErr.Message = "failed to read error response: " + readErr.Error()
+	var wire struct {
+		Code    string `json:"code"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
 	}
-	return apiErr
-}
-
-func parseAPIError(statusCode int, body []byte, truncated bool) *APIError {
-	code := strconv.Itoa(statusCode)
-	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
-		code = "unauthorized"
-	}
-	message := strings.TrimSpace(string(body))
-	var envelope struct {
-		Code    string          `json:"code"`
-		Message string          `json:"message"`
-		Detail  json.RawMessage `json:"detail"`
-	}
-	if json.Unmarshal(body, &envelope) == nil {
-		if envelope.Code != "" {
-			code = envelope.Code
-		}
-		if envelope.Message != "" {
-			message = envelope.Message
-		}
-		if len(envelope.Detail) != 0 {
-			var detail struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			}
-			if json.Unmarshal(envelope.Detail, &detail) == nil {
-				if detail.Code != "" {
-					code = detail.Code
-				}
-				if detail.Message != "" {
-					message = detail.Message
-				}
-			} else {
-				var detailText string
-				if json.Unmarshal(envelope.Detail, &detailText) == nil && detailText != "" {
-					message = detailText
-				}
-			}
-		}
-	}
-	if message == "" {
-		if statusCode != 0 {
-			message = http.StatusText(statusCode)
-		}
-		if message == "" {
-			message = "vmon API request failed"
-		}
-	}
+	_ = json.Unmarshal(body, &wire)
+	message := firstNonempty(wire.Message, wire.Error, strings.TrimSpace(string(body)))
 	if len(message) > maxErrorMessageBytes {
 		message = message[:maxErrorMessageBytes]
 		truncated = true
 	}
-	return &APIError{
-		StatusCode: statusCode,
-		Code:       code,
-		Message:    message,
-		Truncated:  truncated,
+	if readErr != nil && message == "" {
+		message = readErr.Error()
 	}
+	return &APIError{StatusCode: response.StatusCode, Code: wire.Code, Message: message, Truncated: truncated}
 }

@@ -1,11 +1,11 @@
 import { afterAll, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 
-import { VmonClient } from "../src";
+import { type Client, connect } from "../src";
 
 const wantsSmoke = process.env.VMON_TS_SMOKE === "1";
 const configuredUrl = process.env.VMON_SERVER_URL;
@@ -27,12 +27,12 @@ if (!wantsSmoke) {
   configuredToken.length > 0
 ) {
   test("health, volume CRUD, and sandbox listing", async () => {
-    await exerciseApi(new VmonClient({ baseUrl: configuredUrl, token: configuredToken }));
+    await exerciseApi(connect(configuredUrl, { token: configuredToken }));
   });
 } else if (await Bun.file(localBinary).exists()) {
   test("health, volume CRUD, and sandbox listing", async () => {
     const target = await spawnLocalServer(localBinary);
-    const client = new VmonClient({ baseUrl: target.baseUrl, token: target.token });
+    const client = connect(target.baseUrl, { token: target.token });
     await waitForHealth(client);
     await exerciseApi(client);
   });
@@ -54,7 +54,7 @@ interface SpawnedTarget {
   token: string;
 }
 
-async function exerciseApi(client: VmonClient): Promise<void> {
+async function exerciseApi(client: Client): Promise<void> {
   const health = await client.health();
   expect(health.ok).toBe(true);
 
@@ -63,20 +63,19 @@ async function exerciseApi(client: VmonClient): Promise<void> {
   let volumeCreated = false;
 
   try {
-    const createdVolume = await client.createVolume(volumeName);
-    expect(createdVolume.ok).toBe(true);
+    await client.volumes.create(volumeName);
     volumeCreated = true;
-    expect(await client.listVolumes()).toContain(volumeName);
+    expect((await client.volumes.list()).map((volume) => volume.name)).toContain(volumeName);
 
-    const sandboxes = await client.listSandboxes();
+    const sandboxes = await client.sandboxes.list();
     expect(Array.isArray(sandboxes)).toBe(true);
   } finally {
     if (volumeCreated) {
-      await client.removeVolume(volumeName).catch(() => {});
+      await client.volumes.delete(volumeName).catch(() => {});
     }
   }
 
-  expect(await client.listVolumes()).not.toContain(volumeName);
+  expect((await client.volumes.list()).map((volume) => volume.name)).not.toContain(volumeName);
 }
 
 async function spawnLocalServer(binary: string): Promise<SpawnedTarget> {
@@ -100,7 +99,7 @@ async function spawnLocalServer(binary: string): Promise<SpawnedTarget> {
   return { baseUrl: `http://127.0.0.1:${port}`, token };
 }
 
-async function waitForHealth(client: VmonClient): Promise<void> {
+async function waitForHealth(client: Client): Promise<void> {
   const deadline = Date.now() + 10_000;
   let lastError: unknown = null;
   while (Date.now() < deadline) {

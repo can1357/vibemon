@@ -1,21 +1,19 @@
-"""HTTP and WebSocket transport for the Rust v1 API."""
+"""Per-endpoint HTTP and WebSocket mechanics for the Rust v1 API."""
 
 from __future__ import annotations
 
 import base64
 import json
-import os
 import socket
 import ssl
 import threading
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
-from .context import LOCAL, ContextStore
+from .errors import APIError, ProtocolError, TransportError
 from .wsframe import (
     WebSocketHandshakeError,
     client_handshake,
@@ -26,85 +24,24 @@ from .wsframe import (
 DEFAULT_HTTP_TIMEOUT = 60.0
 
 
-class DaemonError(Exception):
-    """A daemon-side failure or transport error.
-
-    ``code`` carries the machine-readable reason (engine/mesh code when the
-    gateway returned a structured detail, else the HTTP status as a string, or
-    a transport code like ``unreachable``). ``status`` is the raw HTTP status
-    for gateway responses, ``None`` for local/transport failures.
-    """
-
-    def __init__(self, message: str, *, code: str = "internal", status: int | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.status = status
-
-
-def state_dir() -> Path:
-    """Return the vmon state directory used by local UDS clients."""
-    return Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
-
-
-def default_socket_path() -> Path:
-    """Return the default Rust daemon HTTP-over-UDS socket path."""
-    return state_dir() / "vmond.sock"
-
-
 def _clean_base_url(url: str) -> str:
     value = (url or "").strip()
     if not value:
-        raise DaemonError("context endpoint is empty", code="invalid")
+        raise ValueError("endpoint is empty")
     parsed = urlsplit(value)
     if not parsed.scheme:
         value = "http://" + value
         parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"}:
-        raise DaemonError(f"unsupported context endpoint scheme {parsed.scheme!r}", code="invalid")
+        raise ValueError(f"unsupported endpoint scheme {parsed.scheme!r}")
     if not parsed.netloc:
-        raise DaemonError(f"invalid context endpoint {url!r}", code="invalid")
+        raise ValueError(f"invalid endpoint {url!r}")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _safe_segment(value: str) -> str:
     encoded = quote(str(value), safe="")
     return encoded.replace(".", "%2E") if encoded in {".", ".."} else encoded
-
-
-def _maybe_remote_context(context: str | None) -> tuple[str | None, str | None]:
-    """Split a create ``context`` argument into transport context and build context.
-
-    Historically the SDK used ``context=\"prod\"`` to select a saved remote
-    context, while Dockerfile builds also use ``context`` for a build directory.
-    Preserve that behavior: a safe name that exists in contexts.json selects the
-    transport; path-like values remain API build contexts.
-    """
-    if context is None or context in {"", "."}:
-        return None, context
-    if context == LOCAL:
-        return None, "."
-    if any(part in context for part in ("/", "\\", ":")):
-        return None, context
-    store = ContextStore()
-    store.load()
-    if store.get(context) is not None:
-        return context, "."
-    return None, context
-
-
-def resolve_context_name(explicit: str | None = None) -> str | None:
-    """Resolve the active remote context name, if any."""
-    if explicit == LOCAL:
-        return None
-    if explicit:
-        return explicit
-    store = ContextStore()
-    store.load()
-    name = store.current_name()
-    if not name or name == LOCAL:
-        return None
-    return name
 
 
 class WebSocketConnection:
@@ -135,13 +72,13 @@ class WebSocketConnection:
     def _send(self, opcode: int, data: bytes) -> None:
         with self._send_lock:
             if self._closed:
-                raise DaemonError("websocket is closed", code="closed")
+                raise TransportError("websocket is closed")
             try:
                 self._sock.sendall(encode_frame(opcode, data))
             except OSError as exc:
                 self._closed = True
                 self._release_socket()
-                raise DaemonError(f"websocket write failed: {exc}", code="closed") from exc
+                raise TransportError(f"websocket write failed: {exc}") from exc
 
     def recv_message(self) -> str | bytes | None:
         """Receive one complete text or binary message, handling control frames."""
@@ -153,7 +90,7 @@ class WebSocketConnection:
             except (ConnectionError, OSError) as exc:
                 self._closed = True
                 self._release_socket()
-                raise DaemonError(f"websocket read failed: {exc}", code="closed") from exc
+                raise TransportError(f"websocket read failed: {exc}") from exc
             if opcode == 0x8:
                 self._closed = True
                 with self._send_lock:
@@ -170,21 +107,21 @@ class WebSocketConnection:
                     except OSError as exc:
                         self._closed = True
                         self._release_socket()
-                        raise DaemonError(f"websocket pong failed: {exc}", code="closed") from exc
+                        raise TransportError(f"websocket pong failed: {exc}") from exc
                 continue
             if opcode == 0xA:
                 continue
             if opcode in {0x1, 0x2}:
                 if message_opcode is not None:
-                    raise DaemonError("interleaved websocket message", code="protocol")
+                    raise ProtocolError("interleaved websocket message")
                 message_opcode = opcode
                 fragments.append(payload)
             elif opcode == 0x0:
                 if message_opcode is None:
-                    raise DaemonError("unexpected websocket continuation", code="protocol")
+                    raise ProtocolError("unexpected websocket continuation")
                 fragments.append(payload)
             else:
-                raise DaemonError(f"unsupported websocket opcode {opcode}", code="protocol")
+                raise ProtocolError(f"unsupported websocket opcode {opcode}")
             if not final:
                 continue
             data = b"".join(fragments)
@@ -193,7 +130,7 @@ class WebSocketConnection:
             try:
                 return data.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise DaemonError("invalid websocket text frame", code="protocol") from exc
+                raise ProtocolError("invalid websocket text frame") from exc
 
     def recv_json(self) -> dict[str, Any] | None:
         """Receive one JSON object, returning ``None`` after a close frame."""
@@ -204,9 +141,9 @@ class WebSocketConnection:
             text = message.decode("utf-8") if isinstance(message, bytes) else message
             value = json.loads(text)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DaemonError("invalid websocket JSON frame", code="protocol") from exc
+            raise ProtocolError("invalid websocket JSON frame") from exc
         if not isinstance(value, dict):
-            raise DaemonError("invalid websocket frame", code="protocol")
+            raise ProtocolError("invalid websocket frame")
         return value
 
     def _release_socket(self) -> None:
@@ -240,7 +177,7 @@ class WebSocketConnection:
 
 
 class ResponseStream:
-    """Closeable streaming HTTP response returned by :class:`VmonTransport`."""
+    """Closeable streaming HTTP response returned by :class:`EndpointTransport`."""
 
     def __init__(self, manager: Any, response: httpx.Response) -> None:
         self._manager = manager
@@ -248,24 +185,24 @@ class ResponseStream:
         self._closed = False
 
     def iter_lines(self) -> Iterator[str]:
-        """Yield decoded response lines and map read failures to ``DaemonError``."""
+        """Yield decoded response lines and map read failures to transport errors."""
         try:
             yield from self.response.iter_lines()
         except httpx.TimeoutException as exc:
-            raise DaemonError("vmon API stream timed out", code="timeout") from exc
+            raise TransportError("vmon API stream timed out") from exc
         except httpx.HTTPError as exc:
-            raise DaemonError(f"vmon API stream failed: {exc}", code="unreachable") from exc
+            raise TransportError(f"vmon API stream failed: {exc}") from exc
         finally:
             self.close()
 
     def iter_bytes(self) -> Iterator[bytes]:
-        """Yield response chunks and map read failures to ``DaemonError``."""
+        """Yield response chunks and map read failures to transport errors."""
         try:
             yield from self.response.iter_bytes()
         except httpx.TimeoutException as exc:
-            raise DaemonError("vmon API stream timed out", code="timeout") from exc
+            raise TransportError("vmon API stream timed out") from exc
         except httpx.HTTPError as exc:
-            raise DaemonError(f"vmon API stream failed: {exc}", code="unreachable") from exc
+            raise TransportError(f"vmon API stream failed: {exc}") from exc
         finally:
             self.close()
 
@@ -282,26 +219,26 @@ class ResponseStream:
         self.close()
 
 
-class VmonTransport:
-    """Synchronous client for the Rust v1 API."""
+class EndpointTransport:
+    """Synchronous transport bound to one HTTP or Unix-socket endpoint."""
 
     def __init__(
         self,
         *,
         base_url: str | None = None,
         token: str | None = None,
-        uds: str | os.PathLike[str] | None = None,
+        uds: str | None = None,
         timeout: float = DEFAULT_HTTP_TIMEOUT,
     ) -> None:
-        self.uds = Path(uds) if uds is not None else None
-        self.base_url = _clean_base_url(base_url) if base_url is not None else "http://vmon"
-        self.token = token
-        self.timeout = float(timeout)
+        self.uds: str | None = uds
+        self.base_url: str = _clean_base_url(base_url) if base_url is not None else "http://vmon"
+        self.token: str | None = token
+        self.timeout: float = float(timeout)
         headers = {"Accept": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if self.uds is not None:
-            transport = httpx.HTTPTransport(uds=str(self.uds))
+            transport = httpx.HTTPTransport(uds=self.uds)
             self._client = httpx.Client(
                 base_url="http://vmon", headers=headers, timeout=self.timeout, transport=transport
             )
@@ -310,7 +247,7 @@ class VmonTransport:
                 base_url=self.base_url, headers=headers, timeout=self.timeout
             )
 
-    def clone(self) -> VmonTransport:
+    def clone(self) -> EndpointTransport:
         """Return an independent transport with the same endpoint and credentials."""
         return type(self)(
             base_url=None if self.uds is not None else self.base_url,
@@ -319,32 +256,11 @@ class VmonTransport:
             timeout=self.timeout,
         )
 
-    @classmethod
-    def local(cls, *, sock_path: str | os.PathLike[str] | None = None) -> VmonTransport:
-        return cls(uds=sock_path or default_socket_path())
-
-    @classmethod
-    def for_context(cls, context: str | None = None, *, token: str | None = None) -> VmonTransport:
-        name = resolve_context_name(context)
-        if name is None:
-            return cls.local()
-        store = ContextStore()
-        store.load()
-        ctx = store.get(name)
-        if ctx is None:
-            raise DaemonError(
-                f"selected context {name!r} not found; run 'vmon context ls'", code="invalid"
-            )
-        if not ctx.endpoints:
-            raise DaemonError(f"context {name!r} has no endpoints", code="invalid")
-        resolved_token = token or os.environ.get("VMON_API_TOKEN") or store.load_token(name)
-        return cls(base_url=ctx.endpoints[0], token=resolved_token)
-
     def close(self) -> None:
         """Close pooled HTTP connections."""
         self._client.close()
 
-    def __enter__(self) -> VmonTransport:
+    def __enter__(self) -> EndpointTransport:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -372,14 +288,16 @@ class VmonTransport:
                 headers=request_headers,
             )
         except httpx.ConnectError as exc:
-            target = str(self.uds) if self.uds is not None else self.base_url
-            raise DaemonError(
-                f"cannot reach vmon daemon at {target}: {exc}", code="unreachable"
+            target = self.uds if self.uds is not None else self.base_url
+            raise TransportError(
+                f"cannot reach vmon daemon at {target}: {exc}", endpoint=target
             ) from exc
         except httpx.TimeoutException as exc:
-            raise DaemonError("vmon API request timed out", code="timeout") from exc
+            raise TransportError("vmon API request timed out", endpoint=self.base_url) from exc
         except httpx.HTTPError as exc:
-            raise DaemonError(f"vmon API transport failed: {exc}", code="unreachable") from exc
+            raise TransportError(
+                f"vmon API transport failed: {exc}", endpoint=self.base_url
+            ) from exc
         if raise_for_status and response.status_code >= 400:
             raise self._error_from_response(response)
         return response
@@ -406,22 +324,26 @@ class VmonTransport:
         try:
             response = manager.__enter__()
         except httpx.ConnectError as exc:
-            target = str(self.uds) if self.uds is not None else self.base_url
-            raise DaemonError(
-                f"cannot reach vmon daemon at {target}: {exc}", code="unreachable"
+            target = self.uds if self.uds is not None else self.base_url
+            raise TransportError(
+                f"cannot reach vmon daemon at {target}: {exc}", endpoint=target
             ) from exc
         except httpx.TimeoutException as exc:
-            raise DaemonError("vmon API request timed out", code="timeout") from exc
+            raise TransportError("vmon API request timed out", endpoint=self.base_url) from exc
         except httpx.HTTPError as exc:
-            raise DaemonError(f"vmon API transport failed: {exc}", code="unreachable") from exc
+            raise TransportError(
+                f"vmon API transport failed: {exc}", endpoint=self.base_url
+            ) from exc
         if response.status_code >= 400:
             try:
                 response.read()
                 error = self._error_from_response(response)
             except httpx.TimeoutException as exc:
-                raise DaemonError("vmon API stream timed out", code="timeout") from exc
+                raise TransportError("vmon API stream timed out", endpoint=self.base_url) from exc
             except httpx.HTTPError as exc:
-                raise DaemonError(f"vmon API stream failed: {exc}", code="unreachable") from exc
+                raise TransportError(
+                    f"vmon API stream failed: {exc}", endpoint=self.base_url
+                ) from exc
             finally:
                 manager.__exit__(None, None, None)
             raise error
@@ -452,7 +374,7 @@ class VmonTransport:
         try:
             return response.json()
         except ValueError as exc:
-            raise DaemonError("vmon API returned invalid JSON", code="protocol") from exc
+            raise ProtocolError("vmon API returned invalid JSON") from exc
 
     def text(self, method: str, path: str, **kwargs: Any) -> str:
         response = self.request(method, path, **kwargs)
@@ -481,11 +403,11 @@ class VmonTransport:
                 raise self._error_from_handshake(exc) from exc
             except TimeoutError as exc:
                 sock.close()
-                raise DaemonError("vmon websocket timed out", code="timeout") from exc
+                raise TransportError("vmon websocket timed out", endpoint=self.uds) from exc
             except OSError as exc:
                 sock.close()
-                raise DaemonError(
-                    f"cannot reach vmon daemon at {self.uds}: {exc}", code="unreachable"
+                raise TransportError(
+                    f"cannot reach vmon daemon at {self.uds}: {exc}", endpoint=self.uds
                 ) from exc
             return WebSocketConnection(sock)
 
@@ -514,34 +436,32 @@ class VmonTransport:
                 ws_sock.close()
             elif raw is not None:
                 raw.close()
-            raise DaemonError("vmon websocket timed out", code="timeout") from exc
+            raise TransportError("vmon websocket timed out", endpoint=self.base_url) from exc
         except OSError as exc:
             if ws_sock is not None:
                 ws_sock.close()
             elif raw is not None:
                 raw.close()
-            raise DaemonError(
-                f"cannot reach vmon daemon at {self.base_url}: {exc}", code="unreachable"
+            raise TransportError(
+                f"cannot reach vmon daemon at {self.base_url}: {exc}", endpoint=self.base_url
             ) from exc
         if ws_sock is None:
-            raise DaemonError("websocket connection was not established", code="protocol")
+            raise ProtocolError("websocket connection was not established")
         return WebSocketConnection(ws_sock)
 
     @staticmethod
-    def _error_from_handshake(error: WebSocketHandshakeError) -> DaemonError:
+    def _error_from_handshake(error: WebSocketHandshakeError) -> APIError | ProtocolError:
         if error.status >= 400:
             response = httpx.Response(
                 error.status,
                 content=error.body,
                 request=httpx.Request("GET", "http://vmon/websocket"),
             )
-            return VmonTransport._error_from_response(response)
-        return DaemonError(
-            str(error), code="protocol", status=error.status if error.status else None
-        )
+            return EndpointTransport._error_from_response(response)
+        return ProtocolError(str(error))
 
     @staticmethod
-    def _error_from_response(response: httpx.Response) -> DaemonError:
+    def _error_from_response(response: httpx.Response) -> APIError:
         code = "unauthorized" if response.status_code in {401, 403} else str(response.status_code)
         message = response.text.strip() or f"vmon API HTTP {response.status_code}"
         try:
@@ -565,17 +485,7 @@ class VmonTransport:
                     code = detail_code
                 if isinstance(detail_message, str) and detail_message:
                     message = detail_message
-        return DaemonError(message, code=code, status=response.status_code)
-
-
-def get_transport(context: str | None = None, *, token: str | None = None) -> VmonTransport:
-    """Resolve the SDK transport from an explicit/selected context."""
-    return VmonTransport.for_context(context, token=token)
-
-
-def split_create_context(context: str | None) -> tuple[str | None, str | None]:
-    """Return ``(transport_context, api_build_context)`` for Sandbox.create."""
-    return _maybe_remote_context(context)
+        return APIError(message, code=code, status=response.status_code)
 
 
 def path_segment(value: str) -> str:

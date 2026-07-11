@@ -2,8 +2,8 @@
 
 A :class:`Secret` carries environment variables injected into in-guest exec
 sessions. Values live only in process memory and are handed to the guest agent
-per ``exec`` call; ``meta.json`` records secret *names* only (see
-``Sandbox.create``), so a sandbox directory never persists secret values.
+per ``exec`` call; sandbox metadata records secret *names* only (see
+``client.sandboxes.create``), so a sandbox directory never persists secret values.
 """
 
 from __future__ import annotations

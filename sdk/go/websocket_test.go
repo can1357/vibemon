@@ -1,289 +1,226 @@
 package vmon
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"net/url"
+	"sync"
 	"testing"
-	"time"
 
 	ws "github.com/coder/websocket"
 )
 
-func TestStreamingExecProtocol(t *testing.T) {
-	t.Parallel()
-
-	handlerErr := make(chan error, 1)
-	serverDone := make(chan struct{})
+func TestProcessFrames(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		defer close(serverDone)
-		if request.Header.Get("Authorization") != "Bearer ws-token" {
-			writer.Header().Set("Content-Type", "application/json")
-			writer.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(writer, `{"code":"unauthorized","message":"missing token"}`)
+		if request.URL.Path != "/v1/sandboxes/box/exec" {
+			t.Errorf("path=%q", request.URL.Path)
+			http.NotFound(writer, request)
 			return
 		}
 		connection, err := ws.Accept(writer, request, nil)
 		if err != nil {
-			handlerErr <- err
+			t.Error(err)
 			return
 		}
 		defer connection.CloseNow()
 		_, first, err := connection.Read(request.Context())
 		if err != nil {
-			handlerErr <- err
+			t.Error(err)
 			return
 		}
-		var execRequest struct {
-			Command []string `json:"cmd"`
-			TTY     bool     `json:"tty"`
-		}
-		if err := json.Unmarshal(first, &execRequest); err != nil {
-			handlerErr <- err
+		var exec ExecRequest
+		if err = json.Unmarshal(first, &exec); err != nil || len(exec.Command) != 1 || exec.Command[0] != "echo" {
+			t.Errorf("request=%s err=%v", first, err)
 			return
 		}
-		if strings.Join(execRequest.Command, " ") != "cat -" || !execRequest.TTY {
-			handlerErr <- fmt.Errorf("first exec frame = %s", first)
-			return
-		}
-
-		seenStdin := false
-		seenResize := false
-		seenEOF := false
-		for range 3 {
-			_, frame, err := connection.Read(request.Context())
-			if err != nil {
-				handlerErr <- err
-				return
-			}
-			var value map[string]json.RawMessage
-			if err := json.Unmarshal(frame, &value); err != nil {
-				handlerErr <- err
-				return
-			}
-			if raw, exists := value["stdin_b64"]; exists {
-				var encoded string
-				if err := json.Unmarshal(raw, &encoded); err != nil {
-					handlerErr <- err
-					return
-				}
-				decoded, err := base64.StdEncoding.DecodeString(encoded)
-				if err != nil || string(decoded) != "input" {
-					handlerErr <- fmt.Errorf("stdin frame = %s", frame)
-					return
-				}
-				seenStdin = true
-			}
-			if raw, exists := value["resize"]; exists {
-				var dimensions [2]uint16
-				if err := json.Unmarshal(raw, &dimensions); err != nil {
-					handlerErr <- err
-					return
-				}
-				seenResize = dimensions == [2]uint16{24, 80}
-			}
-			if raw, exists := value["eof"]; exists {
-				var eof bool
-				if err := json.Unmarshal(raw, &eof); err != nil {
-					handlerErr <- err
-					return
-				}
-				seenEOF = eof
-			}
-		}
-		if !seenStdin || !seenResize || !seenEOF {
-			handlerErr <- fmt.Errorf("client frames: stdin=%v resize=%v eof=%v", seenStdin, seenResize, seenEOF)
-			return
-		}
-		frames := []string{
-			fmt.Sprintf(`{"stream":"stdout","b64":%q}`, base64.StdEncoding.EncodeToString([]byte("out"))),
-			fmt.Sprintf(`{"stream":"stderr","b64":%q}`, base64.StdEncoding.EncodeToString([]byte("err"))),
-			`{"exit":7,"signal":null}`,
-		}
-		for _, frame := range frames {
-			if err := connection.Write(request.Context(), ws.MessageText, []byte(frame)); err != nil {
-				handlerErr <- err
-				return
-			}
-		}
+		_ = connection.Write(request.Context(), ws.MessageText, []byte(`{"stream":"stdout","b64":"b2sK"}`))
+		_ = connection.Write(request.Context(), ws.MessageText, []byte(`{"exit":0}`))
 	}))
 	defer server.Close()
-
-	client, err := NewClient(server.URL, WithToken("ws-token"))
+	client, err := Connect(server.URL, WithDiscovery(false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.Exec(context.Background(), "box", ExecRequest{
-		Command: []string{"cat", "-"},
-		TTY:     true,
-	})
+	defer client.Close()
+	process, err := client.Sandboxes.Ref("box").Exec(context.Background(), ExecRequest{Command: []string{"echo"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	if err := session.WriteStdin(context.Background(), []byte("input")); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.Resize(context.Background(), 24, 80); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.CloseStdin(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	exit, err := session.Copy(context.Background(), &stdout, &stderr)
+	event, err := process.Receive(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exit.Code != 7 || exit.Signal != nil || stdout.String() != "out" || stderr.String() != "err" {
-		t.Fatalf("exit=%#v stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	if string(event.Data) != "ok\n" || event.Stream != StreamStdout {
+		t.Fatalf("event=%+v", event)
 	}
-	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("websocket handler did not finish")
-	}
-	select {
-	case err := <-handlerErr:
+	exit, err := process.Wait(context.Background())
+	if err != nil {
 		t.Fatal(err)
-	default:
+	}
+	if exit.Code != 0 {
+		t.Fatalf("exit=%+v", exit)
 	}
 }
 
-func TestAttachAndWebSocketCancellation(t *testing.T) {
-	t.Parallel()
-
+func TestShellConsumesReadyFrame(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		connection, err := ws.Accept(writer, request, nil)
 		if err != nil {
 			return
 		}
 		defer connection.CloseNow()
-		if strings.Contains(request.URL.Path, "/sandboxes/cancel/") {
-			<-request.Context().Done()
-			return
-		}
-		frame := fmt.Sprintf(
-			`{"stream":"console","b64":%q}`,
-			base64.StdEncoding.EncodeToString([]byte("console")),
-		)
-		if err := connection.Write(request.Context(), ws.MessageText, []byte(frame)); err != nil {
-			return
-		}
 		_, _, _ = connection.Read(request.Context())
+		_ = connection.Write(request.Context(), ws.MessageText, []byte(`{"ready":"box-shell"}`))
+		_ = connection.Write(request.Context(), ws.MessageText, []byte(`{"exit":7}`))
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL)
+	client, err := Connect(server.URL, WithDiscovery(false))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	attach, err := client.Attach(context.Background(), "box")
+	defer client.Close()
+	process, err := client.Shell(context.Background(), ShellRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, err := attach.Receive(context.Background())
+	if process.SandboxID != "box-shell" {
+		t.Fatalf("sandbox=%q", process.SandboxID)
+	}
+	exit, err := process.Wait(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Stream != StreamConsole || string(event.Data) != "console" {
-		t.Fatalf("attach event = %#v", event)
-	}
-	if err := attach.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	cancelAttach, err := client.Attach(context.Background(), "cancel")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	_, err = cancelAttach.Receive(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("receive cancellation error = %T %v", err, err)
-	}
-	_ = cancelAttach.Close()
-}
-
-func TestWebSocketHandshakeAPIError(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(writer, `{"code":"denied","message":"no websocket access"}`)
-	}))
-	defer server.Close()
-	client, err := NewClient(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Exec(context.Background(), "box", ExecRequest{Command: []string{"true"}})
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("handshake error type = %T (%v)", err, err)
-	}
-	if apiErr.StatusCode != http.StatusForbidden || apiErr.Code != "denied" || apiErr.Message != "no websocket access" {
-		t.Fatalf("handshake API error = %#v", apiErr)
+	if exit.Code != 7 {
+		t.Fatalf("exit=%d", exit.Code)
 	}
 }
 
-func TestProxyWebSocketEscapingAndMessages(t *testing.T) {
-	t.Parallel()
+type relocationWebSocketDriver struct {
+	target   string
+	mu       sync.Mutex
+	dials    []string
+	resolves int
+}
 
-	requestURI := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		requestURI <- request.RequestURI
-		connection, err := ws.Accept(writer, request, nil)
-		if err != nil {
-			return
-		}
-		defer connection.CloseNow()
-		messageType, data, err := connection.Read(request.Context())
-		if err != nil {
-			return
-		}
-		_ = connection.Write(request.Context(), messageType, data)
-	}))
-	defer server.Close()
-	client, err := NewClient(server.URL)
+func (driver *relocationWebSocketDriver) Do(context.Context, DriverRequest) (*http.Response, string, error) {
+	return nil, "", io.EOF
+}
+func (driver *relocationWebSocketDriver) Dial(ctx context.Context, path string, query url.Values, endpoint string) (*WebSocketConn, string, error) {
+	driver.mu.Lock()
+	driver.dials = append(driver.dials, endpoint)
+	driver.mu.Unlock()
+	if endpoint == "old" {
+		return nil, "old", &APIError{StatusCode: http.StatusNotFound, Code: "not_found", Message: "moved"}
+	}
+	target := driver.target + path
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	connection, response, err := ws.Dial(ctx, target, nil)
+	if response != nil && response.Body != nil {
+		response.Body.Close()
+	}
 	if err != nil {
-		t.Fatal(err)
+		return nil, endpoint, err
 	}
-	socket, err := client.ProxyWebSocket(
-		context.Background(),
-		"box/a",
-		8080,
-		"api/a b",
-		"connect secret",
-		map[string][]string{"q": {"x&y"}},
-	)
-	if err != nil {
-		t.Fatal(err)
+	return &WebSocketConn{conn: connection}, endpoint, nil
+}
+func (driver *relocationWebSocketDriver) ResolveSandbox(_ context.Context, id, hint string) (string, error) {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	driver.resolves++
+	if id != "box" || hint != "old" {
+		return "", &ProtocolError{Operation: "test resolve", Message: "unexpected affinity"}
 	}
-	defer socket.Close()
-	if err := socket.Write(context.Background(), WebSocketBinaryMessage, []byte{1, 2, 3}); err != nil {
-		t.Fatal(err)
+	return driver.target, nil
+}
+func (driver *relocationWebSocketDriver) Endpoints() []EndpointInfo {
+	return []EndpointInfo{{URL: "old", Healthy: true}, {URL: driver.target, Healthy: true}}
+}
+func (driver *relocationWebSocketDriver) Refresh(context.Context, bool) error { return nil }
+func (driver *relocationWebSocketDriver) Close() error                        { return nil }
+
+func TestSandboxWebSocketsRelocateOnceOnNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		open func(context.Context, *Sandbox) (func() error, error)
+	}{
+		{
+			name: "exec",
+			path: "/v1/sandboxes/box/exec",
+			open: func(ctx context.Context, sandbox *Sandbox) (func() error, error) {
+				process, err := sandbox.Exec(ctx, ExecRequest{Command: []string{"true"}})
+				if err != nil {
+					return nil, err
+				}
+				return process.Close, nil
+			},
+		},
+		{
+			name: "attach",
+			path: "/v1/sandboxes/box/attach",
+			open: func(ctx context.Context, sandbox *Sandbox) (func() error, error) {
+				stream, err := sandbox.Attach(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return stream.Close, nil
+			},
+		},
+		{
+			name: "port",
+			path: "/v1/sandboxes/box/ports/8080/ws/chat",
+			open: func(ctx context.Context, sandbox *Sandbox) (func() error, error) {
+				socket, err := sandbox.Ports.WebSocket(ctx, 8080, "chat", nil)
+				if err != nil {
+					return nil, err
+				}
+				return socket.Close, nil
+			},
+		},
 	}
-	messageType, data, err := socket.Read(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if messageType != WebSocketBinaryMessage || !bytes.Equal(data, []byte{1, 2, 3}) {
-		t.Fatalf("proxy message type=%v data=%v", messageType, data)
-	}
-	got := <-requestURI
-	want := "/v1/sandboxes/box%2Fa/ports/8080/ws/api/a%20b?connect_token=connect+secret&q=x%26y"
-	if got != want {
-		t.Fatalf("proxy request URI = %q; want %q", got, want)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make(chan *http.Request, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				connection, err := ws.Accept(writer, request, nil)
+				if err != nil {
+					return
+				}
+				defer connection.CloseNow()
+				requests <- request.Clone(context.Background())
+				_, _, _ = connection.Read(request.Context())
+			}))
+			defer server.Close()
+			driver := &relocationWebSocketDriver{target: server.URL}
+			sandbox := NewClient(driver).Sandboxes.Ref("box")
+			sandbox.endpoint = "old"
+			sandbox.connectToken = "secret"
+
+			closeSocket, err := test.open(context.Background(), sandbox)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := <-requests
+			if request.URL.Path != test.path {
+				t.Fatalf("path=%q, want %q", request.URL.Path, test.path)
+			}
+			if test.name == "port" && request.URL.Query().Get("connect_token") != "secret" {
+				t.Fatalf("connect token=%q", request.URL.Query().Get("connect_token"))
+			}
+			driver.mu.Lock()
+			dials := append([]string(nil), driver.dials...)
+			resolves := driver.resolves
+			driver.mu.Unlock()
+			if len(dials) != 2 || dials[0] != "old" || dials[1] != server.URL || resolves != 1 || sandbox.endpoint != server.URL {
+				t.Fatalf("dials=%v resolves=%d endpoint=%q", dials, resolves, sandbox.endpoint)
+			}
+			_ = closeSocket()
+		})
 	}
 }

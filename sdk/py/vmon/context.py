@@ -16,7 +16,6 @@ __all__ = [
     "contexts_path",
     "context_token_path",
     "ContextStore",
-    "roster_from_status",
 ]
 
 #: Reserved built-in context name for using the local vmond daemon.
@@ -231,30 +230,3 @@ class ContextStore:
     def resolve_token(self, name: str) -> str | None:
         """Resolve a mesh bearer token: environment override, then saved file."""
         return os.environ.get("VMON_API_TOKEN") or self.load_token(name)
-
-
-def _status_nodes(status: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    nodes: list[Mapping[str, Any]] = []
-    self_status = status.get("self")
-    if isinstance(self_status, Mapping):
-        nodes.append(self_status)
-    peers = status.get("peers")
-    if isinstance(peers, list):
-        nodes.extend(peer for peer in peers if isinstance(peer, Mapping))
-    return nodes
-
-
-def roster_from_status(status: Mapping[str, Any], *, fallback: str | None = None) -> list[str]:
-    """Extract an ordered de-duplicated gateway roster from mesh status data."""
-    roster: list[str] = []
-    seen: set[str] = set()
-
-    for node in _status_nodes(status):
-        advertise = node.get("advertise")
-        if isinstance(advertise, str) and advertise and advertise not in seen:
-            seen.add(advertise)
-            roster.append(advertise)
-
-    if not roster and fallback:
-        return [fallback]
-    return roster

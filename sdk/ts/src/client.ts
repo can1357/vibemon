@@ -1,4 +1,18 @@
-import { remoteFunction, remoteFunctionFromSource } from "./remote";
+import { type Driver, type DriverOptions, type DriverRequestOptions, MeshDriver } from "./driver";
+import { apiError, ProtocolError, TransportError } from "./errors";
+import type {
+  ForkRequest,
+  Health,
+  MeshNode,
+  MeshStatus,
+  PoolSetRequest,
+  PoolStats,
+  RestoreRequest,
+  SandboxCreateRequest,
+  SandboxInfo,
+  ServerInfo,
+} from "./models";
+import { EventStream, Process } from "./process";
 import type {
   JsonValue,
   RemoteCallable,
@@ -6,394 +20,310 @@ import type {
   RemoteFunctionOptions,
   RemoteFunctionSourceSpec,
 } from "./remote";
-import type { components, operations } from "./schema";
+import { remoteFunction, remoteFunctionFromSource } from "./remote";
+import { Sandbox, type SandboxListOptions } from "./sandbox";
+import { type SecretInput, secretWires, Volume } from "./values";
 
-type JsonResponse<
-  Operation extends keyof operations,
-  Status extends keyof operations[Operation]["responses"],
-> = operations[Operation]["responses"][Status] extends {
-  content: { "application/json": infer Body };
-}
-  ? Body
-  : never;
-
-type JsonRequest<Operation extends keyof operations> = operations[Operation] extends {
-  requestBody: { content: { "application/json": infer Body } };
-}
-  ? Body
-  : never;
-
-/** Fetch-compatible transport used by {@link VmonClient}. */
-export type VmonFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-
-/** Connection settings for a vmon HTTP client. */
-export interface VmonClientOptions {
-  baseUrl: string;
-  token: string;
-  fetch?: VmonFetch;
-}
-
-export interface VmonApiErrorShape {
-  status: number;
-  code: string;
-  message: string;
-}
-
-export interface SecretWire {
-  name: string;
-  values: Record<string, string>;
-}
-
-export type SecretInput = Secret | SecretWire | Record<string, string>;
-
-export type HealthBody = JsonResponse<"healthz", 200>;
-export type SandboxCreateRequest = JsonRequest<"create_sandbox">;
+/** Options accepted by the synchronous connect factory. */
+export interface ConnectOptions extends DriverOptions {}
+/** Sandbox creation body with typed secret value objects. */
 export type SandboxCreateRequestWithSecrets = Omit<SandboxCreateRequest, "secrets"> & {
   secrets?: Iterable<SecretInput> | null;
 };
-export type SandboxListBody = JsonResponse<"list_sandboxes", 200>;
-export type SandboxView = SandboxListBody["sandboxes"][number];
-export type ExecSandboxRequest = JsonRequest<"exec_capture">;
-export type ExecSandboxResponse = JsonResponse<"exec_capture", 200>;
-export interface ExecSandboxOptions {
-  secrets?: Iterable<SecretInput> | null;
-}
-export type VolumeName = JsonResponse<"volume_list", 200>["volumes"][number];
-export type OkBody = components["schemas"]["OkBody"];
 
-export class VmonApiError extends Error implements VmonApiErrorShape {
-  override readonly name = "VmonApiError";
-  readonly status: number;
-  readonly code: string;
-
-  constructor(error: VmonApiErrorShape) {
-    super(error.message);
-    this.status = error.status;
-    this.code = error.code;
+/** Root SDK object exposing service namespaces and daemon-wide operations. */
+export class Client {
+  readonly driver: Driver;
+  readonly sandboxes: SandboxAPI;
+  readonly snapshots: SnapshotAPI;
+  readonly volumes: VolumeAPI;
+  readonly pools: PoolAPI;
+  readonly mesh: MeshAPI;
+  /** Bind the client to a driver implementation. */
+  constructor(driver: Driver) {
+    this.driver = driver;
+    this.sandboxes = new SandboxAPI(this);
+    this.snapshots = new SnapshotAPI(this);
+    this.volumes = new VolumeAPI(this);
+    this.pools = new PoolAPI(this);
+    this.mesh = new MeshAPI(this);
   }
-}
-
-export class Secret {
-  readonly name: string;
-  readonly values: Readonly<Record<string, string>>;
-
-  constructor(values: Record<string, string> = {}, name = "secret") {
-    this.name = checkedSecretName(name, "secret name");
-    this.values = Object.freeze(checkedSecretEnv(values));
+  /** Check daemon health. */
+  health(): Promise<Health> {
+    return this.json("GET", "/healthz");
   }
-
-  static fromDict(values: Record<string, string>, name = "secret"): Secret {
-    return new Secret(values, name);
+  /** Fetch daemon and node information. */
+  info(): Promise<ServerInfo> {
+    return this.json("GET", "/v1/info");
   }
-
-  static fromEnv(names: Iterable<string>, name = "env"): Secret {
-    const values: Record<string, string> = {};
-    for (const rawName of names) {
-      const envName = checkedSecretName(rawName, "secret environment names");
-      const value = typeof process === "undefined" ? undefined : process.env[envName];
-      if (value !== undefined) {
-        values[envName] = checkedSecretValue(value);
-      }
-    }
-    return new Secret(values, name);
+  /** Fetch Prometheus metrics text. */
+  async metrics(): Promise<string> {
+    return (await this.response("GET", "/metrics")).text();
   }
-
-  names(): string[] {
-    const names = Object.keys(this.values);
-    names.sort();
-    return names;
+  /** Fetch the daemon OpenAPI document. */
+  openapi(): Promise<Record<string, unknown>> {
+    return this.json("GET", "/v1/openapi.json");
   }
-
-  asEnv(): Record<string, string> {
-    return { ...this.values };
+  /** Open the daemon event stream. */
+  async events(): Promise<EventStream> {
+    return new EventStream(await this.response("GET", "/v1/events", { stream: true }));
   }
-
-  toWire(): SecretWire {
-    return { name: this.name, values: this.asEnv() };
+  /** Open an interactive shell process after its ready envelope. */
+  async shell(request: Record<string, unknown> = {}): Promise<Process> {
+    const [socket] = await this.driver.websocket("/v1/shell");
+    const process = new Process(socket, request);
+    await process.ready();
+    return process;
   }
-}
-
-export class VmonClient {
-  readonly #baseUrl: string;
-  readonly #token: string;
-  readonly #fetch: VmonFetch;
-
-  constructor(options: VmonClientOptions) {
-    this.#baseUrl = normalizeBaseUrl(options.baseUrl);
-    this.#token = options.token;
-    this.#fetch = options.fetch ?? globalThis.fetch;
-  }
-
-  health(): Promise<HealthBody> {
-    return this.#requestJson("/healthz");
-  }
-
-  async listSandboxes(): Promise<SandboxView[]> {
-    const body = await this.#requestJson<SandboxListBody>("/v1/sandboxes");
-    return body.sandboxes;
-  }
-
-  getSandbox(id: string): Promise<SandboxView> {
-    return this.#requestJson(`/v1/sandboxes/${encodeURIComponent(id)}`);
-  }
-
-  createSandbox(request: SandboxCreateRequestWithSecrets): Promise<SandboxView> {
-    return this.#requestJson("/v1/sandboxes", jsonRequest("POST", sandboxCreateBody(request)));
-  }
-
-  removeSandbox(id: string): Promise<SandboxView> {
-    return this.#requestJson(`/v1/sandboxes/${encodeURIComponent(id)}`, { method: "DELETE" });
-  }
-
-  stopSandbox(id: string): Promise<SandboxView> {
-    return this.#requestJson(`/v1/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST" });
-  }
-
-  execSandbox(
-    id: string,
-    request: ExecSandboxRequest,
-    options: ExecSandboxOptions = {},
-  ): Promise<ExecSandboxResponse> {
-    return this.#requestJson(
-      `/v1/sandboxes/${encodeURIComponent(id)}/exec`,
-      jsonRequest("POST", execRequestBody(request, options.secrets)),
-    );
-  }
-  /** Write a file into a sandbox through the v1 filesystem endpoint. */
-  writeSandboxFile(id: string, path: string, contents: BodyInit): Promise<OkBody> {
-    return this.#requestJson(sandboxFileUrl(id, path), {
-      method: "PUT",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: contents,
-    });
-  }
-
-  /** Delete a file from a sandbox through the v1 filesystem endpoint. */
-  deleteSandboxFile(id: string, path: string): Promise<OkBody> {
-    return this.#requestJson(sandboxFileUrl(id, path), { method: "DELETE" });
-  }
-
-  /** Terminate a sandbox and discard its resources. */
-  async terminateSandbox(id: string): Promise<void> {
-    const response = await this.#request(`/v1/sandboxes/${encodeURIComponent(id)}/terminate`, {
-      method: "POST",
-    });
-    await response.arrayBuffer();
-  }
-
-  /** Package a source-serializable JavaScript function for remote execution. */
+  /** Package a source-serializable function for remote execution. */
   remoteFunction<Arguments extends unknown[], Result>(
     fn: RemoteCallable<Arguments, Result>,
     options: RemoteFunctionOptions = {},
   ): RemoteFunction<Arguments, Result> {
     return remoteFunction(this, fn, options);
   }
-
-  /** Create a typed remote function from JavaScript module source and an exported handler. */
+  /** Create a remote function from JavaScript module source. */
   remoteFunctionFromSource<Arguments extends unknown[] = JsonValue[], Result = JsonValue>(
     spec: RemoteFunctionSourceSpec,
     options: RemoteFunctionOptions = {},
   ): RemoteFunction<Arguments, Result> {
     return remoteFunctionFromSource<Arguments, Result>(this, spec, options);
   }
-
-  async listVolumes(): Promise<VolumeName[]> {
-    const body = await this.#requestJson<JsonResponse<"volume_list", 200>>("/v1/volumes");
-    return body.volumes;
+  /** Close the underlying driver. */
+  close(): void | Promise<void> {
+    return this.driver.close();
   }
-
-  createVolume(name: string): Promise<OkBody> {
-    return this.#requestJson(`/v1/volumes/${encodeURIComponent(name)}`, { method: "PUT" });
-  }
-
-  removeVolume(name: string): Promise<OkBody> {
-    return this.#requestJson(`/v1/volumes/${encodeURIComponent(name)}`, { method: "DELETE" });
-  }
-
-  async #request(path: string, init?: RequestInit): Promise<Response> {
-    const response = await this.#fetch(this.#url(path), this.#withAuth(init));
-    if (!response.ok) {
-      throw await apiError(response);
-    }
+  /** Perform an authenticated request and reject API errors. */
+  async response(method: string, path: string, options: DriverRequestOptions = {}) {
+    const response = await this.driver.request(method, path, options);
+    if (!response.ok) throw await apiError(response);
     return response;
   }
-
-  async #requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await this.#request(path, init);
-    return response.json();
+  /** Perform a request and decode its JSON response. */
+  async json<T>(method: string, path: string, options: DriverRequestOptions = {}): Promise<T> {
+    return (await this.response(method, path, options)).json();
   }
+}
 
-  #url(path: string): string {
-    if (path.startsWith("/")) {
-      return `${this.#baseUrl}${path}`;
+/** Create a client backed by a lazily discovering mesh driver. */
+export function connect(dsn?: string, options: ConnectOptions = {}): Client {
+  return new Client(new MeshDriver(dsn, options));
+}
+
+/** Sandbox collection operations. */
+export class SandboxAPI {
+  readonly #client: Client;
+  /** Bind sandbox operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
+  }
+  /** Create a sandbox. */
+  async create(request: SandboxCreateRequestWithSecrets): Promise<Sandbox> {
+    const { secrets, ...rest } = request;
+    const body: SandboxCreateRequest =
+      secrets === undefined
+        ? rest
+        : { ...rest, secrets: secrets === null ? null : secretWires(secrets) };
+    const response = await this.#client.response("POST", "/v1/sandboxes", { json: body });
+    return new Sandbox(this.#client, await response.json(), response.endpoint);
+  }
+  /** Fetch a sandbox and pin its serving endpoint. */
+  async get(id: string): Promise<Sandbox> {
+    const response = await this.#client.response("GET", `/v1/sandboxes/${encodeURIComponent(id)}`);
+    return new Sandbox(this.#client, await response.json(), response.endpoint);
+  }
+  /** Create an unfetched bound sandbox reference. */
+  ref(id: string): Sandbox {
+    return new Sandbox(this.#client, id);
+  }
+  /** List and merge sandboxes across live mesh endpoints. */
+  async list(options: SandboxListOptions = {}): Promise<Sandbox[]> {
+    const endpoints = this.#client.driver.endpoints().filter((entry) => entry.healthy);
+    const params = new URLSearchParams();
+    if (options.tags)
+      for (const key in options.tags) params.append("tag", `${key}=${options.tags[key]}`);
+    if (endpoints.length <= 1) {
+      const response = await this.#client.response("GET", "/v1/sandboxes", { params });
+      return sandboxRows(await response.json())
+        .filter((row) => !options.node || row.node === options.node)
+        .map((row) => new Sandbox(this.#client, row, response.endpoint));
     }
-    return `${this.#baseUrl}/${path}`;
-  }
-
-  #withAuth(init?: RequestInit): RequestInit {
-    const headers = new Headers(init?.headers);
-    headers.set("Authorization", `Bearer ${this.#token}`);
-    return { ...init, headers };
-  }
-}
-
-function sandboxCreateBody(request: SandboxCreateRequestWithSecrets): SandboxCreateRequest {
-  const { secrets, ...body } = request;
-  if (secrets === undefined) {
-    return body;
-  }
-  return { ...body, secrets: secrets === null ? null : secretWires(secrets) };
-}
-
-function execRequestBody(
-  request: ExecSandboxRequest,
-  secrets: Iterable<SecretInput> | null | undefined,
-): ExecSandboxRequest {
-  if (secrets === undefined || secrets === null) {
-    return request;
-  }
-  const secretEnv = mergeSecretEnv(secrets);
-  if (Object.keys(secretEnv).length === 0) {
-    return request;
-  }
-  return { ...request, env: { ...(request.env ?? {}), ...secretEnv } };
-}
-
-function secretWires(secrets: Iterable<SecretInput>): SecretWire[] {
-  const wires: SecretWire[] = [];
-  for (const secret of secrets) {
-    wires.push(toSecret(secret).toWire());
-  }
-  return wires;
-}
-
-function mergeSecretEnv(secrets: Iterable<SecretInput>): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const secret of secrets) {
-    const values = toSecret(secret).asEnv();
-    for (const key in values) {
-      env[key] = values[key];
+    const attempts = await Promise.allSettled(
+      endpoints.map(async (entry) => {
+        const response = await this.#client.driver.request("GET", "/v1/sandboxes", {
+          params,
+          endpoint: entry.url,
+        });
+        if (!response.ok) throw await apiError(response);
+        return { rows: sandboxRows(await response.json()), endpoint: response.endpoint };
+      }),
+    );
+    const merged = new Map<string, Sandbox>();
+    let lastTransportError: TransportError | undefined;
+    for (const attempt of attempts) {
+      if (attempt.status === "rejected") {
+        if (!(attempt.reason instanceof TransportError)) throw attempt.reason;
+        lastTransportError = attempt.reason;
+        continue;
+      }
+      for (const row of attempt.value.rows)
+        if (!merged.has(row.id) && (!options.node || row.node === options.node))
+          merged.set(row.id, new Sandbox(this.#client, row, attempt.value.endpoint));
     }
+    if (attempts.every((attempt) => attempt.status === "rejected")) throw lastTransportError;
+    return [...merged.values()];
   }
-  return env;
 }
 
-function toSecret(input: SecretInput): Secret {
-  if (input instanceof Secret) {
-    return input;
+/** Snapshot collection, restore, and fork operations. */
+export class SnapshotAPI {
+  readonly #client: Client;
+  /** Bind snapshot operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
   }
-  if (isSecretWire(input)) {
-    return new Secret(input.values, input.name);
+  /** List snapshot names. */
+  async list(): Promise<string[]> {
+    const body = await this.#client.json<{ snapshots: string[] }>("GET", "/v1/snapshots");
+    return body.snapshots;
   }
-  return new Secret(input);
+  /** Restore one snapshot into a sandbox. */
+  async restore(name: string, request: RestoreRequest = {}): Promise<Sandbox> {
+    const response = await this.#client.response(
+      "POST",
+      `/v1/snapshots/${encodeURIComponent(name)}/restore`,
+      { json: request },
+    );
+    return new Sandbox(this.#client, await response.json(), response.endpoint);
+  }
+  /** Fork one snapshot into multiple sandboxes. */
+  async fork(name: string, request: ForkRequest): Promise<Sandbox[]> {
+    const response = await this.#client.response(
+      "POST",
+      `/v1/snapshots/${encodeURIComponent(name)}/fork`,
+      { json: request },
+    );
+    const body = await response.json();
+    return sandboxRows(isRecord(body) ? body.clones : undefined).map(
+      (row) => new Sandbox(this.#client, row, response.endpoint),
+    );
+  }
 }
 
-function checkedSecretEnv(values: Record<string, string>): Record<string, string> {
-  const checked: Record<string, string> = {};
-  for (const key in values) {
-    checked[checkedSecretName(key, "secret environment names")] = checkedSecretValue(values[key]);
+/** Persistent volume collection operations. */
+export class VolumeAPI {
+  readonly #client: Client;
+  /** Bind volume operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
   }
-  return checked;
+  /** List persistent volumes. */
+  async list(): Promise<Volume[]> {
+    return (await this.#client.json<{ volumes: string[] }>("GET", "/v1/volumes")).volumes.map(
+      (name) => new Volume(name),
+    );
+  }
+  /** Create a persistent volume. */
+  async create(name: string): Promise<Volume> {
+    await this.#client.response("PUT", `/v1/volumes/${encodeURIComponent(name)}`);
+    return new Volume(name);
+  }
+  /** Delete a persistent volume. */
+  async delete(name: string): Promise<void> {
+    await this.#client.response("DELETE", `/v1/volumes/${encodeURIComponent(name)}`);
+  }
 }
 
-function checkedSecretName(name: string, label: string): string {
-  if (name.length === 0 || name.includes("=") || name.includes("\0")) {
-    throw new TypeError(`${label} must be non-empty and contain no '=' or NUL`);
+/** Bound warm-pool value returned by pool operations. */
+export class Pool {
+  readonly #api: PoolAPI;
+  readonly ref: string;
+  readonly count: number;
+  readonly stats?: PoolStats;
+  /** Bind a pool result to its service. */
+  constructor(api: PoolAPI, ref: string, count: number, stats?: PoolStats) {
+    this.#api = api;
+    this.ref = ref;
+    this.count = count;
+    this.stats = stats;
   }
-  return name;
+  /** Delete this warm pool. */
+  delete(): Promise<void> {
+    return this.#api.delete(this.ref);
+  }
 }
-
-function checkedSecretValue(value: string): string {
-  if (value.includes("\0")) {
-    throw new TypeError("secret environment values must contain no NUL bytes");
+/** Warm-pool collection operations. */
+export class PoolAPI {
+  readonly #client: Client;
+  /** Bind pool operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
   }
-  return value;
-}
-
-function normalizeBaseUrl(baseUrl: string): string {
-  const trimmed = baseUrl.trim();
-  if (!trimmed) {
-    throw new TypeError("baseUrl must not be empty");
-  }
-  return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
-}
-
-function sandboxFileUrl(id: string, path: string): string {
-  return `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`;
-}
-
-function jsonRequest(method: "POST", body: unknown): RequestInit {
-  return {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  };
-}
-
-async function apiError(response: Response): Promise<VmonApiError> {
-  const fallback = response.statusText || "request failed";
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    const body: unknown = await response.json().catch(() => null);
-    const parsed = parseErrorBody(body, fallback);
-    return new VmonApiError({
-      status: response.status,
-      code: parsed.code,
-      message: parsed.message,
-    });
-  }
-  const text = await response.text().catch(() => "");
-  return new VmonApiError({
-    status: response.status,
-    code: "http_error",
-    message: text || fallback,
-  });
-}
-
-function parseErrorBody(body: unknown, fallback: string): Omit<VmonApiErrorShape, "status"> {
-  if (!isRecord(body)) {
-    return { code: "http_error", message: fallback };
-  }
-
-  const detail = body.detail;
-  if (isRecord(detail)) {
-    const code = stringField(detail, "code") ?? "http_error";
-    const message = stringField(detail, "message") ?? fallback;
-    return { code, message };
-  }
-  if (typeof detail === "string") {
-    return { code: "http_error", message: detail };
-  }
-
-  const code = stringField(body, "code") ?? "http_error";
-  const message = stringField(body, "message") ?? fallback;
-  return { code, message };
-}
-
-function isSecretWire(value: unknown): value is SecretWire {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return typeof value.name === "string" && isStringRecord(value.values);
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  if (!isRecord(value)) {
-    return false;
-  }
-  for (const key in value) {
-    if (typeof value[key] !== "string") {
-      return false;
+  /** List warm pools. */
+  async list(): Promise<Pool[]> {
+    const body = await this.#client.json<unknown>("GET", "/v1/pools");
+    if (!isRecord(body) || Array.isArray(body))
+      throw new ProtocolError("pool list response must be an object");
+    const pools: Pool[] = [];
+    for (const ref in body) {
+      const stats = body[ref];
+      if (!isRecord(stats) || Array.isArray(stats))
+        throw new ProtocolError(`pool ${ref} statistics must be an object`);
+      const count = Number(stats.count ?? stats.size ?? 0);
+      if (!Number.isFinite(count)) throw new ProtocolError(`pool ${ref} size must be finite`);
+      pools.push(new Pool(this, ref, count, stats));
     }
+    return pools;
   }
-  return true;
+  /** Set the desired warm-pool size and template. */
+  async set(ref: string, count: number, template: Record<string, unknown> = {}): Promise<Pool> {
+    const body: PoolSetRequest = { ...template, size: count };
+    const result = await this.#client.json<PoolStats>(
+      "PUT",
+      `/v1/pools/${encodeURIComponent(ref)}`,
+      { json: body },
+    );
+    return new Pool(this, ref, count, result);
+  }
+  /** Delete a warm pool. */
+  async delete(ref: string): Promise<void> {
+    await this.#client.response("DELETE", `/v1/pools/${encodeURIComponent(ref)}`);
+  }
+  /** Delete every warm pool. */
+  async clear(): Promise<void> {
+    const pools = await this.list();
+    await Promise.all(pools.map((pool) => this.delete(pool.ref)));
+  }
 }
 
+/** Mesh status and node views. */
+export class MeshAPI {
+  readonly #client: Client;
+  /** Bind mesh operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
+  }
+  /** Fetch typed mesh status. */
+  status(): Promise<MeshStatus> {
+    return this.#client.json("GET", "/v1/mesh/status");
+  }
+  /** Return the local and peer mesh nodes. */
+  async nodes(): Promise<MeshNode[]> {
+    const status = await this.status();
+    return [status.self, ...status.peers];
+  }
+}
+
+function sandboxRows(body: unknown): SandboxInfo[] {
+  const rows = Array.isArray(body)
+    ? body
+    : body && typeof body === "object" && "sandboxes" in body && Array.isArray(body.sandboxes)
+      ? body.sandboxes
+      : body && typeof body === "object" && "items" in body && Array.isArray(body.items)
+        ? body.items
+        : [];
+  return rows.filter((row): row is SandboxInfo => isRecord(row) && typeof row.id === "string");
+}
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function stringField(record: Record<string, unknown>, field: string): string | null {
-  const value = record[field];
-  return typeof value === "string" ? value : null;
 }

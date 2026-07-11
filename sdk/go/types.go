@@ -33,6 +33,8 @@ type Sandbox struct {
 	Name string `json:"name"`
 	// Status is the current lifecycle state.
 	Status string `json:"status"`
+	// Node is the mesh node currently hosting the sandbox.
+	Node string `json:"node,omitempty"`
 	// PID is the monitor process identifier when one is available.
 	PID *int32 `json:"pid,omitempty"`
 	// Source is the image, template, fork, or restore source.
@@ -54,7 +56,11 @@ type Sandbox struct {
 	// Details retains non-canonical response fields as raw JSON.
 	Details map[string]json.RawMessage `json:"-"`
 
-	client *Client
+	client       *Client
+	endpoint     string
+	connectToken string
+	Files        *Files
+	Ports        *Ports
 }
 
 // UnmarshalJSON decodes canonical fields while preserving open sandbox detail fields.
@@ -69,7 +75,7 @@ func (sandbox *Sandbox) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, key := range []string{
-		"id", "name", "status", "pid", "source", "created_at", "last_active",
+		"id", "name", "status", "node", "pid", "source", "created_at", "last_active",
 		"expires_at", "terminated_at", "error", "tags", "returncode",
 	} {
 		delete(details, key)
@@ -141,6 +147,8 @@ type SandboxCreateRequest struct {
 type SandboxListOptions struct {
 	// Tags requires each key/value tag pair to match.
 	Tags map[string]string
+	// Node filters results by hosting mesh node.
+	Node string
 }
 
 // SandboxPoll is one non-blocking sandbox lifecycle observation.
@@ -182,32 +190,46 @@ type MigrateResult struct {
 	Migration MigrationTiming
 }
 
-// MeshPeer is one known member in a node's mesh status view.
-type MeshPeer struct {
-	// NodeID is the peer's stable mesh identifier.
-	NodeID string `json:"node_id"`
-	// Advertise is the peer's advertised API URL.
-	Advertise string `json:"advertise"`
-	// Region is the peer's placement region.
-	Region string `json:"region"`
+// MeshNode is one member of a mesh.
+type MeshNode struct {
+	NodeID    string          `json:"node_id"`
+	Advertise string          `json:"advertise"`
+	Region    string          `json:"region"`
+	Raw       json.RawMessage `json:"-"`
 }
 
-// MeshStatus is a node's mesh membership summary.
+// UnmarshalJSON decodes known mesh-node fields while preserving the original payload.
+func (node *MeshNode) UnmarshalJSON(data []byte) error {
+	type wire MeshNode
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*node = MeshNode(decoded)
+	node.Raw = append(node.Raw[:0], data...)
+	return nil
+}
+
+// MeshStatus is a node's typed mesh membership summary.
 type MeshStatus struct {
-	// Enabled reports whether the node participates in a mesh.
-	Enabled bool `json:"enabled"`
-	// NodeID is this node's stable mesh identifier.
-	NodeID string `json:"node_id"`
-	// Advertise is this node's advertised API URL.
-	Advertise string `json:"advertise"`
-	// Region is this node's placement region.
-	Region string `json:"region"`
-	// ExpectedMembers is the configured cluster size.
-	ExpectedMembers uint64 `json:"expected_members"`
-	// Quorum is the strict majority needed for quorum-gated operations.
-	Quorum uint64 `json:"quorum"`
-	// Peers lists the currently known other members.
-	Peers []MeshPeer `json:"peers"`
+	Self            MeshNode        `json:"self"`
+	Peers           []MeshNode      `json:"peers"`
+	ReplicasHeld    uint64          `json:"replicas_held"`
+	ExpectedMembers uint64          `json:"expected_members"`
+	Quorum          uint64          `json:"quorum"`
+	Raw             json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes known mesh-status fields while preserving the original payload.
+func (status *MeshStatus) UnmarshalJSON(data []byte) error {
+	type wire MeshStatus
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*status = MeshStatus(decoded)
+	status.Raw = append(status.Raw[:0], data...)
+	return nil
 }
 
 // ExecRequest describes a command to run inside a sandbox.

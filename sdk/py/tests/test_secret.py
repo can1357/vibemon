@@ -8,7 +8,7 @@ from vmon.secret import Secret, merge_secrets
 
 
 def test_secret_from_dict_coerces_values_and_names_are_sorted() -> None:
-    secret = Secret.from_dict({"B": 2, 1: True}, name="runtime")
+    secret = Secret.from_dict({"B": 2, 1: True}, name="runtime")  # type: ignore[dict-item]
 
     assert secret.env == {"B": "2", "1": "True"}
     assert secret.names() == ["1", "B"]
@@ -45,7 +45,10 @@ def test_as_env_returns_a_copy() -> None:
 
 
 def test_secret_wire_mapping_round_trips_through_json() -> None:
-    secret = Secret.from_dict({"TOKEN": "value", 1: True}, name="runtime")
+    secret = Secret.from_dict(
+        {"TOKEN": "value", 1: True},  # type: ignore[dict-item]
+        name="runtime",
+    )
 
     payload = json.loads(json.dumps(secret.to_wire()))
 

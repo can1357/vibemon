@@ -1,82 +1,65 @@
-"""vmon — thin Python SDK for the Rust vmon API.
+"""Object-oriented Python client for the Rust vmon API.
 
 Example
 -------
-    from vmon import Sandbox
+    import vmon
 
-    sb = Sandbox.create(image="alpine")
-    proc = sb.exec("sh", "-c", "echo hi")
-    proc.wait()
-    snap = sb.snapshot_filesystem("template")
+    with vmon.connect("vmon://node-a,node-b") as client:
+        sandbox = client.sandboxes.create(image="alpine")
+        result = sandbox.run("echo", "hi")
 """
 
 __version__ = "0.2.0"
 
-from ._transport import DaemonError, WebSocketConnection
-from .context import (
-    LOCAL,
-    Context,
-    ContextStore,
-    context_token_path,
-    contexts_path,
-    roster_from_status,
-)
-from .sandbox import (
-    ConsoleStream,
-    EventStream,
-    ExecResult,
-    LogStream,
-    Process,
-    RemoteFunction,
-    RemoteFunctionError,
-    Sandbox,
-    WarmPoolHandle,
-    daemon_metrics,
-    events,
-    function,
-    health,
-    list_snapshots,
-    openapi_schema,
-    pool_inventory,
-    prewarm,
-    server_info,
-    shell,
-    shutdown_all_pools,
-    shutdown_prewarms,
-)
+from ._endpoint import WebSocketConnection
+from .client import Client, Pool, connect
+from .cls import RemoteClass, RemoteObject, cls, enter, exit, method
+from .context import Context, ContextStore
+from .driver import Driver, MeshDriver, parse_dsn
+from .errors import APIError, ProtocolError, RemoteFunctionError, TransportError
+from .models import ExecExit, MeshNode, MeshStatus, SandboxInfo
+from .process import ConsoleStream, EventStream, LogStream, Process
+from .remote import FunctionCall, RemoteFunction, Retries, function, is_remote
+from .sandbox import ExecResult, Files, Sandbox
 from .secret import Secret
 from .volume import Volume
 
 __all__ = [
+    "APIError",
+    "Client",
     "ConsoleStream",
     "Context",
     "ContextStore",
-    "DaemonError",
+    "Driver",
     "EventStream",
+    "ExecExit",
     "ExecResult",
-    "LOCAL",
+    "Files",
+    "FunctionCall",
     "LogStream",
+    "MeshDriver",
+    "MeshNode",
+    "MeshStatus",
+    "Pool",
     "Process",
+    "ProtocolError",
+    "RemoteClass",
     "RemoteFunction",
     "RemoteFunctionError",
+    "RemoteObject",
+    "Retries",
     "Sandbox",
+    "SandboxInfo",
     "Secret",
+    "TransportError",
     "Volume",
-    "WarmPoolHandle",
     "WebSocketConnection",
-    "context_token_path",
-    "contexts_path",
-    "daemon_metrics",
-    "events",
+    "cls",
+    "connect",
+    "enter",
+    "exit",
     "function",
-    "health",
-    "list_snapshots",
-    "openapi_schema",
-    "pool_inventory",
-    "prewarm",
-    "roster_from_status",
-    "server_info",
-    "shell",
-    "shutdown_all_pools",
-    "shutdown_prewarms",
+    "is_remote",
+    "method",
+    "parse_dsn",
 ]
