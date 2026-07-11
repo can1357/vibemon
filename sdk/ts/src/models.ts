@@ -6,6 +6,18 @@ export interface Health {
   ok: boolean;
 }
 
+/** S3 bucket or prefix mount accepted by sandbox creation. */
+export interface S3MountSpec {
+  uri: string;
+  endpoint?: string;
+  region?: string;
+  read_only?: boolean;
+  access_key?: string;
+  secret_key?: string;
+  session_token?: string;
+}
+
+
 /** Sandbox creation request accepted by the gRPC create operation. */
 export interface SandboxCreateRequest {
   arch?: string | null;
@@ -29,6 +41,7 @@ export interface SandboxCreateRequest {
   ports?: number[] | null;
   readiness_probe?: number | string | { port: number } | null;
   secrets?: SecretWire[] | null;
+  s3_mounts?: Record<string, S3MountSpec | string> | null;
   tags?: Record<string, string> | null;
   template?: string | null;
   timeout?: number | null;

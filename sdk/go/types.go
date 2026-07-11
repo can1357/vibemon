@@ -176,6 +176,8 @@ type SandboxCreateRequest struct {
 	Secrets []Secret `json:"secrets,omitempty"`
 	// Volumes maps guest mountpoints to named volume mounts.
 	Volumes map[string]VolumeMount `json:"volumes,omitempty"`
+	// S3Mounts maps guest mountpoints to S3 bucket or prefix mounts.
+	S3Mounts map[string]S3Mount `json:"s3_mounts,omitempty"`
 	// Tags contains sandbox metadata tags.
 	Tags map[string]string `json:"tags,omitempty"`
 	// FilesystemDirectory selects a host filesystem source where supported.
@@ -202,6 +204,17 @@ type SandboxCreateRequest struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// Command overrides the foreground entrypoint.
 	Command []string `json:"command,omitempty"`
+}
+
+// S3Mount configures one S3 bucket or prefix mount for a sandbox.
+type S3Mount struct {
+	URI          string `json:"uri"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	Region       string `json:"region,omitempty"`
+	ReadOnly     bool   `json:"read_only,omitempty"`
+	AccessKey    string `json:"access_key,omitempty"`
+	SecretKey    string `json:"secret_key,omitempty"`
+	SessionToken string `json:"session_token,omitempty"`
 }
 
 // SandboxListOptions filters sandbox list requests.

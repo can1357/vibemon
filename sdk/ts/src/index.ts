@@ -71,6 +71,7 @@ export type {
   PoolStats,
   RestoreRequest,
   SandboxCreateRequest,
+  S3MountSpec,
   SandboxInfo,
   SandboxMetrics,
   ServerInfo,

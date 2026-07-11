@@ -26,7 +26,7 @@ from .errors import APIError, ProtocolError
 from .process import ConsoleStream, LogStream, Process, open_process
 from .secret import Secret, merge_secrets
 from .v1 import api_pb2
-from .volume import Volume
+from .volume import S3Mount, Volume
 
 if TYPE_CHECKING:
     from .client import Client
@@ -129,6 +129,24 @@ def _volume_wire(volumes: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return wire
 
 
+def _s3_mount_wire(
+    s3_mounts: Mapping[str, S3Mount | str] | None,
+) -> dict[str, dict[str, object]] | None:
+    if s3_mounts is None:
+        return None
+    wire: dict[str, dict[str, object]] = {}
+    for mount, value in s3_mounts.items():
+        if isinstance(value, S3Mount):
+            wire[str(mount)] = value.to_wire()
+        elif isinstance(value, str):
+            wire[str(mount)] = {"uri": value}
+        else:
+            raise TypeError("S3 mount spec must be an S3Mount or URI string")
+    return wire
+
+
+
+
 def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "image",
@@ -147,6 +165,7 @@ def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         "env",
         "secrets",
         "volumes",
+        "s3_mounts",
         "tags",
         "fs_dir",
         "block_network",

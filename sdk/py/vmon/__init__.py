@@ -87,7 +87,7 @@ from .values import (
     decode_value,
     encode_value,
 )
-from .volume import Volume
+from .volume import S3Mount, Volume
 
 # These functions predate the public export contract; keep their definitive
 # user-facing documentation at the package boundary until their modules are
@@ -169,6 +169,7 @@ __all__ = [
     "SandboxMetrics",
     "SandboxNetworkPolicy",
     "Schedule",
+    "S3Mount",
     "Secret",
     "SerializedCallable",
     "SerializerPolicy",

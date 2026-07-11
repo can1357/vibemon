@@ -32,10 +32,11 @@ from .sandbox import (
     _drop_none,
     _secret_wire,
     _volume_wire,
+    _s3_mount_wire,
 )
 from .secret import Secret
 from .v1 import api_pb2
-from .volume import Volume
+from .volume import S3Mount, Volume
 
 if TYPE_CHECKING:
     from .models import Health, MeshNode, MeshStatus, PoolStats, ServerInfo
@@ -102,6 +103,7 @@ class Client:
         memory: int = 512,
         disk_mb: int = 1024,
         timeout: float | None = 300,
+        s3_mounts: Mapping[str, S3Mount | str] | None = None,
     ) -> Process:
         """Start a streaming interactive shell in an ephemeral sandbox."""
         argv = _coerce_cmd(cmd) if cmd else ["/bin/sh"]
@@ -115,6 +117,7 @@ class Client:
                 "disk_mb": int(disk_mb),
                 "timeout": timeout,
                 "tty": True,
+                "s3_mounts": _s3_mount_wire(s3_mounts),
             }
         )
         from .process import open_process
@@ -320,6 +323,7 @@ class SandboxAPI:
         env: dict[str, str] | None = None,
         secrets: Iterable[Secret | Mapping[str, object]] | None = None,
         volumes: Mapping[str, Any] | None = None,
+        s3_mounts: Mapping[str, S3Mount | str] | None = None,
         tags: dict[str, str] | None = None,
         fs_dir: str | None = None,
         block_network: bool = False,
@@ -354,6 +358,7 @@ class SandboxAPI:
                 else None,
                 "secrets": _secret_wire(secret_items),
                 "volumes": _volume_wire(volumes),
+                "s3_mounts": _s3_mount_wire(s3_mounts),
                 "tags": {str(key): str(value) for key, value in (tags or {}).items()}
                 if tags is not None
                 else None,
@@ -533,6 +538,8 @@ class SnapshotAPI:
         extra = _clone_create_extra(kwargs)
         if "volumes" in extra:
             extra["volumes"] = _volume_wire(extra["volumes"])
+        if "s3_mounts" in extra:
+            extra["s3_mounts"] = _s3_mount_wire(extra["s3_mounts"])
         if "secrets" in extra:
             extra["secrets"] = _secret_wire(extra["secrets"])
         return extra
