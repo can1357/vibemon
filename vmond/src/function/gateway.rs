@@ -30,14 +30,60 @@ const MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
 /// I-JSON visitor before it resolves or creates durable work.
 pub fn router(domain: Arc<FunctionDomain>) -> Router {
 	Router::new()
-		.route("/v1/functions/{namespace}/{name}/invoke", post(invoke))
+		.route("/v1/functions/{namespace}/{name}/invoke", post(invoke_function))
+		.route("/v1/apps/{namespace}/{app}/functions/{binding}/invoke", post(invoke_app))
 		.layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
 		.with_state(domain)
 }
 
-async fn invoke(
+async fn invoke_function(
 	State(domain): State<Arc<FunctionDomain>>,
 	Path((namespace, name)): Path<(String, String)>,
+	headers: HeaderMap,
+	body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+	let function = pb::FunctionRef { namespace, name };
+	let lookup = domain.clone();
+	let revision =
+		tokio::task::spawn_blocking(move || lookup.store().get_active_revision(&function))
+			.await
+			.map_err(join_error)?
+			.map_err(ApiError::from)?;
+	invoke_revision(domain, revision, headers, body).await
+}
+
+async fn invoke_app(
+	State(domain): State<Arc<FunctionDomain>>,
+	Path((namespace, name, binding)): Path<(String, String, String)>,
+	headers: HeaderMap,
+	body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+	let app = pb::AppRef { namespace, name };
+	let lookup = domain.clone();
+	let revision = tokio::task::spawn_blocking(move || {
+		let app_revision = lookup.store().get_active_app(&app)?;
+		let pinned = select_app_binding(&app_revision, &binding)?;
+		lookup.store().get_revision(&pinned.revision_id)
+	})
+	.await
+	.map_err(join_error)?
+	.map_err(ApiError::from)?;
+	invoke_revision(domain, revision, headers, body).await
+}
+
+fn select_app_binding(app: &pb::AppRevision, binding: &str) -> crate::Result<pb::RevisionRef> {
+	app.functions
+		.iter()
+		.find(|candidate| candidate.name == binding)
+		.and_then(|candidate| candidate.revision.clone())
+		.ok_or_else(|| {
+			crate::EngineError::not_found(format!("app binding {binding:?} was not found"))
+		})
+}
+
+async fn invoke_revision(
+	domain: Arc<FunctionDomain>,
+	revision: pb::FunctionRevision,
 	headers: HeaderMap,
 	body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
@@ -57,13 +103,6 @@ async fn invoke(
 		));
 	}
 	let value = parse_ijson(&body)?;
-	let function = pb::FunctionRef { namespace, name };
-	let lookup = domain.clone();
-	let revision =
-		tokio::task::spawn_blocking(move || lookup.store().get_active_revision(&function))
-			.await
-			.map_err(join_error)?
-			.map_err(ApiError::from)?;
 	require_json_serializers(&revision)?;
 	let revision_ref = revision
 		.r#ref
@@ -406,7 +445,12 @@ mod tests {
 			.as_mut()
 			.unwrap()
 			.input_serializer = pb::ValueSerializer::Cbor as i32;
-		assert!(require_json_serializers(&revision).is_err());
+		let error = require_json_serializers(&revision).expect_err("CBOR input");
+		assert_eq!(error.code(), "unsupported");
+		assert_eq!(
+			error.message(),
+			"public HTTP invocation requires JSON input and result serializers"
+		);
 		revision
 			.spec
 			.as_mut()
@@ -423,7 +467,48 @@ mod tests {
 			.as_mut()
 			.unwrap()
 			.result_serializer = pb::ValueSerializer::Cloudpickle as i32;
-		assert!(require_json_serializers(&revision).is_err());
+		let error = require_json_serializers(&revision).expect_err("cloudpickle result");
+		assert_eq!(error.code(), "unsupported");
+		assert_eq!(
+			error.message(),
+			"public HTTP invocation requires JSON input and result serializers"
+		);
+	}
+
+	#[test]
+	fn app_binding_selector_returns_the_pinned_aliased_revision() {
+		let pinned = pb::RevisionRef {
+			function:    Some(pb::FunctionRef {
+				namespace: "tests".to_owned(),
+				name:      "implementation".to_owned(),
+			}),
+			revision_id: "revision-1".to_owned(),
+		};
+		let app = pb::AppRevision {
+			functions: vec![pb::AppFunctionBinding {
+				name:     "public-alias".to_owned(),
+				revision: Some(pinned.clone()),
+			}],
+			..Default::default()
+		};
+
+		assert_eq!(select_app_binding(&app, "public-alias").expect("binding"), pinned);
+		let error =
+			select_app_binding(&app, "implementation").expect_err("function name is not an alias");
+		assert_eq!(error.code, crate::ErrorCode::NotFound);
+		assert_eq!(error.message, "app binding \"implementation\" was not found");
+	}
+
+	#[test]
+	fn app_binding_selector_rejects_missing_revision_with_stable_not_found_error() {
+		let app = pb::AppRevision {
+			functions: vec![pb::AppFunctionBinding { name: "broken".to_owned(), revision: None }],
+			..Default::default()
+		};
+
+		let error = select_app_binding(&app, "broken").expect_err("missing pinned revision");
+		assert_eq!(error.code, crate::ErrorCode::NotFound);
+		assert_eq!(error.message, "app binding \"broken\" was not found");
 	}
 
 	#[test]

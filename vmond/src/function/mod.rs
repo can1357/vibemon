@@ -30,7 +30,7 @@ use self::{
 	artifact::ArtifactStore,
 	metrics::{FunctionMetrics, MetricsSnapshot, ReproducibilityDescription},
 	scheduler::{PoolPolicy, SchedulerControl, WorkerPool},
-	store::{LeasedInput, Store},
+	store::{LeasedInput, QueuedRevision, Store},
 	worker::{
 		ActorOperation, ActorRequest, AttemptStats as WorkerAttemptStats, BatchExecuteRequest,
 		BatchExecution, BatchWorkerEvent, EngineExecutor, ExecuteRequest, ExecutionMode, Executor,
@@ -41,6 +41,7 @@ use self::{
 use crate::{EngineError, Result, engine::EngineApi, home::Home};
 
 const EVENT_REPLAY_LIMIT: u32 = 10_000;
+const SNAPSHOT_ARTIFACT_LIMIT: u64 = 64 * 1024 * 1024;
 const LEASE_MILLIS: u64 = 30_000;
 const GLOBAL_WORKER_LIMIT: usize = 64;
 
@@ -78,21 +79,23 @@ impl CallWatch {
 
 /// Shared ownership root for the durable function runtime.
 pub struct FunctionDomain {
-	home:      Home,
-	store:     Arc<Store>,
-	artifacts: ArtifactStore,
-	executor:  Arc<dyn Executor>,
-	actors:    ActorManager,
-	metrics:   Arc<FunctionMetrics>,
-	secrets:   RwLock<HashMap<SecretKey, Vec<u8>>>,
-	snapshots: RwLock<HashMap<String, WorkerSnapshot>>,
-	watchers:  Mutex<HashMap<String, broadcast::Sender<pb::CallEvent>>>,
-	pools:     Mutex<HashMap<String, WorkerPool>>,
-	workers:   Mutex<HashMap<String, Arc<dyn Worker>>>,
-	active:    Mutex<HashMap<ActiveKey, ActiveExecution>>,
-	control:   Arc<SchedulerControl>,
-	shutdown:  broadcast::Sender<()>,
-	tasks:     Mutex<Vec<JoinHandle<()>>>,
+	home:           Home,
+	store:          Arc<Store>,
+	artifacts:      ArtifactStore,
+	executor:       Arc<dyn Executor>,
+	actors:         ActorManager,
+	metrics:        Arc<FunctionMetrics>,
+	secrets:        RwLock<HashMap<SecretKey, Vec<u8>>>,
+	snapshots:      RwLock<HashMap<String, WorkerSnapshot>>,
+	published:      Mutex<HashMap<String, u64>>,
+	watchers:       Mutex<HashMap<String, broadcast::Sender<pb::CallEvent>>>,
+	pools:          Mutex<HashMap<String, WorkerPool>>,
+	workers:        Mutex<HashMap<String, Arc<dyn Worker>>>,
+	active:         Mutex<HashMap<ActiveKey, ActiveExecution>>,
+	worker_startup: Mutex<HashMap<String, pb::StartupKind>>,
+	control:        Arc<SchedulerControl>,
+	shutdown:       broadcast::Sender<()>,
+	tasks:          Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl FunctionDomain {
@@ -118,10 +121,12 @@ impl FunctionDomain {
 			metrics,
 			secrets: RwLock::new(HashMap::new()),
 			snapshots: RwLock::new(HashMap::new()),
+			published: Mutex::new(HashMap::new()),
 			watchers: Mutex::new(HashMap::new()),
 			pools: Mutex::new(HashMap::new()),
 			workers: Mutex::new(HashMap::new()),
 			active: Mutex::new(HashMap::new()),
+			worker_startup: Mutex::new(HashMap::new()),
 			control,
 			shutdown,
 			tasks: Mutex::new(Vec::new()),
@@ -319,8 +324,22 @@ impl FunctionDomain {
 				else {
 					continue;
 				};
-				let expected = SnapshotProvenance::for_revision(&revision)
-					.map_err(|error| EngineError::engine(error.to_string()))?;
+				let Some(revision_id) = revision
+					.r#ref
+					.as_ref()
+					.map(|reference| reference.revision_id.clone())
+				else {
+					continue;
+				};
+				let expected = match SnapshotProvenance::for_revision(&revision) {
+					Ok(expected) => expected,
+					Err(error) => {
+						tracing::warn!(%error, %revision_id, "detaching invalid function snapshot");
+						self.store.detach_function_snapshot(&revision_id)?;
+						self.remove_snapshot(&revision_id);
+						continue;
+					},
+				};
 				if record.revision.as_ref() != revision.r#ref.as_ref()
 					|| record.protocol_version != expected.runner_protocol as u32
 					|| record
@@ -339,19 +358,41 @@ impl FunctionDomain {
 						.map(|digest| digest.value.as_slice())
 						!= Some(expected.package_digest.as_slice())
 				{
-					return Err(EngineError::engine(format!(
-						"snapshot provenance mismatch for revision {}",
-						expected.revision_id
-					)));
+					self.store.detach_function_snapshot(&revision_id)?;
+					self.remove_snapshot(&revision_id);
+					continue;
 				}
-				let digest = record
+				let Some(digest) = record
 					.artifact
 					.as_ref()
 					.and_then(|artifact| artifact.digest.as_ref())
-					.ok_or_else(|| EngineError::engine("snapshot record missing artifact digest"))?;
-				let bytes = self.artifacts.read(&hex::encode(&digest.value), None)?;
-				let engine_snapshot =
-					String::from_utf8(bytes).map_err(|error| EngineError::engine(error.to_string()))?;
+				else {
+					self.store.detach_function_snapshot(&revision_id)?;
+					self.remove_snapshot(&revision_id);
+					continue;
+				};
+				let bytes = match self.artifacts.read_bounded(
+					&hex::encode(&digest.value),
+					None,
+					SNAPSHOT_ARTIFACT_LIMIT,
+				) {
+					Ok(bytes) => bytes,
+					Err(error) => {
+						tracing::warn!(%error, %revision_id, "detaching unreadable function snapshot");
+						self.store.detach_function_snapshot(&revision_id)?;
+						self.remove_snapshot(&revision_id);
+						continue;
+					},
+				};
+				let engine_snapshot = match String::from_utf8(bytes) {
+					Ok(snapshot) => snapshot,
+					Err(error) => {
+						tracing::warn!(%error, %revision_id, "detaching corrupt function snapshot");
+						self.store.detach_function_snapshot(&revision_id)?;
+						self.remove_snapshot(&revision_id);
+						continue;
+					},
+				};
 				self.record_snapshot(WorkerSnapshot {
 					engine_snapshot,
 					provenance: expected,
@@ -437,10 +478,18 @@ impl FunctionDomain {
 	/// Subscribe to newly published events for one call.
 	pub fn subscribe_call(&self, call_id: &str) -> broadcast::Receiver<pb::CallEvent> {
 		let mut watchers = self.watchers.lock();
-		watchers
+		let receiver = watchers
 			.entry(call_id.to_owned())
 			.or_insert_with(|| broadcast::channel(256).0)
-			.subscribe()
+			.subscribe();
+		let frontier = self.store.event_frontier(call_id).unwrap_or_default();
+		self
+			.published
+			.lock()
+			.entry(call_id.to_owned())
+			.and_modify(|published| *published = (*published).max(frontier))
+			.or_insert(frontier);
+		receiver
 	}
 
 	/// Publish an event after its store transaction commits.
@@ -449,10 +498,17 @@ impl FunctionDomain {
 			return;
 		};
 		let mut watchers = self.watchers.lock();
+		self
+			.published
+			.lock()
+			.entry(call_id.clone())
+			.and_modify(|published| *published = (*published).max(event.sequence))
+			.or_insert(event.sequence);
 		if let Some(sender) = watchers.get(&call_id) {
 			let _ = sender.send(event);
 			if sender.receiver_count() == 0 {
 				watchers.remove(&call_id);
+				self.published.lock().remove(&call_id);
 			}
 		}
 	}
@@ -461,13 +517,31 @@ impl FunctionDomain {
 		if !self.watchers.lock().contains_key(call_id) {
 			return;
 		}
-		match self.store.events_after(call_id, 0, EVENT_REPLAY_LIMIT) {
-			Ok(events) => {
-				for event in events {
-					self.publish_call_event(event);
-				}
-			},
-			Err(error) => tracing::warn!(%error, %call_id, "call event publication failed"),
+		let mut cursor = self
+			.published
+			.lock()
+			.get(call_id)
+			.copied()
+			.unwrap_or_default();
+		loop {
+			match self.store.events_after(call_id, cursor, EVENT_REPLAY_LIMIT) {
+				Ok(events) if events.is_empty() => return,
+				Ok(events) => {
+					let previous = cursor;
+					for event in events {
+						cursor = cursor.max(event.sequence);
+						self.publish_call_event(event);
+					}
+					if cursor == previous {
+						tracing::warn!(%call_id, cursor, "call event publication made no progress");
+						return;
+					}
+				},
+				Err(error) => {
+					tracing::warn!(%error, %call_id, "call event publication failed");
+					return;
+				},
+			}
 		}
 	}
 
@@ -498,6 +572,21 @@ impl FunctionDomain {
 	/// Durably create and initialize an actor before publishing it as ready.
 	pub async fn create_actor(&self, request: &pb::CreateActorRequest) -> Result<pb::ActorRecord> {
 		let now = unix_millis();
+		let function = request
+			.function
+			.as_ref()
+			.ok_or_else(|| EngineError::invalid("actor function is required"))?;
+		let admitted_revision = self.store.get_revision(&function.revision_id)?;
+		let lifecycle = admitted_revision
+			.spec
+			.as_ref()
+			.and_then(|spec| pb::FunctionLifecycle::try_from(spec.lifecycle).ok())
+			.unwrap_or(pb::FunctionLifecycle::Stateless);
+		if lifecycle != pb::FunctionLifecycle::Actor {
+			return Err(EngineError::invalid(
+				"durable actor creation requires ACTOR function lifecycle",
+			));
+		}
 		let actor = self.store.create_actor(request, now)?;
 		let actor_id = actor
 			.r#ref
@@ -505,9 +594,12 @@ impl FunctionDomain {
 			.ok_or_else(|| EngineError::engine("created actor missing ref"))?
 			.actor_id
 			.clone();
+		self.actors.register(actor_id.clone(), None);
+		let create_gate = self.actors.acquire_gate(&actor_id).await?;
+		let actor = self.store.get_actor(&actor_id)?;
 		let status = pb::ActorStatus::try_from(actor.status).unwrap_or(pb::ActorStatus::Failed);
 		if status != pb::ActorStatus::Creating {
-			if status == pb::ActorStatus::Ready && self.actors.acquire(&actor_id).await.is_ok() {
+			if status == pb::ActorStatus::Ready && self.actors.gated_worker(&create_gate).is_some() {
 				return Ok(actor);
 			}
 			let checkpoint_id =
@@ -520,15 +612,17 @@ impl FunctionDomain {
 						},
 					});
 			if matches!(status, pb::ActorStatus::Ready | pb::ActorStatus::Stopped)
-				&& let Some(checkpoint_id) = checkpoint_id {
-					return self
-						.restore_actor_checkpoint(
-							&actor_id,
-							&checkpoint_id,
-							&format!("recover:{}", request.request_id),
-						)
-						.await;
-				}
+				&& let Some(checkpoint_id) = checkpoint_id
+			{
+				drop(create_gate);
+				return self
+					.restore_actor_checkpoint(
+						&actor_id,
+						&checkpoint_id,
+						&format!("recover:{}", request.request_id),
+					)
+					.await;
+			}
 			let _ =
 				self
 					.store
@@ -621,8 +715,34 @@ impl FunctionDomain {
 			.ok_or_else(|| EngineError::invalid("actor is required"))?
 			.actor_id
 			.clone();
+		if let Some(checkpoint) = self.store.checkpoint_for_request(&request.request_id)? {
+			if checkpoint
+				.actor
+				.as_ref()
+				.map(|actor| actor.actor_id.as_str())
+				!= Some(actor_id.as_str())
+			{
+				return Err(EngineError::invalid(
+					"request_id was already used for a different actor checkpoint",
+				));
+			}
+			return Ok(checkpoint);
+		}
 		let actor = self.store.get_actor(&actor_id)?;
 		let permit = self.actors.acquire(&actor_id).await?;
+		if let Some(checkpoint) = self.store.checkpoint_for_request(&request.request_id)? {
+			if checkpoint
+				.actor
+				.as_ref()
+				.map(|actor| actor.actor_id.as_str())
+				!= Some(actor_id.as_str())
+			{
+				return Err(EngineError::invalid(
+					"request_id was already used for a different actor checkpoint",
+				));
+			}
+			return Ok(checkpoint);
+		}
 		let sequence = self
 			.store
 			.allocate_actor_operation(&actor_id, unix_millis())?;
@@ -670,7 +790,13 @@ impl FunctionDomain {
 			.put_checkpoint(&checkpoint, &request.request_id, now);
 		self.complete_actor_operation(&actor_id, sequence);
 		let checkpoint = persisted?;
-		self.actors.checkpoint_committed(&actor_id, checkpoint_id)?;
+		let committed_id = checkpoint
+			.r#ref
+			.as_ref()
+			.ok_or_else(|| EngineError::engine("persisted checkpoint missing ref"))?
+			.checkpoint_id
+			.clone();
+		self.actors.checkpoint_committed(&actor_id, committed_id)?;
 		Ok(checkpoint)
 	}
 
@@ -748,10 +874,21 @@ impl FunctionDomain {
 			.function
 			.as_ref()
 			.ok_or_else(|| EngineError::engine("actor missing function"))?;
-		let old_permit = self.actors.acquire(actor_id).await.ok();
-		let old_worker = old_permit
-			.as_ref()
-			.map(|permit| Arc::clone(permit.worker()));
+		let actor_gate = self.actors.acquire_gate(actor_id).await?;
+		let current = self.store.get_actor(actor_id)?;
+		if self.actors.gated_worker(&actor_gate).is_some()
+			&& current.status == pb::ActorStatus::Ready as i32
+			&& current
+				.latest_checkpoint_presence
+				.as_ref()
+				.is_some_and(|presence| match presence {
+					pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint) => {
+						checkpoint.checkpoint_id == checkpoint_id
+					},
+				}) {
+			return Ok(current);
+		}
+		let old_worker = self.actors.gated_worker(&actor_gate);
 		let revision = Arc::new(self.store.get_revision(&function.revision_id)?);
 		let worker = self
 			.executor
@@ -769,7 +906,7 @@ impl FunctionDomain {
 				actor_id:   actor_id.to_owned(),
 				operation:  ActorOperation::Restore {
 					checkpoint_id: checkpoint_id.to_owned(),
-					state: Box::new(state),
+					state:         Box::new(state),
 				},
 				input:      None,
 				deadline:   None,
@@ -788,7 +925,7 @@ impl FunctionDomain {
 				let worker_id = worker.id().to_owned();
 				self
 					.actors
-					.register(actor_id.to_owned(), Some(checkpoint_id.to_owned()));
+					.install_checkpoint_frontier(actor_id, checkpoint_id.to_owned())?;
 				self
 					.actors
 					.pin(actor_id, worker, Some(checkpoint_id.to_owned()))?;
@@ -799,7 +936,7 @@ impl FunctionDomain {
 					Some(&worker_id),
 					unix_millis(),
 				)?;
-				drop(old_permit);
+				drop(actor_gate);
 				if let Some(old_worker) = old_worker {
 					let _ = old_worker.retire().await;
 				}
@@ -819,14 +956,15 @@ impl FunctionDomain {
 		let call = self
 			.store
 			.cancel_call(call_id, reason, request_id, unix_millis())?;
+		self.publish_committed_events(call_id);
 		let active = {
 			let executions = self.active.lock();
 			let mut seen = HashSet::new();
 			executions
 				.iter()
 				.filter(|((active_call_id, _), _)| active_call_id == call_id)
-				.filter(|&(_, execution)| seen
-						.insert(execution.request_id.clone())).map(|(_, execution)| (Arc::clone(&execution.worker), execution.request_id.clone()))
+				.filter(|&(_, execution)| seen.insert(execution.request_id.clone()))
+				.map(|(_, execution)| (Arc::clone(&execution.worker), execution.request_id.clone()))
 				.collect::<Vec<_>>()
 		};
 		for (worker, execution_request_id) in active {
@@ -839,12 +977,42 @@ impl FunctionDomain {
 		Ok(call)
 	}
 
+	async fn retire_worker(&self, worker: Arc<dyn Worker>) {
+		if let Ok(revision) = self.store.get_revision(worker.revision_id())
+			&& revision
+				.spec
+				.as_ref()
+				.and_then(|spec| spec.lifecycle_hooks.as_ref())
+				.is_some_and(|hooks| hooks.snapshot_on_worker_retire)
+		{
+			match worker.snapshot(SnapshotReason::WorkerRetire).await {
+				Ok(snapshot) => {
+					if let Err(error) = self.persist_snapshot(snapshot, &revision) {
+						tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot persistence failed");
+					}
+				},
+				Err(error) => {
+					tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot capture failed")
+				},
+			}
+		}
+		let _ = worker.retire().await;
+	}
+
 	/// Ask every background task to stop and wait for clean termination.
 	pub async fn shutdown(&self) {
 		let _ = self.shutdown.send(());
 		let tasks = std::mem::take(&mut *self.tasks.lock());
 		for task in tasks {
 			let _ = task.await;
+		}
+		let mut retiring = std::mem::take(&mut *self.workers.lock());
+		self.pools.lock().clear();
+		for worker in self.actors.drain_workers() {
+			retiring.entry(worker.id().to_owned()).or_insert(worker);
+		}
+		for (_, worker) in retiring {
+			self.retire_worker(worker).await;
 		}
 		self.clear_secrets();
 	}
@@ -866,6 +1034,12 @@ impl FunctionDomain {
 		self.tasks.lock().push(task);
 	}
 
+	fn track_task(&self, task: JoinHandle<()>) {
+		let mut tasks = self.tasks.lock();
+		reap_finished_tasks(&mut tasks);
+		tasks.push(task);
+	}
+
 	async fn scheduler_tick(self: &Arc<Self>) {
 		let now = unix_millis();
 		if let Err(error) = self.store.expire_leases(now) {
@@ -883,13 +1057,46 @@ impl FunctionDomain {
 		if let Err(error) = self.artifacts.gc_expired(&self.store, now, 128) {
 			tracing::warn!(%error, "function artifact GC failed");
 		}
-		let revisions = match self.store.queued_revisions(now) {
+		let mut revisions = match self.store.queued_revisions(now) {
 			Ok(revisions) => revisions,
 			Err(error) => {
 				tracing::warn!(%error, "function queue scan failed");
 				return;
 			},
 		};
+		let mut page_token = String::new();
+		loop {
+			let page = match self.store.list_revisions(None, 1_000, &page_token) {
+				Ok(page) => page,
+				Err(error) => {
+					tracing::warn!(%error, "function revision scan failed");
+					break;
+				},
+			};
+			for revision in page.items {
+				let Some(revision_id) = revision
+					.r#ref
+					.as_ref()
+					.map(|reference| &reference.revision_id)
+				else {
+					continue;
+				};
+				if !revisions
+					.iter()
+					.any(|queued| queued.revision_id == *revision_id)
+				{
+					revisions.push(QueuedRevision {
+						revision_id:         revision_id.clone(),
+						oldest_available_ms: now,
+						queued_inputs:       0,
+					});
+				}
+			}
+			if page.next_page_token.is_empty() {
+				break;
+			}
+			page_token = page.next_page_token;
+		}
 		for queued in revisions {
 			let revision = match self.store.get_revision(&queued.revision_id) {
 				Ok(revision) => Arc::new(revision),
@@ -938,19 +1145,54 @@ impl FunctionDomain {
 									"secret_unavailable",
 									"required transient secret material is unavailable",
 								);
-								let _ = self
-									.store
-									.fail_user(&leased.lease, &call_error(&unavailable), now);
+								let _ = self.store.fail_user(
+									&leased.lease,
+									&call_error(&unavailable),
+									None,
+									now,
+								);
 							}
 							continue;
 						},
 					};
 					let started = std::time::Instant::now();
-					let spawned = if let Some(snapshot) = self.snapshot_for(&revision) {
-						self
+					let snapshot = self.snapshot_for(&revision);
+					let mut startup = initial_startup(snapshot.is_some());
+					let spawned = if let Some(snapshot) = snapshot {
+						match self
 							.executor
 							.restore(Arc::clone(&revision), snapshot, secrets)
 							.await
+						{
+							Err(error) if !error.retryable => {
+								let revision_id = revision
+									.r#ref
+									.as_ref()
+									.map(|reference| reference.revision_id.as_str())
+									.ok_or_else(|| EngineError::engine("revision missing ref"));
+								if let Ok(revision_id) = revision_id {
+									if let Err(detach_error) =
+										self.store.detach_function_snapshot(revision_id)
+									{
+										tracing::warn!(%detach_error, %revision_id, "failed to detach rejected function snapshot");
+										Err(error)
+									} else {
+										self.remove_snapshot(revision_id);
+										startup = pb::StartupKind::Cold;
+										self
+											.executor
+											.spawn(
+												Arc::clone(&revision),
+												self.secrets_for(&revision).unwrap_or_default(),
+											)
+											.await
+									}
+								} else {
+									Err(error)
+								}
+							},
+							result => result,
+						}
 					} else {
 						self.executor.spawn(Arc::clone(&revision), secrets).await
 					};
@@ -960,10 +1202,12 @@ impl FunctionDomain {
 								.metrics
 								.worker_started(started.elapsed().as_millis() as u64);
 							if let Some(snapshot) = worker.initial_snapshot()
-								&& let Err(error) = self.persist_snapshot(snapshot, &revision) {
-									tracing::warn!(%error, revision_id = %queued.revision_id, "initial function snapshot persistence failed");
-								}
+								&& let Err(error) = self.persist_snapshot(snapshot, &revision)
+							{
+								tracing::warn!(%error, revision_id = %queued.revision_id, "initial function snapshot persistence failed");
+							}
 							let id = worker.id().to_owned();
+							self.worker_startup.lock().insert(id.clone(), startup);
 							self.workers.lock().insert(id.clone(), worker);
 							self
 								.pools
@@ -992,11 +1236,24 @@ impl FunctionDomain {
 				}
 				continue;
 			};
+			if !worker.is_reusable() {
+				if let Some(pool) = self.pools.lock().get_mut(&queued.revision_id) {
+					pool.remove_worker(&worker_id);
+				}
+				self.workers.lock().remove(&worker_id);
+				self.worker_startup.lock().remove(&worker_id);
+				self.metrics.worker_retired();
+				tokio::spawn(async move {
+					let _ = worker.retire().await;
+				});
+				continue;
+			}
 			let batching = revision
 				.spec
 				.as_ref()
 				.and_then(|spec| spec.batching.as_ref())
 				.filter(|batching| batching.enabled);
+			let max_batch_size = effective_batch_size(policy);
 			if let Some(batching) = batching {
 				let frontier = self
 					.store
@@ -1010,7 +1267,7 @@ impl FunctionDomain {
 							frontier.queued_inputs,
 							frontier.oldest_available_ms,
 							now,
-							batching.max_batch_size,
+							max_batch_size,
 							batching.max_wait_millis,
 						)
 					});
@@ -1020,7 +1277,7 @@ impl FunctionDomain {
 						&worker_id,
 						now,
 						LEASE_MILLIS,
-						batching.max_batch_size.max(1),
+						max_batch_size,
 					) {
 						Ok(leased) if !leased.is_empty() => {
 							self.start_batch_execution(leased, Arc::clone(&worker));
@@ -1083,12 +1340,15 @@ impl FunctionDomain {
 		let task = tokio::spawn(async move {
 			domain.execute_leased(leased, worker, request_id).await;
 		});
-		self.tasks.lock().push(task);
+		self.track_task(task);
 	}
 
 	fn start_batch_execution(self: &Arc<Self>, leased: Vec<LeasedInput>, worker: Arc<dyn Worker>) {
 		let Some(first) = leased.first() else { return };
-		let request_id = format!("batch:{}:{}", first.lease.call_id, first.lease.lease_generation);
+		let request_id = format!(
+			"batch:{}:{}:{}",
+			first.lease.call_id, first.lease.input_index, first.lease.lease_generation
+		);
 		for item in &leased {
 			self.active.lock().insert(
 				(item.lease.call_id.clone(), item.input.input_id.clone()),
@@ -1101,7 +1361,7 @@ impl FunctionDomain {
 				.execute_batch_leased(leased, worker, request_id)
 				.await;
 		});
-		self.tasks.lock().push(task);
+		self.track_task(task);
 	}
 
 	async fn execute_leased(
@@ -1111,20 +1371,16 @@ impl FunctionDomain {
 		request_id: String,
 	) {
 		let now = unix_millis();
-		let startup = if worker.initial_snapshot().is_some() {
-			pb::StartupKind::Snapshot
-		} else {
-			pb::StartupKind::Warm
-		};
+		let startup = self.worker_startup(worker.id());
 		if let Err(error) = self.store.mark_running(&leased.lease, now, startup) {
 			tracing::warn!(%error, "leased input could not enter running state");
-			self.finish_worker_slot(&leased, worker.id());
+			self.finish_worker_slot(&leased, worker.id(), true);
 			return;
 		}
 		self.publish_committed_events(&leased.lease.call_id);
 		self
 			.metrics
-			.input_started(now.saturating_sub(leased.call.created_at_unix_millis));
+			.input_started(now.saturating_sub(leased.available_ms));
 		let call_type = pb::CallType::try_from(leased.call.r#type).unwrap_or(pb::CallType::Unary);
 		if !lifecycle_accepts(&leased.revision, call_type) {
 			self.commit_worker_error(
@@ -1133,8 +1389,9 @@ impl FunctionDomain {
 					"lifecycle_mismatch",
 					"call type is incompatible with function lifecycle",
 				),
+				None,
 			);
-			self.finish_worker_slot(&leased, worker.id());
+			self.finish_worker_slot(&leased, worker.id(), true);
 			return;
 		}
 		let mode = scheduler::input_execution_mode(call_type);
@@ -1142,9 +1399,10 @@ impl FunctionDomain {
 			let _ = self.store.fail_user(
 				&leased.lease,
 				&call_error(&WorkerError::platform("invalid_input", "input payload is required")),
+				None,
 				unix_millis(),
 			);
-			self.finish_worker_slot(&leased, worker.id());
+			self.finish_worker_slot(&leased, worker.id(), true);
 			return;
 		};
 		let deadline = leased
@@ -1170,65 +1428,70 @@ impl FunctionDomain {
 				.filter(|method| !method.is_empty());
 			let (Some(actor_id), Some(method)) = (actor_id, method) else {
 				let error = WorkerError::actor_lost("actor call target is incomplete");
-				self.commit_worker_error(&leased, &error);
-				self.finish_worker_slot(&leased, worker.id());
+				self.commit_worker_error(&leased, &error, None);
+				self.finish_worker_slot(&leased, worker.id(), true);
 				return;
 			};
-			let permit = if let Ok(permit) = self.actors.acquire(&actor_id).await { permit } else {
-   					let record = self.store.get_actor(&actor_id);
-   					let checkpoint_id = record.ok().and_then(|record| {
-   						record
-   							.latest_checkpoint_presence
-   							.map(|presence| match presence {
-   								pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(
-   									checkpoint,
-   								) => checkpoint.checkpoint_id,
-   							})
-   					});
-   					if let Some(checkpoint_id) = checkpoint_id {
-   						if self
-   							.restore_actor_checkpoint(
-   								&actor_id,
-   								&checkpoint_id,
-   								&format!("recover:{request_id}"),
-   							)
-   							.await
-   							.is_ok()
-   						{
-   							match self.actors.acquire(&actor_id).await {
-   								Ok(permit) => permit,
-   								Err(error) => {
-   									self.commit_worker_error(
-   										&leased,
-   										&WorkerError::actor_lost(error.to_string()),
-   									);
-   									self.finish_worker_slot(&leased, worker.id());
-   									return;
-   								},
-   							}
-   						} else {
-   							self.commit_worker_error(
-   								&leased,
-   								&WorkerError::actor_lost("actor checkpoint restore failed"),
-   							);
-   							self.finish_worker_slot(&leased, worker.id());
-   							return;
-   						}
-   					} else {
-   						let _ = self.store.set_actor_status(
-   							&actor_id,
-   							pb::ActorStatus::Failed,
-   							None,
-   							unix_millis(),
-   						);
-   						self.commit_worker_error(
-   							&leased,
-   							&WorkerError::actor_lost("actor worker was lost without a checkpoint"),
-   						);
-   						self.finish_worker_slot(&leased, worker.id());
-   						return;
-   					}
-   				};
+			let permit = if let Ok(permit) = self.actors.acquire(&actor_id).await {
+				permit
+			} else {
+				let record = self.store.get_actor(&actor_id);
+				let checkpoint_id = record.ok().and_then(|record| {
+					record
+						.latest_checkpoint_presence
+						.map(|presence| match presence {
+							pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint) => {
+								checkpoint.checkpoint_id
+							},
+						})
+				});
+				if let Some(checkpoint_id) = checkpoint_id {
+					if self
+						.restore_actor_checkpoint(
+							&actor_id,
+							&checkpoint_id,
+							&format!("recover:{request_id}"),
+						)
+						.await
+						.is_ok()
+					{
+						match self.actors.acquire(&actor_id).await {
+							Ok(permit) => permit,
+							Err(error) => {
+								self.commit_worker_error(
+									&leased,
+									&WorkerError::actor_lost(error.to_string()),
+									None,
+								);
+								self.finish_worker_slot(&leased, worker.id(), true);
+								return;
+							},
+						}
+					} else {
+						self.commit_worker_error(
+							&leased,
+							&WorkerError::actor_lost("actor checkpoint restore failed"),
+							None,
+						);
+						self.finish_worker_slot(&leased, worker.id(), true);
+						return;
+					}
+				} else {
+					let _ = self.store.set_actor_status(
+						&actor_id,
+						pb::ActorStatus::Failed,
+						None,
+						unix_millis(),
+					);
+					self.commit_worker_error(
+						&leased,
+						&WorkerError::actor_lost("actor worker was lost without a checkpoint"),
+						None,
+					);
+					self.finish_worker_slot(&leased, worker.id(), true);
+					return;
+				}
+			};
 			let sequence = match self
 				.store
 				.allocate_actor_operation(&actor_id, unix_millis())
@@ -1238,8 +1501,9 @@ impl FunctionDomain {
 					self.commit_worker_error(
 						&leased,
 						&WorkerError::platform("actor_busy", error.to_string()),
+						None,
 					);
-					self.finish_worker_slot(&leased, worker.id());
+					self.finish_worker_slot(&leased, worker.id(), true);
 					return;
 				},
 			};
@@ -1277,7 +1541,7 @@ impl FunctionDomain {
 					call_id: leased.lease.call_id.clone(),
 					input_id: leased.input.input_id.clone(),
 					input_index: leased.lease.input_index,
-					attempt: leased.user_attempts.saturating_add(1),
+					attempt: leased.user_attempts.max(1),
 					mode,
 					input,
 					deadline,
@@ -1291,8 +1555,8 @@ impl FunctionDomain {
 		let execution = match execution_result {
 			Ok(execution) => execution,
 			Err(error) => {
-				self.commit_worker_error(&leased, &error);
-				self.finish_worker_slot(&leased, worker.id());
+				self.commit_worker_error(&leased, &error, None);
+				self.finish_worker_slot(&leased, worker.id(), false);
 				if let Some((actor_id, _)) = &actor_operation {
 					self.mark_actor_worker_lost(actor_id);
 				}
@@ -1322,6 +1586,7 @@ impl FunctionDomain {
 				}
 			}
 		};
+		let mut reusable = true;
 		match outcome {
 			Ok(WorkerOutcome::Success { value, stats }) => {
 				let result = pb::CallResult {
@@ -1334,7 +1599,8 @@ impl FunctionDomain {
 					input_index:            leased.lease.input_index,
 					yield_index_presence:   None,
 				};
-				let proto_stats = attempt_stats(stats, startup, &leased);
+				let proto_stats =
+					attempt_stats(stats, startup, &leased, now.saturating_sub(leased.available_ms));
 				if let Err(error) =
 					self
 						.store
@@ -1350,6 +1616,9 @@ impl FunctionDomain {
 				}
 			},
 			Ok(WorkerOutcome::Cancelled { reason, .. }) => {
+				if worker.interruptibility() == self::worker::Interruptibility::Sync {
+					reusable = false;
+				}
 				if let Err(error) = self
 					.store
 					.finish_cancelled(&leased.lease, &reason, unix_millis())
@@ -1366,28 +1635,59 @@ impl FunctionDomain {
 				| WorkerOutcome::PlatformError { error, stats },
 			) => {
 				self.metrics.user_failure(stats.execution_millis);
-				self.commit_worker_error(&leased, &error);
+				let proto_stats = failed_attempt_stats(
+					stats,
+					startup,
+					&leased,
+					now.saturating_sub(leased.available_ms),
+					pb::AttemptFailureKind::User,
+				);
+				self.commit_worker_error(&leased, &error, Some(&proto_stats));
 				if let Some((actor_id, sequence)) = &actor_operation {
 					self.complete_actor_operation(actor_id, *sequence);
 				}
 			},
 			Ok(WorkerOutcome::ActorLost { error, stats }) => {
+				reusable = false;
 				self.metrics.user_failure(stats.execution_millis);
+				let proto_stats = failed_attempt_stats(
+					stats,
+					startup,
+					&leased,
+					now.saturating_sub(leased.available_ms),
+					pb::AttemptFailureKind::User,
+				);
 				if let Some((actor_id, _)) = &actor_operation {
 					self.mark_actor_worker_lost(actor_id);
 				}
-				self.commit_worker_error(&leased, &error);
+				self.commit_worker_error(&leased, &error, Some(&proto_stats));
 			},
-			Ok(WorkerOutcome::InfrastructureError { error, .. }) | Err(error) => {
+			Ok(WorkerOutcome::InfrastructureError { error, stats }) => {
+				reusable = false;
 				self.metrics.infrastructure_failure();
-				self.commit_worker_error(&leased, &error);
+				let proto_stats = failed_attempt_stats(
+					stats,
+					startup,
+					&leased,
+					now.saturating_sub(leased.available_ms),
+					pb::AttemptFailureKind::Infrastructure,
+				);
+				self.commit_worker_error(&leased, &error, Some(&proto_stats));
+				if let Some((actor_id, _)) = &actor_operation {
+					self.mark_actor_worker_lost(actor_id);
+				}
+			},
+			Err(error) => {
+				reusable = false;
+				self.metrics.infrastructure_failure();
+				self.commit_worker_error(&leased, &error, None);
 				if let Some((actor_id, _)) = &actor_operation {
 					self.mark_actor_worker_lost(actor_id);
 				}
 			},
 		}
 		drop(actor_permit);
-		self.finish_worker_slot(&leased, worker.id());
+		self.finish_worker_slot(&leased, worker.id(), reusable);
 		self.notify_work();
 	}
 
@@ -1398,11 +1698,7 @@ impl FunctionDomain {
 		request_id: String,
 	) {
 		let Some(first) = leased.first() else { return };
-		let startup = if worker.initial_snapshot().is_some() {
-			pb::StartupKind::Snapshot
-		} else {
-			pb::StartupKind::Warm
-		};
+		let startup = self.worker_startup(worker.id());
 		if !lifecycle_accepts(&first.revision, pb::CallType::Batch) {
 			for item in &leased {
 				self.commit_worker_error(
@@ -1411,9 +1707,10 @@ impl FunctionDomain {
 						"lifecycle_mismatch",
 						"batch call is incompatible with actor lifecycle",
 					),
+					None,
 				);
 			}
-			self.finish_worker_slot(first, worker.id());
+			self.finish_worker_slot(first, worker.id(), true);
 			return;
 		}
 		let now = unix_millis();
@@ -1423,14 +1720,14 @@ impl FunctionDomain {
 				for leased_item in &leased {
 					let failure =
 						WorkerError::infrastructure("batch_admission", "grouped batch admission failed");
-					self.commit_worker_error(leased_item, &failure);
+					self.commit_worker_error(leased_item, &failure, None);
 				}
-				self.finish_worker_slot(first, worker.id());
+				self.finish_worker_slot(first, worker.id(), true);
 				return;
 			}
 			self
 				.metrics
-				.input_started(now.saturating_sub(item.call.created_at_unix_millis));
+				.input_started(now.saturating_sub(item.available_ms));
 			self.publish_committed_events(&item.lease.call_id);
 		}
 		let mut inputs = Vec::with_capacity(leased.len());
@@ -1440,9 +1737,10 @@ impl FunctionDomain {
 					self.commit_worker_error(
 						leased_item,
 						&WorkerError::platform("invalid_input", "input payload is required"),
+						None,
 					);
 				}
-				self.finish_worker_slot(first, worker.id());
+				self.finish_worker_slot(first, worker.id(), true);
 				return;
 			};
 			inputs.push(ExecuteRequest {
@@ -1459,7 +1757,7 @@ impl FunctionDomain {
 				call_id: item.lease.call_id.clone(),
 				input_id: item.input.input_id.clone(),
 				input_index: item.lease.input_index,
-				attempt: item.user_attempts.saturating_add(1),
+				attempt: item.user_attempts.max(1),
 				mode: ExecutionMode::Batch,
 				input,
 				deadline: item
@@ -1478,9 +1776,9 @@ impl FunctionDomain {
 			Ok(execution) => execution,
 			Err(error) => {
 				for item in &leased {
-					self.commit_worker_error(item, &error);
+					self.commit_worker_error(item, &error, None);
 				}
-				self.finish_worker_slot(first, worker.id());
+				self.finish_worker_slot(first, worker.id(), false);
 				self.notify_work();
 				return;
 			},
@@ -1508,6 +1806,7 @@ impl FunctionDomain {
 				}
 			}
 		};
+		let mut reusable = true;
 		match outcome {
 			Ok(batch) => {
 				for (item, terminal) in leased.iter().zip(batch.items) {
@@ -1523,7 +1822,8 @@ impl FunctionDomain {
 								input_index:            item.lease.input_index,
 								yield_index_presence:   None,
 							};
-							let proto_stats = attempt_stats(stats, startup, item);
+							let proto_stats =
+								attempt_stats(stats, startup, item, now.saturating_sub(item.available_ms));
 							if self
 								.store
 								.succeed(&item.lease, &result, Some(&proto_stats), unix_millis())
@@ -1533,28 +1833,58 @@ impl FunctionDomain {
 							}
 						},
 						WorkerOutcome::Cancelled { reason, .. } => {
+							if worker.interruptibility() == self::worker::Interruptibility::Sync {
+								reusable = false;
+							}
 							let _ = self
 								.store
 								.finish_cancelled(&item.lease, &reason, unix_millis());
 						},
 						WorkerOutcome::UserError { error, stats }
-						| WorkerOutcome::PlatformError { error, stats }
-						| WorkerOutcome::ActorLost { error, stats } => {
+						| WorkerOutcome::PlatformError { error, stats } => {
 							self.metrics.user_failure(stats.execution_millis);
-							self.commit_worker_error(item, &error);
+							let proto_stats = failed_attempt_stats(
+								stats,
+								startup,
+								item,
+								now.saturating_sub(item.available_ms),
+								pb::AttemptFailureKind::User,
+							);
+							self.commit_worker_error(item, &error, Some(&proto_stats));
 						},
-						WorkerOutcome::InfrastructureError { error, .. } => {
+						WorkerOutcome::ActorLost { error, stats } => {
+							reusable = false;
+							self.metrics.user_failure(stats.execution_millis);
+							let proto_stats = failed_attempt_stats(
+								stats,
+								startup,
+								item,
+								now.saturating_sub(item.available_ms),
+								pb::AttemptFailureKind::User,
+							);
+							self.commit_worker_error(item, &error, Some(&proto_stats));
+						},
+						WorkerOutcome::InfrastructureError { error, stats } => {
+							reusable = false;
 							self.metrics.infrastructure_failure();
-							self.commit_worker_error(item, &error);
+							let proto_stats = failed_attempt_stats(
+								stats,
+								startup,
+								item,
+								now.saturating_sub(item.available_ms),
+								pb::AttemptFailureKind::Infrastructure,
+							);
+							self.commit_worker_error(item, &error, Some(&proto_stats));
 						},
 					}
 					self.publish_committed_events(&item.lease.call_id);
 				}
 			},
 			Err(error) => {
+				reusable = false;
 				for item in &leased {
 					self.metrics.infrastructure_failure();
-					self.commit_worker_error(item, &error);
+					self.commit_worker_error(item, &error, None);
 				}
 			},
 		}
@@ -1564,7 +1894,7 @@ impl FunctionDomain {
 				.lock()
 				.remove(&(item.lease.call_id.clone(), item.input.input_id.clone()));
 		}
-		self.finish_worker_slot(first, worker.id());
+		self.finish_worker_slot(first, worker.id(), reusable);
 		self.notify_work();
 	}
 
@@ -1585,11 +1915,43 @@ impl FunctionDomain {
 	}
 
 	fn commit_batch_worker_event(&self, leased: &[LeasedInput], event: BatchWorkerEvent) {
-		if let Some(item) = leased
-			.iter()
-			.find(|item| item.lease.input_index == event.input_index)
-		{
-			self.commit_worker_event(item, event.event);
+		match event.input_index {
+			Some(input_index) => {
+				let Some(item) = leased
+					.iter()
+					.find(|item| item.lease.input_index == input_index)
+				else {
+					tracing::warn!(input_index, "worker event references input outside leased batch");
+					return;
+				};
+				self.commit_worker_event(item, event.event);
+			},
+			None => match event.event {
+				WorkerEvent::Status { .. } => {},
+				WorkerEvent::Yield { .. } => {
+					tracing::warn!("unindexed batch yield cannot be attributed to an input");
+				},
+				WorkerEvent::Log { stream, message } => {
+					let Some(call_id) = leased.first().map(|item| item.lease.call_id.as_str()) else {
+						return;
+					};
+					if leased.iter().any(|item| item.lease.call_id != call_id) {
+						tracing::warn!("unindexed batch log spans more than one call");
+						return;
+					}
+					match self.store.append_call_log(
+						call_id,
+						log_stream(&stream),
+						message.into_bytes(),
+						unix_millis(),
+					) {
+						Ok(event) => self.publish_call_event(event),
+						Err(error) => {
+							tracing::warn!(%error, %call_id, "unindexed batch log commit failed");
+						},
+					}
+				},
+			},
 		}
 	}
 
@@ -1601,11 +1963,7 @@ impl FunctionDomain {
 					.commit_yield(&leased.lease, index, value, unix_millis())
 			},
 			WorkerEvent::Log { stream, message } => {
-				let stream = match stream.as_str() {
-					"stderr" => pb::LogStream::Stderr,
-					"structured" => pb::LogStream::Structured,
-					_ => pb::LogStream::Stdout,
-				};
+				let stream = log_stream(&stream);
 				self
 					.store
 					.append_log(&leased.lease, stream, message.into_bytes(), unix_millis())
@@ -1618,14 +1976,22 @@ impl FunctionDomain {
 		}
 	}
 
-	fn commit_worker_error(&self, leased: &LeasedInput, error: &WorkerError) {
+	fn commit_worker_error(
+		&self,
+		leased: &LeasedInput,
+		error: &WorkerError,
+		stats: Option<&pb::AttemptStats>,
+	) {
 		let now = unix_millis();
 		let proto = call_error(error);
 		if error.kind == self::worker::WorkerErrorKind::Infrastructure {
 			let retry_at = now.saturating_add(
 				scheduler::retry_backoff(100, 30_000, 2.0, leased.infra_attempts).as_millis() as u64,
 			);
-			let _ = self.store.fail_infra(&leased.lease, &proto, retry_at, now);
+			let _ = self
+				.store
+				.fail_infra(&leased.lease, &proto, retry_at, stats, now);
+			self.publish_committed_events(&leased.lease.call_id);
 			return;
 		}
 		let retry = leased
@@ -1633,7 +1999,7 @@ impl FunctionDomain {
 			.spec
 			.as_ref()
 			.and_then(|spec| spec.retry.as_ref());
-		let attempt = leased.user_attempts.saturating_add(1);
+		let attempt = leased.user_attempts.max(1);
 		let allowed = retry.is_some_and(|policy| {
 			error.retryable
 				&& attempt < policy.max_attempts.max(1)
@@ -1650,26 +2016,59 @@ impl FunctionDomain {
 				)
 				.as_millis() as u64,
 			);
-			let _ = self.store.retry_user(&leased.lease, &proto, retry_at, now);
+			let _ = self
+				.store
+				.retry_user(&leased.lease, &proto, retry_at, stats, now);
 		} else {
-			let _ = self.store.fail_user(&leased.lease, &proto, now);
+			let _ = self.store.fail_user(&leased.lease, &proto, stats, now);
 		}
 		self.publish_committed_events(&leased.lease.call_id);
 	}
 
-	fn finish_worker_slot(&self, leased: &LeasedInput, worker_id: &str) {
+	fn worker_startup(&self, worker_id: &str) -> pb::StartupKind {
+		let mut startups = self.worker_startup.lock();
+		let startup = startups
+			.get(worker_id)
+			.copied()
+			.unwrap_or(pb::StartupKind::Warm);
+		startups.insert(worker_id.to_owned(), pb::StartupKind::Warm);
+		startup
+	}
+
+	fn finish_worker_slot(&self, leased: &LeasedInput, worker_id: &str, reusable: bool) {
 		self
 			.active
 			.lock()
 			.remove(&(leased.lease.call_id.clone(), leased.input.input_id.clone()));
+		let reusable = reusable
+			&& self
+				.workers
+				.lock()
+				.get(worker_id)
+				.is_some_and(|worker| worker.is_reusable());
+		let now = unix_millis();
 		if let Some(revision_id) = leased
 			.revision
 			.r#ref
 			.as_ref()
 			.map(|reference| reference.revision_id.as_str())
-			&& let Some(pool) = self.pools.lock().get_mut(revision_id) {
-				pool.complete(worker_id, unix_millis());
+			&& let Some(pool) = self.pools.lock().get_mut(revision_id)
+		{
+			pool.complete(worker_id, now);
+			if !reusable {
+				pool.remove_worker(worker_id);
 			}
+		}
+		if reusable {
+			return;
+		}
+		self.worker_startup.lock().remove(worker_id);
+		if let Some(worker) = self.workers.lock().remove(worker_id) {
+			self.metrics.worker_retired();
+			tokio::spawn(async move {
+				let _ = worker.retire().await;
+			});
+		}
 	}
 
 	fn retire_idle(&self, now: u64) {
@@ -1701,6 +2100,14 @@ fn parent_edge(call: &pb::CallRecord) -> Option<&pb::ParentEdge> {
 	call.graph.as_ref()?.parents.first()
 }
 
+fn log_stream(stream: &str) -> pb::LogStream {
+	match stream {
+		"stderr" => pb::LogStream::Stderr,
+		"structured" => pb::LogStream::Structured,
+		_ => pb::LogStream::Stdout,
+	}
+}
+
 fn service_dispatch(call: &pb::CallRecord) -> Option<ServiceDispatch> {
 	let receiver = call.target.as_ref()?.receiver.as_ref()?;
 	match receiver {
@@ -1713,39 +2120,32 @@ fn service_dispatch(call: &pb::CallRecord) -> Option<ServiceDispatch> {
 	}
 }
 
+fn reap_finished_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+	tasks.retain(|task| !task.is_finished());
+}
+
+const fn initial_startup(restored: bool) -> pb::StartupKind {
+	if restored {
+		pb::StartupKind::Snapshot
+	} else {
+		pb::StartupKind::Cold
+	}
+}
+
 fn pool_policy(revision: &pb::FunctionRevision) -> PoolPolicy {
 	let spec = revision.spec.as_ref();
 	let workers = spec.and_then(|spec| spec.workers.as_ref());
 	let concurrency = spec.and_then(|spec| spec.concurrency.as_ref());
 	let batching = spec.and_then(|spec| spec.batching.as_ref());
-	let stateless = spec.is_none_or(|spec| {
-		pb::FunctionLifecycle::try_from(spec.lifecycle).unwrap_or(pb::FunctionLifecycle::Stateless)
-			== pb::FunctionLifecycle::Stateless
-	});
-	let capacity = if stateless {
-		1
-	} else {
-		concurrency.map_or(1, |value| value.max_concurrent_calls.max(1)) as usize
-	};
+	let capacity = concurrency.map_or(1, |value| value.max_concurrent_calls.max(1)) as usize;
 	PoolPolicy {
-		min_workers: if stateless {
-			0
-		} else {
-			workers.map_or(0, |value| value.min_workers) as usize
-		},
+		min_workers: workers.map_or(0, |value| value.min_workers) as usize,
 		max_workers: workers.map_or(1, |value| value.max_workers.max(1)) as usize,
-		buffer_workers: if stateless {
-			0
-		} else {
-			workers.map_or(0, |value| value.buffer_workers) as usize
-		},
+		buffer_workers: workers.map_or(0, |value| value.buffer_workers) as usize,
 		capacity,
-		max_outstanding: if stateless {
-			1
-		} else {
-			workers
-				.map_or(capacity, |value| value.max_outstanding_inputs.max(capacity as u32) as usize)
-		},
+
+		max_outstanding: workers
+			.map_or(capacity, |value| value.max_outstanding_inputs.max(capacity as u32) as usize),
 		idle_timeout: Duration::from_millis(workers.map_or(60_000, |value| {
 			if value.idle_timeout_millis == 0 {
 				60_000
@@ -1753,16 +2153,20 @@ fn pool_policy(revision: &pb::FunctionRevision) -> PoolPolicy {
 				value.idle_timeout_millis
 			}
 		})),
-		max_calls: if stateless {
-			1
-		} else {
-			workers.map_or(0, |value| value.max_calls_per_worker)
-		},
+		max_calls: workers.map_or(0, |value| value.max_calls_per_worker),
 		max_batch_size: batching
 			.filter(|value| value.enabled)
 			.map_or(1, |value| value.max_batch_size.max(1)) as usize,
 		batch_wait: Duration::from_millis(batching.map_or(0, |value| value.max_wait_millis)),
 	}
+}
+
+fn effective_batch_size(policy: PoolPolicy) -> u32 {
+	policy
+		.max_batch_size
+		.min(policy.max_outstanding.saturating_sub(1).max(1))
+		.try_into()
+		.unwrap_or(u32::MAX)
 }
 
 fn secret_version(secret: &pb::SecretRef) -> Option<String> {
@@ -1787,22 +2191,37 @@ fn attempt_stats(
 	stats: WorkerAttemptStats,
 	startup: pb::StartupKind,
 	leased: &LeasedInput,
+	queued_millis: u64,
 ) -> pb::AttemptStats {
+	let startup_millis = if startup == pb::StartupKind::Warm {
+		0
+	} else {
+		stats.startup_millis
+	};
 	pb::AttemptStats {
-		attempt_id:        format!(
-			"{}:{}:{}",
-			leased.lease.call_id, leased.lease.input_index, leased.lease.lease_generation
-		),
-		user_attempt:      leased.user_attempts.saturating_add(1),
-		infra_attempt:     leased.infra_attempts,
-		startup:           startup as i32,
-		failure_kind:      pb::AttemptFailureKind::Unspecified as i32,
-		queued_millis:     0,
-		startup_millis:    stats.startup_millis,
-		execution_millis:  stats.execution_millis,
-		cpu_millis:        stats.cpu_millis,
+		attempt_id: leased.attempt_id.clone(),
+		user_attempt: leased.user_attempts.max(1),
+		infra_attempt: leased.infra_attempts,
+		startup: startup as i32,
+		failure_kind: pb::AttemptFailureKind::Unspecified as i32,
+		queued_millis,
+		startup_millis,
+		execution_millis: stats.execution_millis,
+		cpu_millis: stats.cpu_millis,
 		peak_memory_bytes: stats.peak_memory_bytes,
 	}
+}
+
+fn failed_attempt_stats(
+	stats: WorkerAttemptStats,
+	startup: pb::StartupKind,
+	leased: &LeasedInput,
+	queued_millis: u64,
+	failure_kind: pb::AttemptFailureKind,
+) -> pb::AttemptStats {
+	let mut stats = attempt_stats(stats, startup, leased, queued_millis);
+	stats.failure_kind = failure_kind as i32;
+	stats
 }
 
 fn call_error(error: &WorkerError) -> pb::CallError {
@@ -1865,4 +2284,128 @@ fn unix_millis() -> u64 {
 		.as_millis()
 		.try_into()
 		.unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+	use self::store::LeaseToken;
+	use super::*;
+
+	#[test]
+	fn ordinary_function_policy_honors_pool_and_concurrency_settings() {
+		let revision = pb::FunctionRevision {
+			spec: Some(pb::FunctionSpec {
+				workers: Some(pb::WorkerSpec {
+					min_workers:            2,
+					max_workers:            7,
+					buffer_workers:         3,
+					max_outstanding_inputs: 11,
+					max_calls_per_worker:   23,
+					idle_timeout_millis:    456,
+				}),
+				concurrency: Some(pb::ConcurrencySpec {
+					max_concurrent_calls: 5,
+					..Default::default()
+				}),
+				batching: Some(pb::BatchingSpec {
+					enabled:         true,
+					max_batch_size:  10,
+					max_wait_millis: 12,
+				}),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		let policy = pool_policy(&revision);
+		assert_eq!(policy.min_workers, 2);
+		assert_eq!(policy.max_workers, 7);
+		assert_eq!(policy.buffer_workers, 3);
+		assert_eq!(policy.capacity, 5);
+		assert_eq!(policy.max_outstanding, 11);
+		assert_eq!(policy.max_calls, 23);
+		assert_eq!(effective_batch_size(policy), 10);
+	}
+
+	#[test]
+	fn grouped_batch_leaves_the_reserved_outstanding_slot_bounded() {
+		let policy = PoolPolicy { max_outstanding: 4, max_batch_size: 20, ..PoolPolicy::default() };
+		assert_eq!(effective_batch_size(policy), 3);
+		let single = PoolPolicy { max_outstanding: 1, max_batch_size: 20, ..policy };
+		assert_eq!(effective_batch_size(single), 1);
+	}
+
+	#[test]
+	fn attempt_stats_correlate_with_persisted_lease_identity() {
+		let leased = LeasedInput {
+			lease:                 LeaseToken {
+				call_id:          "call".into(),
+				input_index:      4,
+				worker_id:        "worker".into(),
+				lease_generation: 9,
+			},
+			revision:              Default::default(),
+			input:                 Default::default(),
+			call:                  Default::default(),
+			user_attempts:         2,
+			infra_attempts:        3,
+			execution_deadline_ms: None,
+			attempt_id:            "persisted-attempt-uuid".into(),
+			available_ms:          100,
+		};
+		let stats = attempt_stats(
+			WorkerAttemptStats {
+				startup_millis: 7,
+				execution_millis: 8,
+				cpu_millis: 9,
+				peak_memory_bytes: 10,
+				..Default::default()
+			},
+			pb::StartupKind::Cold,
+			&leased,
+			55,
+		);
+		assert_eq!(stats.attempt_id, "persisted-attempt-uuid");
+		assert_eq!(stats.user_attempt, 2);
+		assert_eq!(stats.infra_attempt, 3);
+		assert_eq!(stats.queued_millis, 55);
+		assert_eq!(stats.startup_millis, 7);
+		let warm = attempt_stats(
+			WorkerAttemptStats { startup_millis: 7, ..Default::default() },
+			pb::StartupKind::Warm,
+			&leased,
+			0,
+		);
+		assert_eq!(warm.startup_millis, 0);
+		let failed = failed_attempt_stats(
+			WorkerAttemptStats { execution_millis: 11, ..Default::default() },
+			pb::StartupKind::Warm,
+			&leased,
+			2,
+			pb::AttemptFailureKind::Infrastructure,
+		);
+		assert_eq!(failed.failure_kind, pb::AttemptFailureKind::Infrastructure as i32);
+	}
+
+	#[test]
+	fn startup_lifecycle_is_cold_or_snapshot_then_warm() {
+		assert_eq!(initial_startup(false), pb::StartupKind::Cold);
+		assert_eq!(initial_startup(true), pb::StartupKind::Snapshot);
+		let mut lifecycle = HashMap::from([("worker".to_owned(), pb::StartupKind::Cold)]);
+		let first = lifecycle.get("worker").copied().unwrap();
+		lifecycle.insert("worker".to_owned(), pb::StartupKind::Warm);
+		assert_eq!(first, pb::StartupKind::Cold);
+		assert_eq!(lifecycle["worker"], pb::StartupKind::Warm);
+	}
+
+	#[tokio::test]
+	async fn completed_execution_tasks_are_reaped() {
+		let complete = tokio::spawn(async {});
+		complete.await.unwrap();
+		let pending = tokio::spawn(std::future::pending());
+		let mut tasks = vec![tokio::spawn(async {}), pending];
+		tokio::task::yield_now().await;
+		reap_finished_tasks(&mut tasks);
+		assert_eq!(tasks.len(), 1);
+		tasks.pop().unwrap().abort();
+	}
 }

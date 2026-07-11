@@ -1,6 +1,5 @@
 """Focused subprocess smoke test for the protocol-v2 guest runner."""
 import base64
-import cbor2
 import cloudpickle
 import hashlib
 import io
@@ -16,7 +15,6 @@ import textwrap
 import time
 import unittest
 import zipfile
-import zstandard
 from pathlib import Path
 
 RUNNER = Path(__file__).with_name("runner.py")
@@ -582,9 +580,41 @@ class RunnerSmokeTest(unittest.TestCase):
             still_alive["value"]["inline_data"])), 6)
         checkpoint = actor("checkpoint", "actor_checkpoint", checkpoint_id="cp")
         self.assertEqual(checkpoint["value"]["format"], "cloudpickle")
+        self.assertEqual(checkpoint["value"]["internal_purpose"],
+                         "daemon_actor_state")
+        rejected_public = dict(checkpoint["value"])
+        rejected_public.pop("internal_purpose")
+        self.client.send({
+            "type": "call", "request_id": "public-cloudpickle",
+            "call_id": "call-public-cloudpickle", "definition_id": "capture",
+            "positional": [rejected_public], "named": {}})
+        public_result = self.client.until("public-cloudpickle")[-1]
+        self.assertEqual(public_result["type"], "error")
+        self.assertIn("requires top-level trusted=true",
+                      public_result["error"]["message"])
+        wrong_version = dict(checkpoint["value"])
+        wrong_version["cloudpickle_version"] = "0.invalid"
+        mismatch = actor("restore-mismatch", "actor_restore",
+                         checkpoint_id="cp", state=wrong_version)
+        self.assertEqual(mismatch["type"], "error")
+        self.assertIn("version mismatch", mismatch["error"]["message"])
+        wrong_abi = dict(checkpoint["value"])
+        wrong_abi["python_abi"] = "cp999"
+        abi_mismatch = actor("restore-abi-mismatch", "actor_restore",
+                             checkpoint_id="cp", state=wrong_abi)
+        self.assertEqual(abi_mismatch["type"], "error")
+        self.assertIn("Python ABI mismatch", abi_mismatch["error"]["message"])
+        missing_purpose = dict(checkpoint["value"])
+        missing_purpose.pop("internal_purpose")
+        purpose_error = actor("restore-public-envelope", "actor_restore",
+                              checkpoint_id="cp", state=missing_purpose)
+        self.assertEqual(purpose_error["type"], "error")
+        self.assertIn("internal purpose", purpose_error["error"]["message"])
         actor("fill", "actor_call", method="fill", args=envelope([]))
         big_checkpoint = actor("big-checkpoint", "actor_checkpoint", checkpoint_id="big-cp")
         self.assertNotIn("inline_data", big_checkpoint["value"])
+        self.assertEqual(big_checkpoint["value"]["internal_purpose"],
+                         "daemon_actor_state")
         checkpoint_path = big_checkpoint["value"]["path"]
         with open(checkpoint_path, "rb") as source:
             checkpoint_bytes = source.read()
@@ -771,6 +801,94 @@ class SocketReconnectTest(unittest.TestCase):
                     process.wait(timeout=2)
                 process.stdout.close()
                 process.stderr.close()
+
+
+class IsolatedCapabilityTest(unittest.TestCase):
+    def run_without_site_packages(self, code, environment=None):
+        env = os.environ.copy()
+        if environment:
+            env.update(environment)
+        return subprocess.run(
+            [sys.executable, "-S", "-c", code, str(RUNNER)],
+            text=True, capture_output=True, env=env, timeout=5, check=False)
+
+    def test_portable_json_accepts_tuples_and_rejects_lone_surrogates(self):
+        script = textwrap.dedent("""
+            import base64
+            import json
+            import os
+            import runpy
+            import sys
+            module = runpy.run_path(sys.argv[1], run_name="isolated_runner")
+            canonical = module["_canonical"](("tuple", {"nested": (1, 2)}))
+            failures = []
+            for escaped in (b'"\\\\ud800"', b'"\\\\udfff"', b'{"\\\\ud800": 1}'):
+                try:
+                    module["_json_loads"](escaped)
+                except module["SerializationError"]:
+                    failures.append(True)
+                else:
+                    failures.append(False)
+            os.write(module["_WRITER"]._fd, json.dumps({
+                "canonical": base64.b64encode(canonical).decode(),
+                "rejected": failures,
+            }).encode())
+        """)
+        result = self.run_without_site_packages(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(json.loads(base64.b64decode(observed["canonical"])),
+                         ["tuple", {"nested": [1, 2]}])
+        self.assertEqual(observed["rejected"], [True, True, True])
+
+    def test_hello_advertises_only_usable_isolated_capabilities(self):
+        process = subprocess.Popen(
+            [sys.executable, "-S", str(RUNNER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1)
+        try:
+            hello = json.loads(process.stdout.readline())
+            self.assertEqual(hello["formats"], ["json"])
+            self.assertEqual(hello["compressions"], ["none", "gzip"])
+            self.assertNotIn("cbor", hello["formats"])
+            self.assertNotIn("zstd", hello["compressions"])
+        finally:
+            process.kill()
+            process.wait(timeout=2)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_missing_optional_codecs_fail_clearly_before_use(self):
+        script = textwrap.dedent("""
+            import base64
+            import hashlib
+            import json
+            import os
+            import runpy
+            import sys
+            module = runpy.run_path(sys.argv[1], run_name="isolated_runner")
+            raw = b"null"
+            base = {
+                "version": 1, "uncompressed_size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "inline_data": base64.b64encode(raw).decode(),
+            }
+            messages = []
+            for value_format, compression in (("cbor", "none"), ("json", "zstd")):
+                envelope = dict(base, format=value_format, compression=compression)
+                try:
+                    module["decode_value"](envelope)
+                except RuntimeError as error:
+                    messages.append(str(error))
+            os.write(module["_WRITER"]._fd, json.dumps(messages).encode())
+        """)
+        result = self.run_without_site_packages(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        messages = json.loads(result.stdout)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("cbor2 is not installed", messages[0])
+        self.assertIn("zstandard is not installed", messages[1])
 
 
 if __name__ == "__main__":

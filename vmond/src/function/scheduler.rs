@@ -6,6 +6,7 @@
 
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
+	fmt,
 	sync::Arc,
 	time::Duration,
 };
@@ -15,6 +16,10 @@ use tokio::sync::{Notify, broadcast};
 use super::{
 	metrics::FunctionMetrics,
 	worker::{ExecutionMode, Interruptibility, Worker},
+};
+use crate::{
+	image::normalize_oci_arch,
+	mesh::{place::hrw_score, state::NodeState},
 };
 
 /// Immutable worker-pool limits for one function revision.
@@ -69,16 +74,118 @@ impl PoolPolicy {
 	}
 }
 
-/// Diagnostic placement preferences used when a mesh-backed executor starts a
-/// worker.
+/// Placement constraints and locality hints for one function worker.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlacementHints {
-	/// Prefer hosts other than these current worker hosts.
-	pub avoid_hosts:  Vec<String>,
-	/// Prefer zones other than these current worker zones.
-	pub avoid_zones:  Vec<String>,
+	/// Exclude hosts already running this revision when host spread is required.
+	pub avoid_hosts:       Vec<String>,
+	/// Exclude zones already running this revision when zone spread is required.
+	pub avoid_zones:       Vec<String>,
 	/// Stable affinity key for actors or instance-lifecycle functions.
-	pub affinity_key: Option<String>,
+	pub affinity_key:      Option<String>,
+	/// Canonical worker architecture required by the realized image.
+	pub required_arch:     Option<String>,
+	/// Snapshot digest whose presence avoids a cross-node transfer.
+	pub snapshot_digest:   Option<String>,
+	/// Realized image artifact digest whose presence avoids a cross-node
+	/// transfer.
+	pub artifact_digest:   Option<String>,
+	/// Nodes already holding an idle compatible worker for this revision.
+	pub warm_worker_nodes: Vec<String>,
+}
+
+/// Worker spreading guarantee requested by a function revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlacementSpread {
+	None,
+	Host,
+	Zone,
+}
+
+/// A function worker cannot be placed without weakening its declared contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementError {
+	pub message: String,
+}
+
+impl fmt::Display for PlacementError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.message)
+	}
+}
+
+impl std::error::Error for PlacementError {}
+
+/// Select a real mesh owner for a worker using hard compatibility/spread
+/// filters, locality hints, then deterministic rendezvous ranking.
+///
+/// `node_id` is the physical-host identity in the current mesh protocol and
+/// `region` is its availability-zone identity.
+pub fn place_function_worker(
+	revision_id: &str,
+	spread: PlacementSpread,
+	hints: &PlacementHints,
+	nodes: &[NodeState],
+) -> Result<String, PlacementError> {
+	let required_arch = hints
+		.required_arch
+		.as_deref()
+		.and_then(|arch| normalize_oci_arch(Some(arch)));
+	let mut compatible = nodes
+		.iter()
+		.filter(|node| {
+			required_arch
+				.as_ref()
+				.is_none_or(|required| normalize_oci_arch(Some(&node.arch)).as_ref() == Some(required))
+		})
+		.filter(|node| match spread {
+			PlacementSpread::None => true,
+			PlacementSpread::Host => !hints.avoid_hosts.contains(&node.node_id),
+			PlacementSpread::Zone => {
+				!node.region.is_empty() && !hints.avoid_zones.contains(&node.region)
+			},
+		})
+		.collect::<Vec<_>>();
+	if compatible.is_empty() {
+		let scope = match spread {
+			PlacementSpread::None => "architecture",
+			PlacementSpread::Host => "host",
+			PlacementSpread::Zone => "zone",
+		};
+		return Err(PlacementError {
+			message: format!(
+				"function HA {scope} placement is unavailable: no compatible mesh node satisfies the \
+				 requested spread"
+			),
+		});
+	}
+	let affinity = hints.affinity_key.as_deref().unwrap_or(revision_id);
+	compatible.sort_by(|left, right| {
+		let rank = |node: &NodeState| {
+			(
+				u8::from(hints.warm_worker_nodes.contains(&node.node_id)),
+				u8::from(
+					hints
+						.snapshot_digest
+						.as_ref()
+						.is_some_and(|digest| node.templates.contains(digest)),
+				),
+				u8::from(
+					hints
+						.artifact_digest
+						.as_ref()
+						.is_some_and(|digest| node.templates.contains(digest)),
+				),
+				node.free_vcpus(),
+				node.free_mem_mib(),
+				hrw_score(affinity, &node.node_id),
+			)
+		};
+		rank(right)
+			.cmp(&rank(left))
+			.then_with(|| left.node_id.cmp(&right.node_id))
+	});
+	Ok(compatible[0].node_id.clone())
 }
 
 /// One store-owned input advertised to the ephemeral admission queue.
@@ -435,6 +542,112 @@ pub async fn background_loop(
 mod tests {
 	use super::*;
 
+	fn placement_node(id: &str, zone: &str, arch: &str) -> NodeState {
+		let mut node = NodeState::new(id, format!("https://{id}"));
+		node.region = zone.into();
+		node.arch = arch.into();
+		node.caps = crate::mesh::state::NodeCaps::new(8, 16_384);
+		node
+	}
+
+	#[test]
+	fn none_places_on_one_compatible_node() {
+		let local = placement_node("host-a", "zone-a", "aarch64");
+		assert_eq!(
+			place_function_worker(
+				"revision-1",
+				PlacementSpread::None,
+				&PlacementHints { required_arch: Some("aarch64".into()), ..Default::default() },
+				&[local],
+			)
+			.unwrap(),
+			"host-a"
+		);
+	}
+
+	#[test]
+	fn host_and_zone_spread_are_hard_filters() {
+		let nodes = [
+			placement_node("host-a", "zone-a", "aarch64"),
+			placement_node("host-b", "zone-a", "aarch64"),
+			placement_node("host-c", "zone-b", "aarch64"),
+		];
+		let host = place_function_worker(
+			"revision-1",
+			PlacementSpread::Host,
+			&PlacementHints {
+				avoid_hosts: vec!["host-a".into(), "host-b".into()],
+				..Default::default()
+			},
+			&nodes,
+		)
+		.unwrap();
+		assert_eq!(host, "host-c");
+		let zone = place_function_worker(
+			"revision-1",
+			PlacementSpread::Zone,
+			&PlacementHints { avoid_zones: vec!["zone-a".into()], ..Default::default() },
+			&nodes,
+		)
+		.unwrap();
+		assert_eq!(zone, "host-c");
+	}
+
+	#[test]
+	fn incompatible_arch_and_insufficient_topology_fail() {
+		let nodes = [placement_node("host-a", "zone-a", "x86_64")];
+		let arch = place_function_worker(
+			"revision-1",
+			PlacementSpread::None,
+			&PlacementHints { required_arch: Some("aarch64".into()), ..Default::default() },
+			&nodes,
+		)
+		.unwrap_err();
+		assert!(
+			arch
+				.message
+				.contains("architecture placement is unavailable")
+		);
+		let spread = place_function_worker(
+			"revision-1",
+			PlacementSpread::Zone,
+			&PlacementHints { avoid_zones: vec!["zone-a".into()], ..Default::default() },
+			&nodes,
+		)
+		.unwrap_err();
+		assert!(spread.message.contains("zone placement is unavailable"));
+	}
+
+	#[test]
+	fn snapshot_locality_precedes_capacity() {
+		let cold = placement_node("cold", "zone-a", "aarch64");
+		let mut warm = placement_node("warm", "zone-b", "aarch64");
+		warm.caps = crate::mesh::state::NodeCaps::new(1, 512);
+		warm.templates.push("sha256:snapshot".into());
+		let owner = place_function_worker(
+			"revision-1",
+			PlacementSpread::None,
+			&PlacementHints { snapshot_digest: Some("sha256:snapshot".into()), ..Default::default() },
+			&[cold, warm],
+		)
+		.unwrap();
+		assert_eq!(owner, "warm");
+	}
+
+	#[test]
+	fn actor_affinity_is_stable_across_input_order() {
+		let a = placement_node("host-a", "zone-a", "aarch64");
+		let b = placement_node("host-b", "zone-b", "aarch64");
+		let hints = PlacementHints { affinity_key: Some("actor-42".into()), ..Default::default() };
+		let first = place_function_worker("revision-1", PlacementSpread::None, &hints, &[
+			a.clone(),
+			b.clone(),
+		])
+		.unwrap();
+		let second =
+			place_function_worker("revision-1", PlacementSpread::None, &hints, &[b, a]).unwrap();
+		assert_eq!(first, second);
+	}
 	fn item(revision: &str, index: u64) -> QueuedInput {
 		QueuedInput {
 			revision_id:     revision.into(),

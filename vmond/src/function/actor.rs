@@ -82,9 +82,37 @@ impl ActorManager {
 		Ok(())
 	}
 
+	/// Acquire an actor's serialization gate without requiring a live worker.
+	pub async fn acquire_gate(&self, actor_id: &str) -> Result<ActorGate> {
+		let gate = {
+			let actors = self.actors.read();
+			Arc::clone(
+				&actors
+					.get(actor_id)
+					.ok_or_else(|| EngineError::not_found(format!("actor {actor_id} not found")))?
+					.gate,
+			)
+		};
+		let permit = gate
+			.acquire_owned()
+			.await
+			.map_err(|_| EngineError::not_running(format!("actor {actor_id} is shutting down")))?;
+		Ok(ActorGate { actor_id: actor_id.to_owned(), _permit: permit })
+	}
+
+	/// Return the currently pinned worker while the caller owns the actor gate.
+	pub fn gated_worker(&self, gate: &ActorGate) -> Option<Arc<dyn Worker>> {
+		self
+			.actors
+			.read()
+			.get(&gate.actor_id)
+			.and_then(|slot| slot.worker.clone())
+	}
+
 	/// Acquire the actor's serialization gate and current pinned worker.
 	pub async fn acquire(&self, actor_id: &str) -> Result<ActorPermit> {
-		let (gate, worker) = {
+		let gate = self.acquire_gate(actor_id).await?;
+		let worker = {
 			let actors = self.actors.read();
 			let slot = actors
 				.get(actor_id)
@@ -92,16 +120,11 @@ impl ActorManager {
 			if slot.lost {
 				return Err(EngineError::not_running(format!("actor {actor_id} is lost")));
 			}
-			let worker = slot.worker.clone().ok_or_else(|| {
+			slot.worker.clone().ok_or_else(|| {
 				EngineError::not_running(format!("actor {actor_id} has no restored worker"))
-			})?;
-			(Arc::clone(&slot.gate), worker)
+			})?
 		};
-		let permit = gate
-			.acquire_owned()
-			.await
-			.map_err(|_| EngineError::not_running(format!("actor {actor_id} is shutting down")))?;
-		Ok(ActorPermit { actor_id: actor_id.to_owned(), worker, _permit: permit })
+		Ok(ActorPermit { actor_id: actor_id.to_owned(), worker, _gate: gate })
 	}
 
 	/// Commit a new checkpoint frontier after the store transaction succeeds.
@@ -111,6 +134,20 @@ impl ActorManager {
 			.get_mut(actor_id)
 			.ok_or_else(|| EngineError::not_found(format!("actor {actor_id} not found")))?;
 		slot.checkpoint_id = Some(checkpoint_id);
+		Ok(())
+	}
+
+	/// Install a checkpoint frontier authorized by a successful Store restore.
+	///
+	/// Unlike `checkpoint_committed`, this may move backwards to an older
+	/// compatible checkpoint.
+	pub fn install_checkpoint_frontier(&self, actor_id: &str, checkpoint_id: String) -> Result<()> {
+		let mut actors = self.actors.write();
+		let slot = actors
+			.get_mut(actor_id)
+			.ok_or_else(|| EngineError::not_found(format!("actor {actor_id} not found")))?;
+		slot.checkpoint_id = Some(checkpoint_id);
+		slot.lost = false;
 		Ok(())
 	}
 
@@ -151,13 +188,28 @@ impl ActorManager {
 	pub fn remove(&self, actor_id: &str) {
 		self.actors.write().remove(actor_id);
 	}
+
+	/// Detach every pinned worker for graceful domain retirement.
+	pub fn drain_workers(&self) -> Vec<Arc<dyn Worker>> {
+		let mut actors = self.actors.write();
+		actors
+			.values_mut()
+			.filter_map(|slot| slot.worker.take())
+			.collect()
+	}
+}
+
+/// Exclusive admission to an actor, including creation and recovery.
+pub struct ActorGate {
+	actor_id: String,
+	_permit:  OwnedSemaphorePermit,
 }
 
 /// Exclusive admission to one actor's currently pinned worker.
 pub struct ActorPermit {
 	actor_id: String,
 	worker:   Arc<dyn Worker>,
-	_permit:  OwnedSemaphorePermit,
+	_gate:    ActorGate,
 }
 
 impl ActorPermit {
@@ -174,6 +226,8 @@ impl ActorPermit {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 	use super::*;
 
 	#[test]
@@ -201,5 +255,72 @@ mod tests {
 		actors.register("actor".into(), None);
 		assert_eq!(actors.worker_lost("actor").unwrap(), ActorRecovery::Lost);
 		assert!(actors.fork("actor", "fork".into()).is_err());
+	}
+
+	#[test]
+	fn store_authorized_restore_can_move_frontier_backwards() {
+		let actors = ActorManager::new();
+		actors.register("actor".into(), Some("cp-2".into()));
+		assert_eq!(actors.worker_lost("actor").unwrap(), ActorRecovery::Restore {
+			checkpoint_id: "cp-2".into(),
+		});
+		actors
+			.install_checkpoint_frontier("actor", "cp-1".into())
+			.unwrap();
+		assert_eq!(actors.worker_lost("actor").unwrap(), ActorRecovery::Restore {
+			checkpoint_id: "cp-1".into(),
+		});
+	}
+
+	#[tokio::test]
+	async fn duplicate_creation_gate_runs_constructor_once() {
+		let actors = Arc::new(ActorManager::new());
+		actors.register("actor".into(), None);
+		let initialized = Arc::new(AtomicBool::new(false));
+		let constructors = Arc::new(AtomicUsize::new(0));
+		let create = |actors: Arc<ActorManager>,
+		              initialized: Arc<AtomicBool>,
+		              constructors: Arc<AtomicUsize>| async move {
+			let _gate = actors.acquire_gate("actor").await.unwrap();
+			if !initialized.swap(true, Ordering::AcqRel) {
+				constructors.fetch_add(1, Ordering::Relaxed);
+				tokio::task::yield_now().await;
+			}
+		};
+		tokio::join!(
+			create(Arc::clone(&actors), Arc::clone(&initialized), Arc::clone(&constructors)),
+			create(actors, initialized, Arc::clone(&constructors))
+		);
+		assert_eq!(constructors.load(Ordering::Relaxed), 1);
+	}
+
+	#[tokio::test]
+	async fn concurrent_first_call_recovery_restores_once_and_preserves_cumulative_state() {
+		let actors = Arc::new(ActorManager::new());
+		actors.register("actor".into(), Some("cp-1".into()));
+		let restored = Arc::new(AtomicBool::new(false));
+		let restores = Arc::new(AtomicUsize::new(0));
+		let state = Arc::new(AtomicUsize::new(10));
+		let call = |actors: Arc<ActorManager>,
+		            restored: Arc<AtomicBool>,
+		            restores: Arc<AtomicUsize>,
+		            state: Arc<AtomicUsize>| async move {
+			let _gate = actors.acquire_gate("actor").await.unwrap();
+			if !restored.swap(true, Ordering::AcqRel) {
+				restores.fetch_add(1, Ordering::Relaxed);
+			}
+			state.fetch_add(1, Ordering::Relaxed);
+		};
+		tokio::join!(
+			call(
+				Arc::clone(&actors),
+				Arc::clone(&restored),
+				Arc::clone(&restores),
+				Arc::clone(&state),
+			),
+			call(actors, restored, Arc::clone(&restores), Arc::clone(&state)),
+		);
+		assert_eq!(restores.load(Ordering::Relaxed), 1);
+		assert_eq!(state.load(Ordering::Relaxed), 12);
 	}
 }

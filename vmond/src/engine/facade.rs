@@ -1333,6 +1333,7 @@ impl Engine {
 		kind: &str,
 		track: bool,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+		let t0 = std::time::Instant::now();
 		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
 		let vm = MicroVm::new(sid);
@@ -1345,11 +1346,21 @@ impl Engine {
 			&self.snapshot_root(),
 			track,
 		)?;
+		let snapshot_ms = t0.elapsed().as_millis();
 		stamp_checkpoint_rootfs(self.home(), &snapshot_dir, record.detail.as_object())?;
 		stamp_checkpoint_marker(&snapshot_dir, record.detail.as_object())?;
 		capture_checkpoint_volumes(self.home(), &snapshot_dir, record.detail.get("volumes"))?;
 		ensure_checkpoint_template_present(&snapshot_dir)?;
+		let stamp_ms = t0.elapsed().as_millis() - snapshot_ms;
 		let digest = image::cas::index_template(&snapshot_dir, None)?;
+		tracing::info!(
+			sid,
+			kind,
+			snapshot_ms = snapshot_ms as u64,
+			stamp_ms = stamp_ms as u64,
+			index_ms = (t0.elapsed().as_millis() - snapshot_ms - stamp_ms) as u64,
+			"checkpoint timings"
+		);
 		Ok(crate::mesh::reconciler::ReplicatePreparation {
 			digest,
 			snapshot_dir,

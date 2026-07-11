@@ -80,7 +80,11 @@ IJSON_MAX_INTEGER = (1 << 53) - 1
 
 
 def _validate_ijson(value):
-    if isinstance(value, bool) or value is None or isinstance(value, str):
+    if isinstance(value, bool) or value is None:
+        return
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise SerializationError("JSON strings must not contain lone UTF-16 surrogates")
         return
     if isinstance(value, int):
         if value < -IJSON_MAX_INTEGER or value > IJSON_MAX_INTEGER:
@@ -90,7 +94,7 @@ def _validate_ijson(value):
         if not math.isfinite(value):
             raise SerializationError("JSON numbers must be finite")
         return
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         for item in value:
             _validate_ijson(item)
         return
@@ -98,6 +102,7 @@ def _validate_ijson(value):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise SerializationError("JSON object keys must be strings")
+            _validate_ijson(key)
             _validate_ijson(item)
         return
     raise SerializationError("value of type %s is not JSON serializable" %
@@ -182,6 +187,27 @@ def _cloudpickle_version():
     return version
 
 
+
+
+ACTOR_STATE_PURPOSE = "daemon_actor_state"
+
+
+def encode_actor_state(value, spill=True):
+    envelope = encode_value(
+        value, "cloudpickle", spill=spill,
+        redact_secrets=False, reject_secrets=False)
+    envelope["internal_purpose"] = ACTOR_STATE_PURPOSE
+    return envelope
+
+
+def decode_actor_state(envelope):
+    if not isinstance(envelope, dict):
+        raise ValueError("actor state must be a value envelope")
+    if envelope.get("internal_purpose") != ACTOR_STATE_PURPOSE:
+        raise ValueError("actor state envelope is missing its internal purpose")
+    return decode_value(
+        envelope, trusted=True,
+        cloudpickle_version=envelope.get("cloudpickle_version"))
 
 
 def decode_value(envelope, trusted=False, cloudpickle_version=None):
@@ -1356,12 +1382,7 @@ class Runner:
                 definition = self.definitions.get(definition_id)
                 if definition is None or not inspect.isclass(definition.target):
                     raise KeyError("explicit restore of a lost actor requires its class definition_id")
-                state = decode_value(
-                    envelope,
-                    trusted=True if "state" not in frame else bool(frame.get("trusted")),
-                    cloudpickle_version=(envelope.get("cloudpickle_version")
-                                         if "state" not in frame
-                                         else frame.get("cloudpickle_version")))
+                state = decode_actor_state(envelope)
                 value = definition.target.__new__(definition.target)
                 self._restore_actor_state(value, state)
                 actor = Actor(actor_id, definition_id, definition.revision, value)
@@ -1397,9 +1418,7 @@ class Runner:
                     if _contains_secret(state, definition.secret_names, definition.secrets):
                         raise CheckpointContainsSecret(
                             "actor checkpoint contains configured secret material")
-                    envelope = encode_value(
-                        state, "cloudpickle", spill=False,
-                        redact_secrets=False, reject_secrets=False)
+                    envelope = encode_actor_state(state, spill=False)
                     serialized = base64.b64decode(envelope["inline_data"])
                     if any(secret.encode("utf-8") in serialized
                            for secret in definition.secrets):
@@ -1427,12 +1446,7 @@ class Runner:
                     envelope = frame.get("state") or self.checkpoints.get(checkpoint_key)
                     if envelope is None:
                         raise KeyError("checkpoint is unavailable; actor was not reinitialized")
-                    state = decode_value(
-                        envelope,
-                        trusted=True if "state" not in frame else bool(frame.get("trusted")),
-                        cloudpickle_version=(envelope.get("cloudpickle_version")
-                                             if "state" not in frame
-                                             else frame.get("cloudpickle_version")))
+                    state = decode_actor_state(envelope)
                     candidate = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
                     self._restore_actor_state(candidate, state)
                     await self._run_hook(candidate, "restore", frame)
@@ -1755,15 +1769,39 @@ def _reader_thread(loop, incoming):
             pass
 
 
-def _emit_hello():
+def _usable_capabilities():
+    formats = ["json"]
+    compressions = ["none", "gzip"]
+    try:
+        import cbor2  # type: ignore
+        if callable(getattr(cbor2, "dumps", None)) and callable(getattr(cbor2, "loads", None)):
+            formats.append("cbor")
+    except ImportError:
+        pass
+    try:
+        import zstandard  # type: ignore
+        if (callable(getattr(zstandard, "ZstdCompressor", None)) and
+                callable(getattr(zstandard, "ZstdDecompressor", None))):
+            compressions.append("zstd")
+    except ImportError:
+        pass
     try:
         cloudpickle_version = _cloudpickle_version()
     except RuntimeError:
         cloudpickle_version = None
-    formats = ["json", "cbor"] + (["cloudpickle"] if cloudpickle_version else [])
+    if cloudpickle_version:
+        formats.append("cloudpickle")
+    return formats, compressions, cloudpickle_version
+
+
+
+
+def _emit_hello():
+    formats, compressions, cloudpickle_version = _usable_capabilities()
     _WRITER.emit("hello", None, version=PROTOCOL_VERSION, envelope_version=ENVELOPE_VERSION,
                  cloudpickle_version=cloudpickle_version, python_abi=_python_abi(),
                  python=platform.python_version(), formats=formats,
+                 compressions=compressions,
                  capabilities=["package", "serialized", "async", "generator", "batch",
                                "actors", "checkpoint", "restore", "fork", "cancel", "deadline",
                                "reconnect", "services"])

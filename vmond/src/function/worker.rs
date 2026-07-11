@@ -6,7 +6,9 @@
 
 use std::{
 	collections::HashMap,
+	fs::File,
 	future::Future,
+	io::Read,
 	path::{Component, Path},
 	pin::Pin,
 	sync::{
@@ -25,7 +27,10 @@ use vmon_proto::v1 as pb;
 use super::{
 	artifact::ArtifactStore,
 	image,
-	protocol::{DEFAULT_EVENT_CAPACITY, Frame, ProtocolError, ProtocolSession},
+	protocol::{
+		DEFAULT_EVENT_CAPACITY, Frame, ProtocolError, ProtocolRequirements, ProtocolSession,
+	},
+	store::Store,
 };
 use crate::{
 	engine::{EngineApi, ExecRequest, ExecStream},
@@ -61,7 +66,6 @@ impl SecretValues {
 			previous.fill(0);
 		}
 	}
-
 
 	/// Borrow one secret value without copying it.
 	pub fn get(&self, name: &str) -> Option<&[u8]> {
@@ -122,9 +126,10 @@ impl SecretValues {
 	fn redact_error(&self, mut error: WorkerError) -> WorkerError {
 		for bytes in self.0.values() {
 			if let Ok(secret) = std::str::from_utf8(bytes)
-				&& !secret.is_empty() {
-					error.message = error.message.replace(secret, "[REDACTED]");
-				}
+				&& !secret.is_empty()
+			{
+				error.message = error.message.replace(secret, "[REDACTED]");
+			}
 		}
 		error
 	}
@@ -236,9 +241,11 @@ impl From<ProtocolError> for WorkerError {
 	fn from(error: ProtocolError) -> Self {
 		match error {
 			ProtocolError::Timeout => Self::timeout("execution"),
-			ProtocolError::Version { .. } | ProtocolError::InvalidFrame(_) => {
-				Self::platform("runner_protocol", error.to_string())
-			},
+			ProtocolError::Version { .. }
+			| ProtocolError::EnvelopeVersion { .. }
+			| ProtocolError::InvalidCapabilities { .. }
+			| ProtocolError::MissingCapability { .. }
+			| ProtocolError::InvalidFrame(_) => Self::platform("runner_protocol", error.to_string()),
 			ProtocolError::Backpressure(_) | ProtocolError::Disconnected(_) => {
 				Self::infrastructure("worker_lost", error.to_string())
 			},
@@ -378,7 +385,7 @@ pub struct BatchOutcome {
 /// An event attributed to one grouped input.
 #[derive(Clone, Debug)]
 pub struct BatchWorkerEvent {
-	pub input_index: u64,
+	pub input_index: Option<u64>,
 	pub event:       WorkerEvent,
 }
 /// Split event/completion handles for a grouped invocation.
@@ -436,11 +443,13 @@ impl SnapshotProvenance {
 			.and_then(|p| p.content_digest.as_ref())
 			.map(|d| d.value.clone())
 			.unwrap_or_default();
-		let initialize_hook =
-			spec
-				.lifecycle_hooks
-				.as_ref()
-				.and_then(|hooks| hooks.initialize_presence.as_ref().map(|pb::lifecycle_hooks::InitializePresence::Initialize(hook)| (hook.module.clone(), hook.qualname.clone())));
+		let initialize_hook = spec.lifecycle_hooks.as_ref().and_then(|hooks| {
+			hooks.initialize_presence.as_ref().map(
+				|pb::lifecycle_hooks::InitializePresence::Initialize(hook)| {
+					(hook.module.clone(), hook.qualname.clone())
+				},
+			)
+		});
 		let spec_digest = revision
 			.spec_digest
 			.as_ref()
@@ -530,7 +539,11 @@ impl WorkerSnapshot {
 		let runner = record.runner_digest.as_ref().map(|d| d.value.as_slice());
 		let image = record.image_digest.as_ref().map(|d| d.value.as_slice());
 		let package = record.package_digest.as_ref().map(|d| d.value.as_slice());
-		let hook = record.initialize_hook_presence.as_ref().map(|pb::function_snapshot_record::InitializeHookPresence::InitializeHook(hook)| (hook.module.clone(), hook.qualname.clone()));
+		let hook = record.initialize_hook_presence.as_ref().map(
+			|pb::function_snapshot_record::InitializeHookPresence::InitializeHook(hook)| {
+				(hook.module.clone(), hook.qualname.clone())
+			},
+		);
 		if revision_id != Some(expected.revision_id.as_str())
 			|| record.protocol_version as u64 != expected.runner_protocol
 			|| runner != Some(expected.runner_digest.as_slice())
@@ -573,6 +586,13 @@ pub trait Worker: Send + Sync {
 	fn revision_id(&self) -> &str;
 	fn capacity(&self) -> usize;
 	fn interruptibility(&self) -> Interruptibility;
+	/// Whether this worker can be returned to a pool after the current attempt.
+	///
+	/// Test workers and external implementations are reusable unless they
+	/// explicitly report otherwise.
+	fn is_reusable(&self) -> bool {
+		true
+	}
 	fn execute_batch(
 		&self,
 		request: BatchExecuteRequest,
@@ -682,6 +702,7 @@ impl EngineWorker {
 			duration_ms(spec.timeouts.as_ref().map_or(0, |t| t.startup_millis), DEFAULT_STARTUP);
 		let (output_format, output_compression, allow_trusted_python, cloudpickle_version) =
 			execution_policy(spec)?;
+		let protocol_requirements = protocol_requirements(spec)?;
 		let startup_deadline = started + startup;
 		let name = format!("fn-{}-{serial}", sanitize_name(&expected.revision_id));
 		let create = sandbox_create(&home, spec, &name, &secrets)?;
@@ -734,8 +755,13 @@ impl EngineWorker {
 				move || engine.file_write(&id, PACKAGE_PATH, &artifact)
 			})
 			.await?;
-			let (bootstrap, session) =
-				start_and_connect(Arc::clone(&engine), &id, remaining(startup_deadline)?).await?;
+			let (bootstrap, session) = start_and_connect(
+				Arc::clone(&engine),
+				&id,
+				remaining(startup_deadline)?,
+				protocol_requirements,
+			)
+			.await?;
 			Ok::<_, WorkerError>((bootstrap, session))
 		}
 		.await;
@@ -826,6 +852,7 @@ impl EngineWorker {
 			duration_ms(spec.timeouts.as_ref().map_or(0, |t| t.startup_millis), DEFAULT_STARTUP);
 		let (output_format, output_compression, allow_trusted_python, cloudpickle_version) =
 			execution_policy(spec)?;
+		let protocol_requirements = protocol_requirements(spec)?;
 		let restore_hook = restore_hook(Some(spec)).cloned();
 		let mut extra = HashMap::new();
 		extra.insert("secrets".into(), Value::Array(secrets.sandbox_wire()?));
@@ -847,8 +874,13 @@ impl EngineWorker {
 		let id = sandbox_id(&view).ok_or_else(|| {
 			WorkerError::infrastructure("restore_failed", "restored sandbox view omitted identity")
 		})?;
-		let session =
-			connect_existing(Arc::clone(&engine), &id, remaining(startup_deadline)?).await?;
+		let session = connect_existing(
+			Arc::clone(&engine),
+			&id,
+			remaining(startup_deadline)?,
+			protocol_requirements,
+		)
+		.await?;
 		let package_bytes = engine.file_read(&id, PACKAGE_PATH).map_err(engine_error)?;
 		let package_sha256 = hex::encode(Sha256::digest(&package_bytes));
 		let expected_package = spec
@@ -956,7 +988,13 @@ impl EngineWorker {
 				));
 			},
 		};
-		let frame = json!({"type":"define","request_id":"define:main","definition_id":"main","revision":self.revision_id,"definition":definition,"secrets":self.secrets.protocol_wire()});
+		let frame = define_frame(
+			&self.revision_id,
+			definition,
+			self.secrets.protocol_wire(),
+			self.allow_trusted_python,
+			self.cloudpickle_version.as_deref(),
+		);
 		let terminal = self.session.request(frame)?.complete(timeout).await?;
 		terminal_error(&terminal)?;
 		let callable_kind = terminal
@@ -1037,7 +1075,11 @@ impl EngineWorker {
 					"cloudpickle input rejected by revision serializer policy",
 				));
 			}
-			let supplied = envelope.python_presence.as_ref().map(|pb::value_envelope::PythonPresence::Python(python)| python.cloudpickle_version.as_str());
+			let supplied = envelope.python_presence.as_ref().map(
+				|pb::value_envelope::PythonPresence::Python(python)| {
+					python.cloudpickle_version.as_str()
+				},
+			);
 			if supplied != self.cloudpickle_version.as_deref() {
 				return Err(WorkerError::platform(
 					"cloudpickle_version_mismatch",
@@ -1058,6 +1100,90 @@ impl EngineWorker {
 				None
 			};
 		Ok((envelope_to_wire(envelope, guest_path.as_deref())?, guest_path))
+	}
+
+	fn actor_state_wire_input(
+		&self,
+		envelope: &pb::ValueEnvelope,
+	) -> Result<(Value, Option<String>), WorkerError> {
+		if pb::ValueSerializer::try_from(envelope.serializer).ok()
+			!= Some(pb::ValueSerializer::Cloudpickle)
+		{
+			return Err(WorkerError::platform(
+				"invalid_actor_state",
+				"actor state must use the daemon cloudpickle envelope",
+			));
+		}
+		if pb::ValueCompression::try_from(envelope.compression).ok()
+			!= Some(pb::ValueCompression::None)
+		{
+			return Err(WorkerError::platform(
+				"invalid_actor_state",
+				"actor state must use uncompressed checkpoint bytes",
+			));
+		}
+		let python = match envelope.python_presence.as_ref() {
+			Some(pb::value_envelope::PythonPresence::Python(python)) => python,
+			None => {
+				return Err(WorkerError::platform(
+					"invalid_actor_state",
+					"actor state is missing Python ABI metadata",
+				));
+			},
+		};
+		let expected_abi = self
+			.revision
+			.spec
+			.as_ref()
+			.and_then(|spec| spec.package.as_ref())
+			.and_then(|package| package.python.as_ref())
+			.map(|metadata| metadata.abi_tag.as_str())
+			.filter(|abi| !abi.is_empty());
+		if Some(python.abi_tag.as_str()) != expected_abi
+			|| Some(python.cloudpickle_version.as_str()) != self.cloudpickle_version.as_deref()
+		{
+			return Err(WorkerError::platform(
+				"cloudpickle_version_mismatch",
+				"actor state ABI/version does not match immutable package metadata",
+			));
+		}
+		let bytes = match envelope.storage.as_ref() {
+			Some(pb::value_envelope::Storage::InlineData(bytes)) => bytes.clone(),
+			Some(pb::value_envelope::Storage::Artifact(reference)) => {
+				read_artifact_at(&self.home, reference)?
+			},
+			None => {
+				return Err(WorkerError::platform(
+					"invalid_actor_state",
+					"actor state has no checkpoint bytes",
+				));
+			},
+		};
+		if envelope.uncompressed_size_bytes != bytes.len() as u64
+			|| envelope
+				.checksum
+				.as_ref()
+				.is_none_or(|checksum| checksum.value.as_slice() != Sha256::digest(&bytes).as_slice())
+		{
+			return Err(WorkerError::platform(
+				"invalid_actor_state",
+				"actor state checksum or size does not match checkpoint bytes",
+			));
+		}
+		let guest_path = if matches!(envelope.storage, Some(pb::value_envelope::Storage::Artifact(_)))
+		{
+			let path = guest_value_path();
+			self
+				.engine
+				.file_write(&self.id, &path, &bytes)
+				.map_err(engine_error)?;
+			Some(path)
+		} else {
+			None
+		};
+		let mut wire = envelope_to_wire(envelope, guest_path.as_deref())?;
+		wire["internal_purpose"] = json!("daemon_actor_state");
+		Ok((wire, guest_path))
 	}
 
 	fn wire_payload(
@@ -1156,17 +1282,18 @@ impl EngineWorker {
 							&event_artifact_root,
 							&mut frame,
 						) {
-							*event_failure.lock() = Some(error);
-							break;
-						}
+						*event_failure.lock() = Some(error);
+						break;
+					}
 					if let Some(event) = typed_event(&frame)
-						&& events_tx.try_send(event).is_err() {
-							*event_failure.lock() = Some(WorkerError::infrastructure(
-								"event_backpressure",
-								"worker event consumer did not keep up",
-							));
-							break;
-						}
+						&& events_tx.try_send(event).is_err()
+					{
+						*event_failure.lock() = Some(WorkerError::infrastructure(
+							"event_backpressure",
+							"worker event consumer did not keep up",
+						));
+						break;
+					}
 				}
 			}) {
 			Ok(worker) => worker,
@@ -1268,17 +1395,18 @@ impl EngineWorker {
 				..AttemptStats::default()
 			};
 			if let Ok(metrics) = tokio::task::spawn_blocking(move || engine.metrics(&id)).await
-				&& let Ok(metrics) = metrics {
-					stats.cpu_millis = metrics
-						.get("cpu_millis")
-						.and_then(Value::as_u64)
-						.unwrap_or(0);
-					stats.peak_memory_bytes = metrics
-						.get("peak_memory_bytes")
-						.or_else(|| metrics.get("memory_bytes"))
-						.and_then(Value::as_u64)
-						.unwrap_or(0);
-				}
+				&& let Ok(metrics) = metrics
+			{
+				stats.cpu_millis = metrics
+					.get("cpu_millis")
+					.and_then(Value::as_u64)
+					.unwrap_or(0);
+				stats.peak_memory_bytes = metrics
+					.get("peak_memory_bytes")
+					.or_else(|| metrics.get("memory_bytes"))
+					.and_then(Value::as_u64)
+					.unwrap_or(0);
+			}
 			match result {
 				Ok(frame) => Ok(outcome(frame, stats)),
 				Err(error) => {
@@ -1312,6 +1440,10 @@ impl Worker for EngineWorker {
 		} else {
 			Interruptibility::Sync
 		}
+	}
+
+	fn is_reusable(&self) -> bool {
+		!self.closed.load(Ordering::Acquire)
 	}
 
 	fn capacity(&self) -> usize {
@@ -1403,22 +1535,15 @@ impl Worker for EngineWorker {
 			};
 			let (events_tx, events) = flume::bounded(DEFAULT_EVENT_CAPACITY);
 			let raw_events = protocol.events.clone();
+			let event_error = Arc::new(Mutex::new(None));
+			let event_failure = Arc::clone(&event_error);
 			let event_worker = std::thread::Builder::new()
 				.name(format!("vmon-batch-events-{}", request.request_id))
 				.spawn(move || {
 					while let Ok(frame) = raw_events.recv() {
-						if let Some(event) = typed_event(&frame) {
-							let index = frame
-								.0
-								.get("input_index")
-								.and_then(Value::as_u64)
-								.unwrap_or(0);
-							if events_tx
-								.try_send(BatchWorkerEvent { input_index: index, event })
-								.is_err()
-							{
-								break;
-							}
+						if let Err(error) = dispatch_batch_event(&events_tx, &frame) {
+							*event_failure.lock() = Some(error);
+							break;
 						}
 					}
 				})
@@ -1432,9 +1557,32 @@ impl Worker for EngineWorker {
 			let startup = self.startup_millis;
 			let restored = self.restored;
 			let artifact_root = self.home.root().join("functions/artifacts");
+			let session = self.session.clone();
+			let closed = Arc::clone(&self.closed);
+			let interruptibility = self.interruptibility();
 			let completion = Box::pin(async move {
 				let started = Instant::now();
 				let terminal = protocol.complete(timeout).await;
+				if matches!(&terminal, Err(ProtocolError::Timeout)) {
+					match interruptibility {
+						Interruptibility::Async => {
+							if session.cancel(&batch_id).is_err() {
+								closed.store(true, Ordering::Release);
+								let _ = session.kill();
+							}
+						},
+						Interruptibility::Sync => {
+							closed.store(true, Ordering::Release);
+							let _ = session.kill();
+							let terminate = Arc::clone(&engine);
+							let worker = worker_id.clone();
+							let _ = tokio::task::spawn_blocking(move || {
+								terminate.terminate(&worker, "synchronous batch deadline")
+							})
+							.await;
+						},
+					}
+				}
 				active.lock().remove(&batch_id);
 				let _ = tokio::task::spawn_blocking(move || event_worker.join()).await;
 				let cleanup_engine = Arc::clone(&engine);
@@ -1443,6 +1591,9 @@ impl Worker for EngineWorker {
 					cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths);
 				})
 				.await;
+				if let Some(error) = event_error.lock().take() {
+					return Err(error);
+				}
 				let stats = AttemptStats {
 					attempt: 0,
 					startup_millis: startup,
@@ -1463,6 +1614,9 @@ impl Worker for EngineWorker {
 						})
 						.collect();
 					return Ok(BatchOutcome { items, stats });
+				}
+				if frame.event() == Some("cancelled") {
+					return Ok(cancelled_batch_outcome(frame, inputs, stats));
 				}
 				if frame.event() != Some("batch_result") {
 					return Err(WorkerError::platform(
@@ -1600,7 +1754,7 @@ impl Worker for EngineWorker {
 					("actor_checkpoint", json!({"checkpoint_id":checkpoint_id}))
 				},
 				ActorOperation::Restore { checkpoint_id, state } => {
-					let (state, path) = self.wire_input(&state)?;
+					let (state, path) = self.actor_state_wire_input(&state)?;
 					cleanup_paths.extend(path);
 					("actor_restore", json!({"checkpoint_id":checkpoint_id,"state":state}))
 				},
@@ -1669,6 +1823,30 @@ impl Worker for EngineWorker {
 	}
 }
 
+fn engine_architecture(architecture: pb::CpuArchitecture) -> Option<&'static str> {
+	match architecture {
+		pb::CpuArchitecture::Amd64 => Some("x86_64"),
+		pb::CpuArchitecture::Arm64 => Some("aarch64"),
+		pb::CpuArchitecture::Unspecified => None,
+	}
+}
+fn apply_sandbox_resources(create: &mut SandboxCreate, resources: &pb::ResourceSpec) {
+	create.cpus = resources.cpus.max(1);
+	create.memory = bytes_to_mib(resources.memory_bytes, 512);
+	create.disk_mb = bytes_to_mib(resources.ephemeral_disk_bytes, 1024);
+	create.arch = engine_architecture(
+		pb::CpuArchitecture::try_from(resources.architecture)
+			.unwrap_or(pb::CpuArchitecture::Unspecified),
+	)
+	.map(str::to_owned);
+	if let Some(network) = &resources.network {
+		create.block_network = network.block_network;
+		create.egress_allow = Some(network.egress_cidrs.clone()).filter(|v| !v.is_empty());
+		create.egress_allow_domains = Some(network.egress_domains.clone()).filter(|v| !v.is_empty());
+		create.inbound_cidr_allowlist = Some(network.inbound_cidrs.clone()).filter(|v| !v.is_empty());
+	}
+}
+
 fn sandbox_create(
 	home: &Home,
 	spec: &pb::FunctionSpec,
@@ -1694,40 +1872,19 @@ fn sandbox_create(
 		dockerfile: image.dockerfile,
 		context: image.context.unwrap_or_default(),
 		env: Some(image.environment.into_iter().collect()),
+		// Function HOST/ZONE placement is a mesh concern. A local function VM
+		// must use the engine's non-HA sandbox tier.
+		ha: Some("off".into()),
 		..SandboxCreate::default()
 	};
 	if let Some(resources) = &spec.resources {
-		create.cpus = resources.cpus.max(1);
-		create.memory = bytes_to_mib(resources.memory_bytes, 512);
-		create.disk_mb = bytes_to_mib(resources.ephemeral_disk_bytes, 1024);
-		create.arch = match pb::CpuArchitecture::try_from(resources.architecture)
-			.unwrap_or(pb::CpuArchitecture::Unspecified)
-		{
-			pb::CpuArchitecture::Amd64 => Some("amd64".into()),
-			pb::CpuArchitecture::Arm64 => Some("arm64".into()),
-			pb::CpuArchitecture::Unspecified => None,
-		};
-		create.ha = match pb::HighAvailabilityPolicy::try_from(resources.high_availability)
-			.unwrap_or(pb::HighAvailabilityPolicy::Unspecified)
-		{
-			pb::HighAvailabilityPolicy::None => Some("none".into()),
-			pb::HighAvailabilityPolicy::Host => Some("host".into()),
-			pb::HighAvailabilityPolicy::Zone => Some("zone".into()),
-			pb::HighAvailabilityPolicy::Unspecified => None,
-		};
-		if let Some(network) = &resources.network {
-			create.block_network = network.block_network;
-			create.egress_allow = Some(network.egress_cidrs.clone()).filter(|v| !v.is_empty());
-			create.egress_allow_domains =
-				Some(network.egress_domains.clone()).filter(|v| !v.is_empty());
-			create.inbound_cidr_allowlist =
-				Some(network.inbound_cidrs.clone()).filter(|v| !v.is_empty());
-		}
+		apply_sandbox_resources(&mut create, resources);
 	}
-	create.timeout_secs = spec
-		.timeouts
-		.as_ref()
-		.map(|t| (t.execution_millis + t.startup_millis).div_ceil(1000).max(1));
+	create.timeout_secs = spec.timeouts.as_ref().map(|t| {
+		(t.execution_millis + t.startup_millis)
+			.div_ceil(1000)
+			.max(1)
+	});
 	Ok(create)
 }
 
@@ -1735,6 +1892,7 @@ async fn start_and_connect(
 	engine: Arc<dyn EngineApi>,
 	id: &str,
 	timeout: Duration,
+	requirements: ProtocolRequirements,
 ) -> Result<(ExecStream, ProtocolSession), WorkerError> {
 	let bootstrap = blocking(timeout, {
 		let engine = Arc::clone(&engine);
@@ -1747,13 +1905,14 @@ async fn start_and_connect(
 		}
 	})
 	.await?;
-	let session = connect_existing(engine, id, timeout).await?;
+	let session = connect_existing(engine, id, timeout, requirements).await?;
 	Ok((bootstrap, session))
 }
 async fn connect_existing(
 	engine: Arc<dyn EngineApi>,
 	id: &str,
 	timeout: Duration,
+	requirements: ProtocolRequirements,
 ) -> Result<ProtocolSession, WorkerError> {
 	let relay_code = "import os,socket,select,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.\
 	                  argv[1]);fds=[0,s.fileno()];\nwhile True:\n r,_,_=select.select(fds,[],[])\n \
@@ -1777,6 +1936,7 @@ async fn connect_existing(
 			stream,
 			deadline.saturating_duration_since(Instant::now()),
 			DEFAULT_EVENT_CAPACITY,
+			requirements.clone(),
 		)
 		.await
 		{
@@ -1845,6 +2005,38 @@ fn cleanup_guest_paths(engine: &dyn EngineApi, worker_id: &str, paths: &[String]
 		let _ = engine.file_delete(worker_id, path, false);
 	}
 }
+fn protocol_requirements(spec: &pb::FunctionSpec) -> Result<ProtocolRequirements, WorkerError> {
+	let serializer = spec.serializer.as_ref().ok_or_else(|| {
+		WorkerError::platform("invalid_serializer", "serializer policy is required")
+	})?;
+	let format = |value| match pb::ValueSerializer::try_from(value)
+		.unwrap_or(pb::ValueSerializer::Unspecified)
+	{
+		pb::ValueSerializer::Json => Ok("json"),
+		pb::ValueSerializer::Cbor => Ok("cbor"),
+		pb::ValueSerializer::Cloudpickle => Ok("cloudpickle"),
+		pb::ValueSerializer::Unspecified => {
+			Err(WorkerError::platform("invalid_serializer", "serializer policy is unspecified"))
+		},
+	};
+	let mut requirements = ProtocolRequirements::default()
+		.require_format(format(serializer.input_serializer)?)
+		.require_format(format(serializer.result_serializer)?);
+	let compression =
+		pb::ValueCompression::try_from(serializer.compression).unwrap_or(pb::ValueCompression::None);
+	if compression == pb::ValueCompression::Zstd {
+		requirements = requirements.require_compression("zstd");
+	}
+	let trusted_package = spec.package.as_ref().is_some_and(|package| {
+		pb::PackageMode::try_from(package.mode).unwrap_or(pb::PackageMode::Unspecified)
+			== pb::PackageMode::TrustedSerialized
+	});
+	if trusted_package || serializer.allow_trusted_python {
+		requirements = requirements.require_format("cloudpickle");
+	}
+	Ok(requirements)
+}
+
 fn execution_policy(
 	spec: &pb::FunctionSpec,
 ) -> Result<(String, String, bool, Option<String>), WorkerError> {
@@ -1881,9 +2073,13 @@ fn execution_policy(
 		.package
 		.as_ref()
 		.and_then(|package| package.python.as_ref())
-		.and_then(|python| python.cloudpickle_version_presence.as_ref().map(|pb::python_code_metadata::CloudpickleVersionPresence::CloudpickleVersion(
-				version,
-			)| version.clone()));
+		.and_then(|python| {
+			python.cloudpickle_version_presence.as_ref().map(
+				|pb::python_code_metadata::CloudpickleVersionPresence::CloudpickleVersion(version)| {
+					version.clone()
+				},
+			)
+		});
 	if (output == "cloudpickle" || serializer.allow_trusted_python) && cloudpickle.is_none() {
 		return Err(WorkerError::platform(
 			"cloudpickle_version_missing",
@@ -1891,6 +2087,28 @@ fn execution_policy(
 		));
 	}
 	Ok((output.into(), compression.into(), serializer.allow_trusted_python, cloudpickle))
+}
+fn cancelled_batch_outcome(
+	frame: Frame,
+	inputs: Vec<ExecuteRequest>,
+	stats: AttemptStats,
+) -> BatchOutcome {
+	let reason = frame
+		.0
+		.get("reason")
+		.and_then(Value::as_str)
+		.unwrap_or("cancelled")
+		.to_owned();
+	let items = inputs
+		.into_iter()
+		.map(|input| BatchItemOutcome {
+			request_id:  input.request_id,
+			input_id:    input.input_id,
+			input_index: input.input_index,
+			outcome:     WorkerOutcome::Cancelled { reason: reason.clone(), stats },
+		})
+		.collect();
+	BatchOutcome { items, stats }
 }
 
 fn validate_batch_inputs(
@@ -1930,6 +2148,25 @@ fn validate_batch_inputs(
 	}
 	Ok(())
 }
+fn define_frame(
+	revision_id: &str,
+	definition: Value,
+	secrets: Value,
+	trusted: bool,
+	cloudpickle_version: Option<&str>,
+) -> Value {
+	json!({
+		"type":"define",
+		"request_id":"define:main",
+		"definition_id":"main",
+		"revision":revision_id,
+		"definition":definition,
+		"secrets":secrets,
+		"trusted":trusted,
+		"cloudpickle_version":cloudpickle_version,
+	})
+}
+
 fn materialize_output(
 	engine: &dyn EngineApi,
 	worker_id: &str,
@@ -1953,12 +2190,31 @@ fn materialize_output(
 			"runner returned an unsafe spill path",
 		));
 	}
-	let read = engine.file_read(worker_id, &path).map_err(engine_error);
+	let read = (|| {
+		let stat = engine.file_stat(worker_id, &path).map_err(engine_error)?;
+		if stat.get("size").and_then(Value::as_u64).unwrap_or(u64::MAX) > 64 * 1024 * 1024 {
+			return Err(WorkerError::platform("result_too_large", "runner spill exceeds 64 MiB"));
+		}
+		engine.file_read(worker_id, &path).map_err(engine_error)
+	})();
 	let delete = engine
 		.file_delete(worker_id, &path, false)
 		.map_err(engine_error);
 	let bytes = read?;
 	delete?;
+	materialize_output_bytes(artifact_root, value, bytes)?;
+	if let Some(object) = value.as_object_mut() {
+		object.remove("path");
+		object.remove("remove_after_read");
+	}
+	Ok(())
+}
+
+fn materialize_output_bytes(
+	artifact_root: &Path,
+	value: &mut Value,
+	bytes: Vec<u8>,
+) -> Result<(), WorkerError> {
 	if bytes.len() > 64 * 1024 * 1024 {
 		return Err(WorkerError::platform("result_too_large", "runner spill exceeds 64 MiB"));
 	}
@@ -1966,22 +2222,32 @@ fn materialize_output(
 		.get("sha256")
 		.and_then(Value::as_str)
 		.and_then(|text| hex::decode(text.strip_prefix("sha256:").unwrap_or(text)).ok())
+		.filter(|digest| digest.len() == 32)
 		.ok_or_else(|| {
 			WorkerError::platform("invalid_runner_value", "runner spill checksum is invalid")
 		})?;
-	if value
+	let compression = value
 		.get("compression")
 		.and_then(Value::as_str)
-		.unwrap_or("none")
-		!= "none"
-	{
+		.unwrap_or("none");
+	if !matches!(compression, "none" | "gzip" | "zstd") {
 		return Err(WorkerError::platform(
 			"invalid_runner_value",
-			"compressed runner spills are unsupported",
+			format!("unsupported runner compression {compression}"),
 		));
 	}
-	if value.get("uncompressed_size").and_then(Value::as_u64) != Some(bytes.len() as u64)
-		|| checksum.as_slice() != Sha256::digest(&bytes).as_slice()
+	let uncompressed_size = value
+		.get("uncompressed_size")
+		.and_then(Value::as_u64)
+		.ok_or_else(|| {
+			WorkerError::platform("invalid_runner_value", "runner result size is missing")
+		})?;
+	if uncompressed_size > 64 * 1024 * 1024 {
+		return Err(WorkerError::platform("result_too_large", "runner result exceeds 64 MiB"));
+	}
+	if compression == "none"
+		&& (uncompressed_size != bytes.len() as u64
+			|| checksum.as_slice() != Sha256::digest(&bytes).as_slice())
 	{
 		return Err(WorkerError::platform(
 			"invalid_runner_value",
@@ -1991,15 +2257,29 @@ fn materialize_output(
 	if bytes.len() <= 512 * 1024 {
 		value["inline_data"] = json!(BASE64.encode(bytes));
 	} else {
-		let stored = ArtifactStore::open(artifact_root.to_owned())
-			.map_err(engine_error)?
-			.put_verified(&checksum, bytes.len() as u64, &bytes)
+		let stored_digest = Sha256::digest(&bytes);
+		let artifacts = ArtifactStore::open(artifact_root.to_owned()).map_err(engine_error)?;
+		let stored = artifacts
+			.put_verified(&stored_digest, bytes.len() as u64, &bytes)
+			.map_err(engine_error)?;
+		let home_root = artifact_root
+			.parent()
+			.and_then(Path::parent)
+			.ok_or_else(|| WorkerError::infrastructure("artifact_store", "invalid artifact root"))?;
+		let store = Store::open(&Home::new(home_root)).map_err(engine_error)?;
+		store
+			.record_artifact(
+				&stored.digest,
+				stored.size,
+				None,
+				stored.path.to_str().ok_or_else(|| {
+					WorkerError::infrastructure("artifact_store", "artifact path is not UTF-8")
+				})?,
+				now_ms(),
+				None,
+			)
 			.map_err(engine_error)?;
 		value["artifact_digest"] = json!(stored.digest);
-	}
-	if let Some(object) = value.as_object_mut() {
-		object.remove("path");
-		object.remove("remove_after_read");
 	}
 	Ok(())
 }
@@ -2096,12 +2376,6 @@ pub fn wire_to_envelope(wire: &Value) -> Result<pb::ValueEnvelope, WorkerError> 
 			));
 		},
 	};
-	if compression != pb::ValueCompression::None {
-		return Err(WorkerError::platform(
-			"invalid_runner_value",
-			"runner outputs must be uncompressed",
-		));
-	}
 	let checksum_text = wire.get("sha256").and_then(Value::as_str).ok_or_else(|| {
 		WorkerError::platform("invalid_runner_value", "runner result checksum is missing")
 	})?;
@@ -2129,8 +2403,9 @@ pub fn wire_to_envelope(wire: &Value) -> Result<pb::ValueEnvelope, WorkerError> 
 		let bytes = BASE64.decode(encoded).map_err(|_| {
 			WorkerError::platform("invalid_runner_value", "runner result contains invalid base64")
 		})?;
-		if expected_size != bytes.len() as u64
-			|| Sha256::digest(&bytes).as_slice() != checksum.as_slice()
+		if compression == pb::ValueCompression::None
+			&& (expected_size != bytes.len() as u64
+				|| Sha256::digest(&bytes).as_slice() != checksum.as_slice())
 		{
 			return Err(WorkerError::platform(
 				"invalid_runner_value",
@@ -2142,7 +2417,7 @@ pub fn wire_to_envelope(wire: &Value) -> Result<pb::ValueEnvelope, WorkerError> 
 		let artifact_digest = hex::decode(digest).map_err(|_| {
 			WorkerError::platform("invalid_runner_value", "runner artifact digest is invalid")
 		})?;
-		if artifact_digest != checksum {
+		if compression == pb::ValueCompression::None && artifact_digest != checksum {
 			return Err(WorkerError::platform(
 				"invalid_runner_value",
 				"runner artifact digest does not match value checksum",
@@ -2227,6 +2502,7 @@ fn outcome(frame: Frame, stats: AttemptStats) -> WorkerOutcome {
 				WorkerErrorKind::Infrastructure => {
 					WorkerOutcome::InfrastructureError { error: e, stats }
 				},
+
 				_ => WorkerOutcome::PlatformError { error: e, stats },
 			}
 		},
@@ -2269,6 +2545,20 @@ fn typed_event(frame: &Frame) -> Option<WorkerEvent> {
 		_ => None,
 	}
 }
+fn dispatch_batch_event(
+	events: &flume::Sender<BatchWorkerEvent>,
+	frame: &Frame,
+) -> Result<(), WorkerError> {
+	let Some(event) = typed_event(frame) else {
+		return Ok(());
+	};
+	let input_index = frame.0.get("input_index").and_then(Value::as_u64);
+	events
+		.try_send(BatchWorkerEvent { input_index, event })
+		.map_err(|_| {
+			WorkerError::infrastructure("event_backpressure", "worker event consumer did not keep up")
+		})
+}
 fn callable_interruptibility(kind: &str) -> Interruptibility {
 	if matches!(kind, "async" | "async_generator") {
 		Interruptibility::Async
@@ -2281,16 +2571,20 @@ fn runner_failure(error: &Value, kind: WorkerErrorKind, depth: usize) -> WorkerE
 		.get("message")
 		.and_then(Value::as_str)
 		.unwrap_or("runner error");
-	let code = error
+	let error_type = error
 		.get("type")
 		.and_then(Value::as_str)
 		.unwrap_or("runner_error");
+	let code = error
+		.get("code")
+		.and_then(Value::as_str)
+		.unwrap_or(error_type);
 	let mut failure = match kind {
-		WorkerErrorKind::User => WorkerError::user(code, message, false),
+		WorkerErrorKind::User => WorkerError::user(code, message, true),
 		WorkerErrorKind::ActorLost => WorkerError::actor_lost(message),
 		_ => WorkerError::platform("runner_error", message),
 	};
-	failure.error_type = code.chars().take(256).collect();
+	failure.error_type = error_type.chars().take(256).collect();
 	if let Some(phase) = error.get("phase").and_then(Value::as_str) {
 		failure
 			.details
@@ -2333,9 +2627,10 @@ fn runner_failure(error: &Value, kind: WorkerErrorKind, depth: usize) -> WorkerE
 			.collect();
 	}
 	if depth < 4
-		&& let Some(cause) = error.get("cause").filter(|cause| cause.is_object()) {
-			failure.cause = Some(Box::new(runner_failure(cause, kind, depth + 1)));
-		}
+		&& let Some(cause) = error.get("cause").filter(|cause| cause.is_object())
+	{
+		failure.cause = Some(Box::new(runner_failure(cause, kind, depth + 1)));
+	}
 	failure
 }
 
@@ -2355,7 +2650,7 @@ fn terminal_error(frame: &Frame) -> Result<(), WorkerError> {
 			|| message.contains("checkpoint is unavailable"))
 	{
 		WorkerErrorKind::ActorLost
-	} else if matches!(phase, "call" | "actor") {
+	} else if matches!(phase, "call" | "batch" | "actor") {
 		WorkerErrorKind::User
 	} else {
 		WorkerErrorKind::Platform
@@ -2376,11 +2671,33 @@ fn read_artifact_at(home: &Home, reference: &pb::ArtifactRef) -> Result<Vec<u8>,
 		.join("functions/artifacts")
 		.join(&hex[..2])
 		.join(&hex[2..]);
-	let bytes = std::fs::read(path).map_err(|_| {
-		WorkerError::platform("artifact_unavailable", format!("artifact {hex} is unavailable"))
+	let bytes = read_bounded_file(&path, 64 * 1024 * 1024).map_err(|error| {
+		if error.kind() == std::io::ErrorKind::InvalidData {
+			WorkerError::platform("artifact_too_large", "artifact exceeds 64 MiB worker limit")
+		} else {
+			WorkerError::platform("artifact_unavailable", format!("artifact {hex} is unavailable"))
+		}
 	})?;
 	if Sha256::digest(&bytes).as_slice() != digest.value.as_slice() {
 		return Err(WorkerError::platform("artifact_corrupt", "artifact digest mismatch"));
+	}
+	Ok(bytes)
+}
+fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+	let file = File::open(path)?;
+	if file.metadata()?.len() > limit {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"file exceeds bounded read limit",
+		));
+	}
+	let mut bytes = Vec::with_capacity(usize::try_from(limit.min(1024 * 1024)).unwrap_or(0));
+	file.take(limit + 1).read_to_end(&mut bytes)?;
+	if bytes.len() as u64 > limit {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"file grew beyond bounded read limit",
+		));
 	}
 	Ok(bytes)
 }
@@ -2431,25 +2748,32 @@ fn shutdown_timeout(revision: &pb::FunctionRevision) -> Duration {
 	)
 }
 fn initialize_hook(spec: &pb::FunctionSpec) -> Option<&pb::LifecycleHookRef> {
-	spec
-		.lifecycle_hooks
-		.as_ref()
-		.and_then(|h| h.initialize_presence.as_ref().map(|pb::lifecycle_hooks::InitializePresence::Initialize(h)| h))
+	spec.lifecycle_hooks.as_ref().and_then(|h| {
+		h.initialize_presence
+			.as_ref()
+			.map(|pb::lifecycle_hooks::InitializePresence::Initialize(h)| h)
+	})
 }
 fn shutdown_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
-	spec
-		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| h.shutdown_presence.as_ref().map(|pb::lifecycle_hooks::ShutdownPresence::Shutdown(h)| h))
+	spec.and_then(|s| s.lifecycle_hooks.as_ref()).and_then(|h| {
+		h.shutdown_presence
+			.as_ref()
+			.map(|pb::lifecycle_hooks::ShutdownPresence::Shutdown(h)| h)
+	})
 }
 fn restore_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
-	spec
-		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| h.restore_presence.as_ref().map(|pb::lifecycle_hooks::RestorePresence::Restore(h)| h))
+	spec.and_then(|s| s.lifecycle_hooks.as_ref()).and_then(|h| {
+		h.restore_presence
+			.as_ref()
+			.map(|pb::lifecycle_hooks::RestorePresence::Restore(h)| h)
+	})
 }
 fn snapshot_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
-	spec
-		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| h.snapshot_presence.as_ref().map(|pb::lifecycle_hooks::SnapshotPresence::Snapshot(h)| h))
+	spec.and_then(|s| s.lifecycle_hooks.as_ref()).and_then(|h| {
+		h.snapshot_presence
+			.as_ref()
+			.map(|pb::lifecycle_hooks::SnapshotPresence::Snapshot(h)| h)
+	})
 }
 fn worker_hook_allowed(
 	spec: Option<&pb::FunctionSpec>,
@@ -2464,11 +2788,9 @@ fn worker_hook_allowed(
 	if !hook.qualname.contains('.') && !hook.qualname.contains("<locals>") {
 		return Ok(true);
 	}
-	let lifecycle = spec
-		.map_or(pb::FunctionLifecycle::Unspecified, |spec| {
-			pb::FunctionLifecycle::try_from(spec.lifecycle)
-				.unwrap_or(pb::FunctionLifecycle::Unspecified)
-		});
+	let lifecycle = spec.map_or(pb::FunctionLifecycle::Unspecified, |spec| {
+		pb::FunctionLifecycle::try_from(spec.lifecycle).unwrap_or(pb::FunctionLifecycle::Unspecified)
+	});
 	if matches!(lifecycle, pb::FunctionLifecycle::Actor | pb::FunctionLifecycle::Instance) {
 		Ok(false)
 	} else {
@@ -2584,6 +2906,30 @@ mod tests {
 	}
 
 	#[test]
+	fn protocol_requirements_follow_immutable_serializer_policy() {
+		let spec = pb::FunctionSpec {
+			package: Some(pb::PackageSpec {
+				mode: pb::PackageMode::TrustedSerialized as i32,
+				..pb::PackageSpec::default()
+			}),
+			serializer: Some(pb::SerializerSpec {
+				input_serializer:     pb::ValueSerializer::Cbor as i32,
+				result_serializer:    pb::ValueSerializer::Cloudpickle as i32,
+				compression:          pb::ValueCompression::Zstd as i32,
+				allow_trusted_python: true,
+			}),
+			..pb::FunctionSpec::default()
+		};
+		assert_eq!(
+			protocol_requirements(&spec).unwrap(),
+			ProtocolRequirements::default()
+				.require_format("cbor")
+				.require_format("cloudpickle")
+				.require_compression("zstd")
+		);
+	}
+
+	#[test]
 	fn protobuf_envelope_round_trips_protocol_wire() {
 		let bytes = br#"{\"answer\":42}"#.to_vec();
 		let envelope = pb::ValueEnvelope {
@@ -2622,24 +2968,31 @@ mod tests {
 
 	#[test]
 	fn sandbox_mapping_is_typed_and_secret_errors_are_redacted() {
-		let temp = tempfile::tempdir().unwrap();
-		let home = Home::new(temp.path());
 		let mut secrets = SecretValues::new();
 		secrets.insert("TOKEN", b"sensitive-value".to_vec());
-		let create =
-			sandbox_create(&home, revision().spec.as_ref().unwrap(), "worker", &secrets).unwrap();
-		assert_eq!(
-			create.image.as_deref(),
-			Some(format!("example@sha256:{}", "02".repeat(32)).as_str())
+		let mut create = SandboxCreate { ha: Some("off".into()), ..SandboxCreate::default() };
+		apply_sandbox_resources(
+			&mut create,
+			revision()
+				.spec
+				.as_ref()
+				.unwrap()
+				.resources
+				.as_ref()
+				.unwrap(),
 		);
-		assert_eq!(create.secrets.as_ref().unwrap()[0]["values"]["TOKEN"], "sensitive-value");
+		assert_eq!(create.arch.as_deref(), Some("aarch64"));
+		assert_eq!(create.ha.as_deref(), Some("off"));
+		assert_eq!(engine_architecture(pb::CpuArchitecture::Amd64), Some("x86_64"));
+		assert_eq!(engine_architecture(pb::CpuArchitecture::Arm64), Some("aarch64"));
+		assert_eq!(engine_architecture(pb::CpuArchitecture::Unspecified), None);
+		assert_eq!(secrets.sandbox_wire().unwrap()[0]["values"]["TOKEN"], "sensitive-value");
 		let redacted = secrets
 			.redact_error(WorkerError::infrastructure("engine", "create failed with sensitive-value"));
 		assert_eq!(redacted.message, "create failed with [REDACTED]");
 		let mut invalid = SecretValues::new();
 		invalid.insert("TOKEN", vec![0xff, 0xfe]);
-		let error =
-			sandbox_create(&home, revision().spec.as_ref().unwrap(), "worker", &invalid).unwrap_err();
+		let error = invalid.sandbox_wire().unwrap_err();
 		assert!(!error.to_string().contains("ff"));
 		assert!(!error.to_string().contains("fe"));
 	}
@@ -2719,6 +3072,165 @@ mod tests {
 				.code,
 			"invalid_lifecycle_hook"
 		);
+	}
+
+	#[test]
+	fn compressed_runner_frames_preserve_gzip_and_zstd_storage() {
+		let data = br#"{"answer":42}"#;
+		let checksum = hex::encode(Sha256::digest(data));
+		let gzip = vec![
+			31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 74, 204, 43, 46, 79, 45, 82, 178, 50, 49, 170,
+			5, 0, 245, 101, 217, 204, 13, 0, 0, 0,
+		];
+		let zstd = zstd::encode_all(data.as_slice(), 0).unwrap();
+		for (compression, stored, expected) in
+			[("gzip", gzip, pb::ValueCompression::Gzip), ("zstd", zstd, pb::ValueCompression::Zstd)]
+		{
+			let wire = json!({
+				"version":1,
+				"format":"json",
+				"compression":compression,
+				"sha256":format!("sha256:{checksum}"),
+				"uncompressed_size":data.len(),
+				"inline_data":BASE64.encode(&stored),
+			});
+			let envelope = wire_to_envelope(&wire).unwrap();
+			assert_eq!(envelope.compression, expected as i32);
+			assert_eq!(envelope.storage, Some(pb::value_envelope::Storage::InlineData(stored)));
+		}
+	}
+
+	#[test]
+	fn large_materialized_result_records_retrievable_artifact_metadata() {
+		let temp = tempfile::tempdir().unwrap();
+		let home = Home::new(temp.path());
+		let artifact_root = home.function_artifacts_dir();
+		let bytes = vec![7u8; 600 * 1024];
+		let checksum = hex::encode(Sha256::digest(&bytes));
+		let mut value = json!({
+			"version":1,
+			"format":"json",
+			"compression":"none",
+			"sha256":format!("sha256:{checksum}"),
+			"uncompressed_size":bytes.len(),
+		});
+		materialize_output_bytes(&artifact_root, &mut value, bytes.clone()).unwrap();
+		let digest = value["artifact_digest"].as_str().unwrap();
+		let store = Store::open(&home).unwrap();
+		let metadata = store.stat_artifact(digest).unwrap();
+		assert_eq!(metadata.0, bytes.len() as u64);
+		assert_eq!(
+			ArtifactStore::open(artifact_root)
+				.unwrap()
+				.read(digest, Some(bytes.len() as u64))
+				.unwrap(),
+			bytes
+		);
+		let envelope = wire_to_envelope(&value).unwrap();
+		assert!(matches!(envelope.storage, Some(pb::value_envelope::Storage::Artifact(_))));
+	}
+
+	#[test]
+	fn trusted_serialized_define_uses_runner_top_level_authority() {
+		let definition = json!({
+			"mode":"serialized",
+			"trusted":true,
+			"value":{"format":"cloudpickle","cloudpickle_version":"3.1.1"},
+		});
+		let frame = define_frame(
+			"revision-1",
+			definition.clone(),
+			json!({"TOKEN":"secret"}),
+			true,
+			Some("3.1.1"),
+		);
+		assert_eq!(frame["trusted"], true);
+		assert_eq!(frame["cloudpickle_version"], "3.1.1");
+		assert_eq!(frame["definition"], definition);
+		assert_eq!(frame["definition"]["trusted"], true);
+		assert_eq!(frame["definition"]["value"]["cloudpickle_version"], "3.1.1");
+	}
+
+	#[test]
+	fn bounded_artifact_read_rejects_oversized_file_before_allocation() {
+		let temp = tempfile::tempdir().unwrap();
+		let path = temp.path().join("oversized");
+		let file = File::create(&path).unwrap();
+		file.set_len(1025).unwrap();
+		assert_eq!(
+			read_bounded_file(&path, 1024).unwrap_err().kind(),
+			std::io::ErrorKind::InvalidData
+		);
+	}
+
+	#[test]
+	fn batch_phase_errors_are_retryable_with_runner_codes() {
+		let frame = Frame(json!({
+			"type":"error",
+			"request_id":"batch-1",
+			"error":{"phase":"batch","type":"ValueError","code":"fail_once","message":"try again"},
+		}));
+		let error = terminal_error(&frame).unwrap_err();
+		assert_eq!(error.kind, WorkerErrorKind::User);
+		assert_eq!(error.code, "fail_once");
+		assert_eq!(error.error_type, "ValueError");
+		assert!(error.retryable);
+	}
+
+	#[test]
+	fn cancelled_grouped_batch_finishes_every_active_input() {
+		let input = ExecuteRequest {
+			request_id:        "request-1".into(),
+			function_id:       "function-1".into(),
+			call_id:           "call-1".into(),
+			input_id:          "input-1".into(),
+			input_index:       3,
+			attempt:           1,
+			mode:              ExecutionMode::Unary,
+			input:             pb::call_input::Payload::Value(pb::ValueEnvelope::default()),
+			deadline:          None,
+			parent_call_id:    None,
+			parent_request_id: None,
+			interruptibility:  Interruptibility::Async,
+			service:           None,
+		};
+		let outcome = cancelled_batch_outcome(
+			Frame(json!({"type":"cancelled","request_id":"batch-1","reason":"client request"})),
+			vec![input],
+			AttemptStats::default(),
+		);
+		assert_eq!(outcome.items.len(), 1);
+		assert_eq!(outcome.items[0].input_index, 3);
+		assert!(matches!(
+			&outcome.items[0].outcome,
+			WorkerOutcome::Cancelled { reason, .. } if reason == "client request"
+		));
+	}
+
+	#[test]
+	fn grouped_batch_event_capacity_is_fail_closed() {
+		let (events, receiver) = flume::bounded(1);
+		let frame = Frame(json!({
+			"type":"log",
+			"request_id":"batch-1",
+			"input_index":2,
+			"stream":"stdout",
+			"message":"line",
+		}));
+		dispatch_batch_event(&events, &frame).unwrap();
+		let error = dispatch_batch_event(&events, &frame).unwrap_err();
+		assert_eq!(error.code, "event_backpressure");
+		assert_eq!(error.kind, WorkerErrorKind::Infrastructure);
+		assert!(error.retryable);
+		assert_eq!(receiver.recv().unwrap().input_index, Some(2));
+		let unscoped = Frame(json!({
+			"type":"log",
+			"request_id":"batch-1",
+			"stream":"stderr",
+			"message":"batch-level",
+		}));
+		dispatch_batch_event(&events, &unscoped).unwrap();
+		assert_eq!(receiver.recv().unwrap().input_index, None);
 	}
 
 	#[test]

@@ -225,10 +225,6 @@ fn resolve_source(
 					platform: resolved.platform,
 				})
 			} else {
-				validate_registry_reference(&source.reference)?;
-				if let Some(resolved) = resolved_registry_source(spec, source, arch)? {
-					return Ok(resolved);
-				}
 				let resolved = backend.resolve_oci(&source.reference, arch)?;
 				resolve_layered(backend, home, artifacts, spec, resolved, arch)
 			}
@@ -358,6 +354,9 @@ fn build_cached(
 		&& let Ok(cached) = serde_json::from_slice::<CachedBuild>(&bytes)
 		&& validate_sha256_hex(&cached.digest, "cached image digest").is_ok()
 		&& cached.platform == format!("linux/{arch}")
+		&& let Ok(resolved) = backend.resolve_oci(&cached.reference, arch)
+		&& resolved.digest == cached.digest
+		&& resolved.platform == cached.platform
 	{
 		return Ok(ResolvedOciImage {
 			reference: cached.reference,
@@ -423,9 +422,12 @@ fn prepare_build_context(
 	let artifact_dir = temporary.join(".vmon-artifacts");
 	for mount in &spec.local_artifact_mounts {
 		let digest = artifact_digest(mount.artifact.as_ref(), "local artifact mount")?;
-		let bytes = artifacts.read(&digest, None)?;
-		fs::create_dir_all(&artifact_dir)?;
-		write_new(&artifact_dir.join(&digest), &bytes, 0o400)?;
+		let destination = artifact_dir.join(&digest);
+		if !destination.is_file() {
+			let bytes = artifacts.read(&digest, None)?;
+			fs::create_dir_all(&artifact_dir)?;
+			write_new(&destination, &bytes, 0o400)?;
+		}
 	}
 	write_new(&temporary.join(".vmon.Dockerfile"), recipe.as_bytes(), 0o600)?;
 	if let Some(parent) = context.parent() {
@@ -482,7 +484,7 @@ fn dockerfile_recipe(
 	}
 	for package in &spec.uv_packages {
 		let mut argv =
-			vec!["uv".to_owned(), "pip".to_owned(), "install".to_owned(), "--system".to_owned()];
+			vec!["python".to_owned(), "-m".to_owned(), "pip".to_owned(), "install".to_owned()];
 		if let Some(pb::uv_package::IndexUrlPresence::IndexUrl(index)) = &package.index_url_presence {
 			argv.push("--index-url".to_owned());
 			argv.push(index.clone());
@@ -516,7 +518,8 @@ fn dockerfile_recipe(
 }
 
 fn validate_dockerfile(body: &str) -> Result<()> {
-	let mut from_count = 0;
+	let mut from_count = 0usize;
+	let mut stages = BTreeSet::new();
 	for line in body.lines() {
 		let line = line.trim();
 		if line.is_empty() || line.starts_with('#') {
@@ -527,9 +530,9 @@ fn validate_dockerfile(body: &str) -> Result<()> {
 			.map_or((line, ""), |(directive, arguments)| (directive, arguments.trim()));
 		match directive.to_ascii_uppercase().as_str() {
 			"FROM" => {
-				from_count += 1;
-				let image = arguments
-					.split_whitespace()
+				let words = arguments.split_whitespace().collect::<Vec<_>>();
+				let image = words
+					.iter()
 					.find(|argument| !argument.starts_with("--"))
 					.ok_or_else(|| EngineError::invalid("Dockerfile FROM is missing an image"))?;
 				if arguments.contains("--platform=") {
@@ -537,7 +540,7 @@ fn validate_dockerfile(body: &str) -> Result<()> {
 						"Dockerfile must not override the server-selected platform",
 					));
 				}
-				if image != "scratch" {
+				if *image != "scratch" {
 					let Some(digest) = image.rsplit_once("@sha256:").map(|(_, digest)| digest) else {
 						return Err(EngineError::invalid(
 							"Dockerfile FROM images must be pinned with @sha256:<manifest>",
@@ -545,10 +548,53 @@ fn validate_dockerfile(body: &str) -> Result<()> {
 					};
 					validate_sha256_hex(digest, "Dockerfile FROM digest")?;
 				}
+				if let Some(position) = words
+					.iter()
+					.position(|word| word.eq_ignore_ascii_case("AS"))
+					&& let Some(alias) = words.get(position + 1)
+				{
+					stages.insert(alias.to_ascii_lowercase());
+				}
+				from_count += 1;
+			},
+			"RUN" => {
+				return Err(EngineError::unsupported(
+					"Dockerfile RUN is not reproducible because build commands may access the network; \
+					 use typed image build inputs",
+				));
+			},
+			"COPY" => {
+				if let Some(source) = arguments.split_whitespace().find_map(|argument| {
+					argument
+						.get(.."--from=".len())
+						.filter(|prefix| prefix.eq_ignore_ascii_case("--from="))
+						.map(|_| &argument["--from=".len()..])
+				}) {
+					let local_number = source
+						.parse::<usize>()
+						.is_ok_and(|index| index < from_count);
+					let local_alias = stages.contains(&source.to_ascii_lowercase());
+					if !local_number && !local_alias {
+						let Some(digest) = source.rsplit_once("@sha256:").map(|(_, digest)| digest)
+						else {
+							return Err(EngineError::invalid(
+								"Dockerfile external COPY --from source must be pinned with \
+								 @sha256:<manifest>",
+							));
+						};
+						validate_sha256_hex(digest, "Dockerfile COPY --from digest")?;
+					}
+				}
 			},
 			"ADD" if arguments.contains("://") => {
 				return Err(EngineError::unsupported(
 					"Dockerfile ADD may not fetch remote mutable content; upload an artifact",
+				));
+			},
+			"ONBUILD" => {
+				return Err(EngineError::unsupported(
+					"Dockerfile ONBUILD is not reproducible because deferred instructions are not \
+					 validated",
 				));
 			},
 			"ARG" | "ENV" => {
@@ -682,12 +728,16 @@ fn validate_inputs(spec: &pb::ImageSpec) -> Result<()> {
 
 fn validate_python_source(source: &pb::PythonImageSource) -> Result<()> {
 	let parts = source.python_version.split('.').collect::<Vec<_>>();
-	if parts.len() != 3
+	if !matches!(parts.len(), 2 | 3)
 		|| parts
 			.iter()
 			.any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+		|| parts[0] != "3"
 	{
-		return Err(EngineError::invalid("Python image requires an exact major.minor.patch version"));
+		return Err(EngineError::invalid(
+			"Python image version must be a supported Python 3 major.minor or major.minor.patch \
+			 release",
+		));
 	}
 	if source.variant.is_empty()
 		|| !source
@@ -696,50 +746,6 @@ fn validate_python_source(source: &pb::PythonImageSource) -> Result<()> {
 			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
 	{
 		return Err(EngineError::invalid("Python image variant contains unsupported characters"));
-	}
-	Ok(())
-}
-
-fn resolved_registry_source(
-	spec: &pb::ImageSpec,
-	source: &pb::RegistryImageSource,
-	arch: &str,
-) -> Result<Option<SourceResolution>> {
-	let Some((_, digest)) = source.reference.rsplit_once("@sha256:") else {
-		return Ok(None);
-	};
-	validate_sha256_hex(digest, "registry image digest")?;
-	let Some(claimed) = spec.resolved_oci_digest.as_ref() else {
-		return Ok(None);
-	};
-	if claimed.algorithm != pb::DigestAlgorithm::Sha256 as i32
-		|| hex::encode(&claimed.value) != digest
-	{
-		return Err(EngineError::invalid(
-			"registry reference digest does not match resolved OCI digest",
-		));
-	}
-	let platform = if spec.platform.is_empty() {
-		format!("linux/{arch}")
-	} else {
-		spec.platform.clone()
-	};
-	Ok(Some(SourceResolution {
-		launch: Launch::Image(source.reference.clone()),
-		digest: digest.to_owned(),
-		platform,
-	}))
-}
-
-fn validate_registry_reference(reference: &str) -> Result<()> {
-	if reference.trim() != reference
-		|| reference.is_empty()
-		|| reference.chars().any(char::is_whitespace)
-	{
-		return Err(EngineError::invalid("registry image reference is empty or contains whitespace"));
-	}
-	if reference.contains("//") || reference.starts_with("oci:") || reference.starts_with("dir:") {
-		return Err(EngineError::unsupported("registry source requires a registry reference"));
 	}
 	Ok(())
 }
@@ -1050,7 +1056,14 @@ fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static str> 
 		pb::CpuArchitecture::Amd64 => Ok("amd64"),
 		pb::CpuArchitecture::Arm64 => Ok("arm64"),
 		pb::CpuArchitecture::Unspecified => {
-			Err(EngineError::invalid("function image architecture is required"))
+			#[cfg(target_arch = "x86_64")]
+			return Ok("amd64");
+			#[cfg(target_arch = "aarch64")]
+			return Ok("arm64");
+			#[allow(unreachable_code)]
+			Err(EngineError::unsupported(
+				"server compile-target architecture is unsupported for function images",
+			))
 		},
 	}
 }
@@ -1207,6 +1220,81 @@ mod tests {
 	fn artifact_ref(byte: u8) -> pb::ArtifactRef {
 		pb::ArtifactRef { digest: Some(digest(byte)) }
 	}
+	#[test]
+	fn sdk_defaults_use_host_architecture_and_accept_major_minor_python() {
+		let (_temp, home) = home();
+		let arch = architecture_name(pb::CpuArchitecture::Unspecified).unwrap();
+		let backend =
+			FakeBackend { digest: hex::encode([7u8; 32]), arch, builds: AtomicUsize::new(0) };
+		let spec = pb::ImageSpec {
+			source: Some(pb::image_spec::Source::Python(pb::PythonImageSource {
+				python_version: "3.14".into(),
+				variant:        "slim".into(),
+			})),
+			..Default::default()
+		};
+		let realized =
+			realize_with(&backend, &home, &spec, pb::CpuArchitecture::Unspecified).unwrap();
+		assert_eq!(realized.resolved_spec.platform, format!("linux/{arch}"));
+		assert!(realized.image.unwrap().starts_with(PYTHON_REPOSITORY));
+
+		let mut unsupported = spec;
+		if let Some(pb::image_spec::Source::Python(source)) = &mut unsupported.source {
+			source.python_version = "2.7".into();
+		}
+		assert!(
+			realize_with(&backend, &home, &unsupported, pb::CpuArchitecture::Unspecified)
+				.unwrap_err()
+				.to_string()
+				.contains("supported Python 3")
+		);
+	}
+
+	#[test]
+	fn dockerfile_rejects_network_run_and_unpinned_external_copy() {
+		let digest = hex::encode([8u8; 32]);
+		assert!(
+			validate_dockerfile("FROM scratch\nRUN curl https://example.invalid/x\n")
+				.unwrap_err()
+				.to_string()
+				.contains("network")
+		);
+		assert!(
+			validate_dockerfile("FROM scratch\nCOPY --from=alpine:latest /bin/tool /bin/tool\n")
+				.unwrap_err()
+				.to_string()
+				.contains("must be pinned")
+		);
+		assert!(
+			validate_dockerfile(&format!(
+				"FROM scratch AS local\nCOPY --from=local /x /x\nCOPY \
+				 --from=repo/tool@sha256:{digest} /y /y\n"
+			))
+			.is_ok()
+		);
+	}
+	#[test]
+	fn stale_build_cache_is_verified_before_reuse() {
+		let (_temp, home) = home();
+		let mut spec = registry();
+		spec.uv_packages.push(pb::UvPackage {
+			name:               "httpx".into(),
+			version:            "0.27.0".into(),
+			index_url_presence: None,
+		});
+		spec.environment.insert("MODE".into(), "stable".into());
+		let first = FakeBackend::new(10);
+		let first_result = realize_with(&first, &home, &spec, pb::CpuArchitecture::Amd64).unwrap();
+		let replacement = FakeBackend::new(11);
+		let replacement_result =
+			realize_with(&replacement, &home, &spec, pb::CpuArchitecture::Amd64).unwrap();
+		assert_ne!(
+			first_result.resolved_spec.resolved_oci_digest,
+			replacement_result.resolved_spec.resolved_oci_digest
+		);
+		assert_eq!(replacement.builds.load(Ordering::SeqCst), 1);
+	}
+
 	fn registry() -> pb::ImageSpec {
 		pb::ImageSpec {
 			source: Some(pb::image_spec::Source::Registry(pb::RegistryImageSource {
@@ -1281,6 +1369,11 @@ mod tests {
 			path:      "/opt/model".into(),
 			read_only: true,
 		});
+		spec.local_artifact_mounts.push(pb::LocalArtifactMount {
+			artifact:  spec.local_artifact_mounts[0].artifact.clone(),
+			path:      "/opt/model-copy".into(),
+			read_only: true,
+		});
 		spec.uv_packages[0].index_url_presence =
 			Some(pb::uv_package::IndexUrlPresence::IndexUrl("https://packages.example/simple".into()));
 		let backend = FakeBackend::new(3);
@@ -1304,6 +1397,7 @@ mod tests {
 		for expected in [
 			"curl=8.1.2-1",
 			"httpx==0.27.0",
+			"python\",\"-m\",\"pip\",\"install",
 			"https://packages.example/simple",
 			"compileall",
 			"MODE=\"prod\"",

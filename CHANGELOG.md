@@ -29,6 +29,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `v1/apps/{namespace}/{app}/functions/{binding}/invoke` endpoint for app-bound invocations
+- Added runtime protocol negotiation ensuring runner capabilities match function requirements
+- Added I-JSON serialization safety checks, rejecting lone UTF-16 surrogates and non-string keys
+- Added actor checkpoint state purpose validation to prevent public misuse of internal envelopes
 - Added validation for function High Availability (HA) configurations, rejecting invalid setups
 - Added application rollback support via `App.rollback` to revert to previous revisions
 - Added `egress` network policy options to `App.function` for granular outbound traffic control
@@ -159,6 +163,10 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated durable function runner to use bidirectional protocol handshake for capability discovery
+- Refined checkpointing to include granular timing metrics for snapshot, stamp, and indexing steps
+- Updated SQLite schema to version 5 for improved durable execution tracking
+- Upgraded `invoke` endpoints to require strict JSON serialization for inputs and results
 - Updated SDK health, info, and event response handling to enforce strict object validation
 - Upgraded `Sandbox.network` and `Sandbox.set_network` in SDKs to use typed `SandboxNetworkPolicy`
 - Changed SDK `Sandbox.tunnels` to return a `TunnelSet` object containing host/port targets
@@ -225,6 +233,10 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed concurrent actor initialization to prevent redundant constructor execution
+- Resolved durability race conditions in input stream handling and state recovery
+- Corrected artifact validation logic to prevent truncation-based bypasses
+- Fixed TTY stdin forwarding to ensure graceful EOF handling and prevent daemon crashes
 - Fixed durability of call event stream, ensuring reliable reconnection and recovery from lag
 - Fixed artifact download range and TTL metadata handling to ensure accuracy and consistency
 - Improved TTY-based command execution reliability and stdin handling

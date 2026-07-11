@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use super::{ProtocolError, ProtocolSession};
+use super::{ProtocolError, ProtocolRequirements, ProtocolSession};
 use crate::{
 	Result,
 	engine::{ExecControl, ExecExit, ExecStream},
@@ -73,11 +73,16 @@ async fn connected(capacity: usize) -> (ProtocolSession, Peer) {
 	let (stream, peer) = stream();
 	peer
 		.stdout
-		.send(line(json!({"protocol":2,"type":"hello","version":2})))
+		.send(line(json!({"protocol":2,"type":"hello","version":2,"envelope_version":1,"formats":["json"],"compressions":["none","gzip"]})))
 		.unwrap();
-	let session = ProtocolSession::connect(stream, Duration::from_secs(1), capacity)
-		.await
-		.unwrap();
+	let session = ProtocolSession::connect(
+		stream,
+		Duration::from_secs(1),
+		capacity,
+		ProtocolRequirements::default(),
+	)
+	.await
+	.unwrap();
 	(session, peer)
 }
 
@@ -86,13 +91,96 @@ async fn rejects_wrong_runner_version() {
 	let (stream, peer) = stream();
 	peer
 		.stdout
-		.send(line(json!({"protocol":2,"type":"hello","version":3})))
+		.send(line(json!({"protocol":2,"type":"hello","version":3,"envelope_version":1,"formats":["json"],"compressions":["none","gzip"]})))
 		.unwrap();
-	let error = ProtocolSession::connect(stream, Duration::from_secs(1), 2)
-		.await
-		.err()
-		.unwrap();
+	let error =
+		ProtocolSession::connect(stream, Duration::from_secs(1), 2, ProtocolRequirements::default())
+			.await
+			.err()
+			.unwrap();
 	assert_eq!(error, ProtocolError::Version { received: Some(3) });
+}
+
+async fn negotiate(
+	hello: Value,
+	requirements: ProtocolRequirements,
+) -> Result<ProtocolSession, ProtocolError> {
+	let (stream, peer) = stream();
+	peer.stdout.send(line(hello)).unwrap();
+	ProtocolSession::connect(stream, Duration::from_secs(1), 2, requirements).await
+}
+
+fn hello(formats: Value, compressions: Value) -> Value {
+	json!({
+		"protocol": 2,
+		"type": "hello",
+		"version": 2,
+		"envelope_version": 1,
+		"formats": formats,
+		"compressions": compressions,
+	})
+}
+
+#[tokio::test]
+async fn rejects_wrong_envelope_version() {
+	let mut value = hello(json!(["json"]), json!(["none", "gzip"]));
+	value["envelope_version"] = json!(2);
+	assert_eq!(
+		negotiate(value, ProtocolRequirements::default())
+			.await
+			.err()
+			.unwrap(),
+		ProtocolError::EnvelopeVersion { received: Some(2) }
+	);
+}
+
+#[tokio::test]
+async fn rejects_malformed_capability_lists() {
+	for (field, formats, compressions) in [
+		("formats", json!("json"), json!(["none", "gzip"])),
+		("formats", json!(["json", 1]), json!(["none", "gzip"])),
+		("compressions", json!(["json"]), json!({"none": true})),
+		("compressions", json!(["json"]), json!(["none", false])),
+	] {
+		assert_eq!(
+			negotiate(hello(formats, compressions), ProtocolRequirements::default())
+				.await
+				.err()
+				.unwrap(),
+			ProtocolError::InvalidCapabilities { field }
+		);
+	}
+}
+
+#[tokio::test]
+async fn rejects_missing_policy_codecs() {
+	for (field, capability, requirements) in [
+		("formats", "cbor", ProtocolRequirements::default().require_format("cbor")),
+		("formats", "cloudpickle", ProtocolRequirements::default().require_format("cloudpickle")),
+		("compressions", "zstd", ProtocolRequirements::default().require_compression("zstd")),
+	] {
+		assert_eq!(
+			negotiate(hello(json!(["json"]), json!(["none", "gzip"])), requirements)
+				.await
+				.err()
+				.unwrap(),
+			ProtocolError::MissingCapability { field, capability: capability.into() }
+		);
+	}
+}
+
+#[tokio::test]
+async fn accepts_matching_policy_capabilities() {
+	let requirements = ProtocolRequirements::default()
+		.require_format("cbor")
+		.require_format("cloudpickle")
+		.require_compression("zstd");
+	negotiate(
+		hello(json!(["json", "cbor", "cloudpickle"]), json!(["none", "gzip", "zstd"])),
+		requirements,
+	)
+	.await
+	.unwrap();
 }
 
 #[tokio::test]

@@ -22,6 +22,47 @@ pub const PROTOCOL_VERSION: u64 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Default number of event frames retained per active request.
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
+/// Immutable runner capabilities required by a function revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolRequirements {
+	formats:      Vec<String>,
+	compressions: Vec<String>,
+}
+
+impl ProtocolRequirements {
+	/// Baseline protocol requirements used by callers that only exchange JSON
+	/// envelopes with no optional compression.
+	pub fn baseline() -> Self {
+		Self { formats: vec!["json".into()], compressions: vec!["none".into(), "gzip".into()] }
+	}
+
+	/// Add a serializer required by the immutable function policy.
+	pub fn require_format(mut self, format: impl Into<String>) -> Self {
+		let format = format.into();
+		if !self.formats.contains(&format) {
+			self.formats.push(format);
+		}
+		self
+	}
+
+	/// Add a compression codec required by the immutable function policy.
+	pub fn require_compression(mut self, compression: impl Into<String>) -> Self {
+		let compression = compression.into();
+		if !self.compressions.contains(&compression) {
+			self.compressions.push(compression);
+		}
+		self
+	}
+}
+
+impl Default for ProtocolRequirements {
+	fn default() -> Self {
+		Self::baseline()
+	}
+}
+
+/// Value envelope version supported by this daemon.
+pub const ENVELOPE_VERSION: u64 = 1;
 
 /// A validated protocol frame emitted by the runner.
 #[derive(Clone, Debug)]
@@ -55,6 +96,12 @@ pub enum ProtocolError {
 	Timeout,
 	/// The peer does not implement protocol v2.
 	Version { received: Option<u64> },
+	/// The peer does not implement value envelope v1.
+	EnvelopeVersion { received: Option<u64> },
+	/// A hello capability list was absent or malformed.
+	InvalidCapabilities { field: &'static str },
+	/// The immutable function policy requires an unavailable runner codec.
+	MissingCapability { field: &'static str, capability: String },
 	/// A malformed or oversized frame was received.
 	InvalidFrame(String),
 	/// A bounded request consumer did not keep up with the runner.
@@ -69,6 +116,15 @@ impl fmt::Display for ProtocolError {
 			Self::Timeout => f.write_str("runner protocol deadline exceeded"),
 			Self::Version { received } => {
 				write!(f, "runner protocol version mismatch: expected 2, received {received:?}")
+			},
+			Self::EnvelopeVersion { received } => {
+				write!(f, "runner envelope version mismatch: expected 1, received {received:?}")
+			},
+			Self::InvalidCapabilities { field } => {
+				write!(f, "runner hello {field} must be an array of strings")
+			},
+			Self::MissingCapability { field, capability } => {
+				write!(f, "runner does not support required {field} {capability}")
 			},
 			Self::InvalidFrame(message)
 			| Self::Backpressure(message)
@@ -123,6 +179,7 @@ impl ProtocolSession {
 		stream: ExecStream,
 		timeout: Duration,
 		event_capacity: usize,
+		requirements: ProtocolRequirements,
 	) -> Result<Self, ProtocolError> {
 		let (hello_tx, hello_rx) = oneshot::channel();
 		let inner = Arc::new(Inner {
@@ -145,6 +202,13 @@ impl ProtocolSession {
 			inner.closed.store(true, Ordering::Release);
 			return Err(ProtocolError::Version { received });
 		}
+		let received = hello.0.get("envelope_version").and_then(Value::as_u64);
+		if received != Some(ENVELOPE_VERSION) {
+			inner.closed.store(true, Ordering::Release);
+			return Err(ProtocolError::EnvelopeVersion { received });
+		}
+		validate_capabilities(&hello.0, "formats", &requirements.formats)?;
+		validate_capabilities(&hello.0, "compressions", &requirements.compressions)?;
 		Ok(Self { inner })
 	}
 
@@ -276,6 +340,29 @@ impl ProtocolSession {
 			.kill(9)
 			.map_err(|e| ProtocolError::Disconnected(e.to_string()))
 	}
+}
+
+fn validate_capabilities(
+	hello: &Value,
+	field: &'static str,
+	required: &[String],
+) -> Result<(), ProtocolError> {
+	let advertised = hello
+		.get(field)
+		.and_then(Value::as_array)
+		.ok_or(ProtocolError::InvalidCapabilities { field })?;
+	if advertised.iter().any(|capability| !capability.is_string()) {
+		return Err(ProtocolError::InvalidCapabilities { field });
+	}
+	for capability in required {
+		if !advertised
+			.iter()
+			.any(|advertised| advertised.as_str() == Some(capability))
+		{
+			return Err(ProtocolError::MissingCapability { field, capability: capability.clone() });
+		}
+	}
+	Ok(())
 }
 
 fn dispatch(inner: &Arc<Inner>, bytes: &[u8]) -> Result<(), ProtocolError> {
