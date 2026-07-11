@@ -1429,11 +1429,16 @@ async fn replicate_record(
 /// Live ("teleport") migration: stream the bulk checkpoint while the source
 /// keeps running, then suspend, ship only the RAM/disk delta, and resume on
 /// the target. Downtime is bounded by the delta size, not the full image.
+///
+/// The returned view carries a `migration` object with `precopy_ms` (source
+/// kept running), `downtime_ms` (suspend until the target VM runs), and
+/// `total_ms`.
 pub(crate) async fn migrate_sandbox_to(
 	state: &MeshRouteState,
 	sandbox_id: String,
 	target: String,
 ) -> RouteResult<Value> {
+	let started = Instant::now();
 	let peer = map_mesh(state.mesh.migration_target(&target))?;
 	// Phase 1 (pre-copy): checkpoint the running sandbox and let the target
 	// pull the bulk RAM+disk image; the source resumes right after the dump.
@@ -1463,6 +1468,10 @@ pub(crate) async fn migrate_sandbox_to(
 			format!("migration pre-copy to {target} failed (source unaffected): {}", err.message),
 		));
 	}
+	let precopy_ms = started.elapsed().as_millis() as u64;
+	// Everything from here until the target confirms the restore is guest
+	// blackout: finalize pauses the VM as its first effect.
+	let blackout = Instant::now();
 	// Phase 2 (suspend + delta): pause the source, capture what changed since
 	// the pre-copy, and stop it exactly at the delta. A finalize failure
 	// leaves the source running.
@@ -1492,7 +1501,7 @@ pub(crate) async fn migrate_sandbox_to(
 		"params": fin.params.clone(),
 		"epoch": epoch,
 	});
-	let view = match state
+	let mut view = match state
 		.transport
 		.post(
 			&peer.advertise,
@@ -1521,6 +1530,7 @@ pub(crate) async fn migrate_sandbox_to(
 			));
 		},
 	};
+	let downtime_ms = blackout.elapsed().as_millis() as u64;
 	state.mesh.broadcast_owner(&sandbox_id, &target, epoch);
 	if let Some(mut record) = map_mesh(state.records.get(&sandbox_id))? {
 		record.owner = target.clone();
@@ -1545,6 +1555,16 @@ pub(crate) async fn migrate_sandbox_to(
 			)
 			.await,
 	)?;
+	if let Value::Object(map) = &mut view {
+		map.insert(
+			"migration".to_owned(),
+			json!({
+				"precopy_ms": precopy_ms,
+				"downtime_ms": downtime_ms,
+				"total_ms": started.elapsed().as_millis() as u64,
+			}),
+		);
+	}
 	Ok(view)
 }
 

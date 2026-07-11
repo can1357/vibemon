@@ -165,34 +165,42 @@ func (client *Client) ExtendSandbox(
 	return result, nil
 }
 
-// MigrateSandbox moves a sandbox to a target mesh node and returns the opaque mesh result.
+// MigrateSandbox live-migrates ("teleports") a sandbox to a target mesh node
+// and returns the target-side view plus the migration's phase latencies.
 func (client *Client) MigrateSandbox(
 	ctx context.Context,
 	id string,
 	target string,
 ) (MigrateResult, error) {
 	if err := requireIdentifier("sandbox id", id); err != nil {
-		return nil, err
+		return MigrateResult{}, err
 	}
 	if err := requireIdentifier("target node id", target); err != nil {
-		return nil, err
+		return MigrateResult{}, err
 	}
-	var result MigrateResult
 	body := struct {
 		Target string `json:"target"`
 	}{Target: target}
+	var view Sandbox
 	if err := client.doJSON(
 		ctx,
 		http.MethodPost,
 		sandboxPath(id)+"/migrate",
 		nil,
 		body,
-		&result,
+		&view,
 	); err != nil {
-		return nil, err
+		return MigrateResult{}, err
 	}
-	if result == nil {
-		return nil, &ProtocolError{Operation: "migrate sandbox", Message: "response is not an object"}
+	result := MigrateResult{Sandbox: view}
+	if raw, ok := view.Details["migration"]; ok {
+		if err := json.Unmarshal(raw, &result.Migration); err != nil {
+			return MigrateResult{}, &ProtocolError{
+				Operation: "migrate sandbox",
+				Message:   "invalid migration timings",
+				Err:       err,
+			}
+		}
 	}
 	return result, nil
 }

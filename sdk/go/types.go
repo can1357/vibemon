@@ -161,8 +161,54 @@ type ExtendResult struct {
 	DeadlineUnix int64 `json:"deadline_unix"`
 }
 
-// MigrateResult is the mesh-defined object returned after migrating a sandbox.
-type MigrateResult map[string]any
+// MigrationTiming reports the phase latencies of one live ("teleport")
+// migration as measured by the source node.
+type MigrationTiming struct {
+	// PrecopyMS is the bulk RAM+disk streaming phase; the guest keeps running.
+	PrecopyMS uint64 `json:"precopy_ms"`
+	// DowntimeMS is the guest blackout: suspended on the source until the
+	// target node reports the VM running.
+	DowntimeMS uint64 `json:"downtime_ms"`
+	// TotalMS is the duration of the whole migrate call.
+	TotalMS uint64 `json:"total_ms"`
+}
+
+// MigrateResult is the outcome of one live migration.
+type MigrateResult struct {
+	// Sandbox is the restored sandbox's view as reported by the target node;
+	// follow-up calls should use a client for that node.
+	Sandbox Sandbox
+	// Migration reports the migration's phase latencies.
+	Migration MigrationTiming
+}
+
+// MeshPeer is one known member in a node's mesh status view.
+type MeshPeer struct {
+	// NodeID is the peer's stable mesh identifier.
+	NodeID string `json:"node_id"`
+	// Advertise is the peer's advertised API URL.
+	Advertise string `json:"advertise"`
+	// Region is the peer's placement region.
+	Region string `json:"region"`
+}
+
+// MeshStatus is a node's mesh membership summary.
+type MeshStatus struct {
+	// Enabled reports whether the node participates in a mesh.
+	Enabled bool `json:"enabled"`
+	// NodeID is this node's stable mesh identifier.
+	NodeID string `json:"node_id"`
+	// Advertise is this node's advertised API URL.
+	Advertise string `json:"advertise"`
+	// Region is this node's placement region.
+	Region string `json:"region"`
+	// ExpectedMembers is the configured cluster size.
+	ExpectedMembers uint64 `json:"expected_members"`
+	// Quorum is the strict majority needed for quorum-gated operations.
+	Quorum uint64 `json:"quorum"`
+	// Peers lists the currently known other members.
+	Peers []MeshPeer `json:"peers"`
+}
 
 // ExecRequest describes a command to run inside a sandbox.
 type ExecRequest struct {

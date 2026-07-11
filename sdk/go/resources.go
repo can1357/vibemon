@@ -32,6 +32,15 @@ func (client *Client) Info(ctx context.Context) (ServerInfo, error) {
 	return info, nil
 }
 
+// MeshStatus returns this node's mesh membership summary.
+func (client *Client) MeshStatus(ctx context.Context) (MeshStatus, error) {
+	var status MeshStatus
+	if err := client.doJSON(ctx, http.MethodGet, "/v1/mesh/status", nil, nil, &status); err != nil {
+		return MeshStatus{}, err
+	}
+	return status, nil
+}
+
 // OpenAPISchema returns the daemon's current OpenAPI document as validated JSON.
 func (client *Client) OpenAPISchema(ctx context.Context) (json.RawMessage, error) {
 	request, err := client.newRequest(ctx, http.MethodGet, "/v1/openapi.json", nil, nil, "")
