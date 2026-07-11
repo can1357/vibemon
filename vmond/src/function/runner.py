@@ -16,6 +16,7 @@ import importlib
 import inspect
 import io
 import json
+import math
 import os
 import platform
 import shutil
@@ -33,7 +34,6 @@ from typing import Any, Optional
 
 PROTOCOL_VERSION = 2
 ENVELOPE_VERSION = 1
-CLOUDPICKLE_CODEC_VERSION = 1
 MAX_FRAME_BYTES = int(os.environ.get("VMON_RUNNER_MAX_FRAME_BYTES", str(16 * 1024 * 1024)))
 MAX_VALUE_BYTES = int(os.environ.get("VMON_RUNNER_MAX_VALUE_BYTES", str(64 * 1024 * 1024)))
 MAX_DEFINITIONS = int(os.environ.get("VMON_RUNNER_MAX_DEFINITIONS", "4096"))
@@ -72,6 +72,65 @@ class CurrentCall:
     execution_mode: str = ""
     actor_id: Optional[str] = None
     deadline_unix_ms: Optional[int] = None
+
+
+IJSON_MAX_INTEGER = (1 << 53) - 1
+
+
+def _validate_ijson(value):
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, int):
+        if value < -IJSON_MAX_INTEGER or value > IJSON_MAX_INTEGER:
+            raise SerializationError("JSON integer exceeds interoperable safe range")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise SerializationError("JSON numbers must be finite")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_ijson(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise SerializationError("JSON object keys must be strings")
+            _validate_ijson(item)
+        return
+    raise SerializationError("value of type %s is not JSON serializable" %
+                             type(value).__name__)
+
+
+def _json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise SerializationError("JSON object contains duplicate key %r" % key)
+        result[key] = value
+    return result
+
+
+def _json_loads(data):
+    try:
+        value = json.loads(
+            data.decode("utf-8") if isinstance(data, bytes) else data,
+            object_pairs_hook=_json_pairs,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                SerializationError("JSON number %s is not finite" % constant)))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SerializationError("invalid UTF-8 JSON: %s" % exc) from exc
+    _validate_ijson(value)
+    return value
+
+
+def _canonical(value):
+    _validate_ijson(value)
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                          allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise SerializationError("JSON serialization failed: %s" % exc) from exc
 
 
 def current_call():
@@ -117,9 +176,16 @@ def _cloudpickle():
     except ImportError as exc:
         raise RuntimeError("cloudpickle codec requested but cloudpickle is not installed in the guest") from exc
     return cloudpickle
+def _cloudpickle_version():
+    version = getattr(_cloudpickle(), "__version__", None)
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("installed cloudpickle does not expose a usable __version__")
+    return version
 
 
-def decode_value(envelope, trusted=False):
+
+
+def decode_value(envelope, trusted=False, cloudpickle_version=None):
     if not isinstance(envelope, dict) or "format" not in envelope:
         raise ValueError("value must be a versioned envelope with a format")
     version = envelope.get("version")
@@ -155,6 +221,12 @@ def decode_value(envelope, trusted=False):
                     os.remove(path)
                 except OSError:
                     pass
+    expected_size = envelope.get("uncompressed_size")
+    if (isinstance(expected_size, bool) or not isinstance(expected_size, int) or
+            expected_size < 0):
+        raise ValueError("value uncompressed_size must be a non-negative integer")
+    if expected_size > MAX_VALUE_BYTES:
+        raise ValueError("value uncompressed_size exceeds %d-byte limit" % MAX_VALUE_BYTES)
     compression = envelope.get("compression", "none")
     if compression in (None, "", "none"):
         data = stored
@@ -167,22 +239,27 @@ def decode_value(envelope, trusted=False):
             import zstandard  # type: ignore
         except ImportError as exc:
             raise RuntimeError("zstd-compressed value requested but zstandard is not installed") from exc
-        data = zstandard.ZstdDecompressor().decompress(stored, max_output_size=MAX_VALUE_BYTES)
+        content_size = zstandard.frame_content_size(stored)
+        unknown_sizes = {
+            getattr(zstandard, "CONTENTSIZE_UNKNOWN", -1),
+            getattr(zstandard, "CONTENTSIZE_ERROR", -2),
+        }
+        if content_size not in unknown_sizes and content_size > MAX_VALUE_BYTES:
+            raise ValueError("zstd frame content size exceeds %d-byte limit" % MAX_VALUE_BYTES)
+        decompressor = zstandard.ZstdDecompressor(max_window_size=MAX_VALUE_BYTES)
+        with decompressor.stream_reader(io.BytesIO(stored)) as source:
+            data = source.read(MAX_VALUE_BYTES + 1)
     else:
         raise ValueError("unsupported envelope compression %r" % compression)
     if len(data) > MAX_VALUE_BYTES:
         raise ValueError("decoded value exceeds %d-byte limit" % MAX_VALUE_BYTES)
-    expected_size = envelope.get("uncompressed_size")
-    if expected_size is None or int(expected_size) != len(data):
-        raise ValueError("value uncompressed_size mismatch: expected %r, decoded %d" %
+    if len(data) != expected_size:
+        raise ValueError("value uncompressed_size mismatch: expected %d, decoded %d" %
                          (expected_size, len(data)))
     _verify_checksum(envelope.get("sha256"), data)
     value_format = envelope.get("format")
     if value_format == "json":
-        try:
-            return json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("JSON envelope is not valid UTF-8 JSON") from exc
+        return _json_loads(data)
     if value_format == "cbor":
         try:
             import cbor2  # type: ignore
@@ -190,14 +267,18 @@ def decode_value(envelope, trusted=False):
             raise RuntimeError("CBOR codec requested but cbor2 is not installed in the guest") from exc
         return cbor2.loads(data)
     if value_format == "cloudpickle":
-        if not trusted or envelope.get("trusted") is False:
-            raise ValueError("cloudpickle is executable data and requires trusted=true")
+        if not trusted:
+            raise ValueError("cloudpickle is executable data and requires top-level trusted=true")
         abi = envelope.get("python_abi")
         if abi != _python_abi():
             raise ValueError("cloudpickle Python ABI mismatch: payload requires %r, guest is %r" % (abi, _python_abi()))
-        codec_version = envelope.get("codec_version")
-        if codec_version != CLOUDPICKLE_CODEC_VERSION:
-            raise ValueError("unsupported cloudpickle codec_version %r; runner supports %d" % (codec_version, CLOUDPICKLE_CODEC_VERSION))
+        installed = _cloudpickle_version()
+        declared = envelope.get("cloudpickle_version")
+        if not isinstance(cloudpickle_version, str):
+            raise ValueError("trusted cloudpickle frame is missing cloudpickle_version authority")
+        if declared != cloudpickle_version or declared != installed:
+            raise ValueError("cloudpickle version mismatch: envelope %r, authorized %r, installed %r" %
+                             (declared, cloudpickle_version, installed))
         return _cloudpickle().loads(data)
     raise ValueError("unsupported value format %r; expected json, cbor, or cloudpickle" % value_format)
 
@@ -260,9 +341,10 @@ def _cleanup_spills():
             pass
 
 
-def encode_value(value, value_format="json", spill=True):
+def encode_value(value, value_format="json", spill=True, compression="none",
+                 redact_secrets=True, reject_secrets=True):
     secrets = _CALL.get().get("_secrets", set()) if _CALL.get() else set()
-    value = _redact(value, secrets)
+    value = _redact(value, secrets) if redact_secrets else value
     if value_format == "json":
         data = _canonical(value)
         extra = {}
@@ -275,20 +357,35 @@ def encode_value(value, value_format="json", spill=True):
         extra = {}
     elif value_format == "cloudpickle":
         data = _cloudpickle().dumps(value)
-        extra = {"python_abi": _python_abi(), "codec_version": CLOUDPICKLE_CODEC_VERSION}
+        extra = {"python_abi": _python_abi(), "cloudpickle_version": _cloudpickle_version()}
     else:
         raise ValueError("unsupported output format %r" % value_format)
     if len(data) > MAX_VALUE_BYTES:
         raise ValueError("encoded value exceeds %d-byte limit" % MAX_VALUE_BYTES)
-    for secret in secrets:
-        if secret.encode("utf-8") in data:
-            raise ValueError("refusing to encode a value containing secret material")
+    if reject_secrets:
+        for secret in secrets:
+            if secret.encode("utf-8") in data:
+                raise ValueError("refusing to encode a value containing secret material")
+    if compression in (None, "", "none"):
+        stored = data
+        compression = "none"
+    elif compression == "gzip":
+        import gzip
+        stored = gzip.compress(data)
+    elif compression == "zstd":
+        try:
+            import zstandard  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("zstd output requested but zstandard is not installed") from exc
+        stored = zstandard.ZstdCompressor().compress(data)
+    else:
+        raise ValueError("unsupported output compression %r" % compression)
     result = {"version": ENVELOPE_VERSION, "format": value_format,
-              "inline_data": base64.b64encode(data).decode("ascii"),
+              "inline_data": base64.b64encode(stored).decode("ascii"),
               "uncompressed_size": len(data), "sha256": _checksum(data),
-              "compression": "none"}
+              "compression": compression}
     result.update(extra)
-    return _spill_data(result, data) if spill and len(data) > SPILL_THRESHOLD_BYTES else result
+    return _spill_data(result, stored) if spill and len(stored) > SPILL_THRESHOLD_BYTES else result
 
 
 class ActorLostError(RuntimeError):
@@ -298,6 +395,14 @@ class ActorLostError(RuntimeError):
 class RemoteFunctionError(RuntimeError):
     pass
 
+
+class CheckpointContainsSecret(RuntimeError):
+    pass
+
+
+
+class SerializationError(ValueError):
+    pass
 
 def _decorator(name, lifecycle=None):
     def decorate(*decorator_args, **decorator_kwargs):
@@ -560,6 +665,7 @@ class Definition:
     cleanup_root: Optional[str] = None
     serialized_methods: bool = True
     secrets: set = field(default_factory=set)
+    secret_names: set = field(default_factory=set)
 
 
 @dataclass
@@ -571,6 +677,24 @@ class Actor:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+def _contains_secret(value, names, secrets, seen=None):
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    if isinstance(value, str):
+        return value in names or any(secret in value for secret in secrets)
+    if isinstance(value, bytes):
+        return any(secret.encode("utf-8") in value for secret in secrets)
+    if isinstance(value, dict):
+        return any(_contains_secret(key, names, secrets, seen) or
+                   _contains_secret(item, names, secrets, seen)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_secret(item, names, secrets, seen) for item in value)
+    return False
 def _bounded_error_text(value, limit=131072, representation=False):
     try:
         text = repr(value) if representation else str(value)
@@ -597,6 +721,7 @@ class Runner:
         self.definitions = {}
         self.actors = {}
         self.checkpoints = {}
+        self.services = {}
         self.package_cache = {}
         self.checkpoint_bytes = 0
         self.running = {}
@@ -617,6 +742,12 @@ class Runner:
                 "traceback": _exception_traceback(exc),
             }
         }
+        if isinstance(exc, ActorLostError):
+            fields["error"]["code"] = "actor_lost"
+        if isinstance(exc, CheckpointContainsSecret):
+            fields["error"]["code"] = "checkpoint_contains_secret"
+        if isinstance(exc, SerializationError):
+            fields["error"]["code"] = "serialization_error"
         if phase:
             fields["error"]["phase"] = phase
         cause = exc.__cause__ or exc.__context__
@@ -782,6 +913,7 @@ class Runner:
                 raise ValueError("definition %r is already initialized at revision %r; refusing revision %r" %
                                  (definition_id, old.revision, revision))
             old.secrets = _secret_strings(frame.get("secrets", {}))
+            old.secret_names = set(frame.get("secrets", {}))
             _WRITER.emit("status", request_id, status="already_initialized",
                          definition_id=definition_id, revision=revision,
                          callable_kind=self._callable_kind(old.target))
@@ -801,7 +933,8 @@ class Runner:
                 raise
         elif mode in ("serialized", "cloudpickle"):
             payload = spec.get("value") or spec.get("payload")
-            target = decode_value(payload, trusted=bool(spec.get("trusted")))
+            target = decode_value(payload, trusted=bool(frame.get("trusted")),
+                                  cloudpickle_version=frame.get("cloudpickle_version"))
             root = None
         else:
             raise ValueError("definition mode must be package or serialized")
@@ -812,14 +945,14 @@ class Runner:
         if serialized_methods is None:
             serialized_methods = metadata.get("kind") != "concurrent"
         definition_secrets = _secret_strings(frame.get("secrets", {}))
+        definition_secret_names = set(frame.get("secrets", {}))
         self.definitions[definition_id] = Definition(
             definition_id, revision, target, mode, root, cleanup_root,
-            bool(serialized_methods), definition_secrets)
+            bool(serialized_methods), definition_secrets, definition_secret_names)
         callable_kind = self._callable_kind(target)
         _WRITER.emit("status", request_id, status="initialized",
                      definition_id=definition_id, revision=revision,
                      callable_kind=callable_kind)
-
     def _call_meta(self, frame):
         secrets = _secret_strings(frame.get("secrets", {}))
         definition_id = frame.get("definition_id")
@@ -843,20 +976,51 @@ class Runner:
             "deadline_unix_ms": frame.get("deadline_unix_ms"),
             "_secrets": secrets,
             "_closed": threading.Event(),
-        }
-
     def _decode_args(self, frame):
-        if "args" in frame:
-            args = decode_value(frame["args"], trusted=bool(frame.get("trusted")))
+        trusted = bool(frame.get("trusted"))
+        cloudpickle_version = frame.get("cloudpickle_version")
+        if "positional" in frame or "named" in frame:
+            if "input" in frame or "args" in frame or "kwargs" in frame:
+                raise ValueError("invocation must use exactly one input representation")
+            positional = frame.get("positional", [])
+            named = frame.get("named", {})
+            if not isinstance(positional, list) or not isinstance(named, dict):
+                raise TypeError("positional must be a list and named must be an object")
+            if any(not isinstance(key, str) for key in named):
+                raise TypeError("named argument keys must be strings")
+            args = [decode_value(item, trusted=trusted,
+                                 cloudpickle_version=cloudpickle_version)
+                    for item in positional]
+            kwargs = {key: decode_value(item, trusted=trusted,
+                                        cloudpickle_version=cloudpickle_version)
+                      for key, item in named.items()}
+        elif "args" in frame:
+            args = decode_value(frame["args"], trusted=trusted,
+                                cloudpickle_version=cloudpickle_version)
             if not isinstance(args, (list, tuple)):
                 raise TypeError("args envelope must decode to a list or tuple")
+            kwargs = (decode_value(frame["kwargs"], trusted=trusted,
+                                   cloudpickle_version=cloudpickle_version)
+                      if "kwargs" in frame else {})
         elif "input" in frame:
-            args = [decode_value(frame["input"], trusted=bool(frame.get("trusted")))]
+            value = decode_value(frame["input"], trusted=trusted,
+                                 cloudpickle_version=cloudpickle_version)
+            tagged_keys = {"__vmon_python_call__", "args", "kwargs"}
+            if isinstance(value, dict) and set(value) == tagged_keys:
+                version = value["__vmon_python_call__"]
+                if isinstance(version, bool) or version != 1:
+                    raise ValueError("unsupported __vmon_python_call__ version %r" % version)
+                args, kwargs = value["args"], value["kwargs"]
+                if not isinstance(args, list):
+                    raise TypeError("tagged Python call args must be a list")
+                if not isinstance(kwargs, dict) or any(not isinstance(key, str) for key in kwargs):
+                    raise TypeError("tagged Python call kwargs must be an object with string keys")
+            else:
+                args, kwargs = [value], {}
         else:
-            args = []
-        kwargs = decode_value(frame["kwargs"], trusted=bool(frame.get("trusted"))) if "kwargs" in frame else {}
-        if not isinstance(kwargs, dict):
-            raise TypeError("kwargs envelope must decode to an object")
+            args, kwargs = [], {}
+        if not isinstance(kwargs, dict) or any(not isinstance(key, str) for key in kwargs):
+            raise TypeError("kwargs must be an object with string keys")
         return list(args), kwargs
 
     async def _invoke(self, function, args, kwargs, frame):
@@ -874,36 +1038,103 @@ class Runner:
 
     async def _emit_result(self, value, frame):
         request_id = frame["request_id"]
-        codec = frame.get("output_format", frame.get("output_codec", "json"))
+        compression = frame.get("output_compression", "none")
+        value_format = frame.get("output_format", frame.get("output_codec", "json"))
+        if value_format == "cloudpickle" and not frame.get("trusted"):
+            raise ValueError("cloudpickle output requires top-level trusted=true")
         if inspect.isasyncgen(value):
             index = 0
             async for item in value:
-                _WRITER.emit("yield", request_id, call_id=frame.get("call_id"), index=index,
-                             value=encode_value(item, codec))
+                _WRITER.emit("yield", request_id, index=index,
+                             value=encode_value(item, value_format, compression=compression))
                 index += 1
-            _WRITER.emit("result", request_id, call_id=frame.get("call_id"),
-                         value=encode_value(None, codec), yield_count=index)
+            _WRITER.emit("result", request_id,
+                         value=encode_value(None, value_format, compression=compression),
+                         yield_count=index)
             return
-        if inspect.isgenerator(value) or (frame.get("execution_mode") == "generator" and
-                                           hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict))):
+        if inspect.isgenerator(value) or (
+                frame.get("execution_mode") == "generator" and
+                hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict))):
             index = 0
             iterator = iter(value)
             loop = asyncio.get_running_loop()
             sentinel = object()
             while True:
                 context = contextvars.copy_context()
-                item = await loop.run_in_executor(self.executor, context.run,
-                                                  lambda: next(iterator, sentinel))
+                item = await loop.run_in_executor(
+                    self.executor, context.run, lambda: next(iterator, sentinel))
                 if item is sentinel:
                     break
-                _WRITER.emit("yield", request_id, call_id=frame.get("call_id"), index=index,
-                             value=encode_value(item, codec))
+                _WRITER.emit("yield", request_id, index=index,
+                             value=encode_value(item, value_format, compression=compression))
                 index += 1
-            _WRITER.emit("result", request_id, call_id=frame.get("call_id"),
-                         value=encode_value(None, codec), yield_count=index)
+            _WRITER.emit("result", request_id,
+                         value=encode_value(None, value_format, compression=compression),
+                         yield_count=index)
             return
-        _WRITER.emit("result", request_id, call_id=frame.get("call_id"),
-                     value=encode_value(value, codec))
+        _WRITER.emit("result", request_id,
+                     value=encode_value(value, value_format, compression=compression))
+
+    async def _invoke_service(self, definition, frame, payload=None):
+        if payload is None:
+            service_key = frame.get("service_key")
+            method_name = frame.get("method")
+            constructor = frame.get("constructor") or {}
+            if not isinstance(constructor, dict):
+                raise TypeError("service constructor must be an invocation object")
+            constructor_frame = {
+                "positional": constructor.get("positional", []),
+                "named": constructor.get("named", {}),
+                "trusted": frame.get("trusted", False),
+                "cloudpickle_version": frame.get("cloudpickle_version"),
+            }
+            constructor_args, constructor_kwargs = self._decode_args(constructor_frame)
+            args, kwargs = self._decode_args(frame)
+        else:
+            expected_keys = {
+                "kind", "service_key", "constructor_args", "constructor_kwargs",
+                "method", "args", "kwargs",
+            }
+            if set(payload) != expected_keys or payload.get("kind") != "vmon.service.v1":
+                raise ValueError("invalid vmon.service.v1 payload shape")
+            service_key = payload["service_key"]
+            method_name = payload["method"]
+            constructor_args, constructor_kwargs = (
+                payload["constructor_args"], payload["constructor_kwargs"])
+            args, kwargs = payload["args"], payload["kwargs"]
+        if not isinstance(service_key, str) or not service_key:
+            raise TypeError("service_key must be non-empty text")
+        if not isinstance(constructor_args, list) or not isinstance(args, list):
+            raise TypeError("service constructor and method positional args must be lists")
+        for name, value in (("constructor kwargs", constructor_kwargs),
+                            ("method kwargs", kwargs)):
+            if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+                raise TypeError("service %s must have string keys" % name)
+        if not isinstance(method_name, str) or method_name.startswith("_"):
+            raise ValueError("service method must be a public method name")
+        cache_key = (definition.revision, service_key)
+        instance = self.services.get(cache_key)
+        if instance is None:
+            instance = await self._invoke(
+                definition.target, constructor_args, constructor_kwargs, frame)
+            await self._run_hook(instance, "enter", frame)
+            self.services[cache_key] = instance
+        method_attribute = type(instance).__dict__.get(method_name)
+        if not getattr(method_attribute, "__vmon_method__", False):
+            raise ValueError("service method %r is not exported with @vmon.method" %
+                             method_name)
+        try:
+            return await self._invoke(getattr(instance, method_name), args, kwargs, frame)
+        except BaseException:
+            self.services.pop(cache_key, None)
+            try:
+                await self._shutdown_actor(
+                    Actor(service_key, definition.definition_id,
+                          definition.revision, instance), frame)
+            except BaseException:
+                pass
+            raise
+
 
     async def call(self, frame):
         request_id = frame.get("request_id")
@@ -913,7 +1144,7 @@ class Runner:
         meta = self._call_meta(frame)
         token = _CALL.set(meta)
         try:
-            definition_id = frame.get("definition_id")
+            definition_id = frame.get("definition_id") or frame.get("function_id")
             definition = self.definitions.get(definition_id)
             if definition is None:
                 raise KeyError("definition %r is not initialized" % definition_id)
@@ -921,7 +1152,16 @@ class Runner:
             if revision and revision != definition.revision:
                 raise ValueError("call revision %r does not match initialized revision %r" %
                                  (revision, definition.revision))
+            if frame.get("type") == "service_call":
+                value = await self._invoke_service(definition, frame)
+                await self._emit_result(value, frame)
+                return
             args, kwargs = self._decode_args(frame)
+            if (len(args) == 1 and not kwargs and isinstance(args[0], dict) and
+                    args[0].get("kind") == "vmon.service.v1"):
+                value = await self._invoke_service(definition, frame, args[0])
+                await self._emit_result(value, frame)
+                return
             if frame.get("execution_mode") == "batch":
                 if len(args) != 1 or not isinstance(args[0], list):
                     raise ValueError("batch call requires one list argument")
@@ -969,9 +1209,9 @@ class Runner:
                 args, kwargs = self._decode_args(frame)
                 value = await self._invoke(definition.target, args, kwargs, frame)
                 actor = Actor(actor_id, definition_id, definition.revision, value)
-                hook = self._find_hook(value, "enter")
-                if hook:
-                    entered = await self._invoke(hook, [], {}, frame)
+                hooks = self._find_hooks(value, "enter")
+                if hooks:
+                    entered = await self._run_hook(value, "enter", frame)
                 else:
                     hook = getattr(value, "__aenter__", None) or getattr(value, "__enter__", None)
                     entered = await self._invoke(hook, [], {}, frame) if hook else None
@@ -994,32 +1234,53 @@ class Runner:
                 definition = self.definitions.get(definition_id)
                 if definition is None or not inspect.isclass(definition.target):
                     raise KeyError("explicit restore of a lost actor requires its class definition_id")
-                state = decode_value(envelope, trusted=True)
+                state = decode_value(
+                    envelope,
+                    trusted=True if "state" not in frame else bool(frame.get("trusted")),
+                    cloudpickle_version=(envelope.get("cloudpickle_version")
+                                         if "state" not in frame
+                                         else frame.get("cloudpickle_version")))
                 value = definition.target.__new__(definition.target)
                 self._restore_actor_state(value, state)
                 actor = Actor(actor_id, definition_id, definition.revision, value)
-                await self._run_hook(value, "after_restore", frame)
+                await self._run_hook(value, "restore", frame)
                 self.actors[actor_id] = actor
                 _WRITER.emit("result", request_id, actor_id=actor_id,
                              value=encode_value({"restored": True, "recreated": True}))
                 return
             actor = self.actors.get(actor_id)
             if actor is None:
-                raise KeyError("actor %r is unavailable; explicit restore is required" % actor_id)
-            lock = actor.lock if self.definitions[actor.definition_id].serialized_methods else _NullAsyncLock()
+                raise ActorLostError("actor %r is unavailable; explicit restore is required" %
+                                     actor_id)
             async with lock:
                 if operation in ("actor_call", "method"):
                     method_name = frame.get("method")
                     if not method_name or method_name.startswith("_"):
                         raise ValueError("actor method must be a public method name")
+                    if not getattr(type(actor.value).__dict__.get(method_name),
+                                   "__vmon_method__", False):
+                        raise ValueError("actor method %r is not exported with @vmon.method" %
+                                         method_name)
                     method = getattr(actor.value, method_name)
                     args, kwargs = self._decode_args(frame)
                     result = await self._invoke(method, args, kwargs, frame)
                     await self._emit_result(result, frame)
                 elif operation in ("actor_checkpoint", "checkpoint"):
-                    await self._run_hook(actor.value, "before_snapshot", frame)
-                    state = _redact(self._actor_state(actor.value), meta["_secrets"])
-                    envelope = encode_value(state, "cloudpickle", spill=False)
+                    candidate = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
+                    await self._run_hook(candidate, "snapshot_enter", frame)
+                    state = self._actor_state(candidate)
+                    definition = self.definitions[actor.definition_id]
+                    if _contains_secret(state, definition.secret_names, definition.secrets):
+                        raise CheckpointContainsSecret(
+                            "actor checkpoint contains configured secret material")
+                    envelope = encode_value(
+                        state, "cloudpickle", spill=False,
+                        redact_secrets=False, reject_secrets=False)
+                    serialized = base64.b64decode(envelope["inline_data"])
+                    if any(secret.encode("utf-8") in serialized
+                           for secret in definition.secrets):
+                        raise CheckpointContainsSecret(
+                            "actor checkpoint serialization contains configured secret material")
                     checkpoint_id = frame.get("checkpoint_id") or request_id
                     checkpoint_key = (actor_id, checkpoint_id)
                     encoded_bytes = len(envelope["inline_data"])
@@ -1042,10 +1303,15 @@ class Runner:
                     envelope = frame.get("state") or self.checkpoints.get(checkpoint_key)
                     if envelope is None:
                         raise KeyError("checkpoint is unavailable; actor was not reinitialized")
-                    state = decode_value(envelope, trusted=True)
+                    state = decode_value(
+                        envelope,
+                        trusted=True if "state" not in frame else bool(frame.get("trusted")),
+                        cloudpickle_version=(envelope.get("cloudpickle_version")
+                                             if "state" not in frame
+                                             else frame.get("cloudpickle_version")))
                     candidate = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
                     self._restore_actor_state(candidate, state)
-                    await self._run_hook(candidate, "after_restore", frame)
+                    await self._run_hook(candidate, "restore", frame)
                     actor.value = candidate
                     _WRITER.emit("result", request_id, actor_id=actor_id,
                                  value=encode_value({"restored": True}))
@@ -1057,7 +1323,7 @@ class Runner:
                         raise RuntimeError("actor limit of %d reached" % MAX_ACTORS)
                     child_value = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
                     child = Actor(child_id, actor.definition_id, actor.revision, child_value)
-                    await self._run_hook(child.value, "after_restore", frame)
+                    await self._run_hook(child.value, "restore", frame)
                     self.actors[child_id] = child
                     _WRITER.emit("result", request_id, actor_id=actor_id, child_actor_id=child_id,
                                  value=encode_value({"actor_id": child_id}))
@@ -1107,27 +1373,43 @@ class Runner:
             return
 
     @staticmethod
-    def _find_hook(value, name):
-        hook = getattr(value, name, None)
-        if hook is not None:
-            return hook
-        marker = "__vmon_%s__" % name
-        for owner in type(value).__mro__:
+    def _find_hooks(value, name):
+        if name == "enter":
+            marker = "__vmon_enter__"
+            predicate = lambda item: not getattr(item, "__vmon_snapshot_enter__", False)
+        elif name == "snapshot_enter":
+            marker = "__vmon_enter__"
+            predicate = lambda item: bool(getattr(item, "__vmon_snapshot_enter__", False))
+        elif name == "restore":
+            marker = "__vmon_restore__"
+            predicate = lambda item: True
+        elif name == "exit":
+            marker = "__vmon_exit__"
+            predicate = lambda item: True
+        else:
+            return []
+        if getattr(value, marker, False) and predicate(value):
+            return [value]
+        hooks = []
+        for owner in reversed(type(value).__mro__):
             for attribute_name, attribute in owner.__dict__.items():
-                if getattr(attribute, marker, False):
-                    return getattr(value, attribute_name)
-        return None
+                if getattr(attribute, marker, False) and predicate(attribute):
+                    hooks.append(getattr(value, attribute_name))
+        return hooks
 
     async def _run_hook(self, value, name, frame):
-        hook = self._find_hook(value, name)
-        if hook:
-            return await self._invoke(hook, [], {}, frame)
-        return None
+        result = None
+        for hook in self._find_hooks(value, name):
+            hook_result = await self._invoke(hook, [], {}, frame)
+            if hook_result is not None:
+                result = hook_result
+        return result
 
     async def _shutdown_actor(self, actor, frame):
-        hook = self._find_hook(actor.value, "exit")
-        if hook:
-            await self._invoke(hook, [], {}, frame)
+        hooks = self._find_hooks(actor.value, "exit")
+        if hooks:
+            for hook in hooks:
+                await self._invoke(hook, [], {}, frame)
             return
         exit_hook = getattr(actor.value, "__aexit__", None) or getattr(actor.value, "__exit__", None)
         if exit_hook:
@@ -1143,7 +1425,7 @@ class Runner:
             meta["_secrets"].update(definition.secrets)
         token = _CALL.set(meta)
         operation = frame.get("type") or frame.get("operation")
-        hook_name = "before_snapshot" if operation == "before_snapshot" else "after_restore"
+        hook_name = "snapshot_enter" if operation == "before_snapshot" else "restore"
         try:
             for actor in list(self.actors.values()):
                 async with actor.lock:
@@ -1151,7 +1433,7 @@ class Runner:
             for definition in self.definitions.values():
                 if not inspect.isclass(definition.target):
                     await self._run_hook(definition.target, hook_name, frame)
-            _WRITER.emit("status", request_id, status=hook_name + "_complete")
+            _WRITER.emit("status", request_id, status=operation + "_complete")
         except BaseException as exc:
             _WRITER.emit("error", request_id, **self._error_fields(exc, hook_name))
         finally:
@@ -1187,7 +1469,7 @@ class Runner:
                 task.cancel()
             _WRITER.emit("status", frame.get("request_id"), status="shutting_down")
             return
-        if operation in ("call", "invoke"):
+        if operation in ("call", "invoke", "service_call"):
             coroutine = self.call(frame)
         elif operation in ("actor_create", "actor_call", "actor_checkpoint", "actor_restore",
                            "actor_fork", "actor_shutdown", "create", "method", "checkpoint",
@@ -1276,6 +1558,20 @@ class Runner:
                 pass
             finally:
                 _CALL.reset(token)
+        for (revision, service_key), instance in list(self.services.items()):
+            definition = next(
+                (item for item in self.definitions.values() if item.revision == revision), None)
+            if definition is not None:
+                frame = {"request_id": "shutdown", "definition_id": definition.definition_id}
+                token = _CALL.set(self._call_meta(frame))
+                try:
+                    await self._shutdown_actor(
+                        Actor(service_key, definition.definition_id, revision, instance), frame)
+                except BaseException:
+                    pass
+                finally:
+                    _CALL.reset(token)
+        self.services.clear()
         self.actors.clear()
         self.executor.shutdown(wait=False)
         for definition in self.definitions.values():
@@ -1327,12 +1623,17 @@ def _reader_thread(loop, incoming):
 
 
 def _emit_hello():
+    try:
+        cloudpickle_version = _cloudpickle_version()
+    except RuntimeError:
+        cloudpickle_version = None
+    formats = ["json", "cbor"] + (["cloudpickle"] if cloudpickle_version else [])
     _WRITER.emit("hello", None, version=PROTOCOL_VERSION, envelope_version=ENVELOPE_VERSION,
-                 cloudpickle_codec_version=CLOUDPICKLE_CODEC_VERSION, python_abi=_python_abi(),
-                 python=platform.python_version(), formats=["json", "cbor", "cloudpickle"],
+                 cloudpickle_version=cloudpickle_version, python_abi=_python_abi(),
+                 python=platform.python_version(), formats=formats,
                  capabilities=["package", "serialized", "async", "generator", "batch",
                                "actors", "checkpoint", "restore", "fork", "cancel", "deadline",
-                               "reconnect"])
+                               "reconnect", "services"])
 
 
 async def _process_item(runner, item):

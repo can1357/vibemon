@@ -6,6 +6,7 @@ All notable changes to this project are recorded here.
 
 ### Breaking Changes
 
+- Replaced `value` fields in `CreateCallRequest` with structured `payload` unions
 - Removed raw TCP transport; HTTP gateway is the only supported remote protocol
 - Removed `mesh.json` client configuration; named contexts are now required
 - Removed legacy snapshot format support (v1/v2); existing snapshots must be recaptured
@@ -27,6 +28,8 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `max_inputs_outstanding` flow control to `stream_inputs` for durable functions
+- Added incremental artifact uploading with size and quota validation
 - Added `ListResults` API for paginated retrieval of durable function execution results
 - Added `AttemptFailureKind` categorization to distinguish between user and infrastructure errors
 - Added `AttemptStats` for granular tracking of user-triggered versus infrastructure retries
@@ -140,6 +143,9 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated durable function HTTP gateway to require `application/json` content type
+- Refactored `stream_inputs` to support bidirectional streaming and progress acknowledgments
+- Switched durable function storage schema to version 3
 - Updated durable function calls to support structured invocation arguments
 - Enhanced durable function call results to support paginated output and streaming retrieval
 - Updated `ResourceSpec` to define CPU requirements in absolute vCPUs (`cpus`) instead of `cpu_millis`

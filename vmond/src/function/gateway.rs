@@ -1,15 +1,21 @@
 //! Authenticated, portable JSON-only HTTP invocation gateway.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	collections::HashSet,
+	fmt,
+	sync::Arc,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
 	Json, Router,
+	body::Bytes,
 	extract::{DefaultBodyLimit, Path, State},
-	http::StatusCode,
+	http::{HeaderMap, StatusCode, header},
 	routing::post,
 };
-use serde_json::Value;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 use sha2::{Digest as _, Sha256};
 use vmon_proto::v1 as pb;
 
@@ -21,9 +27,8 @@ const MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Mount the portable unary invocation endpoint.
 ///
-/// Authentication is deliberately supplied by the API router's shared auth
-/// middleware. Axum's [`Json`] extractor rejects CBOR, cloudpickle, and every
-/// other non-JSON content type before any durable call is created.
+/// middleware. The handler verifies the media type and parses through an
+/// I-JSON visitor before it resolves or creates durable work.
 pub fn router(domain: Arc<FunctionDomain>) -> Router {
 	Router::new()
 		.route("/v1/functions/{namespace}/{name}/invoke", post(invoke))
@@ -34,32 +39,61 @@ pub fn router(domain: Arc<FunctionDomain>) -> Router {
 async fn invoke(
 	State(domain): State<Arc<FunctionDomain>>,
 	Path((namespace, name)): Path<(String, String)>,
-	Json(value): Json<Value>,
+	headers: HeaderMap,
+	body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+	let content_type = headers
+		.get(header::CONTENT_TYPE)
+		.and_then(|value| value.to_str().ok())
+		.unwrap_or_default();
+	if !content_type
+		.split(';')
+		.next()
+		.is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+	{
+		return Err(ApiError::new(
+			StatusCode::UNSUPPORTED_MEDIA_TYPE,
+			"unsupported",
+			"public HTTP invocation requires application/json",
+		));
+	}
+	let value = parse_ijson(&body)?;
 	let function = pb::FunctionRef { namespace, name };
 	let lookup = domain.clone();
 	let revision = tokio::task::spawn_blocking(move || lookup.store().get_active_revision(&function))
 		.await
 		.map_err(join_error)?
 		.map_err(ApiError::from)?;
+	let serializer = revision
+		.spec
+		.as_ref()
+		.and_then(|spec| spec.serializer.as_ref())
+		.ok_or_else(|| ApiError::function("invalid", "function serializer contract is missing"))?;
+	if serializer.input_serializer != pb::ValueSerializer::Json as i32
+		|| serializer.result_serializer != pb::ValueSerializer::Json as i32
+	{
+		return Err(ApiError::new(
+			StatusCode::UNSUPPORTED_MEDIA_TYPE,
+			"unsupported",
+			"public HTTP invocation requires JSON input and result serializers",
+		));
+	}
 	let revision_ref = revision
 		.r#ref
 		.ok_or_else(|| ApiError::function("unavailable", "active revision has no identity"))?;
 	let input = json_envelope(&value)?;
 	let request = pb::CreateCallRequest {
 		r#type: pb::CallType::Unary as i32,
-		target: Some(pb::CallTarget {
-			function: Some(revision_ref),
-			actor_presence: None,
-			actor_method_presence: None,
-		}),
-		inputs: vec![pb::CallInput { index: 0, value: Some(input), ..Default::default() }],
+		target: Some(pb::CallTarget { function: Some(revision_ref), receiver: None }),
+		inputs: vec![pb::CallInput {
+			index: 0,
+			payload: Some(pb::call_input::Payload::Value(input)),
+			input_id: uuid::Uuid::new_v4().to_string(),
+		}],
 		inputs_closed: true,
 		graph: Some(pb::CallGraph::default()),
 		request_id: String::new(),
 		labels: Default::default(),
-		client_cancellation: pb::ClientCancellationPolicy::Detach as i32,
-		client_session_id_presence: None,
 		result_ttl_millis_presence: None,
 	};
 	let create_domain = domain.clone();

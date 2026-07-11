@@ -6,15 +6,7 @@
 //! vmond error code in `vmon-code` response metadata. Requests for sandboxes
 //! owned by a mesh peer are re-issued over a tonic channel to the owner.
 
-use std::{
-	pin::Pin,
-	sync::{
-		Arc,
-		atomic::{AtomicBool, Ordering},
-	},
-	task::{Context, Poll},
-	thread,
-};
+use std::{pin::Pin, sync::Arc, thread};
 
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
@@ -50,40 +42,6 @@ const MESH_HOP_KEY: &str = "x-vmon-mesh-hop";
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-struct CallWatchStream {
-	inner:    ReceiverStream<Result<pb::CallEvent, Status>>,
-	cancel:   Option<(Arc<crate::function::FunctionDomain>, String)>,
-	terminal: Arc<AtomicBool>,
-}
-
-impl Stream for CallWatchStream {
-	type Item = Result<pb::CallEvent, Status>;
-
-	fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		Pin::new(&mut self.inner).poll_next(context)
-	}
-}
-
-impl Drop for CallWatchStream {
-	fn drop(&mut self) {
-		if self.terminal.load(Ordering::Acquire) {
-			return;
-		}
-		let Some((domain, call_id)) = self.cancel.take() else {
-			return;
-		};
-		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-			runtime.spawn(async move {
-				if let Err(error) = domain
-					.cancel_call(&call_id, "client disconnected", "")
-					.await
-				{
-					tracing::warn!(%error, %call_id, "failed to persist disconnect cancellation");
-				}
-			});
-		}
-	}
-}
 
 /// Map an [`ApiError`] onto the contract's gRPC status table and attach the
 /// stable vmond code as `vmon-code` metadata.
@@ -1045,10 +1003,13 @@ impl pb::call_service_server::CallService for GrpcApi {
 		Ok(Response::new(record))
 	}
 
+	type StreamInputsStream = BoxStream<pb::StreamCallInputsResponse>;
+
 	async fn stream_inputs(
 		&self,
 		request: Request<Streaming<pb::StreamCallInputsRequest>>,
-	) -> Result<Response<pb::StreamCallInputsResponse>, Status> {
+	) -> Result<Response<Self::StreamInputsStream>, Status> {
+		const INPUT_WINDOW: u32 = 8;
 		let mut stream = request.into_inner();
 		let first = stream
 			.message()
@@ -1064,35 +1025,84 @@ impl pb::call_service_server::CallService for GrpcApi {
 				)));
 			},
 		};
-		let mut committed = self
+		let committed = self
 			.function_call({
 				let call_id = call.call_id.clone();
 				move |domain| Ok(domain.store().get_call(&call_id)?.input_count)
 			})
 			.await?;
-		while let Some(frame) = stream.message().await? {
-			let input = match frame.frame {
-				Some(pb::stream_call_inputs_request::Frame::Input(input)) => input,
-				_ => {
-					return Err(status_from(&ApiError::invalid(
-						"input frames after the opener must contain an input",
-					)));
-				},
-			};
-			let call_id = call.call_id.clone();
-			committed = self
-				.function_call(move |domain| {
-					let committed =
-						domain.store().append_input(&call_id, &input, function_now_millis())?;
-					domain.notify_work();
-					Ok(committed)
-				})
-				.await?;
-		}
-		Ok(Response::new(pb::StreamCallInputsResponse {
-			call: Some(call),
+		let (tx, rx) = mpsc::channel(INPUT_WINDOW as usize);
+		tx.send(Ok(pb::StreamCallInputsResponse {
+			call: Some(call.clone()),
 			committed_input_count: committed,
+			last_input_presence: None,
+			max_inputs_outstanding: INPUT_WINDOW,
 		}))
+		.await
+		.map_err(|_| Status::cancelled("input response stream closed"))?;
+		let domain = self.state.functions.clone();
+		tokio::spawn(async move {
+			loop {
+				let frame = match stream.message().await {
+					Ok(Some(frame)) => frame,
+					Ok(None) => break,
+					Err(error) => {
+						let _ = tx.send(Err(error)).await;
+						break;
+					},
+				};
+				let input = match frame.frame {
+					Some(pb::stream_call_inputs_request::Frame::Input(input)) => input,
+					_ => {
+						let _ = tx
+							.send(Err(status_from(&ApiError::invalid(
+								"input frames after the opener must contain an input",
+							))))
+							.await;
+						break;
+					},
+				};
+				let input_ref = pb::InputRef {
+					input_id: input.input_id.clone(),
+					input_index: input.index,
+				};
+				let call_id = call.call_id.clone();
+				let commit_domain = domain.clone();
+				let result = tokio::task::spawn_blocking(move || {
+					let committed =
+						commit_domain.store().append_input(&call_id, &input, function_now_millis())?;
+					commit_domain.notify_work();
+					Ok::<_, crate::EngineError>(committed)
+				})
+				.await;
+				let committed = match result {
+					Ok(Ok(committed)) => committed,
+					Ok(Err(error)) => {
+						let _ = tx.send(Err(status_from(&ApiError::from(error)))).await;
+						break;
+					},
+					Err(error) => {
+						let _ = tx.send(Err(status_from(&join_error(error)))).await;
+						break;
+					},
+				};
+				if tx
+					.send(Ok(pb::StreamCallInputsResponse {
+						call: Some(call.clone()),
+						committed_input_count: committed,
+						last_input_presence: Some(
+							pb::stream_call_inputs_response::LastInputPresence::LastInput(input_ref),
+						),
+						max_inputs_outstanding: INPUT_WINDOW,
+					}))
+					.await
+					.is_err()
+				{
+					break;
+				}
+			}
+		});
+		Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
 	}
 
 	async fn close_inputs(
@@ -1160,6 +1170,39 @@ impl pb::call_service_server::CallService for GrpcApi {
 		Ok(Response::new(result))
 	}
 
+	async fn list_results(
+		&self,
+		request: Request<pb::ListCallResultsRequest>,
+	) -> Result<Response<pb::ListCallResultsResponse>, Status> {
+		let request = request.into_inner();
+		let cursor = request
+			.cursor
+			.ok_or_else(|| status_from(&ApiError::invalid("result cursor is required")))?;
+		let call = cursor
+			.call
+			.ok_or_else(|| status_from(&ApiError::invalid("cursor call is required")))?;
+		let page_size = if request.page_size == 0 { 100 } else { request.page_size.min(1000) };
+		let call_id = call.call_id.clone();
+		let after = cursor.after_sequence;
+		let (results, end) = self
+			.function_call(move |domain| {
+				let results = domain.store().results_after(&call_id, after, page_size)?;
+				let last = results.last().map_or(after, |result| result.sequence);
+				let end = domain.store().results_after(&call_id, last, 1)?.is_empty();
+				Ok((results, end))
+			})
+			.await?;
+		let after_sequence = results.last().map_or(after, |result| result.sequence);
+		Ok(Response::new(pb::ListCallResultsResponse {
+			results,
+			next_cursor: Some(pb::ResultCursor {
+				call: Some(call),
+				after_sequence,
+			}),
+			end,
+		}))
+	}
+
 	type WatchStream = BoxStream<pb::CallEvent>;
 
 	async fn watch(
@@ -1167,9 +1210,6 @@ impl pb::call_service_server::CallService for GrpcApi {
 		request: Request<pb::WatchCallRequest>,
 	) -> Result<Response<Self::WatchStream>, Status> {
 		let request = request.into_inner();
-		let watcher_session = request.client_session_id_presence.as_ref().map(|presence| match presence {
-			pb::watch_call_request::ClientSessionIdPresence::ClientSessionId(value) => value.as_str(),
-		});
 		let cursor = request
 			.cursor
 			.ok_or_else(|| status_from(&ApiError::invalid("event cursor is required")))?;
@@ -1207,20 +1247,12 @@ impl pb::call_service_server::CallService for GrpcApi {
 				events.into_iter().map(Ok),
 			))));
 		}
-		let (cancellation, creator_session) = self
-			.function_call({
-				let call_id = call.call_id.clone();
-				move |domain| domain.store().client_cancellation(&call_id)
-			})
-			.await?;
 		let mut watch = self
 			.state
 			.functions
 			.watch_call(&call.call_id, cursor.after_sequence)
 			.map_err(|error| status_from(&ApiError::from(error)))?;
 		let (tx, rx) = mpsc::channel(32);
-		let terminal = Arc::new(AtomicBool::new(false));
-		let pump_terminal = terminal.clone();
 		tokio::spawn(async move {
 			loop {
 				match watch.recv().await {
@@ -1230,17 +1262,12 @@ impl pb::call_service_server::CallService for GrpcApi {
 							Some(pb::call_event::Payload::Status(status))
 								if terminal_call_status(status.status)
 						);
-						if is_terminal {
-							pump_terminal.store(true, Ordering::Release);
-						}
 						if tx.send(Ok(event)).await.is_err() || is_terminal {
 							break;
 						}
 					},
-					// A server-side watcher failure is reconnectable and must not
-					// consume the creator's cancellation capability.
+					// Lag is reconnectable from the caller's last durable cursor.
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-						pump_terminal.store(true, Ordering::Release);
 						let _ = tx
 							.send(Err(Status::resource_exhausted(
 								"call watcher fell behind; reconnect from the last sequence",
@@ -1248,22 +1275,11 @@ impl pb::call_service_server::CallService for GrpcApi {
 							.await;
 						break;
 					},
-					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-						pump_terminal.store(true, Ordering::Release);
-						break;
-					},
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 				}
 			}
 		});
-		let can_cancel = cancellation == pb::ClientCancellationPolicy::Cancel
-			&& creator_session.as_deref().is_some_and(|creator| !creator.is_empty())
-			&& watcher_session == creator_session.as_deref();
-		let cancel = can_cancel.then(|| (self.state.functions.clone(), call.call_id));
-		Ok(Response::new(Box::pin(CallWatchStream {
-			inner: ReceiverStream::new(rx),
-			cancel,
-			terminal,
-		})))
+		Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
 	}
 
 	async fn cancel(

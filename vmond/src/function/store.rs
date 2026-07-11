@@ -12,7 +12,7 @@ use vmon_proto::{prost::Message, v1::*};
 
 use crate::{home::Home, EngineError, Result};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const INPUT_QUEUED: i32 = 1;
 const INPUT_LEASED: i32 = 2;
 const INPUT_RUNNING: i32 = 3;
@@ -46,6 +46,17 @@ pub struct LeasedInput {
 pub struct QueuedRevision {
 	pub revision_id: String,
 	pub oldest_available_ms: u64,
+	pub queued_inputs: u64,
+}
+
+/// Oldest eligible dynamic-batch call for one revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedBatch {
+	/// Durable call whose inputs must remain one authority group.
+	pub call_id: String,
+	/// Earliest availability time among currently eligible inputs.
+	pub oldest_available_ms: u64,
+	/// Number of currently eligible inputs in this call.
 	pub queued_inputs: u64,
 }
 /// Startup recovery counts.
@@ -109,7 +120,7 @@ impl Store {
 			created_at_unix_millis: now_ms,
 			status: FunctionRevisionStatus::Ready as i32,
 			unavailable_secrets: Vec::new(),
-			snapshot_provenance_presence: None,
+			snapshot_presence: None,
 		};
 		tx.execute(
 			"INSERT INTO revisions(id,digest,namespace,name,spec,record,created_ms) VALUES(?,?,?,?,?,?,?)",
@@ -226,40 +237,24 @@ impl Store {
 		validate_call_request(request)?; let target=request.target.as_ref().unwrap(); let revision_ref=target.function.as_ref().unwrap();
 		let fingerprint=Sha256::digest(request.encode_to_vec()); let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;
 		if let Some(resource)=idempotent_resource(&tx,"create_call",&request.request_id,&fingerprint)?{let value=call_record(&tx,&resource)?;tx.commit().map_err(sql_error)?;return Ok(value)}
-		let revision=revision_by_id(&tx,&revision_ref.revision_id)?; let spec=revision.spec.as_ref().ok_or_else(||EngineError::engine("revision missing spec"))?;
+		let revision=revision_by_id(&tx,&revision_ref.revision_id)?;if revision.r#ref.as_ref().and_then(|r|r.function.as_ref())!=revision_ref.function.as_ref(){return Err(EngineError::invalid("revision function identity does not match stored revision"));}if let Some(call_target::Receiver::Actor(actor_target))=&target.receiver{let actor_ref=actor_target.actor.as_ref().ok_or_else(||EngineError::invalid("actor target is required"))?;let actor=actor_by_id(&tx,&actor_ref.actor_id)?;if actor.function.as_ref()!=Some(revision_ref){return Err(EngineError::invalid("actor target revision does not match actor"));}} let spec=revision.spec.as_ref().ok_or_else(||EngineError::engine("revision missing spec"))?;
 		let timeouts=spec.timeouts.as_ref(); let queue_deadline=timeouts.and_then(|t|(t.queue_millis>0).then(||now_ms.saturating_add(t.queue_millis))); let execution_ms=timeouts.map_or(0,|t|t.execution_millis); let ttl=request.result_ttl_millis_presence.as_ref().map(|v|match v{create_call_request::ResultTtlMillisPresence::ResultTtlMillis(v)=>*v}).unwrap_or_else(||timeouts.map_or(0,|t|t.result_ttl_millis));
-		let id=Uuid::new_v4().to_string();let mut persisted=request.clone();for input in &mut persisted.inputs{if input.input_id.is_empty(){input.input_id=assigned_input_id(&id,input.index);}}let mut persisted_ids=HashSet::new();if persisted.inputs.iter().any(|input|!persisted_ids.insert(&input.input_id)){return Err(EngineError::invalid("input ids must be unique"));}let status=if persisted.inputs.is_empty() && !persisted.inputs_closed {CallStatus::Pending}else{CallStatus::Queued};
-		tx.execute("INSERT INTO calls(id,revision_id,actor_id,kind,status,input_closed,request,created_ms,updated_ms,queued_ms,queue_deadline_ms,execution_timeout_ms,result_ttl_ms,event_seq,result_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)",params![id,revision_ref.revision_id,target.actor_presence.as_ref().map(|v|match v{call_target::ActorPresence::Actor(a)=>a.actor_id.as_str()}),request.r#type,status as i32,persisted.inputs_closed,persisted.encode_to_vec(),u64_i64(now_ms)?,u64_i64(now_ms)?,u64_i64(now_ms)?,opt_u64_i64(queue_deadline)?,u64_i64(execution_ms)?,u64_i64(ttl)?]).map_err(sql_error)?;
-		for input in &persisted.inputs { insert_input(&tx,&id,input,now_ms)?; for digest in envelope_artifacts(input.value.as_ref()) {add_artifact_ref(&tx,&digest,"input",&format!("{id}:{}",input.index))?;} }
+		let id=Uuid::new_v4().to_string();let persisted=request.clone();let mut persisted_ids=HashSet::new();if persisted.inputs.iter().any(|input|!persisted_ids.insert(&input.input_id)){return Err(EngineError::invalid("input ids must be unique"));}let status=if persisted.inputs.is_empty() && !persisted.inputs_closed {CallStatus::Pending}else{CallStatus::Queued};
+		tx.execute("INSERT INTO calls(id,revision_id,actor_id,kind,status,input_closed,request,created_ms,updated_ms,queued_ms,queue_deadline_ms,execution_timeout_ms,result_ttl_ms,event_seq,result_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)",params![id,revision_ref.revision_id,target.receiver.as_ref().and_then(|value|match value{call_target::Receiver::Actor(target)=>target.actor.as_ref().map(|actor|actor.actor_id.as_str()),call_target::Receiver::Service(_)=>None}),request.r#type,status as i32,persisted.inputs_closed,persisted.encode_to_vec(),u64_i64(now_ms)?,u64_i64(now_ms)?,u64_i64(now_ms)?,opt_u64_i64(queue_deadline)?,u64_i64(execution_ms)?,u64_i64(ttl)?]).map_err(sql_error)?;
+		for input in &persisted.inputs { insert_input(&tx,&id,input,now_ms)?; for digest in call_input_artifacts(input) {add_artifact_ref(&tx,&digest,"input",&format!("{id}:{}",input.index))?;} }
 		append_status_event(&tx,&id,status,now_ms)?; put_idempotency(&tx,"create_call",&request.request_id,&fingerprint,&id,now_ms)?;
 		let value=call_record(&tx,&id)?; tx.commit().map_err(sql_error)?; Ok(value)
 	}
 
 	/// Append one exactly-next input transactionally. Replays of identical committed indexes are idempotent.
-	pub fn append_input(&self,call_id:&str,input:&CallInput,now_ms:u64)->Result<u64>{let mut normalized=input.clone();if normalized.input_id.is_empty(){normalized.input_id=assigned_input_id(call_id,normalized.index);}validate_envelope(normalized.value.as_ref().ok_or_else(||EngineError::invalid("input value is required"))?)?;let input=&normalized;let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;let (closed,count,status):(bool,u64,i32)=tx.query_row("SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id),status FROM calls WHERE id=?",[call_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))?;if closed{return Err(EngineError::invalid("call inputs are closed"))}if input.index<count{let existing:Vec<u8>=tx.query_row("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![call_id,u64_i64(input.index)?],|r|r.get(0)).map_err(sql_error)?;if existing!=input.encode_to_vec(){return Err(EngineError::invalid("input index already contains different payload"))}tx.commit().map_err(sql_error)?;return Ok(count)}if input.index!=count{return Err(EngineError::invalid(format!("input index must be contiguous; expected {count}")))}let mut statement=tx.prepare("SELECT payload FROM inputs WHERE call_id=?").map_err(sql_error)?;let blobs=statement.query_map([call_id],|row|row.get::<_,Vec<u8>>(0)).map_err(sql_error)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql_error)?;drop(statement);for blob in blobs{let existing:CallInput=decode_message(&blob)?;if existing.input_id==input.input_id{return Err(EngineError::invalid("input id already exists in call"));}}insert_input(&tx,call_id,input,now_ms)?;if status==CallStatus::Pending as i32{tx.execute("UPDATE calls SET status=?,queued_ms=?,updated_ms=? WHERE id=?",params![CallStatus::Queued as i32,u64_i64(now_ms)?,u64_i64(now_ms)?,call_id]).map_err(sql_error)?;append_status_event(&tx,call_id,CallStatus::Queued,now_ms)?;}for digest in envelope_artifacts(input.value.as_ref()){add_artifact_ref(&tx,&digest,"input",&format!("{call_id}:{}",input.index))?;}tx.commit().map_err(sql_error)?;Ok(count+1)}
+	pub fn append_input(&self,call_id:&str,input:&CallInput,now_ms:u64)->Result<u64>{if input.input_id.is_empty(){return Err(EngineError::invalid("client input id is required"));}validate_call_input(input)?;let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;let (closed,count,status):(bool,u64,i32)=tx.query_row("SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id),status FROM calls WHERE id=?",[call_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))?;if closed{return Err(EngineError::invalid("call inputs are closed"))}if input.index<count{let existing:Vec<u8>=tx.query_row("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![call_id,u64_i64(input.index)?],|r|r.get(0)).map_err(sql_error)?;if existing!=input.encode_to_vec(){return Err(EngineError::invalid("input index already contains different payload"))}tx.commit().map_err(sql_error)?;return Ok(count)}if input.index!=count{return Err(EngineError::invalid(format!("input index must be contiguous; expected {count}")))}let mut statement=tx.prepare("SELECT payload FROM inputs WHERE call_id=?").map_err(sql_error)?;let blobs=statement.query_map([call_id],|row|row.get::<_,Vec<u8>>(0)).map_err(sql_error)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql_error)?;drop(statement);for blob in blobs{let existing:CallInput=decode_message(&blob)?;if existing.input_id==input.input_id{return Err(EngineError::invalid("input id already exists in call"));}}insert_input(&tx,call_id,input,now_ms)?;if status==CallStatus::Pending as i32{tx.execute("UPDATE calls SET status=?,queued_ms=?,updated_ms=? WHERE id=?",params![CallStatus::Queued as i32,u64_i64(now_ms)?,u64_i64(now_ms)?,call_id]).map_err(sql_error)?;append_status_event(&tx,call_id,CallStatus::Queued,now_ms)?;}for digest in call_input_artifacts(input){add_artifact_ref(&tx,&digest,"input",&format!("{call_id}:{}",input.index))?;}tx.commit().map_err(sql_error)?;Ok(count+1)}
 
 	/// Close an input stream only when its committed count matches the caller's frontier.
-	pub fn close_inputs(&self,call_id:&str,expected_count:u64,now_ms:u64)->Result<CallRecord>{let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;let (closed,count):(bool,u64)=tx.query_row("SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id) FROM calls WHERE id=?",[call_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))?;if count!=expected_count{return Err(EngineError::invalid(format!("expected {expected_count} inputs, found {count}")))}if !closed{tx.execute("UPDATE calls SET input_closed=1,updated_ms=? WHERE id=?",params![u64_i64(now_ms)?,call_id]).map_err(sql_error)?;let response=StreamCallInputsResponse{call:Some(CallRef{call_id:call_id.into()}),committed_input_count:count};append_event(&tx,call_id,CallEventType::InputClosed,call_event::Payload::InputClosed(response),now_ms)?;}let value=call_record(&tx,call_id)?;tx.commit().map_err(sql_error)?;Ok(value)}
+	pub fn close_inputs(&self,call_id:&str,expected_count:u64,now_ms:u64)->Result<CallRecord>{let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;let (closed,count):(bool,u64)=tx.query_row("SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id) FROM calls WHERE id=?",[call_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))?;if count!=expected_count{return Err(EngineError::invalid(format!("expected {expected_count} inputs, found {count}")))}if !closed{tx.execute("UPDATE calls SET input_closed=1,updated_ms=? WHERE id=?",params![u64_i64(now_ms)?,call_id]).map_err(sql_error)?;let response=StreamCallInputsResponse{call:Some(CallRef{call_id:call_id.into()}),committed_input_count:count,last_input_presence:None,max_inputs_outstanding:0};append_event(&tx,call_id,CallEventType::InputClosed,call_event::Payload::InputClosed(response),now_ms)?;}let value=call_record(&tx,call_id)?;tx.commit().map_err(sql_error)?;Ok(value)}
 
 	/// Return the latest durable call record.
 	pub fn get_call(&self,id:&str)->Result<CallRecord>{let c=self.connection.lock().map_err(lock_error)?;call_record(&c,id)}
 
-	/// Return the disconnect policy and private creator-session capability.
-	pub fn client_cancellation(&self, call_id: &str) -> Result<(ClientCancellationPolicy, Option<String>)> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let bytes: Vec<u8> = connection
-			.query_row("SELECT request FROM calls WHERE id=?", [call_id], |row| row.get(0))
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call not found"))?;
-		let request: CreateCallRequest = decode_message(&bytes)?;
-		let policy = ClientCancellationPolicy::try_from(request.client_cancellation)
-			.map_err(|_| EngineError::engine("corrupt client cancellation policy"))?;
-		let session = request.client_session_id_presence.map(|value| match value {
-			create_call_request::ClientSessionIdPresence::ClientSessionId(id) => id,
-		});
-		Ok((policy, session))
-	}
 
 	/// Return one persisted input, including a server-assigned stable input ID.
 	pub fn get_input(&self,call_id:&str,index:u64)->Result<CallInput>{let connection=self.connection.lock().map_err(lock_error)?;let bytes:Vec<u8>=connection.query_row("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![call_id,u64_i64(index)?],|row|row.get(0)).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call input not found"))?;decode_message(&bytes)}
@@ -282,7 +277,7 @@ impl Store {
 
 	/// Lease the oldest available input across all revisions.
 	pub fn lease_next(&self, worker_id: &str, now_ms: u64, lease_ms: u64) -> Result<Option<LeasedInput>> {
-		self.lease_next_matching(None, worker_id, now_ms, lease_ms)
+		self.lease_next_matching(None, worker_id, now_ms, lease_ms, false)
 	}
 
 	/// Summarize revisions that currently have eligible queued work.
@@ -299,17 +294,122 @@ impl Store {
 
 	/// Lease the oldest available input for one immutable revision pool.
 	pub fn lease_next_for_revision(&self, revision_id: &str, worker_id: &str, now_ms: u64, lease_ms: u64) -> Result<Option<LeasedInput>> {
-		self.lease_next_matching(Some(revision_id), worker_id, now_ms, lease_ms)
+		self.lease_next_matching(Some(revision_id), worker_id, now_ms, lease_ms, false)
 	}
 
-	fn lease_next_matching(&self, revision_id: Option<&str>, worker_id: &str, now_ms: u64, lease_ms: u64) -> Result<Option<LeasedInput>> {
+	/// Lease one eligible unary, generator, or actor input while dynamic batches wait.
+	pub fn lease_next_non_batch_for_revision(&self, revision_id:&str, worker_id:&str, now_ms:u64, lease_ms:u64)->Result<Option<LeasedInput>>{
+		self.lease_next_matching(Some(revision_id),worker_id,now_ms,lease_ms,true)
+	}
+
+	/// Inspect the oldest eligible batch call without consuming any leases.
+	pub fn queued_batch_for_revision(&self, revision_id: &str, now_ms: u64) -> Result<Option<QueuedBatch>> {
+		if revision_id.is_empty() {
+			return Err(EngineError::invalid("revision id is required"));
+		}
+		let connection = self.connection.lock().map_err(lock_error)?;
+		connection.query_row(
+			"SELECT c.id,MIN(i.available_ms),COUNT(*) FROM calls c JOIN inputs i ON i.call_id=c.id WHERE i.status=? AND i.available_ms<=? AND c.revision_id=? AND c.kind=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms ORDER BY MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
+			params![INPUT_QUEUED,u64_i64(now_ms)?,revision_id,CallType::Batch as i32,CallStatus::Queued as i32,CallStatus::Running as i32,u64_i64(now_ms)?],
+			|row| Ok(QueuedBatch { call_id:row.get(0)?,oldest_available_ms:row.get(1)?,queued_inputs:row.get(2)? }),
+		).optional().map_err(sql_error)
+	}
+
+	/// Atomically lease an ordered dynamic batch for one immutable revision.
+	pub fn lease_batch_for_revision(
+		&self,
+		revision_id: &str,
+		worker_id: &str,
+		now_ms: u64,
+		lease_ms: u64,
+		max_size: u32,
+	) -> Result<Vec<LeasedInput>> {
+		if revision_id.is_empty() || worker_id.is_empty() || lease_ms == 0 || max_size == 0 {
+			return Err(EngineError::invalid(
+				"revision id, worker id, positive lease duration, and positive batch size are required",
+			));
+		}
+		let mut connection = self.connection.lock().map_err(lock_error)?;
+		let tx = immediate(&mut connection)?;
+		expire_deadlines_tx(&tx, now_ms)?;
+		let selected_call: Option<String> = tx.query_row(
+			"SELECT c.id FROM calls c JOIN inputs i ON i.call_id=c.id WHERE i.status=? AND i.available_ms<=? AND c.revision_id=? AND c.kind=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms ORDER BY MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
+			params![INPUT_QUEUED,u64_i64(now_ms)?,revision_id,CallType::Batch as i32,CallStatus::Queued as i32,CallStatus::Running as i32,u64_i64(now_ms)?],
+			|row| row.get(0),
+		).optional().map_err(sql_error)?;
+		let Some(selected_call) = selected_call else {
+			tx.commit().map_err(sql_error)?;
+			return Ok(Vec::new());
+		};
+		let mut statement = tx
+			.prepare(
+				"SELECT input_index FROM inputs WHERE call_id=? AND status=? AND available_ms<=? ORDER BY input_index LIMIT ?",
+			)
+			.map_err(sql_error)?;
+		let candidates = statement
+			.query_map(
+				params![selected_call,INPUT_QUEUED,u64_i64(now_ms)?,i64::from(max_size)],
+				|row| row.get::<_,i64>(0),
+			)
+			.map_err(sql_error)?
+			.collect::<std::result::Result<Vec<_>,_>>()
+			.map_err(sql_error)?;
+		drop(statement);
+		let revision = revision_by_id(&tx, revision_id)?;
+		let mut leased = Vec::with_capacity(candidates.len());
+		for index in candidates {
+			let call_id = selected_call.clone();
+			let generation: i64 = tx.query_row(
+				"SELECT lease_generation+1 FROM inputs WHERE call_id=? AND input_index=?",
+				params![call_id,index],
+				|row| row.get(0),
+			).map_err(sql_error)?;
+			let changed = tx.execute(
+				"UPDATE inputs SET status=?,lease_owner=?,lease_expiry_ms=?,lease_generation=? WHERE call_id=? AND input_index=? AND status=? AND available_ms<=? AND EXISTS(SELECT 1 FROM calls c WHERE c.id=inputs.call_id AND c.revision_id=? AND c.kind=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?))",
+				params![INPUT_LEASED,worker_id,u64_i64(now_ms.saturating_add(lease_ms))?,generation,call_id,index,INPUT_QUEUED,u64_i64(now_ms)?,revision_id,CallType::Batch as i32,CallStatus::Queued as i32,CallStatus::Running as i32,u64_i64(now_ms)?],
+			).map_err(sql_error)?;
+			if changed != 1 {
+				continue;
+			}
+			let input_blob: Vec<u8> = tx.query_row(
+				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+				params![call_id,index],
+				|row| row.get(0),
+			).map_err(sql_error)?;
+			let input = decode_message(&input_blob)?;
+			let (user_attempts,infra_attempts): (u32,u32) = tx.query_row(
+				"SELECT user_attempts,infra_attempts FROM inputs WHERE call_id=? AND input_index=?",
+				params![call_id,index],
+				|row| Ok((row.get(0)?,row.get(1)?)),
+			).map_err(sql_error)?;
+			let execution_timeout: u64 = tx.query_row(
+				"SELECT execution_timeout_ms FROM calls WHERE id=?",
+				[&call_id],
+				|row| row.get(0),
+			).map_err(sql_error)?;
+			let call = call_record(&tx,&call_id)?;
+			leased.push(LeasedInput {
+				lease: LeaseToken { call_id, input_index:index as u64, worker_id:worker_id.into(), lease_generation:generation as u64 },
+				revision: revision.clone(),
+				input,
+				call,
+				user_attempts,
+				infra_attempts,
+				execution_deadline_ms:(execution_timeout>0).then(||now_ms.saturating_add(execution_timeout)),
+			});
+		}
+		tx.commit().map_err(sql_error)?;
+		Ok(leased)
+	}
+
+	fn lease_next_matching(&self, revision_id: Option<&str>, worker_id: &str, now_ms: u64, lease_ms: u64, exclude_batch: bool) -> Result<Option<LeasedInput>> {
 		if worker_id.is_empty() || lease_ms == 0 { return Err(EngineError::invalid("worker id and positive lease duration are required")); }
 		let mut connection = self.connection.lock().map_err(lock_error)?;
 		let tx = immediate(&mut connection)?;
 		expire_deadlines_tx(&tx, now_ms)?;
 		let candidate: Option<(String, i64)> = tx.query_row(
-			"SELECT i.call_id,i.input_index FROM inputs i JOIN calls c ON c.id=i.call_id WHERE i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) AND (? IS NULL OR c.revision_id=?) ORDER BY i.available_ms,c.created_ms,i.call_id,i.input_index LIMIT 1",
-			params![INPUT_QUEUED,u64_i64(now_ms)?,CallStatus::Queued as i32,CallStatus::Running as i32,u64_i64(now_ms)?,revision_id,revision_id],
+			"SELECT i.call_id,i.input_index FROM inputs i JOIN calls c ON c.id=i.call_id WHERE i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) AND (? IS NULL OR c.revision_id=?) AND (?=0 OR c.kind<>?) ORDER BY i.available_ms,c.created_ms,i.call_id,i.input_index LIMIT 1",
+			params![INPUT_QUEUED,u64_i64(now_ms)?,CallStatus::Queued as i32,CallStatus::Running as i32,u64_i64(now_ms)?,revision_id,revision_id,exclude_batch,CallType::Batch as i32],
 			|row| Ok((row.get(0)?,row.get(1)?))
 		).optional().map_err(sql_error)?;
 		let Some((call_id,index)) = candidate else { tx.commit().map_err(sql_error)?; return Ok(None); };
@@ -331,11 +431,32 @@ impl Store {
 	/// Extend a live lease, rejecting stale owners and generations.
 	pub fn heartbeat(&self,lease:&LeaseToken,now_ms:u64,lease_ms:u64)->Result<()>{let c=self.connection.lock().map_err(lock_error)?;let changed=c.execute("UPDATE inputs SET lease_expiry_ms=? WHERE call_id=? AND input_index=? AND lease_owner=? AND lease_generation=? AND status IN (?,?) AND lease_expiry_ms>?",params![u64_i64(now_ms.saturating_add(lease_ms))?,lease.call_id,u64_i64(lease.input_index)?,lease.worker_id,u64_i64(lease.lease_generation)?,INPUT_LEASED,INPUT_RUNNING,u64_i64(now_ms)?]).map_err(sql_error)?;lease_changed(changed)}
 
-	/// Mark a leased input running and append its attempt event atomically.
-	pub fn mark_running(&self,lease:&LeaseToken,now_ms:u64,startup:StartupKind)->Result<()>{let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;require_lease(&tx,lease,&[INPUT_LEASED],now_ms)?;require_executable_call(&tx,&lease.call_id)?;tx.execute("UPDATE inputs SET status=?,started_ms=COALESCE(started_ms,?),user_attempts=user_attempts+1 WHERE call_id=? AND input_index=?",params![INPUT_RUNNING,u64_i64(now_ms)?,lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;let status:CallStatus=call_status(&tx,&lease.call_id)?;if status==CallStatus::Queued{tx.execute("UPDATE calls SET status=?,started_ms=COALESCE(started_ms,?),updated_ms=? WHERE id=?",params![CallStatus::Running as i32,u64_i64(now_ms)?,u64_i64(now_ms)?,lease.call_id]).map_err(sql_error)?;append_status_event(&tx,&lease.call_id,CallStatus::Running,now_ms)?;}let attempt:u32=tx.query_row("SELECT user_attempts FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|r|r.get(0)).map_err(sql_error)?;append_event(&tx,&lease.call_id,CallEventType::Attempt,call_event::Payload::AttemptEvent(AttemptEvent{attempt,status:AttemptStatus::Started as i32,startup:startup as i32,worker_id:lease.worker_id.clone(),error_presence:None}),now_ms)?;tx.commit().map_err(sql_error)?;Ok(())}
+	/// Mark a leased input running and append its stable attempt event atomically.
+	pub fn mark_running(&self,lease:&LeaseToken,now_ms:u64,startup:StartupKind)->Result<()>{
+		let mut connection=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut connection)?;require_lease(&tx,lease,&[INPUT_LEASED],now_ms)?;require_executable_call(&tx,&lease.call_id)?;let attempt_id=Uuid::new_v4().to_string();
+		tx.execute("UPDATE inputs SET status=?,started_ms=COALESCE(started_ms,?),user_attempts=CASE WHEN user_attempts=0 THEN 1 ELSE user_attempts END,attempt_id=? WHERE call_id=? AND input_index=?",params![INPUT_RUNNING,u64_i64(now_ms)?,attempt_id,lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;
+		let status=call_status(&tx,&lease.call_id)?;if status==CallStatus::Queued{tx.execute("UPDATE calls SET status=?,started_ms=COALESCE(started_ms,?),updated_ms=? WHERE id=?",params![CallStatus::Running as i32,u64_i64(now_ms)?,u64_i64(now_ms)?,lease.call_id]).map_err(sql_error)?;append_status_event(&tx,&lease.call_id,CallStatus::Running,now_ms)?;}
+		append_attempt_transition(&tx,lease,AttemptStatus::Started,AttemptFailureKind::Unspecified,None,startup,now_ms)?;tx.commit().map_err(sql_error)?;Ok(())
+	}
 
-	/// Commit a result exactly once. A terminal input cannot be rewritten.
-	pub fn succeed(&self,lease:&LeaseToken,result:&CallResult,stats:Option<&AttemptStats>,now_ms:u64)->Result<()>{let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now_ms)?;require_executable_call(&tx,&lease.call_id)?;if result.index!=lease.input_index{return Err(EngineError::invalid("result index does not match lease"))}let sequence=next_result_sequence(&tx,&lease.call_id)?;let mut stored=result.clone();stored.call=Some(CallRef{call_id:lease.call_id.clone()});stored.sequence=sequence;stored.created_at_unix_millis=now_ms;stored.input_index=lease.input_index;if stored.input_id.is_empty(){let input:CallInput=decode_message(&tx.query_row::<Vec<u8>,_,_>("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|row|row.get(0)).map_err(sql_error)?)?;stored.input_id=input.input_id;}stored.yield_index_presence=None;tx.execute("INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",params![lease.call_id,u64_i64(stored.index)?,u64_i64(sequence)?,stored.encode_to_vec(),u64_i64(now_ms)?]).map_err(sql_error)?;tx.execute("UPDATE inputs SET status=?,finished_ms=?,result=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_SUCCEEDED,u64_i64(now_ms)?,stored.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;if let Some(stats)=stats{tx.execute("UPDATE inputs SET stats=? WHERE call_id=? AND input_index=?",params![stats.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;}for digest in result_artifacts(&stored){add_artifact_ref(&tx,&digest,"result",&format!("{}:{}",lease.call_id,stored.index))?;}let event_type=CallEventType::Result;let payload=call_event::Payload::Result(stored);append_event(&tx,&lease.call_id,event_type,payload,now_ms)?;complete_call_tx(&tx,&lease.call_id,now_ms)?;tx.commit().map_err(sql_error)?;Ok(())}
+	/// Commit one terminal input outcome exactly once.
+	pub fn succeed(&self,lease:&LeaseToken,result:&CallResult,stats:Option<&AttemptStats>,now_ms:u64)->Result<()>{
+		let mut connection=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut connection)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now_ms)?;require_executable_call(&tx,&lease.call_id)?;
+		let kind=call_kind(&tx,&lease.call_id)?;
+		if kind==CallType::Generator {
+			tx.execute("UPDATE inputs SET status=?,finished_ms=?,result=NULL,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_SUCCEEDED,u64_i64(now_ms)?,lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;
+			if let Some(stats)=stats{tx.execute("UPDATE inputs SET stats=? WHERE call_id=? AND input_index=?",params![stats.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;}
+			append_attempt_transition(&tx,lease,AttemptStatus::Succeeded,AttemptFailureKind::Unspecified,None,StartupKind::Unspecified,now_ms)?;complete_call_tx(&tx,&lease.call_id,now_ms)?;tx.commit().map_err(sql_error)?;return Ok(());
+		}
+		if result.index!=lease.input_index{return Err(EngineError::invalid("result index does not match lease"));}
+		let sequence=next_result_sequence(&tx,&lease.call_id)?;let mut stored=result.clone();stored.call=Some(CallRef{call_id:lease.call_id.clone()});stored.sequence=sequence;stored.created_at_unix_millis=now_ms;stored.input_index=lease.input_index;
+		if stored.input_id.is_empty(){let input:CallInput=decode_message(&tx.query_row::<Vec<u8>,_,_>("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|row|row.get(0)).map_err(sql_error)?)?;stored.input_id=input.input_id;}stored.yield_index_presence=None;
+		tx.execute("INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",params![lease.call_id,u64_i64(stored.index)?,u64_i64(sequence)?,stored.encode_to_vec(),u64_i64(now_ms)?]).map_err(sql_error)?;
+		tx.execute("UPDATE inputs SET status=?,finished_ms=?,result=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_SUCCEEDED,u64_i64(now_ms)?,stored.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;
+		if let Some(stats)=stats{tx.execute("UPDATE inputs SET stats=? WHERE call_id=? AND input_index=?",params![stats.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;}
+		for digest in result_artifacts(&stored){add_artifact_ref(&tx,&digest,"result",&format!("{}:{}",lease.call_id,stored.index))?;}
+		append_event(&tx,&lease.call_id,CallEventType::Result,call_event::Payload::Result(stored),now_ms)?;append_attempt_transition(&tx,lease,AttemptStatus::Succeeded,AttemptFailureKind::Unspecified,None,StartupKind::Unspecified,now_ms)?;complete_call_tx(&tx,&lease.call_id,now_ms)?;tx.commit().map_err(sql_error)?;Ok(())
+	}
 
 	/// Commit one generator yield without terminalizing the leased input.
 	pub fn commit_yield(&self, lease: &LeaseToken, index: u64, value: ValueEnvelope, now_ms: u64) -> Result<CallEvent> {
@@ -361,7 +482,7 @@ impl Store {
 		};
 		tx.execute("INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)", params![lease.call_id,u64_i64(index)?,u64_i64(sequence)?,result.encode_to_vec(),u64_i64(now_ms)?]).map_err(sql_error)?;
 		for digest in result_artifacts(&result) { add_artifact_ref(&tx,&digest,"result",&format!("{}:{index}",lease.call_id))?; }
-		let event_sequence = append_event(&tx,&lease.call_id,CallEventType::Yield,call_event::Payload::Yield(result),now_ms)?;
+		let event_sequence = append_event(&tx,&lease.call_id,CallEventType::Yield,call_event::Payload::YieldResult(result),now_ms)?;
 		let event = event_by_sequence(&tx,&lease.call_id,event_sequence)?;
 		tx.commit().map_err(sql_error)?;
 		Ok(event)
@@ -384,7 +505,7 @@ impl Store {
 		event_by_sequence(&connection,call_id,sequence)
 	}
 	/// Commit a non-retryable user failure.
-	pub fn fail_user(&self,lease:&LeaseToken,error:&CallError,now_ms:u64)->Result<()>{finish_error(self,lease,error,None,now_ms)}
+	pub fn fail_user(&self,lease:&LeaseToken,error:&CallError,now_ms:u64)->Result<()>{fail_user_error(self,lease,error,now_ms)}
 
 	/// Requeue an infrastructure failure at a caller-selected retry instant.
 	pub fn fail_infra(&self,lease:&LeaseToken,error:&CallError,retry_at_ms:u64,now_ms:u64)->Result<()>{retry_error(self,lease,error,retry_at_ms,true,now_ms)}
@@ -417,6 +538,7 @@ impl Store {
 		let mut connection=self.connection.lock().map_err(lock_error)?; let tx=immediate(&mut connection)?;
 		require_lease(&tx,lease,&[INPUT_LEASED,INPUT_RUNNING],now_ms)?;
 		if call_status(&tx,&lease.call_id)? != CallStatus::Cancelling { return Err(EngineError::invalid("call has no pending cancellation")); }
+		append_attempt_transition(&tx,lease,AttemptStatus::Cancelled,AttemptFailureKind::Cancelled,None,StartupKind::Unspecified,now_ms)?;
 		tx.execute("UPDATE inputs SET status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,error=NULL WHERE call_id=? AND input_index=?",params![INPUT_CANCELLED,u64_i64(now_ms)?,lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;
 		if !reason.is_empty(){tx.execute("UPDATE calls SET cancel_reason=? WHERE id=?",params![reason,lease.call_id]).map_err(sql_error)?;}
 		let active:u64=tx.query_row("SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",params![lease.call_id,INPUT_LEASED,INPUT_RUNNING],|row|row.get(0)).map_err(sql_error)?;
@@ -438,6 +560,12 @@ impl Store {
 		let calls=statement.query_map([u64_i64(now_ms)?],|row|row.get::<_,String>(0)).map_err(sql_error)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql_error)?;drop(statement);
 		for id in &calls{tx.execute("DELETE FROM artifact_refs WHERE owner_kind='result' AND (owner_id=? OR owner_id LIKE ?)",params![id,format!("{id}:%")]).map_err(sql_error)?;tx.execute("DELETE FROM results WHERE call_id=?",[id]).map_err(sql_error)?;tx.execute("DELETE FROM events WHERE call_id=? AND event_type IN (?,?)",params![id,CallEventType::Yield as i32,CallEventType::Result as i32]).map_err(sql_error)?;tx.execute("UPDATE inputs SET result=NULL WHERE call_id=?",[id]).map_err(sql_error)?;tx.execute("UPDATE calls SET result_expiry_ms=NULL WHERE id=?",[id]).map_err(sql_error)?;}
 		tx.commit().map_err(sql_error)?;Ok(calls.len() as u64)
+	}
+
+	/// Return the durable event sequence frontier for subscribe-before-replay.
+	pub fn event_frontier(&self,call_id:&str)->Result<u64>{
+		let connection=self.connection.lock().map_err(lock_error)?;
+		connection.query_row("SELECT event_seq FROM calls WHERE id=?",[call_id],|row|row.get(0)).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))
 	}
 
 	/// Replay immutable call events strictly after a durable cursor.
@@ -495,15 +623,13 @@ impl Store {
 			let target = spec.target.as_ref().ok_or_else(|| EngineError::engine("schedule missing target"))?;
 			let request = CreateCallRequest {
 				r#type: CallType::Unary as i32,
-				target: Some(CallTarget { function: target.function.clone(), actor_presence: None, actor_method_presence: None }),
-				inputs: vec![CallInput { index: 0, value: target.input.clone(), input_id: format!("{schedule_id}:{expected}") }],
+				target: Some(CallTarget { function: target.function.clone(), receiver: None }),
+				inputs: vec![CallInput { index: 0, payload: target.input.clone().map(call_input::Payload::Value), input_id: format!("{schedule_id}:{expected}") }],
 				inputs_closed: true,
 				graph: None,
 				request_id: format!("schedule:{schedule_id}:{expected}"),
 				labels: spec.labels.clone(),
-				client_cancellation: ClientCancellationPolicy::Detach as i32,
 				result_ttl_millis_presence: None,
-				client_session_id_presence: None,
 			};
 			let call = self.create_call(&request, now_ms)?;
 			let next = next_schedule_run(&record, expected)?;
@@ -515,7 +641,7 @@ impl Store {
 	}
 
 	/// Create a durable actor identity idempotently.
-	pub fn create_actor(&self,request:&CreateActorRequest,now_ms:u64)->Result<ActorRecord>{let function=request.function.as_ref().ok_or_else(||EngineError::invalid("actor function is required"))?;let fingerprint=Sha256::digest(request.encode_to_vec());let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;if let Some(resource)=idempotent_resource(&tx,"actor",&request.request_id,&fingerprint)?{let v=actor_by_id(&tx,&resource)?;tx.commit().map_err(sql_error)?;return Ok(v)}revision_by_id(&tx,&function.revision_id)?;let id=Uuid::new_v4().to_string();let value=ActorRecord{r#ref:Some(ActorRef{actor_id:id.clone()}),function:Some(function.clone()),status:ActorStatus::Creating as i32,created_at_unix_millis:now_ms,updated_at_unix_millis:now_ms,latest_checkpoint_presence:None,labels:request.labels.clone()};tx.execute("INSERT INTO actors(id,revision_id,status,request,record,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?)",params![id,function.revision_id,value.status,request.encode_to_vec(),value.encode_to_vec(),u64_i64(now_ms)?,u64_i64(now_ms)?]).map_err(sql_error)?;for digest in envelope_artifacts(request.initial_state_presence.as_ref().map(|v|match v{create_actor_request::InitialStatePresence::InitialState(e)=>e})){add_artifact_ref(&tx,&digest,"actor",&id)?;}put_idempotency(&tx,"actor",&request.request_id,&fingerprint,&id,now_ms)?;tx.commit().map_err(sql_error)?;Ok(value)}
+	pub fn create_actor(&self,request:&CreateActorRequest,now_ms:u64)->Result<ActorRecord>{let function=request.function.as_ref().ok_or_else(||EngineError::invalid("actor function is required"))?;let fingerprint=Sha256::digest(request.encode_to_vec());let mut c=self.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;if let Some(resource)=idempotent_resource(&tx,"actor",&request.request_id,&fingerprint)?{let v=actor_by_id(&tx,&resource)?;tx.commit().map_err(sql_error)?;return Ok(v)}revision_by_id(&tx,&function.revision_id)?;let id=Uuid::new_v4().to_string();let value=ActorRecord{r#ref:Some(ActorRef{actor_id:id.clone()}),function:Some(function.clone()),status:ActorStatus::Creating as i32,created_at_unix_millis:now_ms,updated_at_unix_millis:now_ms,latest_checkpoint_presence:None,labels:request.labels.clone()};tx.execute("INSERT INTO actors(id,revision_id,status,request,record,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?)",params![id,function.revision_id,value.status,request.encode_to_vec(),value.encode_to_vec(),u64_i64(now_ms)?,u64_i64(now_ms)?]).map_err(sql_error)?;for digest in actor_initial_artifacts(request){add_artifact_ref(&tx,&digest,"actor",&id)?;}put_idempotency(&tx,"actor",&request.request_id,&fingerprint,&id,now_ms)?;tx.commit().map_err(sql_error)?;Ok(value)}
 
 	/// Get an actor record.
 	pub fn get_actor(&self,id:&str)->Result<ActorRecord>{let c=self.connection.lock().map_err(lock_error)?;actor_by_id(&c,id)}
@@ -621,7 +747,7 @@ CREATE TABLE IF NOT EXISTS app_members(app_revision_id TEXT NOT NULL REFERENCES 
 CREATE TABLE IF NOT EXISTS app_aliases(namespace TEXT NOT NULL,name TEXT NOT NULL,revision_id TEXT NOT NULL REFERENCES app_revisions(id),updated_ms INTEGER NOT NULL,PRIMARY KEY(namespace,name));
 CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY,revision_id TEXT NOT NULL REFERENCES revisions(id),actor_id TEXT,kind INTEGER NOT NULL,status INTEGER NOT NULL,input_closed INTEGER NOT NULL,request BLOB NOT NULL,created_ms INTEGER NOT NULL,updated_ms INTEGER NOT NULL,queued_ms INTEGER,started_ms INTEGER,finished_ms INTEGER,queue_deadline_ms INTEGER,execution_timeout_ms INTEGER NOT NULL,result_ttl_ms INTEGER NOT NULL,result_expiry_ms INTEGER,cancel_reason TEXT,error BLOB,event_seq INTEGER NOT NULL,result_seq INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS calls_queue ON calls(status,queue_deadline_ms,created_ms,id); CREATE INDEX IF NOT EXISTS calls_list ON calls(created_ms,id);
-CREATE TABLE IF NOT EXISTS inputs(call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,input_index INTEGER NOT NULL,payload BLOB NOT NULL,status INTEGER NOT NULL,user_attempts INTEGER NOT NULL DEFAULT 0,infra_attempts INTEGER NOT NULL DEFAULT 0,available_ms INTEGER NOT NULL,lease_owner TEXT,lease_expiry_ms INTEGER,lease_generation INTEGER NOT NULL DEFAULT 0,started_ms INTEGER,finished_ms INTEGER,result BLOB,error BLOB,stats BLOB,PRIMARY KEY(call_id,input_index)); CREATE INDEX IF NOT EXISTS inputs_available ON inputs(status,available_ms,call_id,input_index); CREATE INDEX IF NOT EXISTS inputs_lease ON inputs(status,lease_expiry_ms);
+CREATE TABLE IF NOT EXISTS inputs(call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,input_index INTEGER NOT NULL,payload BLOB NOT NULL,status INTEGER NOT NULL,user_attempts INTEGER NOT NULL DEFAULT 0,infra_attempts INTEGER NOT NULL DEFAULT 0,available_ms INTEGER NOT NULL,lease_owner TEXT,lease_expiry_ms INTEGER,lease_generation INTEGER NOT NULL DEFAULT 0,attempt_id TEXT,started_ms INTEGER,finished_ms INTEGER,result BLOB,error BLOB,stats BLOB,PRIMARY KEY(call_id,input_index)); CREATE INDEX IF NOT EXISTS inputs_available ON inputs(status,available_ms,call_id,input_index); CREATE INDEX IF NOT EXISTS inputs_lease ON inputs(status,lease_expiry_ms);
 CREATE TABLE IF NOT EXISTS events(call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,payload BLOB NOT NULL,event_type INTEGER NOT NULL,created_ms INTEGER NOT NULL,PRIMARY KEY(call_id,sequence));
 CREATE TABLE IF NOT EXISTS results(call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,result_index INTEGER NOT NULL,sequence INTEGER NOT NULL,payload BLOB NOT NULL,created_ms INTEGER NOT NULL,PRIMARY KEY(call_id,result_index),UNIQUE(call_id,sequence));
 CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY,app_namespace TEXT NOT NULL,app_name TEXT NOT NULL,function_namespace TEXT NOT NULL,function_name TEXT NOT NULL,status INTEGER NOT NULL,record BLOB NOT NULL,created_ms INTEGER NOT NULL,updated_ms INTEGER NOT NULL,next_run_ms INTEGER); CREATE INDEX IF NOT EXISTS schedules_due ON schedules(status,next_run_ms,id);
@@ -636,6 +762,8 @@ COMMIT;").map_err(sql_error)?;
 		columns.iter().any(|column|column=="actor_id")
 	};
 	if !has_actor_id { connection.execute("ALTER TABLE calls ADD COLUMN actor_id TEXT",[]).map_err(sql_error)?; }
+	let has_attempt_id={let mut statement=connection.prepare("PRAGMA table_info(inputs)").map_err(sql_error)?;let columns=statement.query_map([],|row|row.get::<_,String>(1)).map_err(sql_error)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql_error)?;columns.iter().any(|column|column=="attempt_id")};
+	if !has_attempt_id{connection.execute("ALTER TABLE inputs ADD COLUMN attempt_id TEXT",[]).map_err(sql_error)?;}
 	connection.pragma_update(None,"user_version",SCHEMA_VERSION).map_err(sql_error)?;
 	Ok(())
 }
@@ -664,19 +792,21 @@ fn sorted_map(map:&std::collections::HashMap<String,String>)->Vec<(String,String
 fn digest_bindings(bindings:&[AppFunctionBinding])->[u8;32]{let mut h=Sha256::new();for b in bindings{h.update((b.name.len()as u64).to_be_bytes());h.update(b.name.as_bytes());if let Some(r)=&b.revision{h.update(r.encode_to_vec())}}h.finalize().into()}
 fn check_expected_revision(current:Option<&str>,expected:Option<&RevisionRef>)->Result<()>{if let Some(e)=expected{if current!=Some(e.revision_id.as_str()){return Err(EngineError::busy("active function revision changed"))}}Ok(())}
 fn check_expected_app(current:Option<&str>,expected:Option<&AppRevisionRef>)->Result<()>{if let Some(e)=expected{if current!=Some(e.revision_id.as_str()){return Err(EngineError::busy("active app revision changed"))}}Ok(())}
-fn assigned_input_id(call_id:&str,index:u64)->String{format!("{call_id}:{index}")}
 fn validate_call_request(r:&CreateCallRequest)->Result<()>{
-	if CallType::try_from(r.r#type).unwrap_or(CallType::Unspecified)==CallType::Unspecified{return Err(EngineError::invalid("call type is required"))}
-	let target=r.target.as_ref().ok_or_else(||EngineError::invalid("call target is required"))?;
-	if target.function.as_ref().is_none_or(|f|f.revision_id.is_empty()){return Err(EngineError::invalid("pinned function revision is required"))}
-	let policy=ClientCancellationPolicy::try_from(r.client_cancellation).map_err(|_|EngineError::invalid("invalid client cancellation policy"))?;
-	let session=r.client_session_id_presence.as_ref().map(|value|match value{create_call_request::ClientSessionIdPresence::ClientSessionId(id)=>id.as_str()});
-	if policy==ClientCancellationPolicy::Cancel&&session.is_none_or(str::is_empty){return Err(EngineError::invalid("cancel-on-disconnect calls require a nonempty client session id"));}
-	if session.is_some_and(str::is_empty){return Err(EngineError::invalid("client session id must be nonempty"));}
-	let mut expected=0;let mut ids=HashSet::new();
-	for input in &r.inputs{if input.index!=expected||input.value.is_none(){return Err(EngineError::invalid("initial input indexes must be contiguous and values are required"))}if !input.input_id.is_empty()&&!ids.insert(&input.input_id){return Err(EngineError::invalid("supplied input ids must be unique"))}validate_envelope(input.value.as_ref().unwrap())?;expected+=1}
-	Ok(())
+	let kind=CallType::try_from(r.r#type).map_err(|_|EngineError::invalid("call type is required"))?;if kind==CallType::Unspecified{return Err(EngineError::invalid("call type is required"));}
+	let target=r.target.as_ref().ok_or_else(||EngineError::invalid("call target is required"))?;if target.function.as_ref().is_none_or(|revision|revision.revision_id.is_empty()||revision.function.is_none()){return Err(EngineError::invalid("pinned function revision and identity are required"));}
+	match (kind,target.receiver.as_ref()) {
+		(CallType::Actor,Some(call_target::Receiver::Actor(actor))) if actor.actor.is_some()&&!actor.method.is_empty()=>{},
+		(CallType::Actor,_)=>return Err(EngineError::invalid("actor calls require a typed actor receiver and method")),
+		(_,Some(call_target::Receiver::Actor(_)))=>return Err(EngineError::invalid("only actor calls may specify an actor receiver")),
+		(_,Some(call_target::Receiver::Service(service))) if service.service_key.is_empty()||service.method.is_empty()=>return Err(EngineError::invalid("service receiver requires a key and method")),
+		_=>{},
+	}
+	if kind!=CallType::Batch&&(r.inputs.len()!=1||r.inputs[0].index!=0||!r.inputs_closed){return Err(EngineError::invalid("unary, generator, and actor calls require exactly one closed index-0 input"));}
+	let mut expected=0;let mut ids=HashSet::new();for input in &r.inputs{if input.index!=expected{return Err(EngineError::invalid("initial input indexes must be contiguous"));}if input.input_id.is_empty()||!ids.insert(&input.input_id){return Err(EngineError::invalid("client input ids must be nonempty and unique"));}validate_call_input(input)?;expected+=1;}Ok(())
 }
+fn validate_call_input(input:&CallInput)->Result<()> {match input.payload.as_ref().ok_or_else(||EngineError::invalid("input payload is required"))?{call_input::Payload::Value(value)=>validate_envelope(value),call_input::Payload::Arguments(arguments)=>{for value in &arguments.positional{validate_envelope(value)?;}for value in arguments.named.values(){validate_envelope(value)?;}Ok(())}}}
+
 fn validate_envelope(value:&ValueEnvelope)->Result<()> {
 	if value.schema_version==0{return Err(EngineError::invalid("value envelope schema version is required"))}
 	if ValueSerializer::try_from(value.serializer).unwrap_or(ValueSerializer::Unspecified)==ValueSerializer::Unspecified{return Err(EngineError::invalid("value serializer is required"))}
@@ -695,19 +825,32 @@ fn call_record(c:&Connection,id:&str)->Result<CallRecord>{let row:(i32,bool,Vec<
 fn call_stats(c:&Connection,id:&str)->Result<CallStats>{let (created,updated,queued,started):(u64,u64,Option<u64>,Option<u64>)=c.query_row("SELECT created_ms,updated_ms,queued_ms,started_ms FROM calls WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(sql_error)?;let mut attempts=Vec::new();let mut s=c.prepare("SELECT stats FROM inputs WHERE call_id=? AND stats IS NOT NULL ORDER BY input_index").map_err(sql_error)?;for row in s.query_map([id],|r|r.get::<_,Vec<u8>>(0)).map_err(sql_error)?{attempts.push(decode_message(&row.map_err(sql_error)?)?)}let queue=started.unwrap_or(updated).saturating_sub(queued.unwrap_or(created));let execution=started.map_or(0,|s|updated.saturating_sub(s));Ok(CallStats{queue_millis:queue,startup_millis:attempts.iter().map(|a:&AttemptStats|a.startup_millis).sum(),execution_millis:execution,wall_millis:updated.saturating_sub(created),cpu_millis:attempts.iter().map(|a|a.cpu_millis).sum(),peak_memory_bytes:attempts.iter().map(|a|a.peak_memory_bytes).max().unwrap_or(0),attempts})}
 fn next_event_sequence(c:&Connection,id:&str)->Result<u64>{let seq:u64=c.query_row("UPDATE calls SET event_seq=event_seq+1 WHERE id=? RETURNING event_seq",[id],|r|r.get(0)).map_err(sql_error)?;Ok(seq)}
 fn next_result_sequence(c:&Connection,id:&str)->Result<u64>{let seq:u64=c.query_row("UPDATE calls SET result_seq=result_seq+1 WHERE id=? RETURNING result_seq",[id],|r|r.get(0)).map_err(sql_error)?;Ok(seq)}
-fn append_event(c:&Connection,id:&str,event_type:CallEventType,payload:call_event::Payload,now:u64)->Result<u64>{let seq=next_event_sequence(c,id)?;let event=CallEvent{call:Some(CallRef{call_id:id.into()}),sequence:seq,created_at_unix_millis:now,r#type:event_type as i32,payload:Some(payload),input_id_presence:None,input_index_presence:None,attempt_presence:None};c.execute("INSERT INTO events(call_id,sequence,payload,event_type,created_ms) VALUES(?,?,?,?,?)",params![id,u64_i64(seq)?,event.encode_to_vec(),event_type as i32,u64_i64(now)?]).map_err(sql_error)?;Ok(seq)}
+fn append_event(c:&Connection,id:&str,event_type:CallEventType,payload:call_event::Payload,now:u64)->Result<u64>{let seq=next_event_sequence(c,id)?;let event=CallEvent{call:Some(CallRef{call_id:id.into()}),sequence:seq,created_at_unix_millis:now,r#type:event_type as i32,payload:Some(payload),input_id_presence:None,input_index_presence:None,attempt_id_presence:None};c.execute("INSERT INTO events(call_id,sequence,payload,event_type,created_ms) VALUES(?,?,?,?,?)",params![id,u64_i64(seq)?,event.encode_to_vec(),event_type as i32,u64_i64(now)?]).map_err(sql_error)?;Ok(seq)}
 fn event_by_sequence(c:&Connection,id:&str,sequence:u64)->Result<CallEvent>{let bytes:Vec<u8>=c.query_row("SELECT payload FROM events WHERE call_id=? AND sequence=?",params![id,u64_i64(sequence)?],|row|row.get(0)).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call event not found"))?;decode_message(&bytes)}
 fn append_status_event(c:&Connection,id:&str,status:CallStatus,now:u64)->Result<u64>{append_event(c,id,CallEventType::Status,call_event::Payload::Status(StatusEvent{status:status as i32}),now)}
 fn call_status(c:&Connection,id:&str)->Result<CallStatus>{let raw:i32=c.query_row("SELECT status FROM calls WHERE id=?",[id],|r|r.get(0)).optional().map_err(sql_error)?.ok_or_else(||EngineError::not_found("call not found"))?;CallStatus::try_from(raw).map_err(|_|EngineError::engine("corrupt call status"))}
 fn call_kind(c:&Connection,id:&str)->Result<CallType>{let raw:i32=c.query_row("SELECT kind FROM calls WHERE id=?",[id],|r|r.get(0)).map_err(sql_error)?;CallType::try_from(raw).map_err(|_|EngineError::engine("corrupt call type"))}
 fn terminal_call(s:CallStatus)->bool{matches!(s,CallStatus::Succeeded|CallStatus::Failed|CallStatus::Cancelled)}
+fn append_attempt_transition(c:&Connection,lease:&LeaseToken,status:AttemptStatus,failure:AttemptFailureKind,error:Option<&CallError>,startup:StartupKind,now:u64)->Result<u64>{let(attempt_id,user_attempt,infra_attempt):(String,u32,u32)=c.query_row("SELECT COALESCE(attempt_id,''),user_attempts,infra_attempts FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(sql_error)?;if attempt_id.is_empty(){return Err(EngineError::engine("input attempt has no stable id"));}append_event(c,&lease.call_id,CallEventType::Attempt,call_event::Payload::AttemptEvent(AttemptEvent{attempt_id,user_attempt,infra_attempt,status:status as i32,startup:startup as i32,worker_id:lease.worker_id.clone(),failure_kind:failure as i32,error_presence:error.cloned().map(attempt_event::ErrorPresence::Error)}),now)}
 fn require_lease(c:&Connection,l:&LeaseToken,statuses:&[i32],now:u64)->Result<()> {let row:Option<(i32,String,u64,u64)>=c.query_row("SELECT status,COALESCE(lease_owner,''),lease_generation,COALESCE(lease_expiry_ms,0) FROM inputs WHERE call_id=? AND input_index=?",params![l.call_id,u64_i64(l.input_index)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(sql_error)?;match row{Some((s,owner,generation,expiry))if statuses.contains(&s)&&owner==l.worker_id&&generation==l.lease_generation&&expiry>now=>Ok(()),_=>Err(EngineError::busy("stale or expired input lease"))}}
 fn require_executable_call(c:&Connection,id:&str)->Result<()> {match call_status(c,id)?{CallStatus::Queued|CallStatus::Running=>Ok(()),CallStatus::Cancelling|CallStatus::Cancelled=>Err(EngineError::busy("call cancellation is pending")),status if terminal_call(status)=>Err(EngineError::invalid("call is already terminal")),_=>Err(EngineError::invalid("call is not executable"))}}
 fn lease_changed(changed:usize)->Result<()>{if changed==1{Ok(())}else{Err(EngineError::busy("stale or expired input lease"))}}
-fn retry_error(store:&Store,lease:&LeaseToken,error:&CallError,retry_at:u64,infra:bool,now:u64)->Result<()> {let mut c=store.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now)?;require_executable_call(&tx,&lease.call_id)?;tx.execute("UPDATE inputs SET status=?,available_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL,infra_attempts=infra_attempts+? WHERE call_id=? AND input_index=?",params![INPUT_QUEUED,u64_i64(retry_at)?,error.encode_to_vec(),if infra{1}else{0},lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;let attempt:u32=tx.query_row("SELECT user_attempts FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|r|r.get(0)).map_err(sql_error)?;append_event(&tx,&lease.call_id,CallEventType::Attempt,call_event::Payload::AttemptEvent(AttemptEvent{attempt,status:AttemptStatus::Failed as i32,startup:StartupKind::Unspecified as i32,worker_id:lease.worker_id.clone(),error_presence:Some(attempt_event::ErrorPresence::Error(error.clone()))}),now)?;tx.commit().map_err(sql_error)?;Ok(())}
-fn finish_error(store:&Store,lease:&LeaseToken,error:&CallError,retry:Option<u64>,now:u64)->Result<()>{let mut c=store.connection.lock().map_err(lock_error)?;let tx=immediate(&mut c)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now)?;require_executable_call(&tx,&lease.call_id)?;if let Some(at)=retry{tx.execute("UPDATE inputs SET status=?,available_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_QUEUED,u64_i64(at)?,error.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;}else{tx.execute("UPDATE inputs SET status=?,finished_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_FAILED,u64_i64(now)?,error.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;tx.execute("UPDATE calls SET status=?,error=?,finished_ms=?,updated_ms=?,result_expiry_ms=CASE WHEN result_ttl_ms=0 THEN NULL ELSE ?+result_ttl_ms END WHERE id=? AND status NOT IN (?,?,?)",params![CallStatus::Failed as i32,error.encode_to_vec(),u64_i64(now)?,u64_i64(now)?,u64_i64(now)?,lease.call_id,CallStatus::Succeeded as i32,CallStatus::Failed as i32,CallStatus::Cancelled as i32]).map_err(sql_error)?;append_event(&tx,&lease.call_id,CallEventType::Error,call_event::Payload::Error(error.clone()),now)?;append_status_event(&tx,&lease.call_id,CallStatus::Failed,now)?;}tx.commit().map_err(sql_error)?;Ok(())}
+fn fail_user_error(store:&Store,lease:&LeaseToken,error:&CallError,now:u64)->Result<()> {
+	let mut connection=store.connection.lock().map_err(lock_error)?;let tx=immediate(&mut connection)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now)?;require_executable_call(&tx,&lease.call_id)?;append_attempt_transition(&tx,lease,AttemptStatus::Failed,AttemptFailureKind::User,Some(error),StartupKind::Unspecified,now)?;
+	if call_kind(&tx,&lease.call_id)?==CallType::Batch {
+		let sequence=next_result_sequence(&tx,&lease.call_id)?;let input:CallInput=decode_message(&tx.query_row::<Vec<u8>,_,_>("SELECT payload FROM inputs WHERE call_id=? AND input_index=?",params![lease.call_id,u64_i64(lease.input_index)?],|row|row.get(0)).map_err(sql_error)?)?;
+		let result=CallResult{call:Some(CallRef{call_id:lease.call_id.clone()}),index:lease.input_index,created_at_unix_millis:now,sequence,input_id:input.input_id,input_index:lease.input_index,outcome:Some(call_result::Outcome::Error(error.clone())),yield_index_presence:None};
+		tx.execute("INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",params![lease.call_id,u64_i64(lease.input_index)?,u64_i64(sequence)?,result.encode_to_vec(),u64_i64(now)?]).map_err(sql_error)?;
+		tx.execute("UPDATE inputs SET status=?,finished_ms=?,result=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_FAILED,u64_i64(now)?,result.encode_to_vec(),error.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;
+		append_event(&tx,&lease.call_id,CallEventType::Result,call_event::Payload::Result(result),now)?;complete_call_tx(&tx,&lease.call_id,now)?;tx.commit().map_err(sql_error)?;return Ok(());
+	}
+	finish_error_tx(&tx,lease,error,now)?;tx.commit().map_err(sql_error)?;Ok(())
+}
+fn finish_error_tx(tx:&Connection,lease:&LeaseToken,error:&CallError,now:u64)->Result<()> {tx.execute("UPDATE inputs SET status=?,finished_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE call_id=? AND input_index=?",params![INPUT_FAILED,u64_i64(now)?,error.encode_to_vec(),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;tx.execute("UPDATE calls SET status=?,error=?,finished_ms=?,updated_ms=?,result_expiry_ms=CASE WHEN result_ttl_ms=0 THEN NULL ELSE ?+result_ttl_ms END WHERE id=? AND status NOT IN (?,?,?)",params![CallStatus::Failed as i32,error.encode_to_vec(),u64_i64(now)?,u64_i64(now)?,u64_i64(now)?,lease.call_id,CallStatus::Succeeded as i32,CallStatus::Failed as i32,CallStatus::Cancelled as i32]).map_err(sql_error)?;append_event(tx,&lease.call_id,CallEventType::Error,call_event::Payload::Error(error.clone()),now)?;append_status_event(tx,&lease.call_id,CallStatus::Failed,now)?;Ok(())}
+fn retry_error(store:&Store,lease:&LeaseToken,error:&CallError,retry_at:u64,infra:bool,now:u64)->Result<()> {let mut connection=store.connection.lock().map_err(lock_error)?;let tx=immediate(&mut connection)?;require_lease(&tx,lease,&[INPUT_RUNNING,INPUT_LEASED],now)?;require_executable_call(&tx,&lease.call_id)?;append_attempt_transition(&tx,lease,AttemptStatus::Failed,if infra{AttemptFailureKind::Infrastructure}else{AttemptFailureKind::User},Some(error),StartupKind::Unspecified,now)?;tx.execute("UPDATE inputs SET status=?,available_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL,infra_attempts=infra_attempts+?,user_attempts=user_attempts+?,attempt_id=NULL WHERE call_id=? AND input_index=?",params![INPUT_QUEUED,u64_i64(retry_at)?,error.encode_to_vec(),u32::from(infra),u32::from(!infra),lease.call_id,u64_i64(lease.input_index)?]).map_err(sql_error)?;tx.commit().map_err(sql_error)?;Ok(())}
+
 fn finalize_cancelled_tx(c:&Connection,id:&str,now:u64)->Result<()> {if call_status(c,id)?==CallStatus::Cancelled{return Ok(())}c.execute("UPDATE calls SET status=?,finished_ms=?,updated_ms=?,result_expiry_ms=CASE WHEN result_ttl_ms=0 THEN NULL ELSE ?+result_ttl_ms END WHERE id=?",params![CallStatus::Cancelled as i32,u64_i64(now)?,u64_i64(now)?,u64_i64(now)?,id]).map_err(sql_error)?;append_status_event(c,id,CallStatus::Cancelled,now)?;Ok(())}
-fn complete_call_tx(c:&Connection,id:&str,now:u64)->Result<bool>{let status=call_status(c,id)?;if terminal_call(status)||status==CallStatus::Cancelling{return Ok(false)}let (closed,pending,failed):(bool,u64,u64)=c.query_row("SELECT input_closed,SUM(CASE WHEN i.status IN (1,2,3) THEN 1 ELSE 0 END),SUM(CASE WHEN i.status=5 THEN 1 ELSE 0 END) FROM calls LEFT JOIN inputs i ON i.call_id=calls.id WHERE calls.id=? GROUP BY calls.id",[id],|r|Ok((r.get(0)?,r.get::<_,Option<u64>>(1)?.unwrap_or(0),r.get::<_,Option<u64>>(2)?.unwrap_or(0)))).map_err(sql_error)?;if !closed||pending>0{return Ok(false)}let target=if failed>0{CallStatus::Failed}else{CallStatus::Succeeded};c.execute("UPDATE calls SET status=?,finished_ms=?,updated_ms=?,result_expiry_ms=CASE WHEN result_ttl_ms=0 THEN NULL ELSE ?+result_ttl_ms END WHERE id=?",params![target as i32,u64_i64(now)?,u64_i64(now)?,u64_i64(now)?,id]).map_err(sql_error)?;append_status_event(c,id,target,now)?;Ok(true)}
+fn complete_call_tx(c:&Connection,id:&str,now:u64)->Result<bool>{let status=call_status(c,id)?;if terminal_call(status)||status==CallStatus::Cancelling{return Ok(false)}let (closed,pending,failed):(bool,u64,u64)=c.query_row("SELECT input_closed,SUM(CASE WHEN i.status IN (1,2,3) THEN 1 ELSE 0 END),SUM(CASE WHEN i.status=5 THEN 1 ELSE 0 END) FROM calls LEFT JOIN inputs i ON i.call_id=calls.id WHERE calls.id=? GROUP BY calls.id",[id],|r|Ok((r.get(0)?,r.get::<_,Option<u64>>(1)?.unwrap_or(0),r.get::<_,Option<u64>>(2)?.unwrap_or(0)))).map_err(sql_error)?;if !closed||pending>0{return Ok(false)}let target=if call_kind(c,id)?==CallType::Batch{CallStatus::Succeeded}else if failed>0{CallStatus::Failed}else{CallStatus::Succeeded};c.execute("UPDATE calls SET status=?,finished_ms=?,updated_ms=?,result_expiry_ms=CASE WHEN result_ttl_ms=0 THEN NULL ELSE ?+result_ttl_ms END WHERE id=?",params![target as i32,u64_i64(now)?,u64_i64(now)?,u64_i64(now)?,id]).map_err(sql_error)?;append_status_event(c,id,target,now)?;Ok(true)}
 fn expire_deadlines_tx(c:&Connection,now:u64)->Result<()> {let mut s=c.prepare("SELECT id FROM calls WHERE status IN (?,?) AND queue_deadline_ms IS NOT NULL AND queue_deadline_ms<=?").map_err(sql_error)?;let ids=s.query_map(params![CallStatus::Queued as i32,CallStatus::Pending as i32,u64_i64(now)?],|r|r.get::<_,String>(0)).map_err(sql_error)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql_error)?;drop(s);for id in ids{let error=CallError{code:"queue_deadline_exceeded".into(),message:"call exceeded its queue deadline".into(),r#type:"QueueDeadlineExceeded".into(),retryable:false,frames:vec![],cause_presence:None,details:Default::default()};c.execute("UPDATE calls SET status=?,error=?,finished_ms=?,updated_ms=? WHERE id=?",params![CallStatus::Failed as i32,error.encode_to_vec(),u64_i64(now)?,u64_i64(now)?,id]).map_err(sql_error)?;c.execute("UPDATE inputs SET status=?,finished_ms=? WHERE call_id=? AND status=?",params![INPUT_FAILED,u64_i64(now)?,id,INPUT_QUEUED]).map_err(sql_error)?;append_event(c,&id,CallEventType::Error,call_event::Payload::Error(error),now)?;append_status_event(c,&id,CallStatus::Failed,now)?;}Ok(())}
 fn validate_schedule(s:&ScheduleSpec)->Result<()>{validate_name(&s.name,"schedule name")?;if s.app.is_none()||s.target.as_ref().is_none_or(|t|t.function.is_none()||t.input.is_none())||s.timing.is_none(){return Err(EngineError::invalid("schedule is incomplete"))}if let Some(schedule_spec::Timing::Period(p))=&s.timing{if p.period_millis==0{return Err(EngineError::invalid("schedule period must be positive"))}}if ScheduleStatus::try_from(s.status).unwrap_or(ScheduleStatus::Unspecified)==ScheduleStatus::Unspecified{return Err(EngineError::invalid("schedule status is required"))}Ok(())}
 fn normalized_page_size(v:u32)->u32{if v==0{100}else{v.min(1000)}}
@@ -717,6 +860,8 @@ fn validate_digest_hex(d:&str)->Result<()>{if d.len()!=64||!d.bytes().all(|b|b.i
 fn add_artifact_ref(c:&Connection,digest:&str,kind:&str,id:&str)->Result<()>{validate_digest_hex(digest)?;let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE digest=?)",[digest],|r|r.get(0)).map_err(sql_error)?;if !exists{return Err(EngineError::invalid(format!("referenced artifact {digest} is not registered")))}c.execute("INSERT OR IGNORE INTO artifact_refs(digest,owner_kind,owner_id) VALUES(?,?,?)",params![digest,kind,id]).map_err(sql_error)?;Ok(())}
 fn digest_hex(d:Option<&Digest>)->Option<String>{let d=d?;(d.algorithm==DigestAlgorithm::Sha256 as i32&&d.value.len()==32).then(||hex::encode(&d.value))}
 fn artifact_ref_digest(a:Option<&ArtifactRef>)->Option<String>{digest_hex(a.and_then(|a|a.digest.as_ref()))}
+fn actor_initial_artifacts(request:&CreateActorRequest)->Vec<String>{let mut out=Vec::new();match &request.initial_payload{Some(create_actor_request::InitialPayload::InitialValue(value))=>out.extend(envelope_artifacts(Some(value))),Some(create_actor_request::InitialPayload::InitialArguments(arguments))=>{for value in &arguments.positional{out.extend(envelope_artifacts(Some(value)));}for value in arguments.named.values(){out.extend(envelope_artifacts(Some(value)));}},None=>{}}out}
+fn call_input_artifacts(input:&CallInput)->Vec<String>{let mut out=Vec::new();match &input.payload{Some(call_input::Payload::Value(value))=>out.extend(envelope_artifacts(Some(value))),Some(call_input::Payload::Arguments(arguments))=>{for value in &arguments.positional{out.extend(envelope_artifacts(Some(value)));}for value in arguments.named.values(){out.extend(envelope_artifacts(Some(value)));}},None=>{}}out}
 fn envelope_artifacts(e:Option<&ValueEnvelope>)->Vec<String>{let mut v=Vec::new();if let Some(ValueEnvelope{storage:Some(value_envelope::Storage::Artifact(a)),..})=e{if let Some(d)=artifact_ref_digest(Some(a)){v.push(d)}}v}
 fn result_artifacts(r:&CallResult)->Vec<String>{match &r.outcome{Some(call_result::Outcome::Value(v))=>envelope_artifacts(Some(v)),_=>Vec::new()}}
 fn function_spec_artifacts(s:&FunctionSpec)->HashSet<String>{let mut out=HashSet::new();if let Some(p)=&s.package{if let Some(d)=artifact_ref_digest(p.source.as_ref()){out.insert(d);}if let Some(package_spec::LockfilePresence::Lockfile(a))=&p.lockfile_presence{if let Some(d)=artifact_ref_digest(Some(a)){out.insert(d);}}}if let Some(i)=&s.image{if let Some(image_spec::Source::Dockerfile(d))=&i.source{if let Some(v)=artifact_ref_digest(d.context.as_ref()){out.insert(v);}}for mount in &i.local_artifact_mounts{if let Some(v)=artifact_ref_digest(mount.artifact.as_ref()){out.insert(v);}}}if let Some(d)=s.snapshot_provenance_placeholder(){out.insert(d);}out}
@@ -740,7 +885,7 @@ mod tests {
 	}
 	fn revision_ref(revision:&FunctionRevision)->RevisionRef { revision.r#ref.clone().unwrap() }
 	fn envelope(bytes:&[u8])->ValueEnvelope { ValueEnvelope { schema_version:1,serializer:ValueSerializer::Json as i32,compression:ValueCompression::None as i32,checksum:Some(Digest{algorithm:DigestAlgorithm::Sha256 as i32,value:Sha256::digest(bytes).to_vec()}),uncompressed_size_bytes:bytes.len() as u64,storage:Some(value_envelope::Storage::InlineData(bytes.to_vec())),python_presence:None,type_name_presence:None } }
-	fn call_request(revision:&FunctionRevision,request_id:&str)->CreateCallRequest { CreateCallRequest { r#type:CallType::Unary as i32,target:Some(CallTarget{function:Some(revision_ref(revision)),actor_presence:None,actor_method_presence:None}),inputs:vec![CallInput{index:0,value:Some(envelope(b"1")),input_id:"input-0".into()}],inputs_closed:true,graph:None,request_id:request_id.into(),labels:Default::default(),client_cancellation:ClientCancellationPolicy::Detach as i32,result_ttl_millis_presence:None,client_session_id_presence:None } }
+	fn call_request(revision:&FunctionRevision,request_id:&str)->CreateCallRequest { CreateCallRequest { r#type:CallType::Unary as i32,target:Some(CallTarget{function:Some(revision_ref(revision)),receiver:None}),inputs:vec![CallInput{index:0,payload:Some(call_input::Payload::Value(envelope(b"1"))),input_id:"input-0".into()}],inputs_closed:true,graph:None,request_id:request_id.into(),labels:Default::default(),result_ttl_millis_presence:None } }
 	fn setup() -> (tempfile::TempDir,Home,Store,FunctionRevision) { let temp=tempfile::tempdir().unwrap();let home=Home::new(temp.path());let store=Store::open(&home).unwrap();let revision=store.register_function(&spec(),"register-1",10).unwrap();(temp,home,store,revision) }
 
 	#[test]
@@ -775,22 +920,38 @@ mod tests {
 		store.create_call(&call_request(&revision,"cancel-race"),30).unwrap();let cancelling=store.lease_next("cancel-worker",31,1_000).unwrap().unwrap();store.mark_running(&cancelling.lease,32,StartupKind::Warm).unwrap();let record=store.cancel_call(&cancelling.lease.call_id,"stop","cancel-request",33).unwrap();assert_eq!(record.status,CallStatus::Cancelling as i32);assert!(store.succeed(&cancelling.lease,&result,None,34).is_err());assert_eq!(store.finish_cancelled(&cancelling.lease,"stop",35).unwrap().status,CallStatus::Cancelled as i32);
 	}
 
+
 	#[test]
-	fn assigns_and_replays_empty_input_ids_stably() {
-		let (_temp,home,store,revision)=setup();let mut request=call_request(&revision,"assigned-inputs");request.r#type=CallType::Batch as i32;request.inputs_closed=false;request.inputs[0].input_id.clear();
-		let call=store.create_call(&request,20).unwrap();let call_id=call.r#ref.unwrap().call_id;assert_eq!(store.client_cancellation(&call_id).unwrap(),(ClientCancellationPolicy::Detach,None));let first=store.get_input(&call_id,0).unwrap();assert_eq!(first.input_id,format!("{call_id}:0"));
-		let appended=CallInput{index:1,value:Some(envelope(b"2")),input_id:String::new()};assert_eq!(store.append_input(&call_id,&appended,21).unwrap(),2);assert_eq!(store.append_input(&call_id,&appended,22).unwrap(),2);let second=store.get_input(&call_id,1).unwrap();assert_eq!(second.input_id,format!("{call_id}:1"));drop(store);
-		let reopened=Store::open(&home).unwrap();assert_eq!(reopened.get_input(&call_id,0).unwrap().input_id,first.input_id);assert_eq!(reopened.get_input(&call_id,1).unwrap().input_id,second.input_id);
+	fn dynamic_batch_leases_only_ordered_batch_inputs() {
+		let (_temp,_home,store,revision)=setup();store.create_call(&call_request(&revision,"unary-before-batch"),19).unwrap();
+		let mut request=call_request(&revision,"dynamic-batch");request.r#type=CallType::Batch as i32;request.inputs=(0..3).map(|index|CallInput{index,payload:Some(call_input::Payload::Value(envelope(index.to_string().as_bytes()))),input_id:format!("batch-{index}")}).collect();
+		let call_id=store.create_call(&request,20).unwrap().r#ref.unwrap().call_id;let revision_id=revision_ref(&revision).revision_id;
+		let mut later=request.clone();later.request_id="later-batch".into();later.inputs=vec![CallInput{index:0,payload:Some(call_input::Payload::Value(envelope(b"later"))),input_id:"later-0".into()}];let later_id=store.create_call(&later,21).unwrap().r#ref.unwrap().call_id;
+		let queued=store.queued_batch_for_revision(&revision_id,22).unwrap().unwrap();assert_eq!(queued.call_id,call_id);assert_eq!(queued.queued_inputs,3);
+		let unary=store.lease_next_non_batch_for_revision(&revision_id,"unary-worker",22,1_000).unwrap().unwrap();assert_eq!(unary.call.r#type,CallType::Unary as i32);
+		let first=store.lease_batch_for_revision(&revision_id,"batch-worker",22,1_000,2).unwrap();assert_eq!(first.iter().map(|item|item.input.index).collect::<Vec<_>>(),vec![0,1]);assert!(first.iter().all(|item|item.lease.call_id==call_id));
+		let second=store.lease_batch_for_revision(&revision_id,"batch-worker",23,1_000,2).unwrap();assert_eq!(second.iter().map(|item|item.input.index).collect::<Vec<_>>(),vec![2]);assert!(second.iter().all(|item|item.lease.call_id==call_id));
+		let third=store.lease_batch_for_revision(&revision_id,"batch-worker",24,1_000,2).unwrap();assert_eq!(third.len(),1);assert_eq!(third[0].lease.call_id,later_id);
+		assert!(store.lease_batch_for_revision(&revision_id,"batch-worker",25,1_000,2).unwrap().is_empty());
 	}
 
 	#[test]
-	fn cancellation_capability_is_required_persisted_and_corruption_checked() {
-		let (_temp,home,store,revision)=setup();let mut request=call_request(&revision,"cancel-capability");request.client_cancellation=ClientCancellationPolicy::Cancel as i32;
-		assert!(store.create_call(&request,20).is_err());request.client_session_id_presence=Some(create_call_request::ClientSessionIdPresence::ClientSessionId("creator-session".into()));
-		let call_id=store.create_call(&request,21).unwrap().r#ref.unwrap().call_id;assert_eq!(store.client_cancellation(&call_id).unwrap(),(ClientCancellationPolicy::Cancel,Some("creator-session".into())));drop(store);
-		let reopened=Store::open(&home).unwrap();assert_eq!(reopened.client_cancellation(&call_id).unwrap(),(ClientCancellationPolicy::Cancel,Some("creator-session".into())));
-		let connection=reopened.connection.lock().unwrap();let bytes:Vec<u8>=connection.query_row("SELECT request FROM calls WHERE id=?",[&call_id],|row|row.get(0)).unwrap();let mut corrupt:CreateCallRequest=decode_message(&bytes).unwrap();corrupt.client_cancellation=999;connection.execute("UPDATE calls SET request=? WHERE id=?",params![corrupt.encode_to_vec(),call_id]).unwrap();drop(connection);assert!(reopened.client_cancellation(&call_id).is_err());
+	fn validates_call_shape_revision_and_actor_authority() {
+		let (_temp,_home,store,revision)=setup();let mut unary=call_request(&revision,"open-unary");unary.inputs_closed=false;assert!(store.create_call(&unary,20).is_err());
+		let mut multiple=call_request(&revision,"multi-unary");multiple.inputs.push(CallInput{index:1,payload:Some(call_input::Payload::Value(envelope(b"2"))),input_id:"two".into()});assert!(store.create_call(&multiple,20).is_err());
+		let mut wrong=call_request(&revision,"wrong-function");wrong.target.as_mut().unwrap().function.as_mut().unwrap().function=Some(FunctionRef{namespace:"test".into(),name:"other".into()});assert!(store.create_call(&wrong,20).is_err());
+		let actor=store.create_actor(&CreateActorRequest{function:Some(revision_ref(&revision)),initial_state_presence:None,request_id:"authority-actor".into(),labels:Default::default()},21).unwrap();let mut other_spec=spec();other_spec.function.as_mut().unwrap().name="other".into();let other=store.register_function(&other_spec,"other-revision",22).unwrap();
+		let actor_call=CreateCallRequest{r#type:CallType::Actor as i32,target:Some(CallTarget{function:Some(revision_ref(&other)),receiver:Some(call_target::Receiver::Actor(ActorTarget{actor:Some(actor.r#ref.unwrap()),method:"run".into()}))}),inputs:vec![CallInput{index:0,payload:Some(call_input::Payload::Value(envelope(b"actor"))),input_id:"actor-input".into()}],inputs_closed:true,graph:None,request_id:"wrong-actor-revision".into(),labels:Default::default(),result_ttl_millis_presence:None};assert!(store.create_call(&actor_call,23).is_err());
 	}
+
+	#[test]
+	fn batch_errors_are_indexed_and_generator_terminal_success_does_not_overwrite_yields() {
+		let (_temp,_home,store,revision)=setup();let revision_id=revision_ref(&revision).revision_id;let mut batch=call_request(&revision,"indexed-errors");batch.r#type=CallType::Batch as i32;batch.inputs.push(CallInput{index:1,payload:Some(call_input::Payload::Value(envelope(b"2"))),input_id:"input-1".into()});let call_id=store.create_call(&batch,20).unwrap().r#ref.unwrap().call_id;
+		let leased=store.lease_batch_for_revision(&revision_id,"batch",21,1_000,2).unwrap();assert_eq!(leased.len(),2);for item in &leased{store.mark_running(&item.lease,22,StartupKind::Warm).unwrap();}let error=CallError{code:"bad-item".into(),message:"bad item".into(),..Default::default()};store.fail_user(&leased[0].lease,&error,23).unwrap();assert_eq!(store.get_call(&call_id).unwrap().status,CallStatus::Running as i32);assert!(matches!(store.get_result(&call_id,0).unwrap().outcome,Some(call_result::Outcome::Error(_))));
+		let result=CallResult{call:None,index:1,created_at_unix_millis:0,sequence:0,input_id:String::new(),input_index:1,outcome:Some(call_result::Outcome::Value(envelope(b"ok"))),yield_index_presence:None};store.succeed(&leased[1].lease,&result,None,24).unwrap();assert_eq!(store.get_call(&call_id).unwrap().status,CallStatus::Succeeded as i32);assert_eq!(store.list_results(&call_id,0,10).unwrap().len(),2);
+		let mut generator=call_request(&revision,"generator-yield");generator.r#type=CallType::Generator as i32;let generator_id=store.create_call(&generator,30).unwrap().r#ref.unwrap().call_id;let lease=store.lease_next_for_revision(&revision_id,"generator",31,1_000).unwrap().unwrap();assert_eq!(lease.lease.call_id,generator_id);store.mark_running(&lease.lease,32,StartupKind::Warm).unwrap();store.commit_yield(&lease.lease,0,envelope(b"yield"),33).unwrap();let terminal=CallResult{call:None,index:0,created_at_unix_millis:0,sequence:0,input_id:String::new(),input_index:0,outcome:Some(call_result::Outcome::Value(envelope(b"ignored-final"))),yield_index_presence:None};store.succeed(&lease.lease,&terminal,None,34).unwrap();assert_eq!(store.get_call(&generator_id).unwrap().status,CallStatus::Succeeded as i32);let results=store.list_results(&generator_id,0,10).unwrap();assert_eq!(results.len(),1);assert_eq!(results[0].yield_index_presence,Some(call_result::YieldIndexPresence::YieldIndex(0)));
+	}
+
 
 	#[test]
 	fn app_activation_and_rollback_are_atomic_across_reopen() {
@@ -816,7 +977,7 @@ mod tests {
 		let reopened=Store::open(&home).unwrap();let recovery=reopened.recover_startup(27).unwrap();assert_eq!(recovery.lost_actors,1);assert_eq!(reopened.get_actor(&actor_ref.actor_id).unwrap().status,ActorStatus::Stopped as i32);assert_eq!(reopened.get_actor(&lost_id).unwrap().status,ActorStatus::Failed as i32);assert_eq!(reopened.get_actor(&actor_ref.actor_id).unwrap().latest_checkpoint_presence.is_some(),true);assert_eq!(reopened.get_schedule("daily").unwrap().r#ref.unwrap().schedule_id,"daily");
 		let artifacts=super::super::artifact::ArtifactStore::open(home.function_artifacts_dir()).unwrap();let kept=artifacts.put(b"kept").unwrap();let gone=artifacts.put(b"gone").unwrap();reopened.record_artifact(&kept.digest,kept.size,None,kept.path.to_str().unwrap(),1,Some(2)).unwrap();reopened.record_artifact(&gone.digest,gone.size,None,gone.path.to_str().unwrap(),1,Some(2)).unwrap();assert!(reopened.record_artifact(&gone.digest,gone.size+1,None,gone.path.to_str().unwrap(),1,Some(2)).is_err());
 		let artifact_value=ValueEnvelope{storage:Some(value_envelope::Storage::Artifact(ArtifactRef{digest:Some(Digest{algorithm:DigestAlgorithm::Sha256 as i32,value:hex::decode(&kept.digest).unwrap()})})),uncompressed_size_bytes:kept.size,checksum:Some(Digest{algorithm:DigestAlgorithm::Sha256 as i32,value:hex::decode(&kept.digest).unwrap()}),schema_version:1,serializer:ValueSerializer::Json as i32,compression:ValueCompression::None as i32,python_presence:None,type_name_presence:None};
-		let mut request=call_request(&revision,"artifact-call");request.inputs[0].value=Some(artifact_value);reopened.create_call(&request,30).unwrap();let expired=reopened.unreferenced_expired_artifacts(3,100).unwrap();assert_eq!(expired,vec![(gone.digest.clone(),gone.path.to_string_lossy().into_owned())]);assert_eq!(artifacts.gc_expired(&reopened,3,100).unwrap(),1);assert!(artifacts.read(&gone.digest,None).is_err());assert!(artifacts.read(&kept.digest,Some(kept.size)).is_ok());
+		let mut request=call_request(&revision,"artifact-call");request.inputs[0].payload=Some(call_input::Payload::Value(artifact_value));reopened.create_call(&request,30).unwrap();let expired=reopened.unreferenced_expired_artifacts(3,100).unwrap();assert_eq!(expired,vec![(gone.digest.clone(),gone.path.to_string_lossy().into_owned())]);assert_eq!(artifacts.gc_expired(&reopened,3,100).unwrap(),1);assert!(artifacts.read(&gone.digest,None).is_err());assert!(artifacts.read(&kept.digest,Some(kept.size)).is_ok());
 	}
 
 	#[test]
@@ -824,7 +985,7 @@ mod tests {
 		let temp=tempfile::tempdir().unwrap();let home=Home::new(temp.path());let store=Store::open(&home).unwrap();let marker=b"TRANSIENT-SUPER-SECRET-92017".to_vec();
 		let request=RegisterFunctionRequest{spec:Some(spec()),request_id:"secret".into(),transient_secrets:vec![TransientSecretMaterial{secret:Some(SecretRef{name:"token".into(),version_presence:None}),value:marker.clone()}]};
 		store.register_function(request.spec.as_ref().unwrap(),&request.request_id,1).unwrap();let revision=store.get_active_revision(&FunctionRef{namespace:"test".into(),name:"echo".into()}).err();assert!(revision.is_some());
-		let registered=store.get_revision(&store.register_function(&spec(),"again",2).unwrap().r#ref.unwrap().revision_id).unwrap();let mut call=call_request(&registered,"bad");call.inputs[0].value.as_mut().unwrap().uncompressed_size_bytes=99;assert!(store.create_call(&call,3).is_err());drop(store);
+		let registered=store.get_revision(&store.register_function(&spec(),"again",2).unwrap().r#ref.unwrap().revision_id).unwrap();let mut call=call_request(&registered,"bad");if let Some(call_input::Payload::Value(value))=call.inputs[0].payload.as_mut(){value.uncompressed_size_bytes=99};assert!(store.create_call(&call,3).is_err());drop(store);
 		for path in [home.functions_db(),home.functions_db().with_extension("sqlite3-wal"),home.functions_db().with_extension("sqlite3-shm")] {if let Ok(bytes)=fs::read(path){assert!(!bytes.windows(marker.len()).any(|window|window==marker));}}
 		if let Ok(entries)=fs::read_dir(home.function_artifacts_dir()){for entry in entries.flatten(){if entry.path().is_file(){let bytes=fs::read(entry.path()).unwrap();assert!(!bytes.windows(marker.len()).any(|window|window==marker));}}}
 	}

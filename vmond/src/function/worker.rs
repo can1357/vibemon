@@ -116,21 +116,30 @@ pub struct WorkerError {
 	pub message: String,
 	/// Whether user retry policy may retry this error.
 	pub retryable: bool,
+	/// Producer exception type, bounded for durable conversion.
+	pub error_type:String,
+	/// Structured frames supplied by the guest.
+	pub frames:Vec<pb::ErrorFrame>,
+	/// One bounded structured cause.
+	pub cause:Option<Box<WorkerError>>,
+	/// Non-secret diagnostic attributes.
+	pub details:HashMap<String,String>,
 }
 
 impl WorkerError {
 	/// Construct an application error reported by user code.
-	pub fn user(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self { Self { kind: WorkerErrorKind::User, code: code.into(), message: message.into(), retryable } }
+	pub fn user(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self { Self::new(WorkerErrorKind::User,code,message,retryable) }
 	/// Construct a deterministic platform/specification error.
-	pub fn platform(code: impl Into<String>, message: impl Into<String>) -> Self { Self { kind: WorkerErrorKind::Platform, code: code.into(), message: message.into(), retryable: false } }
+	pub fn platform(code: impl Into<String>, message: impl Into<String>) -> Self { Self::new(WorkerErrorKind::Platform,code,message,false) }
 	/// Construct a retryable engine, transport, or worker-loss error.
-	pub fn infrastructure(code: impl Into<String>, message: impl Into<String>) -> Self { Self { kind: WorkerErrorKind::Infrastructure, code: code.into(), message: message.into(), retryable: true } }
+	pub fn infrastructure(code: impl Into<String>, message: impl Into<String>) -> Self { Self::new(WorkerErrorKind::Infrastructure,code,message,true) }
 	/// Construct explicit actor loss; callers must never initialize fresh state.
-	pub fn actor_lost(message: impl Into<String>) -> Self { Self { kind: WorkerErrorKind::ActorLost, code: "actor_lost".into(), message: message.into(), retryable: false } }
+	pub fn actor_lost(message: impl Into<String>) -> Self { Self::new(WorkerErrorKind::ActorLost,"actor_lost",message,false) }
 	/// Construct cancellation.
-	pub fn cancelled(message: impl Into<String>) -> Self { Self { kind: WorkerErrorKind::Cancelled, code: "cancelled".into(), message: message.into(), retryable: false } }
+	pub fn cancelled(message: impl Into<String>) -> Self { Self::new(WorkerErrorKind::Cancelled,"cancelled",message,false) }
 	/// Construct a host-enforced deadline failure.
-	pub fn timeout(phase: &'static str) -> Self { Self { kind: WorkerErrorKind::Timeout, code: format!("{phase}_timeout"), message: format!("worker {phase} deadline exceeded"), retryable: phase == "startup" } }
+	pub fn timeout(phase: &'static str) -> Self { Self::new(WorkerErrorKind::Timeout,format!("{phase}_timeout"),format!("worker {phase} deadline exceeded"),phase=="startup") }
+	fn new(kind:WorkerErrorKind,code:impl Into<String>,message:impl Into<String>,retryable:bool)->Self{let message=message.into();Self{kind,code:code.into(),message:message.chars().take(16*1024).collect(),retryable,error_type:String::new(),frames:Vec::new(),cause:None,details:HashMap::new()}}
 }
 
 impl std::fmt::Display for WorkerError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) } }
@@ -164,13 +173,18 @@ pub struct ExecuteRequest {
 	pub input_index: u64,
 	pub attempt: u32,
 	pub mode: ExecutionMode,
-	/// Protocol-v2 value envelope (not an arbitrary JSON document API).
-	pub input: pb::ValueEnvelope,
+	/// Typed scalar or positional/named invocation payload.
+	pub input: pb::call_input::Payload,
 	pub deadline: Option<SystemTime>,
 	pub parent_call_id: Option<String>,
 	pub parent_request_id: Option<String>,
 	pub interruptibility: Interruptibility,
+	pub service: Option<ServiceDispatch>,
 }
+
+/// Deterministic service receiver and constructor arguments.
+#[derive(Clone,Debug,PartialEq)]
+pub struct ServiceDispatch{pub service_key:String,pub method:String,pub constructor:Option<pb::InvocationArguments>}
 
 /// Actor operation executed on a pinned worker.
 #[derive(Clone, Debug)]
@@ -190,7 +204,7 @@ pub struct ActorRequest {
 	pub call_id: Option<String>,
 	pub actor_id: String,
 	pub operation: ActorOperation,
-	pub input: Option<pb::ValueEnvelope>,
+	pub input: Option<pb::call_input::Payload>,
 	pub deadline: Option<SystemTime>,
 }
 
@@ -229,6 +243,20 @@ pub struct Execution {
 	pub events: flume::Receiver<WorkerEvent>,
 	pub completion: BoxFuture<Result<WorkerOutcome, WorkerError>>,
 }
+/// Ordered inputs admitted as one bounded dynamic invocation.
+#[derive(Clone,Debug)]
+pub struct BatchExecuteRequest{pub request_id:String,pub inputs:Vec<ExecuteRequest>}
+/// One ordered terminal result from a grouped invocation.
+#[derive(Clone,Debug)]
+pub struct BatchItemOutcome{pub request_id:String,pub input_id:String,pub input_index:u64,pub outcome:WorkerOutcome}
+/// Terminal grouped result with exactly one item per admitted input.
+#[derive(Clone,Debug)]
+pub struct BatchOutcome{pub items:Vec<BatchItemOutcome>,pub stats:AttemptStats}
+/// An event attributed to one grouped input.
+#[derive(Clone,Debug)]
+pub struct BatchWorkerEvent{pub input_index:u64,pub event:WorkerEvent}
+/// Split event/completion handles for a grouped invocation.
+pub struct BatchExecution{pub events:flume::Receiver<BatchWorkerEvent>,pub completion:BoxFuture<Result<BatchOutcome,WorkerError>>}
 
 /// Why the daemon captures a VM snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +312,7 @@ pub trait Worker: Send + Sync {
 	fn revision_id(&self) -> &str;
 	fn capacity(&self) -> usize;
 	fn interruptibility(&self) -> Interruptibility;
+	fn execute_batch(&self,request:BatchExecuteRequest)->BoxFuture<Result<BatchExecution,WorkerError>>{let _=request;Box::pin(async{Err(WorkerError::platform("batching_unsupported","executor does not support grouped batching"))})}
 	fn execute(&self, request: ExecuteRequest) -> BoxFuture<Result<Execution, WorkerError>>;
 	fn cancel(&self, request_id: &str) -> BoxFuture<Result<(), WorkerError>>;
 	fn snapshot(&self, reason: SnapshotReason) -> BoxFuture<Result<WorkerSnapshot, WorkerError>>;
@@ -332,6 +361,11 @@ struct EngineWorker {
 	secrets: SecretValues,
 	package_sha256: String,
 	package_size: u64,
+	output_format: String,
+	output_compression: String,
+	allow_trusted_python: bool,
+	cloudpickle_version: Option<String>,
+	max_batch_size: usize,
 	initial_snapshot: RwLock<Option<WorkerSnapshot>>,
 }
 
@@ -341,6 +375,7 @@ impl EngineWorker {
 		let expected = SnapshotProvenance::for_revision(&revision)?;
 		let spec = revision.spec.as_ref().ok_or_else(|| WorkerError::platform("invalid_revision", "function spec is required"))?;
 		let startup = duration_ms(spec.timeouts.as_ref().map_or(0, |t| t.startup_millis), DEFAULT_STARTUP);
+		let (output_format,output_compression,allow_trusted_python,cloudpickle_version)=execution_policy(spec)?;
 		let startup_deadline=started+startup;
 		let name = format!("fn-{}-{serial}", sanitize_name(&expected.revision_id));
 		let create = sandbox_create(spec, &name, &secrets)?;
@@ -363,7 +398,7 @@ impl EngineWorker {
 		let (bootstrap, session) = match prepared { Ok(value) => value, Err(error) => { let e=Arc::clone(&engine); let n=id.clone(); let _=tokio::task::spawn_blocking(move || e.remove(&n)).await; return Err(error); } };
 		let worker = Arc::new(Self {
 			id, revision_id: expected.revision_id.clone(), revision: Arc::clone(&revision), home, engine,
-			session, _bootstrap: Mutex::new(Some(bootstrap)), capacity: worker_capacity(spec), async_interruptible: AtomicBool::new(false), secrets, package_sha256, package_size,
+			session, _bootstrap: Mutex::new(Some(bootstrap)), capacity: worker_capacity(spec), max_batch_size:batch_capacity(spec), async_interruptible: AtomicBool::new(false), secrets, package_sha256, package_size, output_format, output_compression, allow_trusted_python, cloudpickle_version,
 			active: Arc::new(Mutex::new(HashMap::new())), closed: Arc::new(AtomicBool::new(false)),
 			startup_millis: millis(started.elapsed()), restored:false, initial_snapshot:RwLock::new(None),
 		});
@@ -384,6 +419,7 @@ impl EngineWorker {
 		if !snapshot.provenance.matches(&revision) { return Err(WorkerError::platform("snapshot_provenance_mismatch", "snapshot immutable inputs no longer match revision")); }
 		let spec = revision.spec.as_ref().ok_or_else(|| WorkerError::platform("invalid_revision", "function spec is required"))?;
 		let startup = duration_ms(spec.timeouts.as_ref().map_or(0, |t| t.startup_millis), DEFAULT_STARTUP);
+		let (output_format,output_compression,allow_trusted_python,cloudpickle_version)=execution_policy(spec)?;
 		let restore_hook = restore_hook(Some(spec)).cloned();
 		let mut extra=HashMap::new();
 		extra.insert("secrets".into(),Value::Array(secrets.sandbox_wire()?));
@@ -398,7 +434,7 @@ impl EngineWorker {
 		if package_sha256!=hex::encode(&expected_package.value){return Err(WorkerError::platform("snapshot_package_mismatch","restored package bytes do not match revision"));}
 		let package_size=package_bytes.len()as u64;
 		let capacity=worker_capacity(spec);
-		let worker=Arc::new(Self { id,revision_id:snapshot.provenance.revision_id.clone(),revision:Arc::clone(&revision),home,engine,session,_bootstrap:Mutex::new(None),capacity,async_interruptible:AtomicBool::new(false),secrets,package_sha256,package_size,active:Arc::new(Mutex::new(HashMap::new())),closed:Arc::new(AtomicBool::new(false)),startup_millis:millis(started.elapsed()),restored:true,initial_snapshot:RwLock::new(Some(snapshot)) });
+		let worker=Arc::new(Self { id,revision_id:snapshot.provenance.revision_id.clone(),revision:Arc::clone(&revision),home,engine,session,_bootstrap:Mutex::new(None),capacity,max_batch_size:batch_capacity(spec),async_interruptible:AtomicBool::new(false),secrets,package_sha256,package_size,output_format,output_compression,allow_trusted_python,cloudpickle_version,active:Arc::new(Mutex::new(HashMap::new())),closed:Arc::new(AtomicBool::new(false)),startup_millis:millis(started.elapsed()),restored:true,initial_snapshot:RwLock::new(Some(snapshot)) });
 		let restored=async{worker.define(remaining(startup_deadline)?).await?;worker.control("after_restore", remaining(startup_deadline)?).await?;if let Some(hook)=restore_hook.as_ref(){worker.run_named_hook("restore",hook,remaining(startup_deadline)?).await?;}Ok::<(),WorkerError>(())}.await;
 		if let Err(error)=restored{let engine=Arc::clone(&worker.engine);let id=worker.id.clone();let _=tokio::task::spawn_blocking(move||engine.remove(&id)).await;return Err(error);}
 		Ok(worker)
@@ -408,11 +444,12 @@ impl EngineWorker {
 		let spec=self.revision.spec.as_ref().ok_or_else(|| WorkerError::platform("invalid_revision", "function spec is required"))?;
 		let package=spec.package.as_ref().ok_or_else(|| WorkerError::platform("invalid_revision", "package is required"))?;
 		let mode=pb::PackageMode::try_from(package.mode).unwrap_or(pb::PackageMode::Unspecified);
+		if mode==pb::PackageMode::TrustedSerialized&&!self.allow_trusted_python{return Err(WorkerError::platform("trusted_python_disabled","trusted serialized package rejected by revision serializer policy"));}
 		let definition=match mode {
 			pb::PackageMode::Module|pb::PackageMode::Package => package_definition(&format!("{}:{}",package.module,package.qualname),&self.package_sha256,self.package_size),
 			pb::PackageMode::TrustedSerialized => {
 				let abi=package.python.as_ref().map(|python|python.abi_tag.as_str()).filter(|abi|!abi.is_empty()).ok_or_else(||WorkerError::platform("python_abi_mismatch","trusted serialized packages require an exact Python ABI tag"))?;
-				json!({"mode":"serialized","trusted":true,"value":path_envelope(PACKAGE_PATH,&self.package_sha256,self.package_size,"cloudpickle",abi)})
+				json!({"mode":"serialized","trusted":self.allow_trusted_python,"value":path_envelope(PACKAGE_PATH,&self.package_sha256,self.package_size,"cloudpickle",abi,self.cloudpickle_version.as_deref())})
 			}
 			pb::PackageMode::Unspecified => return Err(WorkerError::platform("invalid_package_mode", "package mode is unspecified")),
 		};
@@ -452,6 +489,11 @@ impl EngineWorker {
 	}
 
 	fn wire_input(&self, envelope: &pb::ValueEnvelope) -> Result<(Value,Option<String>), WorkerError> {
+		if pb::ValueSerializer::try_from(envelope.serializer).unwrap_or(pb::ValueSerializer::Unspecified)==pb::ValueSerializer::Cloudpickle {
+			if !self.allow_trusted_python{return Err(WorkerError::platform("trusted_python_disabled","cloudpickle input rejected by revision serializer policy"));}
+			let supplied=match &envelope.python_presence{Some(pb::value_envelope::PythonPresence::Python(python))=>Some(python.cloudpickle_version.as_str()),None=>None};
+			if supplied!=self.cloudpickle_version.as_deref(){return Err(WorkerError::platform("cloudpickle_version_mismatch","cloudpickle input version does not match immutable package metadata"));}
+		}
 		let guest_path = if let Some(pb::value_envelope::Storage::Artifact(reference)) = &envelope.storage {
 			let bytes = read_artifact_at(&self.home, reference)?;
 			let path = guest_value_path();
@@ -461,6 +503,23 @@ impl EngineWorker {
 			None
 		};
 		Ok((envelope_to_wire(envelope, guest_path.as_deref())?,guest_path))
+	}
+
+	fn wire_payload(&self,payload:&pb::call_input::Payload)->Result<(serde_json::Map<String,Value>,Vec<String>),WorkerError>{
+		let mut fields=serde_json::Map::new();let mut cleanup=Vec::new();
+		match payload{
+			pb::call_input::Payload::Value(value)=>{let(value,path)=self.wire_input(value)?;cleanup.extend(path);fields.insert("input".into(),value);}
+			pb::call_input::Payload::Arguments(arguments)=>{
+				let mut positional=Vec::with_capacity(arguments.positional.len());for value in &arguments.positional{let(value,path)=self.wire_input(value)?;cleanup.extend(path);positional.push(value);}
+				let mut named=serde_json::Map::new();for(key,value)in &arguments.named{let(value,path)=self.wire_input(value)?;cleanup.extend(path);named.insert(key.clone(),value);}
+				fields.insert("positional".into(),Value::Array(positional));fields.insert("named".into(),Value::Object(named));
+			}
+		}
+		Ok((fields,cleanup))
+	}
+
+	fn wire_arguments(&self,arguments:&pb::InvocationArguments)->Result<(Value,Vec<String>),WorkerError>{
+		let(payload,cleanup)=self.wire_payload(&pb::call_input::Payload::Arguments(arguments.clone()))?;Ok((Value::Object(payload),cleanup))
 	}
 
 	fn execute_frame(&self, frame:Value, request_id:String, interruptibility:Interruptibility, attempt:u32, cleanup_paths:Vec<String>)->Result<Execution,WorkerError>{
@@ -514,12 +573,52 @@ impl Worker for EngineWorker {
 	fn capacity(&self)->usize{self.capacity}
 	fn execute(&self, request:ExecuteRequest)->BoxFuture<Result<Execution,WorkerError>>{
 		let result=(||{
-			let (input,input_path)=self.wire_input(&request.input)?;
+			let (payload,mut cleanup_paths)=self.wire_payload(&request.input)?;
 			let deadline=request.deadline.map(system_ms);
-			let frame=json!({"type":"call","request_id":request.request_id,"function_id":request.function_id,"call_id":request.call_id,"input_id":request.input_id,"input_index":request.input_index,"attempt":request.attempt,"definition_id":"main","revision":self.revision_id,"execution_mode":request.mode.wire(),"input":input,"deadline_unix_ms":deadline,"parent_request_id":request.parent_request_id,"parent_call_id":request.parent_call_id,"output_codec":"json","secrets":self.secrets.protocol_wire()});
-			self.execute_frame(frame,request.request_id,self.interruptibility(),request.attempt,input_path.into_iter().collect())
+			let mut frame=json!({"type":if request.service.is_some(){"service_call"}else{"call"},"request_id":request.request_id,"function_id":request.function_id,"call_id":request.call_id,"input_id":request.input_id,"input_index":request.input_index,"attempt":request.attempt,"definition_id":"main","revision":self.revision_id,"execution_mode":request.mode.wire(),"deadline_unix_ms":deadline,"parent_request_id":request.parent_request_id,"parent_call_id":request.parent_call_id,"output_format":self.output_format,"output_compression":self.output_compression,"trusted":self.allow_trusted_python,"cloudpickle_version":self.cloudpickle_version,"secrets":self.secrets.protocol_wire()});
+			if let Some(object)=frame.as_object_mut(){object.extend(payload);}
+			if let Some(service)=request.service{frame["service_key"]=json!(service.service_key);frame["method"]=json!(service.method);if let Some(constructor)=service.constructor{let(value,paths)=self.wire_arguments(&constructor)?;cleanup_paths.extend(paths);frame["constructor"]=value;}}
+			self.execute_frame(frame,request.request_id,self.interruptibility(),request.attempt,cleanup_paths)
 		})();
 		Box::pin(async move{result})
+	}
+	fn execute_batch(&self,request:BatchExecuteRequest)->BoxFuture<Result<BatchExecution,WorkerError>>{
+		let result=(||{
+			validate_batch_inputs(&request.inputs,self.max_batch_size)?;
+			if self.closed.load(Ordering::Acquire){return Err(WorkerError::infrastructure("worker_retired","worker is retired"));}
+			{let mut active=self.active.lock();if active.len()>=self.capacity{return Err(WorkerError::infrastructure("worker_busy","worker concurrency is exhausted"));}active.insert(request.request_id.clone(),self.interruptibility());}
+			let mut cleanup_paths=Vec::new();let mut items=Vec::with_capacity(request.inputs.len());
+			for input in &request.inputs{
+				let(payload,paths)=match self.wire_payload(&input.input){Ok(value)=>value,Err(error)=>{self.active.lock().remove(&request.request_id);cleanup_guest_paths(self.engine.as_ref(),&self.id,&cleanup_paths);return Err(error);}};cleanup_paths.extend(paths);
+				let mut item=json!({"request_id":input.request_id,"function_id":input.function_id,"call_id":input.call_id,"input_id":input.input_id,"input_index":input.input_index,"attempt":input.attempt,"parent_request_id":input.parent_request_id,"parent_call_id":input.parent_call_id,"deadline_unix_ms":input.deadline.map(system_ms)});
+				if let Some(object)=item.as_object_mut(){object.extend(payload);}
+				if let Some(service)=&input.service{item["service_key"]=json!(service.service_key);item["method"]=json!(service.method);if let Some(constructor)=&service.constructor{let(value,paths)=self.wire_arguments(constructor)?;cleanup_paths.extend(paths);item["constructor"]=value;}}
+				items.push(item);
+			}
+			let frame=json!({"type":"batch","request_id":request.request_id,"definition_id":"main","revision":self.revision_id,"trusted":self.allow_trusted_python,"output_format":self.output_format,"output_compression":self.output_compression,"cloudpickle_version":self.cloudpickle_version,"inputs":items,"secrets":self.secrets.protocol_wire()});
+			let protocol=match self.session.request(frame){Ok(protocol)=>protocol,Err(error)=>{self.active.lock().remove(&request.request_id);cleanup_guest_paths(self.engine.as_ref(),&self.id,&cleanup_paths);return Err(error.into());}};
+			let (events_tx,events)=flume::bounded(DEFAULT_EVENT_CAPACITY);let raw_events=protocol.events.clone();
+			let event_worker=std::thread::Builder::new().name(format!("vmon-batch-events-{}",request.request_id)).spawn(move||{while let Ok(frame)=raw_events.recv(){if let Some(event)=typed_event(&frame){let index=frame.0.get("input_index").and_then(Value::as_u64).unwrap_or(0);if events_tx.try_send(BatchWorkerEvent{input_index:index,event}).is_err(){break;}}}}).map_err(|error|WorkerError::infrastructure("event_dispatch",error.to_string()))?;
+			let active=Arc::clone(&self.active);let engine=Arc::clone(&self.engine);let worker_id=self.id.clone();let batch_id=request.request_id.clone();let inputs=request.inputs;let timeout=execution_timeout(&self.revision);let startup=self.startup_millis;let restored=self.restored;
+			let completion=Box::pin(async move{
+				let started=Instant::now();let terminal=protocol.complete(timeout).await;active.lock().remove(&batch_id);let _=tokio::task::spawn_blocking(move||event_worker.join()).await;
+				let cleanup_engine=Arc::clone(&engine);let cleanup_id=worker_id.clone();let _=tokio::task::spawn_blocking(move||cleanup_guest_paths(cleanup_engine.as_ref(),&cleanup_id,&cleanup_paths)).await;
+				let stats=AttemptStats{attempt:0,startup_millis:startup,execution_millis:millis(started.elapsed()),snapshot_restore:restored,..AttemptStats::default()};
+				let mut frame=terminal.map_err(WorkerError::from)?;
+				if frame.event()==Some("error"){let error=terminal_error(&frame).unwrap_err();let items=inputs.into_iter().map(|input|BatchItemOutcome{request_id:input.request_id,input_id:input.input_id,input_index:input.input_index,outcome:WorkerOutcome::UserError{error:error.clone(),stats}}).collect();return Ok(BatchOutcome{items,stats});}
+				if frame.event()!=Some("batch_result"){return Err(WorkerError::platform("invalid_batch_result","runner omitted batch_result terminal"));}
+				let results=frame.0.get_mut("results").and_then(Value::as_array_mut).ok_or_else(||WorkerError::platform("invalid_batch_result","runner batch results are missing"))?;
+				if results.len()!=inputs.len(){return Err(WorkerError::platform("batch_cardinality","runner batch result cardinality mismatch"));}
+				let mut outcomes=Vec::with_capacity(inputs.len());
+				for (input,result) in inputs.into_iter().zip(results.iter_mut()){
+					if result.get("request_id").and_then(Value::as_str)!=Some(input.request_id.as_str())||result.get("input_id").and_then(Value::as_str)!=Some(input.input_id.as_str())||result.get("input_index").and_then(Value::as_u64)!=Some(input.input_index){return Err(WorkerError::platform("batch_order","runner batch result metadata/order mismatch"));}
+					let mut value_frame=Frame(json!({"value":result.get("value").cloned().unwrap_or(Value::Null)}));materialize_output(engine.as_ref(),&worker_id,&mut value_frame)?;
+					let value=wire_to_envelope(value_frame.0.get("value").unwrap())?;outcomes.push(BatchItemOutcome{request_id:input.request_id,input_id:input.input_id,input_index:input.input_index,outcome:WorkerOutcome::Success{value,stats}});
+				}
+				Ok(BatchOutcome{items:outcomes,stats})
+			});
+			Ok(BatchExecution{events,completion})
+		})();Box::pin(async move{result})
 	}
 	fn cancel(&self,request_id:&str)->BoxFuture<Result<(),WorkerError>>{
 		let mode=self.active.lock().get(request_id).copied();let session=self.session.clone();let engine=Arc::clone(&self.engine);let id=self.id.clone();let closed=Arc::clone(&self.closed);let request_id=request_id.to_owned();
@@ -556,8 +655,8 @@ impl Worker for EngineWorker {
 				ActorOperation::Fork{child_actor_id}=>("actor_fork",json!({"child_actor_id":child_actor_id})),
 				ActorOperation::Shutdown=>("actor_shutdown",json!({}))
 			};
-			let mut frame=json!({"type":kind,"request_id":request_id,"call_id":request.call_id,"actor_id":request.actor_id,"definition_id":"main","revision":self.revision_id,"deadline_unix_ms":request.deadline.map(system_ms),"output_codec":"json","secrets":self.secrets.protocol_wire()});
-			if let Some(input)=request.input{let(input,path)=self.wire_input(&input)?;cleanup_paths.extend(path);frame["input"]=input;}
+			let mut frame=json!({"type":kind,"request_id":request_id,"call_id":request.call_id,"actor_id":request.actor_id,"definition_id":"main","revision":self.revision_id,"deadline_unix_ms":request.deadline.map(system_ms),"output_format":self.output_format,"output_compression":self.output_compression,"trusted":self.allow_trusted_python,"cloudpickle_version":self.cloudpickle_version,"secrets":self.secrets.protocol_wire()});
+			if let Some(input)=request.input{let(payload,paths)=self.wire_payload(&input)?;cleanup_paths.extend(paths);if let Some(object)=frame.as_object_mut(){object.extend(payload);}}
 			if let (Some(target),Some(source))=(frame.as_object_mut(),extra.as_object()){target.extend(source.clone());}
 			self.execute_frame(frame,request_id,Interruptibility::Async,1,cleanup_paths)
 		})();
@@ -620,10 +719,21 @@ async fn blocking<T:Send+'static>(timeout:Duration,operation:impl FnOnce()->crat
 async fn blocking_phase<T:Send+'static>(timeout:Duration,phase:&'static str,operation:impl FnOnce()->crate::Result<T>+Send+'static)->Result<T,WorkerError>{match tokio::time::timeout(timeout,tokio::task::spawn_blocking(operation)).await{Ok(Ok(Ok(value)))=>Ok(value),Ok(Ok(Err(error)))=>Err(engine_error(error)),Ok(Err(error))=>Err(WorkerError::infrastructure("engine_task",error.to_string())),Err(_)=>Err(WorkerError::timeout(phase))}}
 fn engine_error(error:crate::EngineError)->WorkerError{WorkerError::infrastructure(error.code.as_str(),error.to_string())}
 
-fn path_envelope(path:&str,sha256:&str,size:u64,format:&str,python_abi:&str)->Value{json!({"version":1,"format":format,"path":path,"remove_after_read":false,"sha256":format!("sha256:{sha256}"),"uncompressed_size":size,"compression":"none","python_abi":python_abi,"codec_version":1,"trusted":format=="cloudpickle"})}
+fn path_envelope(path:&str,sha256:&str,size:u64,format:&str,python_abi:&str,cloudpickle_version:Option<&str>)->Value{json!({"version":1,"format":format,"path":path,"remove_after_read":false,"sha256":format!("sha256:{sha256}"),"uncompressed_size":size,"compression":"none","python_abi":python_abi,"cloudpickle_version":cloudpickle_version})}
 fn package_definition(target:&str,sha256:&str,size:u64)->Value{json!({"mode":"package","archive_path":PACKAGE_PATH,"archive_sha256":sha256,"archive_size":size,"target":target})}
 fn guest_value_path()->String{format!("/opt/vmon/values/{}",hex::encode(rand::random::<[u8;16]>()))}
 fn cleanup_guest_paths(engine:&dyn EngineApi,worker_id:&str,paths:&[String]){for path in paths{let _=engine.file_delete(worker_id,path,false);}}
+fn execution_policy(spec:&pb::FunctionSpec)->Result<(String,String,bool,Option<String>),WorkerError>{
+	let serializer=spec.serializer.as_ref().ok_or_else(||WorkerError::platform("invalid_serializer","serializer policy is required"))?;
+	let output=match pb::ValueSerializer::try_from(serializer.result_serializer).unwrap_or(pb::ValueSerializer::Unspecified){pb::ValueSerializer::Json=>"json",pb::ValueSerializer::Cbor=>"cbor",pb::ValueSerializer::Cloudpickle=>"cloudpickle",pb::ValueSerializer::Unspecified=>return Err(WorkerError::platform("invalid_serializer","result serializer is unspecified"))};
+	let compression=match pb::ValueCompression::try_from(serializer.compression).unwrap_or(pb::ValueCompression::None){pb::ValueCompression::None=>"none",pb::ValueCompression::Gzip=>"gzip",pb::ValueCompression::Zstd=>"zstd"};
+	if output=="cloudpickle"&&!serializer.allow_trusted_python{return Err(WorkerError::platform("trusted_python_disabled","cloudpickle result serializer requires trusted Python policy"));}
+	let cloudpickle=spec.package.as_ref().and_then(|package|package.python.as_ref()).and_then(|python|match &python.cloudpickle_version_presence{Some(pb::python_code_metadata::CloudpickleVersionPresence::CloudpickleVersion(version))=>Some(version.clone()),None=>None});
+	if (output=="cloudpickle"||serializer.allow_trusted_python)&&cloudpickle.is_none(){return Err(WorkerError::platform("cloudpickle_version_missing","trusted Python policy requires exact cloudpickle version metadata"));}
+	Ok((output.into(),compression.into(),serializer.allow_trusted_python,cloudpickle))
+}
+
+fn validate_batch_inputs(inputs:&[ExecuteRequest],max_batch_size:usize)->Result<(),WorkerError>{if max_batch_size==0{return Err(WorkerError::platform("batching_disabled","revision batching is disabled"));}if inputs.is_empty()||inputs.len()>max_batch_size{return Err(WorkerError::platform("invalid_batch_size","grouped input count is outside revision bounds"));}let function=&inputs[0].function_id;let service=&inputs[0].service;let mut requests=std::collections::HashSet::new();let mut ids=std::collections::HashSet::new();let mut indices=std::collections::HashSet::new();for input in inputs{if &input.function_id!=function||&input.service!=service{return Err(WorkerError::platform("mixed_batch","grouped inputs must target one function and identical service authority"))}if !requests.insert(&input.request_id)||!ids.insert(&input.input_id)||!indices.insert(input.input_index){return Err(WorkerError::platform("duplicate_batch_input","grouped request, input ID, and index must be unique"));}}Ok(())}
 
 fn materialize_output(engine:&dyn EngineApi,worker_id:&str,frame:&mut Frame)->Result<(),WorkerError>{
 	let Some(value)=frame.0.get_mut("value") else{return Ok(());};
@@ -660,7 +770,7 @@ pub fn envelope_to_wire(envelope: &pb::ValueEnvelope, artifact_path: Option<&str
 	if checksum.value.len() != 32 || checksum.algorithm != pb::DigestAlgorithm::Sha256 as i32 {
 		return Err(WorkerError::platform("invalid_value", "protocol-v2 values require SHA-256 checksums"));
 	}
-	let mut wire = json!({"version":envelope.schema_version,"format":format,"compression":compression,"sha256":format!("sha256:{}",hex::encode(&checksum.value)),"uncompressed_size":envelope.uncompressed_size_bytes,"trusted":format=="cloudpickle"});
+	let mut wire = json!({"version":envelope.schema_version,"format":format,"compression":compression,"sha256":format!("sha256:{}",hex::encode(&checksum.value)),"uncompressed_size":envelope.uncompressed_size_bytes});
 	match &envelope.storage {
 		Some(pb::value_envelope::Storage::InlineData(bytes)) => wire["inline_data"] = json!(BASE64.encode(bytes)),
 		Some(pb::value_envelope::Storage::Artifact(_)) => {
@@ -673,7 +783,7 @@ pub fn envelope_to_wire(envelope: &pb::ValueEnvelope, artifact_path: Option<&str
 	}
 	if let Some(pb::value_envelope::PythonPresence::Python(python)) = &envelope.python_presence {
 		wire["python_abi"] = json!(python.abi_tag);
-		wire["codec_version"] = json!(1);
+		wire["cloudpickle_version"] = json!(python.cloudpickle_version);
 	}
 	Ok(wire)
 }
@@ -692,9 +802,10 @@ pub fn wire_to_envelope(wire: &Value) -> Result<pb::ValueEnvelope, WorkerError> 
 	let expected_size=wire.get("uncompressed_size").and_then(Value::as_u64).unwrap_or(bytes.len()as u64);
 	if expected_size!=bytes.len()as u64{return Err(WorkerError::platform("invalid_runner_value","runner result size mismatch"));}
 	if Sha256::digest(&bytes).as_slice()!=checksum.as_slice(){return Err(WorkerError::platform("invalid_runner_value","runner result checksum mismatch"));}
-	let python_presence=if serializer==pb::ValueSerializer::Cloudpickle{Some(pb::value_envelope::PythonPresence::Python(pb::PythonCodecMetadata{implementation:"CPython".into(),abi_tag:wire.get("python_abi").and_then(Value::as_str).unwrap_or_default().to_owned(),python_version:String::new(),cloudpickle_version:wire.get("codec_version").map(Value::to_string).unwrap_or_default()}))}else{None};
+	let python_presence=if serializer==pb::ValueSerializer::Cloudpickle{Some(pb::value_envelope::PythonPresence::Python(pb::PythonCodecMetadata{implementation:"CPython".into(),abi_tag:wire.get("python_abi").and_then(Value::as_str).unwrap_or_default().to_owned(),python_version:String::new(),cloudpickle_version:wire.get("cloudpickle_version").and_then(Value::as_str).unwrap_or_default().to_owned()}))}else{None};
 	Ok(pb::ValueEnvelope{schema_version:wire.get("version").and_then(Value::as_u64).unwrap_or(1)as u32,serializer:serializer as i32,compression:compression as i32,checksum:Some(pb::Digest{algorithm:pb::DigestAlgorithm::Sha256 as i32,value:checksum}),uncompressed_size_bytes:expected_size,storage:Some(pb::value_envelope::Storage::InlineData(bytes)),python_presence,type_name_presence:None})
 }
+fn batch_capacity(spec:&pb::FunctionSpec)->usize{spec.batching.as_ref().filter(|batch|batch.enabled).map_or(0,|batch|batch.max_batch_size.max(1)as usize)}
 
 fn terminal_error(frame:&Frame)->Result<(),WorkerError>{if frame.event()!=Some("error"){return Ok(());}let error=&frame.0["error"];let phase=error.get("phase").and_then(Value::as_str).unwrap_or("user");let message=error.get("message").and_then(Value::as_str).unwrap_or("runner error");if phase=="actor"&&(message.contains("unavailable")||message.contains("explicit restore")||message.contains("checkpoint is unavailable")){Err(WorkerError::actor_lost(message))}else if matches!(phase,"call"|"actor"){Err(WorkerError::user(error.get("type").and_then(Value::as_str).unwrap_or("user_error"),message,false))}else{Err(WorkerError::platform("runner_error",message))}}
 fn outcome(frame:Frame,stats:AttemptStats)->WorkerOutcome{match frame.event(){Some("result")=>match frame.0.get("value").ok_or_else(||WorkerError::platform("invalid_runner_value","runner result omitted value")).and_then(wire_to_envelope){Ok(value)=>WorkerOutcome::Success{value,stats},Err(error)=>WorkerOutcome::PlatformError{error,stats}},Some("cancelled")=>WorkerOutcome::Cancelled{reason:frame.0.get("reason").and_then(Value::as_str).unwrap_or("cancelled").to_owned(),stats},Some("error")=>{let e=terminal_error(&frame).unwrap_err();match e.kind{WorkerErrorKind::User=>WorkerOutcome::UserError{error:e,stats},WorkerErrorKind::ActorLost=>WorkerOutcome::ActorLost{error:e,stats},WorkerErrorKind::Infrastructure=>WorkerOutcome::InfrastructureError{error:e,stats},_=>WorkerOutcome::PlatformError{error:e,stats}}},_=>WorkerOutcome::PlatformError{error:WorkerError::platform("runner_terminal","unexpected terminal frame"),stats}}}
@@ -795,7 +906,7 @@ mod tests {
 		assert_eq!(definition["archive_path"],"/opt/vmon/functions/package.zip");
 		assert_eq!(definition["archive_size"],2*1024*1024);
 		assert!(serde_json::to_vec(&definition).unwrap().len()<512);
-		let serialized=path_envelope(PACKAGE_PATH,&"b".repeat(64),64*1024*1024,"cloudpickle","cp312");
+		let serialized=path_envelope(PACKAGE_PATH,&"b".repeat(64),64*1024*1024,"cloudpickle","cp312",Some("3.1.1"));
 		assert!(serialized.get("inline_data").is_none());
 		assert_eq!(serialized["remove_after_read"],false);
 		assert!(serde_json::to_vec(&serialized).unwrap().len()<512);

@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
 
 use super::metrics::FunctionMetrics;
-use super::worker::{Interruptibility, Worker};
+use super::worker::{ExecutionMode, Interruptibility, Worker};
 
 /// Immutable worker-pool limits for one function revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +316,17 @@ pub fn execution_interruptibility(worker: &dyn Worker) -> Interruptibility {
 	worker.interruptibility()
 }
 
+/// Select the mode for one independently leased durable input.
+///
+/// A durable batch call is a map of independent inputs. It uses unary mode
+/// unless the scheduler explicitly forms a grouped dynamic batch.
+pub fn input_execution_mode(call_type: vmon_proto::v1::CallType) -> ExecutionMode {
+	match call_type {
+		vmon_proto::v1::CallType::Generator => ExecutionMode::Generator,
+		_ => ExecutionMode::Unary,
+	}
+}
+
 /// Compute a bounded exponential delay for a one-based retry attempt.
 pub fn retry_backoff(policy_initial_ms: u64, policy_max_ms: u64, multiplier: f64, attempt: u32) -> Duration {
 	let exponent = attempt.saturating_sub(1) as i32;
@@ -410,6 +421,18 @@ mod tests {
 		assert_eq!(first.iter().map(|input| input.input_index).collect::<Vec<_>>(), vec![0, 1]);
 		assert!(queue.pop(10).is_none());
 		assert_eq!(queue.pop(20).unwrap()[0].input_index, 2);
+	}
+
+	#[test]
+	fn durable_batch_inputs_are_unary_without_grouping() {
+		assert_eq!(
+			input_execution_mode(vmon_proto::v1::CallType::Batch),
+			ExecutionMode::Unary
+		);
+		assert_eq!(
+			input_execution_mode(vmon_proto::v1::CallType::Generator),
+			ExecutionMode::Generator
+		);
 	}
 
 	#[test]

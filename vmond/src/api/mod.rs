@@ -900,14 +900,9 @@ mod tests {
 			.create(authed(
 				pb::CreateCallRequest {
 					r#type: pb::CallType::Batch as i32,
-					target: Some(pb::CallTarget {
-						function: Some(revision_ref),
-						actor_presence: None,
-						actor_method_presence: None,
-					}),
+					target: Some(pb::CallTarget { function: Some(revision_ref), receiver: None }),
 					inputs_closed: false,
 					request_id: "open-call".to_owned(),
-					client_cancellation: pb::ClientCancellationPolicy::Detach as i32,
 					..Default::default()
 				},
 				"client-token",
@@ -919,8 +914,8 @@ mod tests {
 		let malformed = pb::StreamCallInputsRequest {
 			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
 				index: 0,
-				value: Some(test_json_value(json!(1))),
-				..Default::default()
+				payload: Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
+				input_id: "malformed-input".to_owned(),
 			})),
 		};
 		let status = calls
@@ -934,15 +929,18 @@ mod tests {
 		let input = pb::StreamCallInputsRequest {
 			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
 				index: 0,
-				value: Some(test_json_value(json!(1))),
-				..Default::default()
+				payload: Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
+				input_id: "input-0".to_owned(),
 			})),
 		};
-		let committed = calls
+		let mut acknowledgements = calls
 			.stream_inputs(authed(tokio_stream::iter([opener, input]), "client-token"))
 			.await
 			.expect("stream input")
 			.into_inner();
+		let opener_ack = acknowledgements.message().await.expect("opener ack").expect("opener frame");
+		assert_eq!(opener_ack.committed_input_count, 0);
+		let committed = acknowledgements.message().await.expect("input ack").expect("input frame");
 		assert_eq!(committed.committed_input_count, 1);
 		calls
 			.close_inputs(authed(
@@ -972,7 +970,6 @@ mod tests {
 						after_sequence: 0,
 					}),
 					follow: false,
-					client_session_id_presence: None,
 				},
 				"client-token",
 			))
@@ -1000,12 +997,28 @@ mod tests {
 			.expect("get call");
 		let missing = calls
 			.get_result(authed(
-				pb::GetCallResultRequest { call: Some(call_ref), index: 99 },
+				pb::GetCallResultRequest { call: Some(call_ref.clone()), index: 99 },
 				"client-token",
 			))
 			.await
 			.expect_err("missing result");
 		assert_eq!(missing.code(), Code::NotFound);
+		let result_page = calls
+			.list_results(authed(
+				pb::ListCallResultsRequest {
+					cursor: Some(pb::ResultCursor {
+						call: Some(call_ref),
+						after_sequence: 0,
+					}),
+					page_size: 10,
+				},
+				"client-token",
+			))
+			.await
+			.expect("list empty results")
+			.into_inner();
+		assert!(result_page.results.is_empty());
+		assert!(result_page.end);
 
 		let response = api
 			.client
@@ -1019,97 +1032,6 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 	}
 
-	#[tokio::test]
-	async fn watch_disconnect_honors_cancel_and_detach_policies() {
-		let engine = Arc::new(ScriptedEngine::new());
-		let api = ApiHarness::start(engine).await;
-		let mut functions = pb::function_service_client::FunctionServiceClient::new(api.channel());
-		let revision = functions
-			.register(authed(
-				pb::RegisterFunctionRequest {
-					spec: Some(test_function_spec("disconnect")),
-					request_id: "register-disconnect".to_owned(),
-					transient_secrets: Vec::new(),
-				},
-				"admin-token",
-			))
-			.await
-			.expect("register disconnect function")
-			.into_inner()
-			.r#ref
-			.expect("revision ref");
-		let mut calls = pb::call_service_client::CallServiceClient::new(api.channel());
-		for (name, policy, watch_session, should_cancel) in [
-			("cancel-match", pb::ClientCancellationPolicy::Cancel, Some("creator"), true),
-			("cancel-mismatch", pb::ClientCancellationPolicy::Cancel, Some("observer"), false),
-			("cancel-empty", pb::ClientCancellationPolicy::Cancel, None, false),
-			("detach", pb::ClientCancellationPolicy::Detach, Some("creator"), false),
-		] {
-			let call = calls
-				.create(authed(
-					pb::CreateCallRequest {
-						r#type: pb::CallType::Batch as i32,
-						target: Some(pb::CallTarget {
-							function: Some(revision.clone()),
-							actor_presence: None,
-							actor_method_presence: None,
-						}),
-						inputs_closed: false,
-						request_id: format!("{name}-call"),
-						client_cancellation: policy as i32,
-						client_session_id_presence: (policy == pb::ClientCancellationPolicy::Cancel)
-							.then(|| {
-								pb::create_call_request::ClientSessionIdPresence::ClientSessionId(
-									"creator".to_owned(),
-								)
-							}),
-						..Default::default()
-					},
-					"client-token",
-				))
-				.await
-				.expect("create watched call")
-				.into_inner()
-				.r#ref
-				.expect("call ref");
-			let stream = calls
-				.watch(authed(
-					pb::WatchCallRequest {
-						cursor: Some(pb::EventCursor {
-							call: Some(call.clone()),
-							after_sequence: 0,
-						}),
-						follow: true,
-						client_session_id_presence: watch_session.map(|session| {
-							pb::watch_call_request::ClientSessionIdPresence::ClientSessionId(
-								session.to_owned(),
-							)
-						}),
-					},
-					"client-token",
-				))
-				.await
-				.expect("open follow watch")
-				.into_inner();
-			drop(stream);
-			tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-			let status = calls
-				.get(authed(call, "client-token"))
-				.await
-				.expect("get watched call")
-				.into_inner()
-				.status;
-			let status = pb::CallStatus::try_from(status).expect("valid call status");
-			if should_cancel {
-				assert!(
-					matches!(status, pb::CallStatus::Cancelling | pb::CallStatus::Cancelled),
-					"{name}: {status:?}"
-				);
-			} else {
-				assert_eq!(status, pb::CallStatus::Pending);
-			}
-		}
-	}
 
 	#[tokio::test]
 	async fn actor_rpc_surface_returns_stable_missing_resource_errors() {

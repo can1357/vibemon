@@ -37,7 +37,7 @@ impl Frame {
 
 	/// Whether this frame finishes a request.
 	pub fn is_terminal(&self) -> bool {
-		matches!(self.event(), Some("result" | "error" | "cancelled" | "status"))
+		matches!(self.event(), Some("result" | "batch_result" | "error" | "cancelled" | "status"))
 	}
 }
 
