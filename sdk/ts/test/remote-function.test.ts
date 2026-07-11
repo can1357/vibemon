@@ -325,9 +325,7 @@ test("remote reprovisions when its cached sandbox is terminal or missing", async
   expect(server.terminatedSandboxIds).toEqual(["sb-1", "sb-2", "sb-3"]);
   expect(server.terminationResponses.every((response) => response.bodyUsed)).toBe(true);
   expect(
-    server.requests
-      .filter((request) => request.method === "GET")
-      .map((request) => request.path),
+    server.requests.filter((request) => request.method === "GET").map((request) => request.path),
   ).toEqual(["/v1/sandboxes/sb-1", "/v1/sandboxes/sb-2"]);
 });
 
@@ -503,7 +501,9 @@ test("serialization rejects lossy values before sandbox creation", async () => {
   await expect(echo.remote(Number.NaN)).rejects.toThrow(
     "remote function arguments[0] contains a non-finite number",
   );
-  await expect(echo.remote(cyclic)).rejects.toThrow("remote function arguments[0].self contains a cycle");
+  await expect(echo.remote(cyclic)).rejects.toThrow(
+    "remote function arguments[0].self contains a cycle",
+  );
   expect(server.createBodies).toHaveLength(0);
 
   expect(() => clientFor(server).remoteFunction(Math.max)).toThrow(

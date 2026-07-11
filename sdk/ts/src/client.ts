@@ -24,10 +24,7 @@ type JsonRequest<Operation extends keyof operations> = operations[Operation] ext
   : never;
 
 /** Fetch-compatible transport used by {@link VmonClient}. */
-export type VmonFetch = (
-  input: string | URL | Request,
-  init?: RequestInit,
-) => Promise<Response>;
+export type VmonFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 /** Connection settings for a vmon HTTP client. */
 export interface VmonClientOptions {
@@ -178,10 +175,9 @@ export class VmonClient {
 
   /** Terminate a sandbox and discard its resources. */
   async terminateSandbox(id: string): Promise<void> {
-    const response = await this.#request(
-      `/v1/sandboxes/${encodeURIComponent(id)}/terminate`,
-      { method: "POST" },
-    );
+    const response = await this.#request(`/v1/sandboxes/${encodeURIComponent(id)}/terminate`, {
+      method: "POST",
+    });
     await response.arrayBuffer();
   }
 
@@ -340,7 +336,11 @@ async function apiError(response: Response): Promise<VmonApiError> {
   if (contentType.includes("application/json")) {
     const body: unknown = await response.json().catch(() => null);
     const parsed = parseErrorBody(body, fallback);
-    return new VmonApiError({ status: response.status, code: parsed.code, message: parsed.message });
+    return new VmonApiError({
+      status: response.status,
+      code: parsed.code,
+      message: parsed.message,
+    });
   }
   const text = await response.text().catch(() => "");
   return new VmonApiError({

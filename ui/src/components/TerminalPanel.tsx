@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { b64ToBytes, eofFrame, execStartFrame, execWsUrl, resizeFrame, stdinFrame } from "../api.ts";
+import {
+  b64ToBytes,
+  eofFrame,
+  execStartFrame,
+  execWsUrl,
+  resizeFrame,
+  stdinFrame,
+} from "../api.ts";
 
 type XtermDisposable = { dispose: () => void };
 

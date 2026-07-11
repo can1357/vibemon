@@ -174,7 +174,9 @@ export const api = {
       `/v1/sandboxes/${encodeURIComponent(id)}/files/list?path=${encodeURIComponent(path)}`,
     ).then((r) => (Array.isArray(r) ? r : r.entries)),
   fsStat: (id: string, path: string) =>
-    req<FsStat>(`/v1/sandboxes/${encodeURIComponent(id)}/files/stat?path=${encodeURIComponent(path)}`),
+    req<FsStat>(
+      `/v1/sandboxes/${encodeURIComponent(id)}/files/stat?path=${encodeURIComponent(path)}`,
+    ),
 
   // file blob I/O — uses fetch directly to preserve binary.
   readFile: async (id: string, path: string): Promise<Blob> => {

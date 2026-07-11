@@ -312,7 +312,9 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
       }
       return options.ordered === false ? completionResults : orderedResults;
     } finally {
-      await Promise.allSettled(sandboxIds.map((sandboxId) => this.#client.terminateSandbox(sandboxId)));
+      await Promise.allSettled(
+        sandboxIds.map((sandboxId) => this.#client.terminateSandbox(sandboxId)),
+      );
     }
   }
 
@@ -408,10 +410,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
       const status = typeof view.status === "string" ? view.status.toLowerCase() : "";
       return !TERMINAL_SANDBOX_STATUSES.has(status);
     } catch (error) {
-      if (
-        isRecord(error) &&
-        (error.status === 404 || error.code === "not_found")
-      ) {
+      if (isRecord(error) && (error.status === 404 || error.code === "not_found")) {
         return false;
       }
       throw error;
@@ -524,7 +523,10 @@ export function remoteFunction<Arguments extends unknown[], Result>(
 }
 
 /** Create a typed remote function from JavaScript module source and an exported handler. */
-export function remoteFunctionFromSource<Arguments extends unknown[] = JsonValue[], Result = JsonValue>(
+export function remoteFunctionFromSource<
+  Arguments extends unknown[] = JsonValue[],
+  Result = JsonValue,
+>(
   client: VmonClient,
   spec: RemoteFunctionSourceSpec,
   options: RemoteFunctionOptions = {},
@@ -620,7 +622,11 @@ function remoteResponse<Result>(raw: string): DecodedRemoteFunctionResponse<Resu
       cause: error,
     });
   }
-  if (!isRecord(response) || typeof response.ok !== "boolean" || typeof response.stdout !== "string") {
+  if (
+    !isRecord(response) ||
+    typeof response.ok !== "boolean" ||
+    typeof response.stdout !== "string"
+  ) {
     throw new RemoteFunctionError("remote function returned an invalid response envelope", {
       remoteType: "ProtocolError",
     });

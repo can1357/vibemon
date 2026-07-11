@@ -28,7 +28,9 @@ export function DetailView({
   const memory =
     typeof sandbox.memory === "number" ? fmtBytes(sandbox.memory * 1024 * 1024) : "memory n/a";
   const disk =
-    typeof sandbox.disk_mb === "number" ? `${fmtBytes(sandbox.disk_mb * 1024 * 1024)} disk` : "disk n/a";
+    typeof sandbox.disk_mb === "number"
+      ? `${fmtBytes(sandbox.disk_mb * 1024 * 1024)} disk`
+      : "disk n/a";
 
   async function act(
     label: string,
@@ -79,7 +81,8 @@ export function DetailView({
             className="btn btn--sm btn--danger"
             disabled={busy}
             onClick={() => {
-              if (confirm(`Remove ${sandbox.name}?`)) void act("remove", () => api.removeSandbox(sandbox.id), onRemoved);
+              if (confirm(`Remove ${sandbox.name}?`))
+                void act("remove", () => api.removeSandbox(sandbox.id), onRemoved);
             }}
           >
             Remove
