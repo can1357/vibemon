@@ -197,6 +197,20 @@ impl MeshRuntime {
 		self.membership.read().node_id.clone()
 	}
 
+	/// Return the live topology snapshot used to admit function HA policies.
+	///
+	/// This is deliberately topology only: function workers are not sandbox
+	/// owners and must not be inserted into the sandbox owner map.
+	pub fn function_placement_nodes(&self) -> Vec<NodeState> {
+		let now = unix_now();
+		let interval = self.config.mesh_heartbeat_sec;
+		self
+			.all_nodes()
+			.into_iter()
+			.filter(|node| node.node_id == self.local_node_id() || node.healthy(now, interval))
+			.collect()
+	}
+
 	fn route_config(&self) -> MeshRouteConfig {
 		MeshRouteConfig {
 			replicas:          self.config.replicas,

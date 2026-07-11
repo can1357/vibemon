@@ -93,7 +93,7 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		return Err(err(format!("base disk {} changed while creating overlay", base.display())));
 	}
 
-	let mut dst = OpenOptions::new()
+	let dst = OpenOptions::new()
 		.read(true)
 		.write(true)
 		.create_new(true)
@@ -126,16 +126,16 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		"macOS clonefile fast path disabled because it cannot return the created fd",
 	);
 
-	// Reflink unsupported on this filesystem: fall back to a full copy through
-	// the already-open no-follow source and exclusive destination fds. Do not use
-	// path-based copy helpers here; the path may be attacker-controlled.
+	// Reflink unsupported on this filesystem: fall back to a sparse-aware copy
+	// through the already-open no-follow source and exclusive destination fds
+	// (path-based copy helpers are off-limits; the path may be
+	// attacker-controlled). Zero blocks become holes so a mostly-empty base
+	// image costs almost nothing per overlay.
 	src.seek(SeekFrom::Start(0))
 		.map_err(|e| err(format!("seeking base disk {}: {e}", base.display())))?;
-	dst.seek(SeekFrom::Start(0))
-		.map_err(|e| err(format!("seeking overlay {}: {e}", dest.display())))?;
 	dst.set_len(0)
 		.map_err(|e| err(format!("resetting overlay {}: {e}", dest.display())))?;
-	io::copy(&mut src, &mut dst).map_err(|e| {
+	sparse_copy(&mut src, &dst).map_err(|e| {
 		err(format!(
 			"copying {} -> {} after reflink failed ({clone_err}): {e}",
 			base.display(),
@@ -143,6 +143,38 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		))
 	})?;
 	Ok(dst)
+}
+
+/// Copy `src` into `dst` skipping all-zero 64 KiB blocks (they become holes),
+/// then size `dst` to the full logical length.
+fn sparse_copy(src: &mut File, dst: &File) -> io::Result<()> {
+	use std::io::Read;
+	const BLOCK: usize = 64 * 1024;
+	let mut buf = vec![0u8; BLOCK];
+	let mut offset = 0u64;
+	loop {
+		let mut filled = 0usize;
+		while filled < BLOCK {
+			let n = src.read(&mut buf[filled..])?;
+			if n == 0 {
+				break;
+			}
+			filled += n;
+		}
+		if filled == 0 {
+			break;
+		}
+		if !crate::memory::is_zero(&buf[..filled]) {
+			use std::os::unix::fs::FileExt;
+			dst.write_all_at(&buf[..filled], offset)?;
+		}
+		offset += filled as u64;
+		if filled < BLOCK {
+			break;
+		}
+	}
+	dst.set_len(offset)?;
+	Ok(())
 }
 
 const SECTOR_SIZE: u64 = 512;

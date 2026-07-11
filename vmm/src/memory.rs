@@ -51,6 +51,17 @@ pub fn mark_dirty(mem: &GuestMemoryMmap, gpa: GuestAddress, len: usize) {
 	}
 }
 
+/// True when `bytes` is all zero.
+///
+/// Compares 64 KiB chunks against a static zero block (compiles to memcmp),
+/// so scans run at memory bandwidth even in unoptimized dev builds.
+pub fn is_zero(bytes: &[u8]) -> bool {
+	static ZEROES: [u8; 65536] = [0; 65536];
+	bytes
+		.chunks(ZEROES.len())
+		.all(|chunk| chunk == &ZEROES[..chunk.len()])
+}
+
 /// Clear every region's host-write bitmap (arming a fresh tracking window).
 pub fn reset_dirty(mem: &GuestMemoryMmap) {
 	for region in mem.iter() {

@@ -10,10 +10,9 @@
 use std::{
 	ffi::OsStr,
 	fs,
-	io::{Read, Seek, SeekFrom, Write},
+	io::{Read, Seek, SeekFrom},
 	net::ToSocketAddrs,
 	path::{Path, PathBuf},
-	process::Command,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +20,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::bundle;
 use crate::{EngineError, Result, home::state_dir, image::cas};
 
 const MARKER_NAME: &str = "agent-ready.json";
@@ -28,11 +28,14 @@ const ROOTFS_NAME: &str = "rootfs.img";
 const GENERATION_NAME: &str = "current-generation";
 const PAGE_SIZE: usize = 4096;
 
+/// A servable template bundle: the route layer streams it with
+/// [`stream_bundle`]; nothing is materialized on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TemplateArchive {
-	pub path:       PathBuf,
-	pub filename:   String,
-	pub media_type: &'static str,
+pub struct TemplateBundle {
+	pub dir:           PathBuf,
+	pub metadata_only: bool,
+	pub filename:      String,
+	pub media_type:    &'static str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,99 +45,102 @@ pub struct RemotePageMetadata {
 	pub page_url: String,
 }
 
-/// Create a gzip tarball containing the whole bootable template directory.
-pub fn template_archive(template_dir: &Path, digest: &str) -> Result<TemplateArchive> {
-	let archive = temp_path_in(&state_dir(), "vmon-template-", ".tar.gz")?;
-	create_tar_gz(template_dir, &archive)?;
-	Ok(TemplateArchive {
-		path:       archive,
-		filename:   format!("{digest}.tar.gz"),
-		media_type: "application/gzip",
-	})
+/// Compress `bundle` into `tx` chunks; run on a blocking thread. Errors are
+/// surfaced through the channel so the HTTP body fails visibly.
+pub fn stream_bundle(
+	bundle: &TemplateBundle,
+	tx: tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) {
+	let include: &dyn Fn(&Path) -> bool = if bundle.metadata_only {
+		&|path| !is_memory_page(path)
+	} else {
+		&|_| true
+	};
+	let mut writer = bundle::ChannelWriter::new(tx);
+	let result = bundle::write_bundle(&bundle.dir, &mut writer, include);
+	writer.finish(result);
 }
 
-/// Create a metadata-only gzip tarball by excluding `memory.*.bin` pages.  This
-/// matches the Python filter used for lazy remote page-in restore.
-pub fn template_metadata_archive(template_dir: &Path, digest: &str) -> Result<TemplateArchive> {
-	let state = state_dir();
-	fs::create_dir_all(&state)?;
-	let staging = temp_dir_in(&state, ".template-meta-stage-")?;
-	let root_name = file_name(template_dir)?;
-	let staged_root = staging.join(root_name);
-	copy_tree_filtered(template_dir, &staged_root, &|path| !is_memory_page(path))?;
-	let archive = temp_path_in(&state, "vmon-template-meta-", ".tar.gz")?;
-	let result = create_tar_gz(&staged_root, &archive).map(|()| TemplateArchive {
-		path:       archive,
-		filename:   format!("{digest}.metadata.tar.gz"),
-		media_type: "application/gzip",
-	});
-	let _ = fs::remove_dir_all(&staging);
-	result
-}
-
-/// Fetch a metadata-only archive from a peer and install a lazy remote-page
+/// Fetch a metadata-only bundle from a peer and install a lazy remote-page
 /// restore stub under `$VMON_HOME/templates/remote-*`.
+///
+/// Decompression and extraction overlap the download; nothing is buffered on
+/// disk.
 pub async fn pull_template_metadata(
 	client: &Client,
 	peer_url: &str,
 	digest: &str,
 	token: &str,
 ) -> Result<PathBuf> {
-	let archive = pull_archive(
-		client,
-		&format!("{}/v1/templates/{digest}/metadata", peer_url.trim_end_matches('/')),
-		digest,
-		token,
-		".template-meta-pull-",
-	)
-	.await?;
-	let archive_for_install = archive.clone();
-	let peer_url = peer_url.to_owned();
-	let digest = digest.to_owned();
-	let result = tokio::task::spawn_blocking(move || {
-		install_lazy_template_stub(&archive_for_install, &digest, &peer_url)
-	})
-	.await
-	.map_err(|err| EngineError::engine(format!("mesh metadata install task failed: {err}")))?;
-	let _ = fs::remove_file(&archive);
+	let url = format!("{}/v1/templates/{digest}/metadata", peer_url.trim_end_matches('/'));
+	let templates = state_dir().join("templates");
+	fs::create_dir_all(&templates)?;
+	let extract_root = temp_dir_in(&templates, ".pull-meta-")?;
+	let pulled = pull_and_extract(client, &url, digest, token, extract_root.clone()).await;
+	let result = match pulled {
+		Ok(()) => {
+			let digest = digest.to_owned();
+			let peer_url = peer_url.to_owned();
+			let root = extract_root.clone();
+			tokio::task::spawn_blocking(move || install_lazy_template_stub(&root, &digest, &peer_url))
+				.await
+				.map_err(|err| {
+					EngineError::engine(format!("mesh metadata install task failed: {err}"))
+				})?
+		},
+		Err(err) => Err(err),
+	};
+	let _ = fs::remove_dir_all(&extract_root);
 	result
 }
 
-/// Fetch, verify, install, and CAS-index a full template archive from a peer.
+/// Fetch, verify, install, and CAS-index a full template bundle from a peer.
+/// Decompression and extraction overlap the download; nothing is buffered on
+/// disk.
 pub async fn pull_template(
 	client: &Client,
 	peer_url: &str,
 	digest: &str,
 	token: &str,
 ) -> Result<PathBuf> {
-	let archive = pull_archive(
-		client,
-		&format!("{}/v1/templates/{digest}", peer_url.trim_end_matches('/')),
-		digest,
-		token,
-		".template-pull-",
-	)
-	.await?;
-	let archive_for_install = archive.clone();
-	let digest = digest.to_owned();
-	let result =
-		tokio::task::spawn_blocking(move || install_pulled_template(&archive_for_install, &digest))
-			.await
-			.map_err(|err| EngineError::engine(format!("mesh template install task failed: {err}")))?;
-	let _ = fs::remove_file(&archive);
-	result
-}
-
-/// Install a full pulled template archive, verifying that its stable CAS digest
-/// equals `digest` before replacing any local target.
-pub fn install_pulled_template(archive: &Path, digest: &str) -> Result<PathBuf> {
-	validate_digest(digest)?;
+	let url = format!("{}/v1/templates/{digest}", peer_url.trim_end_matches('/'));
 	let templates = state_dir().join("templates");
 	fs::create_dir_all(&templates)?;
 	let extract_root = temp_dir_in(&templates, ".pull-extract-")?;
-	let result = (|| {
-		extract_tar_gz(archive, &extract_root)?;
-		let source = extracted_template_root(&extract_root)?;
+	let t0 = std::time::Instant::now();
+	let pulled = pull_and_extract(client, &url, digest, token, extract_root.clone()).await;
+	let pull_ms = t0.elapsed().as_millis() as u64;
+	let result = match pulled {
+		Ok(()) => {
+			let digest = digest.to_owned();
+			let root = extract_root.clone();
+			tokio::task::spawn_blocking(move || install_pulled_template(&root, &digest))
+				.await
+				.map_err(|err| {
+					EngineError::engine(format!("mesh template install task failed: {err}"))
+				})?
+		},
+		Err(err) => Err(err),
+	};
+	tracing::info!(
+		digest,
+		pull_ms,
+		install_ms = t0.elapsed().as_millis() as u64 - pull_ms,
+		"template pull timings"
+	);
+	let _ = fs::remove_dir_all(&extract_root);
+	result
+}
+
+/// Verify and install an extracted template tree, checking that its stable
+/// CAS digest equals `digest` before replacing any local target.
+pub fn install_pulled_template(extract_root: &Path, digest: &str) -> Result<PathBuf> {
+	validate_digest(digest)?;
+	let templates = state_dir().join("templates");
+	fs::create_dir_all(&templates)?;
+
+	(|| {
+		let source = extracted_template_root(extract_root)?;
 		let actual = cas::template_digest(&source)?;
 		if actual != digest {
 			return Err(EngineError::invalid("pulled template digest mismatch"));
@@ -150,23 +156,24 @@ pub fn install_pulled_template(archive: &Path, digest: &str) -> Result<PathBuf> 
 		fs::rename(&source, &target)?;
 		cas::index_template(&target, Some(digest))?;
 		Ok(target)
-	})();
-	let _ = fs::remove_dir_all(&extract_root);
-	result
+	})()
 }
 
 /// Install a metadata-only lazy template stub and write `remote-page.json`.
 ///
 /// The stub records `{peer_url,digest,page_url}` and is intentionally not
 /// CAS-indexed; it exists to feed `--remote-page-url` during restore.
-pub fn install_lazy_template_stub(archive: &Path, digest: &str, peer_url: &str) -> Result<PathBuf> {
+pub fn install_lazy_template_stub(
+	extract_root: &Path,
+	digest: &str,
+	peer_url: &str,
+) -> Result<PathBuf> {
 	validate_digest(digest)?;
 	let templates = state_dir().join("templates");
 	fs::create_dir_all(&templates)?;
-	let extract_root = temp_dir_in(&templates, ".pull-meta-")?;
-	let result = (|| {
-		extract_tar_gz(archive, &extract_root)?;
-		let source = extracted_template_root(&extract_root)?;
+
+	(|| {
+		let source = extracted_template_root(extract_root)?;
 		if marker_digest(&source).as_deref() != Some(digest) {
 			return Err(EngineError::invalid("pulled template metadata digest mismatch"));
 		}
@@ -196,9 +203,7 @@ pub fn install_lazy_template_stub(archive: &Path, digest: &str, peer_url: &str) 
 		)?;
 		fs::rename(&source, &target)?;
 		Ok(target)
-	})();
-	let _ = fs::remove_dir_all(&extract_root);
-	result
+	})()
 }
 
 /// Build the peer memory-page base URL.  For plain HTTP peers, resolve the
@@ -250,18 +255,28 @@ pub fn template_memory_page(template_dir: &Path, page: u64) -> Result<Vec<u8>> {
 	Ok(data)
 }
 
-/// Resolve and archive a digest for `GET /v1/templates/{digest}` route wiring.
-pub fn archive_for_digest(digest: &str) -> Result<TemplateArchive> {
-	let template_dir =
-		cas::lookup(digest)?.ok_or_else(|| EngineError::not_found("unknown template"))?;
-	template_archive(&template_dir, digest)
+/// Resolve a digest into a streamable full bundle for
+/// `GET /v1/templates/{digest}` route wiring.
+pub fn bundle_for_digest(digest: &str) -> Result<TemplateBundle> {
+	let dir = cas::lookup(digest)?.ok_or_else(|| EngineError::not_found("unknown template"))?;
+	Ok(TemplateBundle {
+		dir,
+		metadata_only: false,
+		filename: format!("{digest}.vbundle"),
+		media_type: "application/x-vmon-bundle",
+	})
 }
 
-/// Resolve and archive metadata for `GET /v1/templates/{digest}/metadata`.
-pub fn metadata_archive_for_digest(digest: &str) -> Result<TemplateArchive> {
-	let template_dir =
-		cas::lookup(digest)?.ok_or_else(|| EngineError::not_found("unknown template"))?;
-	template_metadata_archive(&template_dir, digest)
+/// Resolve a digest into a streamable metadata-only bundle for
+/// `GET /v1/templates/{digest}/metadata`.
+pub fn metadata_bundle_for_digest(digest: &str) -> Result<TemplateBundle> {
+	let dir = cas::lookup(digest)?.ok_or_else(|| EngineError::not_found("unknown template"))?;
+	Ok(TemplateBundle {
+		dir,
+		metadata_only: true,
+		filename: format!("{digest}.metadata.vbundle"),
+		media_type: "application/x-vmon-bundle",
+	})
 }
 
 /// Resolve and read one memory page for `GET
@@ -272,17 +287,17 @@ pub fn page_for_digest(digest: &str, page: u64) -> Result<Vec<u8>> {
 	template_memory_page(&template_dir, page)
 }
 
-async fn pull_archive(
+/// Stream a peer's bundle response straight into `extract_root`: the HTTP
+/// body feeds a channel that a blocking extractor drains, so download,
+/// decompression, and file writes all overlap.
+async fn pull_and_extract(
 	client: &Client,
 	url: &str,
 	digest: &str,
 	token: &str,
-	prefix: &str,
-) -> Result<PathBuf> {
+	extract_root: PathBuf,
+) -> Result<()> {
 	validate_digest(digest)?;
-	let archive_dir = state_dir();
-	fs::create_dir_all(&archive_dir)?;
-	let archive = temp_path_in(&archive_dir, prefix, ".tar.gz")?;
 	let mut response = client
 		.get(url)
 		.bearer_auth(token)
@@ -291,24 +306,41 @@ async fn pull_archive(
 		.await
 		.map_err(|err| EngineError::engine(format!("failed to fetch template: {err}")))?;
 	if response.status() == StatusCode::NOT_FOUND {
-		let _ = fs::remove_file(&archive);
 		return Err(EngineError::not_found(format!("unknown template digest {digest}")));
 	}
 	if let Err(err) = response.error_for_status_ref() {
-		let _ = fs::remove_file(&archive);
 		return Err(EngineError::engine(format!("failed to fetch template: {err}")));
 	}
-	let mut file = fs::File::create(&archive)?;
-	while let Some(chunk) = response
-		.chunk()
-		.await
-		.map_err(|err| EngineError::engine(format!("failed to stream template: {err}")))?
-	{
-		if !chunk.is_empty() {
-			file.write_all(&chunk)?;
+	let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+	let extractor = tokio::task::spawn_blocking(move || {
+		bundle::read_bundle(bundle::ChannelReader::new(rx), &extract_root)
+	});
+	let mut stream_error = None;
+	loop {
+		match response.chunk().await {
+			Ok(Some(chunk)) => {
+				if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+					// Extractor bailed; its error is authoritative.
+					break;
+				}
+			},
+			Ok(None) => break,
+			Err(err) => {
+				stream_error = Some(EngineError::engine(format!("failed to stream template: {err}")));
+				let _ = tx.send(Err(std::io::Error::other(err.to_string()))).await;
+				break;
+			},
 		}
 	}
-	Ok(archive)
+	drop(tx);
+	let extracted = extractor
+		.await
+		.map_err(|err| EngineError::engine(format!("mesh extract task failed: {err}")))?;
+	match (extracted, stream_error) {
+		(Err(err), _) => Err(err),
+		(Ok(()), Some(err)) => Err(err),
+		(Ok(()), None) => Ok(()),
+	}
 }
 
 fn extracted_template_root(root: &Path) -> Result<PathBuf> {
@@ -362,71 +394,6 @@ fn read_marker_json(template_dir: &Path) -> Result<Value> {
 	serde_json::from_str(&raw).map_err(EngineError::from)
 }
 
-fn create_tar_gz(template_dir: &Path, archive: &Path) -> Result<()> {
-	let parent = template_dir
-		.parent()
-		.ok_or_else(|| EngineError::invalid("template directory has no parent"))?;
-	let name = file_name(template_dir)?;
-	run_tar([OsStr::new("-czf"), archive.as_os_str(), OsStr::new("-C"), parent.as_os_str(), name])
-}
-
-fn extract_tar_gz(archive: &Path, output_dir: &Path) -> Result<()> {
-	fs::create_dir_all(output_dir)?;
-	run_tar([OsStr::new("-xzf"), archive.as_os_str(), OsStr::new("-C"), output_dir.as_os_str()])
-}
-
-fn run_tar<const N: usize>(args: [&OsStr; N]) -> Result<()> {
-	let output = Command::new("tar").args(args).output()?;
-	if output.status.success() {
-		Ok(())
-	} else {
-		let stderr = String::from_utf8_lossy(&output.stderr);
-		Err(EngineError::engine(format!("tar failed: {stderr}")))
-	}
-}
-
-fn copy_tree_filtered(src: &Path, dst: &Path, include: &dyn Fn(&Path) -> bool) -> Result<()> {
-	if !include(src) {
-		return Ok(());
-	}
-	let meta = fs::symlink_metadata(src)?;
-	if meta.is_dir() {
-		fs::create_dir_all(dst)?;
-		for entry in fs::read_dir(src)? {
-			let entry = entry?;
-			copy_tree_filtered(&entry.path(), &dst.join(entry.file_name()), include)?;
-		}
-	} else if meta.file_type().is_symlink() {
-		copy_symlink(src, dst)?;
-	} else if meta.is_file() {
-		if let Some(parent) = dst.parent() {
-			fs::create_dir_all(parent)?;
-		}
-		fs::copy(src, dst)?;
-	}
-	Ok(())
-}
-
-#[cfg(unix)]
-fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
-	use std::os::unix::fs as unix_fs;
-	let target = fs::read_link(src)?;
-	if let Some(parent) = dst.parent() {
-		fs::create_dir_all(parent)?;
-	}
-	unix_fs::symlink(target, dst)?;
-	Ok(())
-}
-
-#[cfg(not(unix))]
-fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
-	let target = fs::read_link(src)?;
-	if target.is_file() {
-		fs::copy(target, dst)?;
-	}
-	Ok(())
-}
-
 #[allow(
 	clippy::case_sensitive_file_extension_comparisons,
 	reason = "checkpoint page files are generated with exact lowercase .bin names"
@@ -445,12 +412,6 @@ fn remove_path(path: &Path) -> Result<()> {
 		fs::remove_file(path)?;
 	}
 	Ok(())
-}
-
-fn file_name(path: &Path) -> Result<&OsStr> {
-	path
-		.file_name()
-		.ok_or_else(|| EngineError::invalid("path has no file name"))
 }
 
 fn validate_digest(digest: &str) -> Result<()> {
@@ -476,23 +437,6 @@ fn temp_dir_in(parent: &Path, prefix: &str) -> Result<PathBuf> {
 		}
 	}
 	Err(EngineError::engine("failed to allocate temporary directory"))
-}
-
-fn temp_path_in(parent: &Path, prefix: &str, suffix: &str) -> Result<PathBuf> {
-	fs::create_dir_all(parent)?;
-	for _ in 0..128 {
-		let path = parent.join(format!("{prefix}{}{suffix}", unique_suffix()));
-		match fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(&path)
-		{
-			Ok(_) => return Ok(path),
-			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
-			Err(err) => return Err(err.into()),
-		}
-	}
-	Err(EngineError::engine("failed to allocate temporary archive"))
 }
 
 fn unique_suffix() -> String {

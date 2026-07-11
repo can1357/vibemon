@@ -1096,10 +1096,18 @@ fn regions_total_len(regions: &[MemRegion]) -> Result<u64> {
 
 /// Dump every guest-RAM region into `path` (slot order) and return the region
 /// table.
+///
+/// All-zero pages become file holes: untouched guest RAM — usually most of a
+/// fresh boot — costs neither dump time, disk space, nor transfer bytes,
+/// while readers still observe the full logical image. The zero scan runs
+/// across worker threads (this executes while the VM is paused), and data
+/// runs are written with positioned writes, one syscall per run.
 fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>> {
-	let mut file =
-		File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
+	use std::os::unix::fs::FileExt;
+
+	let file = File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
 	let regions = memory_region_table(mem)?;
+	let mut logical = 0u64;
 	for region in &regions {
 		let ptr = mem
 			.get_host_address(GuestAddress(region.gpa))
@@ -1107,16 +1115,79 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
 		let len = region_len_usize(region)?;
 		// SAFETY: `get_host_address` returned a pointer into `mem` for this
 		// region; `memory_region_table` supplied the region length, and `mem`
-		// outlives the read-only slice used for `write_all`.
+		// outlives the read-only slice.
 		let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-		file
-			.write_all(slice)
-			.map_err(|e| err(format!("writing region {gpa:#x}: {e}", gpa = region.gpa)))?;
+		let nonzero = scan_nonzero_pages(slice);
+		let pages = len / DELTA_PAGE_USIZE + usize::from(!len.is_multiple_of(DELTA_PAGE_USIZE));
+		let mut page = 0usize;
+		while page < pages {
+			let bit = |index: usize| nonzero[index / 8] & (1 << (index % 8)) != 0;
+			if !bit(page) {
+				page += 1;
+				continue;
+			}
+			let start = page;
+			while page < pages && bit(page) {
+				page += 1;
+			}
+			let byte_start = start * DELTA_PAGE_USIZE;
+			let byte_end = len.min(page * DELTA_PAGE_USIZE);
+			file
+				.write_all_at(&slice[byte_start..byte_end], logical + byte_start as u64)
+				.map_err(|e| err(format!("writing region {gpa:#x}: {e}", gpa = region.gpa)))?;
+		}
+		logical += len as u64;
 	}
+	// Materialize the trailing hole so the logical length matches guest RAM.
+	file
+		.set_len(logical)
+		.map_err(|e| err(format!("sizing {}: {e}", path.display())))?;
 	file
 		.sync_all()
 		.map_err(|e| err(format!("syncing {}: {e}", path.display())))?;
 	Ok(regions)
+}
+
+/// LSB-first bitmap of pages in `slice` containing any nonzero byte, scanned
+/// across worker threads.
+fn scan_nonzero_pages(slice: &[u8]) -> Vec<u8> {
+	let pages =
+		slice.len() / DELTA_PAGE_USIZE + usize::from(!slice.len().is_multiple_of(DELTA_PAGE_USIZE));
+	let mut bitmap = vec![0u8; pages.div_ceil(8)];
+	let hardware = thread::available_parallelism().map_or(1, NonZeroUsize::get) as u64;
+	let workers = hardware
+		.min(DIFF_MAX_WORKERS)
+		.min((pages as u64).div_ceil(DIFF_PAGES_PER_WORKER))
+		.max(1);
+	let chunk_pages = (pages as u64).div_ceil(workers).div_ceil(8) * 8;
+	let base = slice.as_ptr() as usize;
+	thread::scope(|scope| {
+		let mut rest: &mut [u8] = &mut bitmap;
+		let mut start = 0u64;
+		while start < pages as u64 {
+			let end = (start + chunk_pages).min(pages as u64);
+			let byte_len = ((end - start).div_ceil(8)) as usize;
+			let (chunk_bits, tail) = rest.split_at_mut(byte_len);
+			rest = tail;
+			let total = slice.len();
+			scope.spawn(move || {
+				for page in start..end {
+					let from = page as usize * DELTA_PAGE_USIZE;
+					let to = total.min(from + DELTA_PAGE_USIZE);
+					// SAFETY: `page` lies inside the scanned slice; the source
+					// mapping is quiesced (VM paused) for the dump.
+					let bytes =
+						unsafe { std::slice::from_raw_parts((base + from) as *const u8, to - from) };
+					if !memory::is_zero(bytes) {
+						let rel = page - start;
+						chunk_bits[(rel / 8) as usize] |= 1 << (rel % 8);
+					}
+				}
+			});
+			start = end;
+		}
+	});
+	bitmap
 }
 
 /// Read-only mmap of a whole file: lets a delta dump diff live RAM against a

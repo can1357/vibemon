@@ -2,6 +2,7 @@
 //!
 //! Phase 4 ports the Python mesh/cluster layer into these focused modules.
 
+pub mod bundle;
 pub mod gossip;
 pub mod lease;
 pub mod place;

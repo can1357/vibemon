@@ -34,7 +34,14 @@ pub fn cas_root() -> Result<PathBuf> {
 }
 
 /// Return a stable SHA-256 digest for a template's bootable content.
+///
+/// All-zero 64 KiB blocks are folded into run-length markers instead of being
+/// hashed byte-by-byte, so digesting a mostly-sparse multi-GiB checkpoint
+/// costs a memory scan rather than a full-length hash. The encoding is
+/// injective (tagged zero-run / data-run records), purely content-defined,
+/// and therefore independent of the file's physical hole layout.
 pub fn template_digest(template_dir: &Path) -> Result<String> {
+	const ZERO_BLOCK: usize = 64 * 1024;
 	let mut digest = Sha256::new();
 	for path in regular_files(template_dir)? {
 		let rel = rel_path(template_dir, &path)?;
@@ -48,12 +55,42 @@ pub fn template_digest(template_dir: &Path) -> Result<String> {
 		}
 		let mut file = File::open(&path)?;
 		let mut buf = vec![0_u8; CHUNK_SIZE];
+		let mut zero_run = 0u64;
 		loop {
-			let n = file.read(&mut buf)?;
+			// Fill the whole chunk (short reads would shift 64 KiB block
+			// boundaries and make the digest depend on read sizes).
+			let mut n = 0usize;
+			while n < buf.len() {
+				let got = file.read(&mut buf[n..])?;
+				if got == 0 {
+					break;
+				}
+				n += got;
+			}
 			if n == 0 {
 				break;
 			}
-			digest.update(&buf[..n]);
+			let mut cursor = 0usize;
+			while cursor < n {
+				let end = n.min(cursor + ZERO_BLOCK);
+				if crate::mesh::bundle::is_zero(&buf[cursor..end]) {
+					zero_run += (end - cursor) as u64;
+				} else {
+					if zero_run > 0 {
+						digest.update([0u8]);
+						digest.update(zero_run.to_le_bytes());
+						zero_run = 0;
+					}
+					digest.update([1u8]);
+					digest.update(((end - cursor) as u64).to_le_bytes());
+					digest.update(&buf[cursor..end]);
+				}
+				cursor = end;
+			}
+		}
+		if zero_run > 0 {
+			digest.update([0u8]);
+			digest.update(zero_run.to_le_bytes());
 		}
 	}
 	Ok(hex::encode(digest.finalize()))
@@ -274,9 +311,40 @@ mod tests {
 		let mut expected = Sha256::new();
 		expected.update(b"agent-ready.json\0");
 		expected.update(br#"{"boot_version":6,"memory":512}"#);
-		expected.update(b"nested/file.txt\0data");
-		expected.update(b"rootfs.img\0root");
+		expected.update(b"nested/file.txt\0");
+		expected.update([1u8]);
+		expected.update(4u64.to_le_bytes());
+		expected.update(b"data");
+		expected.update(b"rootfs.img\0");
+		expected.update([1u8]);
+		expected.update(4u64.to_le_bytes());
+		expected.update(b"root");
 		assert_eq!(digest_a, hex::encode(expected.finalize()));
+		Ok(())
+	}
+
+	/// The digest is content-defined: a materialized run of zero bytes and a
+	/// filesystem hole of the same length hash identically.
+	#[test]
+	fn digest_is_independent_of_physical_hole_layout() -> TestResult {
+		use std::io::{Seek, SeekFrom, Write as _};
+		let tmp = tempfile::tempdir()?;
+		let dense = tmp.path().join("dense");
+		let sparse = tmp.path().join("sparse");
+		for dir in [&dense, &sparse] {
+			fs::create_dir(dir)?;
+			fs::write(dir.join(MARKER_NAME), b"{}")?;
+		}
+		let mut payload = vec![0u8; 8 * 1024 * 1024];
+		payload[4 * 1024 * 1024] = 0xaa;
+		fs::write(dense.join("memory.1.bin"), &payload)?;
+		let mut holey = fs::File::create(sparse.join("memory.1.bin"))?;
+		holey.seek(SeekFrom::Start(4 * 1024 * 1024))?;
+		holey.write_all(&[0xaa])?;
+		holey.set_len(8 * 1024 * 1024)?;
+		drop(holey);
+
+		assert_eq!(template_digest(&dense)?, template_digest(&sparse)?);
 		Ok(())
 	}
 
