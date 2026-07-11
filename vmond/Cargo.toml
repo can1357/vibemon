@@ -31,6 +31,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "signal", "io-util", "time", "sync", "fs", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
