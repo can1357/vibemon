@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added support for overlay filesystem mounts in sandbox environments
 - Added support for S3-backed virtio-fs mounts to `vmon run` via `--s3-mount` and `s3_mounts` configuration
 - Added S3 credential management (via env or inline) with secure masking in logs and API responses
 - Added per-VM Unix-socket proxy for S3 object access to enable high-performance remote filesystem mounts

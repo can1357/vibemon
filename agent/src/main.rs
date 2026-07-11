@@ -236,6 +236,7 @@ mod linux_agent {
 				"resize" => self.resize(id, &request),
 				"tcp_probe" => self.tcp_probe(id, &request),
 				"mount" => self.mount(id, &request),
+				"mount_overlay" => self.mount_overlay(id, &request),
 				_ => self.send_error(id, "unknown op"),
 			}
 		}
@@ -903,6 +904,109 @@ mod linux_agent {
 				self.send_error(id, format!("mount {tag} -> {path}: {}", io::Error::last_os_error()));
 				return;
 			}
+			self.send_resp(id, json!({"ok": true}));
+		}
+
+		fn mount_overlay(&self, id: u32, request: &Value) {
+			let tag = match string_field(request, "tag") {
+				Ok(tag) => tag,
+				Err(err) => {
+					self.send_error(id, err);
+					return;
+				},
+			};
+			let path = match string_field(request, "path") {
+				Ok(path) => path,
+				Err(err) => {
+					self.send_error(id, err);
+					return;
+				},
+			};
+			let base = format!("/var/lib/vmon/s3/{tag}");
+			let lower = format!("{base}/lower");
+			let upper = format!("{base}/upper");
+			let work = format!("{base}/work");
+
+			for directory in [&lower, &upper, &work, &path] {
+				if let Err(err) = fs::create_dir_all(directory) {
+					self.send_error(id, format!("mount_overlay mkdir {directory}: {err}"));
+					return;
+				}
+			}
+
+			let Ok(source) = CString::new(tag.as_str()) else {
+				self.send_error(id, "mount_overlay tag contains an interior nul byte");
+				return;
+			};
+			let Ok(lower_target) = CString::new(lower.as_str()) else {
+				self.send_error(id, "mount_overlay lower path contains an interior nul byte");
+				return;
+			};
+			let Ok(virtiofs) = CString::new("virtiofs") else {
+				self.send_error(id, "mount_overlay virtiofs type contains an interior nul byte");
+				return;
+			};
+
+			// SAFETY: the source, target, and filesystem type C strings are
+			// nul-terminated and live across the call; virtiofs takes no data.
+			let rc = unsafe {
+				libc::mount(
+					source.as_ptr(),
+					lower_target.as_ptr(),
+					virtiofs.as_ptr(),
+					libc::MS_RDONLY,
+					std::ptr::null(),
+				)
+			};
+			if rc != 0 {
+				self.send_error(
+					id,
+					format!(
+						"mount_overlay lower {tag} -> {lower}: {}",
+						io::Error::last_os_error()
+					),
+				);
+				return;
+			}
+
+			let Ok(overlay_source) = CString::new("overlay") else {
+				self.send_error(id, "mount_overlay overlay source contains an interior nul byte");
+				return;
+			};
+			let Ok(target) = CString::new(path.as_str()) else {
+				self.send_error(id, "mount_overlay path contains an interior nul byte");
+				return;
+			};
+			let Ok(overlay_type) = CString::new("overlay") else {
+				self.send_error(id, "mount_overlay overlay type contains an interior nul byte");
+				return;
+			};
+			let options = format!("lowerdir={lower},upperdir={upper},workdir={work}");
+			let Ok(data) = CString::new(options) else {
+				self.send_error(id, "mount_overlay options contain an interior nul byte");
+				return;
+			};
+
+			// SAFETY: source, target, filesystem type, and data are
+			// nul-terminated C strings that remain live across the call; data
+			// contains the overlayfs lowerdir, upperdir, and workdir options.
+			let rc = unsafe {
+				libc::mount(
+					overlay_source.as_ptr(),
+					target.as_ptr(),
+					overlay_type.as_ptr(),
+					0,
+					data.as_ptr().cast(),
+				)
+			};
+			if rc != 0 {
+				self.send_error(
+					id,
+					format!("mount_overlay overlay {path}: {}", io::Error::last_os_error()),
+				);
+				return;
+			}
+
 			self.send_resp(id, json!({"ok": true}));
 		}
 
