@@ -48,6 +48,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -65,7 +66,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from vmon import DaemonError, Sandbox, Secret, Volume
+from vmon import DaemonError, RemoteFunctionError, Sandbox, Secret, Volume, function
 from vmon._transport import VmonTransport, get_transport
 from vmon.sandbox import pool_inventory, prewarm, shutdown_all_pools
 
@@ -204,22 +205,6 @@ def hypervisor_present() -> bool:
     return False
 
 
-def host_is_virtualized() -> bool:
-    """True when the e2e host itself runs under a hypervisor (nested virt).
-
-    Under nested virtualization a paused guest's kvmclock keeps tracking host
-    wall time, so the pause clock-stall in :func:`t_suspend_resume` is
-    unobservable even when the vCPUs are correctly parked. Detected dependency
-    free via the ``hypervisor`` CPU flag: set on cloud VMs (e.g. GitHub-hosted
-    runners), unset on bare metal.
-    """
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as fh:
-            return any(line.startswith("flags") and "hypervisor" in line.split() for line in fh)
-    except OSError:
-        return False
-
-
 def _run_host(
     argv: Sequence[object], *, env: dict[str, str] | None = None, timeout: float = 30
 ) -> subprocess.CompletedProcess[str]:
@@ -264,6 +249,10 @@ class VmonServer:
         env["VMON_BIN"] = str(self.binary)
         env.pop("VMON_CONTEXT", None)
         env.pop("VMON_CONFIG", None)
+        # Root-only network cases cannot launch the VMM sandbox without a
+        # non-root sandbox identity, which the test server does not configure.
+        if os.geteuid() == 0:
+            env.setdefault("VMON_NO_SANDBOX", "1")
         return env
 
     def write_config(self) -> None:
@@ -640,32 +629,47 @@ def t_filesystem(_):
 
 @e2e
 def t_suspend_resume(_):
-    """pause parks the vCPUs (guest clock stalls) and resume continues execution."""
+    """pause parks the vCPUs without allowing guest processes to run."""
     sb = make_sandbox()
+    heartbeat = None
+
+    def heartbeat_size() -> int:
+        rc, out, err = run(sb, "sh", "-lc", "wc -c < /root/pause-heartbeat")
+        assert rc == 0, f"heartbeat read failed: rc={rc} err={err!r}"
+        return int(out.strip())
+
     try:
         sb.filesystem.write_text("/root/pre-pause", "kept")
-        u0 = uptime(sb)
-        t0 = time.time()
+        heartbeat = sb.exec(
+            "sh",
+            "-lc",
+            "while :; do printf x >> /root/pause-heartbeat; sleep 0.1; done",
+            timeout=30,
+            _track_entry=False,
+        )
+        deadline = time.time() + 5
+        start = 0
+        while start < 3 and time.time() < deadline:
+            time.sleep(0.1)
+            start = heartbeat_size()
+        assert start >= 3, f"guest heartbeat never started (size={start})"
+
         sb.pause()
-        time.sleep(3)
-        sb.resume()
-        host = time.time() - t0
-        guest = uptime(sb) - u0
-        # Functional: resume continues execution and preserves guest state.
+        try:
+            time.sleep(3)
+        finally:
+            sb.resume()
+        end = heartbeat_size()
+
+        # A running guest adds roughly 30 beats during the host sleep. A parked
+        # guest can add one expired-timer beat on resume plus RPC scheduling noise.
+        assert end - start < 10, f"guest heartbeat advanced {end - start} times while paused"
         assert sb.filesystem.read_text("/root/pre-pause") == "kept"
         rc, out, _ = run(sb, "sh", "-lc", "echo alive")
         assert rc == 0 and "alive" in out
-        # The clock stall proves the vCPUs were truly parked. Under nested
-        # virtualization the guest's kvmclock tracks host wall time across the
-        # pause, making the stall unobservable, so skip rather than fail there.
-        if guest >= host - 2:
-            if host_is_virtualized():
-                raise Skip(
-                    f"guest clock tracked host wall time across pause "
-                    f"(guest {guest:.2f}s vs host {host:.2f}s); unobservable under nested virt"
-                )
-            raise AssertionError(f"guest advanced {guest:.2f}s over {host:.2f}s host; not parked")
     finally:
+        if heartbeat is not None:
+            heartbeat.close()
         sb.terminate()
 
 
@@ -1010,6 +1014,37 @@ def t_extend(_):
     finally:
         with contextlib.suppress(Exception):
             sb.remove()
+
+
+def _remote_double(value: int) -> int:
+    print(f"doubling {value}")
+    if value < 0:
+        raise ValueError("value must be non-negative")
+    return value * 2
+
+
+@e2e
+def t_remote_function(_):
+    """Python callables execute in a cached sandbox with stdout and structured errors."""
+    remote = function(
+        image=os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"),
+        block_network=True,
+    )(_remote_double)
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            assert remote.remote(21, timeout=120) == 42
+            try:
+                remote.remote(-1, timeout=120)
+            except RemoteFunctionError as exc:
+                assert exc.remote_type == "ValueError"
+                assert "non-negative" in str(exc)
+                assert "_remote_double" in exc.traceback
+            else:
+                raise AssertionError("remote exception was not propagated")
+        assert output.getvalue() == "doubling 21\ndoubling -1\n"
+    finally:
+        remote.terminate()
 
 
 @e2e

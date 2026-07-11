@@ -5,22 +5,29 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import builtins
 import contextlib
 import functools
 import inspect
 import json
 import queue
+import socket
 import symtable
 import sys
 import textwrap
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, overload
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, overload
+
+import httpx
 
 from ._transport import (
     DaemonError,
+    ResponseStream,
     VmonTransport,
+    WebSocketConnection,
     get_transport,
     path_segment,
     split_create_context,
@@ -29,6 +36,15 @@ from .secret import Secret, merge_secrets
 from .volume import Volume
 
 _EOF = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ExecResult:
+    """Captured output and exit status from a non-streaming sandbox command."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
 
 
 class ByteStream(Iterable[bytes]):
@@ -93,31 +109,47 @@ class ByteStream(Iterable[bytes]):
 
 
 class _ExecSession:
-    """A live v1 exec WebSocket session."""
+    """A live v1 exec or shell WebSocket session."""
 
     def __init__(
         self,
         transport: VmonTransport,
-        sandbox_id: str,
+        target: str,
         request: dict[str, Any],
         *,
+        endpoint: str | None = None,
         timeout: float | None = None,
         tty: bool = False,
+        close_transport: bool = False,
     ) -> None:
         self.stdout = ByteStream()
         self.stderr = ByteStream()
+        self._transport = transport
+        self._close_transport = close_transport
         self._timeout = timeout
         self._tty = tty
         self._exit = threading.Event()
         self._returncode: int | None = None
         self._signal: int | None = None
+        self._ready_name: str | None = None
         self._error: BaseException | None = None
         self._send_lock = threading.Lock()
         self._stdin_closed = False
-        self._ws = transport.websocket(f"/v1/sandboxes/{path_segment(sandbox_id)}/exec")
-        self._ws.send_json(request)
+        self._closing = False
+        path = endpoint or f"/v1/sandboxes/{path_segment(target)}/exec"
+        websocket: WebSocketConnection | None = None
+        try:
+            websocket = transport.websocket(path)
+            websocket.send_json(request)
+        except BaseException:
+            if websocket is not None:
+                websocket.close()
+            if close_transport:
+                transport.close()
+            raise
+        self._ws = websocket
         self._reader = threading.Thread(
-            target=self._read_loop, name=f"vmon-exec-{sandbox_id}", daemon=True
+            target=self._read_loop, name=f"vmon-stream-{target}", daemon=True
         )
         self._reader.start()
 
@@ -128,6 +160,10 @@ class _ExecSession:
     @property
     def signal(self) -> int | None:
         return self._signal
+
+    @property
+    def ready_name(self) -> str | None:
+        return self._ready_name
 
     def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
         raw = data.encode() if isinstance(data, str) else bytes(data)
@@ -149,7 +185,8 @@ class _ExecSession:
         self._ws.send_json({"resize": [int(rows), int(cols)]})
 
     def kill(self, signal: int = 15) -> None:
-        del signal
+        self._closing = True
+        self._signal = int(signal)
         self._ws.close()
 
     def wait(self, timeout: float | None = None) -> int:
@@ -158,6 +195,7 @@ class _ExecSession:
                 self.close_stdin()
         effective = self._timeout if timeout is None else timeout
         if not self._exit.wait(effective):
+            self.kill()
             raise TimeoutError("exec timed out")
         if self._error is not None:
             raise self._error
@@ -178,6 +216,10 @@ class _ExecSession:
                     self._error = DaemonError(message, code=code)
                     self._returncode = -1
                     return
+                ready = frame.get("ready")
+                if isinstance(ready, str):
+                    self._ready_name = ready
+                    continue
                 stream = frame.get("stream")
                 if stream in {"stdout", "stderr", "console"}:
                     encoded = frame.get("b64")
@@ -186,8 +228,8 @@ class _ExecSession:
                         self._returncode = -1
                         return
                     try:
-                        data = base64.b64decode(encoded)
-                    except Exception:
+                        data = base64.b64decode(encoded, validate=True)
+                    except ValueError, TypeError:
                         self._error = DaemonError("invalid exec stream payload", code="protocol")
                         self._returncode = -1
                         return
@@ -197,19 +239,25 @@ class _ExecSession:
                     raw_exit = frame.get("exit")
                     try:
                         self._returncode = int(raw_exit) if raw_exit is not None else -1
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         self._returncode = -1
                     raw_signal = frame.get("signal")
-                    self._signal = int(raw_signal) if raw_signal is not None else None
+                    try:
+                        self._signal = int(raw_signal) if raw_signal is not None else None
+                    except TypeError, ValueError:
+                        self._signal = None
                     return
         except BaseException as exc:
-            self._error = exc
+            if not self._closing:
+                self._error = exc
             self._returncode = -1
         finally:
             self.stdout.close()
             self.stderr.close()
             self._exit.set()
             self._ws.close()
+            if self._close_transport:
+                self._transport.close()
 
 
 class _ProcessStdin:
@@ -229,7 +277,7 @@ class _ProcessStdin:
 
 
 class Process:
-    """A process running inside a Sandbox."""
+    """A streaming process running inside a sandbox."""
 
     def __init__(self, session: _ExecSession) -> None:
         self._session = session
@@ -239,31 +287,223 @@ class Process:
 
     @property
     def returncode(self) -> int | None:
+        """Return the exit status once the process has completed."""
         return self._session.returncode
 
+    @property
+    def sandbox_name(self) -> str | None:
+        """Return the shell-created sandbox name once announced by the server."""
+        return self._session.ready_name
+
     def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
+        """Write bytes or text to the process standard input."""
         self.stdin.write(data)
 
     def close_stdin(self) -> None:
+        """Close process standard input."""
         self.stdin.close()
 
     def kill(self, signal: int = 15) -> None:
+        """Disconnect the stream, causing the daemon to terminate the process."""
         self._session.kill(signal)
 
     def resize(self, rows: int, cols: int) -> None:
+        """Resize the process pseudo-terminal."""
         self._session.resize(rows, cols)
 
     def wait(self, timeout: float | None = None) -> int:
+        """Wait for completion and return the process exit status."""
         try:
             return self._session.wait(timeout)
         finally:
             self._close_streams()
+
+    def close(self) -> None:
+        """Close this process stream, terminating a still-running command."""
+        if self.returncode is None:
+            self.kill()
+        self._close_streams()
 
     def _close_streams(self) -> None:
         with contextlib.suppress(Exception):
             self.stdout.close()
         with contextlib.suppress(Exception):
             self.stderr.close()
+
+    def __enter__(self) -> Process:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class ConsoleStream(Iterable[bytes]):
+    """Closeable byte stream from a sandbox console attachment."""
+
+    def __init__(self, websocket: WebSocketConnection) -> None:
+        self._ws = websocket
+        self._stream = ByteStream()
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+        self._closing = False
+        self._reader = threading.Thread(
+            target=self._read_loop, name="vmon-console-attach", daemon=True
+        )
+        self._reader.start()
+
+    def __iter__(self) -> ConsoleStream:
+        return self
+
+    def __next__(self) -> bytes:
+        try:
+            return next(self._stream)
+        except StopIteration:
+            self.wait()
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        """Read console bytes, blocking until enough data or stream completion."""
+        data = self._stream.read(size)
+        if size is None or size < 0:
+            self.wait()
+        return data
+
+    def wait(self, timeout: float | None = None) -> None:
+        """Wait for attachment completion and raise any structured stream error."""
+        if not self._done.wait(timeout):
+            raise TimeoutError("console attachment timed out")
+        if self._error is not None:
+            raise self._error
+
+    def close(self) -> None:
+        """Close the console attachment idempotently."""
+        self._closing = True
+        self._ws.close()
+        self._stream.close()
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                frame = self._ws.recv_json()
+                if frame is None:
+                    return
+                error = frame.get("error")
+                if isinstance(error, Mapping):
+                    self._error = DaemonError(
+                        str(error.get("message") or "console attachment failed"),
+                        code=str(error.get("code") or "internal"),
+                    )
+                    return
+                if frame.get("stream") != "console":
+                    continue
+                encoded = frame.get("b64")
+                if not isinstance(encoded, str):
+                    self._error = DaemonError("invalid console stream frame", code="protocol")
+                    return
+                try:
+                    self._stream.feed(base64.b64decode(encoded, validate=True))
+                except ValueError, TypeError:
+                    self._error = DaemonError("invalid console stream payload", code="protocol")
+                    return
+        except BaseException as exc:
+            if not self._closing:
+                self._error = exc
+        finally:
+            self._stream.close()
+            self._done.set()
+            self._ws.close()
+
+    def __enter__(self) -> ConsoleStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class EventStream(Iterable[dict[str, Any]]):
+    """Closeable iterator over JSON objects from an SSE endpoint."""
+
+    def __init__(
+        self, response: ResponseStream, *, owned_transport: VmonTransport | None = None
+    ) -> None:
+        self._response = response
+        self._owned_transport = owned_transport
+        self._closed = False
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        data_lines: list[str] = []
+        try:
+            for line in self._response.iter_lines():
+                if line == "":
+                    if data_lines:
+                        yield self._decode("\n".join(data_lines))
+                        data_lines.clear()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+            if data_lines:
+                yield self._decode("\n".join(data_lines))
+        finally:
+            self.close()
+
+    @staticmethod
+    def _decode(payload: str) -> dict[str, Any]:
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise DaemonError("vmon event stream returned invalid JSON", code="protocol") from exc
+        if not isinstance(value, dict):
+            raise DaemonError("vmon event stream returned a non-object event", code="protocol")
+        return value
+
+    def close(self) -> None:
+        """Close the event response and any transport owned by the stream."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        finally:
+            if self._owned_transport is not None:
+                self._owned_transport.close()
+
+    def __enter__(self) -> EventStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class LogStream(Iterable[str]):
+    """Closeable iterator over decoded sandbox console log chunks."""
+
+    def __init__(self, events: EventStream) -> None:
+        self._events = events
+
+    def __iter__(self) -> Iterator[str]:
+        for event in self._events:
+            data = event.get("data")
+            if isinstance(data, str):
+                yield data
+                continue
+            encoded = event.get("b64")
+            if isinstance(encoded, str):
+                try:
+                    yield base64.b64decode(encoded, validate=True).decode("utf-8", errors="replace")
+                except ValueError, TypeError:
+                    raise DaemonError(
+                        "invalid sandbox log stream payload", code="protocol"
+                    ) from None
+
+    def close(self) -> None:
+        """Close the underlying event stream."""
+        self._events.close()
+
+    def __enter__(self) -> LogStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 class Filesystem:
@@ -335,8 +575,100 @@ class Filesystem:
         return dict(value) if isinstance(value, dict) else {}
 
 
+def health(*, context: str | None = None) -> dict[str, Any]:
+    """Return the selected daemon's ``/healthz`` response."""
+    with get_transport(context) as transport:
+        value = transport.json("GET", "/healthz")
+    if not isinstance(value, Mapping) or not isinstance(value.get("ok"), bool):
+        raise DaemonError("health check returned a malformed response", code="protocol")
+    return dict(value)
+
+
+def server_info(*, context: str | None = None) -> dict[str, Any]:
+    """Return server capabilities and version information."""
+    with get_transport(context) as transport:
+        value = transport.json("GET", "/v1/info")
+    if not isinstance(value, Mapping):
+        raise DaemonError("server info returned a non-object response", code="protocol")
+    return dict(value)
+
+
+def daemon_metrics(*, context: str | None = None) -> str:
+    """Return the daemon's Prometheus metrics document."""
+    with get_transport(context) as transport:
+        return transport.text("GET", "/metrics")
+
+
+def openapi_schema(*, context: str | None = None) -> dict[str, Any]:
+    """Return the OpenAPI document advertised by the selected daemon."""
+    with get_transport(context) as transport:
+        value = transport.json("GET", "/v1/openapi.json")
+    if not isinstance(value, Mapping):
+        raise DaemonError("OpenAPI endpoint returned a non-object response", code="protocol")
+    return dict(value)
+
+
+def events(*, context: str | None = None) -> EventStream:
+    """Open the daemon's JSON server-sent event stream."""
+    transport = get_transport(context)
+    try:
+        response = transport.stream("GET", "/v1/events")
+    except BaseException:
+        transport.close()
+        raise
+    return EventStream(response, owned_transport=transport)
+
+
+def list_snapshots(*, context: str | None = None) -> list[str]:
+    """Return snapshot names known to the selected daemon."""
+    with get_transport(context) as transport:
+        value = transport.json("GET", "/v1/snapshots")
+    snapshots = value.get("snapshots") if isinstance(value, Mapping) else None
+    if not isinstance(snapshots, list) or not all(isinstance(name, str) for name in snapshots):
+        raise DaemonError("snapshot list returned a malformed response", code="protocol")
+    return list(snapshots)
+
+
+def shell(
+    *cmd: str | Iterable[str],
+    ref: str | None = None,
+    image: str | None = None,
+    context: str | None = None,
+    cpus: int = 1,
+    memory: int = 512,
+    disk_mb: int = 1024,
+    timeout: float | None = 300,
+) -> Process:
+    """Start a streaming interactive shell, cleaning up ephemeral sandboxes on close."""
+    argv = _coerce_cmd(cmd) if cmd else ["/bin/sh"]
+    body = _drop_none(
+        {
+            "ref": ref,
+            "image": image,
+            "cmd": argv,
+            "cpus": int(cpus),
+            "mem": int(memory),
+            "disk_mb": int(disk_mb),
+            "timeout": timeout,
+            "tty": True,
+        }
+    )
+    transport = get_transport(context)
+    return Process(
+        _ExecSession(
+            transport,
+            "shell",
+            body,
+            endpoint="/v1/shell",
+            timeout=timeout,
+            tty=True,
+            close_transport=True,
+        )
+    )
+
+
 class WarmPoolHandle:
-    """Client-side handle for a server-owned warm pool."""
+    """Closeable client-side handle for a server-owned warm pool."""
 
     def __init__(
         self,
@@ -349,8 +681,12 @@ class WarmPoolHandle:
         self.size = int(size)
         self._transport = transport
         self._stats = dict(stats or {})
+        self._closed = False
 
     def stats(self) -> dict[str, Any]:
+        """Refresh and return this pool's server statistics."""
+        if self._closed:
+            return dict(self._stats)
         pools = self._transport.json("GET", "/v1/pools")
         if isinstance(pools, dict):
             value = pools.get(self.reference)
@@ -359,12 +695,28 @@ class WarmPoolHandle:
         return dict(self._stats)
 
     def shutdown(self) -> None:
-        self._transport.json("DELETE", f"/v1/pools/{path_segment(self.reference)}")
+        """Delete this pool and close its transport."""
+        if self._closed:
+            return
+        try:
+            self._transport.json("DELETE", f"/v1/pools/{path_segment(self.reference)}")
+        finally:
+            self._closed = True
+            self._transport.close()
+
+    close = shutdown
+
+    def __enter__(self) -> WarmPoolHandle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.shutdown()
 
 
-def pool_inventory() -> dict[str, int]:
-    """Ready warm-pool counts keyed by the portable image/template ref."""
-    pools = get_transport().json("GET", "/v1/pools")
+def pool_inventory(*, context: str | None = None) -> dict[str, int]:
+    """Return ready warm-pool counts keyed by portable image/template reference."""
+    with get_transport(context) as transport:
+        pools = transport.json("GET", "/v1/pools")
     if not isinstance(pools, dict):
         return {}
     out: dict[str, int] = {}
@@ -383,21 +735,27 @@ def prewarm(ref: str, *, count: int, **template_kwargs: Any) -> WarmPoolHandle:
         raise ValueError("pool size must be >= 0")
     transport = get_transport()
     body = {"size": count, **{k: v for k, v in template_kwargs.items() if v is not None}}
-    stats = transport.json("PUT", f"/v1/pools/{path_segment(ref)}", json_body=body)
+    try:
+        stats = transport.json("PUT", f"/v1/pools/{path_segment(ref)}", json_body=body)
+    except BaseException:
+        transport.close()
+        raise
     return WarmPoolHandle(ref, count, transport, stats if isinstance(stats, Mapping) else None)
 
 
 def shutdown_prewarms(pools: Iterable[WarmPoolHandle]) -> None:
+    """Delete each supplied warm pool."""
     for pool in pools:
         pool.shutdown()
 
 
-def shutdown_all_pools() -> None:
-    transport = get_transport()
-    pools = transport.json("GET", "/v1/pools")
-    if isinstance(pools, dict):
-        for ref in list(pools):
-            transport.json("DELETE", f"/v1/pools/{path_segment(str(ref))}")
+def shutdown_all_pools(*, context: str | None = None) -> None:
+    """Delete every warm pool in the selected API context."""
+    with get_transport(context) as transport:
+        pools = transport.json("GET", "/v1/pools")
+        if isinstance(pools, dict):
+            for ref in list(pools):
+                transport.json("DELETE", f"/v1/pools/{path_segment(str(ref))}")
 
 
 def _coerce_cmd(cmd: tuple[str | Iterable[str], ...]) -> list[str]:
@@ -408,6 +766,10 @@ def _coerce_cmd(cmd: tuple[str | Iterable[str], ...]) -> list[str]:
 
 def _drop_none(data: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if value is not None}
+
+
+def _path_tail(value: str) -> str:
+    return "/".join(path_segment(part) for part in value.lstrip("/").split("/"))
 
 
 def _secret_wire(
@@ -486,7 +848,11 @@ def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         "idempotency_key",
         "command",
     }
-    return {key: value for key, value in kwargs.items() if key in allowed and value is not None}
+    unknown = sorted(set(kwargs) - allowed)
+    if unknown:
+        names = ", ".join(unknown)
+        raise TypeError(f"unsupported sandbox option(s): {names}")
+    return {key: value for key, value in kwargs.items() if value is not None}
 
 
 class Sandbox:
@@ -502,6 +868,7 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
         tags: Mapping[str, str] | None = None,
         secrets: Iterable[Secret | Mapping[str, object]] | None = None,
+        _owns_transport: bool = False,
     ) -> None:
         if isinstance(name, Mapping):
             view = name
@@ -512,7 +879,13 @@ class Sandbox:
             raise ValueError("sandbox name is required")
         self.name = resolved
         self.sandbox_id = resolved
-        self._transport = transport or get_transport()
+        if transport is None:
+            self._transport = get_transport()
+            self._owns_transport = True
+        else:
+            self._transport = transport
+            self._owns_transport = _owns_transport
+        self._transport_closed = False
         self._view: dict[str, Any] = dict(view or {"id": resolved, "name": resolved})
         self.workdir = workdir or self._string_detail("workdir")
         self.env: dict[str, str] = {str(k): str(v) for k, v in (env or {}).items()}
@@ -521,6 +894,7 @@ class Sandbox:
         }
         self.filesystem = Filesystem(self)
         self._secret_env = merge_secrets(secrets)
+        self.connect_token: str | None = None
         self._terminated = False
 
     @classmethod
@@ -550,19 +924,13 @@ class Sandbox:
         inbound_cidr_allowlist: Sequence[str] | None = None,
         readiness_probe: Any = None,
         pool_size: int = 0,
-        remote_page_url: str | None = None,
-        remote_page_token: str | None = None,
-        remote_page_digest: str | None = None,
         ha: str | None = None,
         arch: str | None = None,
         idempotency_key: str | None = None,
         command: Sequence[str] | None = None,
-        **extra: Any,
     ) -> Sandbox:
-        if "mem" in extra and memory == 512:
-            memory = int(extra.pop("mem"))
+        """Create a sandbox using the stable ``SandboxCreate`` request fields."""
         transport_context, api_context = split_create_context(context)
-        transport = get_transport(transport_context)
         body = _drop_none(
             {
                 "image": image,
@@ -596,22 +964,33 @@ class Sandbox:
                 else None,
                 "readiness_probe": readiness_probe,
                 "pool_size": int(pool_size),
-                "remote_page_url": remote_page_url,
-                "remote_page_token": remote_page_token,
-                "remote_page_digest": remote_page_digest,
                 "ha": ha,
                 "arch": arch,
                 "idempotency_key": idempotency_key,
                 "command": [str(part) for part in command] if command is not None else None,
             }
         )
-        for key, value in extra.items():
-            if value is not None:
-                body[key] = value
-        view = transport.json("POST", "/v1/sandboxes", json_body=body)
-        if not isinstance(view, Mapping):
-            raise DaemonError("create returned a non-object response", code="protocol")
-        return cls(view, transport=transport, workdir=workdir, env=env, tags=tags, secrets=secrets)
+        transport = get_transport(transport_context)
+        try:
+            view = transport.json("POST", "/v1/sandboxes", json_body=body)
+            if not isinstance(view, Mapping):
+                raise DaemonError("create returned a non-object response", code="protocol")
+        except BaseException:
+            transport.close()
+            raise
+        try:
+            return cls(
+                view,
+                transport=transport,
+                workdir=workdir,
+                env=env,
+                tags=tags,
+                secrets=secrets,
+                _owns_transport=True,
+            )
+        except BaseException:
+            transport.close()
+            raise
 
     @classmethod
     def from_snapshot(
@@ -626,8 +1005,13 @@ class Sandbox:
         context: str | None = None,
         **kwargs: Any,
     ) -> Sandbox:
+        """Restore one sandbox from a snapshot, optionally using copy-on-write fork."""
+        if fork:
+            if int(count) != 1:
+                raise ValueError("from_snapshot(fork=True) creates one clone; use Sandbox.fork")
+            return cls.fork(snapshot, count=1, context=context, **kwargs)[0]
+
         transport_context, api_context = split_create_context(context)
-        transport = get_transport(transport_context)
         extra = _clone_create_extra(kwargs)
         if api_context is not None:
             extra["context"] = api_context
@@ -635,56 +1019,151 @@ class Sandbox:
             extra["volumes"] = _volume_wire(extra["volumes"])
         if "secrets" in extra:
             extra["secrets"] = _secret_wire(extra["secrets"])
-        restore_name = sandbox_name or name
-        if fork:
-            body = {"count": int(count), **extra}
-            value = transport.json(
-                "POST", f"/v1/snapshots/{path_segment(snapshot)}/fork", json_body=body
+        body = {"name": sandbox_name or name, "agent": bool(agent), **extra}
+        transport = get_transport(transport_context)
+        try:
+            view = transport.json(
+                "POST",
+                f"/v1/snapshots/{path_segment(snapshot)}/restore",
+                json_body=_drop_none(body),
             )
-            clones = value.get("clones") if isinstance(value, Mapping) else None
-            if not isinstance(clones, list) or not clones:
-                raise DaemonError("fork returned no clones", code="protocol")
-            first = clones[0]
-            clone_name = first.get("name") if isinstance(first, Mapping) else None
-            if not isinstance(clone_name, str) or not clone_name:
-                raise DaemonError("fork returned a malformed clone", code="protocol")
-            return cls.attach(clone_name, transport=transport)
-        body = {"name": restore_name, "agent": bool(agent), **extra}
-        view = transport.json(
-            "POST", f"/v1/snapshots/{path_segment(snapshot)}/restore", json_body=_drop_none(body)
-        )
-        if not isinstance(view, Mapping):
-            raise DaemonError("restore returned a non-object response", code="protocol")
-        return cls(
-            view,
-            transport=transport,
-            workdir=kwargs.get("workdir"),
-            env=kwargs.get("env"),
-            tags=kwargs.get("tags"),
-            secrets=kwargs.get("secrets"),
-        )
+            if not isinstance(view, Mapping):
+                raise DaemonError("restore returned a non-object response", code="protocol")
+        except BaseException:
+            transport.close()
+            raise
+        try:
+            return cls(
+                view,
+                transport=transport,
+                workdir=kwargs.get("workdir"),
+                env=kwargs.get("env"),
+                tags=kwargs.get("tags"),
+                secrets=kwargs.get("secrets"),
+                _owns_transport=True,
+            )
+        except BaseException:
+            transport.close()
+            raise
 
     @classmethod
-    def from_id(cls, id: str) -> Sandbox:
-        return cls.attach(id)
+    def fork(
+        cls,
+        snapshot: str,
+        *,
+        count: int = 1,
+        context: str | None = None,
+        **kwargs: Any,
+    ) -> list[Sandbox]:
+        """Create and return all copy-on-write clones from a snapshot."""
+        count = int(count)
+        if count < 1:
+            raise ValueError("fork count must be >= 1")
+        transport_context, api_context = split_create_context(context)
+        extra = _clone_create_extra(kwargs)
+        if api_context is not None:
+            extra["context"] = api_context
+        if "volumes" in extra:
+            extra["volumes"] = _volume_wire(extra["volumes"])
+        if "secrets" in extra:
+            extra["secrets"] = _secret_wire(extra["secrets"])
+        transport = get_transport(transport_context)
+        clones: list[Sandbox] = []
+        try:
+            value = transport.json(
+                "POST",
+                f"/v1/snapshots/{path_segment(snapshot)}/fork",
+                json_body={"count": count, **extra},
+            )
+            rows = value.get("clones") if isinstance(value, Mapping) else None
+            if not isinstance(rows, list) or len(rows) != count:
+                raise DaemonError("fork returned an unexpected clone count", code="protocol")
+            for row in rows:
+                if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+                    raise DaemonError("fork returned a malformed clone", code="protocol")
+                clones.append(
+                    cls(
+                        row,
+                        transport=transport.clone(),
+                        workdir=kwargs.get("workdir"),
+                        env=kwargs.get("env"),
+                        tags=kwargs.get("tags"),
+                        secrets=kwargs.get("secrets"),
+                        _owns_transport=True,
+                    )
+                )
+        except BaseException:
+            for clone in clones:
+                with contextlib.suppress(Exception):
+                    clone.terminate()
+            raise
+        finally:
+            transport.close()
+        return clones
 
     @classmethod
-    def attach(cls, name: str, *, transport: VmonTransport | None = None) -> Sandbox:
-        transport = transport or get_transport()
-        view = transport.json("GET", f"/v1/sandboxes/{path_segment(name)}")
-        if not isinstance(view, Mapping):
-            raise DaemonError("inspect returned a non-object response", code="protocol")
-        return cls(view, transport=transport)
+    def from_id(cls, sandbox_id: str, *, context: str | None = None) -> Sandbox:
+        """Attach a user object to an existing sandbox id."""
+        return cls.attach(sandbox_id, context=context)
 
     @classmethod
-    def list(cls, *, tag: Mapping[str, str] | None = None) -> list[Sandbox]:
-        params: list[tuple[str, str]] = []
-        if tag:
-            params = [("tag", f"{key}={value}") for key, value in tag.items()]
-        transport = get_transport()
-        value = transport.json("GET", "/v1/sandboxes", params=params or None)
-        rows = value.get("sandboxes") if isinstance(value, Mapping) else None
-        return [cls(row, transport=transport) for row in rows or [] if isinstance(row, Mapping)]
+    def attach(
+        cls,
+        name: str,
+        *,
+        context: str | None = None,
+        transport: VmonTransport | None = None,
+    ) -> Sandbox:
+        """Fetch an existing sandbox and return its user object."""
+        if context is not None and transport is not None:
+            raise ValueError("context and transport are mutually exclusive")
+        owns_transport = transport is None
+        resolved_transport = transport or get_transport(context)
+        try:
+            view = resolved_transport.json("GET", f"/v1/sandboxes/{path_segment(name)}")
+            if not isinstance(view, Mapping):
+                raise DaemonError("inspect returned a non-object response", code="protocol")
+        except BaseException:
+            if owns_transport:
+                resolved_transport.close()
+            raise
+        try:
+            return cls(
+                view,
+                transport=resolved_transport,
+                _owns_transport=owns_transport,
+            )
+        except BaseException:
+            if owns_transport:
+                resolved_transport.close()
+            raise
+
+    @classmethod
+    def list(
+        cls,
+        *,
+        tag: Mapping[str, str] | None = None,
+        context: str | None = None,
+    ) -> list[Sandbox]:
+        """List sandboxes, optionally filtering by exact tag values."""
+        params = [("tag", f"{key}={value}") for key, value in sorted(tag.items())] if tag else None
+        with get_transport(context) as transport:
+            value = transport.json("GET", "/v1/sandboxes", params=params)
+            rows = value.get("sandboxes") if isinstance(value, Mapping) else None
+            if not isinstance(rows, list) or not all(
+                isinstance(row, Mapping) and isinstance(row.get("name") or row.get("id"), str)
+                for row in rows
+            ):
+                raise DaemonError("sandbox list returned a malformed response", code="protocol")
+            sandboxes: list[Sandbox] = []
+            try:
+                for row in rows:
+                    sandboxes.append(cls(row, transport=transport.clone(), _owns_transport=True))
+            except BaseException:
+                for sandbox in sandboxes:
+                    sandbox.close()
+                raise
+            return sandboxes
 
     def __repr__(self) -> str:
         return f"Sandbox(name={self.name!r})"
@@ -759,28 +1238,81 @@ class Sandbox:
         )
         return Process(session)
 
+    def exec_capture(
+        self,
+        *cmd: str | Iterable[str],
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        tty: bool = False,
+    ) -> ExecResult:
+        """Run a non-streaming command and return its captured output."""
+        argv = _coerce_cmd(cmd)
+        if not argv:
+            raise ValueError("exec command must not be empty")
+        merged_env = {**self.env, **self._secret_env}
+        if env:
+            merged_env.update({str(key): str(value) for key, value in env.items()})
+        value = self._transport.json(
+            "POST",
+            f"/v1/sandboxes/{path_segment(self.name)}/exec",
+            json_body=_drop_none(
+                {
+                    "cmd": argv,
+                    "workdir": workdir or self.workdir,
+                    "env": merged_env or None,
+                    "timeout": timeout,
+                    "tty": bool(tty),
+                }
+            ),
+        )
+        if not isinstance(value, Mapping):
+            raise DaemonError("captured exec returned a non-object response", code="protocol")
+        raw_exit = value.get("exit")
+        stdout_b64 = value.get("stdout_b64")
+        stderr_b64 = value.get("stderr_b64")
+        if (
+            not isinstance(raw_exit, int)
+            or isinstance(raw_exit, bool)
+            or not isinstance(stdout_b64, str)
+            or not isinstance(stderr_b64, str)
+        ):
+            raise DaemonError("captured exec returned a malformed response", code="protocol")
+        try:
+            stdout = base64.b64decode(stdout_b64, validate=True)
+            stderr = base64.b64decode(stderr_b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise DaemonError("captured exec returned invalid base64", code="protocol") from exc
+        return ExecResult(returncode=raw_exit, stdout=stdout, stderr=stderr)
+
+    def attach_console(self) -> ConsoleStream:
+        """Open a live, read-only stream of sandbox console output."""
+        websocket = self._transport.websocket(f"/v1/sandboxes/{path_segment(self.name)}/attach")
+        return ConsoleStream(websocket)
+
     def wait_until_ready(self, probe: Any = None, timeout: float = 300) -> None:
+        """Wait until a tunnel port accepts TCP or a guest command succeeds."""
         if probe is None:
             return
         deadline = time.monotonic() + timeout
-        last: BaseException | None = None
+        last: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                if isinstance(probe, int):
-                    if self.agent().tcp_probe(int(probe)):
-                        return
-                elif isinstance(probe, Mapping) and "port" in probe:
-                    if self.agent().tcp_probe(
-                        int(probe["port"]), host=str(probe.get("host") or "127.0.0.1")
-                    ):
-                        return
+                if isinstance(probe, int) or (isinstance(probe, Mapping) and "port" in probe):
+                    port = int(probe if isinstance(probe, int) else probe["port"])
+                    target = self.tunnels().get(port)
+                    if target is not None:
+                        with socket.create_connection(target, timeout=min(1.0, timeout)):
+                            return
                 else:
                     proc = self.exec(
-                        ["sh", "-lc", str(probe)], timeout=min(5.0, timeout), _track_entry=False
+                        ["sh", "-lc", str(probe)],
+                        timeout=min(5.0, timeout),
+                        _track_entry=False,
                     )
                     if proc.wait(timeout=min(5.0, timeout)) == 0:
                         return
-            except BaseException as exc:
+            except Exception as exc:
                 last = exc
             time.sleep(0.1)
         raise TimeoutError(f"sandbox readiness probe timed out after {timeout:.0f}s") from last
@@ -798,76 +1330,105 @@ class Sandbox:
         return None
 
     def stop(self, wait: bool = True) -> None:
+        """Stop the sandbox while retaining its server-side record."""
         del wait
         value = self._transport.json("POST", f"/v1/sandboxes/{path_segment(self.name)}/stop")
         if isinstance(value, Mapping):
             self._view = dict(value)
 
     def terminate(self, wait: bool = True) -> None:
+        """Terminate the sandbox idempotently and release owned HTTP resources."""
         del wait
         if self._terminated:
+            self.close()
             return
         value = self._transport.json("POST", f"/v1/sandboxes/{path_segment(self.name)}/terminate")
         if isinstance(value, Mapping):
             self._view = dict(value)
         self._terminated = True
+        self.close()
 
     def remove(self) -> None:
+        """Delete the sandbox record and release owned HTTP resources."""
         value = self._transport.json("DELETE", f"/v1/sandboxes/{path_segment(self.name)}")
         if isinstance(value, Mapping):
             self._view = dict(value)
         self._terminated = True
-
-    rm = remove
+        self.close()
 
     def pause(self) -> dict[str, Any]:
+        """Pause sandbox virtual CPUs and return the updated view."""
         value = self._transport.json("POST", f"/v1/sandboxes/{path_segment(self.name)}/pause")
         if isinstance(value, Mapping):
             self._view = dict(value)
         return dict(self._view)
 
     def resume(self) -> dict[str, Any]:
+        """Resume a paused sandbox and return the updated view."""
         value = self._transport.json("POST", f"/v1/sandboxes/{path_segment(self.name)}/resume")
         if isinstance(value, Mapping):
             self._view = dict(value)
         return dict(self._view)
 
-    def snapshot(self, name: str | None = None, *, stop: bool = False, **_: Any) -> str:
+    def snapshot(self, name: str | None = None, *, stop: bool = False) -> str:
+        """Create a full VM snapshot and return its server-assigned name."""
         value = self._transport.json(
             "POST",
             f"/v1/sandboxes/{path_segment(self.name)}/snapshots",
             json_body={"name": name, "stop": bool(stop)},
         )
-        if isinstance(value, Mapping) and isinstance(value.get("snapshot"), str):
-            return str(value["snapshot"])
-        return str(name or "")
+        snapshot = value.get("snapshot") if isinstance(value, Mapping) else None
+        if not isinstance(snapshot, str) or not snapshot:
+            raise DaemonError("snapshot returned a malformed response", code="protocol")
+        return snapshot
 
-    def snapshot_filesystem(self, name: str | None = None, **_: Any) -> str:
+    def snapshot_filesystem(self, name: str | None = None) -> str:
+        """Snapshot the guest filesystem and return its template image name."""
         value = self._transport.json(
             "POST",
             f"/v1/sandboxes/{path_segment(self.name)}/snapshots/fs",
             json_body={"name": name},
         )
-        if isinstance(value, Mapping) and isinstance(value.get("image"), str):
-            return str(value["image"])
-        return str(name or "")
+        image = value.get("image") if isinstance(value, Mapping) else None
+        if not isinstance(image, str) or not image:
+            raise DaemonError("filesystem snapshot returned a malformed response", code="protocol")
+        return image
 
     def extend(self, secs: int) -> dict[str, Any]:
+        """Extend the sandbox deadline by a non-negative number of seconds."""
+        secs = int(secs)
+        if secs < 0:
+            raise ValueError("extension seconds must be >= 0")
         value = self._transport.json(
-            "POST", f"/v1/sandboxes/{path_segment(self.name)}/extend", json_body={"secs": int(secs)}
+            "POST", f"/v1/sandboxes/{path_segment(self.name)}/extend", json_body={"secs": secs}
         )
-        return dict(value) if isinstance(value, Mapping) else {}
+        if not isinstance(value, Mapping):
+            raise DaemonError("extend returned a non-object response", code="protocol")
+        return dict(value)
 
     def metrics(self) -> dict[str, Any]:
+        """Return this sandbox's runtime metrics."""
         value = self._transport.json("GET", f"/v1/sandboxes/{path_segment(self.name)}/metrics")
-        return dict(value) if isinstance(value, Mapping) else {}
+        if not isinstance(value, Mapping):
+            raise DaemonError("sandbox metrics returned a non-object response", code="protocol")
+        return dict(value)
 
-    def logs(self, follow: bool = False) -> str:
-        return self._transport.text(
-            "GET", f"/v1/sandboxes/{path_segment(self.name)}/logs", params={"follow": bool(follow)}
-        )
+    @overload
+    def logs(self, follow: Literal[False] = False) -> str: ...
+
+    @overload
+    def logs(self, follow: Literal[True]) -> LogStream: ...
+
+    def logs(self, follow: bool = False) -> str | LogStream:
+        """Return buffered logs or open a closeable live log stream."""
+        path = f"/v1/sandboxes/{path_segment(self.name)}/logs"
+        if not follow:
+            return self._transport.text("GET", path, params={"follow": False})
+        response = self._transport.stream("GET", path, params={"follow": True})
+        return LogStream(EventStream(response))
 
     def tunnels(self) -> dict[int, tuple[str, int]]:
+        """Return exposed guest ports mapped to local tunnel addresses."""
         value = self._transport.json("GET", f"/v1/sandboxes/{path_segment(self.name)}/tunnels")
         if isinstance(value, Mapping):
             token = value.get("connect_token")
@@ -886,16 +1447,24 @@ class Sandbox:
                         continue
                     try:
                         out[int(port)] = (host, int(raw_port))
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         continue
         return out
 
     def create_connect_token(self) -> str:
+        """Create and cache the server-issued tunnel connection token."""
         value = self._transport.json("GET", f"/v1/sandboxes/{path_segment(self.name)}/tunnels")
         if isinstance(value, Mapping) and isinstance(value.get("connect_token"), str):
             self.connect_token = str(value["connect_token"])
             return self.connect_token
         raise DaemonError("server did not return a connect token", code="protocol")
+
+    def network_policy(self) -> dict[str, Any]:
+        """Return the sandbox's current network policy."""
+        value = self._transport.json("GET", f"/v1/sandboxes/{path_segment(self.name)}/network")
+        if not isinstance(value, Mapping):
+            raise DaemonError("network policy returned a non-object response", code="protocol")
+        return dict(value)
 
     def set_network_policy(
         self,
@@ -903,6 +1472,7 @@ class Sandbox:
         cidr_allow: Sequence[str] | None = None,
         domain_allow: Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        """Replace supplied fields in the sandbox network policy."""
         body = _drop_none(
             {
                 "block_network": block_network,
@@ -913,9 +1483,92 @@ class Sandbox:
         value = self._transport.json(
             "PUT", f"/v1/sandboxes/{path_segment(self.name)}/network", json_body=body
         )
-        return dict(value) if isinstance(value, Mapping) else {}
+        if not isinstance(value, Mapping):
+            raise DaemonError("network update returned a non-object response", code="protocol")
+        return dict(value)
+
+    def migrate(self, target: str) -> dict[str, Any]:
+        """Migrate the sandbox to a non-empty mesh node id."""
+        target = str(target)
+        if not target:
+            raise ValueError("migration target must not be empty")
+        value = self._transport.json(
+            "POST",
+            f"/v1/sandboxes/{path_segment(self.name)}/migrate",
+            json_body={"target": target},
+        )
+        if not isinstance(value, Mapping):
+            raise DaemonError("migration returned a non-object response", code="protocol")
+        self._view.update(value)
+        return dict(value)
+
+    def _proxy_params(self, params: Any | None) -> builtins.list[tuple[str, str]]:
+        token = self.connect_token or self.create_connect_token()
+        items = builtins.list(httpx.QueryParams(params).multi_items()) if params is not None else []
+        items = [
+            (key, value)
+            for key, value in items
+            if key not in {"connect_token", "token", "access_token"}
+        ]
+        items.append(("connect_token", token))
+        return items
+
+    def proxy_http(
+        self,
+        method: str,
+        port: int,
+        path: str = "",
+        *,
+        params: Any | None = None,
+        headers: Mapping[str, str] | None = None,
+        content: bytes | None = None,
+        json_body: Any | None = None,
+    ) -> httpx.Response:
+        """Proxy one HTTP request to an exposed guest port."""
+        method = method.upper()
+        if method not in {"GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH"}:
+            raise ValueError(f"unsupported proxy HTTP method {method!r}")
+        port = int(port)
+        if not 0 <= port <= 65535:
+            raise ValueError("proxy port must be between 0 and 65535")
+        tail = _path_tail(path)
+        suffix = f"/{tail}" if tail else ""
+        return self._transport.request(
+            method,
+            f"/v1/sandboxes/{path_segment(self.name)}/ports/{port}{suffix}",
+            params=self._proxy_params(params),
+            headers={str(key): str(value) for key, value in (headers or {}).items()},
+            content=content,
+            json_body=json_body,
+            raise_for_status=False,
+        )
+
+    def proxy_websocket(
+        self,
+        port: int,
+        path: str = "",
+        *,
+        params: Any | None = None,
+    ) -> WebSocketConnection:
+        """Open a WebSocket proxied to an exposed guest port."""
+        port = int(port)
+        if not 0 <= port <= 65535:
+            raise ValueError("proxy port must be between 0 and 65535")
+        tail = _path_tail(path)
+        suffix = f"/{tail}" if tail else ""
+        return self._transport.websocket(
+            f"/v1/sandboxes/{path_segment(self.name)}/ports/{port}/ws{suffix}",
+            params=self._proxy_params(params),
+        )
+
+    def close(self) -> None:
+        """Release HTTP resources owned by this sandbox object."""
+        if self._owns_transport and not self._transport_closed:
+            self._transport_closed = True
+            self._transport.close()
 
     def agent(self, connect_timeout: float | None = None) -> Any:
+        """Raise because the v1 daemon exposes no direct guest-agent endpoint."""
         del connect_timeout
         raise DaemonError(
             "direct guest-agent access is not part of the thin SDK", code="unsupported"
@@ -925,7 +1578,10 @@ class Sandbox:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.terminate()
+        try:
+            self.terminate()
+        finally:
+            self.close()
 
 
 class _AsyncFilesystem:
@@ -960,6 +1616,8 @@ class _AsyncFilesystem:
 
 
 class _AsyncSandbox:
+    """Thread-backed async facade for a :class:`Sandbox` instance."""
+
     def __init__(self, sandbox: Sandbox) -> None:
         self._sandbox = sandbox
         self._filesystem = _AsyncFilesystem(sandbox.filesystem)
@@ -968,8 +1626,20 @@ class _AsyncSandbox:
     def filesystem(self) -> _AsyncFilesystem:
         return self._filesystem
 
+    async def refresh(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sandbox.refresh)
+
+    async def exists(self) -> bool:
+        return await asyncio.to_thread(self._sandbox.exists)
+
     async def exec(self, *cmd: str | Iterable[str], **kwargs: Any) -> Process:
         return await asyncio.to_thread(self._sandbox.exec, *cmd, **kwargs)
+
+    async def exec_capture(self, *cmd: str | Iterable[str], **kwargs: Any) -> ExecResult:
+        return await asyncio.to_thread(self._sandbox.exec_capture, *cmd, **kwargs)
+
+    async def attach_console(self) -> ConsoleStream:
+        return await asyncio.to_thread(self._sandbox.attach_console)
 
     async def terminate(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.terminate, *args, **kwargs)
@@ -979,6 +1649,12 @@ class _AsyncSandbox:
 
     async def remove(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.remove, *args, **kwargs)
+
+    async def pause(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sandbox.pause)
+
+    async def resume(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sandbox.resume)
 
     async def wait_until_ready(self, *args: Any, **kwargs: Any) -> None:
         return await asyncio.to_thread(self._sandbox.wait_until_ready, *args, **kwargs)
@@ -992,8 +1668,14 @@ class _AsyncSandbox:
     async def poll(self) -> int | None:
         return await asyncio.to_thread(self._sandbox.poll)
 
+    async def network_policy(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sandbox.network_policy)
+
     async def set_network_policy(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._sandbox.set_network_policy, *args, **kwargs)
+
+    async def migrate(self, target: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sandbox.migrate, target)
 
     async def extend(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._sandbox.extend, *args, **kwargs)
@@ -1001,11 +1683,34 @@ class _AsyncSandbox:
     async def metrics(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._sandbox.metrics, *args, **kwargs)
 
+    async def logs(self, follow: bool = False) -> str | LogStream:
+        if follow:
+            return await asyncio.to_thread(self._sandbox.logs, True)
+        return await asyncio.to_thread(self._sandbox.logs, False)
+
     async def tunnels(self, *args: Any, **kwargs: Any) -> dict[int, tuple[str, int]]:
         return await asyncio.to_thread(self._sandbox.tunnels, *args, **kwargs)
 
     async def create_connect_token(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self._sandbox.create_connect_token, *args, **kwargs)
+
+    async def proxy_http(self, *args: Any, **kwargs: Any) -> httpx.Response:
+        return await asyncio.to_thread(self._sandbox.proxy_http, *args, **kwargs)
+
+    async def proxy_websocket(self, *args: Any, **kwargs: Any) -> WebSocketConnection:
+        return await asyncio.to_thread(self._sandbox.proxy_websocket, *args, **kwargs)
+
+    async def close(self) -> None:
+        return await asyncio.to_thread(self._sandbox.close)
+
+    async def __aenter__(self) -> _AsyncSandbox:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        try:
+            await self.terminate()
+        finally:
+            await self.close()
 
 
 _REMOTE_FUNCTION_RUNNER = r"""

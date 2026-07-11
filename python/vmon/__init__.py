@@ -12,7 +12,7 @@ Example
 
 __version__ = "0.2.0"
 
-from ._transport import DaemonError
+from ._transport import DaemonError, WebSocketConnection
 from .context import (
     LOCAL,
     Context,
@@ -21,22 +21,62 @@ from .context import (
     contexts_path,
     roster_from_status,
 )
-from .sandbox import RemoteFunction, RemoteFunctionError, Sandbox, function
+from .sandbox import (
+    ConsoleStream,
+    EventStream,
+    ExecResult,
+    LogStream,
+    Process,
+    RemoteFunction,
+    RemoteFunctionError,
+    Sandbox,
+    WarmPoolHandle,
+    daemon_metrics,
+    events,
+    function,
+    health,
+    list_snapshots,
+    openapi_schema,
+    pool_inventory,
+    prewarm,
+    server_info,
+    shell,
+    shutdown_all_pools,
+    shutdown_prewarms,
+)
 from .secret import Secret
 from .volume import Volume
 
 __all__ = [
+    "ConsoleStream",
+    "Context",
+    "ContextStore",
+    "DaemonError",
+    "EventStream",
+    "ExecResult",
+    "LOCAL",
+    "LogStream",
+    "Process",
+    "RemoteFunction",
+    "RemoteFunctionError",
     "Sandbox",
     "Secret",
     "Volume",
-    "Context",
-    "ContextStore",
-    "LOCAL",
-    "contexts_path",
+    "WarmPoolHandle",
+    "WebSocketConnection",
     "context_token_path",
-    "roster_from_status",
-    "DaemonError",
-    "RemoteFunction",
-    "RemoteFunctionError",
+    "contexts_path",
+    "daemon_metrics",
+    "events",
     "function",
+    "health",
+    "list_snapshots",
+    "openapi_schema",
+    "pool_inventory",
+    "prewarm",
+    "roster_from_status",
+    "server_info",
+    "shell",
+    "shutdown_all_pools",
+    "shutdown_prewarms",
 ]

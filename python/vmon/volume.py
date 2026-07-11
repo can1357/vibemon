@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
-from pathlib import Path
-from types import TracebackType
 
-from ._transport import get_transport, path_segment, state_dir
-
-STATE = Path(os.environ.get("VMON_HOME", str(Path.home() / ".vmon")))
-VOLUME_DIR = STATE / "volumes"
+from ._transport import DaemonError, get_transport, path_segment
 
 _NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
 
@@ -28,46 +22,17 @@ class Volume:
         if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
             raise ValueError(f"invalid volume name {name!r}: must match {_NAME_RE.pattern}")
         self.name = name
-        # Compatibility for callers that used the old local path as a display
-        # value. The path is only meaningful for local-daemon contexts.
-        self.host_dir = state_dir() / "volumes" / name
 
-    def ensure(self) -> Path:
-        """Create the server-side volume if needed and return the legacy path."""
-        get_transport().json("PUT", f"/v1/volumes/{path_segment(self.name)}")
-        return self.host_dir
-
-    create = ensure
+    def create(self) -> Volume:
+        """Create the server-side volume if needed and return this handle."""
+        with get_transport() as transport:
+            transport.json("PUT", f"/v1/volumes/{path_segment(self.name)}")
+        return self
 
     def delete(self) -> None:
         """Delete the server-side volume."""
-        get_transport().json("DELETE", f"/v1/volumes/{path_segment(self.name)}")
-
-    rm = delete
-
-    def acquire(self) -> None:
-        """Compatibility no-op: the daemon now enforces writer locks."""
-        self.ensure()
-
-    def release(self) -> None:
-        """Compatibility no-op: locks are held by daemon-managed sandboxes."""
-
-    def __enter__(self) -> Volume:
-        self.acquire()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.release()
-
-    @property
-    def tag(self) -> str:
-        """virtio-fs tag derived from the name (Rust charset ``[a-z0-9_]{1,32}``)."""
-        return re.sub(r"[^a-z0-9_]", "_", self.name.lower())[:32] or "vol"
+        with get_transport() as transport:
+            transport.json("DELETE", f"/v1/volumes/{path_segment(self.name)}")
 
     def to_wire(self, *, read_only: bool = False) -> str | dict[str, object]:
         """Return the v1 create-body volume shape."""
@@ -75,7 +40,10 @@ class Volume:
 
     @classmethod
     def list(cls) -> list[str]:
-        """Names of volumes known to the selected vmon API context."""
-        value = get_transport().json("GET", "/v1/volumes")
+        """Return names of volumes known to the selected vmon API context."""
+        with get_transport() as transport:
+            value = transport.json("GET", "/v1/volumes")
         volumes = value.get("volumes") if isinstance(value, dict) else None
-        return sorted(str(name) for name in volumes) if isinstance(volumes, list) else []
+        if not isinstance(volumes, list) or not all(isinstance(name, str) for name in volumes):
+            raise DaemonError("volume list returned a malformed response", code="protocol")
+        return sorted(volumes)

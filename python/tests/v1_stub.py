@@ -44,6 +44,10 @@ class V1StubServer:
         self.requests: list[RecordedRequest] = []
         self.sandboxes: dict[str, dict[str, Any]] = {}
         self.volumes: set[str] = set()
+        self.pools: dict[str, dict[str, Any]] = {}
+        self.snapshots: set[str] = set()
+        self.events: list[dict[str, Any]] = [{"type": "ready", "sequence": 1}]
+        self.required_token: str | None = None
         self._lock = threading.RLock()
         self._next_id = 1
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
@@ -104,44 +108,65 @@ class V1StubServer:
             def do_DELETE(self) -> None:
                 self._handle_http()
 
+            def do_PATCH(self) -> None:
+                self._handle_http()
+
+            def do_OPTIONS(self) -> None:
+                self._handle_http()
+
+            def do_HEAD(self) -> None:
+                self._handle_http()
+
             def _handle_websocket(self) -> None:
                 stub: stub_type = self.server.stub  # type: ignore[attr-defined,valid-type]
                 split = urlsplit(self.path)
-                path = unquote(split.path)
+                path = split.path
                 headers = {key.lower(): value for key, value in self.headers.items()}
                 with stub._lock:
                     stub.requests.append(
                         RecordedRequest("GET", path, parse_qs(split.query), headers, None, b"")
                     )
                 try:
-                    key = self.headers.get("Sec-WebSocket-Key")
-                    if not key:
-                        raise StubError(400, "invalid", "missing websocket key")
-                    accept = base64.b64encode(
-                        hashlib.sha1(
-                            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
-                        ).digest()
-                    ).decode()
-                    response = (
-                        "HTTP/1.1 101 Switching Protocols\r\n"
-                        "Upgrade: websocket\r\n"
-                        "Connection: Upgrade\r\n"
-                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                    )
-                    self.connection.sendall(response.encode("latin-1"))
-                    stub._serve_exec_websocket(
-                        self.connection, path, parse_qs(split.query), headers
-                    )
+                    stub._require_auth(headers)
+                    if path.startswith("/v1/sandboxes/") and "/ports/" in path:
+                        encoded_id = path.removeprefix("/v1/sandboxes/").split("/", 1)[0]
+                        stub._require_connect_token(unquote(encoded_id), parse_qs(split.query))
                 except StubError as exc:
+                    raw = json.dumps(
+                        {"code": exc.code, "message": exc.message}, separators=(",", ":")
+                    ).encode("utf-8")
                     self.send_response(exc.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
+                    self.wfile.write(raw)
+                    self.close_connection = True
+                    return
+
+                key = self.headers.get("Sec-WebSocket-Key")
+                if not key:
+                    self.send_error(400, "missing websocket key")
+                    self.close_connection = True
+                    return
+                accept = base64.b64encode(
+                    hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+                ).decode()
+                response = (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                self.connection.sendall(response.encode("latin-1"))
+                try:
+                    stub._serve_websocket(self.connection, path, parse_qs(split.query), headers)
                 finally:
                     self.close_connection = True
 
             def _handle_http(self) -> None:
                 stub: stub_type = self.server.stub  # type: ignore[attr-defined,valid-type]
                 split = urlsplit(self.path)
-                path = unquote(split.path)
+                path = split.path
                 length = int(self.headers.get("Content-Length") or "0")
                 body = self.rfile.read(length) if length else b""
                 json_body: Any = None
@@ -170,7 +195,7 @@ class V1StubServer:
                     self.send_header(key, value)
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
-                if raw:
+                if raw and self.command != "HEAD":
                     self.wfile.write(raw)
 
         return Handler
@@ -186,11 +211,81 @@ class V1StubServer:
     ) -> tuple[int, None, dict[str, str], bytes]:
         return status, None, {"Content-Type": content_type}, body
 
+    def _require_auth(self, headers: dict[str, str]) -> None:
+        if self.required_token is None:
+            return
+        if headers.get("authorization") != f"Bearer {self.required_token}":
+            raise StubError(401, "unauthorized", "invalid bearer token")
+
+    def _require_connect_token(self, sandbox_id: str, query: dict[str, list[str]]) -> None:
+        expected = f"token-{sandbox_id}"
+        supplied = [
+            value
+            for key in ("connect_token", "token", "access_token")
+            for value in query.get(key, [])
+        ]
+        if expected not in supplied:
+            raise StubError(401, "unauthorized", "invalid connect token")
+
     def _dispatch(self, request: RecordedRequest) -> tuple[int, Any, dict[str, str], bytes]:
+        self._require_auth(request.headers)
         if request.path == "/healthz" and request.method == "GET":
             return self._json_response(200, {"ok": True})
+        if request.path == "/metrics" and request.method == "GET":
+            return self._bytes_response(
+                200,
+                b"# TYPE vmon_test_total counter\nvmon_test_total 1\n",
+                "text/plain; version=0.0.4",
+            )
+        if request.path == "/v1/events" and request.method == "GET":
+            body = b": keepalive\n\n" + b"".join(
+                f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+                for event in self.events
+            )
+            return self._bytes_response(200, body, "text/event-stream")
         if request.path == "/v1/info" and request.method == "GET":
             return self._json_response(200, {"version": "test", "capabilities": {}})
+        if request.path == "/v1/openapi.json" and request.method == "GET":
+            return self._json_response(
+                200, {"openapi": "3.1.0", "info": {"title": "stub"}, "paths": {}}
+            )
+
+        if request.path == "/v1/pools" and request.method == "GET":
+            return self._json_response(200, dict(self.pools))
+        if request.path.startswith("/v1/pools/"):
+            reference = unquote(request.path.removeprefix("/v1/pools/"))
+            if request.method == "PUT":
+                size = int((request.json or {}).get("size", 0))
+                stats = {"size": size, "ready": size}
+                self.pools[reference] = stats
+                return self._json_response(200, stats)
+            if request.method == "DELETE":
+                self.pools.pop(reference, None)
+                return self._json_response(200, {"ok": True})
+            raise StubError(405, "invalid", "method not allowed")
+
+        if request.path == "/v1/snapshots" and request.method == "GET":
+            return self._json_response(200, {"snapshots": sorted(self.snapshots)})
+        if request.path.startswith("/v1/snapshots/"):
+            rest = request.path.removeprefix("/v1/snapshots/")
+            encoded_name, separator, action = rest.partition("/")
+            snapshot = unquote(encoded_name)
+            if not separator:
+                raise StubError(404, "not_found", "snapshot action is required")
+            if action == "restore" and request.method == "POST":
+                payload = dict(request.json or {})
+                payload.setdefault("name", f"{snapshot}-restored-{self._next_id}")
+                return self._create_sandbox(payload)
+            if action == "fork" and request.method == "POST":
+                count = int((request.json or {}).get("count", 0))
+                clones: list[dict[str, Any]] = []
+                for _ in range(count):
+                    payload = dict(request.json or {})
+                    payload["name"] = f"{snapshot}-clone-{self._next_id}"
+                    _, view, _, _ = self._create_sandbox(payload)
+                    clones.append({**view, "reconstruct_ms": 1})
+                return self._json_response(200, {"clones": clones})
+            raise StubError(405, "invalid", "method not allowed")
 
         if request.path == "/v1/volumes":
             if request.method != "GET":
@@ -198,7 +293,7 @@ class V1StubServer:
             with self._lock:
                 return self._json_response(200, {"volumes": sorted(self.volumes)})
         if request.path.startswith("/v1/volumes/"):
-            name = request.path.rsplit("/", 1)[-1]
+            name = unquote(request.path.removeprefix("/v1/volumes/"))
             if request.method == "PUT":
                 with self._lock:
                     self.volumes.add(name)
@@ -230,8 +325,8 @@ class V1StubServer:
         prefix = "/v1/sandboxes/"
         if request.path.startswith(prefix):
             rest = request.path[len(prefix) :]
-            sandbox_id, _, suffix = rest.partition("/")
-            return self._sandbox_route(sandbox_id, suffix, request)
+            encoded_id, _, suffix = rest.partition("/")
+            return self._sandbox_route(unquote(encoded_id), suffix, request)
 
         raise StubError(404, "not_found", f"unknown route {request.path}")
 
@@ -264,6 +359,12 @@ class V1StubServer:
                 "files": {},
                 "logs": "created\n",
                 "volumes": payload.get("volumes") or {},
+                "network": {
+                    "block_network": bool(payload.get("block_network", False)),
+                    "cidr_allow": list(payload.get("egress_allow") or []),
+                    "domain_allow": list(payload.get("egress_allow_domains") or []),
+                },
+                "tunnels": {},
             }
         return self._json_response(201, view)
 
@@ -283,21 +384,60 @@ class V1StubServer:
                     self.sandboxes.pop(sandbox_id, None)
                 return self._json_response(200, {"ok": True})
         if suffix in {"stop", "terminate", "pause", "resume"} and request.method == "POST":
+            statuses = {
+                "stop": "stopped",
+                "terminate": "terminated",
+                "pause": "paused",
+                "resume": "running",
+            }
             with self._lock:
-                sandbox["view"]["status"] = (
-                    "terminated" if suffix in {"stop", "terminate"} else suffix + "d"
-                )
+                sandbox["view"]["status"] = statuses[suffix]
             return self._json_response(200, dict(sandbox["view"]))
         if suffix == "extend" and request.method == "POST":
             return self._json_response(200, {"deadline_unix": 1_800_000_000})
         if suffix == "metrics" and request.method == "GET":
             return self._json_response(200, {"vcpu_exits": 7})
         if suffix == "logs" and request.method == "GET":
+            follow = (request.query.get("follow") or ["false"])[0].lower() == "true"
+            if follow:
+                event = json.dumps(
+                    {"stream": "console", "data": sandbox["logs"]}, separators=(",", ":")
+                )
+                return self._bytes_response(200, f"data: {event}\n\n".encode(), "text/event-stream")
             return self._bytes_response(
                 200, sandbox["logs"].encode("utf-8"), "text/plain; charset=utf-8"
             )
+        if suffix == "network" and request.method == "GET":
+            return self._json_response(200, dict(sandbox["network"]))
+        if suffix == "network" and request.method == "PUT":
+            sandbox["network"].update(request.json or {})
+            return self._json_response(200, dict(sandbox["network"]))
+        if suffix == "tunnels" and request.method == "GET":
+            return self._json_response(
+                200,
+                {"connect_token": f"token-{sandbox_id}", "tunnels": dict(sandbox["tunnels"])},
+            )
+        if suffix == "migrate" and request.method == "POST":
+            target = str((request.json or {}).get("target") or "")
+            sandbox["view"]["node"] = target
+            return self._json_response(200, {"id": sandbox_id, "node": target})
+        if suffix.startswith("ports/"):
+            self._require_connect_token(sandbox_id, request.query)
+            _, _, proxy_rest = suffix.partition("/")
+            port_text, _, guest_path = proxy_rest.partition("/")
+            return self._json_response(
+                200,
+                {
+                    "method": request.method,
+                    "port": int(port_text),
+                    "path": unquote(guest_path),
+                    "query": request.query,
+                    "body_b64": base64.b64encode(request.body).decode("ascii"),
+                },
+            )
         if suffix == "snapshots" and request.method == "POST":
             name = (request.json or {}).get("name") or f"snap-{sandbox_id}"
+            self.snapshots.add(str(name))
             return self._json_response(200, {"snapshot": name, "dir": f"/snapshots/{name}"})
         if suffix == "snapshots/fs" and request.method == "POST":
             name = (request.json or {}).get("name") or f"fs-{sandbox_id}"
@@ -347,10 +487,75 @@ class V1StubServer:
             return self._json_response(200, {"ok": True})
         raise StubError(405, "invalid", "method not allowed")
 
+    def _serve_websocket(
+        self, sock: Any, path: str, query: dict[str, list[str]], headers: dict[str, str]
+    ) -> None:
+        if path == "/v1/shell":
+            self._serve_shell_websocket(sock, path, query, headers)
+            return
+        prefix = "/v1/sandboxes/"
+        if path.startswith(prefix):
+            rest = path.removeprefix(prefix)
+            encoded_id, separator, suffix = rest.partition("/")
+            sandbox_id = unquote(encoded_id)
+            if not separator or sandbox_id not in self.sandboxes:
+                self._send_ws_json(
+                    sock,
+                    {
+                        "error": {
+                            "code": "not_found",
+                            "message": f"unknown sandbox {sandbox_id}",
+                        }
+                    },
+                )
+            elif suffix == "exec":
+                self._serve_exec_websocket(sock, path, query, headers)
+                return
+            elif suffix == "attach":
+                body = self.sandboxes[sandbox_id]["logs"].encode("utf-8")
+                self._send_ws_json(
+                    sock, {"stream": "console", "b64": base64.b64encode(body).decode("ascii")}
+                )
+            elif suffix.startswith("ports/") and "/ws" in suffix:
+                opcode, payload = read_frame_sync(sock)
+                if opcode in {0x1, 0x2}:
+                    sock.sendall(encode_frame(opcode, payload))
+            else:
+                self._send_ws_json(
+                    sock,
+                    {"error": {"code": "not_found", "message": f"unknown websocket {suffix}"}},
+                )
+        else:
+            self._send_ws_json(
+                sock, {"error": {"code": "not_found", "message": f"unknown websocket {path}"}}
+            )
+        with contextlib.suppress(Exception):
+            sock.sendall(encode_frame(0x8, b""))
+
+    def _serve_shell_websocket(
+        self, sock: Any, path: str, query: dict[str, list[str]], headers: dict[str, str]
+    ) -> None:
+        opcode, payload = read_frame_sync(sock)
+        if opcode != 0x1:
+            return
+        request = json.loads(payload.decode("utf-8"))
+        with self._lock:
+            self.requests.append(RecordedRequest("WS", path, query, headers, request, b""))
+        self._send_ws_json(sock, {"ready": "shell-stub"})
+        cmd = [str(part) for part in request.get("cmd") or []]
+        stdout = cmd[1].encode("utf-8") if cmd[:1] == ["printf"] and len(cmd) > 1 else b""
+        if stdout:
+            self._send_ws_json(
+                sock, {"stream": "stdout", "b64": base64.b64encode(stdout).decode("ascii")}
+            )
+        self._send_ws_json(sock, {"exit": 0, "signal": None})
+        with contextlib.suppress(Exception):
+            sock.sendall(encode_frame(0x8, b""))
+
     def _serve_exec_websocket(
         self, sock: Any, path: str, query: dict[str, list[str]], headers: dict[str, str]
     ) -> None:
-        sandbox_id = path.removeprefix("/v1/sandboxes/").removesuffix("/exec")
+        sandbox_id = unquote(path.removeprefix("/v1/sandboxes/").removesuffix("/exec"))
         opcode, payload = read_frame_sync(sock)
         if opcode != 0x1:
             return
