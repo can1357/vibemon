@@ -2212,3 +2212,1433 @@ var SystemService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "vmon/v1/api.proto",
 }
+
+const (
+	ArtifactService_Put_FullMethodName  = "/vmon.v1.ArtifactService/Put"
+	ArtifactService_Get_FullMethodName  = "/vmon.v1.ArtifactService/Get"
+	ArtifactService_Stat_FullMethodName = "/vmon.v1.ArtifactService/Stat"
+)
+
+// ArtifactServiceClient is the client API for ArtifactService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ArtifactService stores and retrieves immutable content-addressed byte sequences.
+type ArtifactServiceClient interface {
+	// Put uploads an artifact as an ordered client stream and verifies its digest.
+	Put(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PutArtifactRequest, ArtifactRecord], error)
+	// Get downloads an artifact as an ordered server stream.
+	Get(ctx context.Context, in *GetArtifactRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ArtifactChunk], error)
+	// Stat returns artifact metadata without transferring its contents.
+	Stat(ctx context.Context, in *ArtifactRef, opts ...grpc.CallOption) (*ArtifactRecord, error)
+}
+
+type artifactServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewArtifactServiceClient(cc grpc.ClientConnInterface) ArtifactServiceClient {
+	return &artifactServiceClient{cc}
+}
+
+func (c *artifactServiceClient) Put(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PutArtifactRequest, ArtifactRecord], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ArtifactService_ServiceDesc.Streams[0], ArtifactService_Put_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PutArtifactRequest, ArtifactRecord]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ArtifactService_PutClient = grpc.ClientStreamingClient[PutArtifactRequest, ArtifactRecord]
+
+func (c *artifactServiceClient) Get(ctx context.Context, in *GetArtifactRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ArtifactChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ArtifactService_ServiceDesc.Streams[1], ArtifactService_Get_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GetArtifactRequest, ArtifactChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ArtifactService_GetClient = grpc.ServerStreamingClient[ArtifactChunk]
+
+func (c *artifactServiceClient) Stat(ctx context.Context, in *ArtifactRef, opts ...grpc.CallOption) (*ArtifactRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ArtifactRecord)
+	err := c.cc.Invoke(ctx, ArtifactService_Stat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ArtifactServiceServer is the server API for ArtifactService service.
+// All implementations must embed UnimplementedArtifactServiceServer
+// for forward compatibility.
+//
+// ArtifactService stores and retrieves immutable content-addressed byte sequences.
+type ArtifactServiceServer interface {
+	// Put uploads an artifact as an ordered client stream and verifies its digest.
+	Put(grpc.ClientStreamingServer[PutArtifactRequest, ArtifactRecord]) error
+	// Get downloads an artifact as an ordered server stream.
+	Get(*GetArtifactRequest, grpc.ServerStreamingServer[ArtifactChunk]) error
+	// Stat returns artifact metadata without transferring its contents.
+	Stat(context.Context, *ArtifactRef) (*ArtifactRecord, error)
+	mustEmbedUnimplementedArtifactServiceServer()
+}
+
+// UnimplementedArtifactServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedArtifactServiceServer struct{}
+
+func (UnimplementedArtifactServiceServer) Put(grpc.ClientStreamingServer[PutArtifactRequest, ArtifactRecord]) error {
+	return status.Error(codes.Unimplemented, "method Put not implemented")
+}
+func (UnimplementedArtifactServiceServer) Get(*GetArtifactRequest, grpc.ServerStreamingServer[ArtifactChunk]) error {
+	return status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedArtifactServiceServer) Stat(context.Context, *ArtifactRef) (*ArtifactRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Stat not implemented")
+}
+func (UnimplementedArtifactServiceServer) mustEmbedUnimplementedArtifactServiceServer() {}
+func (UnimplementedArtifactServiceServer) testEmbeddedByValue()                         {}
+
+// UnsafeArtifactServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ArtifactServiceServer will
+// result in compilation errors.
+type UnsafeArtifactServiceServer interface {
+	mustEmbedUnimplementedArtifactServiceServer()
+}
+
+func RegisterArtifactServiceServer(s grpc.ServiceRegistrar, srv ArtifactServiceServer) {
+	// If the following call panics, it indicates UnimplementedArtifactServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ArtifactService_ServiceDesc, srv)
+}
+
+func _ArtifactService_Put_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ArtifactServiceServer).Put(&grpc.GenericServerStream[PutArtifactRequest, ArtifactRecord]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ArtifactService_PutServer = grpc.ClientStreamingServer[PutArtifactRequest, ArtifactRecord]
+
+func _ArtifactService_Get_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GetArtifactRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ArtifactServiceServer).Get(m, &grpc.GenericServerStream[GetArtifactRequest, ArtifactChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ArtifactService_GetServer = grpc.ServerStreamingServer[ArtifactChunk]
+
+func _ArtifactService_Stat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ArtifactRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ArtifactServiceServer).Stat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ArtifactService_Stat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ArtifactServiceServer).Stat(ctx, req.(*ArtifactRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ArtifactService_ServiceDesc is the grpc.ServiceDesc for ArtifactService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ArtifactService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.ArtifactService",
+	HandlerType: (*ArtifactServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Stat",
+			Handler:    _ArtifactService_Stat_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Put",
+			Handler:       _ArtifactService_Put_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "Get",
+			Handler:       _ArtifactService_Get_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "vmon/v1/api.proto",
+}
+
+const (
+	FunctionService_Register_FullMethodName       = "/vmon.v1.FunctionService/Register"
+	FunctionService_Get_FullMethodName            = "/vmon.v1.FunctionService/Get"
+	FunctionService_List_FullMethodName           = "/vmon.v1.FunctionService/List"
+	FunctionService_Activate_FullMethodName       = "/vmon.v1.FunctionService/Activate"
+	FunctionService_Delete_FullMethodName         = "/vmon.v1.FunctionService/Delete"
+	FunctionService_ActivateApp_FullMethodName    = "/vmon.v1.FunctionService/ActivateApp"
+	FunctionService_GetApp_FullMethodName         = "/vmon.v1.FunctionService/GetApp"
+	FunctionService_RollbackApp_FullMethodName    = "/vmon.v1.FunctionService/RollbackApp"
+	FunctionService_CreateSchedule_FullMethodName = "/vmon.v1.FunctionService/CreateSchedule"
+	FunctionService_GetSchedule_FullMethodName    = "/vmon.v1.FunctionService/GetSchedule"
+	FunctionService_ListSchedules_FullMethodName  = "/vmon.v1.FunctionService/ListSchedules"
+	FunctionService_DeleteSchedule_FullMethodName = "/vmon.v1.FunctionService/DeleteSchedule"
+)
+
+// FunctionServiceClient is the client API for FunctionService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// FunctionService manages immutable function revisions, atomic application
+// activations, and durable schedule definitions.
+type FunctionServiceClient interface {
+	// Register creates an immutable revision from a fully typed function specification.
+	Register(ctx context.Context, in *RegisterFunctionRequest, opts ...grpc.CallOption) (*FunctionRevision, error)
+	// Get resolves either a pinned revision or a function's current active revision.
+	Get(ctx context.Context, in *GetFunctionRequest, opts ...grpc.CallOption) (*FunctionRevision, error)
+	// List returns function revisions in stable creation order.
+	List(ctx context.Context, in *ListFunctionsRequest, opts ...grpc.CallOption) (*ListFunctionsResponse, error)
+	// Activate atomically makes a revision current for its function.
+	Activate(ctx context.Context, in *ActivateFunctionRequest, opts ...grpc.CallOption) (*FunctionRecord, error)
+	// Delete removes an inactive function revision.
+	Delete(ctx context.Context, in *DeleteFunctionRequest, opts ...grpc.CallOption) (*Ok, error)
+	// ActivateApp atomically publishes a complete set of pinned function revisions.
+	ActivateApp(ctx context.Context, in *ActivateAppRequest, opts ...grpc.CallOption) (*AppRevision, error)
+	// GetApp resolves either the current or a pinned application revision.
+	GetApp(ctx context.Context, in *GetAppRequest, opts ...grpc.CallOption) (*AppRevision, error)
+	// RollbackApp atomically restores a prior application revision as current.
+	RollbackApp(ctx context.Context, in *RollbackAppRequest, opts ...grpc.CallOption) (*AppRevision, error)
+	// CreateSchedule creates or replaces a typed cron or fixed-period schedule.
+	CreateSchedule(ctx context.Context, in *CreateScheduleRequest, opts ...grpc.CallOption) (*ScheduleRecord, error)
+	// GetSchedule returns a schedule by its stable identifier.
+	GetSchedule(ctx context.Context, in *ScheduleRef, opts ...grpc.CallOption) (*ScheduleRecord, error)
+	// ListSchedules lists schedules, optionally filtered by application or function.
+	ListSchedules(ctx context.Context, in *ListSchedulesRequest, opts ...grpc.CallOption) (*ListSchedulesResponse, error)
+	// DeleteSchedule permanently removes a schedule.
+	DeleteSchedule(ctx context.Context, in *ScheduleRef, opts ...grpc.CallOption) (*Ok, error)
+}
+
+type functionServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewFunctionServiceClient(cc grpc.ClientConnInterface) FunctionServiceClient {
+	return &functionServiceClient{cc}
+}
+
+func (c *functionServiceClient) Register(ctx context.Context, in *RegisterFunctionRequest, opts ...grpc.CallOption) (*FunctionRevision, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FunctionRevision)
+	err := c.cc.Invoke(ctx, FunctionService_Register_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) Get(ctx context.Context, in *GetFunctionRequest, opts ...grpc.CallOption) (*FunctionRevision, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FunctionRevision)
+	err := c.cc.Invoke(ctx, FunctionService_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) List(ctx context.Context, in *ListFunctionsRequest, opts ...grpc.CallOption) (*ListFunctionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFunctionsResponse)
+	err := c.cc.Invoke(ctx, FunctionService_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) Activate(ctx context.Context, in *ActivateFunctionRequest, opts ...grpc.CallOption) (*FunctionRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FunctionRecord)
+	err := c.cc.Invoke(ctx, FunctionService_Activate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) Delete(ctx context.Context, in *DeleteFunctionRequest, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, FunctionService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) ActivateApp(ctx context.Context, in *ActivateAppRequest, opts ...grpc.CallOption) (*AppRevision, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AppRevision)
+	err := c.cc.Invoke(ctx, FunctionService_ActivateApp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) GetApp(ctx context.Context, in *GetAppRequest, opts ...grpc.CallOption) (*AppRevision, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AppRevision)
+	err := c.cc.Invoke(ctx, FunctionService_GetApp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) RollbackApp(ctx context.Context, in *RollbackAppRequest, opts ...grpc.CallOption) (*AppRevision, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AppRevision)
+	err := c.cc.Invoke(ctx, FunctionService_RollbackApp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) CreateSchedule(ctx context.Context, in *CreateScheduleRequest, opts ...grpc.CallOption) (*ScheduleRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ScheduleRecord)
+	err := c.cc.Invoke(ctx, FunctionService_CreateSchedule_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) GetSchedule(ctx context.Context, in *ScheduleRef, opts ...grpc.CallOption) (*ScheduleRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ScheduleRecord)
+	err := c.cc.Invoke(ctx, FunctionService_GetSchedule_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) ListSchedules(ctx context.Context, in *ListSchedulesRequest, opts ...grpc.CallOption) (*ListSchedulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSchedulesResponse)
+	err := c.cc.Invoke(ctx, FunctionService_ListSchedules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *functionServiceClient) DeleteSchedule(ctx context.Context, in *ScheduleRef, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, FunctionService_DeleteSchedule_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FunctionServiceServer is the server API for FunctionService service.
+// All implementations must embed UnimplementedFunctionServiceServer
+// for forward compatibility.
+//
+// FunctionService manages immutable function revisions, atomic application
+// activations, and durable schedule definitions.
+type FunctionServiceServer interface {
+	// Register creates an immutable revision from a fully typed function specification.
+	Register(context.Context, *RegisterFunctionRequest) (*FunctionRevision, error)
+	// Get resolves either a pinned revision or a function's current active revision.
+	Get(context.Context, *GetFunctionRequest) (*FunctionRevision, error)
+	// List returns function revisions in stable creation order.
+	List(context.Context, *ListFunctionsRequest) (*ListFunctionsResponse, error)
+	// Activate atomically makes a revision current for its function.
+	Activate(context.Context, *ActivateFunctionRequest) (*FunctionRecord, error)
+	// Delete removes an inactive function revision.
+	Delete(context.Context, *DeleteFunctionRequest) (*Ok, error)
+	// ActivateApp atomically publishes a complete set of pinned function revisions.
+	ActivateApp(context.Context, *ActivateAppRequest) (*AppRevision, error)
+	// GetApp resolves either the current or a pinned application revision.
+	GetApp(context.Context, *GetAppRequest) (*AppRevision, error)
+	// RollbackApp atomically restores a prior application revision as current.
+	RollbackApp(context.Context, *RollbackAppRequest) (*AppRevision, error)
+	// CreateSchedule creates or replaces a typed cron or fixed-period schedule.
+	CreateSchedule(context.Context, *CreateScheduleRequest) (*ScheduleRecord, error)
+	// GetSchedule returns a schedule by its stable identifier.
+	GetSchedule(context.Context, *ScheduleRef) (*ScheduleRecord, error)
+	// ListSchedules lists schedules, optionally filtered by application or function.
+	ListSchedules(context.Context, *ListSchedulesRequest) (*ListSchedulesResponse, error)
+	// DeleteSchedule permanently removes a schedule.
+	DeleteSchedule(context.Context, *ScheduleRef) (*Ok, error)
+	mustEmbedUnimplementedFunctionServiceServer()
+}
+
+// UnimplementedFunctionServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedFunctionServiceServer struct{}
+
+func (UnimplementedFunctionServiceServer) Register(context.Context, *RegisterFunctionRequest) (*FunctionRevision, error) {
+	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
+}
+func (UnimplementedFunctionServiceServer) Get(context.Context, *GetFunctionRequest) (*FunctionRevision, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedFunctionServiceServer) List(context.Context, *ListFunctionsRequest) (*ListFunctionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedFunctionServiceServer) Activate(context.Context, *ActivateFunctionRequest) (*FunctionRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Activate not implemented")
+}
+func (UnimplementedFunctionServiceServer) Delete(context.Context, *DeleteFunctionRequest) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedFunctionServiceServer) ActivateApp(context.Context, *ActivateAppRequest) (*AppRevision, error) {
+	return nil, status.Error(codes.Unimplemented, "method ActivateApp not implemented")
+}
+func (UnimplementedFunctionServiceServer) GetApp(context.Context, *GetAppRequest) (*AppRevision, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetApp not implemented")
+}
+func (UnimplementedFunctionServiceServer) RollbackApp(context.Context, *RollbackAppRequest) (*AppRevision, error) {
+	return nil, status.Error(codes.Unimplemented, "method RollbackApp not implemented")
+}
+func (UnimplementedFunctionServiceServer) CreateSchedule(context.Context, *CreateScheduleRequest) (*ScheduleRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSchedule not implemented")
+}
+func (UnimplementedFunctionServiceServer) GetSchedule(context.Context, *ScheduleRef) (*ScheduleRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSchedule not implemented")
+}
+func (UnimplementedFunctionServiceServer) ListSchedules(context.Context, *ListSchedulesRequest) (*ListSchedulesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSchedules not implemented")
+}
+func (UnimplementedFunctionServiceServer) DeleteSchedule(context.Context, *ScheduleRef) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSchedule not implemented")
+}
+func (UnimplementedFunctionServiceServer) mustEmbedUnimplementedFunctionServiceServer() {}
+func (UnimplementedFunctionServiceServer) testEmbeddedByValue()                         {}
+
+// UnsafeFunctionServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to FunctionServiceServer will
+// result in compilation errors.
+type UnsafeFunctionServiceServer interface {
+	mustEmbedUnimplementedFunctionServiceServer()
+}
+
+func RegisterFunctionServiceServer(s grpc.ServiceRegistrar, srv FunctionServiceServer) {
+	// If the following call panics, it indicates UnimplementedFunctionServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&FunctionService_ServiceDesc, srv)
+}
+
+func _FunctionService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterFunctionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).Register(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_Register_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).Register(ctx, req.(*RegisterFunctionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFunctionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).Get(ctx, req.(*GetFunctionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFunctionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).List(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_List_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).List(ctx, req.(*ListFunctionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_Activate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActivateFunctionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).Activate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_Activate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).Activate(ctx, req.(*ActivateFunctionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteFunctionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).Delete(ctx, req.(*DeleteFunctionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_ActivateApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActivateAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).ActivateApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_ActivateApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).ActivateApp(ctx, req.(*ActivateAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_GetApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).GetApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_GetApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).GetApp(ctx, req.(*GetAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_RollbackApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RollbackAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).RollbackApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_RollbackApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).RollbackApp(ctx, req.(*RollbackAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_CreateSchedule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateScheduleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).CreateSchedule(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_CreateSchedule_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).CreateSchedule(ctx, req.(*CreateScheduleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_GetSchedule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScheduleRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).GetSchedule(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_GetSchedule_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).GetSchedule(ctx, req.(*ScheduleRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_ListSchedules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSchedulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).ListSchedules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_ListSchedules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).ListSchedules(ctx, req.(*ListSchedulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FunctionService_DeleteSchedule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScheduleRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FunctionServiceServer).DeleteSchedule(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FunctionService_DeleteSchedule_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FunctionServiceServer).DeleteSchedule(ctx, req.(*ScheduleRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// FunctionService_ServiceDesc is the grpc.ServiceDesc for FunctionService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var FunctionService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.FunctionService",
+	HandlerType: (*FunctionServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Register",
+			Handler:    _FunctionService_Register_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _FunctionService_Get_Handler,
+		},
+		{
+			MethodName: "List",
+			Handler:    _FunctionService_List_Handler,
+		},
+		{
+			MethodName: "Activate",
+			Handler:    _FunctionService_Activate_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _FunctionService_Delete_Handler,
+		},
+		{
+			MethodName: "ActivateApp",
+			Handler:    _FunctionService_ActivateApp_Handler,
+		},
+		{
+			MethodName: "GetApp",
+			Handler:    _FunctionService_GetApp_Handler,
+		},
+		{
+			MethodName: "RollbackApp",
+			Handler:    _FunctionService_RollbackApp_Handler,
+		},
+		{
+			MethodName: "CreateSchedule",
+			Handler:    _FunctionService_CreateSchedule_Handler,
+		},
+		{
+			MethodName: "GetSchedule",
+			Handler:    _FunctionService_GetSchedule_Handler,
+		},
+		{
+			MethodName: "ListSchedules",
+			Handler:    _FunctionService_ListSchedules_Handler,
+		},
+		{
+			MethodName: "DeleteSchedule",
+			Handler:    _FunctionService_DeleteSchedule_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "vmon/v1/api.proto",
+}
+
+const (
+	CallService_Create_FullMethodName       = "/vmon.v1.CallService/Create"
+	CallService_StreamInputs_FullMethodName = "/vmon.v1.CallService/StreamInputs"
+	CallService_CloseInputs_FullMethodName  = "/vmon.v1.CallService/CloseInputs"
+	CallService_Get_FullMethodName          = "/vmon.v1.CallService/Get"
+	CallService_List_FullMethodName         = "/vmon.v1.CallService/List"
+	CallService_GetResult_FullMethodName    = "/vmon.v1.CallService/GetResult"
+	CallService_Watch_FullMethodName        = "/vmon.v1.CallService/Watch"
+	CallService_Cancel_FullMethodName       = "/vmon.v1.CallService/Cancel"
+)
+
+// CallServiceClient is the client API for CallService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// CallService persists function invocations, batch inputs and indexed results,
+// and exposes reconnectable execution event streams.
+type CallServiceClient interface {
+	// Create durably records a call before any execution is eligible to begin.
+	Create(ctx context.Context, in *CreateCallRequest, opts ...grpc.CallOption) (*CallRecord, error)
+	// StreamInputs durably appends ordered inputs to an open generator or batch call.
+	StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error)
+	// CloseInputs marks an input stream complete so execution can finish.
+	CloseInputs(ctx context.Context, in *CloseCallInputsRequest, opts ...grpc.CallOption) (*CallRecord, error)
+	// Get returns the latest durable state of a call.
+	Get(ctx context.Context, in *CallRef, opts ...grpc.CallOption) (*CallRecord, error)
+	// List returns calls in stable creation order.
+	List(ctx context.Context, in *ListCallsRequest, opts ...grpc.CallOption) (*ListCallsResponse, error)
+	// GetResult returns one durable result by its input or yield index.
+	GetResult(ctx context.Context, in *GetCallResultRequest, opts ...grpc.CallOption) (*CallResult, error)
+	// Watch streams events after a durable sequence cursor and may follow new events.
+	Watch(ctx context.Context, in *WatchCallRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CallEvent], error)
+	// Cancel durably requests cancellation of a call and its unfinished work.
+	Cancel(ctx context.Context, in *CancelCallRequest, opts ...grpc.CallOption) (*CallRecord, error)
+}
+
+type callServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCallServiceClient(cc grpc.ClientConnInterface) CallServiceClient {
+	return &callServiceClient{cc}
+}
+
+func (c *callServiceClient) Create(ctx context.Context, in *CreateCallRequest, opts ...grpc.CallOption) (*CallRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CallRecord)
+	err := c.cc.Invoke(ctx, CallService_Create_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) StreamInputs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &CallService_ServiceDesc.Streams[0], CallService_StreamInputs_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamCallInputsRequest, StreamCallInputsResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type CallService_StreamInputsClient = grpc.ClientStreamingClient[StreamCallInputsRequest, StreamCallInputsResponse]
+
+func (c *callServiceClient) CloseInputs(ctx context.Context, in *CloseCallInputsRequest, opts ...grpc.CallOption) (*CallRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CallRecord)
+	err := c.cc.Invoke(ctx, CallService_CloseInputs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) Get(ctx context.Context, in *CallRef, opts ...grpc.CallOption) (*CallRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CallRecord)
+	err := c.cc.Invoke(ctx, CallService_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) List(ctx context.Context, in *ListCallsRequest, opts ...grpc.CallOption) (*ListCallsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListCallsResponse)
+	err := c.cc.Invoke(ctx, CallService_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) GetResult(ctx context.Context, in *GetCallResultRequest, opts ...grpc.CallOption) (*CallResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CallResult)
+	err := c.cc.Invoke(ctx, CallService_GetResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *callServiceClient) Watch(ctx context.Context, in *WatchCallRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CallEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &CallService_ServiceDesc.Streams[1], CallService_Watch_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchCallRequest, CallEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type CallService_WatchClient = grpc.ServerStreamingClient[CallEvent]
+
+func (c *callServiceClient) Cancel(ctx context.Context, in *CancelCallRequest, opts ...grpc.CallOption) (*CallRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CallRecord)
+	err := c.cc.Invoke(ctx, CallService_Cancel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CallServiceServer is the server API for CallService service.
+// All implementations must embed UnimplementedCallServiceServer
+// for forward compatibility.
+//
+// CallService persists function invocations, batch inputs and indexed results,
+// and exposes reconnectable execution event streams.
+type CallServiceServer interface {
+	// Create durably records a call before any execution is eligible to begin.
+	Create(context.Context, *CreateCallRequest) (*CallRecord, error)
+	// StreamInputs durably appends ordered inputs to an open generator or batch call.
+	StreamInputs(grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error
+	// CloseInputs marks an input stream complete so execution can finish.
+	CloseInputs(context.Context, *CloseCallInputsRequest) (*CallRecord, error)
+	// Get returns the latest durable state of a call.
+	Get(context.Context, *CallRef) (*CallRecord, error)
+	// List returns calls in stable creation order.
+	List(context.Context, *ListCallsRequest) (*ListCallsResponse, error)
+	// GetResult returns one durable result by its input or yield index.
+	GetResult(context.Context, *GetCallResultRequest) (*CallResult, error)
+	// Watch streams events after a durable sequence cursor and may follow new events.
+	Watch(*WatchCallRequest, grpc.ServerStreamingServer[CallEvent]) error
+	// Cancel durably requests cancellation of a call and its unfinished work.
+	Cancel(context.Context, *CancelCallRequest) (*CallRecord, error)
+	mustEmbedUnimplementedCallServiceServer()
+}
+
+// UnimplementedCallServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedCallServiceServer struct{}
+
+func (UnimplementedCallServiceServer) Create(context.Context, *CreateCallRequest) (*CallRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
+}
+func (UnimplementedCallServiceServer) StreamInputs(grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]) error {
+	return status.Error(codes.Unimplemented, "method StreamInputs not implemented")
+}
+func (UnimplementedCallServiceServer) CloseInputs(context.Context, *CloseCallInputsRequest) (*CallRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method CloseInputs not implemented")
+}
+func (UnimplementedCallServiceServer) Get(context.Context, *CallRef) (*CallRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedCallServiceServer) List(context.Context, *ListCallsRequest) (*ListCallsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedCallServiceServer) GetResult(context.Context, *GetCallResultRequest) (*CallResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetResult not implemented")
+}
+func (UnimplementedCallServiceServer) Watch(*WatchCallRequest, grpc.ServerStreamingServer[CallEvent]) error {
+	return status.Error(codes.Unimplemented, "method Watch not implemented")
+}
+func (UnimplementedCallServiceServer) Cancel(context.Context, *CancelCallRequest) (*CallRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Cancel not implemented")
+}
+func (UnimplementedCallServiceServer) mustEmbedUnimplementedCallServiceServer() {}
+func (UnimplementedCallServiceServer) testEmbeddedByValue()                     {}
+
+// UnsafeCallServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CallServiceServer will
+// result in compilation errors.
+type UnsafeCallServiceServer interface {
+	mustEmbedUnimplementedCallServiceServer()
+}
+
+func RegisterCallServiceServer(s grpc.ServiceRegistrar, srv CallServiceServer) {
+	// If the following call panics, it indicates UnimplementedCallServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&CallService_ServiceDesc, srv)
+}
+
+func _CallService_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateCallRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).Create(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_Create_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).Create(ctx, req.(*CreateCallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CallService_StreamInputs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(CallServiceServer).StreamInputs(&grpc.GenericServerStream[StreamCallInputsRequest, StreamCallInputsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type CallService_StreamInputsServer = grpc.ClientStreamingServer[StreamCallInputsRequest, StreamCallInputsResponse]
+
+func _CallService_CloseInputs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CloseCallInputsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).CloseInputs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_CloseInputs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).CloseInputs(ctx, req.(*CloseCallInputsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CallService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CallRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).Get(ctx, req.(*CallRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CallService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListCallsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).List(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_List_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).List(ctx, req.(*ListCallsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CallService_GetResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCallResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).GetResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_GetResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).GetResult(ctx, req.(*GetCallResultRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CallService_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchCallRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(CallServiceServer).Watch(m, &grpc.GenericServerStream[WatchCallRequest, CallEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type CallService_WatchServer = grpc.ServerStreamingServer[CallEvent]
+
+func _CallService_Cancel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelCallRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CallServiceServer).Cancel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CallService_Cancel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CallServiceServer).Cancel(ctx, req.(*CancelCallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// CallService_ServiceDesc is the grpc.ServiceDesc for CallService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var CallService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.CallService",
+	HandlerType: (*CallServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Create",
+			Handler:    _CallService_Create_Handler,
+		},
+		{
+			MethodName: "CloseInputs",
+			Handler:    _CallService_CloseInputs_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _CallService_Get_Handler,
+		},
+		{
+			MethodName: "List",
+			Handler:    _CallService_List_Handler,
+		},
+		{
+			MethodName: "GetResult",
+			Handler:    _CallService_GetResult_Handler,
+		},
+		{
+			MethodName: "Cancel",
+			Handler:    _CallService_Cancel_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamInputs",
+			Handler:       _CallService_StreamInputs_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "Watch",
+			Handler:       _CallService_Watch_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "vmon/v1/api.proto",
+}
+
+const (
+	ActorService_Create_FullMethodName     = "/vmon.v1.ActorService/Create"
+	ActorService_Get_FullMethodName        = "/vmon.v1.ActorService/Get"
+	ActorService_Checkpoint_FullMethodName = "/vmon.v1.ActorService/Checkpoint"
+	ActorService_Restore_FullMethodName    = "/vmon.v1.ActorService/Restore"
+	ActorService_Fork_FullMethodName       = "/vmon.v1.ActorService/Fork"
+	ActorService_Delete_FullMethodName     = "/vmon.v1.ActorService/Delete"
+)
+
+// ActorServiceClient is the client API for ActorService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ActorService manages durable actor identities and immutable actor checkpoints.
+type ActorServiceClient interface {
+	// Create durably creates an actor pinned to a function revision.
+	Create(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*ActorRecord, error)
+	// Get returns the latest durable actor state.
+	Get(ctx context.Context, in *ActorRef, opts ...grpc.CallOption) (*ActorRecord, error)
+	// Checkpoint captures the actor's state as an immutable checkpoint artifact.
+	Checkpoint(ctx context.Context, in *CheckpointActorRequest, opts ...grpc.CallOption) (*ActorCheckpoint, error)
+	// Restore atomically restores an actor from a compatible checkpoint.
+	Restore(ctx context.Context, in *RestoreActorRequest, opts ...grpc.CallOption) (*ActorRecord, error)
+	// Fork creates a new actor identity from an immutable checkpoint.
+	Fork(ctx context.Context, in *ForkActorRequest, opts ...grpc.CallOption) (*ActorRecord, error)
+	// Delete permanently removes an actor identity while retaining referenced artifacts.
+	Delete(ctx context.Context, in *ActorRef, opts ...grpc.CallOption) (*Ok, error)
+}
+
+type actorServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewActorServiceClient(cc grpc.ClientConnInterface) ActorServiceClient {
+	return &actorServiceClient{cc}
+}
+
+func (c *actorServiceClient) Create(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*ActorRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorRecord)
+	err := c.cc.Invoke(ctx, ActorService_Create_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actorServiceClient) Get(ctx context.Context, in *ActorRef, opts ...grpc.CallOption) (*ActorRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorRecord)
+	err := c.cc.Invoke(ctx, ActorService_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actorServiceClient) Checkpoint(ctx context.Context, in *CheckpointActorRequest, opts ...grpc.CallOption) (*ActorCheckpoint, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorCheckpoint)
+	err := c.cc.Invoke(ctx, ActorService_Checkpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actorServiceClient) Restore(ctx context.Context, in *RestoreActorRequest, opts ...grpc.CallOption) (*ActorRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorRecord)
+	err := c.cc.Invoke(ctx, ActorService_Restore_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actorServiceClient) Fork(ctx context.Context, in *ForkActorRequest, opts ...grpc.CallOption) (*ActorRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorRecord)
+	err := c.cc.Invoke(ctx, ActorService_Fork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actorServiceClient) Delete(ctx context.Context, in *ActorRef, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, ActorService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ActorServiceServer is the server API for ActorService service.
+// All implementations must embed UnimplementedActorServiceServer
+// for forward compatibility.
+//
+// ActorService manages durable actor identities and immutable actor checkpoints.
+type ActorServiceServer interface {
+	// Create durably creates an actor pinned to a function revision.
+	Create(context.Context, *CreateActorRequest) (*ActorRecord, error)
+	// Get returns the latest durable actor state.
+	Get(context.Context, *ActorRef) (*ActorRecord, error)
+	// Checkpoint captures the actor's state as an immutable checkpoint artifact.
+	Checkpoint(context.Context, *CheckpointActorRequest) (*ActorCheckpoint, error)
+	// Restore atomically restores an actor from a compatible checkpoint.
+	Restore(context.Context, *RestoreActorRequest) (*ActorRecord, error)
+	// Fork creates a new actor identity from an immutable checkpoint.
+	Fork(context.Context, *ForkActorRequest) (*ActorRecord, error)
+	// Delete permanently removes an actor identity while retaining referenced artifacts.
+	Delete(context.Context, *ActorRef) (*Ok, error)
+	mustEmbedUnimplementedActorServiceServer()
+}
+
+// UnimplementedActorServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedActorServiceServer struct{}
+
+func (UnimplementedActorServiceServer) Create(context.Context, *CreateActorRequest) (*ActorRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
+}
+func (UnimplementedActorServiceServer) Get(context.Context, *ActorRef) (*ActorRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedActorServiceServer) Checkpoint(context.Context, *CheckpointActorRequest) (*ActorCheckpoint, error) {
+	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedActorServiceServer) Restore(context.Context, *RestoreActorRequest) (*ActorRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Restore not implemented")
+}
+func (UnimplementedActorServiceServer) Fork(context.Context, *ForkActorRequest) (*ActorRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Fork not implemented")
+}
+func (UnimplementedActorServiceServer) Delete(context.Context, *ActorRef) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedActorServiceServer) mustEmbedUnimplementedActorServiceServer() {}
+func (UnimplementedActorServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeActorServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ActorServiceServer will
+// result in compilation errors.
+type UnsafeActorServiceServer interface {
+	mustEmbedUnimplementedActorServiceServer()
+}
+
+func RegisterActorServiceServer(s grpc.ServiceRegistrar, srv ActorServiceServer) {
+	// If the following call panics, it indicates UnimplementedActorServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ActorService_ServiceDesc, srv)
+}
+
+func _ActorService_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Create(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Create_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Create(ctx, req.(*CreateActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActorService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActorRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Get(ctx, req.(*ActorRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActorService_Checkpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Checkpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Checkpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Checkpoint(ctx, req.(*CheckpointActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActorService_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Restore(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Restore_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Restore(ctx, req.(*RestoreActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActorService_Fork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForkActorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Fork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Fork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Fork(ctx, req.(*ForkActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActorService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActorRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActorServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActorService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActorServiceServer).Delete(ctx, req.(*ActorRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ActorService_ServiceDesc is the grpc.ServiceDesc for ActorService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ActorService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.ActorService",
+	HandlerType: (*ActorServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Create",
+			Handler:    _ActorService_Create_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _ActorService_Get_Handler,
+		},
+		{
+			MethodName: "Checkpoint",
+			Handler:    _ActorService_Checkpoint_Handler,
+		},
+		{
+			MethodName: "Restore",
+			Handler:    _ActorService_Restore_Handler,
+		},
+		{
+			MethodName: "Fork",
+			Handler:    _ActorService_Fork_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _ActorService_Delete_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "vmon/v1/api.proto",
+}

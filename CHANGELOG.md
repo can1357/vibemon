@@ -27,6 +27,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `ArtifactService` for storage and retrieval of content-addressed byte sequences
+- Added portable `ValueEnvelope` for checksummed serialization across language SDKs
+- Added support for JSON and CBOR serialization formats in SDK communication
 - Added gRPC support for all API operations, replacing the legacy HTTP/JSON transport
 - Added gRPC-over-WebSocket bridge to enable full API access for browser-based clients
 - Added Python SDK support for `@vmon.cls` stateful remote classes with lifecycle hooks
