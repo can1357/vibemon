@@ -47,52 +47,54 @@ pub struct WarmImage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServeConfig {
 	/// Vibemon home directory.
-	pub home:                    PathBuf,
+	pub home: PathBuf,
 	/// TCP bind host.
-	pub host:                    String,
+	pub host: String,
 	/// TCP bind port.
-	pub port:                    u16,
+	pub port: u16,
 	/// Admin bearer token.
-	pub token:                   Option<String>,
+	pub token: Option<String>,
 	/// Restricted client bearer token.
-	pub client_token:            Option<String>,
+	pub client_token: Option<String>,
+	/// Maximum accepted size of one streamed function artifact.
+	pub function_artifact_max_bytes: u64,
 	/// TLS certificate path.
-	pub tls_cert:                Option<String>,
+	pub tls_cert: Option<String>,
 	/// TLS private-key path.
-	pub tls_key:                 Option<String>,
+	pub tls_key: Option<String>,
 	/// Idle sandbox timeout in seconds.
-	pub idle_timeout:            f64,
+	pub idle_timeout: f64,
 	/// Replica checkpoint cadence override.
-	pub replicate_sec:           Option<f64>,
+	pub replicate_sec: Option<f64>,
 	/// Desired async replica count.
-	pub replicas:                usize,
+	pub replicas: usize,
 	/// Concurrent replica transfer limit.
-	pub replicate_concurrency:   usize,
+	pub replicate_concurrency: usize,
 	/// Restore-quorum override.
-	pub restore_quorum:          Option<bool>,
+	pub restore_quorum: Option<bool>,
 	/// Default warm-pool size.
-	pub warm_pool_size:          usize,
+	pub warm_pool_size: usize,
 	/// Images to prewarm at startup.
-	pub warm_images:             Vec<WarmImage>,
+	pub warm_images: Vec<WarmImage>,
 	/// Mesh heartbeat cadence in seconds.
-	pub mesh_heartbeat_sec:      f64,
+	pub mesh_heartbeat_sec: f64,
 	/// Mesh reap age in seconds.
-	pub mesh_reap_sec:           f64,
+	pub mesh_reap_sec: f64,
 	/// Mesh idempotency cache TTL in seconds.
-	pub mesh_idem_ttl_sec:       f64,
+	pub mesh_idem_ttl_sec: f64,
 	/// Mesh create dispatch timeout in seconds.
 	pub mesh_create_timeout_sec: f64,
 	/// Placement weight for warm capacity.
-	pub mesh_w_warm:             f64,
+	pub mesh_w_warm: f64,
 	/// Placement weight for free capacity.
-	pub mesh_w_free:             f64,
+	pub mesh_w_free: f64,
 	/// Placement weight for local node bias.
-	pub mesh_w_local:            f64,
+	pub mesh_w_local: f64,
 	/// Placement weight for region affinity.
-	pub mesh_w_region:           f64,
+	pub mesh_w_region: f64,
 	/// Placement penalty for inflight creates.
-	pub mesh_w_inflight:         f64,
-	sources:                     HashMap<String, ConfigSource>,
+	pub mesh_w_inflight: f64,
+	sources: HashMap<String, ConfigSource>,
 }
 
 impl ServeConfig {
@@ -155,6 +157,7 @@ impl Default for ServeConfig {
 			port: 8000,
 			token: None,
 			client_token: None,
+			function_artifact_max_bytes: 4 * 1024 * 1024 * 1024,
 			tls_cert: None,
 			tls_key: None,
 			idle_timeout: 300.0,
@@ -185,6 +188,7 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"port",
 	"token",
 	"client_token",
+	"function_artifact_max_bytes",
 	"tls_cert",
 	"tls_key",
 	"idle_timeout",
@@ -212,6 +216,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("port", "VMON_SERVE_PORT"),
 	("token", "VMON_API_TOKEN"),
 	("client_token", "VMON_CLIENT_TOKEN"),
+	("function_artifact_max_bytes", "VMON_FUNCTION_ARTIFACT_MAX_BYTES"),
 	("tls_cert", "VMON_TLS_CERT"),
 	("tls_key", "VMON_TLS_KEY"),
 	("idle_timeout", "VMON_IDLE_TIMEOUT"),
@@ -239,6 +244,7 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("port", "--port"),
 	("token", "--token"),
 	("client_token", "--client-token"),
+	("function_artifact_max_bytes", "--function-artifact-max-bytes"),
 	("tls_cert", "--tls-cert"),
 	("tls_key", "--tls-key"),
 	("idle_timeout", "--idle-timeout"),
@@ -461,6 +467,16 @@ fn apply_value(
 		"home" => config.home = expand_user(&coerce_string(key, value)?),
 		"token" => config.token = empty_string_as_none(key, value)?,
 		"client_token" => config.client_token = empty_string_as_none(key, value)?,
+		"function_artifact_max_bytes" => {
+			const MAX_ARTIFACT_BYTES: i64 = 1_i64 << 50;
+			let parsed = coerce_int(key, value)?;
+			if !(1..=MAX_ARTIFACT_BYTES).contains(&parsed) {
+				return Err(EngineError::invalid(format!(
+					"{key} must be between 1 and {MAX_ARTIFACT_BYTES}"
+				)));
+			}
+			config.function_artifact_max_bytes = parsed as u64;
+		},
 		"tls_cert" => config.tls_cert = empty_string_as_none(key, value)?,
 		"tls_key" => config.tls_key = empty_string_as_none(key, value)?,
 		"host" => {
@@ -790,6 +806,29 @@ mod tests {
 	}
 
 	#[test]
+	fn function_artifact_quota_defaults_and_honors_env_and_cli() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+		assert_eq!(
+			resolve_serve_config(&HashMap::new())
+				.expect("default config")
+				.function_artifact_max_bytes,
+			4 * 1024 * 1024 * 1024
+		);
+		EnvGuard::set("VMON_FUNCTION_ARTIFACT_MAX_BYTES", "67108864");
+		let from_env = resolve_serve_config(&HashMap::new()).expect("env quota");
+		assert_eq!(from_env.function_artifact_max_bytes, 67_108_864);
+		assert_eq!(from_env.source("function_artifact_max_bytes"), Some(ConfigSource::Env));
+		let from_cli = resolve_serve_config(&HashMap::from([(
+			"function_artifact_max_bytes".to_owned(),
+			"134217728".to_owned(),
+		)]))
+		.expect("CLI quota");
+		assert_eq!(from_cli.function_artifact_max_bytes, 134_217_728);
+		assert_eq!(from_cli.source("function_artifact_max_bytes"), Some(ConfigSource::Flag));
+	}
+
+	#[test]
 	fn malformed_values_name_the_key() {
 		let _lock = test_home::lock();
 		let _env_guard = EnvGuard::clear();
@@ -799,6 +838,20 @@ mod tests {
 			let overrides = HashMap::from([(key.to_owned(), value.to_owned())]);
 			let err = resolve_serve_config(&overrides).expect_err("bad value");
 			assert!(err.message.contains(key), "expected {key:?} in error {:?}", err.message);
+		}
+	}
+
+	#[test]
+	fn function_artifact_quota_rejects_zero_and_excessive_values() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+		for value in ["0", "-1", "1125899906842625"] {
+			let error = resolve_serve_config(&HashMap::from([(
+				"function_artifact_max_bytes".to_owned(),
+				value.to_owned(),
+			)]))
+			.expect_err("invalid artifact quota");
+			assert!(error.message.contains("function_artifact_max_bytes"));
 		}
 	}
 

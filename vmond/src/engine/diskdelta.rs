@@ -150,28 +150,26 @@ fn compare_chunks(
 	if chunk_count <= 1 {
 		return diff_chunk(base, current, 0, compare_end);
 	}
-	let per_chunk = thread::scope(|scope| {
-		let workers: Vec<_> = (0..chunk_count)
-			.map(|index| {
-				let start = index * chunk_len;
-				let end = compare_end.min(start + chunk_len);
-				scope.spawn(move || diff_chunk(base, current, start, end))
-			})
-			.collect();
-		workers
-			.into_iter()
-			.map(thread::ScopedJoinHandle::join)
-			.collect::<Vec<_>>()
-	});
-	let mut runs = Vec::new();
-	for joined in per_chunk {
-		let chunk_runs =
-			joined.map_err(|_| EngineError::engine("disk delta compare worker panicked"))??;
-		for (offset, len) in chunk_runs {
-			push_run(&mut runs, offset, len);
+	thread::scope(|scope| {
+		// Spawn every worker before joining any so the chunks run
+		// concurrently; join in chunk order to keep the runs sorted.
+		let mut workers = Vec::with_capacity(chunk_count as usize);
+		for index in 0..chunk_count {
+			let start = index * chunk_len;
+			let end = compare_end.min(start + chunk_len);
+			workers.push(scope.spawn(move || diff_chunk(base, current, start, end)));
 		}
-	}
-	Ok(runs)
+		let mut runs = Vec::new();
+		for worker in workers {
+			let chunk_runs = worker
+				.join()
+				.map_err(|_| EngineError::engine("disk delta compare worker panicked"))??;
+			for (offset, len) in chunk_runs {
+				push_run(&mut runs, offset, len);
+			}
+		}
+		Ok(runs)
+	})
 }
 
 /// Changed-block runs (offset plus length, adjacent changed blocks coalesced

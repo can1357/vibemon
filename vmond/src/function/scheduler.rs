@@ -4,50 +4,55 @@
 //! ephemeral worker-pool admission state; a daemon restart reconstructs work by
 //! asking the store to recover expired leases.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+	collections::{HashMap, HashSet, VecDeque},
+	sync::Arc,
+	time::Duration,
+};
 
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 
-use super::metrics::FunctionMetrics;
-use super::worker::{ExecutionMode, Interruptibility, Worker};
+use super::{
+	metrics::FunctionMetrics,
+	worker::{ExecutionMode, Interruptibility, Worker},
+};
 
 /// Immutable worker-pool limits for one function revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolPolicy {
 	/// Workers retained even without queued work.
-	pub min_workers: usize,
+	pub min_workers:     usize,
 	/// Hard worker count limit for this revision.
-	pub max_workers: usize,
+	pub max_workers:     usize,
 	/// Extra idle workers retained for bursts.
-	pub buffer_workers: usize,
+	pub buffer_workers:  usize,
 	/// Inputs executable concurrently by one worker.
-	pub capacity: usize,
+	pub capacity:        usize,
 	/// Queued plus executing inputs admitted per worker.
 	pub max_outstanding: usize,
 	/// Worker idle retirement threshold.
-	pub idle_timeout: Duration,
-	/// Calls after which a worker is retired; zero disables call-count retirement.
-	pub max_calls: u64,
+	pub idle_timeout:    Duration,
+	/// Calls after which a worker is retired; zero disables call-count
+	/// retirement.
+	pub max_calls:       u64,
 	/// Largest input group sent to one executor request.
-	pub max_batch_size: usize,
+	pub max_batch_size:  usize,
 	/// Maximum delay used to collect a partial batch.
-	pub batch_wait: Duration,
+	pub batch_wait:      Duration,
 }
 
 impl Default for PoolPolicy {
 	fn default() -> Self {
 		Self {
-			min_workers: 0,
-			max_workers: 1,
-			buffer_workers: 0,
-			capacity: 1,
+			min_workers:     0,
+			max_workers:     1,
+			buffer_workers:  0,
+			capacity:        1,
 			max_outstanding: 1,
-			idle_timeout: Duration::from_secs(60),
-			max_calls: 0,
-			max_batch_size: 1,
-			batch_wait: Duration::ZERO,
+			idle_timeout:    Duration::from_secs(60),
+			max_calls:       0,
+			max_batch_size:  1,
+			batch_wait:      Duration::ZERO,
 		}
 	}
 }
@@ -64,13 +69,14 @@ impl PoolPolicy {
 	}
 }
 
-/// Diagnostic placement preferences used when a mesh-backed executor starts a worker.
+/// Diagnostic placement preferences used when a mesh-backed executor starts a
+/// worker.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlacementHints {
 	/// Prefer hosts other than these current worker hosts.
-	pub avoid_hosts: Vec<String>,
+	pub avoid_hosts:  Vec<String>,
 	/// Prefer zones other than these current worker zones.
-	pub avoid_zones: Vec<String>,
+	pub avoid_zones:  Vec<String>,
 	/// Stable affinity key for actors or instance-lifecycle functions.
 	pub affinity_key: Option<String>,
 }
@@ -79,30 +85,31 @@ pub struct PlacementHints {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedInput {
 	/// Immutable function revision identifier and pool key.
-	pub revision_id: String,
+	pub revision_id:     String,
 	/// Durable call identifier.
-	pub call_id: String,
+	pub call_id:         String,
 	/// Durable input index.
-	pub input_index: u64,
+	pub input_index:     u64,
 	/// Earliest retry admission time in Unix milliseconds.
 	pub available_at_ms: u64,
 	/// Durable actor identifier, when this is an actor method call.
-	pub actor_id: Option<String>,
+	pub actor_id:        Option<String>,
 }
 
 #[derive(Debug)]
 struct RevisionQueue {
 	policy: PoolPolicy,
-	items: VecDeque<QueuedInput>,
+	items:  VecDeque<QueuedInput>,
 }
 
-/// In-memory, bounded round-robin queue. Durable work remains authoritative in the store.
+/// In-memory, bounded round-robin queue. Durable work remains authoritative in
+/// the store.
 #[derive(Debug, Default)]
 pub struct FairQueue {
-	revisions: HashMap<String, RevisionQueue>,
-	ready: VecDeque<String>,
-	ready_set: HashSet<String>,
-	queued: usize,
+	revisions:    HashMap<String, RevisionQueue>,
+	ready:        VecDeque<String>,
+	ready_set:    HashSet<String>,
+	queued:       usize,
 	global_limit: usize,
 }
 
@@ -115,13 +122,15 @@ impl FairQueue {
 	/// Register or replace the immutable policy for a revision pool.
 	pub fn set_policy(&mut self, revision_id: String, policy: PoolPolicy) {
 		let policy = policy.normalized();
-		self.revisions
+		self
+			.revisions
 			.entry(revision_id)
 			.and_modify(|queue| queue.policy = policy)
 			.or_insert_with(|| RevisionQueue { policy, items: VecDeque::new() });
 	}
 
-	/// Advertise a durable input. Returns false when backpressure must be applied.
+	/// Advertise a durable input. Returns false when backpressure must be
+	/// applied.
 	pub fn push(&mut self, input: QueuedInput) -> bool {
 		if self.queued >= self.global_limit {
 			return false;
@@ -129,7 +138,10 @@ impl FairQueue {
 		let Some(queue) = self.revisions.get_mut(&input.revision_id) else {
 			return false;
 		};
-		let revision_limit = queue.policy.max_workers.saturating_mul(queue.policy.max_outstanding);
+		let revision_limit = queue
+			.policy
+			.max_workers
+			.saturating_mul(queue.policy.max_outstanding);
 		if queue.items.len() >= revision_limit {
 			return false;
 		}
@@ -149,7 +161,10 @@ impl FairQueue {
 			let revision_id = self.ready.pop_front()?;
 			self.ready_set.remove(&revision_id);
 			let queue = self.revisions.get_mut(&revision_id)?;
-			let eligible = queue.items.front().is_some_and(|item| item.available_at_ms <= now_ms);
+			let eligible = queue
+				.items
+				.front()
+				.is_some_and(|item| item.available_at_ms <= now_ms);
 			if !eligible {
 				self.ready.push_back(revision_id.clone());
 				self.ready_set.insert(revision_id);
@@ -158,7 +173,11 @@ impl FairQueue {
 			let count = queue.policy.max_batch_size.min(queue.items.len());
 			let mut batch = Vec::with_capacity(count);
 			for _ in 0..count {
-				if queue.items.front().is_none_or(|item| item.available_at_ms > now_ms) {
+				if queue
+					.items
+					.front()
+					.is_none_or(|item| item.available_at_ms > now_ms)
+				{
 					break;
 				}
 				batch.push(queue.items.pop_front().expect("front checked"));
@@ -186,17 +205,17 @@ impl FairQueue {
 
 #[derive(Clone, Debug)]
 struct WorkerSlot {
-	id: String,
-	active: usize,
+	id:              String,
+	active:          usize,
 	completed_calls: u64,
-	last_idle_ms: u64,
-	retiring: bool,
+	last_idle_ms:    u64,
+	retiring:        bool,
 }
 
 /// Admission and retirement accounting for one immutable revision pool.
 #[derive(Debug)]
 pub struct WorkerPool {
-	policy: PoolPolicy,
+	policy:  PoolPolicy,
 	workers: Vec<WorkerSlot>,
 }
 
@@ -206,7 +225,8 @@ impl WorkerPool {
 		Self { policy: policy.normalized(), workers: Vec::new() }
 	}
 
-	/// Number of tracked live workers, including workers draining for retirement.
+	/// Number of tracked live workers, including workers draining for
+	/// retirement.
 	pub fn worker_count(&self) -> usize {
 		self.workers.len()
 	}
@@ -220,7 +240,9 @@ impl WorkerPool {
 		let warm = if queued_inputs == 0 {
 			self.policy.min_workers
 		} else {
-			demand.saturating_add(self.policy.buffer_workers).max(self.policy.min_workers)
+			demand
+				.saturating_add(self.policy.buffer_workers)
+				.max(self.policy.min_workers)
 		};
 		warm.min(self.policy.max_workers)
 	}
@@ -233,11 +255,11 @@ impl WorkerPool {
 			return false;
 		}
 		self.workers.push(WorkerSlot {
-			id: worker_id,
-			active: 0,
+			id:              worker_id,
+			active:          0,
 			completed_calls: 0,
-			last_idle_ms: now_ms,
-			retiring: false,
+			last_idle_ms:    now_ms,
+			retiring:        false,
 		});
 		true
 	}
@@ -255,7 +277,11 @@ impl WorkerPool {
 
 	/// Release a reservation for which no durable lease was obtained.
 	pub fn abandon(&mut self, worker_id: &str, now_ms: u64) -> bool {
-		let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == worker_id) else {
+		let Some(worker) = self
+			.workers
+			.iter_mut()
+			.find(|worker| worker.id == worker_id)
+		else {
 			return false;
 		};
 		worker.active = worker.active.saturating_sub(1);
@@ -267,7 +293,11 @@ impl WorkerPool {
 
 	/// Release one reservation and update call-count retirement state.
 	pub fn complete(&mut self, worker_id: &str, now_ms: u64) -> bool {
-		let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == worker_id) else {
+		let Some(worker) = self
+			.workers
+			.iter_mut()
+			.find(|worker| worker.id == worker_id)
+		else {
 			return false;
 		};
 		worker.active = worker.active.saturating_sub(1);
@@ -284,7 +314,12 @@ impl WorkerPool {
 	/// Mark idle or call-limited workers for retirement and return their IDs.
 	pub fn retire_ready(&mut self, now_ms: u64) -> Vec<String> {
 		let keep = self.policy.min_workers;
-		let idle_timeout_ms = self.policy.idle_timeout.as_millis().try_into().unwrap_or(u64::MAX);
+		let idle_timeout_ms = self
+			.policy
+			.idle_timeout
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX);
 		let mut removable = self.workers.len().saturating_sub(keep);
 		let mut ids = Vec::new();
 		for worker in &mut self.workers {
@@ -303,7 +338,11 @@ impl WorkerPool {
 
 	/// Forget a worker only after executor retirement or confirmed loss.
 	pub fn remove_worker(&mut self, worker_id: &str) -> bool {
-		let Some(index) = self.workers.iter().position(|worker| worker.id == worker_id) else {
+		let Some(index) = self
+			.workers
+			.iter()
+			.position(|worker| worker.id == worker_id)
+		else {
 			return false;
 		};
 		self.workers.swap_remove(index);
@@ -327,8 +366,25 @@ pub fn input_execution_mode(call_type: vmon_proto::v1::CallType) -> ExecutionMod
 	}
 }
 
+/// Return whether an oldest same-call batch has reached size or wait threshold.
+pub fn dynamic_batch_ready(
+	queued_inputs: u64,
+	oldest_available_ms: u64,
+	now_ms: u64,
+	max_batch_size: u32,
+	max_wait_ms: u64,
+) -> bool {
+	queued_inputs >= u64::from(max_batch_size.max(1))
+		|| now_ms.saturating_sub(oldest_available_ms) >= max_wait_ms
+}
+
 /// Compute a bounded exponential delay for a one-based retry attempt.
-pub fn retry_backoff(policy_initial_ms: u64, policy_max_ms: u64, multiplier: f64, attempt: u32) -> Duration {
+pub fn retry_backoff(
+	policy_initial_ms: u64,
+	policy_max_ms: u64,
+	multiplier: f64,
+	attempt: u32,
+) -> Duration {
 	let exponent = attempt.saturating_sub(1) as i32;
 	let factor = if multiplier.is_finite() && multiplier >= 1.0 {
 		multiplier.powi(exponent)
@@ -343,7 +399,7 @@ pub fn retry_backoff(policy_initial_ms: u64, policy_max_ms: u64, multiplier: f64
 #[derive(Debug)]
 pub struct SchedulerControl {
 	/// Notifies the scheduler after a transaction makes new work eligible.
-	pub notify: Notify,
+	pub notify:  Notify,
 	/// Process-local scheduler measurements.
 	pub metrics: Arc<FunctionMetrics>,
 }
@@ -381,11 +437,11 @@ mod tests {
 
 	fn item(revision: &str, index: u64) -> QueuedInput {
 		QueuedInput {
-			revision_id: revision.into(),
-			call_id: format!("call-{revision}-{index}"),
-			input_index: index,
+			revision_id:     revision.into(),
+			call_id:         format!("call-{revision}-{index}"),
+			input_index:     index,
 			available_at_ms: 0,
-			actor_id: None,
+			actor_id:        None,
 		}
 	}
 
@@ -408,31 +464,43 @@ mod tests {
 	#[test]
 	fn batches_only_eligible_inputs_and_preserves_indexes() {
 		let mut queue = FairQueue::new(8);
-		queue.set_policy(
-			"r".into(),
-			PoolPolicy { max_batch_size: 3, max_outstanding: 4, ..PoolPolicy::default() },
-		);
+		queue.set_policy("r".into(), PoolPolicy {
+			max_batch_size: 3,
+			max_outstanding: 4,
+			..PoolPolicy::default()
+		});
 		for index in 0..3 {
 			let mut input = item("r", index);
 			input.available_at_ms = if index == 2 { 20 } else { 10 };
 			assert!(queue.push(input));
 		}
 		let first = queue.pop(10).unwrap();
-		assert_eq!(first.iter().map(|input| input.input_index).collect::<Vec<_>>(), vec![0, 1]);
+		assert_eq!(
+			first
+				.iter()
+				.map(|input| input.input_index)
+				.collect::<Vec<_>>(),
+			vec![0, 1]
+		);
 		assert!(queue.pop(10).is_none());
 		assert_eq!(queue.pop(20).unwrap()[0].input_index, 2);
 	}
 
 	#[test]
 	fn durable_batch_inputs_are_unary_without_grouping() {
-		assert_eq!(
-			input_execution_mode(vmon_proto::v1::CallType::Batch),
-			ExecutionMode::Unary
-		);
+		assert_eq!(input_execution_mode(vmon_proto::v1::CallType::Batch), ExecutionMode::Unary);
 		assert_eq!(
 			input_execution_mode(vmon_proto::v1::CallType::Generator),
 			ExecutionMode::Generator
 		);
+	}
+
+	#[test]
+	fn dynamic_batch_waits_for_size_or_deadline() {
+		assert!(!dynamic_batch_ready(2, 100, 109, 3, 10));
+		assert!(dynamic_batch_ready(3, 100, 101, 3, 10));
+		assert!(dynamic_batch_ready(2, 100, 110, 3, 10));
+		assert!(dynamic_batch_ready(1, 100, 100, 0, 50));
 	}
 
 	#[test]
@@ -494,10 +562,10 @@ mod tests {
 		fn execute(
 			&self,
 			_: super::super::worker::ExecuteRequest,
-		) -> super::super::worker::BoxFuture<Result<super::super::worker::Execution, super::super::worker::WorkerError>> {
-			Box::pin(async {
-				Err(super::super::worker::WorkerError::platform("unused", "unused"))
-			})
+		) -> super::super::worker::BoxFuture<
+			Result<super::super::worker::Execution, super::super::worker::WorkerError>,
+		> {
+			Box::pin(async { Err(super::super::worker::WorkerError::platform("unused", "unused")) })
 		}
 
 		fn cancel(
@@ -510,22 +578,24 @@ mod tests {
 		fn snapshot(
 			&self,
 			_: super::super::worker::SnapshotReason,
-		) -> super::super::worker::BoxFuture<Result<super::super::worker::WorkerSnapshot, super::super::worker::WorkerError>> {
-			Box::pin(async {
-				Err(super::super::worker::WorkerError::platform("unused", "unused"))
-			})
+		) -> super::super::worker::BoxFuture<
+			Result<super::super::worker::WorkerSnapshot, super::super::worker::WorkerError>,
+		> {
+			Box::pin(async { Err(super::super::worker::WorkerError::platform("unused", "unused")) })
 		}
 
 		fn actor(
 			&self,
 			_: super::super::worker::ActorRequest,
-		) -> super::super::worker::BoxFuture<Result<super::super::worker::Execution, super::super::worker::WorkerError>> {
-			Box::pin(async {
-				Err(super::super::worker::WorkerError::platform("unused", "unused"))
-			})
+		) -> super::super::worker::BoxFuture<
+			Result<super::super::worker::Execution, super::super::worker::WorkerError>,
+		> {
+			Box::pin(async { Err(super::super::worker::WorkerError::platform("unused", "unused")) })
 		}
 
-		fn retire(&self) -> super::super::worker::BoxFuture<Result<(), super::super::worker::WorkerError>> {
+		fn retire(
+			&self,
+		) -> super::super::worker::BoxFuture<Result<(), super::super::worker::WorkerError>> {
 			Box::pin(async { Ok(()) })
 		}
 

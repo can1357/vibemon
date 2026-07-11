@@ -2264,8 +2264,14 @@ impl EngineApi for Engine {
 		let snapshot = name.unwrap_or_else(|| format!("{}-{}", id, unix_millis()));
 		let vm = MicroVm::new(id);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let dir =
-			Self::snapshot_machine(&vm, &snapshot, !stop, disk.as_deref(), &self.snapshot_root(), false)?;
+		let dir = Self::snapshot_machine(
+			&vm,
+			&snapshot,
+			!stop,
+			disk.as_deref(),
+			&self.snapshot_root(),
+			false,
+		)?;
 		if stop {
 			let rc = self.teardown(&record);
 			self.persist_status(id, "stopped", rc, None)?;

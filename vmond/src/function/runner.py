@@ -47,7 +47,9 @@ MAX_PACKAGE_ARCHIVE_BYTES = int(os.environ.get(
 FUNCTION_ROOT = os.environ.get("VMON_RUNNER_FUNCTION_ROOT", "/opt/vmon")
 MAX_PACKAGE_FILES = int(os.environ.get("VMON_RUNNER_MAX_PACKAGE_FILES", "10000"))
 MAX_LOG_FRAGMENT_BYTES = int(os.environ.get("VMON_RUNNER_MAX_LOG_FRAGMENT_BYTES", "65536"))
+MAX_BATCH_INPUTS = int(os.environ.get("VMON_RUNNER_MAX_BATCH_INPUTS", "1024"))
 _DEFAULT_THREADS = max(1, min(32, int(os.environ.get("VMON_RUNNER_SYNC_THREADS", "8"))))
+MAX_PENDING_TASKS = int(os.environ.get("VMON_RUNNER_MAX_PENDING_TASKS", "256"))
 _DEFAULT_TASKS = max(1, int(os.environ.get("VMON_RUNNER_ASYNC_TASKS", "128")))
 SPILL_THRESHOLD_BYTES = int(os.environ.get(
     "VMON_RUNNER_SPILL_THRESHOLD_BYTES", str(512 * 1024)))
@@ -148,9 +150,6 @@ def current_call():
     return CurrentCall(**fields)
 
 
-def _canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                      allow_nan=False).encode("utf-8")
 
 
 def _checksum(data):
@@ -388,6 +387,14 @@ def encode_value(value, value_format="json", spill=True, compression="none",
     return _spill_data(result, stored) if spill and len(stored) > SPILL_THRESHOLD_BYTES else result
 
 
+
+
+
+
+class SnapshotWithSecretsUnsupported(RuntimeError):
+    pass
+class RunnerOverloaded(RuntimeError):
+    pass
 class ActorLostError(RuntimeError):
     pass
 
@@ -476,30 +483,21 @@ def _import_target(spec, root):
     if not isinstance(spec, str) or ":" not in spec:
         raise ValueError("package target must be 'module:qualname'")
     module_name, qualname = spec.split(":", 1)
-    added = False
     if root:
         root = os.path.abspath(root)
         if root not in sys.path:
             sys.path.insert(0, root)
-            added = True
-    try:
-        existing = sys.modules.get(module_name)
-        existing_file = getattr(existing, "__file__", None) if existing else None
-        if existing_file and root and not os.path.realpath(existing_file).startswith(
-                os.path.realpath(root) + os.sep):
-            for loaded_name in list(sys.modules):
-                if loaded_name == module_name or loaded_name.startswith(module_name + "."):
-                    del sys.modules[loaded_name]
-        _install_vmon_shim()
-        importlib.invalidate_caches()
-        module = importlib.import_module(module_name)
-        return _resolve_qualname(module, qualname)
-    finally:
-        if added:
-            try:
-                sys.path.remove(root)
-            except ValueError:
-                pass
+    existing = sys.modules.get(module_name)
+    existing_file = getattr(existing, "__file__", None) if existing else None
+    if existing_file and root and not os.path.realpath(existing_file).startswith(
+            os.path.realpath(root) + os.sep):
+        for loaded_name in list(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(module_name + "."):
+                del sys.modules[loaded_name]
+    _install_vmon_shim()
+    importlib.invalidate_caches()
+    module = importlib.import_module(module_name)
+    return _resolve_qualname(module, qualname)
 
 
 def _secret_strings(value):
@@ -585,12 +583,42 @@ class _ProtocolWriter:
 
 
 _WRITER = _ProtocolWriter()
+_NATIVE_CALL_LOCK = threading.Lock()
+_NATIVE_CALLS = {}
+
+
+def _native_call_enter(meta):
+    with _NATIVE_CALL_LOCK:
+        _NATIVE_CALLS[meta["request_id"]] = meta
+
+
+def _native_call_exit(meta):
+    with _NATIVE_CALL_LOCK:
+        _NATIVE_CALLS.pop(meta["request_id"], None)
+
+
+def _emit_native_line(stream, raw):
+    with _NATIVE_CALL_LOCK:
+        active = list(_NATIVE_CALLS.values())
+    if len(active) != 1:
+        return
+    meta = active[0]
+    token = _CALL.set(meta)
+    try:
+        _WRITER.emit("log", meta["request_id"], stream=stream,
+                     message=raw.decode("utf-8", "replace"), partial=False)
+    finally:
+        _CALL.reset(token)
+
+
 def _capture_native_fd(fd, stream):
     reader_fd, writer_fd = os.pipe()
     os.dup2(writer_fd, fd)
     os.close(writer_fd)
 
     def forward():
+        buffered = b""
+        dropping = False
         while True:
             try:
                 chunk = os.read(reader_fd, MAX_LOG_FRAGMENT_BYTES)
@@ -598,10 +626,17 @@ def _capture_native_fd(fd, stream):
                 return
             if not chunk:
                 return
-            message = chunk.decode("utf-8", "replace").rstrip("\r\n")
-            if message:
-                _WRITER.emit("log", None, stream=stream, message=message,
-                             partial=not chunk.endswith((b"\n", b"\r")))
+            buffered += chunk
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                if dropping:
+                    dropping = False
+                    continue
+                _emit_native_line(stream, line)
+            if len(buffered) > MAX_LOG_FRAGMENT_BYTES:
+                buffered = b""
+                dropping = True
+                _emit_native_line(stream, b"[native log line dropped: too long]")
 
     threading.Thread(target=forward, name="vmon-native-%s" % stream,
                      daemon=True).start()
@@ -629,6 +664,8 @@ class _CapturedStream(io.TextIOBase):
             text = str(text)
         meta = _CALL.get()
         message = text.rstrip("\r\n")
+        secrets = meta.get("_secrets", set()) if meta else set()
+        message = _redact(message, secrets)
         if not message and text:
             return len(text)
         if meta is None:
@@ -748,6 +785,10 @@ class Runner:
             fields["error"]["code"] = "checkpoint_contains_secret"
         if isinstance(exc, SerializationError):
             fields["error"]["code"] = "serialization_error"
+        if isinstance(exc, RunnerOverloaded):
+            fields["error"]["code"] = "runner_overloaded"
+        if isinstance(exc, SnapshotWithSecretsUnsupported):
+            fields["error"]["code"] = "snapshot_with_secrets_unsupported"
         if phase:
             fields["error"]["phase"] = phase
         cause = exc.__cause__ or exc.__context__
@@ -976,6 +1017,8 @@ class Runner:
             "deadline_unix_ms": frame.get("deadline_unix_ms"),
             "_secrets": secrets,
             "_closed": threading.Event(),
+        }
+
     def _decode_args(self, frame):
         trusted = bool(frame.get("trusted"))
         cloudpickle_version = frame.get("cloudpickle_version")
@@ -1028,15 +1071,22 @@ class Runner:
         if inspect.isasyncgenfunction(function):
             return function(*args, **kwargs)
         if inspect.iscoroutinefunction(function):
-            return await function(*args, **kwargs)
+            result = await function(*args, **kwargs)
+            if frame.get("_cancel_reason"):
+                raise asyncio.CancelledError()
+            return result
         context = contextvars.copy_context()
         result = await loop.run_in_executor(self.executor, context.run,
                                             lambda: function(*args, **kwargs))
+        if frame.get("_cancel_reason"):
+            raise asyncio.CancelledError()
         if inspect.isawaitable(result):
             return await result
         return result
 
     async def _emit_result(self, value, frame):
+        if frame.get("_cancel_reason"):
+            raise asyncio.CancelledError()
         request_id = frame["request_id"]
         compression = frame.get("output_compression", "none")
         value_format = frame.get("output_format", frame.get("output_codec", "json"))
@@ -1045,9 +1095,13 @@ class Runner:
         if inspect.isasyncgen(value):
             index = 0
             async for item in value:
+                if frame.get("_cancel_reason"):
+                    raise asyncio.CancelledError()
                 _WRITER.emit("yield", request_id, index=index,
                              value=encode_value(item, value_format, compression=compression))
                 index += 1
+            if frame.get("_cancel_reason"):
+                raise asyncio.CancelledError()
             _WRITER.emit("result", request_id,
                          value=encode_value(None, value_format, compression=compression),
                          yield_count=index)
@@ -1063,6 +1117,8 @@ class Runner:
                 context = contextvars.copy_context()
                 item = await loop.run_in_executor(
                     self.executor, context.run, lambda: next(iterator, sentinel))
+                if frame.get("_cancel_reason"):
+                    raise asyncio.CancelledError()
                 if item is sentinel:
                     break
                 _WRITER.emit("yield", request_id, index=index,
@@ -1143,11 +1199,13 @@ class Runner:
         _WRITER.reset(request_id)
         meta = self._call_meta(frame)
         token = _CALL.set(meta)
+        _native_call_enter(meta)
         try:
             definition_id = frame.get("definition_id") or frame.get("function_id")
             definition = self.definitions.get(definition_id)
             if definition is None:
                 raise KeyError("definition %r is not initialized" % definition_id)
+            frame["_callable_kind"] = self._callable_kind(definition.target)
             revision = frame.get("revision")
             if revision and revision != definition.revision:
                 raise ValueError("call revision %r does not match initialized revision %r" %
@@ -1160,30 +1218,94 @@ class Runner:
             if (len(args) == 1 and not kwargs and isinstance(args[0], dict) and
                     args[0].get("kind") == "vmon.service.v1"):
                 value = await self._invoke_service(definition, frame, args[0])
-                await self._emit_result(value, frame)
-                return
-            if frame.get("execution_mode") == "batch":
-                if len(args) != 1 or not isinstance(args[0], list):
-                    raise ValueError("batch call requires one list argument")
-                expected = len(args[0])
-                value = await self._invoke(definition.target, args, kwargs, frame)
-                if inspect.isawaitable(value):
-                    value = await value
-                if not isinstance(value, (list, tuple)) or len(value) != expected:
-                    actual = len(value) if isinstance(value, (list, tuple)) else type(value).__name__
-                    raise ValueError("batch output cardinality mismatch: expected %d, got %s" % (expected, actual))
             else:
                 value = await self._invoke(definition.target, args, kwargs, frame)
             await self._emit_result(value, frame)
         except asyncio.CancelledError:
-            _WRITER.emit("cancelled", request_id, call_id=frame.get("call_id"),
-                         reason=frame.get("_cancel_reason", "cancelled"))
+            _WRITER.emit(
+                "cancelled", request_id, reason=frame.get("_cancel_reason", "cancelled"),
+                worker_kill_required=frame.get("_callable_kind") in ("sync", "generator"))
         except BaseException as exc:
-            _WRITER.emit("error", request_id, call_id=frame.get("call_id"), **self._error_fields(exc, "call"))
+            _WRITER.emit("error", request_id, **self._error_fields(exc, "call"))
         finally:
             sys.stdout.flush()
             sys.stderr.flush()
+            _native_call_exit(meta)
             _CALL.reset(token)
+
+    async def batch_call(self, frame):
+        request_id = frame.get("request_id")
+        if not request_id:
+            raise ValueError("batch requires request_id")
+        _WRITER.reset(request_id)
+        meta = self._call_meta(frame)
+        meta["execution_mode"] = "batch"
+        token = _CALL.set(meta)
+        try:
+            inputs = frame.get("inputs")
+            if not isinstance(inputs, list) or not inputs:
+                raise ValueError("batch inputs must be a non-empty list")
+            if len(inputs) > MAX_BATCH_INPUTS:
+                raise ValueError("batch exceeds %d-input limit" % MAX_BATCH_INPUTS)
+            definition_id = frame.get("definition_id") or frame.get("function_id")
+            definition = self.definitions.get(definition_id)
+            if definition is None:
+                raise KeyError("definition %r is not initialized" % definition_id)
+            frame["_callable_kind"] = self._callable_kind(definition.target)
+            if frame.get("revision") not in (None, definition.revision):
+                raise ValueError("batch revision does not match initialized definition")
+            values = []
+            item_metas = []
+            for index, item in enumerate(inputs):
+                if not isinstance(item, dict):
+                    raise TypeError("batch input %d must be an object" % index)
+                merged = dict(frame)
+                merged.pop("inputs", None)
+                merged.update(item)
+                merged["definition_id"] = definition_id
+                merged["execution_mode"] = "batch"
+                item_meta = self._call_meta(merged)
+                item_token = _CALL.set(item_meta)
+                try:
+                    args, kwargs = self._decode_args(merged)
+                finally:
+                    _CALL.reset(item_token)
+                if len(args) != 1 or kwargs:
+                    raise ValueError("batch input %d must decode to one positional value" % index)
+                values.append(args[0])
+                item_metas.append(item_meta)
+            result = await self._invoke(definition.target, [values], {}, frame)
+            if not isinstance(result, (list, tuple)) or len(result) != len(inputs):
+                actual = len(result) if isinstance(result, (list, tuple)) else type(result).__name__
+                raise ValueError("batch output cardinality mismatch: expected %d, got %s" %
+                                 (len(inputs), actual))
+            results = []
+            value_format = frame.get("output_format", "json")
+            compression = frame.get("output_compression", "none")
+            for item, item_meta, value in zip(inputs, item_metas, result):
+                item_token = _CALL.set(item_meta)
+                try:
+                    encoded = encode_value(value, value_format, compression=compression)
+                finally:
+                    _CALL.reset(item_token)
+                results.append({
+                    "request_id": item.get("request_id"),
+                    "input_id": item.get("input_id"),
+                    "input_index": item.get("input_index"),
+                    "value": encoded,
+                })
+            if frame.get("_cancel_reason"):
+                raise asyncio.CancelledError()
+            _WRITER.emit("batch_result", request_id, results=results)
+        except asyncio.CancelledError:
+            _WRITER.emit(
+                "cancelled", request_id, reason=frame.get("_cancel_reason", "cancelled"),
+                worker_kill_required=frame.get("_callable_kind") in ("sync", "generator"))
+        except BaseException as exc:
+            _WRITER.emit("error", request_id, **self._error_fields(exc, "batch"))
+        finally:
+            _CALL.reset(token)
+
 
     async def _actor_operation(self, frame):
         request_id = frame.get("request_id")
@@ -1252,6 +1374,8 @@ class Runner:
             if actor is None:
                 raise ActorLostError("actor %r is unavailable; explicit restore is required" %
                                      actor_id)
+            definition = self.definitions[actor.definition_id]
+            lock = actor.lock if definition.serialized_methods else _NullAsyncLock()
             async with lock:
                 if operation in ("actor_call", "method"):
                     method_name = frame.get("method")
@@ -1427,6 +1551,10 @@ class Runner:
         operation = frame.get("type") or frame.get("operation")
         hook_name = "snapshot_enter" if operation == "before_snapshot" else "restore"
         try:
+            if operation == "before_snapshot" and any(
+                    definition.secrets for definition in self.definitions.values()):
+                raise SnapshotWithSecretsUnsupported(
+                    "VM snapshots are unsupported while function secrets are configured")
             for actor in list(self.actors.values()):
                 async with actor.lock:
                     await self._run_hook(actor.value, hook_name, frame)
@@ -1469,7 +1597,9 @@ class Runner:
                 task.cancel()
             _WRITER.emit("status", frame.get("request_id"), status="shutting_down")
             return
-        if operation in ("call", "invoke", "service_call"):
+        if operation == "batch":
+            coroutine = self.batch_call(frame)
+        elif operation in ("call", "invoke", "service_call"):
             coroutine = self.call(frame)
         elif operation in ("actor_create", "actor_call", "actor_checkpoint", "actor_restore",
                            "actor_fork", "actor_shutdown", "create", "method", "checkpoint",
@@ -1480,6 +1610,9 @@ class Runner:
         request_id = frame.get("request_id")
         if not request_id:
             raise ValueError("%s requires request_id" % operation)
+        if len(self.running) >= MAX_PENDING_TASKS:
+            coroutine.close()
+            raise RunnerOverloaded("runner pending request limit reached")
         if request_id in self.running:
             raise ValueError("request_id %r is already running" % request_id)
         deadline = frame.get("deadline_unix_ms")

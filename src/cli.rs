@@ -4,14 +4,17 @@ use std::{
 	io::{self, Cursor, IsTerminal, Read, Write},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
-	sync::{atomic::{AtomicBool, Ordering}, mpsc},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		mpsc,
+	},
 	thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use serde_json::{Map, Value, json};
 use prost::Message;
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use vmon_proto::v1 as pb;
@@ -145,7 +148,8 @@ struct DeployArgs {
 enum FunctionCommands {
 	/// List immutable function revisions.
 	Ls,
-	/// Resolve a current or pinned function and open an interactive worker shell.
+	/// Resolve a current or pinned function and open an interactive worker
+	/// shell.
 	Shell { reference: String },
 }
 
@@ -155,7 +159,7 @@ enum CallCommands {
 	Get { id: String },
 	/// Stream call logs, reconnecting from the last committed sequence.
 	Logs {
-		id: String,
+		id:     String,
 		#[arg(short, long)]
 		follow: bool,
 	},
@@ -363,60 +367,63 @@ enum DaemonCommands {
 #[derive(Args, Default)]
 struct ServeArgs {
 	/// Optional Python application target to deploy before serving.
-	target:                   Option<String>,
+	target: Option<String>,
 	/// Redeploy changed function inputs while the daemon is running.
 	#[arg(long, requires = "target")]
-	watch:                    bool,
+	watch: bool,
 	#[arg(long = "config")]
-	config_path:             Option<PathBuf>,
+	config_path: Option<PathBuf>,
 	#[arg(long)]
-	home:                    Option<PathBuf>,
+	home: Option<PathBuf>,
 	#[arg(long)]
-	host:                    Option<String>,
+	host: Option<String>,
 	#[arg(long)]
-	port:                    Option<u16>,
+	port: Option<u16>,
 	#[arg(long)]
-	token:                   Option<String>,
+	token: Option<String>,
 	#[arg(long)]
-	client_token:            Option<String>,
+	client_token: Option<String>,
 	#[arg(long)]
-	tls_cert:                Option<String>,
+	tls_cert: Option<String>,
 	#[arg(long)]
-	tls_key:                 Option<String>,
+	tls_key: Option<String>,
 	#[arg(long)]
-	idle_timeout:            Option<f64>,
+	idle_timeout: Option<f64>,
+	/// Maximum uncompressed function artifact size accepted by the daemon.
+	#[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_125_899_906_842_624))]
+	function_artifact_max_bytes: Option<u64>,
 	#[arg(long)]
-	replicate_sec:           Option<f64>,
+	replicate_sec: Option<f64>,
 	#[arg(long)]
-	replicas:                Option<usize>,
+	replicas: Option<usize>,
 	#[arg(long)]
-	replicate_concurrency:   Option<usize>,
+	replicate_concurrency: Option<usize>,
 	#[arg(long = "restore-quorum", conflicts_with = "no_restore_quorum")]
-	restore_quorum:          bool,
+	restore_quorum: bool,
 	#[arg(long = "no-restore-quorum")]
-	no_restore_quorum:       bool,
+	no_restore_quorum: bool,
 	#[arg(long)]
-	warm_pool_size:          Option<usize>,
+	warm_pool_size: Option<usize>,
 	#[arg(long)]
-	warm_images:             Option<String>,
+	warm_images: Option<String>,
 	#[arg(long)]
-	mesh_heartbeat_sec:      Option<f64>,
+	mesh_heartbeat_sec: Option<f64>,
 	#[arg(long)]
-	mesh_reap_sec:           Option<f64>,
+	mesh_reap_sec: Option<f64>,
 	#[arg(long)]
-	mesh_idem_ttl_sec:       Option<f64>,
+	mesh_idem_ttl_sec: Option<f64>,
 	#[arg(long)]
 	mesh_create_timeout_sec: Option<f64>,
 	#[arg(long)]
-	mesh_w_warm:             Option<f64>,
+	mesh_w_warm: Option<f64>,
 	#[arg(long)]
-	mesh_w_free:             Option<f64>,
+	mesh_w_free: Option<f64>,
 	#[arg(long)]
-	mesh_w_local:            Option<f64>,
+	mesh_w_local: Option<f64>,
 	#[arg(long)]
-	mesh_w_region:           Option<f64>,
+	mesh_w_region: Option<f64>,
 	#[arg(long)]
-	mesh_w_inflight:         Option<f64>,
+	mesh_w_inflight: Option<f64>,
 }
 
 #[derive(Subcommand)]
@@ -686,7 +693,7 @@ fn inspect_target(target: &str) -> Result<InspectedTarget> {
 fn sha256_digest(data: &[u8]) -> pb::Digest {
 	pb::Digest {
 		algorithm: pb::DigestAlgorithm::Sha256 as i32,
-		value: Sha256::digest(data).to_vec(),
+		value:     Sha256::digest(data).to_vec(),
 	}
 }
 
@@ -703,7 +710,7 @@ fn upload_artifact(grpc: &Grpc, data: &[u8]) -> Result<pb::ArtifactRef> {
 		Err(status) => return Err(status_error(status)),
 	}
 	let header = pb::PutArtifactHeader {
-		expected_digest: Some(sha256_digest(data)),
+		expected_digest:     Some(sha256_digest(data)),
 		expected_size_bytes: data.len() as u64,
 		media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
 			"application/vnd.vmon.python-package".to_owned(),
@@ -713,9 +720,13 @@ fn upload_artifact(grpc: &Grpc, data: &[u8]) -> Result<pb::ArtifactRef> {
 	frames.push(pb::PutArtifactRequest {
 		frame: Some(pb::put_artifact_request::Frame::Header(header)),
 	});
-	frames.extend(data.chunks(ARTIFACT_CHUNK_SIZE).map(|chunk| pb::PutArtifactRequest {
-		frame: Some(pb::put_artifact_request::Frame::Data(chunk.to_vec())),
-	}));
+	frames.extend(
+		data
+			.chunks(ARTIFACT_CHUNK_SIZE)
+			.map(|chunk| pb::PutArtifactRequest {
+				frame: Some(pb::put_artifact_request::Frame::Data(chunk.to_vec())),
+			}),
+	);
 	grpc
 		.block_on(artifacts.put(ReceiverStream::new({
 			let (tx, rx) = tokio::sync::mpsc::channel(frames.len().max(1));
@@ -772,8 +783,8 @@ fn deploy_target_mode(
 		let encoded = spec.encode_to_vec();
 		let revision = grpc
 			.block_on(functions.register(pb::RegisterFunctionRequest {
-				spec: Some(spec),
-				request_id: request_id("cli-register", &encoded),
+				spec:              Some(spec),
+				request_id:        request_id("cli-register", &encoded),
 				transient_secrets: Vec::new(),
 			}))
 			.map_err(status_error)?
@@ -781,7 +792,7 @@ fn deploy_target_mode(
 			.r#ref
 			.ok_or_else(|| CliError::new("function registration omitted revision"))?;
 		bindings.push(pb::AppFunctionBinding {
-			name: inspected_function.binding,
+			name:     inspected_function.binding,
 			revision: Some(revision),
 		});
 	}
@@ -804,7 +815,11 @@ fn deploy_target_mode(
 		.map(|value| value.revision_id.as_str())
 		.unwrap_or("-");
 	println!("deployed {} functions  app-revision={revision}", activated.functions.len());
-	Ok(activated.functions.into_iter().filter_map(|binding| binding.revision).collect())
+	Ok(activated
+		.functions
+		.into_iter()
+		.filter_map(|binding| binding.revision)
+		.collect())
 }
 
 fn deploy_target(target: &str, options: &TransportOptions) -> Result<Vec<pb::RevisionRef>> {
@@ -823,15 +838,13 @@ fn parse_function_ref(reference: &str) -> Result<(pb::FunctionRef, Option<String
 	if name.is_empty() || revision.as_deref() == Some("") {
 		return err("function reference must be NAME or NAME@REVISION");
 	}
-	let (namespace, name) =
-		name.split_once('/').map_or(("default", name), |(namespace, name)| (namespace, name));
+	let (namespace, name) = name
+		.split_once('/')
+		.map_or(("default", name), |(namespace, name)| (namespace, name));
 	if namespace.is_empty() || name.is_empty() {
 		return err("function reference must contain non-empty namespace and name");
 	}
-	Ok((
-		pb::FunctionRef { namespace: namespace.to_owned(), name: name.to_owned() },
-		revision,
-	))
+	Ok((pb::FunctionRef { namespace: namespace.to_owned(), name: name.to_owned() }, revision))
 }
 
 fn app_binding_reference(reference: &str) -> Option<(&str, &str)> {
@@ -850,7 +863,7 @@ fn lookup_revision(grpc: &Grpc, reference: &str) -> Result<pb::FunctionRevision>
 				app: Some(pb::AppSelector {
 					selection: Some(pb::app_selector::Selection::Current(pb::AppRef {
 						namespace: "default".to_owned(),
-						name: app.to_owned(),
+						name:      app.to_owned(),
 					})),
 				}),
 			}))
@@ -899,7 +912,10 @@ fn lookup_revision(grpc: &Grpc, reference: &str) -> Result<pb::FunctionRevision>
 					.map_err(status_error)?
 					.into_inner();
 				if let Some(revision) = response.revisions.into_iter().find(|revision| {
-					revision.r#ref.as_ref().is_some_and(|value| value.revision_id == reference)
+					revision
+						.r#ref
+						.as_ref()
+						.is_some_and(|value| value.revision_id == reference)
 				}) {
 					return Ok(revision);
 				}
@@ -916,14 +932,14 @@ fn lookup_revision(grpc: &Grpc, reference: &str) -> Result<pb::FunctionRevision>
 fn json_envelope(value: &Value) -> Result<pb::ValueEnvelope> {
 	let encoded = serde_json::to_vec(value)?;
 	Ok(pb::ValueEnvelope {
-		schema_version: 1,
-		serializer: pb::ValueSerializer::Json as i32,
-		compression: pb::ValueCompression::None as i32,
-		checksum: Some(sha256_digest(&encoded)),
+		schema_version:          1,
+		serializer:              pb::ValueSerializer::Json as i32,
+		compression:             pb::ValueCompression::None as i32,
+		checksum:                Some(sha256_digest(&encoded)),
 		uncompressed_size_bytes: encoded.len() as u64,
-		storage: Some(pb::value_envelope::Storage::InlineData(encoded)),
-		python_presence: None,
-		type_name_presence: Some(pb::value_envelope::TypeNamePresence::TypeName(
+		storage:                 Some(pb::value_envelope::Storage::InlineData(encoded)),
+		python_presence:         None,
+		type_name_presence:      Some(pb::value_envelope::TypeNamePresence::TypeName(
 			"json".to_owned(),
 		)),
 	})
@@ -945,10 +961,10 @@ fn download_artifact(grpc: &Grpc, artifact: pb::ArtifactRef) -> Result<Vec<u8>> 
 	let expected = artifact.digest.clone();
 	let mut artifacts = grpc.artifacts();
 	let mut stream = grpc
-		.block_on(artifacts.get(pb::GetArtifactRequest {
-			artifact: Some(artifact),
-			range_presence: None,
-		}))
+		.block_on(
+			artifacts
+				.get(pb::GetArtifactRequest { artifact: Some(artifact), range_presence: None }),
+		)
 		.map_err(status_error)?
 		.into_inner();
 	let mut data = Vec::new();
@@ -1041,8 +1057,8 @@ fn wait_call(grpc: &Grpc, call_id: &str) -> Result<i32> {
 		if CALL_INTERRUPTED.load(Ordering::SeqCst) {
 			grpc
 				.block_on(calls.cancel(pb::CancelCallRequest {
-					call: Some(pb::CallRef { call_id: call_id.to_owned() }),
-					reason: "client interrupted".to_owned(),
+					call:       Some(pb::CallRef { call_id: call_id.to_owned() }),
+					reason:     "client interrupted".to_owned(),
 					request_id: request_id("cli-cancel", call_id.as_bytes()),
 				}))
 				.map_err(status_error)?;
@@ -1058,13 +1074,12 @@ fn wait_call(grpc: &Grpc, call_id: &str) -> Result<i32> {
 		}
 		if record.status == pb::CallStatus::Succeeded as i32 {
 			let result = grpc
-				.block_on(calls.get_result(pb::GetCallResultRequest {
-					call: record.r#ref,
-					index: 0,
-				}))
+				.block_on(calls.get_result(pb::GetCallResultRequest { call: record.r#ref, index: 0 }))
 				.map_err(status_error)?
 				.into_inner();
-			let outcome = result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
+			let outcome = result
+				.outcome
+				.ok_or_else(|| CliError::new("call result omitted outcome"))?;
 			let exit_code = outcome_exit_code(&outcome);
 			match outcome {
 				pb::call_result::Outcome::Value(value) => {
@@ -1077,7 +1092,11 @@ fn wait_call(grpc: &Grpc, call_id: &str) -> Result<i32> {
 		if let Some(pb::call_record::ErrorPresence::Error(error)) = record.error_presence {
 			print_call_error(&error);
 		}
-		return Ok(if record.status == pb::CallStatus::Cancelled as i32 { 130 } else { 1 });
+		return Ok(if record.status == pb::CallStatus::Cancelled as i32 {
+			130
+		} else {
+			1
+		});
 	}
 }
 
@@ -1085,7 +1104,10 @@ fn invocation_input(values: &[Value], input_id: String) -> Result<pb::CallInput>
 	if input_id.is_empty() {
 		return err("call input ID must not be empty");
 	}
-	let positional = values.iter().map(json_envelope).collect::<Result<Vec<_>>>()?;
+	let positional = values
+		.iter()
+		.map(json_envelope)
+		.collect::<Result<Vec<_>>>()?;
 	Ok(pb::CallInput {
 		index: 0,
 		payload: Some(pb::call_input::Payload::Arguments(pb::InvocationArguments {
@@ -1130,10 +1152,7 @@ fn cmd_run_function(
 	let call = grpc
 		.block_on(calls.create(pb::CreateCallRequest {
 			r#type: pb::CallType::Unary as i32,
-			target: Some(pb::CallTarget {
-				function: Some(revision),
-				receiver: None,
-			}),
+			target: Some(pb::CallTarget { function: Some(revision), receiver: None }),
 			inputs: vec![invocation_input(&values, format!("{call_request_id}:0"))?],
 			inputs_closed: true,
 			graph: Some(pb::CallGraph::default()),
@@ -1374,22 +1393,24 @@ fn function_shell(grpc: &Grpc, reference: &str, options: &TransportOptions) -> R
 	let mut sandboxes = grpc.sandboxes();
 	let view = json_view(
 		grpc
-			.block_on(sandboxes.create(pb::CreateSandboxRequest {
-				spec_json: json!({
-					"image": image,
-					"memory": 512,
-					"cpus": 1,
-					"disk_mb": 1024,
-					"timeout": 300.0,
-				})
-				.to_string(),
-			}))
+			.block_on(
+				sandboxes.create(pb::CreateSandboxRequest {
+					spec_json: json!({
+						"image": image,
+						"memory": 512,
+						"cpus": 1,
+						"disk_mb": 1024,
+						"timeout": 300.0,
+					})
+					.to_string(),
+				}),
+			)
 			.map_err(status_error)?
 			.into_inner(),
 	)?;
 	let sandbox = view_name(&view)?.to_owned();
 	if let Err(status) = grpc.block_on(sandboxes.file_write(pb::FileWriteRequest {
-		id: sandbox.clone(),
+		id:   sandbox.clone(),
 		path: "/tmp/vmon-function.zip".to_owned(),
 		data: package,
 	})) {
@@ -1399,15 +1420,15 @@ fn function_shell(grpc: &Grpc, reference: &str, options: &TransportOptions) -> R
 	let result = cmd_shell(
 		ShellArgs {
 			reference: Some(sandbox.clone()),
-			command: None,
-			image: None,
-			env: vec!["PYTHONPATH=/tmp/vmon-function.zip".to_owned()],
-			mem: 512,
-			cpus: 1,
-			disk_mb: 1024,
-			timeout: 300.0,
-			pty: true,
-			no_pty: false,
+			command:   None,
+			image:     None,
+			env:       vec!["PYTHONPATH=/tmp/vmon-function.zip".to_owned()],
+			mem:       512,
+			cpus:      1,
+			disk_mb:   1024,
+			timeout:   300.0,
+			pty:       true,
+			no_pty:    false,
 		},
 		options,
 	);
@@ -1433,7 +1454,9 @@ fn cmd_function(command: FunctionCommands, options: &TransportOptions) -> Result
 					.map_err(status_error)?
 					.into_inner();
 				for revision in response.revisions {
-					let Some(reference) = revision.r#ref else { continue };
+					let Some(reference) = revision.r#ref else {
+						continue;
+					};
 					let function = reference.function.unwrap_or_default();
 					let status = pb::FunctionRevisionStatus::try_from(revision.status)
 						.map_or("unknown", |status| status.as_str_name());
@@ -1466,18 +1489,16 @@ fn print_call_results(grpc: &Grpc, call: pb::CallRef) -> Result<i32> {
 		let requested_after = after_sequence;
 		let page = grpc
 			.block_on(calls.list_results(pb::ListCallResultsRequest {
-				cursor: Some(pb::ResultCursor {
-					call: Some(call.clone()),
-					after_sequence,
-				}),
+				cursor:    Some(pb::ResultCursor { call: Some(call.clone()), after_sequence }),
 				page_size: 200,
 			}))
 			.map_err(status_error)?
 			.into_inner();
 		for result in page.results {
 			after_sequence = after_sequence.max(result.sequence);
-			let outcome =
-				result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
+			let outcome = result
+				.outcome
+				.ok_or_else(|| CliError::new("call result omitted outcome"))?;
 			exit_code = exit_code.max(outcome_exit_code(&outcome));
 			match outcome {
 				pb::call_result::Outcome::Value(value) => {
@@ -1509,8 +1530,11 @@ fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
 				.block_on(calls.get(pb::CallRef { call_id: id }))
 				.map_err(status_error)?
 				.into_inner();
-			let call_id =
-				record.r#ref.as_ref().map(|value| value.call_id.as_str()).unwrap_or("-");
+			let call_id = record
+				.r#ref
+				.as_ref()
+				.map(|value| value.call_id.as_str())
+				.unwrap_or("-");
 			println!(
 				"{}",
 				serde_json::to_string_pretty(&json!({
@@ -1523,12 +1547,11 @@ fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
 				}))?
 			);
 			if record.result_count > 0 {
-				let call =
-					record.r#ref.ok_or_else(|| CliError::new("call record omitted its ID"))?;
+				let call = record
+					.r#ref
+					.ok_or_else(|| CliError::new("call record omitted its ID"))?;
 				print_call_results(&grpc, call)
-			} else if let Some(pb::call_record::ErrorPresence::Error(error)) =
-				record.error_presence
-			{
+			} else if let Some(pb::call_record::ErrorPresence::Error(error)) = record.error_presence {
 				print_call_error(&error);
 				Ok(1)
 			} else {
@@ -1586,7 +1609,6 @@ fn follow_call_logs(grpc: &Grpc, call_id: &str, follow: bool) -> Result<i32> {
 		thread::sleep(Duration::from_millis(100));
 	}
 }
-
 
 enum LifecycleVerb {
 	Stop,
@@ -1980,7 +2002,10 @@ fn cmd_serve(mut args: ServeArgs, options: &TransportOptions) -> Result<i32> {
 		.map_err(|error| CliError::new(format!("failed to start vmond: {error}")))?;
 	let deadline = Instant::now() + Duration::from_secs(10);
 	loop {
-		if client(options, false).and_then(|client| client.grpc()).is_ok() {
+		if client(options, false)
+			.and_then(|client| client.grpc())
+			.is_ok()
+		{
 			break;
 		}
 		if let Ok(result) = server_rx.try_recv() {
@@ -2178,6 +2203,11 @@ impl ServeArgs {
 		insert_override(&mut overrides, "tls_cert", self.tls_cert);
 		insert_override(&mut overrides, "tls_key", self.tls_key);
 		insert_override(&mut overrides, "idle_timeout", self.idle_timeout);
+		insert_override(
+			&mut overrides,
+			"function_artifact_max_bytes",
+			self.function_artifact_max_bytes,
+		);
 		insert_override(&mut overrides, "replicate_sec", self.replicate_sec);
 		insert_override(&mut overrides, "replicas", self.replicas);
 		insert_override(&mut overrides, "replicate_concurrency", self.replicate_concurrency);
@@ -2534,15 +2564,29 @@ mod durable_cli_tests {
 	#[test]
 	fn legacy_run_and_serve_shapes_are_unchanged() {
 		let run = Cli::try_parse_from(["vmon", "run", "alpine", "--", "echo", "ok"]).unwrap();
-		let Commands::Run(run) = run.command else { panic!("expected run") };
+		let Commands::Run(run) = run.command else {
+			panic!("expected run")
+		};
 		assert_eq!(run.image.as_deref(), Some("alpine"));
 		assert_eq!(run.cmd, ["echo", "ok"]);
 
 		let serve = Cli::try_parse_from(["vmon", "serve", "--port", "9000"]).unwrap();
-		let Commands::Serve(serve) = serve.command else { panic!("expected serve") };
+		let Commands::Serve(serve) = serve.command else {
+			panic!("expected serve")
+		};
 		assert_eq!(serve.port, Some(9000));
 		assert!(serve.target.is_none());
 		assert!(!serve.watch);
+		let serve =
+			Cli::try_parse_from(["vmon", "serve", "--function-artifact-max-bytes", "4294967296"])
+				.unwrap();
+		let Commands::Serve(serve) = serve.command else {
+			panic!("expected serve")
+		};
+		assert_eq!(serve.function_artifact_max_bytes, Some(4_294_967_296));
+		assert!(
+			Cli::try_parse_from(["vmon", "serve", "--function-artifact-max-bytes", "0",]).is_err()
+		);
 	}
 
 	#[test]
@@ -2552,7 +2596,9 @@ mod durable_cli_tests {
 			Commands::Deploy(DeployArgs { target }) if target == "app.py"
 		));
 		assert!(matches!(
-			Cli::try_parse_from(["vmon", "function", "ls"]).unwrap().command,
+			Cli::try_parse_from(["vmon", "function", "ls"])
+				.unwrap()
+				.command,
 			Commands::Function { command: FunctionCommands::Ls }
 		));
 		assert!(matches!(
@@ -2581,8 +2627,7 @@ mod durable_cli_tests {
 			Commands::Serve(ServeArgs { target: Some(target), watch: true, .. })
 				if target == "app.py"
 		));
-		let run = Cli::try_parse_from(["vmon", "run", "app.py::embed", "1", "{\"x\":2}"])
-			.unwrap();
+		let run = Cli::try_parse_from(["vmon", "run", "app.py::embed", "1", "{\"x\":2}"]).unwrap();
 		assert!(matches!(
 			run.command,
 			Commands::Run(RunArgs { image: Some(target), cmd, .. })
@@ -2592,15 +2637,20 @@ mod durable_cli_tests {
 
 	#[test]
 	fn invalid_json_is_rejected_before_target_or_rpc_work() {
-		let error = cmd_run_function("missing.py::embed".to_owned(), vec!["{".to_owned()], &TransportOptions::default())
-			.unwrap_err();
+		let error = cmd_run_function(
+			"missing.py::embed".to_owned(),
+			vec!["{".to_owned()],
+			&TransportOptions::default(),
+		)
+		.unwrap_err();
 		assert!(error.to_string().contains("invalid JSON argument"));
 	}
 
 	#[test]
 	fn invalid_target_is_rejected_before_rpc_work() {
-		let error =
-			inspect_target("definitely-missing.py::embed").err().expect("target must fail");
+		let error = inspect_target("definitely-missing.py::embed")
+			.err()
+			.expect("target must fail");
 		assert!(error.to_string().contains("not an existing file"));
 	}
 
@@ -2611,8 +2661,7 @@ mod durable_cli_tests {
 		assert_eq!(outcome_exit_code(&value), 0);
 		assert_eq!(outcome_exit_code(&error), 1);
 		let input =
-			invocation_input(&[json!(1), json!({"key": "value"})], "request-1:0".to_owned())
-				.unwrap();
+			invocation_input(&[json!(1), json!({"key": "value"})], "request-1:0".to_owned()).unwrap();
 		assert!(!input.input_id.is_empty());
 		let Some(pb::call_input::Payload::Arguments(arguments)) = input.payload else {
 			panic!("expected structured invocation arguments");
@@ -2645,14 +2694,8 @@ mod durable_cli_tests {
 
 	#[test]
 	fn watch_invalidates_only_changed_function_inputs() {
-		let before = vec![
-			("a".to_owned(), vec![1]),
-			("b".to_owned(), vec![2]),
-		];
-		let after = vec![
-			("a".to_owned(), vec![1]),
-			("b".to_owned(), vec![3]),
-		];
+		let before = vec![("a".to_owned(), vec![1]), ("b".to_owned(), vec![2])];
+		let after = vec![("a".to_owned(), vec![1]), ("b".to_owned(), vec![3])];
 		assert_eq!(changed_function_bindings(&before, &after), ["b"]);
 		assert_eq!(changed_function_bindings(&before, &after[..1]), ["b"]);
 	}
@@ -2662,26 +2705,26 @@ mod durable_cli_tests {
 		let spec = pb::FunctionSpec {
 			function: Some(pb::FunctionRef {
 				namespace: "default".to_owned(),
-				name: "embed".to_owned(),
+				name:      "embed".to_owned(),
 			}),
 			..Default::default()
 		};
 		let encoded = spec.encode_to_vec();
 		assert_eq!(request_id("cli-register", &encoded), request_id("cli-register", &encoded));
 		let request = pb::RegisterFunctionRequest {
-			spec: Some(spec),
-			request_id: request_id("cli-register", &encoded),
+			spec:              Some(spec),
+			request_id:        request_id("cli-register", &encoded),
 			transient_secrets: Vec::new(),
 		};
 		assert!(request.transient_secrets.is_empty());
 		assert!(!String::from_utf8_lossy(&request.encode_to_vec()).contains("secret-value"));
 
 		let revision = |name: &str, id: &str| pb::AppFunctionBinding {
-			name: name.to_owned(),
+			name:     name.to_owned(),
 			revision: Some(pb::RevisionRef {
-				function: Some(pb::FunctionRef {
+				function:    Some(pb::FunctionRef {
 					namespace: "default".to_owned(),
-					name: name.to_owned(),
+					name:      name.to_owned(),
 				}),
 				revision_id: id.to_owned(),
 			}),
@@ -2691,10 +2734,19 @@ mod durable_cli_tests {
 			vec![revision("zeta", "r2"), revision("alpha", "r1")],
 		);
 		assert_eq!(
-			activation.functions.iter().map(|binding| binding.name.as_str()).collect::<Vec<_>>(),
+			activation
+				.functions
+				.iter()
+				.map(|binding| binding.name.as_str())
+				.collect::<Vec<_>>(),
 			["alpha", "zeta"]
 		);
-		assert!(activation.functions.iter().all(|binding| binding.revision.is_some()));
+		assert!(
+			activation
+				.functions
+				.iter()
+				.all(|binding| binding.revision.is_some())
+		);
 		assert!(activation.expected_current_presence.is_none());
 		assert!(!String::from_utf8_lossy(&activation.encode_to_vec()).contains("secret-value"));
 	}
