@@ -17,6 +17,8 @@ use std::{
 	thread,
 };
 
+use rayon::prelude::*;
+
 use crate::error::{EngineError, Result};
 
 /// Side file carried in a live-migration delta checkpoint next to
@@ -132,8 +134,8 @@ fn compare_chunk_len(compare_end: u64) -> u64 {
 		.max(MIN_COMPARE_CHUNK_LEN)
 }
 
-/// Changed-block runs over `[0, compare_end)`, one worker thread per
-/// `chunk_len`-sized chunk (inline for a single chunk), joined in chunk
+/// Changed-block runs over `[0, compare_end)`, one rayon task per
+/// `chunk_len`-sized chunk (inline for a single chunk), merged in chunk
 /// order and coalesced across chunk boundaries exactly like a sequential
 /// scan.
 fn compare_chunks(
@@ -150,26 +152,22 @@ fn compare_chunks(
 	if chunk_count <= 1 {
 		return diff_chunk(base, current, 0, compare_end);
 	}
-	thread::scope(|scope| {
-		// Spawn every worker before joining any so the chunks run
-		// concurrently; join in chunk order to keep the runs sorted.
-		let mut workers = Vec::with_capacity(chunk_count as usize);
-		for index in 0..chunk_count {
+	// collect() keeps chunk order, so cross-boundary coalescing below matches
+	// a sequential scan byte-for-byte.
+	let chunks: Vec<Vec<(u64, u64)>> = (0..chunk_count)
+		.into_par_iter()
+		.map(|index| {
 			let start = index * chunk_len;
-			let end = compare_end.min(start + chunk_len);
-			workers.push(scope.spawn(move || diff_chunk(base, current, start, end)));
+			diff_chunk(base, current, start, compare_end.min(start + chunk_len))
+		})
+		.collect::<Result<_>>()?;
+	let mut runs = Vec::new();
+	for chunk_runs in chunks {
+		for (offset, len) in chunk_runs {
+			push_run(&mut runs, offset, len);
 		}
-		let mut runs = Vec::new();
-		for worker in workers {
-			let chunk_runs = worker
-				.join()
-				.map_err(|_| EngineError::engine("disk delta compare worker panicked"))??;
-			for (offset, len) in chunk_runs {
-				push_run(&mut runs, offset, len);
-			}
-		}
-		Ok(runs)
-	})
+	}
+	Ok(runs)
 }
 
 /// Changed-block runs (offset plus length, adjacent changed blocks coalesced
