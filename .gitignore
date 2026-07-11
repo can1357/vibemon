@@ -37,3 +37,6 @@ python/build
 .ruff_cache/
 .venv/
 
+
+# Workstation-specific agent instructions
+AGENTS.local.md
