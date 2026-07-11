@@ -77,6 +77,9 @@ impl ApiError {
 
 impl From<EngineError> for ApiError {
 	fn from(value: EngineError) -> Self {
+		if value.message.starts_with("ha_unavailable") {
+			return Self::function("ha_unavailable", value.message);
+		}
 		if value.message.starts_with("actor_lost") || value.message.contains("actor is lost") {
 			return Self::function("actor_lost", value.message);
 		}

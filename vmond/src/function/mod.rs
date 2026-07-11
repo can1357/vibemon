@@ -978,25 +978,19 @@ impl FunctionDomain {
 	}
 
 	async fn retire_worker(&self, worker: Arc<dyn Worker>) {
-		if let Ok(revision) = self.store.get_revision(worker.revision_id())
-			&& revision
-				.spec
+		let revision = self.store.get_revision(worker.revision_id()).ok();
+		let snapshot_on_retire = revision
+			.as_ref()
+			.and_then(|revision| revision.spec.as_ref())
+			.and_then(|spec| spec.lifecycle_hooks.as_ref())
+			.is_some_and(|hooks| hooks.snapshot_on_worker_retire);
+		retire_worker_ordered(worker, snapshot_on_retire, |snapshot| {
+			let revision = revision
 				.as_ref()
-				.and_then(|spec| spec.lifecycle_hooks.as_ref())
-				.is_some_and(|hooks| hooks.snapshot_on_worker_retire)
-		{
-			match worker.snapshot(SnapshotReason::WorkerRetire).await {
-				Ok(snapshot) => {
-					if let Err(error) = self.persist_snapshot(snapshot, &revision) {
-						tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot persistence failed");
-					}
-				},
-				Err(error) => {
-					tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot capture failed")
-				},
-			}
-		}
-		let _ = worker.retire().await;
+				.ok_or_else(|| EngineError::not_found("worker revision not found"))?;
+			self.persist_snapshot(snapshot, revision).map(|_| ())
+		})
+		.await;
 	}
 
 	/// Ask every background task to stop and wait for clean termination.
@@ -2275,6 +2269,25 @@ impl Drop for FunctionDomain {
 		}
 	}
 }
+async fn retire_worker_ordered(
+	worker: Arc<dyn Worker>,
+	snapshot_on_retire: bool,
+	persist: impl FnOnce(WorkerSnapshot) -> Result<()>,
+) {
+	if snapshot_on_retire {
+		match worker.snapshot(SnapshotReason::WorkerRetire).await {
+			Ok(snapshot) => {
+				if let Err(error) = persist(snapshot) {
+					tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot persistence failed");
+				}
+			},
+			Err(error) => {
+				tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot capture failed")
+			},
+		}
+	}
+	let _ = worker.retire().await;
+}
 
 fn unix_millis() -> u64 {
 	use std::time::{SystemTime, UNIX_EPOCH};
@@ -2407,5 +2420,90 @@ mod tests {
 		reap_finished_tasks(&mut tasks);
 		assert_eq!(tasks.len(), 1);
 		tasks.pop().unwrap().abort();
+	}
+
+	struct OrderedRetireWorker {
+		events: Mutex<Vec<&'static str>>,
+	}
+
+	impl Worker for OrderedRetireWorker {
+		fn id(&self) -> &str {
+			"ordered-retire"
+		}
+
+		fn revision_id(&self) -> &str {
+			"revision"
+		}
+
+		fn capacity(&self) -> usize {
+			1
+		}
+
+		fn interruptibility(&self) -> worker::Interruptibility {
+			worker::Interruptibility::Async
+		}
+
+		fn execute(
+			&self,
+			_request: ExecuteRequest,
+		) -> worker::BoxFuture<Result<worker::Execution, WorkerError>> {
+			Box::pin(async { Err(WorkerError::platform("unused", "unused")) })
+		}
+
+		fn cancel(&self, _request_id: &str) -> worker::BoxFuture<Result<(), WorkerError>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn snapshot(
+			&self,
+			reason: SnapshotReason,
+		) -> worker::BoxFuture<Result<WorkerSnapshot, WorkerError>> {
+			self.events.lock().push("snapshot");
+			Box::pin(async move {
+				Ok(WorkerSnapshot {
+					engine_snapshot: "snapshot".into(),
+					provenance: SnapshotProvenance {
+						revision_id:     "revision".into(),
+						function:        None,
+						image_digest:    vec![],
+						spec_digest:     vec![],
+						package_digest:  vec![],
+						initialize_hook: None,
+						runner_digest:   vec![],
+						runner_protocol: 2,
+					},
+					reason,
+					created_at_unix_millis: 1,
+				})
+			})
+		}
+
+		fn actor(
+			&self,
+			_request: ActorRequest,
+		) -> worker::BoxFuture<Result<worker::Execution, WorkerError>> {
+			Box::pin(async { Err(WorkerError::platform("unused", "unused")) })
+		}
+
+		fn retire(&self) -> worker::BoxFuture<Result<(), WorkerError>> {
+			self.events.lock().push("retire");
+			Box::pin(async { Ok(()) })
+		}
+
+		fn initial_snapshot(&self) -> Option<WorkerSnapshot> {
+			None
+		}
+	}
+
+	#[tokio::test]
+	async fn worker_retire_snapshot_is_persisted_before_shutdown_hook() {
+		let worker = Arc::new(OrderedRetireWorker { events: Mutex::new(Vec::new()) });
+		let erased: Arc<dyn Worker> = worker.clone();
+		retire_worker_ordered(erased, true, |_| {
+			worker.events.lock().push("persist");
+			Ok(())
+		})
+		.await;
+		assert_eq!(*worker.events.lock(), vec!["snapshot", "persist", "retire"]);
 	}
 }

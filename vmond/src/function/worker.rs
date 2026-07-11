@@ -2967,6 +2967,20 @@ mod tests {
 	}
 
 	#[test]
+	fn none_worker_start_builds_a_single_node_local_sandbox() {
+		let temp = tempfile::tempdir().unwrap();
+		let mut revision = revision();
+		let spec = revision.spec.as_mut().unwrap();
+		spec.resources.as_mut().unwrap().high_availability = pb::HighAvailabilityPolicy::None as i32;
+		let create =
+			sandbox_create(&Home::new(temp.path()), spec, "fn-revision-1-1", &SecretValues::new())
+				.unwrap();
+		assert_eq!(create.name.as_deref(), Some("fn-revision-1-1"));
+		assert_eq!(create.ha.as_deref(), Some("off"));
+		assert_eq!(create.arch.as_deref(), Some("aarch64"));
+	}
+
+	#[test]
 	fn sandbox_mapping_is_typed_and_secret_errors_are_redacted() {
 		let mut secrets = SecretValues::new();
 		secrets.insert("TOKEN", b"sensitive-value".to_vec());

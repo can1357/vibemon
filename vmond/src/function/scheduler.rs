@@ -159,9 +159,9 @@ pub fn place_function_worker(
 			),
 		});
 	}
-	let affinity = hints.affinity_key.as_deref().unwrap_or(revision_id);
+	let affinity = hints.affinity_key.as_deref();
 	compatible.sort_by(|left, right| {
-		let rank = |node: &NodeState| {
+		let locality_rank = |node: &NodeState| {
 			(
 				u8::from(hints.warm_worker_nodes.contains(&node.node_id)),
 				u8::from(
@@ -178,12 +178,15 @@ pub fn place_function_worker(
 				),
 				node.free_vcpus(),
 				node.free_mem_mib(),
-				hrw_score(affinity, &node.node_id),
+				hrw_score(revision_id, &node.node_id),
 			)
 		};
-		rank(right)
-			.cmp(&rank(left))
-			.then_with(|| left.node_id.cmp(&right.node_id))
+		let order = if let Some(key) = affinity {
+			hrw_score(key, &right.node_id).cmp(&hrw_score(key, &left.node_id))
+		} else {
+			locality_rank(right).cmp(&locality_rank(left))
+		};
+		order.then_with(|| left.node_id.cmp(&right.node_id))
 	});
 	Ok(compatible[0].node_id.clone())
 }

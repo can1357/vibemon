@@ -237,6 +237,9 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed worker-retire snapshot order to ensure persistence occurs before worker termination
+- Fixed function placement logic to prioritize locality-based ranking when affinity is unset
+- Fixed function registration to reject host/zone HA policies when cross-node execution is unavailable
 - Fixed concurrent actor initialization to prevent redundant constructor execution
 - Resolved durability race conditions in input stream handling and state recovery
 - Corrected artifact validation logic to prevent truncation-based bypasses

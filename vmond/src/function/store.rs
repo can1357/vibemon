@@ -3470,6 +3470,26 @@ fn validate_function_spec(s: &FunctionSpec) -> Result<()> {
 	}
 	Ok(())
 }
+
+fn reject_unroutable_function_ha(spec: &FunctionSpec) -> Result<()> {
+	let policy = spec
+		.resources
+		.as_ref()
+		.and_then(|resources| HighAvailabilityPolicy::try_from(resources.high_availability).ok())
+		.unwrap_or(HighAvailabilityPolicy::Unspecified);
+	if matches!(policy, HighAvailabilityPolicy::Host | HighAvailabilityPolicy::Zone) {
+		let scope = if policy == HighAvailabilityPolicy::Host {
+			"host"
+		} else {
+			"zone"
+		};
+		return Err(EngineError::not_running(format!(
+			"ha_unavailable: function HA {scope} cannot run because cross-node function execution is \
+			 unavailable; use HIGH_AVAILABILITY_POLICY_NONE"
+		)));
+	}
+	Ok(())
+}
 fn canonical_spec_digest(spec: &FunctionSpec) -> [u8; 32] {
 	let mut base = spec.clone();
 	let mut maps = vec![("function.labels".into(), sorted_map(&base.labels))];
@@ -4639,6 +4659,28 @@ mod tests {
 			..Default::default()
 		}
 	}
+
+	#[test]
+	fn none_registers_locally_while_unroutable_host_is_rejected() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = Store::open(&Home::new(temp.path())).unwrap();
+		record_package(&store);
+		let mut local = spec();
+		local.resources.as_mut().unwrap().high_availability = HighAvailabilityPolicy::None as i32;
+		assert!(store.register_function(&local, "local-none", 1).is_ok());
+		let mut host = spec();
+		host.resources.as_mut().unwrap().high_availability = HighAvailabilityPolicy::Host as i32;
+		let error = store
+			.register_function(&host, "remote-host", 2)
+			.unwrap_err();
+		assert_eq!(error.code, crate::ErrorCode::NotRunning);
+		assert!(error.message.starts_with("ha_unavailable:"));
+		assert!(
+			error
+				.message
+				.contains("cross-node function execution is unavailable")
+		);
+	}
 	fn revision_ref(revision: &FunctionRevision) -> RevisionRef {
 		revision.r#ref.clone().unwrap()
 	}
@@ -4975,6 +5017,23 @@ mod tests {
 			result_ttl_millis_presence: None,
 		};
 		assert!(store.create_call(&actor_call, 23).is_err());
+		let mut actor_spec = spec();
+		actor_spec.function.as_mut().unwrap().name = "actor-only".into();
+		actor_spec.lifecycle = FunctionLifecycle::Actor as i32;
+		let actor_revision = store
+			.register_function(&actor_spec, "actor-only-revision", 24)
+			.unwrap();
+		let direct_actor = call_request(&actor_revision, "direct-actor");
+		assert!(store.create_call(&direct_actor, 25).is_err());
+
+		let mut instance_spec = spec();
+		instance_spec.function.as_mut().unwrap().name = "instance-only".into();
+		instance_spec.lifecycle = FunctionLifecycle::Instance as i32;
+		let instance_revision = store
+			.register_function(&instance_spec, "instance-only-revision", 26)
+			.unwrap();
+		let direct_instance = call_request(&instance_revision, "direct-instance");
+		assert!(store.create_call(&direct_instance, 27).is_err());
 	}
 
 	#[test]
