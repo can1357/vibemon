@@ -112,7 +112,7 @@ def test_all_image_sources_and_validation_are_declarative(tmp_path):
             ),
             "allow_trusted_python",
         ),
-        (lambda: SerializerPolicy(compression="gzip"), "compression"),
+        (lambda: SerializerPolicy(compression="snappy"), "compression"),
     ],
 )
 def test_every_policy_boundary_is_validated(factory, message):
