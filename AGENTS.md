@@ -12,7 +12,7 @@ Vibemon (`vmon`) is a small KVM/HVF-based Linux microVM monitor. One Rust binary
 Three runtime layers. The Rust server owns the registry and spawns one `vmon vmm` child per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
 
 ```
-Web UI / Rust CLI / Python SDK / TypeScript SDK
+Web UI / Rust CLI / Python SDK / TypeScript SDK / Go SDK
    │ HTTP / WebSocket (or local HTTP-over-UDS)
 vmon serve (Rust axum API, vmond crate)
    │ Engine registry, image pipeline, pools, mesh, volumes
@@ -38,9 +38,10 @@ vmon-agent (guest agent, Linux guest only)
 - `vmond/` — Rust server/engine crate used by `vmon serve`: HTTP API, registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
-- `python/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`; `client.py` only exposes `DaemonError`).
+- `python/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
 - `python/tests/`, `python/e2e.py` — Python SDK unit tests and real-VM SDK driver.
 - `sdk/ts/` — TypeScript SDK (bun).
+- `sdk/go/` — Go SDK (`go test`, `github.com/coder/websocket`).
 - `ui/` — React + Vite + TypeScript web panel; **builds into `vmond/web/`** for Rust embedding.
 - `demo/` — runnable demo and asset-fetch scripts (Ubuntu/arm64 boots, OCI→ext4, Lima bridge for macOS).
 
@@ -64,11 +65,12 @@ just ui              # cd ui && bun install && bun run build  → vmond/web/
 just agent-musl      # build static vmon-agent → target/test-assets/vmon-agent-<arch>
 just sdk-ts          # cd sdk/ts && bun install && bun run typecheck
 just sdk-ts-smoke    # cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
+just sdk-go          # cd sdk/go && go test ./...
 ```
 
 macOS HVF requires the `vmon` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
 
-A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] members = ["python"]`) makes the `python/` SDK package resolve from the repository root, so a single root `.venv` + root `uv.lock` serve both `uv run <cmd>` from the repo root (e.g. `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`) and `cd python && uv run <cmd>`. The package's own `pyproject.toml` stays in `python/`. Python tooling for the SDK: `uv run ruff check`, `uv run mypy`, `uv run pytest` — from the root or `python/`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`); TypeScript SDK recipes are `just sdk-ts` and `just sdk-ts-smoke`.
+A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] members = ["python"]`) makes the `python/` SDK package resolve from the repository root, so a single root `.venv` + root `uv.lock` serve both `uv run <cmd>` from the repo root (e.g. `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`) and `cd python && uv run <cmd>`. The package's own `pyproject.toml` stays in `python/`. Python tooling for the SDK: `uv run ruff check`, `uv run mypy`, `uv run pytest` — from the root or `python/`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`); SDK recipes are `just sdk-ts`, `just sdk-ts-smoke`, and `just sdk-go`.
 
 ## Code Conventions & Common Patterns
 
@@ -123,6 +125,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `agent/src/main.rs`, `agent/src/proto.rs` — guest agent and its frame protocol.
 - `python/vmon/sandbox.py`, `_transport.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
 - `sdk/ts/package.json`, `sdk/ts/src/` — TypeScript SDK.
+- `sdk/go/go.mod`, `sdk/go/*.go` — Go SDK.
 - `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `python/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.
 
 ## Runtime/Tooling Preferences
@@ -130,6 +133,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - **Rust:** pinned `nightly-2026-04-29` (`rust-toolchain.toml`, with rustfmt/clippy/rust-analyzer). Release profile: `opt-level = 2`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 - **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `python/` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependency is the HTTP client stack for the SDK (`httpx`).
 - **UI + TS SDK:** **bun** for everything (`bun.lock`; no `package-lock.json`). React/Vite/TS power the UI, which builds into `vmond/web/`; the TypeScript SDK lives in `sdk/ts` with `bun run typecheck` and `bun test`.
+- **Go SDK:** Go 1.23+ with standard `go fmt`/`go vet`/`go test`; `github.com/coder/websocket` is the sole runtime dependency.
 - **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`. The Rust CLI/server locates the `vmon` binary from cargo target dirs, `$VMON_BIN`, or `PATH`.
 
 ## Testing & QA
@@ -139,8 +143,10 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `boot.rs`, `blk.rs`, `lifecycle.rs`, `net.rs`, `pager.rs`, `snapshot.rs`, `timeout.rs`, `uefi.rs`, `server_e2e.rs`, `cluster_e2e.rs`, `soak.rs` — one concern each (boot markers, block I/O, control protocol, networking, pager eviction, snapshot/fork, timeout self-kill, UEFI boot, server API, cluster failover, stability).
 - Integration runs single-threaded (`--test-threads=1`). Boot tests require assets from `just fetch-assets` (cached in `target/test-assets/`). macOS uses `demo/hvf-test-runner.sh` to codesign spawned test binaries.
 
-**Python** — thin SDK unit tests live under `python/tests/` and run with `cd python && uv run pytest`. The real-VM SDK driver is `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`.
+**Python** — thin SDK unit tests live under `python/tests/` and run with `cd python && uv run pytest`. The real-VM SDK driver is `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`, including the Python remote-function path.
 
-**CI** — `ci.yml` (ubuntu): Rust fmt/check/clippy `-D warnings`, AArch64 check/clippy, `cargo test`, cargo-audit; Python SDK `ruff check`/`mypy`/`pytest`; web UI checks; TypeScript SDK typecheck + ungated `bun test`; macOS builds + codesigns + `cargo test --no-run`. `integration.yml` runs gated Rust e2e, Python SDK e2e, and Rust cluster e2e on KVM/HVF; `mesh-soak.yml` loops the Rust cluster suite under host-level tc-netem; `release.yml` builds musl binaries plus an SDK-only Python wheel/sdist.
+**TypeScript and Go** — package tests run with `cd sdk/ts && bun test` and `cd sdk/go && go test ./...`. Real-VM remote-function tests require a running server plus `VMON_TS_REMOTE_SMOKE=1` or `VMON_GO_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
+
+**CI** — `ci.yml` (ubuntu): Rust fmt/check/clippy `-D warnings`, AArch64 check/clippy, `cargo test`, cargo-audit; Python SDK `ruff check`/`mypy`/`pytest`; Go SDK formatting/vet/race tests; web UI checks; TypeScript SDK typecheck + ungated `bun test`; macOS builds + codesigns + `cargo test --no-run`. `integration.yml` runs gated Rust e2e, Python SDK e2e, and Rust cluster e2e on KVM/HVF; `mesh-soak.yml` loops the Rust cluster suite under host-level tc-netem; `release.yml` builds musl binaries plus an SDK-only Python wheel/sdist.
 
 When changing exported Rust symbols, check call sites with the language server (`lsp references`) before editing. Verify behavioral changes with the specific gated test rather than relying on `cargo check` alone.

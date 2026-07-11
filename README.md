@@ -264,9 +264,11 @@ Named volumes persist outside snapshots and are protected by the Rust server's s
 
 Exposed ports are available through `sb.tunnels()`. `sb.create_connect_token()` creates a bearer token for the REST proxy at `/v1/sandboxes/{id}/ports/{port}/...`. Runtime deadlines can be extended through `Sandbox.extend(secs)` or `POST /v1/sandboxes/{id}/extend`; `poll()` and `returncode` report the entry process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for terminate.
 
-`Sandbox.create(template=..., pool_size=N)` keeps pre-forked copy-on-write clones ready and falls back to cold restore when the pool is empty. `Sandbox.aio.*` mirrors the synchronous SDK with thread-backed async methods. Remote functions (`@vmon.function`) are client-side packaging helpers layered over the same create/exec API: arguments and return values must be JSON-serializable, guest `print()` output is forwarded, and `.map()` returns ordered results by default.
+Remote functions remain client-side packaging helpers layered over sandbox create, file-write, exec, and terminate. Python exposes source-aware `@vmon.function` callables; TypeScript exposes `client.remoteFunction(fn)` plus `remoteFunctionFromSource(...)`; Go exposes typed `vmon.NewRemoteFunction[Result](...)` over explicit JavaScript module source because Go cannot recover source from a `func` value. Every SDK enforces JSON-serializable arguments/results, forwards guest stdout, preserves structured remote errors, reuses one sandbox for direct calls, and uses bounded ephemeral workers for ordered maps.
 
-The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install + typecheck and `just sdk-ts-smoke` for the smoke tests.
+The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install + typecheck and `just sdk-ts-smoke` for the HTTP smoke tests. Its real-VM remote-function test is gated by `VMON_TS_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
+
+The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`. It covers every stable OpenAPI operation, streaming WebSockets/SSE, structured errors, secrets/volumes, and remote functions. Run `just sdk-go` for its HTTP/WebSocket unit suite; the real-VM remote-function test additionally requires `VMON_GO_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
 
 ## Cluster
 

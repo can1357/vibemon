@@ -232,6 +232,10 @@ sdk-ts:
 sdk-ts-smoke:
     cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
 
+# -- Go SDK (sdk/go) --
+sdk-go:
+    cd sdk/go && go test ./...
+
 # ----------------------------------------------------------------------- assets
 
 # Download pinned UEFI firmware + guest images used by the integration suite.
