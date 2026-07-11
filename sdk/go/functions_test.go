@@ -64,32 +64,6 @@ func TestDeployedFunctionLookupInvokeAndReconstruct(t *testing.T) {
 	if created == nil || created.Target.Function.RevisionId != "rev-1" || len(created.Inputs) != 1 { t.Fatalf("create = %#v", created) }
 }
 
-func TestClientCancellationSessionOwnership(t *testing.T) {
-	stub := &functionCallStub{}
-	listener := startGRPCServices(t, func(server *grpc.Server) {
-		pb.RegisterFunctionServiceServer(server, &functionStub{})
-		pb.RegisterCallServiceServer(server, stub)
-	})
-	client := bufconnClient(t, listener)
-	function, err := LookupFunction[int](context.Background(), client, "ns", "double")
-	if err != nil { t.Fatal(err) }
-	call, err := function.WithOptions(WithClientCancellation()).spawn(context.Background(), pb.CallType_CALL_TYPE_UNARY, []any{21}, true, true)
-	if err != nil { t.Fatal(err) }
-	events, failures := call.watch(context.Background(), 0, true, true)
-	for range events {}
-	if err := <-failures; err != nil { t.Fatal(err) }
-	stub.mu.Lock(); created, watched := stub.created, stub.watched; stub.mu.Unlock()
-	if created.GetClientSessionId() == "" { t.Fatal("cancel policy omitted creator client_session_id") }
-	if watched.GetClientSessionId() != created.GetClientSessionId() { t.Fatal("owner follow watch did not present creator session capability") }
-	events, failures = call.Watch(context.Background(), 0, true)
-	for range events {}
-	if err := <-failures; err != nil { t.Fatal(err) }
-	stub.mu.Lock(); watched = stub.watched; stub.mu.Unlock()
-	if watched.GetClientSessionId() != "" { t.Fatal("public observer watch presented creator capability") }
-	rebuilt, err := FunctionCallFromID[int](client, call.ID())
-	if err != nil { t.Fatal(err) }
-	if rebuilt.watchRequest(0, true).GetClientSessionId() != "" { t.Fatal("reconstructed observer retained creator session capability") }
-}
 
 func TestWatchCursorAndCancel(t *testing.T) {
 	stub := &functionCallStub{}

@@ -27,6 +27,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `CompletionResults` stream for batch calls to receive results in order of completion
+- Added `App` handle and `AppFunction` to retrieve pinned functions from deployed applications
+- Added I-JSON safety validation for JSON-encoded values, rejecting integers outside IEEE-754 range
 - Added `ListResults` API for fetching paginated durable call results
 - Added support for named and positional invocation arguments in durable calls
 - Added `AttemptFailureKind` to categorize execution failures as user-level or infrastructure-level
@@ -134,6 +137,11 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated `CallStats` to include granular `UserAttempt` and `InfraAttempt` counters
+- Refactored `CallGraph` to use `ParentEdge` structures for call ancestry tracking
+- Simplified `FunctionCall` API by removing deprecated client-side cancellation sessions
+- Enhanced `Watch` event stream to automatically resume and recover across transport failures
+- Improved `Map` implementation to include robust backpressure and input commitment tracking
 - Updated durable call execution stats to distinguish between user-triggered and infra-level retries
 - Changed `ResourceSpec` CPU quota definition from `cpu_millis` to total virtual CPUs (`cpus`)
 - Refactored durable function snapshot records to include reloadable provenance and validation metadata

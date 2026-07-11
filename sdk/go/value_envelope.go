@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -54,6 +55,7 @@ func EncodeValue(value any, codec ValueCodec, compression ValueCompression) (*Va
 	switch codec {
 	case ValueJSON:
 		raw, err = json.Marshal(value)
+		if err == nil { err = validateIJSON(raw) }
 		serializer = pb.ValueSerializer_VALUE_SERIALIZER_JSON
 	case ValueCBOR:
 		mode, modeErr := cbor.CanonicalEncOptions().EncMode()
@@ -130,12 +132,35 @@ func (value *ValueEnvelope) Decode(destination any, loader ArtifactValueLoader) 
 	if wire.Checksum == nil || wire.Checksum.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(digest[:], wire.Checksum.Value) { return errors.New("vmon: value checksum mismatch") }
 	switch wire.Serializer {
 	case pb.ValueSerializer_VALUE_SERIALIZER_JSON:
+		if err := validateIJSON(raw); err != nil { return err }
 		return json.Unmarshal(raw, destination)
 	case pb.ValueSerializer_VALUE_SERIALIZER_CBOR:
 		return cbor.Unmarshal(raw, destination)
 	default:
 		return errors.New("vmon: unsupported value serializer")
 	}
+}
+
+func validateIJSON(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil { return fmt.Errorf("vmon: invalid JSON value: %w", err) }
+	var visit func(any) error
+	visit = func(current any) error {
+		switch typed := current.(type) {
+		case json.Number:
+			number, err := typed.Float64()
+			if err != nil || math.IsInf(number, 0) || math.IsNaN(number) { return fmt.Errorf("vmon: JSON number %q is outside IEEE-754", typed) }
+			if math.Trunc(number) == number && math.Abs(number) > 9007199254740991 { return fmt.Errorf("vmon: JSON integer %q exceeds the I-JSON safe range; use CBOR", typed) }
+		case []any:
+			for _, item := range typed { if err := visit(item); err != nil { return err } }
+		case map[string]any:
+			for _, item := range typed { if err := visit(item); err != nil { return err } }
+		}
+		return nil
+	}
+	return visit(value)
 }
 
 func envelopeFromWire(wire *pb.ValueEnvelope) *ValueEnvelope { return &ValueEnvelope{wire: wire} }

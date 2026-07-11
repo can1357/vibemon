@@ -41,3 +41,18 @@ func TestValueEnvelopeArtifactAndChecksum(t *testing.T) {
 	value.wire.Checksum.Value[0] ^= 0xff
 	if err := value.Decode(&output, func(ref *ArtifactReference) ([]byte, error) { return stored, nil }); err == nil { t.Fatal("corrupt checksum accepted") }
 }
+
+func TestJSONSafeIntegerBoundary(t *testing.T) {
+	if _, err := EncodeValue(map[string]any{"nested": []any{int64(9007199254740991)}}, ValueJSON, CompressionNone); err != nil {
+		t.Fatalf("safe boundary rejected: %v", err)
+	}
+	if _, err := EncodeValue(map[string]any{"nested": []any{int64(9007199254740992)}}, ValueJSON, CompressionNone); err == nil {
+		t.Fatal("unsafe nested JSON integer accepted")
+	}
+	value, err := EncodeValue(uint64(9007199254740992), ValueCBOR, CompressionNone)
+	if err != nil { t.Fatalf("wide CBOR integer rejected: %v", err) }
+	var decoded uint64
+	if err := value.Decode(&decoded, nil); err != nil || decoded != 9007199254740992 {
+		t.Fatalf("wide CBOR round trip = %d, %v", decoded, err)
+	}
+}
