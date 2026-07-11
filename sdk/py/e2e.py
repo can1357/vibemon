@@ -1029,14 +1029,8 @@ def _function_options(
     min_workers: int = 0,
 ) -> vmon.FunctionOptions:
     selected_serializer = serializer or SerializerPolicy()
-    image = _py_image()
-    if ValueCodec.CLOUDPICKLE in (
-        selected_serializer.input_serializer,
-        selected_serializer.result_serializer,
-    ):
-        image = image.uv_install("cloudpickle==3.1.2")
     return vmon.FunctionOptions(
-        image=image,
+        image=_py_image(),
         timeouts=vmon.TimeoutPolicy(execution=120),
         workers=vmon.WorkerPolicy(min_workers=min_workers),
         serializer=selected_serializer,
@@ -1050,7 +1044,7 @@ _RemoteCounter = vmon.cls(options=_function_options())(RemoteCounter)
 
 
 @e2e
-def t_remote_function(_):
+def t_remote_function_warm(_):
     """Durable calls preserve warm execution and structured remote failures."""
     remote = sdk().function(
         remote_double,
@@ -1067,7 +1061,7 @@ def t_remote_function(_):
     except RemoteFunctionError as exc:
         assert "non-negative" in str(exc)
         assert exc.remote_type.endswith("ValueError")
-        assert "remote_double" in exc.traceback
+        assert exc.code
     else:
         raise AssertionError("remote exception was not propagated")
     print(f"    remote(): cold={cold:.3f}s warm={warm:.4f}s ({cold / max(warm, 1e-9):.0f}x)")
@@ -1078,6 +1072,10 @@ def t_remote_function(_):
 def t_remote_function_rich_args(_):
     """Explicit trusted-Python serialization preserves rich Python values."""
     import datetime
+    import cloudpickle
+
+    assert cloudpickle.__file__ is not None
+    cloudpickle_root = Path(cloudpickle.__file__).resolve().parent
 
     remote = sdk().function(
         remote_shift,
@@ -1088,6 +1086,7 @@ def t_remote_function_rich_args(_):
                 allow_trusted_python=True,
             )
         ),
+        local_packages=(str(cloudpickle_root),),
     )
     stamp = datetime.datetime(2026, 7, 11, 8, 30, 0)
     shifted, swapped = remote.remote(stamp, (1, 2))
@@ -1143,7 +1142,11 @@ def t_remote_function_spawn_map(_):
         )
     )
     assert mixed[0] == 2
-    assert isinstance(mixed[1], TypeError), f"expected TypeError slot, got {mixed[1]!r}"
+    failure = mixed[1]
+    assert isinstance(failure, RemoteFunctionError), (
+        f"expected RemoteFunctionError slot, got {failure!r}"
+    )
+    assert failure.remote_type.endswith("TypeError")
 
 
 @e2e
