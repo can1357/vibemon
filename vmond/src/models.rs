@@ -70,7 +70,7 @@ pub struct S3MountSpec {
 	pub uri:           String,
 	/// Optional S3-compatible path-style endpoint.
 	pub endpoint:      Option<String>,
-	/// Optional SigV4 region override.
+	/// Optional `SigV4` region override.
 	pub region:        Option<String>,
 	/// Mount without a guest-side volatile overlay.
 	#[serde(default)]

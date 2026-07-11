@@ -307,7 +307,7 @@ fn serve_s3_fixture(mut stream: TcpStream, range_reads: &AtomicUsize) {
 		write_s3_fixture_response(
 			&mut stream,
 			"200 OK",
-			br#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>hello.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;hello&quot;</ETag><Size>9</Size></Contents></ListBucketResult>"#,
+			br"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>hello.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;hello&quot;</ETag><Size>9</Size></Contents></ListBucketResult>",
 		);
 	} else {
 		write_s3_fixture_response(&mut stream, "404 Not Found", b"");

@@ -45,12 +45,12 @@ pub struct VerifiedArtifactReader {
 
 impl VerifiedArtifactReader {
 	/// Exact verified byte length.
-	pub fn len(&self) -> u64 {
+	pub const fn len(&self) -> u64 {
 		self.size
 	}
 
 	/// Whether this artifact contains no bytes.
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.size == 0
 	}
 }
@@ -417,7 +417,7 @@ fn verify_open_file(file: &mut File, digest: &str, expected_size: Option<u64>) -
 		return Err(EngineError::engine(format!("artifact {digest} has corrupt size")));
 	}
 	let mut hasher = Sha256::new();
-	let mut buffer = [0u8; 64 * 1024];
+	let mut buffer = vec![0u8; 64 * 1024];
 	loop {
 		let read = file.read(&mut buffer)?;
 		if read == 0 {
@@ -518,25 +518,24 @@ mod tests {
 		let store = ArtifactStore::open(temp.path()).unwrap();
 		let bytes = vec![7u8; 256 * 1024];
 		let digest = Sha256::digest(&bytes);
-		let mut threads = Vec::new();
-		for _ in 0..4 {
-			let store = store.clone();
-			let bytes = bytes.clone();
-			let digest = digest.to_vec();
-			threads.push(std::thread::spawn(move || {
-				let mut writer = store
-					.begin_put(&digest, bytes.len() as u64, bytes.len() as u64)
-					.unwrap();
-				for chunk in bytes.chunks(8192) {
-					writer.write_chunk(chunk).unwrap();
-				}
-				writer.finalize().unwrap()
-			}));
-		}
-		let records: Vec<_> = threads
-			.into_iter()
-			.map(|thread| thread.join().unwrap())
-			.collect();
+		let records = std::thread::scope(|scope| {
+			let mut threads = Vec::new();
+			for _ in 0..4 {
+				threads.push(scope.spawn(|| {
+					let mut writer = store
+						.begin_put(&digest, bytes.len() as u64, bytes.len() as u64)
+						.unwrap();
+					for chunk in bytes.chunks(8192) {
+						writer.write_chunk(chunk).unwrap();
+					}
+					writer.finalize().unwrap()
+				}));
+			}
+			threads
+				.into_iter()
+				.map(|thread| thread.join().unwrap())
+				.collect::<Vec<_>>()
+		});
 		assert!(records.windows(2).all(|pair| pair[0] == pair[1]));
 		assert_eq!(
 			store

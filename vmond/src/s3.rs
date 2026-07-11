@@ -1,7 +1,7 @@
 //! Lazy, signed S3 object access for remote virtio-fs mounts.
 //!
-//! [`S3Client`] owns all S3-specific behavior: addressing, SigV4 signing,
-//! ListObjectsV2 parsing, short-lived metadata caches, and bounded ranged-read
+//! [`S3Client`] owns all S3-specific behavior: addressing, `SigV4` signing,
+//! `ListObjectsV2` parsing, short-lived metadata caches, and bounded ranged-read
 //! caching. The VMM only exchanges the compact proxy protocol defined by its
 //! remote filesystem device.
 
@@ -27,6 +27,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK_SIZE: usize = 1 << 20;
 const CHUNK_CACHE_CAP: usize = 256 << 20;
 const MAX_LIST_ENTRIES: usize = 100_000;
+type ListCacheEntry = (Instant, Arc<Vec<ObjEntry>>);
+type ListCache = HashMap<String, ListCacheEntry>;
+
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 /// Resolved S3 connection settings for one sandbox mount.
@@ -94,7 +97,7 @@ pub enum S3Error {
 	NotFound,
 	/// Credentials lack access to the requested resource.
 	Access,
-	/// The object ETag changed during a ranged read.
+	/// The object `ETag` changed during a ranged read.
 	Stale,
 	/// The caller supplied an invalid S3 request.
 	BadRequest,
@@ -149,7 +152,7 @@ pub struct ObjEntry {
 	pub size:  u64,
 	/// Last modification time as Unix seconds.
 	pub mtime: u64,
-	/// Object ETag, absent for directories.
+	/// Object `ETag`, absent for directories.
 	pub etag:  Option<String>,
 }
 
@@ -162,7 +165,7 @@ pub struct ObjStat {
 	pub size:  u64,
 	/// Last modification time as Unix seconds.
 	pub mtime: u64,
-	/// Object ETag, absent for directories.
+	/// Object `ETag`, absent for directories.
 	pub etag:  Option<String>,
 }
 
@@ -170,7 +173,7 @@ pub struct ObjStat {
 pub struct S3Client {
 	http:       reqwest::Client,
 	cfg:        S3MountConfig,
-	list_cache: Mutex<HashMap<String, (Instant, Arc<Vec<ObjEntry>>)>>,
+	list_cache: Mutex<ListCache>,
 	chunks:     Mutex<ChunkLru>,
 }
 
@@ -249,12 +252,12 @@ impl S3Client {
 		Ok(Self {
 			http,
 			cfg,
-			list_cache: Mutex::new(HashMap::new()),
+			list_cache: Mutex::new(ListCache::new()),
 			chunks: Mutex::new(ChunkLru { entries: HashMap::new(), bytes: 0, clock: 0 }),
 		})
 	}
 
-	/// Verifies bucket access with a one-key ListObjectsV2 request.
+	/// Verifies bucket access with a one-key `ListObjectsV2` request.
 	pub async fn probe(&self) -> std::result::Result<(), S3Error> {
 		let prefix = self.list_prefix("")?;
 		self.list_page(&prefix, None, 1).await.map(|_| ())
@@ -386,7 +389,8 @@ impl S3Client {
 		size: u64,
 	) -> std::result::Result<Bytes, S3Error> {
 		let key = ChunkKey { path: path.to_owned(), etag: etag.to_owned(), index };
-		if let Some(chunk) = self.chunks.lock().get(&key) {
+		let cached_chunk = self.chunks.lock().get(&key);
+		if let Some(chunk) = cached_chunk {
 			return Ok(chunk);
 		}
 		let start = index.saturating_mul(CHUNK_SIZE as u64);
@@ -787,10 +791,12 @@ mod sigv4 {
 	) -> String {
 		let mut headers = headers.to_vec();
 		headers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-		let canonical_headers = headers
-			.iter()
-			.map(|(name, value)| format!("{name}:{}\n", normalize_header(value)))
-			.collect::<String>();
+		use std::fmt::Write as _;
+
+		let mut canonical_headers = String::new();
+		for (name, value) in &headers {
+			let _ = writeln!(canonical_headers, "{name}:{}", normalize_header(value));
+		}
 		let signed_headers = headers
 			.iter()
 			.map(|(name, _)| name.as_str())
@@ -886,13 +892,13 @@ mod tests {
 	#[test]
 	fn parses_truncated_listing_xml_and_merges_directory_over_file() {
 		let page: ListBucketResult = from_str(
-			r#"<ListBucketResult>
+			r"<ListBucketResult>
 				<IsTruncated>true</IsTruncated>
 				<NextContinuationToken>next-token</NextContinuationToken>
 				<Contents><Key>prefix/a.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;a&quot;</ETag><Size>5</Size></Contents>
 				<Contents><Key>prefix/dir</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;file-dir&quot;</ETag><Size>7</Size></Contents>
 				<CommonPrefixes><Prefix>prefix/dir/</Prefix></CommonPrefixes>
-			</ListBucketResult>"#,
+			</ListBucketResult>",
 		)
 		.expect("valid ListObjectsV2 fixture");
 		assert!(page.is_truncated);

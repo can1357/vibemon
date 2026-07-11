@@ -33,7 +33,7 @@ use super::{
 	store::Store,
 };
 use crate::{
-	engine::{EngineApi, ExecRequest, ExecStream},
+	engine::{EngineApi, ExecRequest},
 	home::Home,
 	models::{RestoreBody, SandboxCreate},
 };
@@ -42,6 +42,7 @@ const RUNNER: &[u8] = include_bytes!("runner.py");
 const RUNNER_PATH: &str = "/opt/vmon/runner.py";
 const PACKAGE_PATH: &str = "/opt/vmon/functions/package.zip";
 const SOCKET_PATH: &str = "/run/vmon/function-v2.sock";
+const DETACHED_RUNNER: &str = "import os,sys\npid=os.fork()\nif pid:\n os._exit(0)\nos.setsid()\nnull=os.open('/dev/null',os.O_RDWR)\nlog=os.open('/tmp/vmon-function-runner.log',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\nos.dup2(null,0)\nos.dup2(log,1)\nos.dup2(log,2)\nos.closerange(3,256)\nos.execv(sys.executable,[sys.executable,sys.argv[1],'--socket',sys.argv[2]])";
 const DEFAULT_STARTUP: Duration = Duration::from_mins(1);
 const DEFAULT_EXECUTION: Duration = Duration::from_mins(5);
 const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
@@ -667,7 +668,6 @@ struct EngineWorker {
 	home:                 Home,
 	engine:               Arc<dyn EngineApi>,
 	session:              ProtocolSession,
-	_bootstrap:           Mutex<Option<ExecStream>>,
 	capacity:             usize,
 	active:               Arc<Mutex<HashMap<String, Interruptibility>>>,
 	closed:               Arc<AtomicBool>,
@@ -756,24 +756,24 @@ impl EngineWorker {
 				move || engine.file_write(&id, PACKAGE_PATH, &artifact)
 			})
 			.await?;
-			let (bootstrap, session) = start_and_connect(
+			let session = start_and_connect(
 				Arc::clone(&engine),
 				&id,
 				remaining(startup_deadline)?,
 				protocol_requirements,
 			)
 			.await?;
-			Ok::<_, WorkerError>((bootstrap, session))
+			Ok::<_, WorkerError>(session)
 		}
 		.await;
-		let (bootstrap, session) = match prepared {
-			Ok(value) => value,
+		let session = match prepared {
+			Ok(session) => session,
 			Err(error) => {
 				let e = Arc::clone(&engine);
 				let n = id.clone();
 				let _ = tokio::task::spawn_blocking(move || e.remove(&n)).await;
 				return Err(error);
-			},
+			}
 		};
 		let worker = Arc::new(Self {
 			id,
@@ -782,7 +782,6 @@ impl EngineWorker {
 			home,
 			engine,
 			session,
-			_bootstrap: Mutex::new(Some(bootstrap)),
 			capacity: worker_capacity(spec),
 			max_batch_size: batch_capacity(spec),
 			async_interruptible: AtomicBool::new(false),
@@ -911,7 +910,6 @@ impl EngineWorker {
 			home,
 			engine,
 			session,
-			_bootstrap: Mutex::new(None),
 			capacity,
 			max_batch_size: batch_capacity(spec),
 			async_interruptible: AtomicBool::new(false),
@@ -1127,14 +1125,13 @@ impl EngineWorker {
 				"actor state must use uncompressed checkpoint bytes",
 			));
 		}
-		let python = match envelope.python_presence.as_ref() {
-			Some(pb::value_envelope::PythonPresence::Python(python)) => python,
-			None => {
-				return Err(WorkerError::platform(
-					"invalid_actor_state",
-					"actor state is missing Python ABI metadata",
-				));
-			},
+		let Some(pb::value_envelope::PythonPresence::Python(python)) =
+			envelope.python_presence.as_ref()
+		else {
+			return Err(WorkerError::platform(
+				"invalid_actor_state",
+				"actor state is missing Python ABI metadata",
+			));
 		};
 		let expected_abi = self
 			.revision
@@ -1596,7 +1593,8 @@ impl Worker for EngineWorker {
 					cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths);
 				})
 				.await;
-				if let Some(error) = event_error.lock().take() {
+				let event_error = event_error.lock().take();
+				if let Some(error) = event_error {
 					return Err(error);
 				}
 				let stats = AttemptStats {
@@ -1828,7 +1826,7 @@ impl Worker for EngineWorker {
 	}
 }
 
-fn engine_architecture(architecture: pb::CpuArchitecture) -> Option<&'static str> {
+const fn engine_architecture(architecture: pb::CpuArchitecture) -> Option<&'static str> {
 	match architecture {
 		pb::CpuArchitecture::Amd64 => Some("x86_64"),
 		pb::CpuArchitecture::Arm64 => Some("aarch64"),
@@ -1907,20 +1905,25 @@ async fn start_and_connect(
 	id: &str,
 	timeout: Duration,
 	requirements: ProtocolRequirements,
-) -> Result<(ExecStream, ProtocolSession), WorkerError> {
-	let bootstrap = blocking(timeout, {
+) -> Result<ProtocolSession, WorkerError> {
+	blocking(timeout, {
 		let engine = Arc::clone(&engine);
 		let id = id.to_owned();
 		move || {
-			engine.exec_stream(&id, ExecRequest {
-				cmd: vec!["python3".into(), RUNNER_PATH.into(), "--socket".into(), SOCKET_PATH.into()],
+			engine.exec_capture(&id, ExecRequest {
+				cmd: vec![
+					"python3".into(),
+					"-c".into(),
+					DETACHED_RUNNER.into(),
+					RUNNER_PATH.into(),
+					SOCKET_PATH.into(),
+				],
 				..ExecRequest::default()
 			})
 		}
 	})
 	.await?;
-	let session = connect_existing(engine, id, timeout, requirements).await?;
-	Ok((bootstrap, session))
+	connect_existing(engine, id, timeout, requirements).await
 }
 async fn connect_existing(
 	engine: Arc<dyn EngineApi>,

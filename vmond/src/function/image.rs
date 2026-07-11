@@ -766,9 +766,7 @@ fn validate_local_oci_reference(home: &Home, reference: &str) -> Result<()> {
 		.or_else(|| {
 			body
 				.match_indices(':')
-				.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok())
-				.filter(|path| path.is_dir())
-				.next_back()
+				.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok()).rfind(|path| path.is_dir())
 		})
 		.ok_or_else(|| EngineError::not_found("resolved local OCI cache entry is missing"))?;
 	let owned = [home.root().join("builds"), home.images_dir()]
@@ -1062,7 +1060,7 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 	Ok(())
 }
 
-fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static str> {
+const fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static str> {
 	match architecture {
 		pb::CpuArchitecture::Amd64 => Ok("amd64"),
 		pb::CpuArchitecture::Arm64 => Ok("arm64"),
@@ -1071,7 +1069,7 @@ fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static str> 
 			return Ok("amd64");
 			#[cfg(target_arch = "aarch64")]
 			return Ok("arm64");
-			#[allow(unreachable_code)]
+			#[allow(unreachable_code, reason = "native targets return above; fallback supports future targets")]
 			Err(EngineError::unsupported(
 				"server compile-target architecture is unsupported for function images",
 			))
@@ -1514,10 +1512,11 @@ mod tests {
 	fn template_arch_and_secret_rejections_are_actionable() {
 		let (_temp, home) = home();
 		let revision = hex::encode([5u8; 32]);
+		let expected_template = format!("warm@{revision}");
 		let template = pb::ImageSpec {
 			source: Some(pb::image_spec::Source::Template(pb::TemplateImageSource {
 				name:     "warm".into(),
-				revision: revision.clone(),
+				revision,
 			})),
 			..Default::default()
 		};
@@ -1527,7 +1526,7 @@ mod tests {
 			pb::CpuArchitecture::Amd64
 		};
 		let realized = realize_with(&FakeBackend::new(5), &home, &template, architecture).unwrap();
-		assert_eq!(realized.template.as_deref(), Some(format!("warm@{revision}").as_str()));
+		assert_eq!(realized.template.as_deref(), Some(expected_template.as_str()));
 		let wrong = FakeBackend {
 			digest:      hex::encode([1u8; 32]),
 			arch:        "arm64",

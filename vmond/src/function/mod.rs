@@ -1159,6 +1159,7 @@ impl FunctionDomain {
 							.await
 						{
 							Err(error) if !error.retryable => {
+								tracing::warn!(%error, revision_id = %queued.revision_id, "function snapshot restore rejected; falling back to cold start");
 								let revision_id = revision
 									.r#ref
 									.as_ref()
@@ -1224,16 +1225,20 @@ impl FunctionDomain {
 				}
 			}
 			let Some(worker_id) = worker_id else { continue };
-			let Some(worker) = self.workers.lock().get(&worker_id).cloned() else {
-				if let Some(pool) = self.pools.lock().get_mut(&queued.revision_id) {
+			let worker = self.workers.lock().get(&worker_id).cloned();
+			let Some(worker) = worker else {
+				let mut pools = self.pools.lock();
+				if let Some(pool) = pools.get_mut(&queued.revision_id) {
 					pool.abandon(&worker_id, now);
 				}
 				continue;
 			};
 			if !worker.is_reusable() {
-				if let Some(pool) = self.pools.lock().get_mut(&queued.revision_id) {
+				let mut pools = self.pools.lock();
+				if let Some(pool) = pools.get_mut(&queued.revision_id) {
 					pool.remove_worker(&worker_id);
 				}
+				drop(pools);
 				self.workers.lock().remove(&worker_id);
 				self.worker_startup.lock().remove(&worker_id);
 				self.metrics.worker_retired();
@@ -1281,7 +1286,9 @@ impl FunctionDomain {
 							continue;
 						},
 						Ok(_) => {},
-						Err(error) => tracing::warn!(%error, "dynamic batch lease failed"),
+						Err(error) => {
+							tracing::warn!(%error, "dynamic batch lease failed");
+						},
 					}
 				}
 			}
@@ -1969,7 +1976,9 @@ impl FunctionDomain {
 		};
 		match committed {
 			Ok(event) => self.publish_call_event(event),
-			Err(error) => tracing::warn!(%error, "worker event commit failed"),
+			Err(error) => {
+				tracing::warn!(%error, "worker event commit failed");
+			},
 		}
 	}
 
@@ -2044,23 +2053,26 @@ impl FunctionDomain {
 				.get(worker_id)
 				.is_some_and(|worker| worker.is_reusable());
 		let now = unix_millis();
-		if let Some(revision_id) = leased
+		let revision_id = leased
 			.revision
 			.r#ref
 			.as_ref()
-			.map(|reference| reference.revision_id.as_str())
-			&& let Some(pool) = self.pools.lock().get_mut(revision_id)
-		{
-			pool.complete(worker_id, now);
-			if !reusable {
-				pool.remove_worker(worker_id);
+			.map(|reference| reference.revision_id.as_str());
+		if let Some(revision_id) = revision_id {
+			let mut pools = self.pools.lock();
+			if let Some(pool) = pools.get_mut(revision_id) {
+				pool.complete(worker_id, now);
+				if !reusable {
+					pool.remove_worker(worker_id);
+				}
 			}
 		}
 		if reusable {
 			return;
 		}
 		self.worker_startup.lock().remove(worker_id);
-		if let Some(worker) = self.workers.lock().remove(worker_id) {
+		let worker = self.workers.lock().remove(worker_id);
+		if let Some(worker) = worker {
 			self.metrics.worker_retired();
 			tokio::spawn(async move {
 				let _ = worker.retire().await;
@@ -2285,7 +2297,7 @@ async fn retire_worker_ordered(
 				}
 			},
 			Err(error) => {
-				tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot capture failed")
+				tracing::warn!(%error, worker_id = worker.id(), "worker-retire snapshot capture failed");
 			},
 		}
 	}
@@ -2430,11 +2442,11 @@ mod tests {
 	}
 
 	impl Worker for OrderedRetireWorker {
-		fn id(&self) -> &str {
+		fn id(&self) -> &'static str {
 			"ordered-retire"
 		}
 
-		fn revision_id(&self) -> &str {
+		fn revision_id(&self) -> &'static str {
 			"revision"
 		}
 

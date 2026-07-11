@@ -284,13 +284,12 @@ impl Store {
 		let snapshot_id = revision
 			.snapshot_presence
 			.as_ref()
-			.map(|presence| match presence {
+			.and_then(|presence| match presence {
 				function_revision::SnapshotPresence::Snapshot(record) => record
 					.r#ref
 					.as_ref()
 					.map(|reference| reference.snapshot_id.clone()),
-			})
-			.flatten();
+			});
 		revision.snapshot_presence = None;
 		tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
 			revision.encode_to_vec(),
@@ -476,7 +475,7 @@ impl Store {
 		}
 		let digest = digest_bindings(&bindings);
 		let mut canonical_request = request.clone();
-		canonical_request.functions = bindings.clone();
+		canonical_request.functions.clone_from(&bindings);
 		canonical_request.request_id.clear();
 		let fingerprint = canonical_request.encode_to_vec();
 		let mut connection = self.connection.lock().map_err(lock_error)?;
@@ -5269,7 +5268,7 @@ mod tests {
 		assert_eq!(store.activate_app(&first_request, 21).unwrap(), first);
 		let colliding_other_app = ActivateAppRequest {
 			app: Some(app_b.clone()),
-			functions: vec![binding.clone()],
+			functions: vec![binding],
 			expected_current_presence: None,
 			request_id: "shared-command-id".into(),
 		};
@@ -5314,7 +5313,7 @@ mod tests {
 			functions: vec![],
 			expected_current_presence: Some(
 				activate_app_request::ExpectedCurrentPresence::ExpectedCurrent(
-					first.r#ref.clone().unwrap(),
+					first.r#ref.unwrap(),
 				),
 			),
 			request_id: "redeploy-a".into(),
@@ -5390,7 +5389,7 @@ mod tests {
 		let fork_replay = store
 			.fork_actor_from_checkpoint(
 				&ForkActorRequest {
-					checkpoint: checkpoint.r#ref.clone(),
+					checkpoint: checkpoint.r#ref,
 					request_id: "fork".into(),
 					labels:     Default::default(),
 				},

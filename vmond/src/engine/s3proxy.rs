@@ -155,16 +155,16 @@ async fn serve_connection(
 			},
 			Err(error) => return Err(error),
 		};
-		let (response_ty, response) = if ty != proto::REQ {
-			error_response("bad_request", "expected S3 proxy request frame")?
-		} else {
-			match serde_json::from_slice::<proto::Request>(&payload) {
-				Ok(request) => dispatch(request, &mounts).await?,
-				Err(error) => {
-					error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?
-				},
-			}
-		};
+		let (response_ty, response) = if ty == proto::REQ {
+  			match serde_json::from_slice::<proto::Request>(&payload) {
+  				Ok(request) => dispatch(request, &mounts).await?,
+  				Err(error) => {
+  					error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?
+  				},
+  			}
+  		} else {
+  			error_response("bad_request", "expected S3 proxy request frame")?
+  		};
 		write_frame(&mut stream, response_ty, id, &response).await?;
 	}
 }
@@ -219,7 +219,7 @@ async fn dispatch(
 	}
 }
 
-fn obj_kind(kind: ObjKind) -> proto::Kind {
+const fn obj_kind(kind: ObjKind) -> proto::Kind {
 	match kind {
 		ObjKind::File => proto::Kind::File,
 		ObjKind::Dir => proto::Kind::Dir,
@@ -342,7 +342,7 @@ mod tests {
 		let (status, body) = if request.starts_with("GET /bucket?") {
 			(
 				"200 OK",
-				r#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>5</Size></Contents></ListBucketResult>"#.as_bytes(),
+				r"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>5</Size></Contents></ListBucketResult>".as_bytes(),
 			)
 		} else if request.starts_with("GET /bucket/a.txt") {
 			assert!(request.contains("Range: bytes=0-4") || request.contains("range: bytes=0-4"));
