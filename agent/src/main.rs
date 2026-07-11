@@ -961,10 +961,7 @@ mod linux_agent {
 			if rc != 0 {
 				self.send_error(
 					id,
-					format!(
-						"mount_overlay lower {tag} -> {lower}: {}",
-						io::Error::last_os_error()
-					),
+					format!("mount_overlay lower {tag} -> {lower}: {}", io::Error::last_os_error()),
 				);
 				return;
 			}

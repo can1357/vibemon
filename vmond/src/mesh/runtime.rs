@@ -41,6 +41,7 @@ use crate::{
 	EngineError, ErrorCode, Result,
 	config::ServeConfig,
 	engine::{Engine, EngineApi},
+	function::store::Store as FunctionStore,
 	home::Home,
 	image::cas,
 	models::SandboxCreate,
@@ -60,6 +61,7 @@ pub struct MeshRuntime {
 	engine:             MeshEngineAdapter,
 	records:            record::RecordStore,
 	replicas:           replica::ReplicaStore,
+	function_store:     FunctionStore,
 	leases:             lease::LeaseManager,
 	owners:             RwLock<BTreeMap<String, (String, u64)>>,
 	orphans:            Mutex<Vec<(String, String)>>,
@@ -91,6 +93,7 @@ impl MeshRuntime {
 		records.load();
 		let replicas = replica::ReplicaStore::for_home(home.clone());
 		replicas.load();
+		let function_store = FunctionStore::open(&home)?;
 		let leases = lease::LeaseManager::for_home(home);
 		let (compat_backend, compat_arch) = state::probe_compat();
 		let cpu_baseline = state::probe_cpu_baseline();
@@ -110,6 +113,7 @@ impl MeshRuntime {
 			engine: MeshEngineAdapter::new(engine),
 			records,
 			replicas,
+			function_store,
 			leases,
 			owners: RwLock::new(owners),
 			orphans: Mutex::new(Vec::new()),
@@ -238,6 +242,10 @@ impl MeshRuntime {
 		state.backend.clone_from(&self.compat_backend);
 		state.arch.clone_from(&self.compat_arch);
 		state.cpu_baseline.clone_from(&self.cpu_baseline);
+		state.function_artifacts = self
+			.function_store
+			.placement_artifact_digests(4096)
+			.unwrap_or_default();
 
 		for view in self.engine.list_views().unwrap_or_default() {
 			let Some(object) = view.as_object() else {

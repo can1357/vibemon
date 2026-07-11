@@ -28,6 +28,7 @@ All notable changes to this project are recorded here.
 - Dropped all support for legacy snapshots older than the current snapshot format; previous snapshots must be recaptured.
 
 ### Added
+- Added lazy S3 bucket mounts: `SandboxCreate.s3_mounts` exposes `s3://bucket/prefix` through a per-VM object proxy and read-only remote virtio-fs device, with volatile guest overlay writes, inline/env/anonymous credentials, and MinIO/R2-compatible endpoint overrides.
 
 - Added support for configuring S3 bucket or prefix mounts via `s3_mounts` in Go, Python, and TS SDKs
 - Added support for overlay filesystem mounts in sandbox environments

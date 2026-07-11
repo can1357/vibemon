@@ -168,13 +168,13 @@ pub fn place_function_worker(
 					hints
 						.snapshot_digest
 						.as_ref()
-						.is_some_and(|digest| node.templates.contains(digest)),
+						.is_some_and(|digest| node.function_artifacts.contains(digest)),
 				),
 				u8::from(
 					hints
 						.artifact_digest
 						.as_ref()
-						.is_some_and(|digest| node.templates.contains(digest)),
+						.is_some_and(|digest| node.function_artifacts.contains(digest)),
 				),
 				node.free_vcpus(),
 				node.free_mem_mib(),
@@ -626,7 +626,7 @@ mod tests {
 		let cold = placement_node("cold", "zone-a", "aarch64");
 		let mut warm = placement_node("warm", "zone-b", "aarch64");
 		warm.caps = crate::mesh::state::NodeCaps::new(1, 512);
-		warm.templates.push("sha256:snapshot".into());
+		warm.function_artifacts.push("sha256:snapshot".into());
 		let owner = place_function_worker(
 			"revision-1",
 			PlacementSpread::None,
@@ -635,6 +635,23 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(owner, "warm");
+	}
+
+	#[test]
+	fn package_artifact_locality_precedes_capacity() {
+		let cold = placement_node("cold", "zone-a", "aarch64");
+		let mut cached = placement_node("cached", "zone-b", "aarch64");
+		cached.caps = crate::mesh::state::NodeCaps::new(1, 512);
+		cached.function_artifacts.push("package".into());
+		let cached = NodeState::from_wire(&cached.to_wire()).unwrap();
+		let owner = place_function_worker(
+			"revision-1",
+			PlacementSpread::None,
+			&PlacementHints { artifact_digest: Some("package".into()), ..Default::default() },
+			&[cold, cached],
+		)
+		.unwrap();
+		assert_eq!(owner, "cached");
 	}
 
 	#[test]

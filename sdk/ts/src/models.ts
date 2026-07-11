@@ -17,7 +17,6 @@ export interface S3MountSpec {
   session_token?: string;
 }
 
-
 /** Sandbox creation request accepted by the gRPC create operation. */
 export interface SandboxCreateRequest {
   arch?: string | null;

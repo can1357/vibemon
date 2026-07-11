@@ -145,8 +145,6 @@ def _s3_mount_wire(
     return wire
 
 
-
-
 def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "image",

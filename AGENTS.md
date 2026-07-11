@@ -5,7 +5,7 @@
 Vibemon (`vmon`) is a small KVM/HVF-based Linux microVM monitor. One Rust binary owns the user CLI, `vmon serve` HTTP/WebSocket server (`vmond` crate), and low-level `vmon vmm` per-VM monitor (`vmm` crate). Python and TypeScript are thin client SDKs for the Rust API.
 
 - **Platforms:** Linux + KVM (`x86_64`, `aarch64`); macOS 15+ Apple Silicon + HVF (`aarch64` guests only). Backend is selected at compile time — there is no runtime switch, and `x86_64` macOS is unsupported.
-- **Capabilities:** direct-kernel and UEFI boot, virtio devices (blk/net/console/fs), snapshot / restore / fork with copy-on-write, in-process sandboxing (seccomp + Landlock + jailer), warm pools, secrets, volumes, egress control, PTY exec, and metrics.
+- **Capabilities:** direct-kernel and UEFI boot, virtio devices (blk/net/console/fs), snapshot / restore / fork with copy-on-write, in-process sandboxing (seccomp + Landlock + jailer), warm pools, secrets, volumes, lazy S3 mounts, egress control, PTY exec, and metrics.
 
 ## Architecture & Data Flow
 
@@ -37,7 +37,7 @@ vmon-agent (guest agent, Linux guest only)
   - `vmm/src/os/` — OS primitives (`EventFd`: real `eventfd(2)` on Linux, pipe-backed shim on macOS).
   - `vmm/src/devices/`, `vmm/src/snapshot/`.
 - `proto/` — `vmon-proto` crate and the API contract: `vmon/v1/api.proto` (five gRPC services; the ONLY API) and `vmon/v1/bridge.proto` (browser WS bridge framing). Rust code generates at build time via protox + tonic; client codegen is checked in.
-- `vmond/` — Rust server/engine crate used by `vmon serve`: gRPC services (`api/grpc.rs`), WS bridge (`api/bridge.rs`), remaining HTTP surfaces (healthz, metrics, ports proxy, static UI), registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
+- `vmond/` — Rust server/engine crate used by `vmon serve`: gRPC services (`api/grpc.rs`), WS bridge (`api/bridge.rs`), remaining HTTP surfaces (healthz, metrics, ports proxy, static UI), registry, image pipeline, mesh, pools, volumes, lazy S3 access (`s3.rs`, `engine/s3proxy.rs`), and VM spawn/control.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
 - `sdk/py/vmon/` — thin Python SDK only (`_endpoint.py`, `client.py`, `driver.py`, `process.py`, `sandbox.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `v1/` generated protobuf/gRPC code, `__init__.py`).

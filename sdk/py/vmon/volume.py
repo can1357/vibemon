@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 _NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
 
+
 @dataclass(frozen=True, slots=True)
 class S3Mount:
     """An S3 bucket or prefix mounted into a sandbox create request."""
@@ -34,8 +35,6 @@ class S3Mount:
             if value is not None:
                 wire[key] = value
         return wire
-
-
 
 
 class Volume:

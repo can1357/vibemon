@@ -877,10 +877,9 @@ mod tests {
 			"us-east-1",
 			&credentials,
 		);
-		assert!(
-			authorization.ends_with(
-				"Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
-			)
+		assert_eq!(
+			authorization.split("Signature=").nth(1),
+			Some("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 		);
 	}
 
