@@ -8,9 +8,11 @@ version = "0.3.0"
 description = "Thin Python SDK for the Rust vmon API"
 requires-python = ">=3.14"
 dependencies = [
+    "cbor2>=5.7",
+    "cloudpickle>=3.1",
     "grpcio>=1.66",
     "httpx>=0.28",
-    "protobuf>=6",
+    "protobuf>=7.35.1",
 ]
 
 [project.optional-dependencies]
