@@ -1281,13 +1281,26 @@ fn two_node_migrate_moves_running_sandbox() {
 		assert_eq!(exit, 0, "writing markers failed stdout={stdout:?} stderr={stderr:?}");
 
 		let migrate_path = format!("/v1/sandboxes/{}/migrate", percent_encode(&sid));
-		source.api_json(
+		let migrated = source.api_json(
 			"POST",
 			&migrate_path,
 			Some(&json!({"target": target_node})),
 			&[],
 			BOOT_TIMEOUT,
 		);
+		let timing = migrated
+			.get("migration")
+			.unwrap_or_else(|| panic!("migrate response missing timing object: {migrated}"));
+		let downtime_ms = timing
+			.get("downtime_ms")
+			.and_then(Value::as_u64)
+			.expect("downtime_ms");
+		let total_ms = timing
+			.get("total_ms")
+			.and_then(Value::as_u64)
+			.expect("total_ms");
+		assert!(downtime_ms > 0, "guest blackout must be measured: {timing}");
+		assert!(downtime_ms <= total_ms, "downtime {downtime_ms}ms cannot exceed total {total_ms}ms");
 
 		let moved =
 			eventually("migrated sandbox to run on target", RESTORE_TIMEOUT, POLL_INTERVAL, || {

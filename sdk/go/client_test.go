@@ -295,7 +295,8 @@ func TestExtendAndMigrateResponses(t *testing.T) {
 		case "/v1/sandboxes/box/migrate":
 			_, _ = io.WriteString(
 				writer,
-				`{"accepted":true,"migration_id":"migration-1","owner":"node-b"}`,
+				`{"id":"box","name":"box","status":"running","node":"node-b",`+
+					`"migration":{"precopy_ms":1200,"downtime_ms":85,"total_ms":1420}}`,
 			)
 		default:
 			writer.WriteHeader(http.StatusNotFound)
@@ -319,10 +320,13 @@ func TestExtendAndMigrateResponses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated["accepted"] != true ||
-		migrated["migration_id"] != "migration-1" ||
-		migrated["owner"] != "node-b" {
-		t.Fatalf("migrate result = %#v", migrated)
+	if migrated.Sandbox.Name != "box" || migrated.Sandbox.Status != "running" {
+		t.Fatalf("migrate sandbox view = %#v", migrated.Sandbox)
+	}
+	if migrated.Migration.PrecopyMS != 1200 ||
+		migrated.Migration.DowntimeMS != 85 ||
+		migrated.Migration.TotalMS != 1420 {
+		t.Fatalf("migrate timings = %#v", migrated.Migration)
 	}
 
 	if got, want := <-requests, `POST /v1/sandboxes/box/extend {"secs":45}`; got != want {
