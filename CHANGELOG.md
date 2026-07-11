@@ -167,6 +167,7 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated remote function error reporting to include full stack trace context in error objects
 - Updated durable function runner to use bidirectional protocol handshake for capability discovery
 - Refined checkpointing to include granular timing metrics for snapshot, stamp, and indexing steps
 - Updated SQLite schema to version 5 for improved durable execution tracking
