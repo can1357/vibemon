@@ -70,6 +70,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import vmon
+from e2e_remote import RemoteCounter, remote_add, remote_double, remote_shift, remote_ticks
 from vmon import (
     APIError,
     Client,
@@ -82,7 +83,6 @@ from vmon import (
     Volume,
     connect,
 )
-from e2e_remote import RemoteCounter, remote_add, remote_double, remote_shift, remote_ticks
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
 RUN = f"e2e{os.getpid()}"
@@ -1023,32 +1023,38 @@ def _py_image() -> vmon.Image:
     return vmon.Image.from_registry(os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"))
 
 
-vmon.enter(RemoteCounter._mark)
-vmon.method(RemoteCounter.bump)
-vmon.exit(RemoteCounter._farewell)
-
-
-_RemoteCounter = vmon.cls(
-    RemoteCounter,
-    options=vmon.FunctionOptions(
-        image=_py_image(),
+def _function_options(
+    *,
+    serializer: SerializerPolicy | None = None,
+    min_workers: int = 0,
+) -> vmon.FunctionOptions:
+    selected_serializer = serializer or SerializerPolicy()
+    image = _py_image()
+    if ValueCodec.CLOUDPICKLE in (
+        selected_serializer.input_serializer,
+        selected_serializer.result_serializer,
+    ):
+        image = image.uv_install("cloudpickle==3.1.2")
+    return vmon.FunctionOptions(
+        image=image,
+        timeouts=vmon.TimeoutPolicy(execution=120),
+        workers=vmon.WorkerPolicy(min_workers=min_workers),
+        serializer=selected_serializer,
         resources=vmon.ResourcePolicy(
             network=vmon.NetworkPolicy(block_network=True),
         ),
-    ),
-)
+    )
+
+
+_RemoteCounter = vmon.cls(options=_function_options())(RemoteCounter)
 
 
 @e2e
 def t_remote_function(_):
     """Durable calls preserve warm execution and structured remote failures."""
-    remote = vmon.function(
+    remote = sdk().function(
         remote_double,
-        client=sdk(),
-        image=_py_image(),
-        block_network=True,
-        execution_timeout=120,
-        min_workers=1,
+        options=_function_options(min_workers=1),
     )
     cold_started = time.monotonic()
     assert remote.remote(21) == 42
@@ -1073,16 +1079,14 @@ def t_remote_function_rich_args(_):
     """Explicit trusted-Python serialization preserves rich Python values."""
     import datetime
 
-    remote = vmon.function(
+    remote = sdk().function(
         remote_shift,
-        client=sdk(),
-        image=_py_image().uv_install("cloudpickle==3.1.2"),
-        block_network=True,
-        execution_timeout=120,
-        serializer=SerializerPolicy(
-            input_serializer=ValueCodec.CLOUDPICKLE,
-            result_serializer=ValueCodec.CLOUDPICKLE,
-            allow_trusted_python=True,
+        options=_function_options(
+            serializer=SerializerPolicy(
+                input_serializer=ValueCodec.CLOUDPICKLE,
+                result_serializer=ValueCodec.CLOUDPICKLE,
+                allow_trusted_python=True,
+            )
         ),
     )
     stamp = datetime.datetime(2026, 7, 11, 8, 30, 0)
@@ -1094,12 +1098,9 @@ def t_remote_function_rich_args(_):
 @e2e
 def t_remote_function_stream(_):
     """Durable generator yields arrive incrementally."""
-    remote = vmon.function(
+    remote = sdk().function(
         remote_ticks,
-        client=sdk(),
-        image=_py_image(),
-        block_network=True,
-        execution_timeout=120,
+        options=_function_options(),
     )
     started = time.monotonic()
     arrivals: list[tuple[int, float]] = []
@@ -1115,12 +1116,9 @@ def t_remote_function_stream(_):
 @e2e
 def t_remote_function_spawn_map(_):
     """Detached calls reconstruct by ID and lazy maps preserve input order."""
-    remote = vmon.function(
+    remote = sdk().function(
         remote_add,
-        client=sdk(),
-        image=_py_image(),
-        block_network=True,
-        execution_timeout=120,
+        options=_function_options(),
     )
     first = remote.spawn(1, 2)
     second = remote.spawn(30, 12)

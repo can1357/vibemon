@@ -841,7 +841,7 @@ class BatchCall[R]:
                                 raise
                             record = self._call.get_record()
                         if self._feeder_errors:
-                            raise self._feeder_errors[0]
+                            raise self._feeder_errors[0] from None
                         if record.status not in _TERMINAL:
                             time.sleep(0.02)
                             continue
@@ -865,7 +865,7 @@ class BatchCall[R]:
                             if return_exceptions:
                                 yield cast(R, failure)
                                 return
-                            raise failure
+                            raise failure from None
                         return
                     try:
                         value = _result_value(
@@ -1229,7 +1229,11 @@ class _AsyncBatchCall[R]:
                                     timeout=deadline,
                                 )
                             except grpc.RpcError as record_error:
-                                if record_error.code() != grpc.StatusCode.NOT_FOUND:
+                                owner_missing = record_error.code() == grpc.StatusCode.NOT_FOUND
+                                if not owner_missing and not _reconnectable_rpc(record_error):
+                                    raise
+                                failures += 1
+                                if failures > 5:
                                     raise
                                 resolver = getattr(
                                     self._call._client.driver,
@@ -1237,18 +1241,22 @@ class _AsyncBatchCall[R]:
                                     None,
                                 )
                                 if not callable(resolver):
-                                    raise
-                                try:
-                                    self._call._endpoint = await _run_blocking(
-                                        resolver,
-                                        self._call.id,
-                                        self._call._endpoint,
-                                    )
-                                except TypeError:
-                                    self._call._endpoint = await _run_blocking(
-                                        resolver,
-                                        self._call.id,
-                                    )
+                                    if owner_missing:
+                                        raise
+                                else:
+                                    try:
+                                        self._call._endpoint = await _run_blocking(
+                                            resolver,
+                                            self._call.id,
+                                            self._call._endpoint,
+                                        )
+                                    except TypeError:
+                                        self._call._endpoint = await _run_blocking(
+                                            resolver,
+                                            self._call.id,
+                                        )
+                                if not owner_missing:
+                                    await asyncio.sleep(min(0.05 * (2 ** (failures - 1)), 1.0))
                                 continue
                             failures = 0
                             if record.status not in _TERMINAL:
@@ -1276,7 +1284,7 @@ class _AsyncBatchCall[R]:
                                 if return_exceptions:
                                     yield cast(R, failure)
                                     return
-                                raise failure
+                                raise failure from None
                             return
                         if not _reconnectable_rpc(error):
                             raise

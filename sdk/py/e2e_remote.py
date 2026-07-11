@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 
 def remote_double(value: int) -> int:
@@ -31,6 +31,24 @@ def remote_add(a: int, b: int) -> int:
     return a + b
 
 
+def _tag[F: Callable[..., object]](fn: F, **attributes: object) -> F:
+    for name, value in attributes.items():
+        setattr(fn, name, value)
+    return fn
+
+
+def _method[F: Callable[..., object]](fn: F) -> F:
+    return _tag(fn, __vmon_method__=True)
+
+
+def _enter[F: Callable[..., object]](fn: F) -> F:
+    return _tag(fn, __vmon_enter__=True, __vmon_snapshot_enter__=False)
+
+
+def _exit[F: Callable[..., object]](fn: F) -> F:
+    return _tag(fn, __vmon_exit__=True)
+
+
 class RemoteCounter:
     """Stateful actor used by the real-VM SDK smoke test."""
 
@@ -38,13 +56,16 @@ class RemoteCounter:
         self.value: int = start
         self.entered: bool = False
 
+    @_enter
     def _mark(self) -> None:
         self.entered = True
 
+    @_method
     def bump(self) -> int:
         assert self.entered, "enter hook must run before methods"
         self.value += 1
         return self.value
 
+    @_exit
     def _farewell(self) -> None:
         print("counter exiting")
