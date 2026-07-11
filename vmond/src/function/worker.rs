@@ -1864,6 +1864,15 @@ fn sandbox_create(
 			pb::CpuArchitecture::try_from(r.architecture).unwrap_or(pb::CpuArchitecture::Unspecified)
 		});
 	let image = image::realize(home, image_spec, architecture).map_err(engine_error)?;
+	sandbox_create_from_image(spec, name, secrets, image)
+}
+
+fn sandbox_create_from_image(
+	spec: &pb::FunctionSpec,
+	name: &str,
+	secrets: &SecretValues,
+	image: image::RealizedImage,
+) -> Result<SandboxCreate, WorkerError> {
 	let mut create = SandboxCreate {
 		name: Some(name.to_owned()),
 		secrets: Some(secrets.sandbox_wire()?),
@@ -2866,6 +2875,8 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
 	use super::*;
 
 	fn digest(byte: u8) -> pb::Digest {
@@ -2967,14 +2978,21 @@ mod tests {
 	}
 
 	#[test]
-	fn none_worker_start_builds_a_single_node_local_sandbox() {
-		let temp = tempfile::tempdir().unwrap();
+	fn none_worker_request_builds_a_single_node_local_sandbox() {
 		let mut revision = revision();
 		let spec = revision.spec.as_mut().unwrap();
 		spec.resources.as_mut().unwrap().high_availability = pb::HighAvailabilityPolicy::None as i32;
+		let image = image::RealizedImage {
+			image: Some("local-test-image".into()),
+			template: None,
+			dockerfile: None,
+			context: None,
+			environment: BTreeMap::new(),
+			resolved_spec: spec.image.clone().unwrap(),
+			provenance_digest: "07".repeat(32),
+		};
 		let create =
-			sandbox_create(&Home::new(temp.path()), spec, "fn-revision-1-1", &SecretValues::new())
-				.unwrap();
+			sandbox_create_from_image(spec, "fn-revision-1-1", &SecretValues::new(), image).unwrap();
 		assert_eq!(create.name.as_deref(), Some("fn-revision-1-1"));
 		assert_eq!(create.ha.as_deref(), Some("off"));
 		assert_eq!(create.arch.as_deref(), Some("aarch64"));

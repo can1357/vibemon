@@ -467,6 +467,7 @@ mod tests {
 				compression:          pb::ValueCompression::None as i32,
 				allow_trusted_python: false,
 			}),
+			lifecycle: pb::FunctionLifecycle::Stateless as i32,
 			..Default::default()
 		}
 	}
