@@ -52,7 +52,7 @@ pub mod proto {
 		pub size:  u64,
 		/// Unix modification time in seconds.
 		pub mtime: u64,
-		/// Object ETag, omitted for directories.
+		/// Object `ETag`, omitted for directories.
 		pub etag:  Option<String>,
 	}
 
@@ -701,7 +701,7 @@ fn attr(nodeid: u64, kind: proto::Kind, size: u64, mtime: u64) -> fs::FuseAttr {
 	clippy::unnecessary_cast,
 	reason = "libc DT constants have different integer types on supported hosts"
 )]
-fn dtype(kind: proto::Kind) -> u32 {
+const fn dtype(kind: proto::Kind) -> u32 {
 	match kind {
 		proto::Kind::File => libc::DT_REG as u32,
 		proto::Kind::Dir => libc::DT_DIR as u32,
@@ -712,7 +712,7 @@ fn dtype(kind: proto::Kind) -> u32 {
 	clippy::unnecessary_cast,
 	reason = "libc O constants have different integer types on supported hosts"
 )]
-fn write_intent(flags: u32) -> bool {
+const fn write_intent(flags: u32) -> bool {
 	let access = flags & libc::O_ACCMODE as u32;
 	access == libc::O_WRONLY as u32
 		|| access == libc::O_RDWR as u32
@@ -990,9 +990,8 @@ mod tests {
 			let (mut stream, _) = listener.accept().expect("proxy accepts device");
 			let mut served = 0usize;
 			loop {
-				let (ty, id, payload) = match proto::read_frame(&mut stream) {
-					Ok(frame) => frame,
-					Err(_) => return,
+				let Ok((ty, id, payload)) = proto::read_frame(&mut stream) else {
+					return;
 				};
 				assert_eq!(ty, proto::REQ);
 				let request = serde_json::from_slice(&payload).expect("valid proxy request");
