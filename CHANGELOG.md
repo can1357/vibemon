@@ -244,6 +244,10 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed race condition in S3 mount usage during sandbox initialization
+- Improved naming stability and collision resistance for worker and template sandboxes
+- Fixed local OCI reference validation to restrict path access to server image caches
+- Added validation for `--remote-fs` tags and socket paths in CLI to prevent configuration errors
 - Fixed worker-retire snapshot order to ensure persistence occurs before worker termination
 - Fixed function placement logic to prioritize locality-based ranking when affinity is unset
 - Fixed function registration to reject host/zone HA policies when cross-node execution is unavailable

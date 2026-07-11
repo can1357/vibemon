@@ -158,15 +158,14 @@ def run(iterations: int, output: Path) -> None:
         def __init__(self) -> None:
             self.ready = False
 
-        @vmon.enter(snapshot=True)
+        @vmon.enter
         def initialize(self) -> None:
             self.ready = True
 
         @vmon.on_restore
         def restored(self) -> None:
-            # Presence of this hook makes restoration part of the service
-            # lifecycle, while AttemptStats remains the source of classification.
-            self.ready = True
+            if not self.ready:
+                raise RuntimeError("snapshot restored before service initialization")
 
         @vmon.method
         def increment(self, value: int) -> int:
@@ -184,6 +183,10 @@ def run(iterations: int, output: Path) -> None:
     service = SnapshotService()
     try:
         ordinary_samples = _collect(ordinary.spawn, {"cold", "warm"}, iterations)
+        # Retiring this one-call worker captures the initialized service. Samples then
+        # measure workers restored from that snapshot rather than the import-only seed.
+        if service.increment.spawn(-1).get(timeout=180) != 0:
+            raise RuntimeError("snapshot benchmark seed returned an unexpected value")
         snapshot_samples = _collect(service.increment.spawn, {"snapshot"}, iterations)
         revisions = {
             "ordinary": ordinary._resolve().ref.revision_id,

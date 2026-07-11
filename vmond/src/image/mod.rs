@@ -377,6 +377,11 @@ pub fn template_name(
 	name
 }
 
+fn template_vm_name(template: &str) -> String {
+	let digest = hex::encode(Sha256::digest(template.as_bytes()));
+	format!("_t-{}", &digest[..16])
+}
+
 /// Build or reuse an agent-capable ext4 rootfs and boot-verified template
 /// snapshot.
 pub fn cached_template(
@@ -459,20 +464,7 @@ pub fn cached_template(
 	if tpl_dir.exists() {
 		fs::remove_dir_all(&tpl_dir)?;
 	}
-	let vm_name = format!(
-		"_template-{}-{}-a{}{}",
-		digest_prefix(&image_digest, 12),
-		request.disk_mb,
-		digest_prefix(&agent_digest, 12),
-		template_suffix(
-			request.memory,
-			request.cpus,
-			request.fs_slots,
-			request.host_slot,
-			request.nic_slot,
-			request.tap_slot
-		)
-	);
+	let vm_name = template_vm_name(&tpl_name);
 	let slot_void = crate::home::state_dir().join("slot-void");
 	fs::create_dir_all(&slot_void)?;
 	let volumes = (0..request.fs_slots)
@@ -1424,30 +1416,6 @@ fn temp_file_in(dir: &Path, prefix: &str) -> Result<PathBuf> {
 	Err(EngineError::engine("failed to create temporary file"))
 }
 
-fn template_suffix(
-	memory: u64,
-	cpus: u64,
-	fs_slots: u64,
-	host_slot: bool,
-	nic_slot: bool,
-	tap_slot: bool,
-) -> String {
-	let mut suffix = format!("-m{memory}-c{cpus}");
-	if fs_slots != 0 {
-		suffix.push_str("-s");
-		suffix.push_str(&fs_slots.to_string());
-	}
-	if host_slot {
-		suffix.push_str("-h");
-	}
-	if nic_slot {
-		suffix.push_str("-n");
-	}
-	if tap_slot {
-		suffix.push_str("-t");
-	}
-	suffix
-}
 
 fn digest_prefix(digest: &str, len: usize) -> &str {
 	digest.get(..len).unwrap_or(digest)
@@ -1519,6 +1487,14 @@ mod tests {
 		assert_eq!(
 			template_name(image_digest, 2048, agent_digest, 768, 2, 3, true, false, true),
 			"tpl-abcdef123456-2048-a001122334455-m768-c2-s3-h-t"
+		);
+		assert_eq!(
+			template_vm_name("tpl-abcdef123456-1024-a001122334455-m512-c1"),
+			"_t-cac4617d1239a251"
+		);
+		assert_ne!(
+			template_vm_name("tpl-abcdef123456-1024-a001122334455-m512-c1"),
+			template_vm_name("tpl-abcdef123456-1024-a001122334455-m512-c2")
 		);
 		assert_eq!(slot_tag(7), "vmon_slot7");
 	}

@@ -83,6 +83,49 @@ fn duplicate_volume_tag_rejected() {
 	);
 }
 
+/// Remote virtio-fs tags share the guest namespace with host-backed volumes.
+#[test]
+fn remote_fs_duplicate_tag_rejected() {
+	assert_cli_rejects(
+		&[
+			"--kernel",
+			"k",
+			"--volume",
+			"data:/srv/data",
+			"--remote-fs",
+			"data:/tmp/vmon-s3.sock",
+		],
+		"--volume tags must be unique",
+	);
+}
+
+/// Proxy-backed virtio-fs tags follow the same restricted tag syntax as volumes.
+#[test]
+fn remote_fs_bad_tag_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--remote-fs", "Tag!:/tmp/vmon-s3.sock"],
+		"--remote-fs tag Tag! must match",
+	);
+}
+
+/// Remote proxy mounts require an explicit tag-to-socket separator.
+#[test]
+fn remote_fs_missing_separator_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--remote-fs", "data"],
+		"expected <tag>:<absolute-socket>",
+	);
+}
+
+/// The VMM sandbox and jail can only expose absolute proxy socket paths.
+#[test]
+fn remote_fs_relative_socket_rejected() {
+	assert_cli_rejects(
+		&["--kernel", "k", "--remote-fs", "data:relative.sock"],
+		"--remote-fs socket path must be absolute",
+	);
+}
+
 /// A virtio-fs share needs both the guest tag and the host directory.
 #[test]
 fn fs_tag_without_dir_rejected() {

@@ -45,6 +45,7 @@ const SOCKET_PATH: &str = "/run/vmon/function-v2.sock";
 const DEFAULT_STARTUP: Duration = Duration::from_mins(1);
 const DEFAULT_EXECUTION: Duration = Duration::from_mins(5);
 const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
+static RESTORE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// A boxed asynchronous operation used by object-safe executor traits.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -704,7 +705,7 @@ impl EngineWorker {
 			execution_policy(spec)?;
 		let protocol_requirements = protocol_requirements(spec)?;
 		let startup_deadline = started + startup;
-		let name = format!("fn-{}-{serial}", sanitize_name(&expected.revision_id));
+		let name = worker_name(&expected.revision_id, serial);
 		let create = sandbox_create(&home, spec, &name, &secrets)?;
 		let view = blocking(remaining(startup_deadline)?, {
 			let engine = Arc::clone(&engine);
@@ -856,6 +857,10 @@ impl EngineWorker {
 		let restore_hook = restore_hook(Some(spec)).cloned();
 		let mut extra = HashMap::new();
 		extra.insert("secrets".into(), Value::Array(secrets.sandbox_wire()?));
+		let restore_name = worker_name(
+			&snapshot.provenance.revision_id,
+			RESTORE_SERIAL.fetch_add(1, Ordering::Relaxed),
+		);
 		let started = Instant::now();
 		let startup_deadline = started + startup;
 		let view = blocking(remaining(startup_deadline)?, {
@@ -863,9 +868,9 @@ impl EngineWorker {
 			let name = snapshot.engine_snapshot.clone();
 			move || {
 				engine.restore(&name, RestoreBody {
+					name: Some(restore_name),
 					agent: Some(true),
 					extra,
-					..RestoreBody::default()
 				})
 			}
 		})
@@ -2831,23 +2836,9 @@ fn sandbox_id(view: &Value) -> Option<String> {
 		.and_then(Value::as_str)
 		.map(str::to_owned)
 }
-fn sanitize_name(value: &str) -> String {
-	let clean: String = value
-		.chars()
-		.map(|c| {
-			if c.is_ascii_alphanumeric() || c == '-' {
-				c
-			} else {
-				'-'
-			}
-		})
-		.take(32)
-		.collect();
-	if clean.is_empty() {
-		"revision".into()
-	} else {
-		clean
-	}
+fn worker_name(revision_id: &str, serial: u64) -> String {
+	let digest = hex::encode(Sha256::digest(revision_id.as_bytes()));
+	format!("f-{}-{serial:x}", &digest[..12])
 }
 fn validate_absolute(path: &str) -> Result<(), WorkerError> {
 	let path = Path::new(path);
@@ -2996,6 +2987,25 @@ mod tests {
 		assert_eq!(create.name.as_deref(), Some("fn-revision-1-1"));
 		assert_eq!(create.ha.as_deref(), Some("off"));
 		assert_eq!(create.arch.as_deref(), Some("aarch64"));
+	}
+
+	#[test]
+	fn worker_names_are_short_stable_and_collision_resistant() {
+		let first = worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX);
+		assert_eq!(
+			first,
+			worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX)
+		);
+		assert_ne!(
+			first,
+			worker_name("revision-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", u64::MAX)
+		);
+		assert_ne!(
+			first,
+			worker_name("revision-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", u64::MAX - 1)
+		);
+		assert!(first.len() <= 31);
+		assert!(first.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
 	}
 
 	#[test]

@@ -1242,6 +1242,9 @@ impl FunctionDomain {
 				});
 				continue;
 			}
+			// Image builds and snapshot restores may outlive one lease interval. Lease
+			// against the current clock, not the scheduler scan that started the worker.
+			let now = unix_millis();
 			let batching = revision
 				.spec
 				.as_ref()

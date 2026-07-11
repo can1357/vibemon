@@ -762,22 +762,24 @@ fn validate_python_source(source: &pb::PythonImageSource) -> Result<()> {
 }
 
 fn validate_local_oci_reference(home: &Home, reference: &str) -> Result<()> {
-	let location = reference
+	let body = reference
 		.strip_prefix("oci:")
-		.and_then(|value| value.rsplit_once(':').map(|(path, _)| path))
 		.ok_or_else(|| EngineError::invalid("resolved local OCI reference is malformed"))?;
-	let path = Path::new(location);
-	let canonical = path
-		.canonicalize()
-		.map_err(|_| EngineError::not_found("resolved local OCI build cache entry is missing"))?;
-	let builds = home
-		.root()
-		.join("builds")
-		.canonicalize()
-		.map_err(|_| EngineError::not_found("server OCI build cache is missing"))?;
-	if !canonical.is_dir() || !canonical.starts_with(builds) {
+	let direct = Path::new(body).canonicalize().ok().filter(|path| path.is_dir());
+	let canonical = direct.or_else(|| {
+		body.match_indices(':')
+			.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok())
+			.filter(|path| path.is_dir())
+			.next_back()
+	})
+	.ok_or_else(|| EngineError::not_found("resolved local OCI cache entry is missing"))?;
+	let owned = [home.root().join("builds"), home.images_dir()]
+		.into_iter()
+		.filter_map(|root| root.canonicalize().ok())
+		.any(|root| canonical.starts_with(root));
+	if !owned {
 		return Err(EngineError::invalid(
-			"resolved local OCI reference escapes the server build cache",
+			"resolved local OCI reference escapes the server image caches",
 		));
 	}
 	Ok(())
@@ -1550,6 +1552,38 @@ mod tests {
 		assert!(!error.contains("not-logged"));
 		assert!(error.contains("SecretRef"));
 		assert!(!home.images_dir().exists(), "rejected secrets must not create a build context");
+	}
+
+	#[test]
+	fn local_oci_references_accept_owned_pull_and_build_caches_only() {
+		let (_temp, home) = home();
+		let pulled = home.images_dir().join("pulled");
+		let built = home.root().join("builds/built");
+		fs::create_dir_all(&pulled).unwrap();
+		fs::create_dir_all(&built).unwrap();
+		validate_local_oci_reference(
+			&home,
+			&format!("oci:{}:latest", pulled.display()),
+		)
+		.unwrap();
+		validate_local_oci_reference(
+			&home,
+			&format!("oci:{}:latest", built.display()),
+		)
+		.unwrap();
+		validate_local_oci_reference(
+			&home,
+			&format!("oci:{}:vmon-function:{}", built.display(), "a".repeat(64)),
+		)
+		.unwrap();
+
+		let outside = tempfile::tempdir().unwrap();
+		let error = validate_local_oci_reference(
+			&home,
+			&format!("oci:{}:latest", outside.path().display()),
+		)
+		.unwrap_err();
+		assert!(error.to_string().contains("escapes the server image caches"));
 	}
 
 	#[test]

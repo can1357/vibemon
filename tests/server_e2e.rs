@@ -13,10 +13,15 @@ mod common;
 use std::{
 	fs,
 	io::{Read, Write},
+	net::{TcpListener, TcpStream},
 	os::unix::{fs::DirBuilderExt, net::UnixStream},
 	path::{Path, PathBuf},
 	process::{Child, Command, Stdio},
-	sync::LazyLock,
+	sync::{
+		Arc, LazyLock,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	},
+	thread::{self, JoinHandle},
 	time::{Duration, Instant},
 };
 
@@ -218,6 +223,101 @@ impl Drop for Server {
 		}
 		self.kill_hard();
 	}
+}
+
+/// Tiny path-style S3 fixture that serves one object and records ranged reads.
+struct FakeS3 {
+	endpoint:    String,
+	range_reads: Arc<AtomicUsize>,
+	stop:        Arc<AtomicBool>,
+	thread:      Option<JoinHandle<()>>,
+}
+
+impl FakeS3 {
+	fn start() -> Self {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake S3");
+		listener.set_nonblocking(true).expect("make fake S3 listener nonblocking");
+		let endpoint = format!("http://{}", listener.local_addr().expect("fake S3 address"));
+		let range_reads = Arc::new(AtomicUsize::new(0));
+		let stop = Arc::new(AtomicBool::new(false));
+		let thread_stop = Arc::clone(&stop);
+		let thread_reads = Arc::clone(&range_reads);
+		let thread = thread::spawn(move || {
+			while !thread_stop.load(Ordering::Relaxed) {
+				match listener.accept() {
+					Ok((_stream, _)) if thread_stop.load(Ordering::Relaxed) => break,
+					Ok((stream, _)) => serve_s3_fixture(stream, &thread_reads),
+					Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					},
+					Err(err) => panic!("fake S3 accept failed: {err}"),
+				}
+			}
+		});
+		Self { endpoint, range_reads, stop, thread: Some(thread) }
+	}
+
+	fn range_reads(&self) -> usize {
+		self.range_reads.load(Ordering::Relaxed)
+	}
+}
+
+impl Drop for FakeS3 {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::Relaxed);
+		let _ = TcpStream::connect(self.endpoint.trim_start_matches("http://"));
+		if let Some(thread) = self.thread.take() {
+			thread.join().expect("fake S3 thread");
+		}
+	}
+}
+
+fn serve_s3_fixture(mut stream: TcpStream, range_reads: &AtomicUsize) {
+	stream
+		.set_read_timeout(Some(Duration::from_secs(1)))
+		.expect("set fake S3 read timeout");
+	let mut request = Vec::new();
+	let mut chunk = [0; 1024];
+	while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+		match stream.read(&mut chunk) {
+			Ok(0) => return,
+			Ok(read) => request.extend_from_slice(&chunk[..read]),
+			Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
+			Err(err) => panic!("read fake S3 request: {err}"),
+		}
+	}
+	let request = String::from_utf8(request).expect("fake S3 request is UTF-8");
+	let mut lines = request.lines();
+	let request_line = lines.next().expect("fake S3 request line");
+	let mut parts = request_line.split_whitespace();
+	let method = parts.next().expect("fake S3 method");
+	let target = parts.next().expect("fake S3 target");
+	let ranged = lines.any(|line| {
+		line.split_once(':')
+			.is_some_and(|(name, _)| name.eq_ignore_ascii_case("range"))
+	});
+	if method == "GET" && target.starts_with("/testbucket/hello.txt") {
+		assert!(ranged, "object reads must use HTTP ranges");
+		range_reads.fetch_add(1, Ordering::Relaxed);
+		write_s3_fixture_response(&mut stream, "206 Partial Content", b"hello s3\n");
+	} else if method == "GET" && target.starts_with("/testbucket") {
+		write_s3_fixture_response(
+			&mut stream,
+			"200 OK",
+			br#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>hello.txt</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>&quot;hello&quot;</ETag><Size>9</Size></Contents></ListBucketResult>"#,
+		);
+	} else {
+		write_s3_fixture_response(&mut stream, "404 Not Found", b"");
+	}
+}
+
+fn write_s3_fixture_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
+	let head = format!(
+		"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+		body.len()
+	);
+	stream.write_all(head.as_bytes()).expect("write fake S3 headers");
+	stream.write_all(body).expect("write fake S3 body");
 }
 
 /// Create a block-network sandbox from the e2e image; first call in the
@@ -556,6 +656,42 @@ fn volumes_rw_and_ro_roundtrip() {
 				common::api::status_detail(&status)
 			)
 		});
+}
+
+#[test]
+fn s3_mount_lazy_read_and_volatile_write() {
+	if !require_server_e2e() {
+		return;
+	}
+	let fixture = FakeS3::start();
+	let server = Server::start(&HOME);
+	let view = create_sandbox(
+		&server,
+		json!({
+			"s3_mounts": {
+				"/mnt/s3": {
+					"uri": "s3://testbucket",
+					"endpoint": fixture.endpoint,
+					"region": "us-east-1"
+				}
+			}
+		}),
+	);
+	let id = sandbox_id(&view);
+	assert_eq!(fixture.range_reads(), 0, "mount setup must not fetch object bytes");
+
+	let (exit, stdout, _) = exec(&server, &id, &["/bin/sh", "-c", "cat /mnt/s3/hello.txt"]);
+	assert_eq!(exit, 0, "guest lazy S3 read failed");
+	assert_eq!(stdout, "hello s3\n");
+	assert!(fixture.range_reads() > 0, "guest read did not issue a ranged S3 request");
+
+	let (exit, ..) = exec(
+		&server,
+		&id,
+		&["/bin/sh", "-c", "printf volatile > /mnt/s3/guest.txt && test -f /mnt/s3/guest.txt"],
+	);
+	assert_eq!(exit, 0, "guest overlay write failed");
+	remove_sandbox(&server, &id);
 }
 
 #[test]

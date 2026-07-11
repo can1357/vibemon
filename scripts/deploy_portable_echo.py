@@ -37,12 +37,17 @@ def main() -> None:
     with vmon.connect(args.server_url, token=args.api_token, discover=False, timeout=30) as client:
         revisions: dict[str, str] = {}
         for codec, name in names.items():
+            image = (
+                args.python_image
+                if codec == "json"
+                else vmon.Image.from_registry(args.python_image).uv_install("cbor2==6.1.3")
+            )
             function = vmon.function(
                 deployed_echo,
                 client=client,
                 namespace=args.namespace,
                 name=name,
-                image=args.python_image,
+                image=image,
                 serializer=codec,
                 startup_timeout=120,
                 execution_timeout=60,
