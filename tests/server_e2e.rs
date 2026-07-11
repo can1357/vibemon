@@ -20,8 +20,8 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
+use vmon_proto::v1 as pb;
 
 /// Extra PATH entries the spawned server needs for skopeo/umoci/mkfs.ext4.
 const EXTRA_PATH: &str =
@@ -182,32 +182,11 @@ impl Server {
 		Ok((status, parsed))
 	}
 
-	fn http(&self, method: &str, path: &str, body: Option<(&str, &[u8])>) -> (u16, Value) {
-		self
-			.try_http(method, path, body)
-			.unwrap_or_else(|e| panic!("{method} {path}: {e}; server log tail:\n{}", self.log_tail()))
-	}
-
-	fn get(&self, path: &str) -> (u16, Value) {
-		self.http("GET", path, None)
-	}
-
-	fn post_json(&self, path: &str, body: &Value) -> (u16, Value) {
-		let payload = body.to_string();
-		self.http("POST", path, Some(("application/json", payload.as_bytes())))
-	}
-
-	fn put_json(&self, path: &str, body: &Value) -> (u16, Value) {
-		let payload = body.to_string();
-		self.http("PUT", path, Some(("application/json", payload.as_bytes())))
-	}
-
-	fn put_bytes(&self, path: &str, bytes: &[u8]) -> (u16, Value) {
-		self.http("PUT", path, Some(("application/octet-stream", bytes)))
-	}
-
-	fn delete(&self, path: &str) -> (u16, Value) {
-		self.http("DELETE", path, None)
+	/// Fresh gRPC channel over the server UDS; panics with the log tail when
+	/// the connect fails.
+	fn grpc(&self) -> common::api::Grpc {
+		common::api::Grpc::connect_uds(&self.sock)
+			.unwrap_or_else(|e| panic!("{e}; server log tail:\n{}", self.log_tail()))
 	}
 
 	fn pid(&self) -> u32 {
@@ -254,8 +233,19 @@ fn create_sandbox(server: &Server, extra: Value) -> Value {
 			base.insert(key, value);
 		}
 	}
-	let (status, view) = server.post_json("/v1/sandboxes", &body);
-	assert_eq!(status, 201, "create failed: {view}; log tail:\n{}", server.log_tail());
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let view = grpc
+		.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json: body.to_string() }))
+		.unwrap_or_else(|status| {
+			panic!(
+				"create failed: {}; log tail:\n{}",
+				common::api::status_detail(&status),
+				server.log_tail()
+			)
+		})
+		.into_inner();
+	let view: Value = serde_json::from_str(&view.json).expect("create view JSON");
 	assert!(view.get("id").and_then(Value::as_str).is_some(), "view missing id: {view}");
 	view
 }
@@ -264,23 +254,55 @@ fn sandbox_id(view: &Value) -> String {
 	view["id"].as_str().expect("sandbox id").to_string()
 }
 
-/// Run a command via `POST /{id}/exec`; returns (exit, stdout, stderr).
-fn exec(server: &Server, id: &str, cmd: &[&str]) -> (i64, String, String) {
-	let (status, out) =
-		server.post_json(&format!("/v1/sandboxes/{id}/exec"), &json!({"cmd": cmd, "timeout": 30.0}));
-	assert_eq!(status, 200, "exec {cmd:?} failed: {out}");
-	let decode = |key: &str| {
-		out.get(key)
-			.and_then(Value::as_str)
-			.map(|b| String::from_utf8_lossy(&B64.decode(b).unwrap_or_default()).into_owned())
-			.unwrap_or_default()
-	};
-	(out["exit"].as_i64().unwrap_or(-1), decode("stdout_b64"), decode("stderr_b64"))
+/// Fetch a sandbox view document via `SandboxService.Get`.
+fn sandbox_view(server: &Server, id: &str) -> Value {
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let view = grpc
+		.block_on(sandboxes.get(pb::SandboxRef { id: id.to_owned() }))
+		.unwrap_or_else(|status| panic!("view fetch failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	serde_json::from_str(&view.json).expect("sandbox view JSON")
 }
 
+/// Run a command via `SandboxService.ExecCapture`; returns (exit, stdout,
+/// stderr).
+fn exec(server: &Server, id: &str, cmd: &[&str]) -> (i64, String, String) {
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::ExecCaptureRequest {
+		id:   id.to_owned(),
+		exec: Some(pb::ExecStart {
+			cmd: cmd.iter().map(|&part| part.to_owned()).collect(),
+			timeout: Some(30.0),
+			..Default::default()
+		}),
+	};
+	let out = grpc
+		.block_on(sandboxes.exec_capture(request))
+		.unwrap_or_else(|status| {
+			panic!("exec {cmd:?} failed: {}", common::api::status_detail(&status))
+		})
+		.into_inner();
+	(
+		out.code,
+		String::from_utf8_lossy(&out.stdout).into_owned(),
+		String::from_utf8_lossy(&out.stderr).into_owned(),
+	)
+}
+
+/// Remove is idempotent for the tests: Ok or NotFound both pass.
 fn remove_sandbox(server: &Server, id: &str) {
-	let (status, body) = server.delete(&format!("/v1/sandboxes/{id}"));
-	assert!(status == 200 || status == 404, "remove {id} -> {status}: {body}");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	if let Err(status) = grpc.block_on(sandboxes.remove(pb::SandboxRef { id: id.to_owned() })) {
+		assert_eq!(
+			status.code(),
+			tonic::Code::NotFound,
+			"remove {id} -> {}",
+			common::api::status_detail(&status)
+		);
+	}
 }
 
 #[test]
@@ -297,16 +319,24 @@ fn create_exec_roundtrip() {
 	assert_eq!(stdout.trim(), "e2e-ok");
 
 	// Env + workdir pass through the exec body.
-	let (status, out) = server.post_json(
-		&format!("/v1/sandboxes/{id}/exec"),
-		&json!({"cmd": ["/bin/sh", "-c", "printf %s-%s \"$PWD\" \"$MARK\""],
-		        "env": {"MARK": "m1"}, "workdir": "/tmp"}),
-	);
-	assert_eq!(status, 200, "exec with env failed: {out}");
-	let stdout = B64
-		.decode(out["stdout_b64"].as_str().unwrap_or_default())
-		.expect("stdout b64");
-	assert_eq!(String::from_utf8_lossy(&stdout), "/tmp-m1");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::ExecCaptureRequest {
+		id:   id.clone(),
+		exec: Some(pb::ExecStart {
+			cmd: vec!["/bin/sh".into(), "-c".into(), "printf %s-%s \"$PWD\" \"$MARK\"".into()],
+			env: std::collections::HashMap::from([("MARK".to_owned(), "m1".to_owned())]),
+			workdir: Some("/tmp".to_owned()),
+			..Default::default()
+		}),
+	};
+	let out = grpc
+		.block_on(sandboxes.exec_capture(request))
+		.unwrap_or_else(|status| {
+			panic!("exec with env failed: {}", common::api::status_detail(&status))
+		})
+		.into_inner();
+	assert_eq!(String::from_utf8_lossy(&out.stdout), "/tmp-m1");
 
 	remove_sandbox(&server, &id);
 }
@@ -321,25 +351,47 @@ fn files_roundtrip_binary_clean() {
 	let id = sandbox_id(&view);
 
 	let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
-	let (status, _) = server.put_bytes(&format!("/v1/sandboxes/{id}/files?path=/tmp/bin"), &payload);
-	assert_eq!(status, 200);
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let write =
+		pb::FileWriteRequest { id: id.clone(), path: "/tmp/bin".to_owned(), data: payload };
+	grpc
+		.block_on(sandboxes.file_write(write))
+		.unwrap_or_else(|status| {
+			panic!("file write failed: {}", common::api::status_detail(&status))
+		});
 
-	// GET returns the raw bytes (non-JSON body arrives as a string value only
-	// when valid UTF-8; fetch via exec to compare content hashes instead).
+	// Verify the write from inside the guest.
 	let (exit, stdout, _) = exec(&server, &id, &["/bin/sh", "-c", "wc -c < /tmp/bin"]);
 	assert_eq!(exit, 0);
 	assert_eq!(stdout.trim(), "4096", "guest file size mismatch");
 
-	let (status, list) = server.get(&format!("/v1/sandboxes/{id}/files/list?path=/tmp"));
-	assert_eq!(status, 200, "files/list failed: {list}");
-	let listed = list.to_string();
-	assert!(listed.contains("bin"), "listing missing file: {list}");
+	let list = grpc
+		.block_on(
+			sandboxes.file_list(pb::FilePathRequest { id: id.clone(), path: "/tmp".to_owned() }),
+		)
+		.unwrap_or_else(|status| panic!("files/list failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	assert!(list.json.contains("bin"), "listing missing file: {}", list.json);
 
-	let (status, stat) = server.get(&format!("/v1/sandboxes/{id}/files/stat?path=/tmp/bin"));
-	assert_eq!(status, 200, "files/stat failed: {stat}");
+	grpc
+		.block_on(
+			sandboxes.file_stat(pb::FilePathRequest { id: id.clone(), path: "/tmp/bin".to_owned() }),
+		)
+		.unwrap_or_else(|status| {
+			panic!("files/stat failed: {}", common::api::status_detail(&status))
+		});
 
-	let (status, _) = server.delete(&format!("/v1/sandboxes/{id}/files?path=/tmp/bin"));
-	assert_eq!(status, 200);
+	let delete = pb::FileDeleteRequest {
+		id:        id.clone(),
+		path:      "/tmp/bin".to_owned(),
+		recursive: false,
+	};
+	grpc
+		.block_on(sandboxes.file_delete(delete))
+		.unwrap_or_else(|status| {
+			panic!("file delete failed: {}", common::api::status_detail(&status))
+		});
 	let (exit, ..) = exec(&server, &id, &["/bin/sh", "-c", "test -e /tmp/bin"]);
 	assert_ne!(exit, 0, "file still present after DELETE");
 
@@ -360,19 +412,43 @@ fn snapshot_restore_preserves_disk_state() {
 		exec(&server, &id, &["/bin/sh", "-c", "echo snapshotted > /root/marker && sync"]);
 	assert_eq!(exit, 0);
 
-	let (status, out) =
-		server.post_json(&format!("/v1/sandboxes/{id}/snapshots"), &json!({"name": snap}));
-	assert_eq!(status, 200, "snapshot failed: {out}");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::SnapshotRequest { id: id.clone(), name: Some(snap.clone()), stop: false };
+	let out = grpc
+		.block_on(sandboxes.snapshot(request))
+		.unwrap_or_else(|status| panic!("snapshot failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	let out: Value = serde_json::from_str(&out.json).expect("snapshot view JSON");
 	assert_eq!(out["snapshot"].as_str(), Some(snap.as_str()));
 
 	remove_sandbox(&server, &id);
 
-	let (status, snaps) = server.get("/v1/snapshots");
-	assert_eq!(status, 200);
-	assert!(snaps.to_string().contains(&snap), "snapshot missing from list: {snaps}");
+	let mut snapshots = grpc.snapshots();
+	let snaps = grpc
+		.block_on(snapshots.list(pb::ListSnapshotsRequest {}))
+		.unwrap_or_else(|status| {
+			panic!("snapshot list failed: {}", common::api::status_detail(&status))
+		})
+		.into_inner();
+	assert!(
+		snaps.snapshots.iter().any(|name| name.contains(&snap)),
+		"snapshot missing from list: {:?}",
+		snaps.snapshots
+	);
 
-	let (status, restored) = server.post_json(&format!("/v1/snapshots/{snap}/restore"), &json!({}));
-	assert_eq!(status, 201, "restore failed: {restored}; log:\n{}", server.log_tail());
+	let restore = pb::RestoreSnapshotRequest { name: snap.clone(), body_json: "{}".to_owned() };
+	let restored = grpc
+		.block_on(snapshots.restore(restore))
+		.unwrap_or_else(|status| {
+			panic!(
+				"restore failed: {}; log:\n{}",
+				common::api::status_detail(&status),
+				server.log_tail()
+			)
+		})
+		.into_inner();
+	let restored: Value = serde_json::from_str(&restored.json).expect("restore view JSON");
 	let rid = sandbox_id(&restored);
 
 	let (exit, stdout, _) = exec(&server, &rid, &["/bin/sh", "-c", "cat /root/marker"]);
@@ -394,14 +470,26 @@ fn fork_clones_are_cow_isolated() {
 
 	let (exit, ..) = exec(&server, &id, &["/bin/sh", "-c", "echo base > /root/shared && sync"]);
 	assert_eq!(exit, 0);
-	let (status, out) =
-		server.post_json(&format!("/v1/sandboxes/{id}/snapshots"), &json!({"name": snap}));
-	assert_eq!(status, 200, "snapshot failed: {out}");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::SnapshotRequest { id: id.clone(), name: Some(snap.clone()), stop: false };
+	grpc
+		.block_on(sandboxes.snapshot(request))
+		.unwrap_or_else(|status| panic!("snapshot failed: {}", common::api::status_detail(&status)));
 	remove_sandbox(&server, &id);
 
-	let (status, forked) =
-		server.post_json(&format!("/v1/snapshots/{snap}/fork"), &json!({"count": 2}));
-	assert_eq!(status, 200, "fork failed: {forked}; log:\n{}", server.log_tail());
+	let mut snapshots = grpc.snapshots();
+	let fork = pb::ForkSnapshotRequest {
+		name:      snap.clone(),
+		body_json: json!({"count": 2}).to_string(),
+	};
+	let forked = grpc
+		.block_on(snapshots.fork(fork))
+		.unwrap_or_else(|status| {
+			panic!("fork failed: {}; log:\n{}", common::api::status_detail(&status), server.log_tail())
+		})
+		.into_inner();
+	let forked: Value = serde_json::from_str(&forked.json).expect("fork view JSON");
 	let clones = forked["clones"].as_array().expect("clones array");
 	assert_eq!(clones.len(), 2, "expected two clones: {forked}");
 	let names: Vec<String> = clones
@@ -432,8 +520,13 @@ fn volumes_rw_and_ro_roundtrip() {
 	}
 	let server = Server::start(&HOME);
 	let volume = format!("e2evol{}", std::process::id());
-	let (status, out) = server.put_json(&format!("/v1/volumes/{volume}"), &json!({}));
-	assert!(status == 200 || status == 201, "volume create -> {status}: {out}");
+	let grpc = server.grpc();
+	let mut volumes = grpc.volumes();
+	grpc
+		.block_on(volumes.create(pb::VolumeRef { name: volume.clone() }))
+		.unwrap_or_else(|status| {
+			panic!("volume create failed: {}", common::api::status_detail(&status))
+		});
 
 	let writer = create_sandbox(&server, json!({"volumes": {"/data": volume}}));
 	let wid = sandbox_id(&writer);
@@ -457,8 +550,14 @@ fn volumes_rw_and_ro_roundtrip() {
 	assert_ne!(exit, 0, "write to read-only volume unexpectedly succeeded");
 	remove_sandbox(&server, &rid);
 
-	let (status, _) = server.delete(&format!("/v1/volumes/{volume}"));
-	assert_eq!(status, 200, "volume delete after unmount should succeed");
+	grpc
+		.block_on(volumes.delete(pb::VolumeRef { name: volume.clone() }))
+		.unwrap_or_else(|status| {
+			panic!(
+				"volume delete after unmount should succeed: {}",
+				common::api::status_detail(&status)
+			)
+		});
 }
 
 #[test]
@@ -519,21 +618,25 @@ fn warm_pool_prewarms_and_claims() {
 	}
 	let server = Server::start(&HOME);
 	let image = e2e_image();
-	let encoded = image.replace('/', "%2F");
 
 	// The pool key includes template params (memory/cpus/disk); match the
 	// create defaults used by `create_sandbox` so the claim hits this pool.
-	let (status, out) =
-		server.put_json(&format!("/v1/pools/{encoded}"), &json!({"size": 1, "memory": 256}));
-	assert!(status == 200 || status == 201, "pool set -> {status}: {out}");
+	let grpc = server.grpc();
+	let mut pools = grpc.pools();
+	let request = pb::PoolSetRequest {
+		reference: image.clone(),
+		body_json: json!({"size": 1, "memory": 256}).to_string(),
+	};
+	grpc
+		.block_on(pools.set(request))
+		.unwrap_or_else(|status| panic!("pool set failed: {}", common::api::status_detail(&status)));
 
 	// Wait for the refiller to stock one clone.
 	let deadline = Instant::now() + Duration::from_mins(3);
 	let mut ready = 0;
 	while Instant::now() < deadline {
-		let (status, pools) = server.get("/v1/pools");
-		assert_eq!(status, 200);
-		ready = pools
+		let pools_view = pool_view(&server);
+		ready = pools_view
 			.as_object()
 			.map_or(0, |m| m.values().filter_map(|v| v["ready"].as_u64()).sum::<u64>())
 			as usize;
@@ -557,14 +660,25 @@ fn warm_pool_prewarms_and_claims() {
 	);
 
 	remove_sandbox(&server, &id);
-	let (status, _) = server.delete(&format!("/v1/pools/{encoded}"));
-	assert_eq!(status, 200);
+	grpc
+		.block_on(pools.delete(pb::PoolRef { reference: image }))
+		.unwrap_or_else(|status| {
+			panic!("pool delete failed: {}", common::api::status_detail(&status))
+		});
+}
+
+fn pool_view(server: &Server) -> Value {
+	let grpc = server.grpc();
+	let mut pools = grpc.pools();
+	let view = grpc
+		.block_on(pools.list(pb::ListPoolsRequest {}))
+		.unwrap_or_else(|status| panic!("pool list failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	serde_json::from_str(&view.json).expect("pools view JSON")
 }
 
 fn pool_hits(server: &Server) -> u64 {
-	let (status, pools) = server.get("/v1/pools");
-	assert_eq!(status, 200);
-	pools
+	pool_view(server)
 		.as_object()
 		.map_or(0, |m| m.values().filter_map(|v| v["hits"].as_u64()).sum())
 }
@@ -582,8 +696,7 @@ fn timeout_terminates_and_extend_defers() {
 	let deadline = Instant::now() + Duration::from_secs(30);
 	let mut last;
 	let timed_out = loop {
-		let (status, view) = server.get(&format!("/v1/sandboxes/{did}"));
-		assert_eq!(status, 200, "view fetch failed: {view}");
+		let view = sandbox_view(&server, &did);
 		let returncode = view.get("returncode").and_then(Value::as_i64);
 		let running = view.get("status").and_then(Value::as_str) == Some("running");
 		last = view;
@@ -601,13 +714,16 @@ fn timeout_terminates_and_extend_defers() {
 	// Extend: re-arming the deadline outlives the original timeout.
 	let survivor = create_sandbox(&server, json!({"timeout_secs": 4}));
 	let sid = sandbox_id(&survivor);
-	let (status, out) =
-		server.post_json(&format!("/v1/sandboxes/{sid}/extend"), &json!({"secs": 60}));
-	assert_eq!(status, 200, "extend failed: {out}");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let out = grpc
+		.block_on(sandboxes.extend(pb::ExtendSandboxRequest { id: sid.clone(), secs: 60 }))
+		.unwrap_or_else(|status| panic!("extend failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	let out: Value = serde_json::from_str(&out.json).expect("extend view JSON");
 	assert!(out.get("deadline_unix").and_then(Value::as_u64).is_some(), "no deadline: {out}");
 	std::thread::sleep(Duration::from_secs(7));
-	let (status, view) = server.get(&format!("/v1/sandboxes/{sid}"));
-	assert_eq!(status, 200);
+	let view = sandbox_view(&server, &sid);
 	assert_eq!(
 		view.get("status").and_then(Value::as_str),
 		Some("running"),
@@ -633,17 +749,21 @@ fn rehydrate_after_server_kill() {
 	assert_ne!(old_pid, 0);
 
 	let server = Server::start(&HOME);
-	let (status, list) = server.get("/v1/sandboxes");
-	assert_eq!(status, 200);
-	let listed = list["sandboxes"].as_array().is_some_and(|entries| {
-		entries
-			.iter()
-			.any(|v| v["id"].as_str() == Some(id.as_str()))
-	});
-	assert!(listed, "sandbox {id} missing after rehydrate: {list}");
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let listing = grpc
+		.block_on(sandboxes.list(pb::ListSandboxesRequest { tags: Vec::new() }))
+		.unwrap_or_else(|status| panic!("list failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	let rows: Vec<Value> = listing
+		.sandboxes_json
+		.iter()
+		.map(|row| serde_json::from_str(row).expect("sandbox view JSON"))
+		.collect();
+	let listed = rows.iter().any(|v| v["id"].as_str() == Some(id.as_str()));
+	assert!(listed, "sandbox {id} missing after rehydrate: {rows:?}");
 
-	let (status, view) = server.get(&format!("/v1/sandboxes/{id}"));
-	assert_eq!(status, 200);
+	let view = sandbox_view(&server, &id);
 	assert_eq!(
 		view.get("status").and_then(Value::as_str),
 		Some("running"),

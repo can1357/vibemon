@@ -718,3 +718,170 @@ pub fn assert_no_panic(output: &str) {
 		"panic observed in vmon output:\n{output}"
 	);
 }
+
+/// Blocking gRPC client for the e2e harnesses, modeled on the CLI transport:
+/// one shared background current-thread runtime drives all channels; callers
+/// `block_on` unary calls from the test thread.
+pub mod api {
+	use std::{path::Path, sync::LazyLock, thread};
+
+	use tonic::{
+		metadata::{Ascii, MetadataValue},
+		service::interceptor::InterceptedService,
+		transport::{Channel, Endpoint, Uri},
+	};
+	use vmon_proto::v1::{
+		pool_service_client::PoolServiceClient, sandbox_service_client::SandboxServiceClient,
+		snapshot_service_client::SnapshotServiceClient, system_service_client::SystemServiceClient,
+		volume_service_client::VolumeServiceClient,
+	};
+
+	/// 64 MiB message cap, matching the CLI transport.
+	const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+	pub type SandboxClient = SandboxServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+	pub type SnapshotClient = SnapshotServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+	pub type VolumeClient = VolumeServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+	pub type PoolClient = PoolServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+	pub type SystemClient = SystemServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+
+	static RUNTIME: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("build e2e gRPC runtime");
+		let handle = runtime.handle().clone();
+		thread::Builder::new()
+			.name("e2e-grpc".to_owned())
+			.spawn(move || runtime.block_on(std::future::pending::<()>()))
+			.expect("spawn e2e gRPC runtime thread");
+		handle
+	});
+
+	/// Injects `authorization: Bearer <token>` metadata on every RPC.
+	#[derive(Clone)]
+	pub struct AuthInterceptor {
+		token: Option<MetadataValue<Ascii>>,
+	}
+
+	impl tonic::service::Interceptor for AuthInterceptor {
+		fn call(
+			&mut self,
+			mut request: tonic::Request<()>,
+		) -> Result<tonic::Request<()>, tonic::Status> {
+			if let Some(token) = &self.token {
+				request
+					.metadata_mut()
+					.insert("authorization", token.clone());
+			}
+			Ok(request)
+		}
+	}
+
+	#[derive(Clone)]
+	pub struct Grpc {
+		handle:  tokio::runtime::Handle,
+		channel: Channel,
+		auth:    AuthInterceptor,
+	}
+
+	impl Grpc {
+		/// Connects over a vmond UDS.
+		pub fn connect_uds(sock: &Path) -> Result<Self, String> {
+			let handle = RUNTIME.clone();
+			let sock = sock.to_path_buf();
+			let connector = tower::service_fn(move |_: Uri| {
+				let sock = sock.clone();
+				async move {
+					let stream = tokio::net::UnixStream::connect(sock).await?;
+					Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+				}
+			});
+			let channel = handle
+				.block_on(Endpoint::from_static("http://vmon.uds").connect_with_connector(connector))
+				.map_err(|error| format!("gRPC UDS connect failed: {error}"))?;
+			Ok(Self { handle, channel, auth: AuthInterceptor { token: None } })
+		}
+
+		/// Connects to `http://127.0.0.1:{port}`, optionally with a bearer token.
+		pub fn connect_tcp(port: u16, token: Option<&str>) -> Result<Self, String> {
+			let handle = RUNTIME.clone();
+			let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+				.map_err(|error| format!("invalid gRPC endpoint: {error}"))?;
+			let channel = handle
+				.block_on(endpoint.connect())
+				.map_err(|error| format!("gRPC connect to 127.0.0.1:{port} failed: {error}"))?;
+			let token = token
+				.map(|token| {
+					format!("Bearer {token}")
+						.parse::<MetadataValue<Ascii>>()
+						.map_err(|_| "API token is not header-safe".to_owned())
+				})
+				.transpose()?;
+			Ok(Self { handle, channel, auth: AuthInterceptor { token } })
+		}
+
+		/// Runs `future` to completion on the shared runtime.
+		pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+			self.handle.block_on(future)
+		}
+
+		pub fn sandboxes(&self) -> SandboxClient {
+			limited(SandboxServiceClient::with_interceptor(self.channel.clone(), self.auth.clone()))
+		}
+
+		pub fn snapshots(&self) -> SnapshotClient {
+			limited(SnapshotServiceClient::with_interceptor(self.channel.clone(), self.auth.clone()))
+		}
+
+		pub fn volumes(&self) -> VolumeClient {
+			limited(VolumeServiceClient::with_interceptor(self.channel.clone(), self.auth.clone()))
+		}
+
+		pub fn pools(&self) -> PoolClient {
+			limited(PoolServiceClient::with_interceptor(self.channel.clone(), self.auth.clone()))
+		}
+
+		pub fn system(&self) -> SystemClient {
+			limited(SystemServiceClient::with_interceptor(self.channel.clone(), self.auth.clone()))
+		}
+	}
+
+	macro_rules! impl_limited {
+		($($client:ident),+ $(,)?) => {
+			$(impl Limited for $client {
+				fn limited(self) -> Self {
+					self
+						.max_decoding_message_size(MAX_MESSAGE_SIZE)
+						.max_encoding_message_size(MAX_MESSAGE_SIZE)
+				}
+			})+
+		};
+	}
+
+	trait Limited {
+		fn limited(self) -> Self;
+	}
+
+	impl_limited!(SandboxClient, SnapshotClient, VolumeClient, PoolClient, SystemClient);
+
+	fn limited<T: Limited>(client: T) -> T {
+		client.limited()
+	}
+
+	/// vmond's stable error code from `vmon-code` metadata, with the gRPC code
+	/// as fallback — for assertion messages.
+	pub fn vmon_code(status: &tonic::Status) -> String {
+		status
+			.metadata()
+			.get("vmon-code")
+			.and_then(|value| value.to_str().ok())
+			.filter(|code| !code.is_empty())
+			.map_or_else(|| format!("{:?}", status.code()), str::to_owned)
+	}
+
+	/// `"code: message"` rendering of a gRPC status for panics/log lines.
+	pub fn status_detail(status: &tonic::Status) -> String {
+		format!("{}: {}", vmon_code(status), status.message())
+	}
+}

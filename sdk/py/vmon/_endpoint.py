@@ -354,10 +354,15 @@ class EndpointTransport:
         """Return the lazily-created service stubs for this endpoint."""
         with self._grpc_lock:
             if self._grpc_stubs is None:
-                options = (
+                options: tuple[tuple[str, Any], ...] = (
                     ("grpc.max_send_message_length", GRPC_MAX_MESSAGE),
                     ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE),
                 )
+                if self.uds is not None:
+                    # grpc-core uses the socket path as :authority for unix:
+                    # targets; hyper's h2 rejects that as malformed (RST_STREAM
+                    # PROTOCOL_ERROR), so pin a valid authority instead.
+                    options = (*options, ("grpc.default_authority", "localhost"))
                 target = self._grpc_target()
                 if self.uds is None and urlsplit(self.base_url).scheme == "https":
                     channel = grpc.secure_channel(
