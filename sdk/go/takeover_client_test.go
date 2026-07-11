@@ -3,13 +3,10 @@ package vmon
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,15 +16,20 @@ import (
 	"testing"
 	"time"
 
-	ws "github.com/coder/websocket"
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
-// takeoverStub is a fake vmond: HTTP endpoints answer the sandbox lifecycle and
-// the exec WebSocket bridges to a real re-exec of this test binary in worker
+// takeoverStub is a fake vmond: gRPC handlers answer the sandbox lifecycle and
+// the Exec stream bridges to a real re-exec of this test binary in worker
 // mode, exercising the full session protocol over real pipes.
 type takeoverStub struct {
-	t      *testing.T
-	server *httptest.Server
+	pb.UnimplementedSandboxServiceServer
+	t        *testing.T
+	listener *bufconn.Listener
 
 	mu         sync.Mutex
 	creates    int
@@ -38,9 +40,11 @@ type takeoverStub struct {
 
 func startTakeoverStub(t *testing.T) *takeoverStub {
 	t.Helper()
-	stub := &takeoverStub{t: t, uploads: map[string][]byte{}}
-	stub.server = httptest.NewServer(http.HandlerFunc(stub.handle))
-	t.Cleanup(stub.server.Close)
+	stub := &takeoverStub{t: t, uploads: map[string][]byte{}, listener: bufconn.Listen(1 << 20)}
+	server := grpc.NewServer()
+	pb.RegisterSandboxServiceServer(server, stub)
+	go func() { _ = server.Serve(stub.listener) }()
+	t.Cleanup(server.Stop)
 	return stub
 }
 
@@ -50,63 +54,48 @@ func (stub *takeoverStub) counts() (creates, sessions int, terminated []string) 
 	return stub.creates, stub.sessions, append([]string(nil), stub.terminated...)
 }
 
-func (stub *takeoverStub) handle(writer http.ResponseWriter, request *http.Request) {
-	path := request.URL.Path
-	switch {
-	case request.Method == http.MethodPost && path == "/v1/sandboxes":
-		stub.mu.Lock()
-		stub.creates++
-		id := fmt.Sprintf("to-%d", stub.creates)
-		stub.mu.Unlock()
-		writer.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(writer, `{"id":%q,"status":"running"}`, id)
-	case request.Method == http.MethodPut && strings.HasSuffix(path, "/files"):
-		data, _ := io.ReadAll(request.Body)
-		stub.mu.Lock()
-		stub.uploads[request.URL.Query().Get("path")] = data
-		stub.mu.Unlock()
-		writer.WriteHeader(http.StatusNoContent)
-	case request.Method == http.MethodPost && strings.HasSuffix(path, "/exec"):
-		var exec ExecRequest
-		_ = json.NewDecoder(request.Body).Decode(&exec)
-		if len(exec.Command) == 0 || exec.Command[0] != "chmod" {
-			stub.t.Errorf("unexpected captured exec %v", exec.Command)
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(writer, `{"exit":0,"stdout_b64":"","stderr_b64":""}`)
-	case request.Method == http.MethodPost && strings.HasSuffix(path, "/terminate"):
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/sandboxes/"), "/terminate")
-		stub.mu.Lock()
-		stub.terminated = append(stub.terminated, id)
-		stub.mu.Unlock()
-		writer.WriteHeader(http.StatusNoContent)
-	case request.Method == http.MethodGet && strings.HasSuffix(path, "/exec"):
-		stub.bridgeExec(writer, request)
-	default:
-		stub.t.Errorf("unexpected request %s %s", request.Method, path)
-		http.NotFound(writer, request)
-	}
+func (stub *takeoverStub) Create(_ context.Context, _ *pb.CreateSandboxRequest) (*pb.JsonView, error) {
+	stub.mu.Lock()
+	stub.creates++
+	id := fmt.Sprintf("to-%d", stub.creates)
+	stub.mu.Unlock()
+	return &pb.JsonView{Json: fmt.Sprintf(`{"id":%q,"status":"running"}`, id)}, nil
 }
 
-// bridgeExec runs this test binary in takeover worker mode and relays the vmon
-// exec WebSocket frames to its pipes, mirroring the real guest agent.
-func (stub *takeoverStub) bridgeExec(writer http.ResponseWriter, request *http.Request) {
-	connection, err := ws.Accept(writer, request, nil)
-	if err != nil {
-		return
+func (stub *takeoverStub) FileWrite(_ context.Context, request *pb.FileWriteRequest) (*pb.Ok, error) {
+	stub.mu.Lock()
+	stub.uploads[request.GetPath()] = bytes.Clone(request.GetData())
+	stub.mu.Unlock()
+	return &pb.Ok{}, nil
+}
+
+func (stub *takeoverStub) ExecCapture(_ context.Context, request *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error) {
+	cmd := request.GetExec().GetCmd()
+	if len(cmd) == 0 || cmd[0] != "chmod" {
+		stub.t.Errorf("unexpected captured exec %v", cmd)
 	}
-	defer connection.CloseNow()
-	ctx := request.Context()
-	_, first, err := connection.Read(ctx)
+	return &pb.ExecCaptureResponse{Code: 0}, nil
+}
+
+func (stub *takeoverStub) Terminate(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+	stub.mu.Lock()
+	stub.terminated = append(stub.terminated, ref.GetId())
+	stub.mu.Unlock()
+	return &pb.JsonView{Json: "{}"}, nil
+}
+
+// Exec runs this test binary in takeover worker mode and relays the exec
+// stream frames to its pipes, mirroring the real guest agent.
+func (stub *takeoverStub) Exec(stream grpc.BidiStreamingServer[pb.ExecInput, pb.ExecOutput]) error {
+	first, err := stream.Recv()
 	if err != nil {
-		return
+		return err
 	}
-	var execRequest ExecRequest
-	if err := json.Unmarshal(first, &execRequest); err != nil ||
-		len(execRequest.Command) != 1 || execRequest.Command[0] != takeoverWorkerGuestPath ||
-		execRequest.Env[takeoverModeEnv] != "1" || execRequest.Timeout != nil {
-		stub.t.Errorf("unexpected exec request %s", first)
-		return
+	start := first.GetStart()
+	if start == nil || len(start.GetCmd()) != 1 || start.GetCmd()[0] != takeoverWorkerGuestPath ||
+		start.GetEnv()[takeoverModeEnv] != "1" || start.Timeout != nil || start.GetSandboxId() == "" {
+		stub.t.Errorf("unexpected exec start %v", start)
+		return status.Error(codes.InvalidArgument, "unexpected exec start frame")
 	}
 	stub.mu.Lock()
 	stub.sessions++
@@ -117,56 +106,44 @@ func (stub *takeoverStub) bridgeExec(writer http.ResponseWriter, request *http.R
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		stub.t.Error(err)
-		return
+		return status.Error(codes.Internal, "stdin pipe")
 	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		stub.t.Error(err)
-		return
+		return status.Error(codes.Internal, "stdout pipe")
 	}
 	stderr, err := command.StderrPipe()
 	if err != nil {
 		stub.t.Error(err)
-		return
+		return status.Error(codes.Internal, "stderr pipe")
 	}
 	if err := command.Start(); err != nil {
 		stub.t.Error(err)
-		return
+		return status.Error(codes.Internal, "start worker")
 	}
 
 	var writeMu sync.Mutex
-	writeFrame := func(frame any) {
-		encoded, _ := json.Marshal(frame)
+	writeFrame := func(output *pb.ExecOutput) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		_ = connection.Write(ctx, ws.MessageText, encoded)
+		_ = stream.Send(output)
 	}
 
-	// Client → worker stdin; a dropped WebSocket kills the worker (server parity).
+	// Client → worker stdin; a dropped stream kills the worker (server parity).
 	go func() {
 		defer stdin.Close()
 		for {
-			_, data, err := connection.Read(ctx)
+			input, err := stream.Recv()
 			if err != nil {
 				_ = command.Process.Kill()
 				return
 			}
-			var input struct {
-				Stdin string `json:"stdin_b64"`
-				EOF   bool   `json:"eof"`
-			}
-			if json.Unmarshal(data, &input) != nil {
-				continue
-			}
-			if input.EOF {
+			if input.GetEof() != nil {
 				return
 			}
-			if input.Stdin != "" {
-				decoded, err := base64.StdEncoding.DecodeString(input.Stdin)
-				if err != nil {
-					continue
-				}
-				if _, err := stdin.Write(decoded); err != nil {
+			if chunk := input.GetStdin(); len(chunk) != 0 {
+				if _, err := stdin.Write(chunk); err != nil {
 					return
 				}
 			}
@@ -174,16 +151,15 @@ func (stub *takeoverStub) bridgeExec(writer http.ResponseWriter, request *http.R
 	}()
 
 	var pumps sync.WaitGroup
-	pump := func(stream string, reader io.Reader) {
+	pump := func(name pb.Stream, reader io.Reader) {
 		defer pumps.Done()
 		buffer := make([]byte, 8192)
 		for {
 			count, err := reader.Read(buffer)
 			if count > 0 {
-				writeFrame(map[string]string{
-					"stream": stream,
-					"b64":    base64.StdEncoding.EncodeToString(buffer[:count]),
-				})
+				writeFrame(&pb.ExecOutput{Output: &pb.ExecOutput_Chunk{
+					Chunk: &pb.Output{Stream: name, Data: bytes.Clone(buffer[:count])},
+				}})
 			}
 			if err != nil {
 				return
@@ -191,8 +167,8 @@ func (stub *takeoverStub) bridgeExec(writer http.ResponseWriter, request *http.R
 		}
 	}
 	pumps.Add(2)
-	go pump("stdout", stdout)
-	go pump("stderr", stderr)
+	go pump(pb.Stream_STREAM_STDOUT, stdout)
+	go pump(pb.Stream_STREAM_STDERR, stderr)
 	pumps.Wait()
 	code := 0
 	if err := command.Wait(); err != nil {
@@ -203,8 +179,8 @@ func (stub *takeoverStub) bridgeExec(writer http.ResponseWriter, request *http.R
 			code = -1
 		}
 	}
-	writeFrame(map[string]int{"exit": code})
-	_ = connection.Close(ws.StatusNormalClosure, "")
+	writeFrame(&pb.ExecOutput{Output: &pb.ExecOutput_Exit{Exit: &pb.Exit{Code: int64(code)}}})
+	return nil
 }
 
 func takeoverTestOptions(t *testing.T, extra FunctionOptions) FunctionOptions {
@@ -227,7 +203,9 @@ func takeoverTestOptions(t *testing.T, extra FunctionOptions) FunctionOptions {
 
 func takeoverTestClient(t *testing.T, stub *takeoverStub) *Client {
 	t.Helper()
-	client, err := Connect(stub.server.URL, WithDiscovery(false))
+	client, err := Connect("http://127.0.0.1:1", WithDiscovery(false), withGRPCDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		return stub.listener.DialContext(ctx)
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

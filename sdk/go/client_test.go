@@ -2,6 +2,7 @@ package vmon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,28 +10,33 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
+// stubDriver covers the residual HTTP surface (ports proxy) and the endpoint
+// roster; gRPC traffic bypasses it entirely.
 type stubDriver struct {
 	do        func(context.Context, DriverRequest) (*http.Response, string, error)
-	resolve   func(context.Context, string, string) (string, error)
 	endpoints []EndpointInfo
 }
 
 func (driver *stubDriver) Do(ctx context.Context, request DriverRequest) (*http.Response, string, error) {
+	if driver.do == nil {
+		return nil, "", io.EOF
+	}
 	return driver.do(ctx, request)
 }
 func (driver *stubDriver) Dial(context.Context, string, url.Values, string) (*WebSocketConn, string, error) {
 	return nil, "", io.EOF
-}
-func (driver *stubDriver) ResolveSandbox(ctx context.Context, id, hint string) (string, error) {
-	if driver.resolve != nil {
-		return driver.resolve(ctx, id, hint)
-	}
-	return hint, nil
 }
 func (driver *stubDriver) Endpoints() []EndpointInfo           { return driver.endpoints }
 func (driver *stubDriver) Refresh(context.Context, bool) error { return nil }
@@ -39,20 +45,64 @@ func jsonResponse(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}
 }
 
-func TestClientServicesAndBoundSandbox(t *testing.T) {
-	var requests []DriverRequest
-	driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://node-a", Healthy: true}}, do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		requests = append(requests, request)
-		switch request.Path {
-		case "/v1/sandboxes":
-			return jsonResponse(200, `{"id":"box","status":"running"}`), "http://node-a", nil
-		case "/v1/sandboxes/box/metrics":
-			return jsonResponse(200, `{"cpu":1}`), "http://node-a", nil
-		default:
-			return jsonResponse(404, `{"code":"not_found","message":"missing"}`), "http://node-a", nil
+// routingDialer routes gRPC dials to per-endpoint bufconn listeners by
+// address (e.g. "a.test:80").
+func routingDialer(routes map[string]*bufconn.Listener) func(context.Context, string) (net.Conn, error) {
+	return func(ctx context.Context, address string) (net.Conn, error) {
+		if listener := routes[address]; listener != nil {
+			return listener.DialContext(ctx)
 		}
-	}}
-	client := NewClient(driver)
+		return nil, fmt.Errorf("no route for %s", address)
+	}
+}
+
+type snapshotServiceStub struct {
+	pb.UnimplementedSnapshotServiceServer
+	fork func(context.Context, *pb.ForkSnapshotRequest) (*pb.JsonView, error)
+}
+
+func (stub *snapshotServiceStub) Fork(ctx context.Context, request *pb.ForkSnapshotRequest) (*pb.JsonView, error) {
+	if stub.fork == nil {
+		return nil, status.Error(codes.Unimplemented, "fork not stubbed")
+	}
+	return stub.fork(ctx, request)
+}
+
+type poolServiceStub struct {
+	pb.UnimplementedPoolServiceServer
+	list   func(context.Context, *pb.ListPoolsRequest) (*pb.JsonView, error)
+	delete func(context.Context, *pb.PoolRef) (*pb.Ok, error)
+}
+
+func (stub *poolServiceStub) List(ctx context.Context, request *pb.ListPoolsRequest) (*pb.JsonView, error) {
+	if stub.list == nil {
+		return nil, status.Error(codes.Unimplemented, "list not stubbed")
+	}
+	return stub.list(ctx, request)
+}
+func (stub *poolServiceStub) Delete(ctx context.Context, ref *pb.PoolRef) (*pb.Ok, error) {
+	if stub.delete == nil {
+		return nil, status.Error(codes.Unimplemented, "delete not stubbed")
+	}
+	return stub.delete(ctx, ref)
+}
+
+func TestClientServicesAndBoundSandbox(t *testing.T) {
+	var metricsID string
+	stub := &sandboxServiceStub{
+		create: func(_ context.Context, request *pb.CreateSandboxRequest) (*pb.JsonView, error) {
+			var spec SandboxCreateRequest
+			if err := json.Unmarshal([]byte(request.GetSpecJson()), &spec); err != nil || spec.Image != "alpine" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected create spec")
+			}
+			return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+		},
+		metrics: func(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+			metricsID = ref.GetId()
+			return &pb.JsonView{Json: `{"cpu":1}`}, nil
+		},
+	}
+	client := bufconnClient(t, startSandboxServiceStub(t, stub))
 	if client.Sandboxes == nil || client.Snapshots == nil || client.Volumes == nil || client.Pools == nil || client.Mesh == nil {
 		t.Fatal("client services were not initialized")
 	}
@@ -64,75 +114,90 @@ func TestClientServicesAndBoundSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metrics["cpu"] != float64(1) {
-		t.Fatalf("metrics=%v", metrics)
+	if metrics["cpu"] != float64(1) || metricsID != "box" {
+		t.Fatalf("metrics=%v id=%q", metrics, metricsID)
 	}
-	if requests[1].Endpoint != "http://node-a" {
-		t.Fatalf("sandbox affinity=%q", requests[1].Endpoint)
+	if sandbox.endpoint != "http://127.0.0.1:1" {
+		t.Fatalf("sandbox affinity=%q", sandbox.endpoint)
 	}
 }
 
 func TestSandboxRelocatesOnceOnNotFound(t *testing.T) {
-	calls := 0
-	resolved := 0
-	driver := &stubDriver{endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}}, resolve: func(_ context.Context, id, hint string) (string, error) {
-		resolved++
-		if id != "box" || hint != "a" {
-			t.Fatalf("resolve(%q,%q)", id, hint)
-		}
-		return "b", nil
-	}, do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		calls++
-		if request.Endpoint == "a" {
-			return jsonResponse(404, `{"code":"not_found","message":"moved"}`), "a", nil
-		}
-		if request.Endpoint != "b" {
-			t.Fatalf("endpoint=%q", request.Endpoint)
-		}
-		return jsonResponse(200, `{"id":"box","status":"running"}`), "b", nil
+	var mu sync.Mutex
+	oldGets, newGets := 0, 0
+	old := &sandboxServiceStub{get: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+		mu.Lock()
+		oldGets++
+		mu.Unlock()
+		return nil, status.Error(codes.NotFound, "moved")
 	}}
-	client := NewClient(driver)
+	current := &sandboxServiceStub{get: func(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+		mu.Lock()
+		newGets++
+		mu.Unlock()
+		if ref.GetId() != "box" {
+			return nil, status.Error(codes.InvalidArgument, "unexpected id")
+		}
+		return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+	}}
+	dialer := routingDialer(map[string]*bufconn.Listener{
+		"a.test:80": startSandboxServiceStub(t, old),
+		"b.test:80": startSandboxServiceStub(t, current),
+	})
+	driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}}}
+	client := NewClient(driver, withGRPCDialer(dialer))
+	defer client.Close()
 	sandbox := client.Sandboxes.Ref("box")
-	sandbox.endpoint = "a"
+	sandbox.endpoint = "http://a.test"
 	if _, err := sandbox.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 || resolved != 1 || sandbox.endpoint != "b" {
-		t.Fatalf("calls=%d resolved=%d endpoint=%q", calls, resolved, sandbox.endpoint)
+	mu.Lock()
+	defer mu.Unlock()
+	// Initial Get + resolve probe on the old node; resolve probe + retried Get
+	// on the new one.
+	if oldGets != 2 || newGets != 2 || sandbox.endpoint != "http://b.test" {
+		t.Fatalf("oldGets=%d newGets=%d endpoint=%q", oldGets, newGets, sandbox.endpoint)
 	}
 }
 
 func TestSandboxListFiltersNodeAndOnlySkipsTransportErrors(t *testing.T) {
 	t.Run("transport error", func(t *testing.T) {
-		driver := &stubDriver{
-			endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-			do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-				if request.Endpoint == "a" {
-					return nil, "", &TransportError{Endpoint: "a", Err: io.EOF}
-				}
-				return jsonResponse(http.StatusOK, `{"sandboxes":[{"id":"other","node":"node-a"},{"id":"wanted","node":"node-b"}]}`), "b", nil
-			},
-		}
-		sandboxes, err := NewClient(driver).Sandboxes.List(context.Background(), SandboxListOptions{Node: "node-b"})
+		live := &sandboxServiceStub{list: func(context.Context, *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+			return &pb.ListSandboxesResponse{SandboxesJson: []string{
+				`{"id":"other","node":"node-a"}`,
+				`{"id":"wanted","node":"node-b"}`,
+			}}, nil
+		}}
+		// a.test has no route: its dial fails and the call fails over to b.
+		dialer := routingDialer(map[string]*bufconn.Listener{"b.test:80": startSandboxServiceStub(t, live)})
+		driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}}}
+		client := NewClient(driver, withGRPCDialer(dialer))
+		defer client.Close()
+		sandboxes, err := client.Sandboxes.List(context.Background(), SandboxListOptions{Node: "node-b"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(sandboxes) != 1 || sandboxes[0].ID != "wanted" || sandboxes[0].endpoint != "b" {
+		if len(sandboxes) != 1 || sandboxes[0].ID != "wanted" || sandboxes[0].endpoint != "http://b.test" {
 			t.Fatalf("sandboxes=%#v", sandboxes)
 		}
 	})
 
 	t.Run("API error", func(t *testing.T) {
-		driver := &stubDriver{
-			endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-			do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-				if request.Endpoint == "a" {
-					return jsonResponse(http.StatusConflict, `{"code":"busy","message":"try later"}`), "a", nil
-				}
-				return jsonResponse(http.StatusOK, `{"sandboxes":[]}`), "b", nil
-			},
-		}
-		_, err := NewClient(driver).Sandboxes.List(context.Background())
+		busy := &sandboxServiceStub{list: func(context.Context, *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+			return nil, status.Error(codes.Aborted, "try later")
+		}}
+		empty := &sandboxServiceStub{list: func(context.Context, *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+			return &pb.ListSandboxesResponse{}, nil
+		}}
+		dialer := routingDialer(map[string]*bufconn.Listener{
+			"a.test:80": startSandboxServiceStub(t, busy),
+			"b.test:80": startSandboxServiceStub(t, empty),
+		})
+		driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}}}
+		client := NewClient(driver, withGRPCDialer(dialer))
+		defer client.Close()
+		_, err := client.Sandboxes.List(context.Background())
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Code != "busy" {
 			t.Fatalf("error=%T %v", err, err)
@@ -140,16 +205,11 @@ func TestSandboxListFiltersNodeAndOnlySkipsTransportErrors(t *testing.T) {
 	})
 
 	t.Run("protocol error", func(t *testing.T) {
-		driver := &stubDriver{
-			endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-			do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-				if request.Endpoint == "a" {
-					return jsonResponse(http.StatusOK, `{}`), "a", nil
-				}
-				return jsonResponse(http.StatusOK, `{"sandboxes":[]}`), "b", nil
-			},
-		}
-		_, err := NewClient(driver).Sandboxes.List(context.Background())
+		invalid := &sandboxServiceStub{list: func(context.Context, *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+			return &pb.ListSandboxesResponse{SandboxesJson: []string{"not json"}}, nil
+		}}
+		client := bufconnClient(t, startSandboxServiceStub(t, invalid))
+		_, err := client.Sandboxes.List(context.Background())
 		var protocolErr *ProtocolError
 		if !errors.As(err, &protocolErr) {
 			t.Fatalf("error=%T %v", err, err)
@@ -160,28 +220,27 @@ func TestSandboxListFiltersNodeAndOnlySkipsTransportErrors(t *testing.T) {
 func TestSandboxListFansOutConcurrentlyAndEmptySuccessWins(t *testing.T) {
 	var active atomic.Int32
 	var peak atomic.Int32
-	driver := &stubDriver{
-		endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-		do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-			current := active.Add(1)
-			defer active.Add(-1)
-			for {
-				seen := peak.Load()
-				if current <= seen || peak.CompareAndSwap(seen, current) {
-					break
-				}
+	live := &sandboxServiceStub{list: func(_ context.Context, request *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			seen := peak.Load()
+			if current <= seen || peak.CompareAndSwap(seen, current) {
+				break
 			}
-			time.Sleep(20 * time.Millisecond)
-			if got := request.Query["tag"]; len(got) != 2 || got[0] != "a=1" || got[1] != "z=2" {
-				t.Errorf("tag query=%v", got)
-			}
-			if request.Endpoint == "a" {
-				return nil, "", &TransportError{Endpoint: "a", Err: io.EOF}
-			}
-			return jsonResponse(http.StatusOK, `{"sandboxes":[]}`), "b", nil
-		},
-	}
-	sandboxes, err := NewClient(driver).Sandboxes.List(context.Background(), SandboxListOptions{Tags: map[string]string{"z": "2", "a": "1"}})
+		}
+		time.Sleep(100 * time.Millisecond)
+		if got := request.GetTags(); len(got) != 2 || got[0] != "a=1" || got[1] != "z=2" {
+			t.Errorf("tag filters=%v", got)
+		}
+		return &pb.ListSandboxesResponse{}, nil
+	}}
+	// a.test is unreachable: that fan-out leg fails over to b concurrently.
+	dialer := routingDialer(map[string]*bufconn.Listener{"b.test:80": startSandboxServiceStub(t, live)})
+	driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}}}
+	client := NewClient(driver, withGRPCDialer(dialer))
+	defer client.Close()
+	sandboxes, err := client.Sandboxes.List(context.Background(), SandboxListOptions{Tags: map[string]string{"z": "2", "a": "1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,28 +253,31 @@ func TestSandboxListFansOutConcurrentlyAndEmptySuccessWins(t *testing.T) {
 }
 
 func TestPoolClearListsAndDeletesEveryReference(t *testing.T) {
-	var deleted map[string]bool
-	deleted = make(map[string]bool)
-	driver := &stubDriver{do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		switch {
-		case request.Method == http.MethodGet && request.Path == "/v1/pools":
-			return jsonResponse(http.StatusOK, `{"image:one":{"ready":1},"image/two":{"ready":2}}`), "node", nil
-		case request.Method == http.MethodDelete:
-			deleted[request.Path] = true
-			return jsonResponse(http.StatusNoContent, ""), "node", nil
-		default:
-			t.Fatalf("unexpected request: %s %s", request.Method, request.Path)
-			return nil, "", nil
-		}
-	}}
-	if err := NewClient(driver).Pools.Clear(context.Background()); err != nil {
+	var mu sync.Mutex
+	deleted := make(map[string]bool)
+	pools := &poolServiceStub{
+		list: func(context.Context, *pb.ListPoolsRequest) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: `{"image:one":{"ready":1},"image/two":{"ready":2}}`}, nil
+		},
+		delete: func(_ context.Context, ref *pb.PoolRef) (*pb.Ok, error) {
+			mu.Lock()
+			deleted[ref.GetReference()] = true
+			mu.Unlock()
+			return &pb.Ok{}, nil
+		},
+	}
+	listener := startGRPCServices(t, func(server *grpc.Server) { pb.RegisterPoolServiceServer(server, pools) })
+	if err := bufconnClient(t, listener).Pools.Clear(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(deleted) != 2 || !deleted["/v1/pools/image:one"] || !deleted["/v1/pools/image%2Ftwo"] {
+	if len(deleted) != 2 || !deleted["image:one"] || !deleted["image/two"] {
 		t.Fatalf("deleted=%v", deleted)
 	}
 }
 
+// TestStrictCollectionEnvelopes covers the JsonView documents whose envelope
+// the client still validates. The former snapshots/volumes list subtests are
+// gone with REST: their repeated proto fields cannot be absent.
 func TestStrictCollectionEnvelopes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -230,14 +292,6 @@ func TestStrictCollectionEnvelopes(t *testing.T) {
 			_, err := client.Snapshots.Fork(context.Background(), "base", ForkRequest{})
 			return err
 		}},
-		{name: "snapshots list", call: func(client *Client) error {
-			_, err := client.Snapshots.List(context.Background())
-			return err
-		}},
-		{name: "volumes list", call: func(client *Client) error {
-			_, err := client.Volumes.List(context.Background())
-			return err
-		}},
 		{name: "pools list null", body: "null", call: func(client *Client) error {
 			_, err := client.Pools.List(context.Background())
 			return err
@@ -249,10 +303,13 @@ func TestStrictCollectionEnvelopes(t *testing.T) {
 			if body == "" {
 				body = `{}`
 			}
-			driver := &stubDriver{do: func(_ context.Context, _ DriverRequest) (*http.Response, string, error) {
-				return jsonResponse(http.StatusOK, body), "node", nil
-			}}
-			err := test.call(NewClient(driver))
+			view := func() (*pb.JsonView, error) { return &pb.JsonView{Json: body}, nil }
+			listener := startGRPCServices(t, func(server *grpc.Server) {
+				pb.RegisterSandboxServiceServer(server, &sandboxServiceStub{fileList: func(context.Context, *pb.FilePathRequest) (*pb.JsonView, error) { return view() }})
+				pb.RegisterSnapshotServiceServer(server, &snapshotServiceStub{fork: func(context.Context, *pb.ForkSnapshotRequest) (*pb.JsonView, error) { return view() }})
+				pb.RegisterPoolServiceServer(server, &poolServiceStub{list: func(context.Context, *pb.ListPoolsRequest) (*pb.JsonView, error) { return view() }})
+			})
+			err := test.call(bufconnClient(t, listener))
 			var protocolErr *ProtocolError
 			if !errors.As(err, &protocolErr) {
 				t.Fatalf("missing envelope error=%T %v", err, err)
@@ -262,13 +319,13 @@ func TestStrictCollectionEnvelopes(t *testing.T) {
 }
 
 func TestExtendPreservesSandboxIDWhenResponseOmitsIt(t *testing.T) {
-	driver := &stubDriver{do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		if request.Path != "/v1/sandboxes/box/extend" {
-			t.Fatalf("path=%q", request.Path)
+	stub := &sandboxServiceStub{extend: func(_ context.Context, request *pb.ExtendSandboxRequest) (*pb.JsonView, error) {
+		if request.GetId() != "box" || request.GetSecs() != 30 {
+			return nil, status.Error(codes.InvalidArgument, "unexpected extend request")
 		}
-		return jsonResponse(http.StatusOK, `{"status":"running"}`), "node", nil
+		return &pb.JsonView{Json: `{"status":"running"}`}, nil
 	}}
-	sandbox := NewClient(driver).Sandboxes.Ref("box")
+	sandbox := bufconnClient(t, startSandboxServiceStub(t, stub)).Sandboxes.Ref("box")
 	extended, err := sandbox.Extend(context.Background(), 30)
 	if err != nil {
 		t.Fatal(err)
@@ -308,77 +365,93 @@ func TestPortProxyReturnsRawDownstreamNon2xx(t *testing.T) {
 }
 
 func TestPortProxyOnlyRelocatesDaemonNotFound(t *testing.T) {
+	// Relocation probes are gRPC Gets: the old node reports not_found, the
+	// new one hosts the sandbox.
+	newFixture := func(t *testing.T) (func(context.Context, string) (net.Conn, error), *int) {
+		resolves := new(int)
+		var mu sync.Mutex
+		old := &sandboxServiceStub{get: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+			mu.Lock()
+			*resolves++
+			mu.Unlock()
+			return nil, status.Error(codes.NotFound, "moved")
+		}}
+		dialer := routingDialer(map[string]*bufconn.Listener{
+			"a.test:80": startSandboxServiceStub(t, old),
+			"b.test:80": startSandboxServiceStub(t, &sandboxServiceStub{}),
+		})
+		return dialer, resolves
+	}
+
 	t.Run("downstream 404 is not replayed", func(t *testing.T) {
 		calls := 0
-		resolves := 0
+		dialer, resolves := newFixture(t)
 		driver := &stubDriver{
-			endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-			resolve: func(context.Context, string, string) (string, error) {
-				resolves++
-				return "b", nil
-			},
+			endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}},
 			do: func(_ context.Context, _ DriverRequest) (*http.Response, string, error) {
 				calls++
-				return jsonResponse(http.StatusNotFound, `{"message":"app route missing"}`), "a", nil
+				return jsonResponse(http.StatusNotFound, `{"message":"app route missing"}`), "http://a.test", nil
 			},
 		}
-		sandbox := NewClient(driver).Sandboxes.Ref("box")
-		sandbox.endpoint, sandbox.connectToken = "a", "secret"
+		client := NewClient(driver, withGRPCDialer(dialer))
+		defer client.Close()
+		sandbox := client.Sandboxes.Ref("box")
+		sandbox.endpoint, sandbox.connectToken = "http://a.test", "secret"
 		response, err := sandbox.Ports.HTTP(context.Background(), 8080, ProxyRequest{Method: http.MethodPost, Body: strings.NewReader("side effect")})
 		if err != nil {
 			t.Fatal(err)
 		}
 		body, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
-		if calls != 1 || resolves != 0 || string(body) != `{"message":"app route missing"}` {
-			t.Fatalf("calls=%d resolves=%d body=%q", calls, resolves, body)
+		if calls != 1 || *resolves != 0 || string(body) != `{"message":"app route missing"}` {
+			t.Fatalf("calls=%d resolves=%d body=%q", calls, *resolves, body)
 		}
 	})
 
 	t.Run("daemon not_found relocates once", func(t *testing.T) {
 		calls := 0
-		resolves := 0
+		dialer, resolves := newFixture(t)
 		driver := &stubDriver{
-			endpoints: []EndpointInfo{{URL: "a", Healthy: true}, {URL: "b", Healthy: true}},
-			resolve: func(context.Context, string, string) (string, error) {
-				resolves++
-				return "b", nil
-			},
+			endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}},
 			do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
 				calls++
-				if request.Endpoint == "a" {
-					return jsonResponse(http.StatusNotFound, `{"code":"not_found","message":"moved"}`), "a", nil
+				if request.Endpoint == "http://a.test" {
+					return jsonResponse(http.StatusNotFound, `{"code":"not_found","message":"moved"}`), "http://a.test", nil
 				}
-				return jsonResponse(http.StatusCreated, "created"), "b", nil
+				return jsonResponse(http.StatusCreated, "created"), "http://b.test", nil
 			},
 		}
-		sandbox := NewClient(driver).Sandboxes.Ref("box")
-		sandbox.endpoint, sandbox.connectToken = "a", "secret"
+		client := NewClient(driver, withGRPCDialer(dialer))
+		defer client.Close()
+		sandbox := client.Sandboxes.Ref("box")
+		sandbox.endpoint, sandbox.connectToken = "http://a.test", "secret"
 		response, err := sandbox.Ports.HTTP(context.Background(), 8080, ProxyRequest{Method: http.MethodPost, Body: strings.NewReader("side effect")})
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = response.Body.Close()
-		if calls != 2 || resolves != 1 || response.StatusCode != http.StatusCreated {
-			t.Fatalf("calls=%d resolves=%d status=%d", calls, resolves, response.StatusCode)
+		if calls != 2 || *resolves != 1 || response.StatusCode != http.StatusCreated || sandbox.endpoint != "http://b.test" {
+			t.Fatalf("calls=%d resolves=%d status=%d endpoint=%q", calls, *resolves, response.StatusCode, sandbox.endpoint)
 		}
 	})
 }
 
 func TestFilesLimitsDeleteOptionsAndPathValidation(t *testing.T) {
-	var deleteQuery url.Values
-	driver := &stubDriver{do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		switch request.Method {
-		case http.MethodGet:
-			return jsonResponse(http.StatusOK, "12345"), "node", nil
-		case http.MethodDelete:
-			deleteQuery = request.Query
-			return jsonResponse(http.StatusNoContent, ""), "node", nil
-		default:
-			return jsonResponse(http.StatusOK, `{"exit":0,"stdout_b64":"","stderr_b64":""}`), "node", nil
-		}
-	}}
-	client := NewClient(driver, WithMaxResponseBytes(4))
+	var deleteRequest *pb.FileDeleteRequest
+	stub := &sandboxServiceStub{
+		fileRead: func(context.Context, *pb.FilePathRequest) (*pb.FileContent, error) {
+			return &pb.FileContent{Data: []byte("12345")}, nil
+		},
+		fileDelete: func(_ context.Context, request *pb.FileDeleteRequest) (*pb.Ok, error) {
+			deleteRequest = request
+			return &pb.Ok{}, nil
+		},
+	}
+	client, err := Connect("http://127.0.0.1:1", WithDiscovery(false), WithMaxResponseBytes(4), withGRPCDialer(bufconnDialer(startSandboxServiceStub(t, stub))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
 	files := client.Sandboxes.Ref("box").Files
 	if _, err := files.Read(context.Background(), "large"); !errors.As(err, new(*ResponseTooLargeError)) {
 		t.Fatalf("large read error=%T %v", err, err)
@@ -386,8 +459,8 @@ func TestFilesLimitsDeleteOptionsAndPathValidation(t *testing.T) {
 	if err := files.Delete(context.Background(), "dir", DeleteOptions{Recursive: true}); err != nil {
 		t.Fatal(err)
 	}
-	if deleteQuery.Get("recursive") != "true" {
-		t.Fatalf("delete query=%v", deleteQuery)
+	if deleteRequest.GetPath() != "dir" || !deleteRequest.GetRecursive() {
+		t.Fatalf("delete request=%v", deleteRequest)
 	}
 	if err := files.Write(context.Background(), "", nil); err == nil {
 		t.Fatal("empty write path accepted")
@@ -405,10 +478,7 @@ func TestFilesLimitsDeleteOptionsAndPathValidation(t *testing.T) {
 
 func TestWaitReadyProbes(t *testing.T) {
 	t.Run("mutually exclusive", func(t *testing.T) {
-		sandbox := NewClient(&stubDriver{do: func(context.Context, DriverRequest) (*http.Response, string, error) {
-			t.Fatal("driver called for invalid options")
-			return nil, "", nil
-		}}).Sandboxes.Ref("box")
+		sandbox := NewClient(&stubDriver{}).Sandboxes.Ref("box")
 		_, err := sandbox.WaitReady(context.Background(), WaitReadyOptions{Port: 80, Command: []string{"true"}})
 		if err == nil {
 			t.Fatal("accepted mutually exclusive probes")
@@ -416,18 +486,13 @@ func TestWaitReadyProbes(t *testing.T) {
 	})
 
 	t.Run("command", func(t *testing.T) {
-		driver := &stubDriver{do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-			switch request.Path {
-			case "/v1/sandboxes/box":
-				return jsonResponse(http.StatusOK, `{"id":"box","status":"running"}`), "node", nil
-			case "/v1/sandboxes/box/exec":
-				return jsonResponse(http.StatusOK, `{"exit":0,"stdout_b64":"","stderr_b64":""}`), "node", nil
-			default:
-				t.Fatalf("unexpected path %q", request.Path)
-				return nil, "", nil
+		stub := &sandboxServiceStub{execCapture: func(_ context.Context, request *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error) {
+			if cmd := request.GetExec().GetCmd(); len(cmd) != 1 || cmd[0] != "check" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected probe command")
 			}
+			return &pb.ExecCaptureResponse{Code: 0}, nil
 		}}
-		sandbox := NewClient(driver).Sandboxes.Ref("box")
+		sandbox := bufconnClient(t, startSandboxServiceStub(t, stub)).Sandboxes.Ref("box")
 		if _, err := sandbox.WaitReady(context.Background(), WaitReadyOptions{Command: []string{"check"}, Timeout: time.Second, Interval: time.Millisecond}); err != nil {
 			t.Fatal(err)
 		}
@@ -446,19 +511,10 @@ func TestWaitReadyProbes(t *testing.T) {
 			}
 		}()
 		port := listener.Addr().(*net.TCPAddr).Port
-		driver := &stubDriver{do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-			switch request.Path {
-			case "/v1/sandboxes/box":
-				return jsonResponse(http.StatusOK, `{"id":"box","status":"running"}`), "node", nil
-			case "/v1/sandboxes/box/tunnels":
-				body := fmt.Sprintf(`{"tunnels":{"8080":{"host":"127.0.0.1","port":%d}}}`, port)
-				return jsonResponse(http.StatusOK, body), "node", nil
-			default:
-				t.Fatalf("unexpected path %q", request.Path)
-				return nil, "", nil
-			}
+		stub := &sandboxServiceStub{tunnels: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: fmt.Sprintf(`{"tunnels":{"8080":{"host":"127.0.0.1","port":%d}}}`, port)}, nil
 		}}
-		sandbox := NewClient(driver).Sandboxes.Ref("box")
+		sandbox := bufconnClient(t, startSandboxServiceStub(t, stub)).Sandboxes.Ref("box")
 		if _, err := sandbox.WaitReady(context.Background(), WaitReadyOptions{Port: 8080, Timeout: time.Second, Interval: time.Millisecond}); err != nil {
 			t.Fatal(err)
 		}

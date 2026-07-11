@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -45,7 +44,6 @@ type EndpointInfo struct {
 type Driver interface {
 	Do(context.Context, DriverRequest) (*http.Response, string, error)
 	Dial(context.Context, string, url.Values, string) (*WebSocketConn, string, error)
-	ResolveSandbox(context.Context, string, string) (string, error)
 	Endpoints() []EndpointInfo
 	Refresh(context.Context, bool) error
 	Close() error
@@ -163,6 +161,9 @@ type meshDriver struct {
 	lastRefresh      time.Time
 	refreshing       bool
 	closed           bool
+	// meshStatus fetches the mesh roster document over gRPC
+	// (SystemService.MeshStatus); installed by newClient.
+	meshStatus func(context.Context) ([]byte, error)
 }
 
 func newMeshDriver(config DSNConfig, options ...meshDriverOption) (*meshDriver, error) {
@@ -350,50 +351,6 @@ func (driver *meshDriver) Dial(ctx context.Context, path string, query url.Value
 	return nil, "", &TransportError{Err: errors.New("no vmon endpoints are currently available")}
 }
 
-func (driver *meshDriver) ResolveSandbox(ctx context.Context, id, hint string) (string, error) {
-	path := "/v1/sandboxes/" + escapePathSegment(id)
-	var originalNotFound error
-	var lastTransport *TransportError
-	for _, endpoint := range driver.candidates(hint) {
-		response, err := driver.doEndpoint(ctx, endpoint, DriverRequest{Method: http.MethodGet, Path: path}, nil)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return "", ctxErr
-			}
-			var transportErr *TransportError
-			if errors.As(err, &transportErr) {
-				lastTransport = transportErr
-				driver.markFailed(endpoint)
-				continue
-			}
-			return "", err
-		}
-		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			if response.Body != nil {
-				_ = response.Body.Close()
-			}
-			driver.markSuccess(endpoint)
-			return endpoint, nil
-		}
-		apiErr := apiErrorFromResponse(response)
-		var typed *APIError
-		if errors.As(apiErr, &typed) && (typed.Code == "not_found" || typed.StatusCode == http.StatusNotFound) {
-			if originalNotFound == nil {
-				originalNotFound = apiErr
-			}
-			continue
-		}
-		return "", apiErr
-	}
-	if originalNotFound != nil {
-		return "", originalNotFound
-	}
-	if lastTransport != nil {
-		return "", lastTransport
-	}
-	return "", &APIError{StatusCode: http.StatusNotFound, Code: "not_found", Message: "sandbox was not found"}
-}
-
 func (driver *meshDriver) Endpoints() []EndpointInfo {
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
@@ -425,22 +382,21 @@ func (driver *meshDriver) Refresh(ctx context.Context, force bool) error {
 		driver.mu.Unlock()
 	}()
 
-	response, _, err := driver.do(ctx, DriverRequest{Method: http.MethodGet, Path: "/v1/mesh/status"}, false)
-	if err != nil {
+	driver.mu.Lock()
+	meshStatus := driver.meshStatus
+	driver.mu.Unlock()
+	if meshStatus == nil {
 		return nil
 	}
-	if response.Body != nil {
-		defer response.Body.Close()
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
+	raw, err := meshStatus(ctx)
+	if err != nil {
 		return nil
 	}
 	var status struct {
 		Self  map[string]any   `json:"self"`
 		Peers []map[string]any `json:"peers"`
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, defaultMaxResponseBytes+1))
-	if err := decoder.Decode(&status); err != nil {
+	if err := json.Unmarshal(raw, &status); err != nil {
 		return nil
 	}
 	advertised := make([]string, 0, 1+len(status.Peers))

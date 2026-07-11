@@ -7,9 +7,10 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use vmon_proto::v1 as pb;
 
 use crate::{
 	contexts::{
@@ -17,8 +18,7 @@ use crate::{
 		roster_from_status,
 	},
 	error::{CliError, Result, err},
-	transport::{ApiClient, path_segment, query},
-	ws::{Message, WebSocket},
+	transport::{ApiClient, Grpc, status_error},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -117,8 +117,6 @@ enum Commands {
 	},
 	/// Print a shell completion script.
 	Completion(CompletionArgs),
-	/// Print the generated `OpenAPI` document.
-	Openapi,
 }
 
 #[derive(Args)]
@@ -163,7 +161,7 @@ struct RunArgs {
 #[derive(Args)]
 struct ExecArgs {
 	name: String,
-	/// Allocate a PTY and use the WebSocket frame protocol.
+	/// Allocate a PTY and stream over the interactive exec protocol.
 	#[arg(short = 't', long)]
 	tty:  bool,
 	/// Command to run.
@@ -472,10 +470,16 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Shell(args) => cmd_shell(args, transport_options),
 		Commands::Cp(args) => cmd_cp(args, transport_options),
 		Commands::Logs(args) => cmd_logs(args, transport_options),
-		Commands::Stop(args) => lifecycle(transport_options, &args.name, "stop", "stopped"),
+		Commands::Stop(args) => {
+			lifecycle(transport_options, &args.name, LifecycleVerb::Stop, "stopped")
+		},
 		Commands::Rm(args) => cmd_rm(args, transport_options),
-		Commands::Pause(args) => lifecycle(transport_options, &args.name, "pause", "paused"),
-		Commands::Resume(args) => lifecycle(transport_options, &args.name, "resume", "resumed"),
+		Commands::Pause(args) => {
+			lifecycle(transport_options, &args.name, LifecycleVerb::Pause, "paused")
+		},
+		Commands::Resume(args) => {
+			lifecycle(transport_options, &args.name, LifecycleVerb::Resume, "resumed")
+		},
 		Commands::Extend(args) => cmd_extend(args, transport_options),
 		Commands::Snapshot(args) => cmd_snapshot(args, transport_options),
 		Commands::Restore(args) => cmd_restore(args, transport_options),
@@ -491,10 +495,6 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Context { command } => cmd_context(command),
 		Commands::Mesh { command } => cmd_mesh(command, transport_options),
 		Commands::Completion(args) => Ok(cmd_completion(args)),
-		Commands::Openapi => {
-			println!("{}", vmond::api::openapi_json());
-			Ok(0)
-		},
 	}
 }
 
@@ -572,7 +572,15 @@ fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
 	if args.detach && !cmd.is_empty() {
 		body.insert("command".to_owned(), json!(&cmd));
 	}
-	let view = client.request_json("POST", "/v1/sandboxes", Some(Value::Object(body)))?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::CreateSandboxRequest { spec_json: Value::Object(body).to_string() };
+	let view = json_view(
+		grpc
+			.block_on(sandboxes.create(request))
+			.map_err(status_error)?
+			.into_inner(),
+	)?;
 	let name = view_name(&view)?.to_owned();
 	if args.detach {
 		println!("started {name}  image={}", string_field(&view, "image").unwrap_or("-"));
@@ -582,36 +590,32 @@ fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
 		return Ok(0);
 	}
 	if cmd.is_empty() {
-		let _ = attach_console(&client, &name);
-		let final_view =
-			client.request_json("GET", &format!("/v1/sandboxes/{}", path_segment(&name)), None)?;
-		return Ok(exit_code_from_view(&final_view));
+		let _ = attach_console(&grpc, &name);
+		return Ok(exit_code_from_view(&sandbox_view(&grpc, &name)?));
 	}
-	let mut socket = client.websocket(&format!("/v1/sandboxes/{}/exec", path_segment(&name)))?;
-	socket.send_json(&json!({"cmd": cmd, "tty": false}))?;
-	let exit = pump_socket(socket, false)?;
-	let _ = client.request_json(
-		"POST",
-		&format!("/v1/sandboxes/{}/stop", path_segment(&name)),
-		Some(json!({"returncode": exit})),
+	let exit = pump_exec(&grpc, ExecRpc::Exec, exec_start(&name, cmd, false), false, false, false)?;
+	let _ = grpc.block_on(
+		sandboxes
+			.stop(pb::StopSandboxRequest { id: name, returncode: Some(i64::from(exit)) }),
 	);
 	Ok(exit)
 }
 
 fn cmd_ps(options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	let value = client.request_json("GET", "/v1/sandboxes", None)?;
-	let sandboxes = value
-		.get("sandboxes")
-		.and_then(Value::as_array)
-		.cloned()
-		.unwrap_or_default();
-	if sandboxes.is_empty() {
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let response = grpc
+		.block_on(sandboxes.list(pb::ListSandboxesRequest { tags: Vec::new() }))
+		.map_err(status_error)?
+		.into_inner();
+	if response.sandboxes_json.is_empty() {
 		println!("no sandboxes — boot one with `vmon run <image>`");
 		return Ok(0);
 	}
 	println!("{:<24} {:<12} {:<8} IMAGE", "NAME", "STATUS", "PID");
-	for sandbox in sandboxes {
+	for sandbox in response.sandboxes_json {
+		let sandbox: Value = serde_json::from_str(&sandbox)?;
 		let name = string_field(&sandbox, "name")
 			.or_else(|| string_field(&sandbox, "id"))
 			.unwrap_or("-");
@@ -629,24 +633,24 @@ fn cmd_exec(args: ExecArgs, options: &TransportOptions) -> Result<i32> {
 		return err("exec requires a command (vmon exec NAME -- <cmd>)");
 	}
 	let client = client(options, true)?;
+	let grpc = client.grpc()?;
 	if args.tty {
-		let path = format!("/v1/sandboxes/{}/exec", path_segment(&args.name));
-		let mut socket = client.websocket(&path)?;
-		socket.send_json(&json!({"cmd": argv, "tty": true}))?;
-		return pump_interactive(socket, true, true);
+		return pump_exec(&grpc, ExecRpc::Exec, exec_start(&args.name, argv, true), true, true, true);
 	}
-	let response = client.request_json(
-		"POST",
-		&format!("/v1/sandboxes/{}/exec", path_segment(&args.name)),
-		Some(json!({"cmd": argv, "tty": false})),
-	)?;
-	write_b64_field(&response, "stdout_b64", &mut io::stdout())?;
-	write_b64_field(&response, "stderr_b64", &mut io::stderr())?;
-	Ok(response
-		.get("exit")
-		.and_then(Value::as_i64)
-		.unwrap_or(0)
-		.clamp(0, 255) as i32)
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::ExecCaptureRequest {
+		id:   args.name,
+		exec: Some(pb::ExecStart { cmd: argv, ..Default::default() }),
+	};
+	let response = grpc
+		.block_on(sandboxes.exec_capture(request))
+		.map_err(status_error)?
+		.into_inner();
+	io::stdout().write_all(&response.stdout)?;
+	io::stdout().flush()?;
+	io::stderr().write_all(&response.stderr)?;
+	io::stderr().flush()?;
+	Ok(clamp_exit(response.code))
 }
 
 fn cmd_shell(args: ShellArgs, options: &TransportOptions) -> Result<i32> {
@@ -675,9 +679,9 @@ fn cmd_shell(args: ShellArgs, options: &TransportOptions) -> Result<i32> {
 	params.insert("cpus".to_owned(), json!(args.cpus));
 	params.insert("disk_mb".to_owned(), json!(args.disk_mb));
 	params.insert("timeout".to_owned(), json!(args.timeout));
-	let mut socket = client.websocket("/v1/shell")?;
-	socket.send_json(&Value::Object(params))?;
-	pump_interactive(socket, tty, tty)
+	let grpc = client.grpc()?;
+	let params = pb::exec_input::Input::ShellParamsJson(Value::Object(params).to_string());
+	pump_exec(&grpc, ExecRpc::Shell, params, tty, tty, true)
 }
 
 fn cmd_cp(args: CpArgs, options: &TransportOptions) -> Result<i32> {
@@ -687,70 +691,111 @@ fn cmd_cp(args: CpArgs, options: &TransportOptions) -> Result<i32> {
 		return err("cp requires exactly one remote operand of the form <name>:<path>");
 	}
 	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
 	if let Some((name, remote_path)) = src_remote {
-		let bytes = client.request_bytes(
-			"GET",
-			&format!(
-				"/v1/sandboxes/{}/files?{}",
-				path_segment(&name),
-				query(&[("path", remote_path.clone())])
-			),
-			None,
-		)?;
+		let request = pb::FilePathRequest { id: name, path: remote_path.clone() };
+		let content = grpc
+			.block_on(sandboxes.file_read(request))
+			.map_err(status_error)?
+			.into_inner();
 		let mut out = PathBuf::from(&args.dst);
 		if out.is_dir() {
 			out.push(Path::new(&remote_path).file_name().unwrap_or_default());
 		}
-		fs::write(out, bytes)?;
+		fs::write(out, content.data)?;
 	} else if let Some((name, remote_path)) = dst_remote {
 		let data = fs::read(&args.src)?;
-		client.request_bytes(
-			"PUT",
-			&format!(
-				"/v1/sandboxes/{}/files?{}",
-				path_segment(&name),
-				query(&[("path", remote_path)])
-			),
-			Some(data),
-		)?;
+		let request = pb::FileWriteRequest { id: name, path: remote_path, data };
+		grpc
+			.block_on(sandboxes.file_write(request))
+			.map_err(status_error)?;
 	}
 	Ok(0)
 }
 
 fn cmd_logs(args: LogsArgs, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	let text = client.request_text(
-		"GET",
-		&format!(
-			"/v1/sandboxes/{}/logs?{}",
-			path_segment(&args.name),
-			query(&[("follow", args.follow.to_string())])
-		),
-	)?;
-	print!("{text}");
-	Ok(0)
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::LogsRequest { id: args.name, follow: args.follow, tail: None };
+	let mut stream = grpc
+		.block_on(sandboxes.logs(request))
+		.map_err(status_error)?
+		.into_inner();
+	loop {
+		match grpc.block_on(stream.message()) {
+			Ok(Some(chunk)) => {
+				io::stdout().write_all(&chunk.data)?;
+				io::stdout().flush()?;
+			},
+			Ok(None) => return Ok(0),
+			Err(status) => return Err(status_error(status)),
+		}
+	}
 }
 
-fn lifecycle(options: &TransportOptions, name: &str, verb: &str, label: &str) -> Result<i32> {
+enum LifecycleVerb {
+	Stop,
+	Pause,
+	Resume,
+}
+
+fn lifecycle(
+	options: &TransportOptions,
+	name: &str,
+	verb: LifecycleVerb,
+	label: &str,
+) -> Result<i32> {
 	let client = client(options, true)?;
-	client.request_json("POST", &format!("/v1/sandboxes/{}/{}", path_segment(name), verb), None)?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	grpc
+		.block_on(async {
+			match verb {
+				LifecycleVerb::Stop => {
+					sandboxes
+						.stop(pb::StopSandboxRequest { id: name.to_owned(), returncode: None })
+						.await
+				},
+				LifecycleVerb::Pause => {
+					sandboxes
+						.pause(pb::SandboxRef { id: name.to_owned() })
+						.await
+				},
+				LifecycleVerb::Resume => {
+					sandboxes
+						.resume(pb::SandboxRef { id: name.to_owned() })
+						.await
+				},
+			}
+		})
+		.map_err(status_error)?;
 	println!("{label} {name}");
 	Ok(0)
 }
 
 fn cmd_rm(args: NameArg, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	client.request_json("DELETE", &format!("/v1/sandboxes/{}", path_segment(&args.name)), None)?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	grpc
+		.block_on(sandboxes.remove(pb::SandboxRef { id: args.name.clone() }))
+		.map_err(status_error)?;
 	println!("removed {}", args.name);
 	Ok(0)
 }
 
 fn cmd_extend(args: ExtendArgs, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	let response = client.request_json(
-		"POST",
-		&format!("/v1/sandboxes/{}/extend", path_segment(&args.name)),
-		Some(json!({"secs": args.secs})),
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::ExtendSandboxRequest { id: args.name.clone(), secs: args.secs };
+	let response = json_view(
+		grpc
+			.block_on(sandboxes.extend(request))
+			.map_err(status_error)?
+			.into_inner(),
 	)?;
 	if let Some(deadline) = response.get("deadline_unix") {
 		println!("extended {} deadline to {deadline}", args.name);
@@ -762,10 +807,15 @@ fn cmd_extend(args: ExtendArgs, options: &TransportOptions) -> Result<i32> {
 
 fn cmd_snapshot(args: SnapshotArgs, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	let response = client.request_json(
-		"POST",
-		&format!("/v1/sandboxes/{}/snapshots", path_segment(&args.name)),
-		Some(json!({"name": args.snapshot, "stop": args.stop})),
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let request =
+		pb::SnapshotRequest { id: args.name, name: Some(args.snapshot), stop: args.stop };
+	let response = json_view(
+		grpc
+			.block_on(sandboxes.snapshot(request))
+			.map_err(status_error)?
+			.into_inner(),
 	)?;
 	println!(
 		"snapshot {} -> {}",
@@ -783,20 +833,25 @@ fn cmd_restore(args: RestoreArgs, options: &TransportOptions) -> Result<i32> {
 	if let Some(arch) = args.arch {
 		body.insert("arch".to_owned(), json!(arch.as_str()));
 	}
-	let view = client.request_json(
-		"POST",
-		&format!("/v1/snapshots/{}/restore", path_segment(&args.snapshot)),
-		Some(Value::Object(body)),
+	let grpc = client.grpc()?;
+	let mut snapshots = grpc.snapshots();
+	let request = pb::RestoreSnapshotRequest {
+		name:      args.snapshot.clone(),
+		body_json: Value::Object(body).to_string(),
+	};
+	let view = json_view(
+		grpc
+			.block_on(snapshots.restore(request))
+			.map_err(status_error)?
+			.into_inner(),
 	)?;
 	let name = view_name(&view)?.to_owned();
 	println!("restored {name} from {}", args.snapshot);
 	if args.detach {
 		return Ok(0);
 	}
-	let _ = attach_console(&client, &name);
-	let final_view =
-		client.request_json("GET", &format!("/v1/sandboxes/{}", path_segment(&name)), None)?;
-	Ok(exit_code_from_view(&final_view))
+	let _ = attach_console(&grpc, &name);
+	Ok(exit_code_from_view(&sandbox_view(&grpc, &name)?))
 }
 
 fn cmd_fork(args: ForkArgs, options: &TransportOptions) -> Result<i32> {
@@ -806,10 +861,17 @@ fn cmd_fork(args: ForkArgs, options: &TransportOptions) -> Result<i32> {
 	if let Some(arch) = args.arch {
 		body.insert("arch".to_owned(), json!(arch.as_str()));
 	}
-	let response = client.request_json(
-		"POST",
-		&format!("/v1/snapshots/{}/fork", path_segment(&args.snapshot)),
-		Some(Value::Object(body)),
+	let grpc = client.grpc()?;
+	let mut snapshots = grpc.snapshots();
+	let request = pb::ForkSnapshotRequest {
+		name:      args.snapshot.clone(),
+		body_json: Value::Object(body).to_string(),
+	};
+	let response = json_view(
+		grpc
+			.block_on(snapshots.fork(request))
+			.map_err(status_error)?
+			.into_inner(),
 	)?;
 	let clones = response
 		.get("clones")
@@ -830,9 +892,13 @@ fn cmd_fork(args: ForkArgs, options: &TransportOptions) -> Result<i32> {
 
 fn cmd_stats(name: &str, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	let response =
-		client.request_json("GET", &format!("/v1/sandboxes/{}/metrics", path_segment(name)), None)?;
-	print_json(&response)
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let view = grpc
+		.block_on(sandboxes.metrics(pb::SandboxRef { id: name.to_owned() }))
+		.map_err(status_error)?
+		.into_inner();
+	print_json(&json_view(view)?)
 }
 
 fn cmd_metrics(args: MetricsArgs, options: &TransportOptions) -> Result<i32> {
@@ -846,55 +912,46 @@ fn cmd_metrics(args: MetricsArgs, options: &TransportOptions) -> Result<i32> {
 
 fn cmd_fs(command: FsCommands, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
-	match command {
-		FsCommands::List { reference } => {
-			let (name, path) = parse_ref(&reference);
-			let response = client.request_json(
-				"GET",
-				&format!(
-					"/v1/sandboxes/{}/files/list?{}",
-					path_segment(&name),
-					query(&[("path", path)])
-				),
-				None,
-			)?;
-			print_json(&response)
-		},
-		FsCommands::Stat { reference } => {
-			let (name, path) = parse_ref(&reference);
-			let response = client.request_json(
-				"GET",
-				&format!(
-					"/v1/sandboxes/{}/files/stat?{}",
-					path_segment(&name),
-					query(&[("path", path)])
-				),
-				None,
-			)?;
-			print_json(&response)
-		},
-	}
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let (reference, list) = match command {
+		FsCommands::List { reference } => (reference, true),
+		FsCommands::Stat { reference } => (reference, false),
+	};
+	let (name, path) = parse_ref(&reference);
+	let request = pb::FilePathRequest { id: name, path };
+	let view = grpc
+		.block_on(async {
+			if list {
+				sandboxes.file_list(request).await
+			} else {
+				sandboxes.file_stat(request).await
+			}
+		})
+		.map_err(status_error)?
+		.into_inner();
+	print_json(&json_view(view)?)
 }
 
 fn cmd_volume(command: VolumeCommands, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let mut volumes = grpc.volumes();
 	match command {
 		VolumeCommands::Ls => {
-			let response = client.request_json("GET", "/v1/volumes", None)?;
-			for volume in response
-				.get("volumes")
-				.and_then(Value::as_array)
-				.into_iter()
-				.flatten()
-			{
-				if let Some(name) = volume.as_str() {
-					println!("{name}");
-				}
+			let response = grpc
+				.block_on(volumes.list(pb::ListVolumesRequest {}))
+				.map_err(status_error)?
+				.into_inner();
+			for volume in response.volumes {
+				println!("{volume}");
 			}
 			Ok(0)
 		},
 		VolumeCommands::Rm { name } => {
-			client.request_json("DELETE", &format!("/v1/volumes/{}", path_segment(&name)), None)?;
+			grpc
+				.block_on(volumes.delete(pb::VolumeRef { name: name.clone() }))
+				.map_err(status_error)?;
 			println!("removed volume {name}");
 			Ok(0)
 		},
@@ -903,10 +960,15 @@ fn cmd_volume(command: VolumeCommands, options: &TransportOptions) -> Result<i32
 
 fn cmd_pool(command: PoolCommands, options: &TransportOptions) -> Result<i32> {
 	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let mut pools = grpc.pools();
 	match command {
 		PoolCommands::Ls => {
-			let response = client.request_json("GET", "/v1/pools", None)?;
-			print_json(&response)
+			let view = grpc
+				.block_on(pools.list(pb::ListPoolsRequest {}))
+				.map_err(status_error)?
+				.into_inner();
+			print_json(&json_view(view)?)
 		},
 		PoolCommands::Set(args) => {
 			let mut body = Map::new();
@@ -919,15 +981,20 @@ fn cmd_pool(command: PoolCommands, options: &TransportOptions) -> Result<i32> {
 			if args.block_network {
 				body.insert("block_network".to_owned(), json!(true));
 			}
-			let response = client.request_json(
-				"PUT",
-				&format!("/v1/pools/{}", path_segment(&args.reference)),
-				Some(Value::Object(body)),
-			)?;
-			print_json(&response)
+			let request = pb::PoolSetRequest {
+				reference: args.reference,
+				body_json: Value::Object(body).to_string(),
+			};
+			let view = grpc
+				.block_on(pools.set(request))
+				.map_err(status_error)?
+				.into_inner();
+			print_json(&json_view(view)?)
 		},
 		PoolCommands::Rm { reference } => {
-			client.request_json("DELETE", &format!("/v1/pools/{}", path_segment(&reference)), None)?;
+			grpc
+				.block_on(pools.delete(pb::PoolRef { reference: reference.clone() }))
+				.map_err(status_error)?;
 			println!("removed pool {reference}");
 			Ok(0)
 		},
@@ -971,7 +1038,15 @@ fn daemon_status() -> i32 {
 	let client = ApiClient::local(false);
 	if client.request_json("GET", "/healthz", None).is_ok() {
 		let info = client
-			.request_json("GET", "/v1/info", None)
+			.grpc()
+			.and_then(|grpc| {
+				let mut system = grpc.system();
+				let view = grpc
+					.block_on(system.info(pb::InfoRequest {}))
+					.map_err(status_error)?
+					.into_inner();
+				json_view(view)
+			})
 			.unwrap_or_else(|_| json!({}));
 		let pid = read_pid().unwrap_or_else(|| "?".to_owned());
 		let sock = vmond::home::Home::new(vmond::home::state_dir()).vmond_sock();
@@ -1053,9 +1128,15 @@ fn context_add(args: ContextAddArgs) -> Result<i32> {
 		return err("a token is required: pass --token or set VMON_API_TOKEN");
 	}
 	let url = normalize_server(&args.server);
-	let endpoints = match ApiClient::remote(vec![url.clone()], token.clone())
-		.and_then(|client| client.request_json("GET", "/v1/mesh/status", None))
-	{
+	let endpoints = match ApiClient::remote(vec![url.clone()], token.clone()).and_then(|client| {
+		let grpc = client.grpc()?;
+		let mut system = grpc.system();
+		let view = grpc
+			.block_on(system.mesh_status(pb::MeshStatusRequest {}))
+			.map_err(status_error)?
+			.into_inner();
+		json_view(view)
+	}) {
 		Ok(status) => roster_from_status(&status, &url),
 		Err(error) => {
 			eprintln!("warning: could not fetch mesh status ({error}); storing the single endpoint");
@@ -1148,8 +1229,13 @@ fn cmd_mesh(command: MeshCommands, options: &TransportOptions) -> Result<i32> {
 			print_json(&response)
 		},
 		MeshCommands::Status => {
-			let response = client.request_json("GET", "/v1/mesh/status", None)?;
-			print_json(&response)
+			let grpc = client.grpc()?;
+			let mut system = grpc.system();
+			let view = grpc
+				.block_on(system.mesh_status(pb::MeshStatusRequest {}))
+				.map_err(status_error)?
+				.into_inner();
+			print_json(&json_view(view)?)
 		},
 	}
 }
@@ -1213,90 +1299,120 @@ impl Arch {
 	}
 }
 
-fn attach_console(client: &ApiClient, name: &str) -> Result<()> {
-	let socket = client.websocket(&format!("/v1/sandboxes/{}/attach", path_segment(name)))?;
-	let _ = pump_socket(socket, false)?;
-	Ok(())
-}
-
-fn pump_interactive(socket: WebSocket, raw_mode: bool, forward_stdin: bool) -> Result<i32> {
-	let _raw = RawModeGuard::enable(raw_mode)?;
-	let stdin_thread = if forward_stdin {
-		Some(spawn_stdin_forward(socket.try_clone()?))
-	} else {
-		None
-	};
-	let result = pump_socket(socket, true);
-	if let Some(handle) = stdin_thread {
-		let _ = handle.thread().id();
-	}
-	result
-}
-
-fn pump_socket(mut socket: WebSocket, show_ready: bool) -> Result<i32> {
-	let mut exit = None;
-	while let Some(message) = socket.next_message()? {
-		match message {
-			Message::Text(text) => {
-				let value: Value = serde_json::from_str(&text)?;
-				if let Some(error) = value.get("error") {
-					let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
-					let message = error
-						.get("message")
-						.and_then(Value::as_str)
-						.unwrap_or("unknown error");
-					return err(format!("{code}: {message}"));
-				}
-				if let Some(ready) = value.get("ready").and_then(Value::as_str) {
-					if show_ready {
-						eprintln!("ready: {ready}");
-					}
-					continue;
-				}
-				if let Some(stream) = value.get("stream").and_then(Value::as_str) {
-					let data = value
-						.get("b64")
-						.and_then(Value::as_str)
-						.map(|text| B64.decode(text))
-						.transpose()
-						.map_err(|error| CliError::new(format!("invalid base64 stream frame: {error}")))?
-						.unwrap_or_default();
-					if stream == "stderr" {
-						io::stderr().write_all(&data)?;
-						io::stderr().flush()?;
-					} else {
-						io::stdout().write_all(&data)?;
-						io::stdout().flush()?;
-					}
-					continue;
-				}
-				if let Some(code) = value.get("exit").and_then(Value::as_i64) {
-					exit = Some(code.clamp(0, 255) as i32);
+fn attach_console(grpc: &Grpc, name: &str) -> Result<()> {
+	let mut sandboxes = grpc.sandboxes();
+	let mut stream = grpc
+		.block_on(sandboxes.attach(pb::SandboxRef { id: name.to_owned() }))
+		.map_err(status_error)?
+		.into_inner();
+	loop {
+		match grpc.block_on(stream.message()) {
+			Ok(Some(output)) => {
+				if let Some(pb::exec_output::Output::Chunk(chunk)) = output.output {
+					write_chunk(&chunk)?;
 				}
 			},
-			Message::Binary(bytes) => {
-				io::stdout().write_all(&bytes)?;
-				io::stdout().flush()?;
-			},
+			Ok(None) => return Ok(()),
+			Err(status) => return Err(status_error(status)),
 		}
 	}
+}
+
+enum ExecRpc {
+	Exec,
+	Shell,
+}
+
+const fn exec_input(input: pb::exec_input::Input) -> pb::ExecInput {
+	pb::ExecInput { input: Some(input) }
+}
+
+fn exec_start(sandbox_id: &str, cmd: Vec<String>, tty: bool) -> pb::exec_input::Input {
+	pb::exec_input::Input::Start(pb::ExecStart {
+		sandbox_id: sandbox_id.to_owned(),
+		cmd,
+		tty,
+		..Default::default()
+	})
+}
+
+/// Bridges an Exec/Shell bidi stream onto the synchronous terminal loop:
+/// stdin is forwarded from a plain thread through the outbound channel while
+/// this thread blocks on inbound frames.
+fn pump_exec(
+	grpc: &Grpc,
+	rpc: ExecRpc,
+	first: pb::exec_input::Input,
+	raw_mode: bool,
+	forward_stdin: bool,
+	show_ready: bool,
+) -> Result<i32> {
+	let (tx, rx) = tokio::sync::mpsc::channel::<pb::ExecInput>(16);
+	grpc
+		.block_on(tx.send(exec_input(first)))
+		.map_err(|_| CliError::new("exec stream closed before start"))?;
+	let mut sandboxes = grpc.sandboxes();
+	let outbound = ReceiverStream::new(rx);
+	let response = grpc
+		.block_on(async {
+			match rpc {
+				ExecRpc::Exec => sandboxes.exec(outbound).await,
+				ExecRpc::Shell => sandboxes.shell(outbound).await,
+			}
+		})
+		.map_err(status_error)?;
+	let mut stream = response.into_inner();
+	let _raw = RawModeGuard::enable(raw_mode)?;
+	let _stdin = forward_stdin.then(|| spawn_stdin_forward(tx.clone()));
+	let mut exit = None;
+	loop {
+		match grpc.block_on(stream.message()) {
+			Ok(Some(output)) => match output.output {
+				Some(pb::exec_output::Output::Chunk(chunk)) => write_chunk(&chunk)?,
+				Some(pb::exec_output::Output::Exit(code)) => exit = Some(clamp_exit(code.code)),
+				Some(pb::exec_output::Output::Ready(ready)) => {
+					if show_ready {
+						eprintln!("ready: {}", ready.sandbox_id);
+					}
+				},
+				None => return err("invalid exec output frame"),
+			},
+			Ok(None) => break,
+			Err(status) => return Err(status_error(status)),
+		}
+	}
+	drop(tx);
 	Ok(exit.unwrap_or(0))
 }
 
-fn spawn_stdin_forward(mut socket: WebSocket) -> thread::JoinHandle<()> {
+fn write_chunk(chunk: &pb::Output) -> Result<()> {
+	if pb::Stream::try_from(chunk.stream) == Ok(pb::Stream::Stderr) {
+		io::stderr().write_all(&chunk.data)?;
+		io::stderr().flush()?;
+	} else {
+		io::stdout().write_all(&chunk.data)?;
+		io::stdout().flush()?;
+	}
+	Ok(())
+}
+
+fn clamp_exit(code: i64) -> i32 {
+	code.clamp(0, 255) as i32
+}
+
+fn spawn_stdin_forward(tx: tokio::sync::mpsc::Sender<pb::ExecInput>) -> thread::JoinHandle<()> {
 	thread::spawn(move || {
 		let mut stdin = io::stdin();
 		let mut buf = [0_u8; 8192];
 		loop {
 			match stdin.read(&mut buf) {
 				Ok(0) => {
-					let _ = socket.send_json(&json!({"eof": true}));
-					let _ = socket.send_close();
+					let _ = tx.blocking_send(exec_input(pb::exec_input::Input::Eof(pb::Eof {})));
 					break;
 				},
 				Ok(n) => {
-					if socket
-						.send_json(&json!({"stdin_b64": B64.encode(&buf[..n])}))
+					if tx
+						.blocking_send(exec_input(pb::exec_input::Input::Stdin(buf[..n].to_vec())))
 						.is_err()
 					{
 						break;
@@ -1413,15 +1529,17 @@ fn exit_code_from_view(value: &Value) -> i32 {
 	}
 }
 
-fn write_b64_field(value: &Value, key: &str, out: &mut dyn Write) -> Result<()> {
-	if let Some(encoded) = value.get(key).and_then(Value::as_str) {
-		let data = B64
-			.decode(encoded)
-			.map_err(|error| CliError::new(format!("invalid {key}: {error}")))?;
-		out.write_all(&data)?;
-		out.flush()?;
-	}
-	Ok(())
+fn json_view(view: pb::JsonView) -> Result<Value> {
+	serde_json::from_str(&view.json).map_err(Into::into)
+}
+
+fn sandbox_view(grpc: &Grpc, name: &str) -> Result<Value> {
+	let mut sandboxes = grpc.sandboxes();
+	let view = grpc
+		.block_on(sandboxes.get(pb::SandboxRef { id: name.to_owned() }))
+		.map_err(status_error)?
+		.into_inner();
+	json_view(view)
 }
 
 fn print_json(value: &Value) -> Result<i32> {

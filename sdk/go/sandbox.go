@@ -1,10 +1,8 @@
 package vmon
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
+	"google.golang.org/grpc"
 )
 
 func sandboxPath(id string) string { return "/v1/sandboxes/" + escapePathSegment(id) }
@@ -31,48 +32,88 @@ func (sandbox *Sandbox) initServices() {
 	sandbox.Files = &Files{sandbox: sandbox}
 	sandbox.Ports = &Ports{sandbox: sandbox}
 }
-func (sandbox *Sandbox) do(ctx context.Context, request DriverRequest) (*http.Response, error) {
+
+// invoke runs one SandboxService unary RPC with endpoint affinity, retrying
+// once through mesh relocation when the pinned node no longer hosts the
+// sandbox.
+func (sandbox *Sandbox) invoke(ctx context.Context, operation string, call func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error) error {
 	if sandbox == nil || sandbox.client == nil {
-		return nil, errors.New("vmon: sandbox is not bound to a client")
+		return errors.New("vmon: sandbox is not bound to a client")
 	}
-	request.Path = sandboxPath(sandbox.ID) + request.Path
-	request.Endpoint = sandbox.endpoint
-	execute := func() (*http.Response, error) {
-		response, endpoint, err := sandbox.client.request(ctx, request)
+	execute := func() error {
+		endpoint, err := sandbox.client.unary(ctx, sandbox.endpoint, operation, func(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) error {
+			return call(ctx, pb.NewSandboxServiceClient(conn), opts...)
+		})
 		if endpoint != "" {
 			sandbox.endpoint = endpoint
 		}
-		return response, err
+		return err
 	}
-	response, err := execute()
-	var apiErr *APIError
-	if err == nil || !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || len(sandbox.client.driver.Endpoints()) <= 1 {
-		return response, err
+	err := execute()
+	if err == nil || !isNotFoundAPIError(err) || len(sandbox.client.driver.Endpoints()) <= 1 {
+		return err
 	}
-	endpoint, resolveErr := sandbox.client.driver.ResolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
+	endpoint, resolveErr := sandbox.client.resolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
 	if resolveErr != nil {
-		return nil, resolveErr
+		return resolveErr
 	}
 	sandbox.endpoint = endpoint
-	request.Endpoint = endpoint
 	return execute()
 }
-func (sandbox *Sandbox) json(ctx context.Context, method, path string, query url.Values, body, out any) error {
-	response, err := sandbox.do(ctx, DriverRequest{Method: method, Path: path, Query: query, JSON: body})
+
+// view runs a JsonView-returning sandbox RPC and yields the raw document.
+func (sandbox *Sandbox) view(ctx context.Context, operation string, call func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error)) ([]byte, error) {
+	var view *pb.JsonView
+	err := sandbox.invoke(ctx, operation, func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		var callErr error
+		view, callErr = call(ctx, service, opts...)
+		return callErr
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if out == nil {
-		_, err = sandbox.client.readResponse(response)
-		return err
+	return []byte(view.GetJson()), nil
+}
+
+// pinEndpoint returns the endpoint sandbox streams should be opened against,
+// resolving mesh relocation up front when several endpoints are known.
+func (sandbox *Sandbox) pinEndpoint(ctx context.Context) (string, error) {
+	if sandbox == nil || sandbox.client == nil || sandbox.client.driver == nil {
+		return "", errors.New("vmon: sandbox is not bound to a client")
 	}
-	return sandbox.client.decodeJSONResponse(response, method+" "+path, out)
+	if len(sandbox.client.driver.Endpoints()) <= 1 {
+		if sandbox.endpoint != "" {
+			return sandbox.endpoint, nil
+		}
+		return sandbox.client.grpcEndpoint("")
+	}
+	endpoint, err := sandbox.client.resolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
+	if err != nil {
+		return "", err
+	}
+	sandbox.endpoint = endpoint
+	return endpoint, nil
+}
+
+// streamConn returns the gRPC connection sandbox streams should use.
+func (sandbox *Sandbox) streamConn(ctx context.Context) (*grpc.ClientConn, error) {
+	endpoint, err := sandbox.pinEndpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sandbox.client.conn(endpoint)
 }
 
 // Refresh updates the sandbox state by fetching metadata from the server.
 func (sandbox *Sandbox) Refresh(ctx context.Context) (*Sandbox, error) {
+	body, err := sandbox.view(ctx, "get sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Get(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
+	if err != nil {
+		return nil, err
+	}
 	var out Sandbox
-	if err := sandbox.json(ctx, http.MethodGet, "", nil, nil, &out); err != nil {
+	if err := decodeJSONView(body, "get sandbox", &out); err != nil {
 		return nil, err
 	}
 	endpoint, client := sandbox.endpoint, sandbox.client
@@ -83,107 +124,125 @@ func (sandbox *Sandbox) Refresh(ctx context.Context) (*Sandbox, error) {
 	return sandbox, nil
 }
 
+func execStartProto(request ExecRequest) *pb.ExecStart {
+	start := &pb.ExecStart{Cmd: request.Command, Env: request.Env, Tty: request.TTY}
+	if request.Workdir != "" {
+		workdir := request.Workdir
+		start.Workdir = &workdir
+	}
+	if request.Timeout != nil {
+		timeout := *request.Timeout
+		start.Timeout = &timeout
+	}
+	return start
+}
+
 // Run executes a command and captures its output.
 func (sandbox *Sandbox) Run(ctx context.Context, request ExecRequest) (ExecResult, error) {
 	if len(request.Command) == 0 {
 		return ExecResult{}, errors.New("vmon: exec command must not be empty")
 	}
-	var wire struct {
-		Exit   int64  `json:"exit"`
-		Stdout string `json:"stdout_b64"`
-		Stderr string `json:"stderr_b64"`
-	}
-	if err := sandbox.json(ctx, http.MethodPost, "/exec", nil, request, &wire); err != nil {
+	var out *pb.ExecCaptureResponse
+	err := sandbox.invoke(ctx, "run", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		var callErr error
+		out, callErr = service.ExecCapture(ctx, &pb.ExecCaptureRequest{Id: sandbox.ID, Exec: execStartProto(request)}, opts...)
+		return callErr
+	})
+	if err != nil {
 		return ExecResult{}, err
 	}
-	stdout, err := base64.StdEncoding.DecodeString(wire.Stdout)
-	if err != nil {
-		return ExecResult{}, &ProtocolError{Operation: "run", Message: "invalid stdout_b64", Err: err}
-	}
-	stderr, err := base64.StdEncoding.DecodeString(wire.Stderr)
-	if err != nil {
-		return ExecResult{}, &ProtocolError{Operation: "run", Message: "invalid stderr_b64", Err: err}
-	}
-	return ExecResult{ExitCode: wire.Exit, Stdout: stdout, Stderr: stderr}, nil
+	return ExecResult{ExitCode: out.GetCode(), Stdout: out.GetStdout(), Stderr: out.GetStderr()}, nil
 }
 
 // Logs retrieves the current standard output and standard error logs of the sandbox.
 func (sandbox *Sandbox) Logs(ctx context.Context) (string, error) {
-	response, err := sandbox.do(ctx, DriverRequest{Method: http.MethodGet, Path: "/logs", Query: url.Values{"follow": {"false"}}, Headers: http.Header{"Accept": {"text/plain"}}})
+	conn, err := sandbox.streamConn(ctx)
 	if err != nil {
 		return "", err
 	}
-	body, err := sandbox.client.readResponse(response)
-	return string(body), err
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := pb.NewSandboxServiceClient(conn).Logs(streamCtx, &pb.LogsRequest{Id: sandbox.ID, Follow: false})
+	if err != nil {
+		return "", apiErrorFromStatus(err, "get logs")
+	}
+	var builder strings.Builder
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return builder.String(), nil
+		}
+		if err != nil {
+			return "", apiErrorFromStatus(err, "get logs", stream.Trailer())
+		}
+		builder.Write(chunk.GetData())
+	}
 }
 
-// LogStream incrementally decodes follow-log SSE chunks.
+// LogStream incrementally decodes follow-log chunks.
 type LogStream struct {
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	cancel context.CancelFunc
+	stream grpc.ServerStreamingClient[pb.LogChunk]
 }
 
 // Next returns the next decoded log chunk.
 func (stream *LogStream) Next() ([]byte, error) {
-	if stream == nil || stream.body == nil {
+	if stream == nil || stream.stream == nil {
 		return nil, errors.New("vmon: log stream is not open")
 	}
-	for stream.scanner.Scan() {
-		line := strings.TrimSuffix(stream.scanner.Text(), "\r")
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	chunk, err := stream.stream.Recv()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		var event struct {
-			Data string `json:"data"`
-			B64  string `json:"b64"`
-		}
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			return nil, &ProtocolError{Operation: "follow logs", Message: "invalid log event JSON", Err: err}
-		}
-		if event.B64 != "" {
-			chunk, err := base64.StdEncoding.DecodeString(event.B64)
-			if err != nil {
-				return nil, &ProtocolError{Operation: "follow logs", Message: "invalid base64 log chunk", Err: err}
-			}
-			return chunk, nil
-		}
-		return []byte(event.Data), nil
+		return nil, apiErrorFromStatus(err, "follow logs", stream.stream.Trailer())
 	}
-	if err := stream.scanner.Err(); err != nil {
-		return nil, err
-	}
-	return nil, io.EOF
+	return chunk.GetData(), nil
 }
 
-// Close closes the underlying response stream.
+// Close closes the underlying log stream.
 func (stream *LogStream) Close() error {
-	if stream == nil || stream.body == nil {
+	if stream == nil || stream.cancel == nil {
 		return nil
 	}
-	return stream.body.Close()
+	stream.cancel()
+	return nil
 }
 
 // FollowLogs opens a stream to receive real-time sandbox logs.
 func (sandbox *Sandbox) FollowLogs(ctx context.Context) (*LogStream, error) {
-	response, err := sandbox.do(ctx, DriverRequest{Method: http.MethodGet, Path: "/logs", Query: url.Values{"follow": {"true"}}, Stream: true, Headers: http.Header{"Accept": {"text/event-stream"}}})
+	conn, err := sandbox.streamConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 4096), maxEventBytes)
-	return &LogStream{body: response.Body, scanner: scanner}, nil
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream, err := pb.NewSandboxServiceClient(conn).Logs(streamCtx, &pb.LogsRequest{Id: sandbox.ID, Follow: true})
+	if err != nil {
+		cancel()
+		return nil, apiErrorFromStatus(err, "follow logs")
+	}
+	return &LogStream{cancel: cancel, stream: stream}, nil
 }
 
 // Metrics retrieves resource utilization metrics for the sandbox.
 func (sandbox *Sandbox) Metrics(ctx context.Context) (map[string]any, error) {
+	body, err := sandbox.view(ctx, "get metrics", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Metrics(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
+	if err != nil {
+		return nil, err
+	}
 	var out map[string]any
-	err := sandbox.json(ctx, http.MethodGet, "/metrics", nil, nil, &out)
+	err = decodeJSONView(body, "get metrics", &out)
 	return out, err
 }
-func (sandbox *Sandbox) action(ctx context.Context, method, suffix string, body any) (*Sandbox, error) {
+func (sandbox *Sandbox) action(ctx context.Context, operation string, call func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error)) (*Sandbox, error) {
+	body, err := sandbox.view(ctx, operation, call)
+	if err != nil {
+		return nil, err
+	}
 	var out Sandbox
-	if err := sandbox.json(ctx, method, suffix, nil, body, &out); err != nil {
+	if err := decodeJSONView(body, operation, &out); err != nil {
 		return nil, err
 	}
 	endpoint := sandbox.endpoint
@@ -203,53 +262,57 @@ func (sandbox *Sandbox) action(ctx context.Context, method, suffix string, body 
 
 // Stop halts the execution of the sandbox.
 func (sandbox *Sandbox) Stop(ctx context.Context) (*Sandbox, error) {
-	return sandbox.action(ctx, http.MethodPost, "/stop", nil)
+	return sandbox.action(ctx, "stop sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Stop(ctx, &pb.StopSandboxRequest{Id: sandbox.ID}, opts...)
+	})
 }
 
 // Terminate immediately halts the sandbox and releases all its resources.
 func (sandbox *Sandbox) Terminate(ctx context.Context) error {
-	response, err := sandbox.do(ctx, DriverRequest{Method: http.MethodPost, Path: "/terminate"})
-	if err == nil {
-		response.Body.Close()
-	}
-	return err
+	return sandbox.invoke(ctx, "terminate sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		_, err := service.Terminate(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+		return err
+	})
 }
 
 // Remove deletes the sandbox and any persistent filesystems.
 func (sandbox *Sandbox) Remove(ctx context.Context) error {
-	response, err := sandbox.do(ctx, DriverRequest{Method: http.MethodDelete})
-	if err == nil {
-		response.Body.Close()
-	}
-	return err
+	return sandbox.invoke(ctx, "remove sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		_, err := service.Remove(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+		return err
+	})
 }
 
 // Pause suspends all active processes in the sandbox.
 func (sandbox *Sandbox) Pause(ctx context.Context) (*Sandbox, error) {
-	return sandbox.action(ctx, http.MethodPost, "/pause", nil)
+	return sandbox.action(ctx, "pause sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Pause(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
 }
 
 // Resume reactivates previously paused processes in the sandbox.
 func (sandbox *Sandbox) Resume(ctx context.Context) (*Sandbox, error) {
-	return sandbox.action(ctx, http.MethodPost, "/resume", nil)
+	return sandbox.action(ctx, "resume sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Resume(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
 }
 
 // Extend increases the lease duration of the sandbox by the specified seconds.
 func (sandbox *Sandbox) Extend(ctx context.Context, seconds uint64) (*Sandbox, error) {
-	return sandbox.action(ctx, http.MethodPost, "/extend", struct {
-		Seconds uint64 `json:"secs"`
-	}{seconds})
+	return sandbox.action(ctx, "extend sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Extend(ctx, &pb.ExtendSandboxRequest{Id: sandbox.ID, Secs: seconds}, opts...)
+	})
 }
 
 // Migrate relocates the sandbox to a different target node.
 func (sandbox *Sandbox) Migrate(ctx context.Context, target string) (*Sandbox, error) {
-	out, err := sandbox.action(ctx, http.MethodPost, "/migrate", struct {
-		Target string `json:"target"`
-	}{target})
+	out, err := sandbox.action(ctx, "migrate sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Migrate(ctx, &pb.MigrateRequest{Id: sandbox.ID, Target: target}, opts...)
+	})
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := sandbox.client.driver.ResolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
+	endpoint, err := sandbox.client.resolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -259,10 +322,19 @@ func (sandbox *Sandbox) Migrate(ctx context.Context, target string) (*Sandbox, e
 
 // Snapshot captures the current filesystem and memory state of the sandbox.
 func (sandbox *Sandbox) Snapshot(ctx context.Context, request SnapshotRequest) (string, error) {
-	var out struct {
-		Snapshot string `json:"snapshot"`
+	message := &pb.SnapshotRequest{Id: sandbox.ID, Stop: request.Stop}
+	if request.Name != "" {
+		name := request.Name
+		message.Name = &name
 	}
-	if err := sandbox.json(ctx, http.MethodPost, "/snapshots", nil, request, &out); err != nil {
+	body, err := sandbox.view(ctx, "snapshot", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Snapshot(ctx, message, opts...)
+	})
+	if err != nil {
+		return "", err
+	}
+	var out SnapshotResult
+	if err := decodeJSONView(body, "snapshot", &out); err != nil {
 		return "", err
 	}
 	if out.Snapshot == "" {
@@ -273,10 +345,19 @@ func (sandbox *Sandbox) Snapshot(ctx context.Context, request SnapshotRequest) (
 
 // SnapshotFilesystem captures the current filesystem image of the sandbox.
 func (sandbox *Sandbox) SnapshotFilesystem(ctx context.Context, request FilesystemSnapshotRequest) (string, error) {
-	var out struct {
-		Image string `json:"image"`
+	message := &pb.SnapshotFsRequest{Id: sandbox.ID}
+	if request.Name != "" {
+		name := request.Name
+		message.Name = &name
 	}
-	if err := sandbox.json(ctx, http.MethodPost, "/snapshots/fs", nil, request, &out); err != nil {
+	body, err := sandbox.view(ctx, "filesystem snapshot", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.SnapshotFs(ctx, message, opts...)
+	})
+	if err != nil {
+		return "", err
+	}
+	var out FilesystemSnapshotResult
+	if err := decodeJSONView(body, "filesystem snapshot", &out); err != nil {
 		return "", err
 	}
 	if out.Image == "" {
@@ -288,25 +369,52 @@ func (sandbox *Sandbox) SnapshotFilesystem(ctx context.Context, request Filesyst
 // Network retrieves the active network state and policy for the sandbox.
 func (sandbox *Sandbox) Network(ctx context.Context) (NetworkState, error) {
 	var out NetworkState
-	err := sandbox.json(ctx, http.MethodGet, "/network", nil, nil, &out)
+	body, err := sandbox.view(ctx, "get network", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.NetworkGet(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
+	if err != nil {
+		return out, err
+	}
+	err = decodeJSONView(body, "get network", &out)
 	return out, err
 }
 
 // SetNetwork updates the network policy of the sandbox.
 func (sandbox *Sandbox) SetNetwork(ctx context.Context, policy NetworkPolicy) (NetworkState, error) {
 	var out NetworkState
-	err := sandbox.json(ctx, http.MethodPut, "/network", nil, policy, &out)
+	request := &pb.NetworkSetRequest{Id: sandbox.ID, BlockNetwork: policy.BlockNetwork}
+	if policy.CIDRAllow != nil {
+		request.CidrAllow = &pb.StringList{Values: *policy.CIDRAllow}
+	}
+	if policy.DomainAllow != nil {
+		request.DomainAllow = &pb.StringList{Values: *policy.DomainAllow}
+	}
+	body, err := sandbox.view(ctx, "set network", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.NetworkSet(ctx, request, opts...)
+	})
+	if err != nil {
+		return out, err
+	}
+	err = decodeJSONView(body, "set network", &out)
 	return out, err
 }
 
 // Tunnels retrieves active proxy tunnel endpoints and updates the connect token.
 func (sandbox *Sandbox) Tunnels(ctx context.Context) (TunnelSet, error) {
 	var out TunnelSet
-	err := sandbox.json(ctx, http.MethodGet, "/tunnels", nil, nil, &out)
-	if err == nil && out.ConnectToken != "" {
+	body, err := sandbox.view(ctx, "get tunnels", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Tunnels(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
+	if err != nil {
+		return out, err
+	}
+	if err = decodeJSONView(body, "get tunnels", &out); err != nil {
+		return out, err
+	}
+	if out.ConnectToken != "" {
 		sandbox.connectToken = out.ConnectToken
 	}
-	return out, err
+	return out, nil
 }
 
 // WaitReadyOptions configures lifecycle polling and an optional readiness probe.
@@ -383,29 +491,30 @@ type Files struct{ sandbox *Sandbox }
 
 // Open retrieves a stream to read the file at the specified guest path.
 func (files *Files) Open(ctx context.Context, path string) (io.ReadCloser, error) {
-	if path == "" {
-		return nil, errors.New("vmon: guest path must not be empty")
-	}
-	response, err := files.sandbox.do(ctx, DriverRequest{Method: http.MethodGet, Path: "/files", Query: url.Values{"path": {path}}, Stream: true, Headers: http.Header{"Accept": {"application/octet-stream"}}})
+	data, err := files.Read(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	return response.Body, nil
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // Read reads and returns the full contents of the file at the specified guest path.
 func (files *Files) Read(ctx context.Context, path string) ([]byte, error) {
-	body, err := files.Open(ctx, path)
+	if path == "" {
+		return nil, errors.New("vmon: guest path must not be empty")
+	}
+	var out *pb.FileContent
+	err := files.sandbox.invoke(ctx, "read file", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		var callErr error
+		out, callErr = service.FileRead(ctx, &pb.FilePathRequest{Id: files.sandbox.ID, Path: path}, opts...)
+		return callErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
-	data, err := io.ReadAll(io.LimitReader(body, files.sandbox.client.maxResponseBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > files.sandbox.client.maxResponseBytes {
-		return nil, &ResponseTooLargeError{Limit: files.sandbox.client.maxResponseBytes}
+	data := out.GetData()
+	if limit := files.sandbox.client.maxResponseBytes; limit > 0 && int64(len(data)) > limit {
+		return nil, &ResponseTooLargeError{Limit: limit}
 	}
 	return data, nil
 }
@@ -415,11 +524,10 @@ func (files *Files) Write(ctx context.Context, path string, data []byte) error {
 	if path == "" {
 		return errors.New("vmon: guest path must not be empty")
 	}
-	response, err := files.sandbox.do(ctx, DriverRequest{Method: http.MethodPut, Path: "/files", Query: url.Values{"path": {path}}, Content: data, Headers: http.Header{"Content-Type": {"application/octet-stream"}}})
-	if err == nil {
-		response.Body.Close()
-	}
-	return err
+	return files.sandbox.invoke(ctx, "write file", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		_, err := service.FileWrite(ctx, &pb.FileWriteRequest{Id: files.sandbox.ID, Path: path, Data: data}, opts...)
+		return err
+	})
 }
 
 // List retrieves metadata for files and directories inside the specified guest path.
@@ -427,10 +535,16 @@ func (files *Files) List(ctx context.Context, path string) ([]FileInfo, error) {
 	if path == "" {
 		path = "."
 	}
+	body, err := files.sandbox.view(ctx, "list files", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.FileList(ctx, &pb.FilePathRequest{Id: files.sandbox.ID, Path: path}, opts...)
+	})
+	if err != nil {
+		return nil, err
+	}
 	var out struct {
 		Entries []FileInfo `json:"entries"`
 	}
-	if err := files.sandbox.json(ctx, http.MethodGet, "/files/list", url.Values{"path": {path}}, nil, &out); err != nil {
+	if err := decodeJSONView(body, "list files", &out); err != nil {
 		return nil, err
 	}
 	if out.Entries == nil {
@@ -445,7 +559,13 @@ func (files *Files) Stat(ctx context.Context, path string) (FileInfo, error) {
 		return FileInfo{}, errors.New("vmon: guest path must not be empty")
 	}
 	var out FileInfo
-	err := files.sandbox.json(ctx, http.MethodGet, "/files/stat", url.Values{"path": {path}}, nil, &out)
+	body, err := files.sandbox.view(ctx, "stat file", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.FileStat(ctx, &pb.FilePathRequest{Id: files.sandbox.ID, Path: path}, opts...)
+	})
+	if err != nil {
+		return out, err
+	}
+	err = decodeJSONView(body, "stat file", &out)
 	return out, err
 }
 
@@ -459,15 +579,11 @@ func (files *Files) Delete(ctx context.Context, path string, options ...DeleteOp
 	if path == "" {
 		return errors.New("vmon: guest path must not be empty")
 	}
-	query := url.Values{"path": {path}}
-	if len(options) > 0 && options[0].Recursive {
-		query.Set("recursive", "true")
-	}
-	response, err := files.sandbox.do(ctx, DriverRequest{Method: http.MethodDelete, Path: "/files", Query: query})
-	if err == nil {
-		response.Body.Close()
-	}
-	return err
+	recursive := len(options) > 0 && options[0].Recursive
+	return files.sandbox.invoke(ctx, "delete file", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		_, err := service.FileDelete(ctx, &pb.FileDeleteRequest{Id: files.sandbox.ID, Path: path, Recursive: recursive}, opts...)
+		return err
+	})
 }
 
 // Mkdir creates a directory (and any necessary parent directories) inside the guest.
@@ -577,7 +693,7 @@ func (ports *Ports) HTTP(ctx context.Context, port uint16, proxy ProxyRequest) (
 		return response, nil
 	}
 	_ = response.Body.Close()
-	endpoint, err = ports.sandbox.client.driver.ResolveSandbox(ctx, ports.sandbox.ID, ports.sandbox.endpoint)
+	endpoint, err = ports.sandbox.client.resolveSandbox(ctx, ports.sandbox.ID, ports.sandbox.endpoint)
 	if err != nil {
 		return nil, err
 	}

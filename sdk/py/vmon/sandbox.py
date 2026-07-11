@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import builtins
 import socket
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+import grpc
 import httpx
 
-from ._endpoint import ResponseStream, WebSocketConnection, path_segment
+from ._endpoint import (
+    GrpcStubs,
+    WebSocketConnection,
+    decode_view,
+    path_segment,
+    translate_rpc_error,
+)
 from .driver import response_endpoint
 from .errors import APIError, ProtocolError
-from .process import ConsoleStream, EventStream, LogStream, Process, open_process
+from .process import ConsoleStream, LogStream, Process, open_process
 from .secret import Secret, merge_secrets
+from .v1 import api_pb2
 from .volume import Volume
 
 if TYPE_CHECKING:
@@ -46,6 +53,26 @@ def _drop_none(data: Mapping[str, Any]) -> dict[str, Any]:
 
 def _path_tail(value: str) -> str:
     return "/".join(path_segment(part) for part in value.lstrip("/").split("/"))
+
+
+def _exec_start(body: Mapping[str, Any], *, sandbox_id: str | None = None) -> api_pb2.ExecStart:
+    """Build a typed ExecStart from an exec body document."""
+    start = api_pb2.ExecStart(
+        cmd=[str(part) for part in body["cmd"]],
+        tty=bool(body.get("tty", False)),
+    )
+    if sandbox_id is not None:
+        start.sandbox_id = sandbox_id
+    workdir = body.get("workdir")
+    if workdir is not None:
+        start.workdir = str(workdir)
+    env = body.get("env")
+    if env:
+        start.env.update({str(key): str(value) for key, value in env.items()})
+    timeout = body.get("timeout")
+    if timeout is not None:
+        start.timeout = float(timeout)
+    return start
 
 
 def _secret_wire(
@@ -152,11 +179,10 @@ class Files:
 
     def read_bytes(self, path: str) -> bytes:
         """Read an entire guest file as bytes."""
-        return self._sandbox._bytes(
-            "GET",
-            self._path("files"),
-            params={"path": path},
-        )
+        sandbox = self._sandbox
+        return sandbox._rpc(
+            lambda stubs: stubs.sandbox.FileRead(api_pb2.FilePathRequest(id=sandbox.id, path=path))
+        ).data
 
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         """Read and decode an entire guest text file."""
@@ -170,12 +196,12 @@ class Files:
     ) -> None:
         """Replace a guest file with the supplied bytes."""
         del mode
-        self._sandbox._json(
-            "PUT",
-            self._path("files"),
-            params={"path": path},
-            content=bytes(data),
-            headers={"Content-Type": "application/octet-stream"},
+        sandbox = self._sandbox
+        payload = bytes(data)
+        sandbox._rpc(
+            lambda stubs: stubs.sandbox.FileWrite(
+                api_pb2.FileWriteRequest(id=sandbox.id, path=path, data=payload)
+            )
         )
 
     def write_text(
@@ -190,12 +216,12 @@ class Files:
 
     def list(self, path: str = ".") -> list[FileInfo]:
         """List typed directory entries at a guest path."""
-        value = self._sandbox._json(
-            "GET",
-            self._path("files/list"),
-            params={"path": path},
+        sandbox = self._sandbox
+        value = sandbox._view_rpc(
+            lambda stubs: stubs.sandbox.FileList(api_pb2.FilePathRequest(id=sandbox.id, path=path)),
+            error="file list returned a malformed response",
         )
-        entries = value.get("entries") if isinstance(value, Mapping) else value
+        entries = value.get("entries", value)
         if not isinstance(entries, list) or not all(isinstance(item, Mapping) for item in entries):
             raise ProtocolError("file list returned a malformed response")
         from .models import FileInfo
@@ -204,23 +230,22 @@ class Files:
 
     def stat(self, path: str) -> FileInfo:
         """Return typed metadata for one guest path."""
-        value = self._sandbox._json(
-            "GET",
-            self._path("files/stat"),
-            params={"path": path},
+        sandbox = self._sandbox
+        value = sandbox._view_rpc(
+            lambda stubs: stubs.sandbox.FileStat(api_pb2.FilePathRequest(id=sandbox.id, path=path)),
+            error="file stat returned a malformed response",
         )
-        if not isinstance(value, Mapping):
-            raise ProtocolError("file stat returned a malformed response")
         from .models import FileInfo
 
         return FileInfo.from_dict(value)
 
     def delete(self, path: str, recursive: bool = False) -> None:
         """Delete a guest path, optionally recursively."""
-        self._sandbox._json(
-            "DELETE",
-            self._path("files"),
-            params={"path": path, "recursive": bool(recursive)},
+        sandbox = self._sandbox
+        sandbox._rpc(
+            lambda stubs: stubs.sandbox.FileDelete(
+                api_pb2.FileDeleteRequest(id=sandbox.id, path=path, recursive=bool(recursive))
+            )
         )
 
     def mkdir(self, path: str, parents: bool = True) -> None:
@@ -236,20 +261,50 @@ class Files:
                 code="engine",
             )
 
-    def open(self, path: str) -> ResponseStream:
-        """Open a streaming response for a guest file."""
-        response = self._sandbox._request(
-            "GET",
-            self._path("files"),
-            params={"path": path},
-            stream=True,
-        )
-        if not isinstance(response, ResponseStream):
-            raise ProtocolError("file open did not return a stream")
-        return response
+    def open(self, path: str) -> FileStream:
+        """Open a closeable stream over a guest file's contents."""
+        return FileStream(self.read_bytes(path))
 
-    def _path(self, suffix: str) -> str:
-        return f"{self._sandbox._base_path}/{suffix}"
+
+class FileStream(Iterable[bytes]):
+    """A closeable in-memory stream over one guest file's contents."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._consumed = False
+
+    def read(self, size: int = -1) -> bytes:
+        """Read up to ``size`` bytes, or everything that remains."""
+        if self._consumed:
+            return b""
+        if size < 0 or size >= len(self._data):
+            data = self._data
+            self._data = b""
+            self._consumed = not data
+            return data
+        data = self._data[:size]
+        self._data = self._data[size:]
+        return data
+
+    def iter_bytes(self) -> Iterable[bytes]:
+        """Yield the remaining contents as one chunk."""
+        data = self.read()
+        if data:
+            yield data
+
+    def __iter__(self) -> Any:
+        return self.iter_bytes()
+
+    def close(self) -> None:
+        """Release the buffered contents idempotently."""
+        self._data = b""
+        self._consumed = True
+
+    def __enter__(self) -> FileStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 class Ports:
@@ -291,9 +346,7 @@ class Ports:
             json=json,
             raise_for_status=False,
         )
-        if isinstance(response, ResponseStream | tuple):
-            if isinstance(response, ResponseStream):
-                response.close()
+        if isinstance(response, tuple):
             raise ProtocolError("port proxy returned an unexpected response")
         return response
 
@@ -415,6 +468,30 @@ class Sandbox:
         value = self._raw.get(key)
         return value if isinstance(value, str) else None
 
+    def _rpc[T](self, fn: Callable[[GrpcStubs], T], *, stream: bool = False) -> T:
+        """Invoke one sandbox-scoped RPC, re-resolving the endpoint on not_found."""
+
+        def send() -> tuple[T, str]:
+            return self._client.driver.call(fn, endpoint=self._endpoint, stream=stream)
+
+        try:
+            result, endpoint = send()
+        except APIError as original:
+            if original.code != "not_found" or len(self._client.driver.endpoints()) <= 1:
+                raise
+            try:
+                self._endpoint = self._client.driver.resolve_sandbox(self.id, self._endpoint)
+            except APIError:
+                raise original from None
+            result, endpoint = send()
+        self._endpoint = endpoint
+        return result
+
+    def _view_rpc(
+        self, fn: Callable[[GrpcStubs], api_pb2.JsonView], *, error: str
+    ) -> dict[str, Any]:
+        return decode_view(self._rpc(fn).json, error)
+
     def _request(
         self,
         method: str,
@@ -424,11 +501,12 @@ class Sandbox:
         json: Any | None = None,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
-        stream: bool = False,
         websocket: bool = False,
         raise_for_status: bool = True,
-    ) -> httpx.Response | ResponseStream | tuple[WebSocketConnection, str]:
-        def send() -> httpx.Response | ResponseStream | tuple[WebSocketConnection, str]:
+    ) -> httpx.Response | tuple[WebSocketConnection, str]:
+        """Issue one HTTP or WebSocket ports-proxy request pinned to this sandbox."""
+
+        def send() -> httpx.Response | tuple[WebSocketConnection, str]:
             if websocket:
                 return self._client.driver.websocket(
                     path,
@@ -442,7 +520,6 @@ class Sandbox:
                 json=json,
                 content=content,
                 headers=headers,
-                stream=stream,
                 endpoint=self._endpoint,
                 raise_for_status=raise_for_status,
             )
@@ -470,34 +547,12 @@ class Sandbox:
                 self._endpoint = selected
         return result
 
-    def _json(self, method: str, path: str, **kwargs: Any) -> Any:
-        result = self._request(method, path, **kwargs)
-        if isinstance(result, ResponseStream):
-            result.close()
-            raise ProtocolError(f"{path} unexpectedly returned a stream")
-        if isinstance(result, tuple):
-            result[0].close()
-            raise ProtocolError(f"{path} unexpectedly returned a WebSocket")
-        if not result.content:
-            return {}
-        try:
-            return result.json()
-        except ValueError as exc:
-            raise ProtocolError(f"{path} returned invalid JSON") from exc
-
-    def _bytes(self, method: str, path: str, **kwargs: Any) -> bytes:
-        result = self._request(method, path, **kwargs)
-        if isinstance(result, ResponseStream):
-            result.close()
-            raise ProtocolError(f"{path} unexpectedly returned a stream")
-        if isinstance(result, tuple):
-            result[0].close()
-            raise ProtocolError(f"{path} unexpectedly returned a WebSocket")
-        return result.content
-
     def refresh(self) -> SandboxInfo:
         """Refresh this object's server view and return its typed form."""
-        value = self._json("GET", self._base_path)
+        value = self._view_rpc(
+            lambda stubs: stubs.sandbox.Get(api_pb2.SandboxRef(id=self.id)),
+            error="inspect returned a non-object response",
+        )
         self._update(value, "inspect returned a non-object response")
         return self.info
 
@@ -511,25 +566,13 @@ class Sandbox:
     ) -> ExecResult:
         """Run a command to completion and capture stdout, stderr, and exit status."""
         body = self._exec_body(cmd, workdir=workdir, env=env, timeout=timeout, tty=tty)
-        value = self._json("POST", f"{self._base_path}/exec", json=body)
-        if not isinstance(value, Mapping):
-            raise ProtocolError("captured exec returned a non-object response")
-        raw_exit = value.get("exit")
-        stdout_b64 = value.get("stdout_b64")
-        stderr_b64 = value.get("stderr_b64")
-        if (
-            isinstance(raw_exit, bool)
-            or not isinstance(raw_exit, int)
-            or not isinstance(stdout_b64, str)
-            or not isinstance(stderr_b64, str)
-        ):
-            raise ProtocolError("captured exec returned a malformed response")
-        try:
-            stdout = base64.b64decode(stdout_b64, validate=True)
-            stderr = base64.b64decode(stderr_b64, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise ProtocolError("captured exec returned invalid base64") from exc
-        return ExecResult(returncode=raw_exit, stdout=stdout, stderr=stderr)
+        request = api_pb2.ExecCaptureRequest(id=self.id, exec=_exec_start(body))
+        response = self._rpc(lambda stubs: stubs.sandbox.ExecCapture(request))
+        return ExecResult(
+            returncode=response.code,
+            stdout=response.stdout,
+            stderr=response.stderr,
+        )
 
     def exec(
         self,
@@ -549,16 +592,20 @@ class Sandbox:
             timeout=timeout,
             tty=use_tty,
         )
-        result = self._request(
-            "WS",
-            f"{self._base_path}/exec",
-            websocket=True,
-        )
-        if not isinstance(result, tuple):
-            raise ProtocolError("exec did not return a WebSocket")
+        start = _exec_start(body, sandbox_id=self.id)
+
+        def starter(
+            make_inputs: Callable[[], Iterable[api_pb2.ExecInput]],
+        ) -> tuple[Any, str]:
+            return self._client.driver.call(
+                lambda stubs: stubs.sandbox.Exec(make_inputs()),
+                endpoint=self._endpoint,
+                stream=True,
+            )
+
         return open_process(
-            result[0],
-            body,
+            starter,
+            api_pb2.ExecInput(start=start),
             timeout=timeout,
             tty=use_tty,
             thread_name=f"vmon-exec-{self.id}",
@@ -591,10 +638,11 @@ class Sandbox:
 
     def attach(self) -> ConsoleStream:
         """Open a live read-only console stream."""
-        result = self._request("WS", f"{self._base_path}/attach", websocket=True)
-        if not isinstance(result, tuple):
-            raise ProtocolError("attach did not return a WebSocket")
-        return ConsoleStream(result[0])
+        responses = self._rpc(
+            lambda stubs: stubs.sandbox.Attach(api_pb2.SandboxRef(id=self.id)),
+            stream=True,
+        )
+        return ConsoleStream(responses, self._endpoint)
 
     @overload
     def logs(self, follow: Literal[False] = False) -> str: ...
@@ -604,56 +652,81 @@ class Sandbox:
 
     def logs(self, follow: bool = False) -> str | LogStream:
         """Return buffered logs or open a closeable live log stream."""
-        path = f"{self._base_path}/logs"
-        if not follow:
-            result = self._request("GET", path, params={"follow": False})
-            if isinstance(result, ResponseStream | tuple):
-                if isinstance(result, ResponseStream):
-                    result.close()
-                raise ProtocolError("logs returned an unexpected response")
-            return result.text
-        result = self._request("GET", path, params={"follow": True}, stream=True)
-        if not isinstance(result, ResponseStream):
-            raise ProtocolError("follow logs did not return a stream")
-        return LogStream(EventStream(result))
+        chunks = self._rpc(
+            lambda stubs: stubs.sandbox.Logs(api_pb2.LogsRequest(id=self.id, follow=bool(follow))),
+            stream=True,
+        )
+        if follow:
+            return LogStream(chunks, self._endpoint)
+        try:
+            data = b"".join(chunk.data for chunk in chunks)
+        except grpc.RpcError as exc:
+            raise translate_rpc_error(
+                exc, endpoint=self._endpoint, fallback_message="logs failed"
+            ) from exc
+        return data.decode("utf-8", errors="replace")
 
     def metrics(self) -> dict[str, Any]:
         """Return this sandbox's runtime metrics."""
-        value = self._json("GET", f"{self._base_path}/metrics")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("sandbox metrics returned a non-object response")
-        return dict(value)
+        return self._view_rpc(
+            lambda stubs: stubs.sandbox.Metrics(api_pb2.SandboxRef(id=self.id)),
+            error="sandbox metrics returned a non-object response",
+        )
 
     def stop(self, wait: bool = True) -> None:
         """Stop the sandbox while retaining its server record."""
         del wait
-        self._update_optional(self._json("POST", f"{self._base_path}/stop"))
+        self._update_optional(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Stop(api_pb2.StopSandboxRequest(id=self.id)),
+                error="stop returned a non-object response",
+            )
+        )
 
     def terminate(self, wait: bool = True) -> None:
         """Terminate the sandbox idempotently."""
         del wait
         if self._terminated or self._removed:
             return
-        self._update_optional(self._json("POST", f"{self._base_path}/terminate"))
+        self._update_optional(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Terminate(api_pb2.SandboxRef(id=self.id)),
+                error="terminate returned a non-object response",
+            )
+        )
         self._terminated = True
 
     def remove(self) -> None:
         """Delete the sandbox record idempotently."""
         if self._removed:
             return
-        self._update_optional(self._json("DELETE", self._base_path))
+        self._update_optional(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Remove(api_pb2.SandboxRef(id=self.id)),
+                error="remove returned a non-object response",
+            )
+        )
         self._terminated = True
         self._removed = True
 
     def pause(self) -> SandboxInfo:
         """Pause virtual CPUs and return the updated view."""
-        self._update(self._json("POST", f"{self._base_path}/pause"), "pause returned invalid data")
+        self._update(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Pause(api_pb2.SandboxRef(id=self.id)),
+                error="pause returned invalid data",
+            ),
+            "pause returned invalid data",
+        )
         return self.info
 
     def resume(self) -> SandboxInfo:
         """Resume virtual CPUs and return the updated view."""
         self._update(
-            self._json("POST", f"{self._base_path}/resume"),
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Resume(api_pb2.SandboxRef(id=self.id)),
+                error="resume returned invalid data",
+            ),
             "resume returned invalid data",
         )
         return self.info
@@ -664,7 +737,12 @@ class Sandbox:
         if secs < 0:
             raise ValueError("extension seconds must be >= 0")
         self._update(
-            self._json("POST", f"{self._base_path}/extend", json={"secs": secs}),
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Extend(
+                    api_pb2.ExtendSandboxRequest(id=self.id, secs=secs)
+                ),
+                error="extend returned a non-object response",
+            ),
             "extend returned a non-object response",
         )
         return self.info
@@ -675,7 +753,12 @@ class Sandbox:
         if not target:
             raise ValueError("migration target must not be empty")
         self._update(
-            self._json("POST", f"{self._base_path}/migrate", json={"target": target}),
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Migrate(
+                    api_pb2.MigrateRequest(id=self.id, target=target)
+                ),
+                error="migration returned a non-object response",
+            ),
             "migration returned a non-object response",
         )
         self._endpoint = self._client.driver.resolve_sandbox(self.id, self._endpoint)
@@ -683,45 +766,61 @@ class Sandbox:
 
     def snapshot(self, name: str | None = None, *, stop: bool = False) -> str:
         """Create a full VM snapshot and return its server-assigned name."""
-        value = self._json(
-            "POST",
-            f"{self._base_path}/snapshots",
-            json={"name": name, "stop": bool(stop)},
+        request = api_pb2.SnapshotRequest(id=self.id, stop=bool(stop))
+        if name is not None:
+            request.name = str(name)
+        value = self._view_rpc(
+            lambda stubs: stubs.sandbox.Snapshot(request),
+            error="snapshot returned a malformed response",
         )
-        snapshot = value.get("snapshot") if isinstance(value, Mapping) else None
+        snapshot = value.get("snapshot")
         if not isinstance(snapshot, str) or not snapshot:
             raise ProtocolError("snapshot returned a malformed response")
         return snapshot
 
     def snapshot_filesystem(self, name: str | None = None) -> str:
         """Snapshot the guest filesystem and return its template image name."""
-        value = self._json(
-            "POST",
-            f"{self._base_path}/snapshots/fs",
-            json={"name": name},
+        request = api_pb2.SnapshotFsRequest(id=self.id)
+        if name is not None:
+            request.name = str(name)
+        value = self._view_rpc(
+            lambda stubs: stubs.sandbox.SnapshotFs(request),
+            error="filesystem snapshot returned a malformed response",
         )
-        image = value.get("image") if isinstance(value, Mapping) else None
+        image = value.get("image")
         if not isinstance(image, str) or not image:
             raise ProtocolError("filesystem snapshot returned a malformed response")
         return image
 
     def network(self) -> dict[str, Any]:
         """Return the current sandbox network policy."""
-        value = self._json("GET", f"{self._base_path}/network")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("network policy returned a non-object response")
-        return dict(value)
+        return self._view_rpc(
+            lambda stubs: stubs.sandbox.NetworkGet(api_pb2.SandboxRef(id=self.id)),
+            error="network policy returned a non-object response",
+        )
 
     def set_network(self, policy: Mapping[str, Any]) -> dict[str, Any]:
         """Replace supplied fields in the sandbox network policy."""
-        value = self._json("PUT", f"{self._base_path}/network", json=dict(policy))
-        if not isinstance(value, Mapping):
-            raise ProtocolError("network update returned a non-object response")
-        return dict(value)
+        request = api_pb2.NetworkSetRequest(id=self.id)
+        if policy.get("block_network") is not None:
+            request.block_network = bool(policy["block_network"])
+        if policy.get("cidr_allow") is not None:
+            request.cidr_allow.SetInParent()
+            request.cidr_allow.values.extend(str(item) for item in policy["cidr_allow"])
+        if policy.get("domain_allow") is not None:
+            request.domain_allow.SetInParent()
+            request.domain_allow.values.extend(str(item) for item in policy["domain_allow"])
+        return self._view_rpc(
+            lambda stubs: stubs.sandbox.NetworkSet(request),
+            error="network update returned a non-object response",
+        )
 
     def tunnels(self) -> dict[int, tuple[str, int]]:
         """Return exposed guest ports mapped to local tunnel addresses."""
-        value = self._json("GET", f"{self._base_path}/tunnels")
+        value = self._view_rpc(
+            lambda stubs: stubs.sandbox.Tunnels(api_pb2.SandboxRef(id=self.id)),
+            error="tunnels returned a malformed response",
+        )
         raw = None
         if isinstance(value, Mapping):
             token = value.get("connect_token")
@@ -845,7 +944,7 @@ class _AsyncFiles:
     async def mkdir(self, *args: Any, **kwargs: Any) -> None:
         await asyncio.to_thread(self._files.mkdir, *args, **kwargs)
 
-    async def open(self, *args: Any, **kwargs: Any) -> ResponseStream:
+    async def open(self, *args: Any, **kwargs: Any) -> FileStream:
         return await asyncio.to_thread(self._files.open, *args, **kwargs)
 
 

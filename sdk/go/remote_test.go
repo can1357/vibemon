@@ -3,39 +3,46 @@ package vmon
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"net/http"
+	"sync"
 	"testing"
+
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 )
 
 func TestRemoteFunctionUsesBoundSandboxServices(t *testing.T) {
+	var mu sync.Mutex
 	execCalls := 0
-	driver := &stubDriver{endpoints: []EndpointInfo{{URL: "node", Healthy: true}}, do: func(_ context.Context, request DriverRequest) (*http.Response, string, error) {
-		switch request.Method + " " + request.Path {
-		case "POST /v1/sandboxes":
-			return jsonResponse(200, `{"id":"remote","status":"running"}`), "node", nil
-		case "PUT /v1/sandboxes/remote/files":
-			return jsonResponse(204, ""), "node", nil
-		case "DELETE /v1/sandboxes/remote/files":
-			return jsonResponse(204, ""), "node", nil
-		case "POST /v1/sandboxes/remote/terminate":
-			return jsonResponse(204, ""), "node", nil
-		case "POST /v1/sandboxes/remote/exec":
+	stub := &sandboxServiceStub{
+		create: func(context.Context, *pb.CreateSandboxRequest) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: `{"id":"remote","status":"running"}`}, nil
+		},
+		fileWrite: func(context.Context, *pb.FileWriteRequest) (*pb.Ok, error) {
+			return &pb.Ok{}, nil
+		},
+		fileDelete: func(context.Context, *pb.FileDeleteRequest) (*pb.Ok, error) {
+			return &pb.Ok{}, nil
+		},
+		terminate: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: `{}`}, nil
+		},
+		execCapture: func(_ context.Context, request *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error) {
+			if request.GetId() != "remote" {
+				t.Errorf("exec sandbox id=%q", request.GetId())
+			}
+			mu.Lock()
 			execCalls++
+			calls := execCalls
+			mu.Unlock()
 			stdout := []byte("v22.0.0\n")
-			if execCalls > 1 {
+			if calls > 1 {
 				payload, _ := json.Marshal(map[string]any{"ok": true, "result": 42, "stdout": "guest output\n"})
 				stdout = payload
 			}
-			body, _ := json.Marshal(map[string]any{"exit": 0, "stdout_b64": base64.StdEncoding.EncodeToString(stdout), "stderr_b64": ""})
-			return jsonResponse(200, string(body)), "node", nil
-		default:
-			t.Fatalf("unexpected request %s %s", request.Method, request.Path)
-			return nil, "", nil
-		}
-	}}
-	client := NewClient(driver)
+			return &pb.ExecCaptureResponse{Code: 0, Stdout: stdout}, nil
+		},
+	}
+	client := bufconnClient(t, startSandboxServiceStub(t, stub))
 	var output bytes.Buffer
 	function, err := NewRemoteFunction[int](client, RemoteFunctionSourceSpec{Source: "export default () => 42", ExportName: "default"}, RemoteFunctionOptions{Stdout: &output})
 	if err != nil {

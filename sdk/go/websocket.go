@@ -2,17 +2,17 @@ package vmon
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	ws "github.com/coder/websocket"
+	"google.golang.org/grpc"
 )
 
 // WebSocketMessageType identifies a text or binary WebSocket message.
@@ -93,18 +93,6 @@ func (socket *WebSocketConn) Close() error {
 	return socket.closeErr
 }
 
-func (socket *WebSocketConn) closeNow() error {
-	if socket == nil {
-		return nil
-	}
-	socket.closeOnce.Do(func() {
-		if socket.conn != nil {
-			socket.closeErr = normalizeWebSocketCloseError(socket.conn.CloseNow())
-		}
-	})
-	return socket.closeErr
-}
-
 func normalizeWebSocketCloseError(err error) error {
 	if err == nil || errors.Is(err, io.EOF) {
 		return nil
@@ -134,94 +122,18 @@ func (client *Client) dialWebSocket(ctx context.Context, path string, query url.
 	return client.driver.Dial(ctx, path, query, endpoint)
 }
 
-type webSocketEnvelope struct {
-	Stream string          `json:"stream"`
-	Base64 string          `json:"b64"`
-	Exit   json.RawMessage `json:"exit"`
-	Signal *int            `json:"signal"`
-	Ready  string          `json:"ready"`
-	Error  *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-func readWebSocketEnvelope(ctx context.Context, socket *WebSocketConn, operation string) (webSocketEnvelope, error) {
-	_, data, err := socket.Read(ctx)
-	if err != nil {
-		return webSocketEnvelope{}, err
-	}
-	var envelope webSocketEnvelope
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return webSocketEnvelope{}, &ProtocolError{Operation: operation, Message: "invalid JSON frame", Err: err}
-	}
-	if envelope.Error != nil {
-		code := envelope.Error.Code
-		if code == "" {
-			code = "internal"
-		}
-		return webSocketEnvelope{}, &APIError{Code: code, Message: envelope.Error.Message}
-	}
-	return envelope, nil
-}
-
-// Process is a live streaming command or shell.
-type Process struct {
-	socket      *WebSocketConn
-	stateMu     sync.Mutex
-	stdinClosed bool
-	done        bool
-	// SandboxID is set for shell processes after the ready frame.
-	SandboxID string
-}
-
-func openProcess(ctx context.Context, client *Client, path string, request any, endpoint string, consumeReady bool) (*Process, string, error) {
-	socket, used, err := client.dialWebSocket(ctx, path, nil, endpoint)
-	if err != nil {
-		return nil, "", err
-	}
-	encoded, err := json.Marshal(request)
-	if err != nil {
-		_ = socket.closeNow()
-		return nil, "", fmt.Errorf("vmon: encode process request: %w", err)
-	}
-	if err = socket.Write(ctx, WebSocketTextMessage, encoded); err != nil {
-		_ = socket.closeNow()
-		return nil, "", err
-	}
-	process := &Process{socket: socket}
-	if consumeReady {
-		envelope, readyErr := readWebSocketEnvelope(ctx, socket, "shell setup")
-		if readyErr != nil {
-			_ = socket.closeNow()
-			return nil, "", readyErr
-		}
-		if envelope.Ready == "" {
-			_ = socket.closeNow()
-			return nil, "", &ProtocolError{Operation: "shell setup", Message: "missing ready sandbox name"}
-		}
-		process.SandboxID = envelope.Ready
-	}
-	return process, used, nil
-}
-
-// Shell opens an existing-sandbox or ephemeral shell and consumes its ready frame.
-func (client *Client) Shell(ctx context.Context, request ShellRequest) (*Process, error) {
-	process, _, err := openProcess(ctx, client, "/v1/shell", request, "", true)
-	return process, err
-}
-
+// dial opens a ports-proxy WebSocket with endpoint affinity, relocating once
+// when the pinned node no longer hosts the sandbox.
 func (sandbox *Sandbox) dial(ctx context.Context, path string, query url.Values) (*WebSocketConn, string, error) {
 	fullPath := sandboxPath(sandbox.ID) + path
 	socket, endpoint, err := sandbox.client.dialWebSocket(ctx, fullPath, query, sandbox.endpoint)
 	if endpoint != "" {
 		sandbox.endpoint = endpoint
 	}
-	var apiErr *APIError
-	if err == nil || !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || len(sandbox.client.driver.Endpoints()) <= 1 {
+	if err == nil || !isNotFoundAPIError(err) || len(sandbox.client.driver.Endpoints()) <= 1 {
 		return socket, endpoint, err
 	}
-	endpoint, resolveErr := sandbox.client.driver.ResolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
+	endpoint, resolveErr := sandbox.client.resolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
 	if resolveErr != nil {
 		return nil, "", resolveErr
 	}
@@ -233,34 +145,105 @@ func (sandbox *Sandbox) dial(ctx context.Context, path string, query url.Values)
 	return socket, used, err
 }
 
-// Exec opens a streaming command in this sandbox.
-func (sandbox *Sandbox) Exec(ctx context.Context, request ExecRequest) (*Process, error) {
-	if len(request.Command) == 0 {
-		return nil, errors.New("vmon: exec command must not be empty")
+// Process is a live streaming command or shell.
+type Process struct {
+	stream      grpc.BidiStreamingClient[pb.ExecInput, pb.ExecOutput]
+	cancel      context.CancelFunc
+	sendMu      sync.Mutex
+	stateMu     sync.Mutex
+	stdinClosed bool
+	done        bool
+	// SandboxID is set for shell processes after the ready frame.
+	SandboxID string
+}
+
+// Shell opens an existing-sandbox or ephemeral shell and consumes its ready frame.
+func (client *Client) Shell(ctx context.Context, request ShellRequest) (*Process, error) {
+	endpoint, err := client.grpcEndpoint("")
+	if err != nil {
+		return nil, err
 	}
-	socket, endpoint, err := sandbox.dial(ctx, "/exec", nil)
+	conn, err := client.conn(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil {
-		_ = socket.closeNow()
+		return nil, fmt.Errorf("vmon: encode shell request: %w", err)
+	}
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stream, err := pb.NewSandboxServiceClient(conn).Shell(streamCtx)
+	if err != nil {
+		cancel()
+		return nil, apiErrorFromStatus(err, "shell setup")
+	}
+	process := &Process{stream: stream, cancel: cancel}
+	// A cancelled caller context aborts the setup handshake.
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	if err := process.send(&pb.ExecInput{Input: &pb.ExecInput_ShellParamsJson{ShellParamsJson: string(encoded)}}, "shell setup"); err != nil {
+		_ = process.closeWithState()
 		return nil, err
 	}
-	if err := socket.Write(ctx, WebSocketTextMessage, encoded); err != nil {
-		_ = socket.closeNow()
+	output, err := stream.Recv()
+	if err != nil {
+		_ = process.closeWithState()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, apiErrorFromStatus(err, "shell setup", stream.Trailer())
+	}
+	name := output.GetReady().GetSandboxId()
+	if name == "" {
+		_ = process.closeWithState()
+		return nil, &ProtocolError{Operation: "shell setup", Message: "missing ready sandbox name"}
+	}
+	process.SandboxID = name
+	return process, nil
+}
+
+// Exec opens a streaming command in this sandbox.
+func (sandbox *Sandbox) Exec(ctx context.Context, request ExecRequest) (*Process, error) {
+	if len(request.Command) == 0 {
+		return nil, errors.New("vmon: exec command must not be empty")
+	}
+	conn, err := sandbox.streamConn(ctx)
+	if err != nil {
 		return nil, err
 	}
-	process := &Process{socket: socket}
-	if endpoint != "" {
-		sandbox.endpoint = endpoint
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stream, err := pb.NewSandboxServiceClient(conn).Exec(streamCtx)
+	if err != nil {
+		cancel()
+		return nil, apiErrorFromStatus(err, "exec")
+	}
+	start := execStartProto(request)
+	start.SandboxId = sandbox.ID
+	process := &Process{stream: stream, cancel: cancel}
+	if err := process.send(&pb.ExecInput{Input: &pb.ExecInput_Start{Start: start}}, "exec"); err != nil {
+		_ = process.closeWithState()
+		return nil, err
 	}
 	return process, nil
 }
 
+// send serializes one client frame onto the stream.
+func (process *Process) send(input *pb.ExecInput, operation string) error {
+	process.sendMu.Lock()
+	defer process.sendMu.Unlock()
+	err := process.stream.Send(input)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.EOF) {
+		return &ProtocolError{Operation: operation, Message: "process stream closed"}
+	}
+	return apiErrorFromStatus(err, operation, process.stream.Trailer())
+}
+
 // Receive waits for one decoded stream or exit frame.
 func (process *Process) Receive(ctx context.Context) (ExecEvent, error) {
-	if process == nil || process.socket == nil {
+	if process == nil || process.stream == nil {
 		return ExecEvent{}, errors.New("vmon: process is not open")
 	}
 	process.stateMu.Lock()
@@ -269,36 +252,46 @@ func (process *Process) Receive(ctx context.Context) (ExecEvent, error) {
 	if done {
 		return ExecEvent{}, io.EOF
 	}
-	envelope, err := readWebSocketEnvelope(ctx, process.socket, "process")
+	stop := context.AfterFunc(ctx, func() { _ = process.closeWithState() })
+	defer stop()
+	output, err := process.stream.Recv()
 	if err != nil {
 		_ = process.closeWithState()
-		return ExecEvent{}, err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ExecEvent{}, ctxErr
+		}
+		if errors.Is(err, io.EOF) {
+			return ExecEvent{}, io.EOF
+		}
+		return ExecEvent{}, apiErrorFromStatus(err, "process", process.stream.Trailer())
 	}
-	if envelope.Stream != "" {
-		stream := StreamName(envelope.Stream)
-		if stream != StreamStdout && stream != StreamStderr && stream != StreamConsole {
+	switch payload := output.GetOutput().(type) {
+	case *pb.ExecOutput_Chunk:
+		var stream StreamName
+		switch payload.Chunk.GetStream() {
+		case pb.Stream_STREAM_STDOUT:
+			stream = StreamStdout
+		case pb.Stream_STREAM_STDERR:
+			stream = StreamStderr
+		case pb.Stream_STREAM_CONSOLE:
+			stream = StreamConsole
+		default:
 			_ = process.closeWithState()
 			return ExecEvent{}, &ProtocolError{Operation: "process", Message: "unknown stream name"}
 		}
-		data, decodeErr := base64.StdEncoding.DecodeString(envelope.Base64)
-		if decodeErr != nil {
-			_ = process.closeWithState()
-			return ExecEvent{}, &ProtocolError{Operation: "process", Message: "invalid base64 stream payload", Err: decodeErr}
+		return ExecEvent{Stream: stream, Data: payload.Chunk.GetData()}, nil
+	case *pb.ExecOutput_Exit:
+		exit := &ExecExit{Code: payload.Exit.GetCode()}
+		if payload.Exit.Signal != nil {
+			signal := int(payload.Exit.GetSignal())
+			exit.Signal = &signal
 		}
-		return ExecEvent{Stream: stream, Data: data}, nil
-	}
-	if len(envelope.Exit) != 0 {
-		var code int64
-		if err := json.Unmarshal(envelope.Exit, &code); err != nil {
-			_ = process.closeWithState()
-			return ExecEvent{}, &ProtocolError{Operation: "process", Message: "invalid exit code", Err: err}
-		}
-		exit := &ExecExit{Code: code, Signal: envelope.Signal}
 		_ = process.closeWithState()
 		return ExecEvent{Exit: exit}, nil
+	default:
+		_ = process.closeWithState()
+		return ExecEvent{}, &ProtocolError{Operation: "process", Message: "unrecognized frame"}
 	}
-	_ = process.closeWithState()
-	return ExecEvent{}, &ProtocolError{Operation: "process", Message: "unrecognized frame"}
 }
 
 // WriteStdin writes a chunk of bytes to the standard input of the process.
@@ -312,9 +305,7 @@ func (process *Process) WriteStdin(ctx context.Context, data []byte) error {
 	if closed {
 		return errors.New("vmon: process stdin is closed")
 	}
-	return process.writeJSON(ctx, struct {
-		Stdin string `json:"stdin_b64"`
-	}{base64.StdEncoding.EncodeToString(data)})
+	return process.writeFrame(ctx, &pb.ExecInput{Input: &pb.ExecInput_Stdin{Stdin: data}})
 }
 
 // CloseStdin sends an EOF signal to the standard input of the process.
@@ -330,29 +321,27 @@ func (process *Process) CloseStdin(ctx context.Context) error {
 	}
 	process.stdinClosed = true
 	process.stateMu.Unlock()
-	return process.writeJSON(ctx, struct {
-		EOF bool `json:"eof"`
-	}{true})
+	return process.writeFrame(ctx, &pb.ExecInput{Input: &pb.ExecInput_Eof{Eof: &pb.Eof{}}})
 }
 
 // Resize updates the terminal size (rows and columns) of the process.
 func (process *Process) Resize(ctx context.Context, rows, columns uint16) error {
-	return process.writeJSON(ctx, struct {
-		Resize [2]uint16 `json:"resize"`
-	}{[2]uint16{rows, columns}})
+	return process.writeFrame(ctx, &pb.ExecInput{Input: &pb.ExecInput_Resize{Resize: &pb.Resize{Rows: uint32(rows), Cols: uint32(columns)}}})
 }
-func (process *Process) writeJSON(ctx context.Context, value any) error {
-	if process == nil || process.socket == nil {
+func (process *Process) writeFrame(ctx context.Context, input *pb.ExecInput) error {
+	if process == nil || process.stream == nil {
 		return errors.New("vmon: process is not open")
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
+	stop := context.AfterFunc(ctx, func() { _ = process.closeWithState() })
+	defer stop()
+	if err := process.send(input, "process"); err != nil {
+		_ = process.closeWithState()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
-	if err = process.socket.Write(ctx, WebSocketTextMessage, encoded); err != nil {
-		_ = process.closeWithState()
-	}
-	return err
+	return nil
 }
 
 // Copy streams stdout and stderr of the process to the provided writers until the process exits.
@@ -399,53 +388,64 @@ func (process *Process) closeWithState() error {
 	process.stateMu.Lock()
 	process.done = true
 	process.stateMu.Unlock()
-	if process.socket == nil {
-		return nil
+	if process.cancel != nil {
+		process.cancel()
 	}
-	return process.socket.Close()
+	return nil
 }
 
 // ConsoleStream is a live read-only sandbox console.
-type ConsoleStream struct{ socket *WebSocketConn }
+type ConsoleStream struct {
+	stream grpc.ServerStreamingClient[pb.ExecOutput]
+	cancel context.CancelFunc
+}
 
 // Attach connects to the live interactive serial console of the sandbox.
 func (sandbox *Sandbox) Attach(ctx context.Context) (*ConsoleStream, error) {
-	socket, endpoint, err := sandbox.dial(ctx, "/attach", nil)
-	if endpoint != "" {
-		sandbox.endpoint = endpoint
-	}
+	conn, err := sandbox.streamConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &ConsoleStream{socket: socket}, nil
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stream, err := pb.NewSandboxServiceClient(conn).Attach(streamCtx, &pb.SandboxRef{Id: sandbox.ID})
+	if err != nil {
+		cancel()
+		return nil, apiErrorFromStatus(err, "attach")
+	}
+	return &ConsoleStream{stream: stream, cancel: cancel}, nil
 }
 
-// Receive reads and decodes the next console event or stream frame.
+// Receive reads and decodes the next console event.
 func (stream *ConsoleStream) Receive(ctx context.Context) (StreamEvent, error) {
-	if stream == nil || stream.socket == nil {
+	if stream == nil || stream.stream == nil {
 		return StreamEvent{}, errors.New("vmon: console stream is not open")
 	}
-	envelope, err := readWebSocketEnvelope(ctx, stream.socket, "attach")
+	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	defer stop()
+	output, err := stream.stream.Recv()
 	if err != nil {
-		return StreamEvent{}, err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return StreamEvent{}, ctxErr
+		}
+		if errors.Is(err, io.EOF) {
+			return StreamEvent{}, io.EOF
+		}
+		return StreamEvent{}, apiErrorFromStatus(err, "attach", stream.stream.Trailer())
 	}
-	name := StreamName(envelope.Stream)
-	if name != StreamConsole && name != StreamStdout && name != StreamStderr {
+	chunk := output.GetChunk()
+	if chunk == nil || chunk.GetStream() != pb.Stream_STREAM_CONSOLE {
 		return StreamEvent{}, &ProtocolError{Operation: "attach", Message: "unknown stream frame"}
 	}
-	data, err := base64.StdEncoding.DecodeString(envelope.Base64)
-	if err != nil {
-		return StreamEvent{}, &ProtocolError{Operation: "attach", Message: "invalid base64 stream payload", Err: err}
-	}
-	return StreamEvent{Stream: name, Data: data}, nil
+	return StreamEvent{Stream: StreamConsole, Data: chunk.GetData()}, nil
 }
 
 // Close terminates the console stream session.
 func (stream *ConsoleStream) Close() error {
-	if stream == nil || stream.socket == nil {
+	if stream == nil || stream.cancel == nil {
 		return nil
 	}
-	return stream.socket.Close()
+	stream.cancel()
+	return nil
 }
 
 // WebSocket opens a connect-token-authenticated guest port websocket.

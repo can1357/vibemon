@@ -2,25 +2,30 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import {
-  b64ToBytes,
-  eofFrame,
-  execStartFrame,
-  execWsUrl,
-  resizeFrame,
-  stdinFrame,
-} from "../api.ts";
+import type { MessageInitShape } from "@bufbuild/protobuf";
+import { ConnectError } from "@connectrpc/connect";
+import { sandboxClient } from "../api.ts";
+import type { ExecInputSchema } from "../gen/vmon/v1/api_pb.ts";
+import { PushQueue } from "../grpc-ws.ts";
 
 type XtermDisposable = { dispose: () => void };
 
-// An interactive terminal over the exec WS. A fresh shell per connect; the
-// session is torn down (process killed) when the component unmounts or the
-// user clicks Disconnect.
+// One interactive exec RPC (SandboxService.Exec bidi stream over the WS
+// bridge). Client inputs flow through a push queue; aborting the controller
+// tears the RPC (and the guest process) down.
+type ExecSession = {
+  queue: PushQueue<MessageInitShape<typeof ExecInputSchema>>;
+  abort: AbortController;
+};
+
+// An interactive terminal over the exec stream. A fresh shell per connect;
+// the session is torn down (process killed) when the component unmounts or
+// the user clicks Disconnect.
 export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const sessionRef = useRef<ExecSession | null>(null);
   const inputDisposableRef = useRef<XtermDisposable | null>(null);
   const mountedRef = useRef(false);
   const [cmd, setCmd] = useState("/bin/sh");
@@ -58,7 +63,7 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
     window.addEventListener("resize", onResize);
     return () => {
       mountedRef.current = false;
-      closeSocket(false);
+      closeSession(false);
       window.removeEventListener("resize", onResize);
       fitRef.current = null;
       termRef.current = null;
@@ -71,35 +76,28 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
     inputDisposableRef.current = null;
   }
 
-  function closeSocket(sendCloseStdin: boolean): void {
-    const ws = wsRef.current;
+  function closeSession(sendEof: boolean): void {
+    const session = sessionRef.current;
     disposeInput();
-    if (ws) {
-      ws.onopen = null;
-      ws.onmessage = null;
-      ws.onerror = null;
-      ws.onclose = null;
-      if (sendCloseStdin && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(eofFrame());
-        } catch {
-          /* closing */
-        }
-      }
-      if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
+    if (session) {
+      if (sendEof) session.queue.push({ input: { case: "eof", value: {} } });
+      session.queue.finish();
+      session.abort.abort();
     }
-    wsRef.current = null;
+    sessionRef.current = null;
   }
 
-  function writeStdin(ws: WebSocket, data: string): void {
-    if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) ws.send(stdinFrame(data));
+  function writeStdin(session: ExecSession, data: string): void {
+    if (sessionRef.current === session) {
+      session.queue.push({ input: { case: "stdin", value: new TextEncoder().encode(data) } });
+    }
   }
 
-  function sendResize(term: Terminal, ws = wsRef.current): void {
-    if (ws && wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(resizeFrame(term.rows, term.cols));
+  function sendResize(term: Terminal, session = sessionRef.current): void {
+    if (session && sessionRef.current === session) {
+      session.queue.push({
+        input: { case: "resize", value: { rows: term.rows, cols: term.cols } },
+      });
     }
   }
 
@@ -111,91 +109,73 @@ export function TerminalPanel({ sandboxId }: { sandboxId: string }): React.React
       setError("command must not be empty");
       return;
     }
-    closeSocket(false);
+    closeSession(false);
     setConnected(false);
     setError(null);
     term.reset();
     term.writeln(`\x1b[36m[vmon] connecting to ${sandboxId} …\x1b[0m`);
 
-    const ws = new WebSocket(execWsUrl(sandboxId));
-    let reportedError = false;
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    const session: ExecSession = {
+      queue: new PushQueue(),
+      abort: new AbortController(),
+    };
+    sessionRef.current = session;
+    session.queue.push({
+      input: { case: "start", value: { sandboxId, cmd: argv, tty: true } },
+    });
+    setConnected(true);
+    term.writeln("\x1b[36m[vmon] connected\x1b[0m");
+    term.focus();
+    fitRef.current?.fit();
+    sendResize(term, session);
+    disposeInput();
+    inputDisposableRef.current = term.onData((d) => writeStdin(session, d));
 
-    ws.onopen = () => {
-      if (wsRef.current !== ws || !mountedRef.current) {
-        ws.close();
-        return;
-      }
-      ws.send(execStartFrame(argv, true));
-      setConnected(true);
-      term.writeln("\x1b[36m[vmon] connected\x1b[0m");
-      term.focus();
-      fitRef.current?.fit();
-      sendResize(term, ws);
-      disposeInput();
-      inputDisposableRef.current = term.onData((d) => writeStdin(ws, d));
-    };
-    ws.onmessage = (ev) => {
-      if (wsRef.current !== ws || !mountedRef.current) return;
-      if (ev.data instanceof ArrayBuffer) {
-        term.write(new Uint8Array(ev.data));
-        return;
-      }
-      let payload: Record<string, unknown>;
+    void (async () => {
       try {
-        payload = JSON.parse(ev.data as string);
-      } catch {
-        return;
+        for await (const out of sandboxClient.exec(session.queue, {
+          signal: session.abort.signal,
+        })) {
+          if (sessionRef.current !== session || !mountedRef.current) break;
+          switch (out.output.case) {
+            case "chunk":
+              term.write(out.output.value.data);
+              break;
+            case "exit":
+              term.writeln(
+                `\x1b[36m[vmon] process exited with code ${Number(out.output.value.code)}\x1b[0m`,
+              );
+              setConnected(false);
+              break;
+            default:
+              break; // ready / unknown → ignore
+          }
+        }
+      } catch (err) {
+        if (sessionRef.current !== session || !mountedRef.current) return;
+        const ce = ConnectError.from(err);
+        const vmonCode = ce.metadata.get("vmon-code");
+        const text = vmonCode ? `${vmonCode}: ${ce.rawMessage}` : ce.rawMessage;
+        term.writeln(`\x1b[31m[vmon] ${text}\x1b[0m`);
+        setError(text);
+      } finally {
+        if (sessionRef.current === session) {
+          disposeInput();
+          sessionRef.current = null;
+          if (mountedRef.current) setConnected(false);
+        }
       }
-      if (typeof payload.stream === "string" && typeof payload.b64 === "string") {
-        term.write(b64ToBytes(payload.b64));
-      } else if (typeof payload.exit === "number") {
-        term.writeln(`\x1b[36m[vmon] process exited with code ${payload.exit}\x1b[0m`);
-        setConnected(false);
-      } else if (typeof payload.error === "object" && payload.error !== null) {
-        const err = payload.error as { code?: unknown; message?: unknown };
-        const message =
-          typeof err.message === "string"
-            ? typeof err.code === "string"
-              ? `${err.code}: ${err.message}`
-              : err.message
-            : JSON.stringify(payload.error);
-        reportedError = true;
-        term.writeln(`\x1b[31m[vmon] ${message}\x1b[0m`);
-        setError(message);
-      } else if (typeof payload.error === "string") {
-        reportedError = true;
-        term.writeln(`\x1b[31m[vmon] ${payload.error}\x1b[0m`);
-        setError(payload.error);
-      }
-    };
-    ws.onerror = () => {
-      if (wsRef.current !== ws || !mountedRef.current) return;
-      reportedError = true;
-      setError("websocket error");
-      term.writeln("\x1b[31m[vmon] connection error\x1b[0m");
-    };
-    ws.onclose = (ev) => {
-      if (wsRef.current !== ws) return;
-      disposeInput();
-      wsRef.current = null;
-      if (!mountedRef.current) return;
-      setConnected(false);
-      if (!reportedError && ev.code !== 1000 && ev.code !== 1005) {
-        setError(ev.reason || `websocket closed (${ev.code})`);
-      }
-    };
+    })();
   }
 
   function disconnect(): void {
-    closeSocket(true);
+    closeSession(true);
     setConnected(false);
   }
 
   // tear down on unmount / sandbox switch
   useEffect(() => {
-    closeSocket(false);
+    closeSession(false);
     setConnected(false);
     setError(null);
   }, [sandboxId]);

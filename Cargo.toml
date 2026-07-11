@@ -13,7 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [workspace]
-members = ["vmm", "agent", "vmond"]
+members = ["vmm", "agent", "vmond", "proto"]
 resolver = "3"
 
 [workspace.lints.rust]
@@ -135,6 +135,11 @@ serde_json = "1"
 sha1 = "0.10"
 vmm = { path = "vmm" }
 vmond = { path = "vmond" }
+vmon-proto = { path = "proto" }
+tonic = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.52.3", features = ["rt", "net", "time", "sync"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 [dev-dependencies]
 base64 = "0.22"
 flume = { version = "0.11", default-features = false }

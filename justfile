@@ -270,6 +270,10 @@ fetch-assets:
 ui:
     cd ui && bun install && bun run build
 
+# Regenerate protobuf client code (Go/Py/TS/UI) from proto/. Needs network (buf remote plugins).
+proto:
+    bunx @bufbuild/buf generate
+
 # Build the statically linked (musl) guest agent for the host arch into
 # target/test-assets so e2e initramfs builders can embed it when present.
 agent-musl:

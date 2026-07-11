@@ -2,7 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Code, ConnectError, createRouterTransport, type Transport } from "@connectrpc/connect";
 import { APIError, Client, MeshDriver, Sandbox, TransportError } from "../src";
+import { SandboxService, SystemService } from "../src/gen/vmon/v1/api_pb";
+
+const A = "http://node-a";
+const B = "http://node-b";
+const A_8000 = "http://node-a:8000";
+const B_8000 = "http://node-b:8000";
 
 const servers: Bun.Server<unknown>[] = [];
 afterEach(() => {
@@ -13,35 +20,41 @@ function serve(fetch: (request: Request) => Response | Promise<Response>): Bun.S
   servers.push(server);
   return server;
 }
-function base(server: Bun.Server<unknown>): string {
-  return `http://127.0.0.1:${server.port}`;
-}
 function json(value: unknown, status = 200): Response {
   return Response.json(value, { status });
 }
 
-test("discovers a peer, fails over, and sticks to the successful endpoint", async () => {
-  let bCalls = 0;
-  const b = serve((request) => {
-    bCalls += 1;
-    return request.url.endsWith("/v1/mesh/status")
-      ? json({ self: { node_id: "b", advertise: base(b) }, peers: [] })
-      : json({ node: "b" });
+function meshStatusRouter(doc: () => unknown): Transport {
+  return createRouterTransport(({ service }) => {
+    service(SystemService, { meshStatus: () => ({ json: JSON.stringify(doc()) }) });
   });
-  let advertised = "";
-  const a = serve((request) =>
-    request.url.endsWith("/v1/mesh/status")
-      ? json({
-          self: { node_id: "a", advertise: base(a) },
-          peers: [{ node_id: "b", advertise: advertised }],
-        })
-      : json({ node: "a" }),
-  );
-  advertised = base(b);
-  const driver = new MeshDriver(base(a));
+}
+
+test("discovers a peer, fails over, and sticks to the successful endpoint", async () => {
+  const state = { aDown: false };
+  let bCalls = 0;
+  const routers: Record<string, Transport> = {
+    [A]: meshStatusRouter(() => ({
+      self: { node_id: "a", advertise: A },
+      peers: [{ node_id: "b", advertise: B }],
+    })),
+    [B]: meshStatusRouter(() => ({ self: { node_id: "b", advertise: B }, peers: [] })),
+  };
+  const driver = new MeshDriver(A, {
+    transport: (baseUrl) => routers[baseUrl],
+    fetch: (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.host === "node-a") {
+        if (state.aDown) return Promise.reject(new TypeError("connection refused"));
+        return Promise.resolve(json({ node: "a" }));
+      }
+      bCalls += 1;
+      return Promise.resolve(json({ node: "b" }));
+    },
+  });
   expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ node: "a" });
-  expect(driver.endpoints().map((entry) => entry.url)).toEqual([base(a), base(b)]);
-  a.stop(true);
+  expect(driver.endpoints().map((entry) => entry.url)).toEqual([A, B]);
+  state.aDown = true;
   expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ node: "b" });
   expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ node: "b" });
   expect(bCalls).toBeGreaterThanOrEqual(2);
@@ -49,21 +62,19 @@ test("discovers a peer, fails over, and sticks to the successful endpoint", asyn
 
 test("refresh drops discovered peers absent from the latest mesh status", async () => {
   let includePeer = true;
-  const peer = serve(() => json({ ok: true }));
-  const seed = serve((request) =>
-    request.url.endsWith("/v1/mesh/status")
-      ? json({
-          self: { node_id: "seed", advertise: base(seed) },
-          peers: includePeer ? [{ node_id: "peer", advertise: base(peer) }] : [],
-        })
-      : json({ ok: true }),
-  );
-  const driver = new MeshDriver(base(seed));
+  const router = meshStatusRouter(() => ({
+    self: { node_id: "seed", advertise: A },
+    peers: includePeer ? [{ node_id: "peer", advertise: B }] : [],
+  }));
+  const driver = new MeshDriver(A, {
+    transport: () => router,
+    fetch: () => Promise.resolve(json({ ok: true })),
+  });
   await driver.request("GET", "/healthz");
-  expect(driver.endpoints().map((entry) => entry.url)).toEqual([base(seed), base(peer)]);
+  expect(driver.endpoints().map((entry) => entry.url)).toEqual([A, B]);
   includePeer = false;
   await driver.refresh(true);
-  expect(driver.endpoints().map((entry) => entry.url)).toEqual([base(seed)]);
+  expect(driver.endpoints().map((entry) => entry.url)).toEqual([A]);
 });
 
 test("does not retry HTTP errors and reports all transport failures", async () => {
@@ -76,7 +87,7 @@ test("does not retry HTTP errors and reports all transport failures", async () =
   const driver = new MeshDriver(
     `vmon://127.0.0.1:${first.port},127.0.0.1:${second.port}?discover=off`,
   );
-  expect((await driver.request("POST", "/v1/sandboxes")).status).toBe(503);
+  expect((await driver.request("GET", "/healthz")).status).toBe(503);
   expect(secondCalls).toBe(0);
   first.stop(true);
   second.stop(true);
@@ -84,28 +95,51 @@ test("does not retry HTTP errors and reports all transport failures", async () =
 });
 
 test("fan-out list propagates API errors instead of hiding them", async () => {
-  const failing = serve(() => json({ code: "busy", message: "node busy" }, 503));
-  const healthy = serve(() => json({ sandboxes: [{ id: "healthy" }] }));
+  const failing = createRouterTransport(({ service }) => {
+    service(SandboxService, {
+      list() {
+        throw new ConnectError("node busy", Code.Aborted, { "vmon-code": "busy" });
+      },
+    });
+  });
+  const healthy = createRouterTransport(({ service }) => {
+    service(SandboxService, {
+      list: () => ({ sandboxesJson: [JSON.stringify({ id: "healthy" })] }),
+    });
+  });
   const client = new Client(
-    new MeshDriver(`vmon://127.0.0.1:${failing.port},127.0.0.1:${healthy.port}?discover=off`),
+    new MeshDriver("vmon://node-a,node-b?discover=off", {
+      transport: (baseUrl) => (baseUrl === A_8000 ? failing : healthy),
+    }),
   );
-  await expect(client.sandboxes.list()).rejects.toMatchObject({ status: 503, code: "busy" });
+  await expect(client.sandboxes.list()).rejects.toMatchObject({ status: 409, code: "busy" });
 });
 
 test("sandbox transparently relocates once after pinned not_found", async () => {
   const id = "moved";
-  const a = serve(() => json({ code: "not_found", message: "gone" }, 404));
-  const b = serve((request) =>
-    request.url.endsWith(`/v1/sandboxes/${id}`)
-      ? json({ id, node: "b", state: "running" })
-      : json({ code: "not_found", message: "missing" }, 404),
-  );
-  const driver = new MeshDriver(`vmon://127.0.0.1:${a.port},127.0.0.1:${b.port}?discover=off`);
-  const sandbox = new Sandbox(new Client(driver), { id }, base(a));
+  const gone = createRouterTransport(({ service }) => {
+    service(SandboxService, {
+      get() {
+        throw new ConnectError("gone", Code.NotFound, { "vmon-code": "not_found" });
+      },
+    });
+  });
+  const serving = createRouterTransport(({ service }) => {
+    service(SandboxService, {
+      get(req) {
+        if (req.id === id) return { json: JSON.stringify({ id, node: "b", state: "running" }) };
+        throw new ConnectError("missing", Code.NotFound, { "vmon-code": "not_found" });
+      },
+    });
+  });
+  const driver = new MeshDriver("vmon://node-a,node-b?discover=off", {
+    transport: (baseUrl) => (baseUrl === A_8000 ? gone : serving),
+  });
+  const sandbox = new Sandbox(new Client(driver), { id }, A_8000);
   expect((await sandbox.refresh()).node).toBe("b");
-  expect(sandbox.endpoint).toBe(base(b));
+  expect(sandbox.endpoint).toBe(B_8000);
 
-  const absent = new Sandbox(new Client(driver), { id: "absent" }, base(a));
+  const absent = new Sandbox(new Client(driver), { id: "absent" }, A_8000);
   await expect(absent.refresh()).rejects.toBeInstanceOf(APIError);
 });
 

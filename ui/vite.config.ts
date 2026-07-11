@@ -15,6 +15,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/v1": { target: "http://127.0.0.1:8000", ws: true },
+      // gRPC-over-WebSocket bridge (one RPC per socket; see proto/vmon/v1/bridge.proto).
+      "/grpc": { target: "http://127.0.0.1:8000", ws: true },
       "/healthz": { target: "http://127.0.0.1:8000" },
       "/metrics": { target: "http://127.0.0.1:8000" },
     },

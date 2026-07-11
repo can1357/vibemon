@@ -1,28 +1,85 @@
 import { afterEach, expect, test } from "bun:test";
+import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import type { Driver, DriverRequestOptions, DriverResponse, EndpointInfo } from "../src";
 import { APIError, Client, EventStream, LogStream, MeshDriver, Sandbox } from "../src";
+import {
+  type ExecInput,
+  ExecInputSchema,
+  ExecOutputSchema,
+  JsonViewSchema,
+  SandboxRefSchema,
+  Stream,
+} from "../src/gen/vmon/v1/api_pb";
+import { BridgeFrameSchema } from "../src/gen/vmon/v1/bridge_pb";
 
-const servers: Bun.Server<unknown>[] = [];
+const servers: Bun.Server<BridgeSocketState>[] = [];
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
 });
 
-function sessionServer(frames: unknown[]): Bun.Server<unknown> {
-  const server = Bun.serve({
+interface BridgeConn {
+  sendMessage(payload: Uint8Array): void;
+  end(status?: number, message?: string, trailers?: Record<string, string>): void;
+}
+interface RpcStub {
+  onCall?(conn: BridgeConn, metadata: Record<string, string>): void;
+  onMessage?(conn: BridgeConn, payload: Uint8Array): void;
+  onHalfClose?(conn: BridgeConn): void;
+}
+interface BridgeSocketState {
+  stub: RpcStub | null;
+}
+
+function bridgeFrame(frame: MessageInitShape<typeof BridgeFrameSchema>["frame"]): Uint8Array {
+  return toBinary(BridgeFrameSchema, create(BridgeFrameSchema, { frame }));
+}
+
+/** A Bun WS server speaking the /grpc BridgeFrame protocol. */
+function bridgeServer(routes: Record<string, RpcStub>): Bun.Server<BridgeSocketState> {
+  const server = Bun.serve<BridgeSocketState>({
     port: 0,
     fetch(request, server) {
-      return server.upgrade(request)
+      const url = new URL(request.url);
+      if (url.pathname !== "/grpc") return new Response("not found", { status: 404 });
+      return server.upgrade(request, { data: { stub: null } })
         ? undefined
         : new Response("upgrade required", { status: 426 });
     },
     websocket: {
       open() {},
-      message(socket, message) {
-        const frame = JSON.parse(String(message));
-        frames.push(frame);
-        if (frame.stdin_b64) {
-          socket.send(JSON.stringify({ stream: "stdout", b64: frame.stdin_b64 }));
-          socket.send(JSON.stringify({ exit: 0, signal: null }));
+      message(ws, message) {
+        const conn: BridgeConn = {
+          sendMessage: (payload) => ws.send(bridgeFrame({ case: "message", value: payload })),
+          end: (status = 0, text = "", trailers = {}) => {
+            ws.send(bridgeFrame({ case: "end", value: { status, message: text, trailers } }));
+            ws.close();
+          },
+        };
+        if (typeof message === "string") {
+          conn.end(Code.Internal, "expected binary bridge frame", {});
+          return;
+        }
+        const frame = fromBinary(BridgeFrameSchema, new Uint8Array(message)).frame;
+        switch (frame.case) {
+          case "call": {
+            const stub = routes[frame.value.method];
+            if (!stub) {
+              conn.end(Code.Unimplemented, `unknown method ${frame.value.method}`, {});
+              return;
+            }
+            ws.data.stub = stub;
+            stub.onCall?.(conn, frame.value.metadata);
+            return;
+          }
+          case "message":
+            ws.data.stub?.onMessage?.(conn, frame.value);
+            return;
+          case "halfClose":
+            ws.data.stub?.onHalfClose?.(conn);
+            return;
+          default:
+            conn.end(Code.Internal, "unexpected bridge frame", {});
         }
       },
     },
@@ -31,10 +88,32 @@ function sessionServer(frames: unknown[]): Bun.Server<unknown> {
   return server;
 }
 
-test("Process sends request, resize, stdin and decodes stdout and exit", async () => {
-  const frames: unknown[] = [];
-  const server = sessionServer(frames);
-  const client = new Client(new MeshDriver(`http://127.0.0.1:${server.port}`, { discover: false }));
+function clientFor(server: Bun.Server<BridgeSocketState>): Client {
+  return new Client(new MeshDriver(`http://127.0.0.1:${server.port}`, { discover: false }));
+}
+
+function execOutput(output: MessageInitShape<typeof ExecOutputSchema>["output"]): Uint8Array {
+  return toBinary(ExecOutputSchema, create(ExecOutputSchema, { output }));
+}
+
+test("Process sends start, resize, stdin and decodes stdout and exit over the bridge", async () => {
+  const inputs: ExecInput["input"][] = [];
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/Exec": {
+      onMessage(conn, payload) {
+        const input = fromBinary(ExecInputSchema, payload).input;
+        inputs.push(input);
+        if (input.case === "stdin") {
+          conn.sendMessage(
+            execOutput({ case: "chunk", value: { stream: Stream.STDOUT, data: input.value } }),
+          );
+          conn.sendMessage(execOutput({ case: "exit", value: { code: 0n } }));
+          conn.end();
+        }
+      },
+    },
+  });
+  const client = clientFor(server);
   const stdout: string[] = [];
   const process = await client.sandboxes.ref("s1").exec(["cat"], {
     tty: true,
@@ -46,43 +125,104 @@ test("Process sends request, resize, stdin and decodes stdout and exit", async (
   for await (const event of process)
     events.push({ stream: event.stream, text: new TextDecoder().decode(event.data) });
   expect(await process.wait()).toEqual({ code: 0, signal: null });
-  expect(frames).toEqual([
-    { cmd: ["cat"], tty: true },
-    { resize: [24, 80] },
-    { stdin_b64: btoa("hi") },
-  ]);
+  expect(inputs.map((input) => input.case)).toEqual(["start", "resize", "stdin"]);
+  const [start, resize, stdin] = inputs;
+  expect(
+    start?.case === "start" && {
+      sandboxId: start.value.sandboxId,
+      cmd: start.value.cmd,
+      tty: start.value.tty,
+    },
+  ).toEqual({ sandboxId: "s1", cmd: ["cat"], tty: true });
+  expect(resize?.case === "resize" && { rows: resize.value.rows, cols: resize.value.cols }).toEqual(
+    { rows: 24, cols: 80 },
+  );
+  expect(stdin?.case === "stdin" && new TextDecoder().decode(stdin.value)).toBe("hi");
   expect(events).toEqual([{ stream: "stdout", text: "hi" }]);
   expect(stdout).toEqual(["hi"]);
 });
 
-test("Process turns an error envelope into APIError", async () => {
-  const server = Bun.serve({
-    port: 0,
-    fetch(request, server) {
-      return server.upgrade(request) ? undefined : new Response(null, { status: 426 });
-    },
-    websocket: {
-      open(socket) {
-        queueMicrotask(() =>
-          socket.send(JSON.stringify({ error: { code: "not_running", message: "stopped" } })),
-        );
+test("shell waits for the ready frame and decodes its exit", async () => {
+  const params: unknown[] = [];
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/Shell": {
+      onMessage(conn, payload) {
+        const input = fromBinary(ExecInputSchema, payload).input;
+        if (input.case === "shellParamsJson") {
+          params.push(JSON.parse(input.value));
+          conn.sendMessage(execOutput({ case: "ready", value: { sandboxId: "box" } }));
+          conn.sendMessage(execOutput({ case: "exit", value: { code: 0n } }));
+          conn.end();
+        }
       },
-      message() {},
     },
   });
-  servers.push(server);
-  const client = new Client(new MeshDriver(`http://127.0.0.1:${server.port}`, { discover: false }));
-  const process = await client.sandboxes.ref("s1").exec(["true"]);
-  await expect(process.wait()).rejects.toBeInstanceOf(APIError);
+  const shell = await clientFor(server).shell({ image: "alpine" });
+  expect(await shell.wait()).toEqual({ code: 0, signal: null });
+  expect(params).toEqual([{ image: "alpine" }]);
 });
 
-test("attach returns a read-only console stream that closes its socket", async () => {
-  const frames: unknown[] = [];
-  const server = sessionServer(frames);
-  const client = new Client(new MeshDriver(`http://127.0.0.1:${server.port}`, { discover: false }));
-  const console = await client.sandboxes.ref("s1").attach();
+test("Process turns a failed stream status into APIError", async () => {
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/Exec": {
+      onMessage(conn, payload) {
+        if (fromBinary(ExecInputSchema, payload).input.case === "start")
+          conn.end(Code.FailedPrecondition, "stopped", { "vmon-code": "not_running" });
+      },
+    },
+  });
+  const process = await clientFor(server).sandboxes.ref("s1").exec(["true"]);
+  await expect(process.wait()).rejects.toMatchObject({
+    name: "APIError",
+    code: "not_running",
+    message: "stopped",
+  });
+});
+
+test("unary RPCs round-trip messages and vmon-code trailers over the bridge", async () => {
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/Get": {
+      onMessage(conn, payload) {
+        const ref = fromBinary(SandboxRefSchema, payload);
+        if (ref.id === "missing") {
+          conn.end(Code.NotFound, "gone", { "vmon-code": "not_found" });
+          return;
+        }
+        conn.sendMessage(
+          toBinary(
+            JsonViewSchema,
+            create(JsonViewSchema, { json: JSON.stringify({ id: ref.id, state: "running" }) }),
+          ),
+        );
+        conn.end();
+      },
+    },
+  });
+  const client = clientFor(server);
+  const sandbox = await client.sandboxes.get("s1");
+  expect(sandbox.info).toEqual({ id: "s1", state: "running" });
+  await expect(client.sandboxes.get("missing")).rejects.toMatchObject({
+    name: "APIError",
+    code: "not_found",
+    status: 404,
+    message: "gone",
+  });
+});
+
+test("attach opens the console stream and close cancels it", async () => {
+  const called = Promise.withResolvers<void>();
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/Attach": {
+      onCall() {
+        called.resolve();
+      },
+    },
+  });
+  const console = await clientFor(server).sandboxes.ref("s1").attach();
   console.close();
-  expect(frames).toEqual([]);
+  expect(await Array.fromAsync(console)).toEqual([]);
+  // The server saw the Attach call before the cancel closed the socket.
+  await called.promise;
 });
 
 test("sandbox WebSocket helper relocates a migrated sandbox after not_found", async () => {
@@ -95,6 +235,15 @@ test("sandbox WebSocket helper relocates a migrated sandbox after not_found", as
       _options?: DriverRequestOptions,
     ): Promise<DriverResponse> {
       throw new Error("unexpected HTTP request");
+    },
+    call(): never {
+      throw new Error("unexpected RPC");
+    },
+    serverStream(): never {
+      throw new Error("unexpected streaming RPC");
+    },
+    duplex(): never {
+      throw new Error("unexpected bidi RPC");
     },
     websocket(): Promise<[WebSocket, string]> {
       attempts += 1;
@@ -120,28 +269,26 @@ test("sandbox WebSocket helper relocates a migrated sandbox after not_found", as
   expect(sandbox.endpoint).toBe("http://node-b");
 });
 
-test("SSE stream close methods cancel their response bodies", async () => {
+test("stream close cancels the underlying RPC handle", async () => {
   let eventCancelled = false;
   let logCancelled = false;
-  const events = new EventStream(
-    new Response(
-      new ReadableStream({
-        cancel() {
-          eventCancelled = true;
-        },
-      }),
-    ),
-  );
-  const logs = new LogStream(
-    new Response(
-      new ReadableStream({
-        cancel() {
-          logCancelled = true;
-        },
-      }),
-    ),
-  );
-  await Promise.all([events.close(), logs.close()]);
+  const events = new EventStream({
+    stream: (async function* (): AsyncGenerator<{ json: string }> {})(),
+    cancel() {
+      eventCancelled = true;
+    },
+  });
+  const logs = new LogStream({
+    stream: (async function* (): AsyncGenerator<{ data: Uint8Array }> {
+      yield { data: new TextEncoder().encode("line") };
+    })(),
+    cancel() {
+      logCancelled = true;
+    },
+  });
+  expect((await Array.fromAsync(logs)).join("")).toBe("line");
+  events.close();
+  logs.close();
   expect(eventCancelled).toBe(true);
   expect(logCancelled).toBe(true);
 });

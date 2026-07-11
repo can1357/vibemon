@@ -5,7 +5,6 @@ mod cli;
 mod contexts;
 mod error;
 mod transport;
-mod ws;
 
 fn main() {
 	let mut args = std::env::args().collect::<Vec<_>>();

@@ -1,14 +1,22 @@
+import type {
+  DescMessage,
+  DescMethodBiDiStreaming,
+  DescMethodServerStreaming,
+  DescMethodUnary,
+  MessageInitShape,
+  MessageShape,
+} from "@bufbuild/protobuf";
+import { base64Encode } from "@bufbuild/protobuf/wire";
 import type { Client } from "./client";
-import type { DriverRequestOptions, DriverResponse } from "./driver";
+import type { DriverRequestOptions, DriverResponse, RpcStream } from "./driver";
 import { APIError, apiError, ProtocolError } from "./errors";
+import { SandboxService } from "./gen/vmon/v1/api_pb";
 import type {
   ExecRequest,
   ExecResult,
   FileInfo,
   NetworkPolicy,
   SandboxInfo,
-  SnapshotFilesystemRequest,
-  SnapshotRequest,
   TunnelSet,
 } from "./models";
 import { ConsoleStream, LogStream, Process, type ProcessOptions } from "./process";
@@ -71,8 +79,8 @@ export class Sandbox {
 
   /** Refresh and merge the sandbox view. */
   async refresh(): Promise<SandboxInfo> {
-    const response = await this.request("GET", "");
-    this.#info = mergeInfo(this.#info, await response.json());
+    const view = await this.call(SandboxService.method.get, { id: this.id });
+    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
     return this.#info;
   }
   /** Run a command and capture its output. */
@@ -80,93 +88,143 @@ export class Sandbox {
     const { secrets, ...request } = options;
     const body: ExecRequest = { ...request, cmd };
     if (secrets) body.env = { ...(body.env ?? {}), ...mergeSecretEnv(secrets) };
-    return this.json("POST", "/exec", { json: body });
+    const result = await this.call(SandboxService.method.execCapture, {
+      id: this.id,
+      exec: {
+        cmd,
+        workdir: body.workdir ?? body.cwd ?? undefined,
+        env: body.env ?? {},
+        timeout: body.timeout ?? undefined,
+        tty: body.tty ?? false,
+      },
+    });
+    return {
+      exit: Number(result.code),
+      stdout_b64: base64Encode(result.stdout),
+      stderr_b64: base64Encode(result.stderr),
+    };
   }
   /** Open a streaming command process. */
   async exec(cmd: string[], options: ExecOptions = {}): Promise<Process> {
     const { secrets, onStdout, onStderr, ...request } = options;
     const body: ExecRequest = { ...request, cmd };
     if (secrets) body.env = { ...(body.env ?? {}), ...mergeSecretEnv(secrets) };
-    const [socket] = await this.websocket("/exec");
-    return new Process(socket, body, { onStdout, onStderr });
+    return new Process(
+      (inputs) => this.duplex(SandboxService.method.exec, inputs),
+      {
+        case: "start",
+        value: {
+          sandboxId: this.id,
+          cmd,
+          workdir: body.workdir ?? body.cwd ?? undefined,
+          env: body.env ?? {},
+          timeout: body.timeout ?? undefined,
+          tty: body.tty ?? false,
+        },
+      },
+      { onStdout, onStderr },
+    );
   }
   /** Attach a read-only console stream. */
   async attach(): Promise<ConsoleStream> {
-    const [socket] = await this.websocket("/attach");
-    return new ConsoleStream(socket);
+    return new ConsoleStream(() => this.stream(SandboxService.method.attach, { id: this.id }));
   }
   /** Fetch current logs as text. */
   async logs(): Promise<string> {
-    const response = await this.request("GET", "/logs", { params: { follow: false } });
-    return response.text();
+    const handle = await this.stream(SandboxService.method.logs, { id: this.id, follow: false });
+    const decoder = new TextDecoder();
+    let text = "";
+    for await (const chunk of handle.stream) text += decoder.decode(chunk.data, { stream: true });
+    return text;
   }
   /** Follow logs as a stream. */
   async followLogs(): Promise<LogStream> {
-    const response = await this.request("GET", "/logs", { params: { follow: true }, stream: true });
-    return new LogStream(response);
+    return new LogStream(
+      await this.stream(SandboxService.method.logs, { id: this.id, follow: true }),
+    );
   }
   /** Fetch sandbox metrics. */
-  metrics(): Promise<Record<string, unknown>> {
-    return this.json("GET", "/metrics");
+  async metrics(): Promise<Record<string, unknown>> {
+    return JSON.parse((await this.call(SandboxService.method.metrics, { id: this.id })).json);
   }
   /** Gracefully stop the sandbox. */
   async stop(wait = true): Promise<SandboxInfo> {
-    const result = await this.json<SandboxInfo>("POST", "/stop");
-    this.#info = result;
+    this.#info = JSON.parse(
+      (await this.call(SandboxService.method.stop, { id: this.id })).json,
+    ) as SandboxInfo;
     if (wait) await this.#waitForState(new Set(["stopped", "exited"]));
     return this.#info;
   }
   /** Forcefully terminate the sandbox. */
   async terminate(wait = true): Promise<void> {
-    await (await this.request("POST", "/terminate")).arrayBuffer();
+    await this.call(SandboxService.method.terminate, { id: this.id });
     if (wait) await this.#waitForState(new Set(["terminated", "stopped", "exited"]));
   }
   /** Remove the sandbox record. */
   async remove(): Promise<void> {
-    await this.request("DELETE", "");
+    await this.call(SandboxService.method.remove, { id: this.id });
   }
   /** Pause sandbox execution. */
   async pause(): Promise<SandboxInfo> {
-    this.#info = await this.json("POST", "/pause");
+    this.#info = JSON.parse((await this.call(SandboxService.method.pause, { id: this.id })).json);
     return this.#info;
   }
   /** Resume sandbox execution. */
   async resume(): Promise<SandboxInfo> {
-    this.#info = await this.json("POST", "/resume");
+    this.#info = JSON.parse((await this.call(SandboxService.method.resume, { id: this.id })).json);
     return this.#info;
   }
   /** Extend the sandbox lease. */
   async extend(secs: number): Promise<SandboxInfo> {
-    this.#info = mergeInfo(this.#info, await this.json("POST", "/extend", { json: { secs } }));
+    const view = await this.call(SandboxService.method.extend, {
+      id: this.id,
+      secs: BigInt(secs),
+    });
+    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
     return this.#info;
   }
   /** Migrate and re-pin the sandbox. */
   async migrate(target: string): Promise<SandboxInfo> {
-    this.#info = mergeInfo(this.#info, await this.json("POST", "/migrate", { json: { target } }));
+    const view = await this.call(SandboxService.method.migrate, { id: this.id, target });
+    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
     this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
     return this.#info;
   }
   /** Create a full VM snapshot. */
   async snapshot(name?: string, stop = false): Promise<string> {
-    const body: SnapshotRequest = { name: name ?? null, stop };
-    return responseField(await this.json("POST", "/snapshots", { json: body }), "snapshot");
+    const view = await this.call(SandboxService.method.snapshot, {
+      id: this.id,
+      name: name ?? undefined,
+      stop,
+    });
+    return responseField(JSON.parse(view.json), "snapshot");
   }
   /** Create a filesystem snapshot. */
   async snapshotFilesystem(name?: string): Promise<string> {
-    const body: SnapshotFilesystemRequest = { name: name ?? null };
-    return responseField(await this.json("POST", "/snapshots/fs", { json: body }), "image");
+    const view = await this.call(SandboxService.method.snapshotFs, {
+      id: this.id,
+      name: name ?? undefined,
+    });
+    return responseField(JSON.parse(view.json), "image");
   }
   /** Fetch the network policy. */
-  network(): Promise<NetworkPolicy> {
-    return this.json("GET", "/network");
+  async network(): Promise<NetworkPolicy> {
+    return JSON.parse((await this.call(SandboxService.method.networkGet, { id: this.id })).json);
   }
   /** Replace the network policy. */
-  setNetwork(policy: NetworkPolicy): Promise<NetworkPolicy> {
-    return this.json("PUT", "/network", { json: policy });
+  async setNetwork(policy: NetworkPolicy): Promise<NetworkPolicy> {
+    const view = await this.call(SandboxService.method.networkSet, {
+      id: this.id,
+      blockNetwork: policy.block_network ?? undefined,
+      cidrAllow: policy.cidr_allow != null ? { values: policy.cidr_allow } : undefined,
+      domainAllow: policy.domain_allow != null ? { values: policy.domain_allow } : undefined,
+    });
+    return JSON.parse(view.json);
   }
   /** Fetch tunnels and cache the proxy token. */
   async tunnels(): Promise<TunnelSet> {
-    const value = await this.json<TunnelSet>("GET", "/tunnels");
+    const view = await this.call(SandboxService.method.tunnels, { id: this.id });
+    const value = JSON.parse(view.json) as TunnelSet;
     if (typeof value.connect_token === "string") this.#connectToken = value.connect_token;
     return value;
   }
@@ -212,12 +270,61 @@ export class Sandbox {
   get path(): string {
     return `/v1/sandboxes/${encodeURIComponent(this.id)}`;
   }
-  /** Perform a sandbox request and decode JSON. */
-  async json<T>(method: string, suffix: string, options: DriverRequestOptions = {}): Promise<T> {
-    const response = await this.request(method, suffix, options);
-    return response.json();
+  /** Perform a sandbox-affine unary RPC with not_found relocation. */
+  async call<I extends DescMessage, O extends DescMessage>(
+    method: DescMethodUnary<I, O>,
+    input: MessageInitShape<I>,
+  ): Promise<MessageShape<O>> {
+    const execute = async () => {
+      const result = await this.#client.driver.call(method, input, { endpoint: this.#endpoint });
+      this.#endpoint = result.endpoint;
+      return result.message;
+    };
+    return this.#relocating(execute);
   }
-  /** Perform a sandbox request and reject API errors. */
+  /** Open a sandbox-affine server-streaming RPC with not_found relocation. */
+  async stream<I extends DescMessage, O extends DescMessage>(
+    method: DescMethodServerStreaming<I, O>,
+    input: MessageInitShape<I>,
+  ): Promise<RpcStream<MessageShape<O>>> {
+    const execute = async () => {
+      const result = await this.#client.driver.serverStream(method, input, {
+        endpoint: this.#endpoint,
+      });
+      this.#endpoint = result.endpoint;
+      return result;
+    };
+    return this.#relocating(execute);
+  }
+  /** Open a sandbox-affine bidi-streaming RPC with not_found relocation. */
+  async duplex<I extends DescMessage, O extends DescMessage>(
+    method: DescMethodBiDiStreaming<I, O>,
+    input: AsyncIterable<MessageInitShape<I>>,
+  ): Promise<RpcStream<MessageShape<O>>> {
+    const execute = async () => {
+      const result = await this.#client.driver.duplex(method, input, {
+        endpoint: this.#endpoint,
+      });
+      this.#endpoint = result.endpoint;
+      return result;
+    };
+    return this.#relocating(execute);
+  }
+  async #relocating<T>(execute: () => Promise<T>): Promise<T> {
+    try {
+      return await execute();
+    } catch (error) {
+      if (
+        !(error instanceof APIError) ||
+        error.code !== "not_found" ||
+        this.#client.driver.endpoints().length <= 1
+      )
+        throw error;
+      this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
+      return execute();
+    }
+  }
+  /** Perform a sandbox HTTP request and reject API errors. */
   async request(
     method: string,
     suffix: string,
@@ -295,8 +402,11 @@ export class Files {
   }
   /** Read raw guest file bytes. */
   async read(path: string): Promise<Uint8Array> {
-    const response = await this.#sandbox.request("GET", "/files", { params: { path } });
-    return new Uint8Array(await response.arrayBuffer());
+    const content = await this.#sandbox.call(SandboxService.method.fileRead, {
+      id: this.#sandbox.id,
+      path,
+    });
+    return content.data;
   }
   /** Read a UTF-8 guest file. */
   async readText(path: string): Promise<string> {
@@ -304,10 +414,11 @@ export class Files {
   }
   /** Write raw guest file content. */
   async write(path: string, content: BodyInit): Promise<void> {
-    await this.#sandbox.request("PUT", "/files", {
-      params: { path },
-      content,
-      headers: { "Content-Type": "application/octet-stream" },
+    const data = new Uint8Array(await new Response(content).arrayBuffer());
+    await this.#sandbox.call(SandboxService.method.fileWrite, {
+      id: this.#sandbox.id,
+      path,
+      data,
     });
   }
   /** Write UTF-8 guest file content. */
@@ -316,18 +427,30 @@ export class Files {
   }
   /** List guest directory entries. */
   async list(path = "."): Promise<FileInfo[]> {
-    const body = await this.#sandbox.json<unknown>("GET", "/files/list", { params: { path } });
+    const view = await this.#sandbox.call(SandboxService.method.fileList, {
+      id: this.#sandbox.id,
+      path,
+    });
+    const body: unknown = JSON.parse(view.json);
     if (!isRecord(body) || !Array.isArray(body.entries))
       throw new ProtocolError("file list response did not include entries");
     return body.entries.filter(isFileInfo);
   }
   /** Stat a guest filesystem path. */
-  stat(path: string): Promise<FileInfo> {
-    return this.#sandbox.json("GET", "/files/stat", { params: { path } });
+  async stat(path: string): Promise<FileInfo> {
+    const view = await this.#sandbox.call(SandboxService.method.fileStat, {
+      id: this.#sandbox.id,
+      path,
+    });
+    return JSON.parse(view.json);
   }
   /** Delete a guest path, optionally recursively. */
   async delete(path: string, recursive = false): Promise<void> {
-    await this.#sandbox.request("DELETE", "/files", { params: { path, recursive } });
+    await this.#sandbox.call(SandboxService.method.fileDelete, {
+      id: this.#sandbox.id,
+      path,
+      recursive,
+    });
   }
   /** Create a guest directory and its parents. */
   async mkdir(path: string): Promise<void> {
@@ -341,12 +464,13 @@ export class Files {
   }
   /** Open a streaming guest file reader. */
   async open(path: string): Promise<ReadableStream<Uint8Array>> {
-    const response = await this.#sandbox.request("GET", "/files", {
-      params: { path },
-      stream: true,
+    const data = await this.read(path);
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      },
     });
-    if (!response.body) throw new ProtocolError("file response has no body");
-    return response.body;
   }
 }
 

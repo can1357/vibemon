@@ -458,7 +458,7 @@ func startTakeoverSession(ctx context.Context, host *takeoverHost) (*takeoverWor
 	process, err := host.sandbox.Exec(ctx, ExecRequest{
 		Command: []string{takeoverWorkerGuestPath},
 		Env:     map[string]string{takeoverModeEnv: "1"},
-		// No exec timeout: the session lives until shutdown or WebSocket close.
+		// No exec timeout: the session lives until shutdown or exec-stream close.
 	})
 	host.execMu.Unlock()
 	if err != nil {

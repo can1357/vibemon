@@ -574,7 +574,13 @@ async fn mesh_status(
 	headers: HeaderMap,
 ) -> RouteResult<Json<Value>> {
 	require_mesh_auth(&state, &headers, false)?;
-	let mut status = value_object(map_mesh(state.mesh.status())?)?;
+	Ok(Json(map_mesh(mesh_status_view(&state))?))
+}
+
+/// Compose the mesh status document served by `GET /v1/mesh/status` and the
+/// `SystemService.MeshStatus` RPC.
+pub fn mesh_status_view(state: &MeshRouteState) -> MeshResult<Value> {
+	let mut status = value_object(state.mesh.status()?)?;
 	let mut self_status = status
 		.remove("self")
 		.and_then(|value| match value {
@@ -582,10 +588,10 @@ async fn mesh_status(
 			_ => None,
 		})
 		.unwrap_or_default();
-	self_status.insert("sandboxes".to_owned(), Value::Array(sandbox_status_rows(&state)?));
+	self_status.insert("sandboxes".to_owned(), Value::Array(sandbox_status_rows(state)?));
 	status.insert("self".to_owned(), Value::Object(self_status));
-	status.insert("replicas_held".to_owned(), json!(map_mesh(state.replicas.list())?.len()));
-	Ok(Json(Value::Object(status)))
+	status.insert("replicas_held".to_owned(), json!(state.replicas.list()?.len()));
+	Ok(Value::Object(status))
 }
 
 async fn mesh_members(

@@ -21,7 +21,7 @@ def test_create_redacts_secrets_and_exec_layers_environment(monkeypatch, mvm_hom
                 tags={"suite": "secrets"},
             )
 
-            create_request = server.last("POST", "/v1/sandboxes")
+            create_request = server.last_rpc("SandboxService/Create")
             assert create_request.json["image"] == "python:3.14-slim"
             assert create_request.json["context"] == "."
             assert create_request.json["name"] == "secretbox"
@@ -41,7 +41,7 @@ def test_create_redacts_secrets_and_exec_layers_environment(monkeypatch, mvm_hom
             assert seen_env["TOKEN"] == "call-wins"
             assert seen_env["EXTRA"] == "1"
 
-            exec_request = server.last("WS", "/v1/sandboxes/secretbox/exec")
+            exec_request = server.last_rpc("SandboxService/Exec", id="secretbox")
             assert exec_request.json["cmd"] == ["env"]
             assert exec_request.json["env"]["PLAIN"] == "ok"
             assert exec_request.json["env"]["TOKEN"] == "call-wins"

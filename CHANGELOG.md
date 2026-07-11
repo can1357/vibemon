@@ -27,6 +27,8 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added gRPC support for all API operations, replacing the legacy HTTP/JSON transport
+- Added gRPC-over-WebSocket bridge to enable full API access for browser-based clients
 - Added Python SDK support for `@vmon.cls` stateful remote classes with lifecycle hooks
 - Added streaming generators, lazy maps, and retries to Python SDK remote functions
 - Added `vmon.is_remote()` to detect guest-side execution in Python SDK
@@ -100,6 +102,8 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Migrated all SDKs (Go, Python, TypeScript) to native gRPC communication
+- Switched CLI to use gRPC for all daemon communication
 - Updated Python and TypeScript SDKs to use a unified `Client` interface and DSN-based connectivity
 - Refactored SDK object hierarchy to bind resources (sandboxes, volumes) to client sessions
 - Standardized sandbox execution and process management across all language SDKs
@@ -132,6 +136,7 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed TTY-based exec session handling and stdin/stdout multiplexing consistency
 - Fixed hanging `vmon exec` commands on TTY
 - Fixed KVM vCPU run-loop transient `EAGAIN` error handling
 - Improved `vmon stats` output by flattening VMM counter groups

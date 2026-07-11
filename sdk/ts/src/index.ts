@@ -19,10 +19,15 @@ export {
   type EndpointInfo,
   MeshDriver,
   ROSTER_TTL,
+  type RpcCallOptions,
+  type RpcResult,
+  type RpcStream,
+  type TransportFactory,
   type VmonFetch,
 } from "./driver";
 export { type DsnConfig, type DsnEndpoint, type ParseDsnOptions, parseDsn } from "./dsn";
 export { APIError, type APIErrorShape, ProtocolError, TransportError } from "./errors";
+export { createWsBridgeTransport, type WsBridgeTransportOptions } from "./grpc-ws";
 export type {
   EventRecord,
   ExecExit,
@@ -49,9 +54,11 @@ export {
   ConsoleStream,
   EventStream,
   type ExecEvent,
+  type ExecInputInit,
   LogStream,
   Process,
   type ProcessOptions,
+  type StreamHandle,
 } from "./process";
 export {
   DEFAULT_REMOTE_FUNCTION_IMAGE,
@@ -72,10 +79,10 @@ export {
   type RemoteMapOptions,
   type RemoteOutputHandler,
   type RemoteYield,
-  remoteFunction,
-  remoteFunctionFromSource,
   Retries,
   type RetriesOptions,
+  remoteFunction,
+  remoteFunctionFromSource,
   SESSION_RUNNER,
   SESSION_RUNNER_PATH,
 } from "./remote";

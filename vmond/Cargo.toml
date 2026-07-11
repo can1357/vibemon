@@ -10,7 +10,7 @@ description = "Vibemon server core: engine, image pipeline, v1 HTTP API, mesh"
 workspace = true
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["http2", "ws"] }
 base64 = "0.22"
 flume = { version = "0.11", default-features = false }
 futures-util = { version = "0.3", default-features = false }
@@ -29,9 +29,10 @@ tokio-stream = "0.1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-utoipa = "5"
 vmm = { path = "../vmm" }
+vmon-proto = { path = "../proto" }
 vmon-agent = { path = "../agent" }
+tonic = "0.14.6"
 
 [dev-dependencies]
 tempfile = "3"

@@ -25,9 +25,9 @@ def test_volume_namespace_create_list_and_delete(monkeypatch, mvm_home) -> None:
         with connect() as client:
             volume = client.volumes.create("data")
             assert volume.name == "data"
-            assert server.last("PUT", "/v1/volumes/data").json is None
+            assert server.last_rpc("VolumeService/Create").json == {"name": "data"}
             assert [item.name for item in client.volumes.list()] == ["data"]
-            assert server.last("GET", "/v1/volumes").headers["authorization"] == (
+            assert server.last_rpc("VolumeService/List").headers["authorization"] == (
                 "Bearer test-token"
             )
 
@@ -56,7 +56,7 @@ def test_sandbox_create_mounts_named_volumes_without_host_paths(monkeypatch, mvm
                 },
             )
 
-        create_request = server.last("POST", "/v1/sandboxes")
+        create_request = server.last_rpc("SandboxService/Create")
         assert create_request.json["volumes"] == {
             "/data": "data",
             "/readonly": {"name": "snap", "read_only": True},

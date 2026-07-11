@@ -134,30 +134,58 @@ async fn authorize_tcp(
 		state.count_auth_failure();
 		return Err(ApiError::unauthorized("unauthorized"));
 	}
-	if client && !admin && is_admin_path(request.method(), request.uri().path()) {
+	if client && !admin && is_admin_path(request.uri().path()) {
 		return Err(ApiError::forbidden("forbidden"));
 	}
 	Ok(next.run(request).await)
 }
 
 pub fn is_public_path(method: &Method, path: &str) -> bool {
-	*method == Method::GET
-		&& (matches!(path, "/healthz" | "/v1/openapi.json") || is_static_web_path(path))
+	*method == Method::GET && (path == "/healthz" || is_static_web_path(path))
 }
 
 fn is_static_web_path(path: &str) -> bool {
-	!(path.starts_with("/v1") || path.starts_with("/healthz") || path.starts_with("/metrics"))
+	!(path.starts_with("/v1")
+		|| path.starts_with("/healthz")
+		|| path.starts_with("/metrics")
+		|| path.starts_with("/vmon.v1.")
+		|| path == "/grpc")
 }
 
-pub fn is_admin_path(method: &Method, path: &str) -> bool {
+pub fn is_admin_path(path: &str) -> bool {
 	if path.starts_with("/v1/mesh/") {
 		return true;
 	}
-	if *method == Method::POST && migrate_path(path) {
-		return true;
+	// Admin-only gRPC methods (the former PUT/DELETE pool & volume routes and
+	// POST migrate).
+	if let Some(rest) = path.strip_prefix("/vmon.v1.") {
+		return matches!(
+			rest,
+			"VolumeService/Create"
+				| "VolumeService/Delete"
+				| "PoolService/Set"
+				| "PoolService/Delete"
+				| "SandboxService/Migrate"
+		);
 	}
-	matches!(*method, Method::PUT | Method::DELETE)
-		&& (path.starts_with("/v1/pools/") || path.starts_with("/v1/volumes/"))
+	false
+}
+
+/// Whether a `/grpc` bridge connection is limited to non-admin RPCs: a TCP
+/// connection authenticated with the client token only. UDS peer-cred
+/// connections and admin bearers get the full surface.
+pub(super) fn bridge_restricted(
+	state: &ApiState,
+	headers: &axum::http::HeaderMap,
+	query: Option<&str>,
+) -> bool {
+	if state.transport == Transport::Unix {
+		return false;
+	}
+	let supplied = bearer_token(headers.get(header::AUTHORIZATION)).or_else(|| query_token(query));
+	let admin = token_matches_any(supplied.as_deref(), state.config.token.as_deref());
+	let client = token_matches_any(supplied.as_deref(), state.config.client_token.as_deref());
+	client && !admin
 }
 
 pub fn bearer_token(header: Option<&axum::http::HeaderValue>) -> Option<String> {
@@ -194,20 +222,16 @@ fn websocket_query_token(request: &Request<Body>) -> Option<String> {
 }
 
 fn is_query_token_websocket_path(path: &str) -> bool {
-	if path == "/v1/shell" {
+	if path == "/grpc" {
 		return true;
 	}
 	let segments = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
-	match segments.as_slice() {
-		["v1", "sandboxes", id, op] if !id.is_empty() && matches!(*op, "exec" | "attach") => true,
+	matches!(
+		segments.as_slice(),
 		["v1", "sandboxes", id, "ports", port, "ws"]
 		| ["v1", "sandboxes", id, "ports", port, "ws", ..]
-			if !id.is_empty() && !port.is_empty() =>
-		{
-			true
-		},
-		_ => false,
-	}
+			if !id.is_empty() && !port.is_empty()
+	)
 }
 
 fn query_token(query: Option<&str>) -> Option<String> {
@@ -281,15 +305,6 @@ fn token_configured(expected: Option<&str>) -> bool {
 		.any(|token| !token.is_empty())
 }
 
-fn migrate_path(path: &str) -> bool {
-	let mut parts = path.trim_matches('/').split('/');
-	matches!(parts.next(), Some("v1"))
-		&& matches!(parts.next(), Some("sandboxes"))
-		&& parts.next().is_some()
-		&& matches!(parts.next(), Some("migrate"))
-		&& parts.next().is_none()
-}
-
 #[cfg(test)]
 #[allow(
 	clippy::items_after_test_module,
@@ -308,26 +323,23 @@ mod tests {
 
 	#[test]
 	fn query_token_auth_is_limited_to_get_websocket_routes() {
-		let exec = request(Method::GET, "/v1/sandboxes/sb/exec?token=a%20b", true);
-		assert_eq!(request_bearer_token(&exec), Some("a b".to_owned()));
+		let bridge = request(Method::GET, "/grpc?token=a%20b", true);
+		assert_eq!(request_bearer_token(&bridge), Some("a b".to_owned()));
 
-		let attach = request(Method::GET, "/v1/sandboxes/sb/attach?access_token=tok", true);
-		assert_eq!(request_bearer_token(&attach), Some("tok".to_owned()));
-
-		let shell = request(Method::GET, "/v1/shell?token=tok", true);
-		assert_eq!(request_bearer_token(&shell), Some("tok".to_owned()));
+		let bridge_access = request(Method::GET, "/grpc?access_token=tok", true);
+		assert_eq!(request_bearer_token(&bridge_access), Some("tok".to_owned()));
 
 		let port_ws = request(Method::GET, "/v1/sandboxes/sb/ports/8080/ws/path?token=tok", true);
 		assert_eq!(request_bearer_token(&port_ws), Some("tok".to_owned()));
 
-		let post_exec = request(Method::POST, "/v1/sandboxes/sb/exec?token=tok", true);
-		assert_eq!(request_bearer_token(&post_exec), None);
+		let post_bridge = request(Method::POST, "/grpc?token=tok", true);
+		assert_eq!(request_bearer_token(&post_bridge), None);
 
-		let upgraded_info = request(Method::GET, "/v1/info?token=tok", true);
-		assert_eq!(request_bearer_token(&upgraded_info), None);
+		let upgraded_rpc = request(Method::GET, "/vmon.v1.SystemService/Info?token=tok", true);
+		assert_eq!(request_bearer_token(&upgraded_rpc), None);
 
-		let non_upgrade_exec = request(Method::GET, "/v1/sandboxes/sb/exec?token=tok", false);
-		assert_eq!(request_bearer_token(&non_upgrade_exec), None);
+		let non_upgrade_bridge = request(Method::GET, "/grpc?token=tok", false);
+		assert_eq!(request_bearer_token(&non_upgrade_bridge), None);
 	}
 }
 

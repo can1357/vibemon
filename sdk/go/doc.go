@@ -1,4 +1,4 @@
-// Package vmon provides a driver-backed client for the vmon HTTP and WebSocket API.
+// Package vmon provides a driver-backed client for the vmon gRPC API.
 //
 // Connect accepts local UDS, HTTP(S), multi-host mesh, and named-context DSNs.
 // It discovers advertised peers lazily and fails over only when a request did not

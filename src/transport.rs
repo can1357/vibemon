@@ -5,21 +5,148 @@ use std::{
 	os::unix::net::UnixStream,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
+	sync::{Arc, LazyLock, OnceLock},
 	thread,
 	time::{Duration, Instant},
 };
 
 use serde_json::Value;
-
-use crate::{
-	error::{CliError, Result, err},
-	ws::WebSocket,
+use tonic::{
+	metadata::{Ascii, MetadataValue},
+	service::interceptor::InterceptedService,
+	transport::{Channel, Endpoint as GrpcEndpoint, Uri},
 };
+use vmon_proto::v1::{
+	pool_service_client::PoolServiceClient, sandbox_service_client::SandboxServiceClient,
+	snapshot_service_client::SnapshotServiceClient, system_service_client::SystemServiceClient,
+	volume_service_client::VolumeServiceClient,
+};
+
+use crate::error::{CliError, Result, err};
+
+/// 64 MiB cap on encoded/decoded gRPC messages (file transfers, capture
+/// output).
+const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+pub type SandboxClient = SandboxServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+pub type SnapshotClient = SnapshotServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+pub type VolumeClient = VolumeServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+pub type PoolClient = PoolServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+pub type SystemClient = SystemServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
 #[derive(Clone, Debug)]
 pub struct ApiClient {
 	endpoints: Vec<Endpoint>,
 	autostart: bool,
+	grpc:      Arc<OnceLock<Grpc>>,
+}
+
+/// Shared handle to the lazily-connected gRPC channel plus the background
+/// runtime that drives it. Cheap to clone.
+#[derive(Clone, Debug)]
+pub struct Grpc {
+	handle:  tokio::runtime::Handle,
+	channel: Channel,
+	auth:    AuthInterceptor,
+}
+
+/// Injects `authorization: Bearer <token>` metadata on every RPC.
+#[derive(Clone, Debug)]
+pub struct AuthInterceptor {
+	token: Option<MetadataValue<Ascii>>,
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+	fn call(
+		&mut self,
+		mut request: tonic::Request<()>,
+	) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+		if let Some(token) = &self.token {
+			request
+				.metadata_mut()
+				.insert("authorization", token.clone());
+		}
+		Ok(request)
+	}
+}
+
+impl Grpc {
+	/// Runs `future` to completion on the transport runtime.
+	pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+		self.handle.block_on(future)
+	}
+
+	pub fn sandboxes(&self) -> SandboxClient {
+		self.client(SandboxServiceClient::with_interceptor)
+	}
+
+	pub fn snapshots(&self) -> SnapshotClient {
+		self.client(SnapshotServiceClient::with_interceptor)
+	}
+
+	pub fn volumes(&self) -> VolumeClient {
+		self.client(VolumeServiceClient::with_interceptor)
+	}
+
+	pub fn pools(&self) -> PoolClient {
+		self.client(PoolServiceClient::with_interceptor)
+	}
+
+	pub fn system(&self) -> SystemClient {
+		self.client(SystemServiceClient::with_interceptor)
+	}
+
+	fn client<T>(&self, build: fn(Channel, AuthInterceptor) -> T) -> T
+	where
+		T: WithMessageLimits,
+	{
+		build(self.channel.clone(), self.auth.clone()).with_message_limits()
+	}
+}
+
+/// Uniform 64 MiB limit application across the generated clients.
+trait WithMessageLimits {
+	fn with_message_limits(self) -> Self;
+}
+
+macro_rules! impl_message_limits {
+	($($client:ident),+ $(,)?) => {
+		$(impl WithMessageLimits for $client {
+			fn with_message_limits(self) -> Self {
+				self
+					.max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+					.max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+			}
+		})+
+	};
+}
+
+impl_message_limits!(SandboxClient, SnapshotClient, VolumeClient, PoolClient, SystemClient);
+
+/// Rebuilds a `CliError` from a gRPC status: the stable vmond code travels in
+/// `vmon-code` metadata; the gRPC code is the fallback mapping.
+pub fn status_error(status: tonic::Status) -> CliError {
+	let code = status
+		.metadata()
+		.get("vmon-code")
+		.and_then(|value| value.to_str().ok())
+		.filter(|code| !code.is_empty())
+		.map_or_else(|| fallback_code(status.code()), str::to_owned);
+	CliError::new(format!("{code}: {}", status.message()))
+}
+
+fn fallback_code(code: tonic::Code) -> String {
+	match code {
+		tonic::Code::NotFound => "not_found",
+		tonic::Code::InvalidArgument => "invalid",
+		tonic::Code::Unauthenticated => "unauthorized",
+		tonic::Code::FailedPrecondition => "not_running",
+		tonic::Code::Aborted => "busy",
+		tonic::Code::Unimplemented => "unsupported",
+		tonic::Code::Unavailable => "engine",
+		_ => "error",
+	}
+	.to_owned()
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +177,11 @@ pub struct HttpResponse {
 impl ApiClient {
 	pub fn local(autostart: bool) -> Self {
 		let home = vmond::home::Home::new(vmond::home::state_dir());
-		Self { endpoints: vec![Endpoint::Uds { sock: home.vmond_sock() }], autostart }
+		Self {
+			endpoints: vec![Endpoint::Uds { sock: home.vmond_sock() }],
+			autostart,
+			grpc: Arc::default(),
+		}
 	}
 
 	pub fn remote(endpoints: Vec<String>, token: Option<String>) -> Result<Self> {
@@ -63,7 +194,7 @@ impl ApiClient {
 				Ok(Endpoint::Tcp { base: BaseUrl::parse(&endpoint)?, token: token.clone() })
 			})
 			.collect::<Result<Vec<_>>>()?;
-		Ok(Self { endpoints, autostart: false })
+		Ok(Self { endpoints, autostart: false, grpc: Arc::default() })
 	}
 
 	pub fn request_json(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
@@ -81,11 +212,6 @@ impl ApiClient {
 	pub fn request_text(&self, method: &str, path: &str) -> Result<String> {
 		let response = self.request(method, path, None)?;
 		Ok(String::from_utf8_lossy(&response.body).into_owned())
-	}
-
-	pub fn request_bytes(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Vec<u8>> {
-		let body = body.map(|bytes| ("application/octet-stream", bytes));
-		Ok(self.request(method, path, body)?.body)
 	}
 
 	pub fn request(
@@ -108,14 +234,28 @@ impl ApiClient {
 		Err(last_error.unwrap_or_else(|| CliError::new("no API endpoint configured")))
 	}
 
-	pub fn websocket(&self, path: &str) -> Result<WebSocket> {
+	/// Lazily connects the gRPC channel (trying each endpoint in order) and
+	/// returns a cheap clone of the shared transport.
+	pub fn grpc(&self) -> Result<Grpc> {
+		if let Some(grpc) = self.grpc.get() {
+			return Ok(grpc.clone());
+		}
+		let grpc = self.connect_grpc()?;
+		Ok(self.grpc.get_or_init(|| grpc).clone())
+	}
+
+	fn connect_grpc(&self) -> Result<Grpc> {
+		let handle = GRPC_RUNTIME.clone();
 		let mut last_error = None;
 		for endpoint in &self.endpoints {
 			if matches!(endpoint, Endpoint::Uds { .. }) && self.autostart {
 				self.ensure_local_running()?;
 			}
-			match WebSocket::connect(endpoint, path) {
-				Ok(socket) => return Ok(socket),
+			match connect_channel(&handle, endpoint) {
+				Ok(channel) => {
+					let auth = AuthInterceptor { token: bearer(endpoint.token())? };
+					return Ok(Grpc { handle, channel, auth });
+				},
 				Err(error) => last_error = Some(error),
 			}
 		}
@@ -147,6 +287,65 @@ impl ApiClient {
 			thread::sleep(Duration::from_millis(100));
 		}
 		err(format!("vmond did not become ready at {}", sock.display()))
+	}
+}
+
+/// Background current-thread runtime driving all gRPC IO; unary calls
+/// `block_on` against its handle from the CLI thread.
+static GRPC_RUNTIME: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("failed to build the gRPC runtime");
+	let handle = runtime.handle().clone();
+	thread::Builder::new()
+		.name("vmon-grpc".to_owned())
+		.spawn(move || runtime.block_on(std::future::pending::<()>()))
+		.expect("failed to spawn the gRPC runtime thread");
+	handle
+});
+
+fn bearer(token: Option<&str>) -> Result<Option<MetadataValue<Ascii>>> {
+	token
+		.map(|token| {
+			format!("Bearer {token}")
+				.parse()
+				.map_err(|_| CliError::new("API token contains characters not valid in a header"))
+		})
+		.transpose()
+}
+
+fn connect_channel(handle: &tokio::runtime::Handle, endpoint: &Endpoint) -> Result<Channel> {
+	match endpoint {
+		Endpoint::Uds { sock } => {
+			let sock = sock.clone();
+			let connector = tower::service_fn(move |_: Uri| {
+				let sock = sock.clone();
+				async move {
+					let stream = tokio::net::UnixStream::connect(sock).await?;
+					Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+				}
+			});
+			handle
+				.block_on(
+					GrpcEndpoint::from_static("http://vmon.uds").connect_with_connector(connector),
+				)
+				.map_err(|error| CliError::new(format!("gRPC connect failed: {error}")))
+		},
+		Endpoint::Tcp { base, .. } => {
+			if base.scheme != "http" {
+				return err(format!(
+					"{} contexts are not supported by this CLI transport yet; use http://",
+					base.scheme
+				));
+			}
+			let uri = format!("http://{}:{}", base.host, base.port);
+			let grpc_endpoint = GrpcEndpoint::from_shared(uri)
+				.map_err(|error| CliError::new(format!("invalid gRPC endpoint: {error}")))?;
+			handle
+				.block_on(grpc_endpoint.connect())
+				.map_err(|error| CliError::new(format!("gRPC connect failed: {error}")))
+		},
 	}
 }
 
@@ -229,15 +428,6 @@ impl BaseUrl {
 	}
 }
 
-impl Connection {
-	pub fn try_clone(&self) -> Result<Self> {
-		match self {
-			Self::Unix(stream) => Ok(Self::Unix(stream.try_clone()?)),
-			Self::Tcp(stream) => Ok(Self::Tcp(stream.try_clone()?)),
-		}
-	}
-}
-
 impl Read for Connection {
 	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
 		match self {
@@ -261,40 +451,6 @@ impl Write for Connection {
 			Self::Tcp(stream) => stream.flush(),
 		}
 	}
-}
-
-pub fn percent_encode(input: &str) -> String {
-	const HEX: &[u8; 16] = b"0123456789ABCDEF";
-	let mut out = String::new();
-	for byte in input.bytes() {
-		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-			out.push(byte as char);
-		} else {
-			out.push('%');
-			out.push(HEX[(byte >> 4) as usize] as char);
-			out.push(HEX[(byte & 0x0f) as usize] as char);
-		}
-	}
-	out
-}
-
-pub fn query(params: &[(&str, String)]) -> String {
-	let mut first = true;
-	let mut out = String::new();
-	for (key, value) in params {
-		if !first {
-			out.push('&');
-		}
-		first = false;
-		out.push_str(&percent_encode(key));
-		out.push('=');
-		out.push_str(&percent_encode(value));
-	}
-	out
-}
-
-pub fn path_segment(segment: &str) -> String {
-	percent_encode(segment)
 }
 
 fn healthz(sock: &Path) -> Result<()> {

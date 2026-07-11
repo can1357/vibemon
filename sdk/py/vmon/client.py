@@ -7,13 +7,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
-from ._endpoint import ResponseStream, path_segment
+from ._endpoint import GrpcStubs, decode_view, dump_json
 from .driver import (
     DEFAULT_TIMEOUT,
     Driver,
     MeshDriver,
     parse_dsn,
-    response_endpoint,
 )
 from .errors import ProtocolError, TransportError
 from .sandbox import (
@@ -25,6 +24,7 @@ from .sandbox import (
     _volume_wire,
 )
 from .secret import Secret
+from .v1 import api_pb2
 from .volume import Volume
 
 if TYPE_CHECKING:
@@ -47,43 +47,38 @@ class Client:
 
     def health(self) -> dict[str, Any]:
         """Return the selected daemon's health document."""
-        value, _ = self._json("GET", "/healthz")
+        response = self.driver.request("GET", "/healthz")
+        try:
+            value = response.json()
+        except ValueError as exc:
+            raise ProtocolError("health check returned a malformed response") from exc
         if not isinstance(value, Mapping) or not isinstance(value.get("ok"), bool):
             raise ProtocolError("health check returned a malformed response")
         return dict(value)
 
     def info(self) -> ServerInfo:
         """Return typed server version and capability information."""
-        value, _ = self._json("GET", "/v1/info")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("server info returned a non-object response")
+        value, _ = self._view(
+            lambda stubs: stubs.system.Info(api_pb2.InfoRequest()),
+            error="server info returned a non-object response",
+        )
         from .models import ServerInfo
 
         return ServerInfo.from_dict(value)
 
     def metrics(self) -> str:
         """Return the daemon's Prometheus metrics document."""
-        response = self.driver.request("GET", "/metrics")
-        if isinstance(response, ResponseStream):
-            response.close()
-            raise ProtocolError("metrics unexpectedly returned a stream")
-        return response.text
-
-    def openapi(self) -> dict[str, Any]:
-        """Return the OpenAPI document advertised by the daemon."""
-        value, _ = self._json("GET", "/v1/openapi.json")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("OpenAPI endpoint returned a non-object response")
-        return dict(value)
+        return self.driver.request("GET", "/metrics").text
 
     def events(self) -> EventStream:
-        """Open the daemon's JSON server-sent event stream."""
-        response = self.driver.request("GET", "/v1/events", stream=True)
-        if not isinstance(response, ResponseStream):
-            raise ProtocolError("events endpoint did not return a stream")
+        """Open the daemon's engine event stream."""
+        responses, endpoint = self.driver.call(
+            lambda stubs: stubs.system.Events(api_pb2.EventsRequest()),
+            stream=True,
+        )
         from .process import EventStream
 
-        return EventStream(response)
+        return EventStream(responses, endpoint)
 
     def shell(
         self,
@@ -111,10 +106,17 @@ class Client:
         )
         from .process import open_process
 
-        websocket, _ = self.driver.websocket("/v1/shell")
+        def starter(
+            make_inputs: Callable[[], Iterable[api_pb2.ExecInput]],
+        ) -> tuple[Any, str]:
+            return self.driver.call(
+                lambda stubs: stubs.sandbox.Shell(make_inputs()),
+                stream=True,
+            )
+
         return open_process(
-            websocket,
-            body,
+            starter,
+            api_pb2.ExecInput(shell_params_json=dump_json(body)),
             timeout=timeout,
             tty=True,
             consume_ready=True,
@@ -139,35 +141,15 @@ class Client:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _json(
+    def _view(
         self,
-        method: str,
-        path: str,
+        fn: Callable[[GrpcStubs], api_pb2.JsonView],
         *,
-        params: Any | None = None,
-        body: Any | None = None,
-        content: bytes | None = None,
-        headers: dict[str, str] | None = None,
         endpoint: str | None = None,
-    ) -> tuple[Any, str | None]:
-        response = self.driver.request(
-            method,
-            path,
-            params=params,
-            json=body,
-            content=content,
-            headers=headers,
-            endpoint=endpoint,
-        )
-        if isinstance(response, ResponseStream):
-            response.close()
-            raise ProtocolError(f"{path} unexpectedly returned a stream")
-        if not response.content:
-            return {}, response_endpoint(response)
-        try:
-            return response.json(), response_endpoint(response)
-        except ValueError as exc:
-            raise ProtocolError(f"{path} returned invalid JSON") from exc
+        error: str = "vmon API returned a non-object response",
+    ) -> tuple[dict[str, Any], str | None]:
+        view, chosen = self.driver.call(fn, endpoint=endpoint)
+        return decode_view(view.json, error), chosen
 
 
 class SandboxAPI:
@@ -248,15 +230,23 @@ class SandboxAPI:
                 "command": [str(part) for part in command] if command is not None else None,
             }
         )
-        value, endpoint = self._client._json("POST", "/v1/sandboxes", body=body)
-        sandbox = self._from_view(value, endpoint, error="create returned a non-object response")
+        value, endpoint = self._client._view(
+            lambda stubs: stubs.sandbox.Create(
+                api_pb2.CreateSandboxRequest(spec_json=dump_json(body))
+            ),
+            error="create returned a non-object response",
+        )
+        sandbox = Sandbox(self._client, value, endpoint=endpoint)
         sandbox._bind_defaults(workdir=workdir, env=env, tags=tags, secrets=secret_items)
         return sandbox
 
     def get(self, sandbox_id: str) -> Sandbox:
         """Fetch a sandbox and pin it to the responding endpoint."""
-        value, endpoint = self._client._json("GET", f"/v1/sandboxes/{path_segment(sandbox_id)}")
-        return self._from_view(value, endpoint, error="inspect returned a non-object response")
+        value, endpoint = self._client._view(
+            lambda stubs: stubs.sandbox.Get(api_pb2.SandboxRef(id=sandbox_id)),
+            error="inspect returned a non-object response",
+        )
+        return Sandbox(self._client, value, endpoint=endpoint)
 
     def ref(self, sandbox_id: str) -> Sandbox:
         """Create a bound sandbox reference without performing I/O."""
@@ -268,30 +258,17 @@ class SandboxAPI:
         node: str | None = None,
     ) -> builtins.list[Sandbox]:
         """List and merge sandboxes across every live roster endpoint."""
-        params = (
-            [("tag", f"{key}={value}") for key, value in sorted(tags.items())] if tags else None
-        )
+        tag_items = [f"{key}={value}" for key, value in sorted(tags.items())] if tags else []
         roster = self._client.driver.endpoints()
         live = [entry for entry in roster if entry.healthy] or roster
         if len(live) <= 1:
             hint = live[0].url if live else None
-            value, endpoint = self._client._json(
-                "GET", "/v1/sandboxes", params=params, endpoint=hint
-            )
-            return self._views(value, endpoint, node)
+            response, endpoint = self._fetch(tag_items, hint)
+            return self._views(response, endpoint, node)
 
-        results: builtins.list[tuple[Any, str | None] | TransportError] = []
+        results: builtins.list[tuple[api_pb2.ListSandboxesResponse, str] | TransportError] = []
         with ThreadPoolExecutor(max_workers=len(live)) as executor:
-            futures = [
-                executor.submit(
-                    self._client._json,
-                    "GET",
-                    "/v1/sandboxes",
-                    params=params,
-                    endpoint=entry.url,
-                )
-                for entry in live
-            ]
+            futures = [executor.submit(self._fetch, tag_items, entry.url) for entry in live]
             for future in futures:
                 try:
                     results.append(future.result())
@@ -306,32 +283,36 @@ class SandboxAPI:
                 last_error = result
                 continue
             succeeded = True
-            value, endpoint = result
-            for sandbox in self._views(value, endpoint, node):
+            response, endpoint = result
+            for sandbox in self._views(response, endpoint, node):
                 merged.setdefault(sandbox.id, sandbox)
         if not succeeded and last_error is not None:
             raise last_error
         return list(merged.values())
 
-    def _views(self, value: Any, endpoint: str | None, node: str | None) -> builtins.list[Sandbox]:
-        rows = value.get("sandboxes") if isinstance(value, Mapping) else None
-        if not isinstance(rows, list):
-            raise ProtocolError("sandbox list returned a malformed response")
+    def _fetch(
+        self, tag_items: Sequence[str], endpoint: str | None
+    ) -> tuple[api_pb2.ListSandboxesResponse, str]:
+        return self._client.driver.call(
+            lambda stubs: stubs.sandbox.List(api_pb2.ListSandboxesRequest(tags=tag_items)),
+            endpoint=endpoint,
+        )
+
+    def _views(
+        self,
+        response: api_pb2.ListSandboxesResponse,
+        endpoint: str | None,
+        node: str | None,
+    ) -> builtins.list[Sandbox]:
         sandboxes: builtins.list[Sandbox] = []
-        for row in rows:
-            if not isinstance(row, Mapping) or not isinstance(
-                row.get("name") or row.get("id"), str
-            ):
+        for payload in response.sandboxes_json:
+            row = decode_view(payload, "sandbox list returned a malformed response")
+            if not isinstance(row.get("name") or row.get("id"), str):
                 raise ProtocolError("sandbox list returned a malformed response")
             if node is not None and row.get("node") != node:
                 continue
             sandboxes.append(Sandbox(self._client, row, endpoint=endpoint))
         return sandboxes
-
-    def _from_view(self, value: Any, endpoint: str | None, *, error: str) -> Sandbox:
-        if not isinstance(value, Mapping):
-            raise ProtocolError(error)
-        return Sandbox(self._client, value, endpoint=endpoint)
 
 
 class SnapshotAPI:
@@ -342,11 +323,10 @@ class SnapshotAPI:
 
     def list(self) -> builtins.list[str]:
         """Return snapshot names known to the selected daemon."""
-        value, _ = self._client._json("GET", "/v1/snapshots")
-        snapshots = value.get("snapshots") if isinstance(value, Mapping) else None
-        if not isinstance(snapshots, list) or not all(isinstance(name, str) for name in snapshots):
-            raise ProtocolError("snapshot list returned a malformed response")
-        return list(snapshots)
+        response, _ = self._client.driver.call(
+            lambda stubs: stubs.snapshots.List(api_pb2.ListSnapshotsRequest())
+        )
+        return list(response.snapshots)
 
     def restore(self, snapshot: str, **kwargs: Any) -> Sandbox:
         """Restore one sandbox from a named snapshot."""
@@ -354,11 +334,12 @@ class SnapshotAPI:
         if kwargs.get("secrets") is not None:
             kwargs["secrets"] = builtins.list(kwargs["secrets"])
         body = self._body(kwargs)
-        value, endpoint = self._client._json(
-            "POST", f"/v1/snapshots/{path_segment(snapshot)}/restore", body=body
+        value, endpoint = self._client._view(
+            lambda stubs: stubs.snapshots.Restore(
+                api_pb2.RestoreSnapshotRequest(name=snapshot, body_json=dump_json(body))
+            ),
+            error="restore returned a non-object response",
         )
-        if not isinstance(value, Mapping):
-            raise ProtocolError("restore returned a non-object response")
         sandbox = Sandbox(self._client, value, endpoint=endpoint)
         sandbox._bind_defaults(
             workdir=kwargs.get("workdir"),
@@ -377,10 +358,13 @@ class SnapshotAPI:
         if count < 1:
             raise ValueError("fork count must be >= 1")
         body = {"count": count, **self._body(kwargs)}
-        value, endpoint = self._client._json(
-            "POST", f"/v1/snapshots/{path_segment(snapshot)}/fork", body=body
+        value, endpoint = self._client._view(
+            lambda stubs: stubs.snapshots.Fork(
+                api_pb2.ForkSnapshotRequest(name=snapshot, body_json=dump_json(body))
+            ),
+            error="fork returned a non-object response",
         )
-        rows = value.get("clones") if isinstance(value, Mapping) else None
+        rows = value.get("clones")
         if not isinstance(rows, list) or len(rows) != count:
             raise ProtocolError("fork returned an unexpected clone count")
         clones: builtins.list[Sandbox] = []
@@ -417,22 +401,23 @@ class VolumeAPI:
 
     def list(self) -> builtins.list[Volume]:
         """Return all named volumes sorted by name."""
-        value, _ = self._client._json("GET", "/v1/volumes")
-        volumes = value.get("volumes") if isinstance(value, Mapping) else None
-        if not isinstance(volumes, list) or not all(isinstance(name, str) for name in volumes):
-            raise ProtocolError("volume list returned a malformed response")
-        return [Volume(name) for name in sorted(volumes)]
+        response, _ = self._client.driver.call(
+            lambda stubs: stubs.volumes.List(api_pb2.ListVolumesRequest())
+        )
+        return [Volume(name) for name in sorted(response.volumes)]
 
     def create(self, name: str) -> Volume:
         """Create a named volume if absent and return its value object."""
         volume = Volume(name)
-        self._client._json("PUT", f"/v1/volumes/{path_segment(volume.name)}")
+        self._client.driver.call(
+            lambda stubs: stubs.volumes.Create(api_pb2.VolumeRef(name=volume.name))
+        )
         return volume
 
     def delete(self, volume: str | Volume) -> None:
         """Delete a named volume if present."""
         name = volume.name if isinstance(volume, Volume) else Volume(volume).name
-        self._client._json("DELETE", f"/v1/volumes/{path_segment(name)}")
+        self._client.driver.call(lambda stubs: stubs.volumes.Delete(api_pb2.VolumeRef(name=name)))
 
 
 class Pool:
@@ -484,9 +469,10 @@ class PoolAPI:
 
     def list(self) -> builtins.list[Pool]:
         """Return every warm pool with its latest statistics."""
-        value, _ = self._client._json("GET", "/v1/pools")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("pool inventory returned a malformed response")
+        value, _ = self._client._view(
+            lambda stubs: stubs.pools.List(api_pb2.ListPoolsRequest()),
+            error="pool inventory returned a malformed response",
+        )
         pools: builtins.list[Pool] = []
         for reference, stats in value.items():
             if not isinstance(reference, str) or not isinstance(stats, Mapping):
@@ -508,13 +494,17 @@ class PoolAPI:
             "size": count,
             **{key: value for key, value in template.items() if value is not None},
         }
-        value, _ = self._client._json("PUT", f"/v1/pools/{path_segment(ref)}", body=body)
-        stats = value if isinstance(value, Mapping) else {}
-        return Pool(self, ref, count, stats)
+        value, _ = self._client._view(
+            lambda stubs: stubs.pools.Set(
+                api_pb2.PoolSetRequest(reference=ref, body_json=dump_json(body))
+            ),
+            error="pool update returned a malformed response",
+        )
+        return Pool(self, ref, count, value)
 
     def delete(self, ref: str) -> None:
         """Delete one warm pool by portable image or template reference."""
-        self._client._json("DELETE", f"/v1/pools/{path_segment(ref)}")
+        self._client.driver.call(lambda stubs: stubs.pools.Delete(api_pb2.PoolRef(reference=ref)))
 
     def clear(self) -> None:
         """Delete every warm pool visible to this client."""
@@ -530,9 +520,10 @@ class MeshAPI:
 
     def status(self) -> MeshStatus:
         """Return typed mesh self, peer, and replica state."""
-        value, _ = self._client._json("GET", "/v1/mesh/status")
-        if not isinstance(value, Mapping):
-            raise ProtocolError("mesh status returned a malformed response")
+        value, _ = self._client._view(
+            lambda stubs: stubs.system.MeshStatus(api_pb2.MeshStatusRequest()),
+            error="mesh status returned a malformed response",
+        )
         from .models import MeshStatus
 
         return MeshStatus.from_dict(value)

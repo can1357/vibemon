@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"]
+    "includes": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "!src/gen/**"]
   },
   "formatter": {
     "enabled": true,

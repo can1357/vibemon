@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 
 import pytest
 from v1_stub import V1StubServer, configure_context
@@ -20,22 +19,16 @@ def test_client_root_operations_stream_events_and_send_bearer_auth(monkeypatch, 
             assert client.health() == {"ok": True}
             assert client.info().version == "test"
             assert "vmon_test_total 1" in client.metrics()
-            assert client.openapi()["openapi"] == "3.1.0"
             assert client.snapshots.list() == []
             with client.events() as stream:
                 assert list(stream) == [{"type": "ready", "sequence": 1}]
 
-        checked_paths = {
-            "/healthz",
-            "/metrics",
-            "/v1/events",
-            "/v1/info",
-            "/v1/openapi.json",
-            "/v1/snapshots",
-        }
-        checked = [request for request in server.requests if request.path in checked_paths]
-        assert {request.path for request in checked} == checked_paths
+        http_paths = {"/healthz", "/metrics"}
+        checked = [request for request in server.requests if request.path in http_paths]
+        assert {request.path for request in checked} == http_paths
         assert all(request.headers["authorization"] == "Bearer test-token" for request in checked)
+        for method in ("SystemService/Info", "SystemService/Events", "SnapshotService/List"):
+            assert server.last_rpc(method).headers["authorization"] == "Bearer test-token"
 
 
 def test_pool_namespace_escapes_references_and_owns_resources(monkeypatch, mvm_home) -> None:
@@ -49,7 +42,7 @@ def test_pool_namespace_escapes_references_and_owns_resources(monkeypatch, mvm_h
             pool.delete()
             pool.delete()
             assert client.pools.list() == []
-            assert len(server.recorded("DELETE", "/v1/pools/python%2Fbase")) == 1
+            assert len(server.rpcs("PoolService/Delete", reference="python/base")) == 1
 
             client.pools.set("one", 1)
             client.pools.set("two", 1)
@@ -68,14 +61,9 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
                 name="box/name",
                 tags={"suite": "coverage"},
             )
-            create_request = server.last("POST", "/v1/sandboxes")
+            create_request = server.last_rpc("SandboxService/Create")
             assert create_request.json["context"] == "."
-            assert create_request.body == json.dumps(
-                create_request.json,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
+            assert create_request.json["name"] == "box/name"
 
             assert sandbox.network() == {
                 "block_network": False,
@@ -113,7 +101,7 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             listed = client.sandboxes.list(tags={"suite": "coverage"})
             assert [item.id for item in listed] == ["box/name"]
             assert (
-                server.last("GET", "/v1/sandboxes/box%2Fname").headers["authorization"]
+                server.last_rpc("SandboxService/Get", id="box/name").headers["authorization"]
                 == "Bearer test-token"
             )
 
@@ -224,7 +212,7 @@ def test_shell_and_aio_preserve_streaming_semantics(monkeypatch, mvm_home) -> No
             asyncio.run(exercise())
 
 
-def test_websocket_upgrade_and_stream_errors_are_structured(monkeypatch, mvm_home) -> None:
+def test_stream_errors_are_structured(monkeypatch, mvm_home) -> None:
     with V1StubServer() as server:
         server._create_sandbox({"name": "protected"})
         server.required_token = "correct-token"
@@ -233,7 +221,6 @@ def test_websocket_upgrade_and_stream_errors_are_structured(monkeypatch, mvm_hom
             sandbox = client.sandboxes.ref("protected")
             with pytest.raises(APIError) as exc_info:
                 sandbox.attach()
-            assert exc_info.value.status == 401
             assert exc_info.value.code == "unauthorized"
             assert "invalid bearer token" in str(exc_info.value)
 
@@ -241,11 +228,9 @@ def test_websocket_upgrade_and_stream_errors_are_structured(monkeypatch, mvm_hom
         configure_context(monkeypatch, mvm_home, server)
         with connect() as client:
             missing = client.sandboxes.ref("missing")
-            stream = missing.attach()
             with pytest.raises(APIError) as exc_info:
-                stream.read()
+                missing.attach()
             assert exc_info.value.code == "not_found"
-            stream.close()
 
 
 def test_all_exported_callables_have_useful_docs() -> None:

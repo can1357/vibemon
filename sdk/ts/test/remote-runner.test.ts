@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
-import type { Subprocess } from "bun";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Subprocess } from "bun";
 
 import { SESSION_RUNNER } from "../src";
 
@@ -100,7 +100,12 @@ test("runner greets, caches sources by hash, and shuts down cleanly", async () =
       args: { json: [2, 3] },
       mode: "value",
     });
-    expect(await session.next()).toEqual({ event: "out", id: 1, stream: "stdout", data: "sum 5\n" });
+    expect(await session.next()).toEqual({
+      event: "out",
+      id: 1,
+      stream: "stdout",
+      data: "sum 5\n",
+    });
     expect(await session.next()).toEqual({ event: "result", id: 1, json: { sum: 5 } });
 
     // Second call carries the hash only: the guest namespace cache must serve it.
@@ -112,10 +117,22 @@ test("runner greets, caches sources by hash, and shuts down cleanly", async () =
       args: { json: [10, 4] },
       mode: "value",
     });
-    expect(await session.next()).toEqual({ event: "out", id: 2, stream: "stdout", data: "sum 14\n" });
+    expect(await session.next()).toEqual({
+      event: "out",
+      id: 2,
+      stream: "stdout",
+      data: "sum 14\n",
+    });
     expect(await session.next()).toEqual({ event: "result", id: 2, json: { sum: 14 } });
 
-    session.send({ op: "call", id: 3, hash: "never-sent", exportName: "handle", args: { json: [] }, mode: "value" });
+    session.send({
+      op: "call",
+      id: 3,
+      hash: "never-sent",
+      exportName: "handle",
+      args: { json: [] },
+      mode: "value",
+    });
     const unknown = await session.next();
     expect(unknown.event).toBe("error");
     expect(unknown.message).toContain("unknown source hash");
@@ -148,7 +165,9 @@ test("runner streams generator yields and interleaved output in order", async ()
       events.push(frame);
       if (frame.event === "result" || frame.event === "error") break;
     }
-    expect(events.map((frame) => [frame.event, frame.event === "out" ? frame.data : frame.json])).toEqual([
+    expect(
+      events.map((frame) => [frame.event, frame.event === "out" ? frame.data : frame.json]),
+    ).toEqual([
       ["out", "at 0\n"],
       ["yield", 0],
       ["out", "at 1\n"],
@@ -186,11 +205,17 @@ test("runner reports structured errors and mode mismatches", async () => {
       id: 1,
       hash: "boom-v1",
       exportName: "boom",
-      source: "export function boom(value) { console.error('warn ' + value); throw new RangeError('bad ' + value); }",
+      source:
+        "export function boom(value) { console.error('warn ' + value); throw new RangeError('bad ' + value); }",
       args: { json: [7] },
       mode: "value",
     });
-    expect(await session.next()).toEqual({ event: "out", id: 1, stream: "stderr", data: "warn 7\n" });
+    expect(await session.next()).toEqual({
+      event: "out",
+      id: 1,
+      stream: "stderr",
+      data: "warn 7\n",
+    });
     const failure = await session.next();
     expect(failure.event).toBe("error");
     expect(failure.etype).toBe("RangeError");

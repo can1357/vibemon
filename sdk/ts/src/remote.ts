@@ -34,11 +34,12 @@ export interface RemoteFunctionSourceSpec {
 export type RemoteOutputHandler = (output: string) => void;
 
 /** The element type streamed by {@link RemoteFunction.remoteGen}. */
-export type RemoteYield<Result> = Result extends Generator<infer Item, unknown, unknown>
-  ? Item
-  : Result extends AsyncGenerator<infer Item, unknown>
+export type RemoteYield<Result> =
+  Result extends Generator<infer Item, unknown, unknown>
     ? Item
-    : Result;
+    : Result extends AsyncGenerator<infer Item, unknown>
+      ? Item
+      : Result;
 
 /** Options accepted by the {@link Retries} constructor. */
 export interface RetriesOptions {
@@ -58,12 +59,7 @@ export class Retries {
   readonly maxDelay: number;
 
   constructor(options: RetriesOptions) {
-    const {
-      maxRetries,
-      backoffCoefficient = 2.0,
-      initialDelay = 1.0,
-      maxDelay = 60.0,
-    } = options;
+    const { maxRetries, backoffCoefficient = 2.0, initialDelay = 1.0, maxDelay = 60.0 } = options;
     if (!Number.isInteger(maxRetries) || maxRetries < 0) {
       throw new RangeError("maxRetries must be an integer >= 0");
     }
@@ -84,7 +80,10 @@ export class Retries {
 
   /** Delay in seconds before 1-based retry `retryNumber`. */
   delayFor(retryNumber: number): number {
-    return Math.min(this.initialDelay * this.backoffCoefficient ** (retryNumber - 1), this.maxDelay);
+    return Math.min(
+      this.initialDelay * this.backoffCoefficient ** (retryNumber - 1),
+      this.maxDelay,
+    );
   }
 }
 
@@ -466,7 +465,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     const target: DispatchTarget = {
       acquire: async () => {
         if (state.cancelled) throw cancelledError();
-        if (state.session !== null && state.session.alive) return state.session;
+        if (state.session?.alive) return state.session;
         const sandbox = await this.#ensureSandbox();
         const session = await WorkerSession.start(sandbox);
         state.session = session;
@@ -520,7 +519,10 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     if (this.#generatorKind === "generator") {
       throw new TypeError("a generator function cannot be mapped; use .remoteGen() per input");
     }
-    return this.#mapEngine(this.#argIterator(inputs, (item) => [item]), options);
+    return this.#mapEngine(
+      this.#argIterator(inputs, (item) => [item]),
+      options,
+    );
   }
 
   /** {@link map} over argument tuples, spread into the handler. */
@@ -654,7 +656,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
         };
         const target: DispatchTarget = {
           acquire: async () => {
-            if (held.session !== null && held.session.alive) return held.session;
+            if (held.session?.alive) return held.session;
             dropSession();
             held.sandbox ??= await this.#provisionSandbox();
             const session = await WorkerSession.start(held.sandbox);
@@ -678,9 +680,15 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
             if (!stopped && !inputDone && active < cap) startWorker();
             const output: OutputChunk[] = [];
             try {
-              const value = await this.#callWithPolicy(target, spec, item.args, timeout, (stream, text) => {
-                output.push([stream, text]);
-              });
+              const value = await this.#callWithPolicy(
+                target,
+                spec,
+                item.args,
+                timeout,
+                (stream, text) => {
+                  output.push([stream, text]);
+                },
+              );
               completions.push({ index: item.index, ok: true, value, error: undefined, output });
             } catch (error) {
               completions.push({

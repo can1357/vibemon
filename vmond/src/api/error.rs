@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::{EngineError, ErrorCode};
 
-#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ErrorBody {
 	pub code:    String,
 	pub message: String,

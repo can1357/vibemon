@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import json
 import queue
 import threading
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
-from ._endpoint import ResponseStream, WebSocketConnection
-from .errors import APIError, ProtocolError, TransportError
+import grpc
+
+from ._endpoint import translate_rpc_error
+from .errors import ProtocolError, TransportError
+from .v1 import api_pb2
 
 if TYPE_CHECKING:
     from .models import ExecExit
 
 _EOF = object()
+_INPUT_DONE = object()
+
+# A session starter receives a factory producing a fresh ExecInput iterator per
+# connection attempt and returns the response stream plus the chosen endpoint.
+type SessionStarter = Callable[[Callable[[], Iterator[api_pb2.ExecInput]]], tuple[Any, str | None]]
 
 
 class ByteStream(Iterable[bytes]):
@@ -131,8 +138,8 @@ class _ProcessStdin:
 class _ProcessSession:
     def __init__(
         self,
-        websocket: WebSocketConnection,
-        request: Mapping[str, Any],
+        starter: SessionStarter,
+        first_input: api_pb2.ExecInput,
         *,
         timeout: float | None,
         tty: bool,
@@ -141,7 +148,6 @@ class _ProcessSession:
     ) -> None:
         self.stdout = ByteStream()
         self.stderr = ByteStream()
-        self._websocket = websocket
         self._timeout = timeout
         self._tty = tty
         self._exit = threading.Event()
@@ -152,15 +158,30 @@ class _ProcessSession:
         self._send_lock = threading.Lock()
         self._stdin_closed = False
         self._closing = False
-        try:
-            websocket.send_json(dict(request))
-            if consume_ready:
+        self._first = first_input
+        self._inputs: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._responses, self._endpoint = starter(self._make_inputs)
+        if consume_ready:
+            try:
                 self._consume_ready()
-        except BaseException:
-            websocket.close()
-            raise
+            except BaseException:
+                self._shutdown()
+                raise
         self._reader = threading.Thread(target=self._read_loop, name=thread_name, daemon=True)
         self._reader.start()
+
+    def _make_inputs(self) -> Iterator[api_pb2.ExecInput]:
+        yield self._first
+        while True:
+            item = self._inputs.get()
+            if item is _INPUT_DONE:
+                return
+            yield item
+
+    def _shutdown(self) -> None:
+        self._inputs.put(_INPUT_DONE)
+        with contextlib.suppress(Exception):
+            self._responses.cancel()
 
     @property
     def returncode(self) -> int | None:
@@ -175,19 +196,17 @@ class _ProcessSession:
         return self._ready_name
 
     def _consume_ready(self) -> None:
-        frame = self._websocket.recv_json()
-        if frame is None:
-            raise ProtocolError("shell closed before its ready frame")
-        error = frame.get("error")
-        if isinstance(error, Mapping):
-            raise APIError(
-                str(error.get("message") or "shell setup failed"),
-                code=str(error.get("code") or "engine"),
-            )
-        ready = frame.get("ready")
-        if not isinstance(ready, str) or not ready:
+        try:
+            frame = next(iter(self._responses))
+        except StopIteration:
+            raise ProtocolError("shell closed before its ready frame") from None
+        except grpc.RpcError as exc:
+            raise translate_rpc_error(
+                exc, endpoint=self._endpoint, fallback_message="shell setup failed"
+            ) from exc
+        if frame.WhichOneof("output") != "ready" or not frame.ready.sandbox_id:
             raise ProtocolError("shell ready frame omitted the sandbox id")
-        self._ready_name = ready
+        self._ready_name = frame.ready.sandbox_id
 
     def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
         raw = data.encode() if isinstance(data, str) else bytes(data)
@@ -196,24 +215,24 @@ class _ProcessSession:
         with self._send_lock:
             if self._stdin_closed:
                 raise TransportError("process stdin is closed")
-            self._websocket.send_json({"stdin_b64": base64.b64encode(raw).decode("ascii")})
+            self._inputs.put(api_pb2.ExecInput(stdin=raw))
 
     def close_stdin(self) -> None:
         with self._send_lock:
             if self._stdin_closed:
                 return
             self._stdin_closed = True
-            self._websocket.send_json({"eof": True})
+            self._inputs.put(api_pb2.ExecInput(eof=api_pb2.Eof()))
 
     def resize(self, rows: int, cols: int) -> None:
         if rows <= 0 or cols <= 0:
             raise ValueError("terminal rows and columns must be positive")
-        self._websocket.send_json({"resize": [int(rows), int(cols)]})
+        self._inputs.put(api_pb2.ExecInput(resize=api_pb2.Resize(rows=int(rows), cols=int(cols))))
 
     def kill(self, signal: int = 15) -> None:
         self._closing = True
         self._signal = int(signal)
-        self._websocket.close()
+        self._shutdown()
 
     def wait(self, timeout: float | None = None) -> ExecExit:
         if not self._tty and not self._stdin_closed:
@@ -234,51 +253,30 @@ class _ProcessSession:
 
     def _read_loop(self) -> None:
         try:
-            while True:
-                frame = self._websocket.recv_json()
-                if frame is None:
-                    if self._returncode is None:
-                        self._error = ProtocolError("process stream closed before an exit frame")
-                    return
-                error = frame.get("error")
-                if isinstance(error, Mapping):
-                    self._error = APIError(
-                        str(error.get("message") or "exec failed"),
-                        code=str(error.get("code") or "engine"),
+            for frame in self._responses:
+                kind = frame.WhichOneof("output")
+                if kind == "chunk":
+                    target = (
+                        self.stderr if frame.chunk.stream == api_pb2.STREAM_STDERR else self.stdout
                     )
-                    return
-                stream = frame.get("stream")
-                if stream in {"stdout", "stderr", "console"}:
-                    encoded = frame.get("b64")
-                    if not isinstance(encoded, str):
-                        self._error = ProtocolError("invalid exec stream frame")
-                        return
-                    try:
-                        data = base64.b64decode(encoded, validate=True)
-                    except ValueError, TypeError:
-                        self._error = ProtocolError("invalid exec stream payload")
-                        return
-                    (self.stderr if stream == "stderr" else self.stdout).feed(data)
+                    target.feed(frame.chunk.data)
                     continue
-                if "exit" in frame:
-                    raw_exit = frame.get("exit")
-                    if isinstance(raw_exit, bool) or not isinstance(raw_exit, int):
-                        self._error = ProtocolError("invalid process exit frame")
-                        return
-                    raw_signal = frame.get("signal")
-                    if raw_signal is not None and (
-                        isinstance(raw_signal, bool) or not isinstance(raw_signal, int)
-                    ):
-                        self._error = ProtocolError("invalid process signal")
-                        return
-                    self._returncode = raw_exit
-                    self._signal = raw_signal
+                if kind == "exit":
+                    self._returncode = frame.exit.code
+                    self._signal = frame.exit.signal if frame.exit.HasField("signal") else None
                     return
-                if "ready" in frame:
+                if kind == "ready":
                     self._error = ProtocolError("unexpected process ready frame")
                     return
                 self._error = ProtocolError("unknown process frame")
                 return
+            if self._returncode is None:
+                self._error = ProtocolError("process stream closed before an exit frame")
+        except grpc.RpcError as exc:
+            if not self._closing:
+                self._error = translate_rpc_error(
+                    exc, endpoint=self._endpoint, fallback_message="exec failed"
+                )
         except BaseException as exc:
             if not self._closing:
                 self._error = exc
@@ -286,7 +284,7 @@ class _ProcessSession:
             self.stdout.close()
             self.stderr.close()
             self._exit.set()
-            self._websocket.close()
+            self._shutdown()
 
 
 class Process:
@@ -341,8 +339,9 @@ class Process:
 class ConsoleStream(Iterable[bytes]):
     """A closeable byte stream from a sandbox console attachment."""
 
-    def __init__(self, websocket: WebSocketConnection) -> None:
-        self._websocket = websocket
+    def __init__(self, responses: Any, endpoint: str | None = None) -> None:
+        self._responses = responses
+        self._endpoint = endpoint
         self._stream = ByteStream()
         self._done = threading.Event()
         self._error: BaseException | None = None
@@ -381,41 +380,35 @@ class ConsoleStream(Iterable[bytes]):
     def close(self) -> None:
         """Close the console attachment idempotently."""
         self._closing = True
-        self._websocket.close()
+        with contextlib.suppress(Exception):
+            self._responses.cancel()
         self._stream.close()
 
     def _read_loop(self) -> None:
         try:
-            while True:
-                frame = self._websocket.recv_json()
-                if frame is None:
-                    return
-                error = frame.get("error")
-                if isinstance(error, Mapping):
-                    self._error = APIError(
-                        str(error.get("message") or "console attachment failed"),
-                        code=str(error.get("code") or "engine"),
-                    )
-                    return
-                if frame.get("stream") != "console":
+            for frame in self._responses:
+                if (
+                    frame.WhichOneof("output") != "chunk"
+                    or frame.chunk.stream != api_pb2.STREAM_CONSOLE
+                ):
                     self._error = ProtocolError("unknown console frame")
                     return
-                encoded = frame.get("b64")
-                if not isinstance(encoded, str):
-                    self._error = ProtocolError("invalid console stream frame")
-                    return
-                try:
-                    self._stream.feed(base64.b64decode(encoded, validate=True))
-                except ValueError, TypeError:
-                    self._error = ProtocolError("invalid console stream payload")
-                    return
+                self._stream.feed(frame.chunk.data)
+        except grpc.RpcError as exc:
+            if not self._closing:
+                self._error = translate_rpc_error(
+                    exc,
+                    endpoint=self._endpoint,
+                    fallback_message="console attachment failed",
+                )
         except BaseException as exc:
             if not self._closing:
                 self._error = exc
         finally:
             self._stream.close()
             self._done.set()
-            self._websocket.close()
+            with contextlib.suppress(Exception):
+                self._responses.cancel()
 
     def __enter__(self) -> ConsoleStream:
         return self
@@ -425,25 +418,22 @@ class ConsoleStream(Iterable[bytes]):
 
 
 class EventStream(Iterable[dict[str, Any]]):
-    """A closeable iterator over JSON objects from an SSE endpoint."""
+    """A closeable iterator over engine event documents from the Events RPC."""
 
-    def __init__(self, response: ResponseStream) -> None:
-        self._response = response
+    def __init__(self, responses: Any, endpoint: str | None = None) -> None:
+        self._responses = responses
+        self._endpoint = endpoint
         self._closed = False
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        data_lines: list[str] = []
         try:
-            for line in self._response.iter_lines():
-                if line == "":
-                    if data_lines:
-                        yield self._decode("\n".join(data_lines))
-                        data_lines.clear()
-                    continue
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip(" "))
-            if data_lines:
-                yield self._decode("\n".join(data_lines))
+            for view in self._responses:
+                yield self._decode(view.json)
+        except grpc.RpcError as exc:
+            if not self._closed:
+                raise translate_rpc_error(
+                    exc, endpoint=self._endpoint, fallback_message="event stream failed"
+                ) from exc
         finally:
             self.close()
 
@@ -458,10 +448,11 @@ class EventStream(Iterable[dict[str, Any]]):
         return value
 
     def close(self) -> None:
-        """Close the streaming response idempotently."""
+        """Cancel the streaming call idempotently."""
         if not self._closed:
             self._closed = True
-            self._response.close()
+            with contextlib.suppress(Exception):
+                self._responses.cancel()
 
     def __enter__(self) -> EventStream:
         return self
@@ -473,25 +464,29 @@ class EventStream(Iterable[dict[str, Any]]):
 class LogStream(Iterable[str]):
     """A closeable iterator over decoded sandbox log chunks."""
 
-    def __init__(self, events: EventStream) -> None:
-        self._events = events
+    def __init__(self, responses: Any, endpoint: str | None = None) -> None:
+        self._responses = responses
+        self._endpoint = endpoint
+        self._closed = False
 
     def __iter__(self) -> Iterator[str]:
-        for event in self._events:
-            data = event.get("data")
-            if isinstance(data, str):
-                yield data
-                continue
-            encoded = event.get("b64")
-            if isinstance(encoded, str):
-                try:
-                    yield base64.b64decode(encoded, validate=True).decode("utf-8", errors="replace")
-                except ValueError, TypeError:
-                    raise ProtocolError("invalid sandbox log stream payload") from None
+        try:
+            for chunk in self._responses:
+                yield chunk.data.decode("utf-8", errors="replace")
+        except grpc.RpcError as exc:
+            if not self._closed:
+                raise translate_rpc_error(
+                    exc, endpoint=self._endpoint, fallback_message="log stream failed"
+                ) from exc
+        finally:
+            self.close()
 
     def close(self) -> None:
-        """Close the underlying event stream."""
-        self._events.close()
+        """Cancel the streaming call idempotently."""
+        if not self._closed:
+            self._closed = True
+            with contextlib.suppress(Exception):
+                self._responses.cancel()
 
     def __enter__(self) -> LogStream:
         return self
@@ -501,18 +496,19 @@ class LogStream(Iterable[str]):
 
 
 def open_process(
-    websocket: WebSocketConnection,
-    request: Mapping[str, Any],
+    starter: SessionStarter,
+    first_input: api_pb2.ExecInput,
     *,
     timeout: float | None = None,
     tty: bool = False,
     consume_ready: bool = False,
     thread_name: str = "vmon-process",
 ) -> Process:
+    """Open a streaming exec or shell session over a bidi gRPC call."""
     return Process(
         _ProcessSession(
-            websocket,
-            request,
+            starter,
+            first_input,
             timeout=timeout,
             tty=tty,
             consume_ready=consume_ready,

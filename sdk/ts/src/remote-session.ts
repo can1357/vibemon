@@ -379,11 +379,14 @@ class FrameQueue {
     const waiter: FrameWaiter = { resolve, reject };
     this.#waiters.push(waiter);
     if (deadline !== null) {
-      const timer = setTimeout(() => {
-        const index = this.#waiters.indexOf(waiter);
-        if (index >= 0) this.#waiters.splice(index, 1);
-        reject(DEADLINE);
-      }, Math.max(0, deadline - Date.now()));
+      const timer = setTimeout(
+        () => {
+          const index = this.#waiters.indexOf(waiter);
+          if (index >= 0) this.#waiters.splice(index, 1);
+          reject(DEADLINE);
+        },
+        Math.max(0, deadline - Date.now()),
+      );
       const clear = () => clearTimeout(timer);
       promise.then(clear, clear);
     }

@@ -1,7 +1,11 @@
-// Same-origin client for the `vmon serve` HTTP+WebSocket v1 API.
-// In dev, vite.config.ts proxies /v1, /healthz, and /metrics to 127.0.0.1:8000.
+// Same-origin client for the `vmon serve` v1 API: gRPC over the WebSocket
+// bridge (GET /grpc, see proto/vmon/v1/bridge.proto) for every RPC.
 // In production the UI is served by `vmon serve` itself, so relative URLs are
 // correct regardless of host/port/proxy in front of it.
+
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
+import { type JsonView, SandboxService } from "./gen/vmon/v1/api_pb.ts";
+import { createWsBridgeTransport } from "./grpc-ws.ts";
 
 export type SandboxStatus = "running" | "stopped" | "terminated" | "paused" | "failed";
 
@@ -103,148 +107,100 @@ export class ApiError extends Error {
   }
 }
 
-function authHeaders(): Record<string, string> {
-  const t = getToken();
-  return t ? { Authorization: `Bearer ${t}` } : {};
+// vmond error codes (vmon-code response metadata) → the HTTP statuses the JSON
+// REST API used, so ApiError.status keeps its meaning (vmond/src/error.rs).
+const VMON_CODE_STATUS: Record<string, number> = {
+  not_found: 404,
+  not_running: 409,
+  busy: 409,
+  invalid: 400,
+  unsupported: 501,
+  unauthorized: 401,
+};
+
+// Fallback when the vmon-code trailer is missing: reverse of the server's
+// gRPC status mapping (see proto/vmon/v1/api.proto header).
+const GRPC_CODE_STATUS: Partial<Record<Code, number>> = {
+  [Code.NotFound]: 404,
+  [Code.InvalidArgument]: 400,
+  [Code.Unauthenticated]: 401,
+  [Code.FailedPrecondition]: 409,
+  [Code.Aborted]: 409,
+  [Code.Unimplemented]: 501,
+};
+
+function toApiError(err: unknown): ApiError {
+  const ce = ConnectError.from(err);
+  const vmonCode = ce.metadata.get("vmon-code") ?? "";
+  const status = VMON_CODE_STATUS[vmonCode] ?? GRPC_CODE_STATUS[ce.code] ?? 503;
+  const detail = vmonCode ? `${vmonCode}: ${ce.rawMessage}` : ce.rawMessage;
+  return new ApiError(status, `${status} ${detail}`);
 }
 
-async function responseErrorDetail(res: Response): Promise<string> {
-  const fallback = res.statusText || "request failed";
-  const ct = res.headers.get("content-type") ?? "";
+async function rpc<T>(call: Promise<T>): Promise<T> {
   try {
-    if (ct.includes("application/json")) {
-      const body = await res.json();
-      if (typeof body?.message === "string") {
-        return typeof body?.code === "string" ? `${body.code}: ${body.message}` : body.message;
-      }
-      if (typeof body?.detail === "string") return body.detail;
-      return JSON.stringify(body);
-    }
-    const text = await res.text();
-    return text || fallback;
-  } catch {
-    return fallback;
+    return await call;
+  } catch (err) {
+    throw toApiError(err);
   }
 }
 
-async function throwApiError(res: Response): Promise<never> {
-  throw new ApiError(res.status, `${res.status} ${await responseErrorDetail(res)}`);
-}
+const transport = createWsBridgeTransport({
+  baseUrl: window.location.origin,
+  token: getToken,
+});
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { ...authHeaders(), ...(init?.headers ?? {}) },
-  });
-  if (!res.ok) await throwApiError(res);
-  if (res.status === 204) return undefined as T;
-  const ct = res.headers.get("content-type") ?? "";
-  if (ct.includes("application/json")) return res.json() as Promise<T>;
-  return (await res.text()) as unknown as T;
+export const sandboxClient = createClient(SandboxService, transport);
+
+function parseView(view: JsonView): SandboxView {
+  return JSON.parse(view.json) as SandboxView;
 }
 
 export const api = {
-  health: () => req<{ ok: boolean }>("/healthz"),
+  health: async (): Promise<{ ok: boolean }> => {
+    const res = await fetch("/healthz");
+    if (!res.ok) {
+      throw new ApiError(res.status, `${res.status} ${res.statusText || "request failed"}`);
+    }
+    return (await res.json()) as { ok: boolean };
+  },
   sandboxMetrics: (id: string) =>
-    req<SandboxMetrics>(`/v1/sandboxes/${encodeURIComponent(id)}/metrics`),
+    rpc(sandboxClient.metrics({ id })).then((r) => JSON.parse(r.json) as SandboxMetrics),
 
-  listSandboxes: () => req<{ sandboxes: SandboxView[] }>("/v1/sandboxes").then((r) => r.sandboxes),
-  getSandbox: (id: string) => req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}`),
+  listSandboxes: () =>
+    rpc(sandboxClient.list({})).then((r) =>
+      r.sandboxesJson.map((s) => JSON.parse(s) as SandboxView),
+    ),
+  getSandbox: (id: string) => rpc(sandboxClient.get({ id })).then(parseView),
   createSandbox: (body: SandboxCreate) =>
-    req<SandboxView>("/v1/sandboxes", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  stopSandbox: (id: string) =>
-    req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST" }),
-  terminateSandbox: (id: string) =>
-    req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}/terminate`, { method: "POST" }),
-  removeSandbox: (id: string) =>
-    req<SandboxView>(`/v1/sandboxes/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    rpc(sandboxClient.create({ specJson: JSON.stringify(body) })).then(parseView),
+  stopSandbox: (id: string) => rpc(sandboxClient.stop({ id })).then(parseView),
+  terminateSandbox: (id: string) => rpc(sandboxClient.terminate({ id })).then(parseView),
+  removeSandbox: (id: string) => rpc(sandboxClient.remove({ id })).then(parseView),
   snapshotSandbox: (id: string, name?: string) =>
-    req<{ snapshot: string; dir: string }>(`/v1/sandboxes/${encodeURIComponent(id)}/snapshots`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name ?? null }),
-    }),
-
-  fsList: (id: string, path: string) =>
-    req<{ entries: FsEntry[] } | FsEntry[]>(
-      `/v1/sandboxes/${encodeURIComponent(id)}/files/list?path=${encodeURIComponent(path)}`,
-    ).then((r) => (Array.isArray(r) ? r : r.entries)),
-  fsStat: (id: string, path: string) =>
-    req<FsStat>(
-      `/v1/sandboxes/${encodeURIComponent(id)}/files/stat?path=${encodeURIComponent(path)}`,
+    rpc(sandboxClient.snapshot({ id, name })).then(
+      (r) => JSON.parse(r.json) as { snapshot: string; dir: string },
     ),
 
-  // file blob I/O — uses fetch directly to preserve binary.
+  fsList: (id: string, path: string) =>
+    rpc(sandboxClient.fileList({ id, path })).then((r) => {
+      const parsed = JSON.parse(r.json) as { entries: FsEntry[] } | FsEntry[];
+      return Array.isArray(parsed) ? parsed : parsed.entries;
+    }),
+  fsStat: (id: string, path: string) =>
+    rpc(sandboxClient.fileStat({ id, path })).then((r) => JSON.parse(r.json) as FsStat),
+
   readFile: async (id: string, path: string): Promise<Blob> => {
-    const res = await fetch(
-      `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
-      { headers: authHeaders() },
-    );
-    if (!res.ok) await throwApiError(res);
-    return res.blob();
+    const r = await rpc(sandboxClient.fileRead({ id, path }));
+    // copy so the Blob sees a plain ArrayBuffer-backed view
+    return new Blob([new Uint8Array(r.data)]);
   },
   writeFile: async (id: string, path: string, data: Blob): Promise<void> => {
-    const res = await fetch(
-      `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
-      { method: "PUT", headers: authHeaders(), body: data },
+    await rpc(
+      sandboxClient.fileWrite({ id, path, data: new Uint8Array(await data.arrayBuffer()) }),
     );
-    if (!res.ok) await throwApiError(res);
   },
   deleteFile: async (id: string, path: string, recursive = false): Promise<void> => {
-    const res = await fetch(
-      `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}&recursive=${recursive}`,
-      { method: "DELETE", headers: authHeaders() },
-    );
-    if (!res.ok) await throwApiError(res);
+    await rpc(sandboxClient.fileDelete({ id, path, recursive }));
   },
 };
-
-// Build an exec WebSocket URL from the current page origin (so wss:// is used
-// automatically when the page is served over HTTPS), appending the token as a
-// query param because browsers cannot attach Authorization headers to WebSocket
-// constructors. The first message carries the exec request body.
-export function execWsUrl(id: string): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const base = `${proto}//${window.location.host}/v1/sandboxes/${encodeURIComponent(id)}/exec`;
-  const params = new URLSearchParams();
-  const t = getToken();
-  if (t) params.append("token", t);
-  const query = params.toString();
-  return query ? `${base}?${query}` : base;
-}
-
-export function execStartFrame(cmd: string[], tty = true): string {
-  return JSON.stringify({ cmd, tty });
-}
-
-export function stdinFrame(data: string): string {
-  return JSON.stringify({ stdin_b64: bytesToB64(new TextEncoder().encode(data)) });
-}
-
-export function eofFrame(): string {
-  return JSON.stringify({ eof: true });
-}
-
-export function resizeFrame(rows: number, cols: number): string {
-  return JSON.stringify({ resize: [rows, cols] });
-}
-
-export function b64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-function bytesToB64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}

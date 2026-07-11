@@ -1,5 +1,12 @@
 import { type Driver, type DriverOptions, type DriverRequestOptions, MeshDriver } from "./driver";
 import { apiError, ProtocolError, TransportError } from "./errors";
+import {
+  PoolService,
+  SandboxService,
+  SnapshotService,
+  SystemService,
+  VolumeService,
+} from "./gen/vmon/v1/api_pb";
 import type {
   ForkRequest,
   Health,
@@ -53,25 +60,24 @@ export class Client {
     return this.json("GET", "/healthz");
   }
   /** Fetch daemon and node information. */
-  info(): Promise<ServerInfo> {
-    return this.json("GET", "/v1/info");
+  async info(): Promise<ServerInfo> {
+    const { message } = await this.driver.call(SystemService.method.info, {});
+    return JSON.parse(message.json);
   }
   /** Fetch Prometheus metrics text. */
   async metrics(): Promise<string> {
     return (await this.response("GET", "/metrics")).text();
   }
-  /** Fetch the daemon OpenAPI document. */
-  openapi(): Promise<Record<string, unknown>> {
-    return this.json("GET", "/v1/openapi.json");
-  }
   /** Open the daemon event stream. */
   async events(): Promise<EventStream> {
-    return new EventStream(await this.response("GET", "/v1/events", { stream: true }));
+    return new EventStream(await this.driver.serverStream(SystemService.method.events, {}));
   }
-  /** Open an interactive shell process after its ready envelope. */
+  /** Open an interactive shell process after its ready frame. */
   async shell(request: Record<string, unknown> = {}): Promise<Process> {
-    const [socket] = await this.driver.websocket("/v1/shell");
-    const process = new Process(socket, request);
+    const process = new Process(
+      (inputs) => this.driver.duplex(SandboxService.method.shell, inputs),
+      { case: "shellParamsJson", value: JSON.stringify(request) },
+    );
     await process.ready();
     return process;
   }
@@ -124,13 +130,17 @@ export class SandboxAPI {
       secrets === undefined
         ? rest
         : { ...rest, secrets: secrets === null ? null : secretWires(secrets) };
-    const response = await this.#client.response("POST", "/v1/sandboxes", { json: body });
-    return new Sandbox(this.#client, await response.json(), response.endpoint);
+    const { message, endpoint } = await this.#client.driver.call(SandboxService.method.create, {
+      specJson: JSON.stringify(body),
+    });
+    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
   }
   /** Fetch a sandbox and pin its serving endpoint. */
   async get(id: string): Promise<Sandbox> {
-    const response = await this.#client.response("GET", `/v1/sandboxes/${encodeURIComponent(id)}`);
-    return new Sandbox(this.#client, await response.json(), response.endpoint);
+    const { message, endpoint } = await this.#client.driver.call(SandboxService.method.get, {
+      id,
+    });
+    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
   }
   /** Create an unfetched bound sandbox reference. */
   ref(id: string): Sandbox {
@@ -139,23 +149,27 @@ export class SandboxAPI {
   /** List and merge sandboxes across live mesh endpoints. */
   async list(options: SandboxListOptions = {}): Promise<Sandbox[]> {
     const endpoints = this.#client.driver.endpoints().filter((entry) => entry.healthy);
-    const params = new URLSearchParams();
-    if (options.tags)
-      for (const key in options.tags) params.append("tag", `${key}=${options.tags[key]}`);
+    const tags: string[] = [];
+    if (options.tags) for (const key in options.tags) tags.push(`${key}=${options.tags[key]}`);
     if (endpoints.length <= 1) {
-      const response = await this.#client.response("GET", "/v1/sandboxes", { params });
-      return sandboxRows(await response.json())
+      const { message, endpoint } = await this.#client.driver.call(SandboxService.method.list, {
+        tags,
+      });
+      return sandboxRows(message.sandboxesJson.map((row) => JSON.parse(row) as unknown))
         .filter((row) => !options.node || row.node === options.node)
-        .map((row) => new Sandbox(this.#client, row, response.endpoint));
+        .map((row) => new Sandbox(this.#client, row, endpoint));
     }
     const attempts = await Promise.allSettled(
       endpoints.map(async (entry) => {
-        const response = await this.#client.driver.request("GET", "/v1/sandboxes", {
-          params,
-          endpoint: entry.url,
-        });
-        if (!response.ok) throw await apiError(response);
-        return { rows: sandboxRows(await response.json()), endpoint: response.endpoint };
+        const { message, endpoint } = await this.#client.driver.call(
+          SandboxService.method.list,
+          { tags },
+          { endpoint: entry.url },
+        );
+        return {
+          rows: sandboxRows(message.sandboxesJson.map((row) => JSON.parse(row) as unknown)),
+          endpoint,
+        };
       }),
     );
     const merged = new Map<string, Sandbox>();
@@ -184,28 +198,25 @@ export class SnapshotAPI {
   }
   /** List snapshot names. */
   async list(): Promise<string[]> {
-    const body = await this.#client.json<{ snapshots: string[] }>("GET", "/v1/snapshots");
-    return body.snapshots;
+    return (await this.#client.driver.call(SnapshotService.method.list, {})).message.snapshots;
   }
   /** Restore one snapshot into a sandbox. */
   async restore(name: string, request: RestoreRequest = {}): Promise<Sandbox> {
-    const response = await this.#client.response(
-      "POST",
-      `/v1/snapshots/${encodeURIComponent(name)}/restore`,
-      { json: request },
-    );
-    return new Sandbox(this.#client, await response.json(), response.endpoint);
+    const { message, endpoint } = await this.#client.driver.call(SnapshotService.method.restore, {
+      name,
+      bodyJson: JSON.stringify(request),
+    });
+    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
   }
   /** Fork one snapshot into multiple sandboxes. */
   async fork(name: string, request: ForkRequest): Promise<Sandbox[]> {
-    const response = await this.#client.response(
-      "POST",
-      `/v1/snapshots/${encodeURIComponent(name)}/fork`,
-      { json: request },
-    );
-    const body = await response.json();
+    const { message, endpoint } = await this.#client.driver.call(SnapshotService.method.fork, {
+      name,
+      bodyJson: JSON.stringify(request),
+    });
+    const body: unknown = JSON.parse(message.json);
     return sandboxRows(isRecord(body) ? body.clones : undefined).map(
-      (row) => new Sandbox(this.#client, row, response.endpoint),
+      (row) => new Sandbox(this.#client, row, endpoint),
     );
   }
 }
@@ -219,18 +230,17 @@ export class VolumeAPI {
   }
   /** List persistent volumes. */
   async list(): Promise<Volume[]> {
-    return (await this.#client.json<{ volumes: string[] }>("GET", "/v1/volumes")).volumes.map(
-      (name) => new Volume(name),
-    );
+    const { message } = await this.#client.driver.call(VolumeService.method.list, {});
+    return message.volumes.map((name) => new Volume(name));
   }
   /** Create a persistent volume. */
   async create(name: string): Promise<Volume> {
-    await this.#client.response("PUT", `/v1/volumes/${encodeURIComponent(name)}`);
+    await this.#client.driver.call(VolumeService.method.create, { name });
     return new Volume(name);
   }
   /** Delete a persistent volume. */
   async delete(name: string): Promise<void> {
-    await this.#client.response("DELETE", `/v1/volumes/${encodeURIComponent(name)}`);
+    await this.#client.driver.call(VolumeService.method.delete, { name });
   }
 }
 
@@ -261,7 +271,9 @@ export class PoolAPI {
   }
   /** List warm pools. */
   async list(): Promise<Pool[]> {
-    const body = await this.#client.json<unknown>("GET", "/v1/pools");
+    const body: unknown = JSON.parse(
+      (await this.#client.driver.call(PoolService.method.list, {})).message.json,
+    );
     if (!isRecord(body) || Array.isArray(body))
       throw new ProtocolError("pool list response must be an object");
     const pools: Pool[] = [];
@@ -278,16 +290,15 @@ export class PoolAPI {
   /** Set the desired warm-pool size and template. */
   async set(ref: string, count: number, template: Record<string, unknown> = {}): Promise<Pool> {
     const body: PoolSetRequest = { ...template, size: count };
-    const result = await this.#client.json<PoolStats>(
-      "PUT",
-      `/v1/pools/${encodeURIComponent(ref)}`,
-      { json: body },
-    );
-    return new Pool(this, ref, count, result);
+    const { message } = await this.#client.driver.call(PoolService.method.set, {
+      reference: ref,
+      bodyJson: JSON.stringify(body),
+    });
+    return new Pool(this, ref, count, JSON.parse(message.json) as PoolStats);
   }
   /** Delete a warm pool. */
   async delete(ref: string): Promise<void> {
-    await this.#client.response("DELETE", `/v1/pools/${encodeURIComponent(ref)}`);
+    await this.#client.driver.call(PoolService.method.delete, { reference: ref });
   }
   /** Delete every warm pool. */
   async clear(): Promise<void> {
@@ -304,8 +315,9 @@ export class MeshAPI {
     this.#client = client;
   }
   /** Fetch typed mesh status. */
-  status(): Promise<MeshStatus> {
-    return this.#client.json("GET", "/v1/mesh/status");
+  async status(): Promise<MeshStatus> {
+    const { message } = await this.#client.driver.call(SystemService.method.meshStatus, {});
+    return JSON.parse(message.json);
   }
   /** Return the local and peer mesh nodes. */
   async nodes(): Promise<MeshNode[]> {

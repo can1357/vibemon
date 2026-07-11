@@ -161,7 +161,6 @@ def test_sandbox_relocate() -> None:
             with pytest.raises(APIError) as exc_info:
                 missing.refresh()
             assert exc_info.value.code == "not_found"
-            assert exc_info.value.status == 404
     finally:
         server_a.stop()
         server_b.stop()
@@ -220,7 +219,7 @@ def test_sandbox_list_propagates_api_errors_from_any_node() -> None:
         with connect(_multi_dsn(server_a, server_b, discover="off")) as client:
             with pytest.raises(APIError) as exc_info:
                 client.sandboxes.list()
-            assert exc_info.value.status == 401
+            assert exc_info.value.code == "unauthorized"
     finally:
         server_a.stop()
         server_b.stop()

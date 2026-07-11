@@ -1,7 +1,12 @@
-//! v1 HTTP API: axum router, auth tiers, WS exec, SSE. Port of
-//! python/vmon/server/.
+//! v1 API surface of vmond.
+//!
+//! gRPC services (vmon.v1, proto/vmon/v1/api.proto) over native h2c and the
+//! `/grpc` WebSocket bridge, plus the kept HTTP surface — healthz, metrics,
+//! ports proxy, and the static web UI. Port of python/vmon/server/.
 
+mod bridge;
 mod error;
+mod grpc;
 mod routes;
 mod server;
 mod state;
@@ -12,17 +17,12 @@ use std::{collections::HashMap, hash::BuildHasher};
 
 pub use error::{ApiError, ErrorBody};
 
-/// Serve the v1 HTTP API over `$VMON_HOME/vmond.sock` and optional TCP.
+/// Serve the v1 API over `$VMON_HOME/vmond.sock` and optional TCP.
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> crate::Result<()>
 where
 	S: BuildHasher,
 {
 	server::serve(overrides)
-}
-
-/// Return the generated v1 `OpenAPI` document as pretty JSON.
-pub fn openapi_json() -> String {
-	routes::openapi_json()
 }
 
 #[cfg(test)]
@@ -39,6 +39,13 @@ mod tests {
 
 	use axum::http::StatusCode;
 	use serde_json::{Value, json};
+	use tokio::{io::AsyncWriteExt as _, net::TcpStream};
+	use tonic::{
+		Code, Request,
+		metadata::MetadataValue,
+		transport::{Channel, Endpoint},
+	};
+	use vmon_proto::{prost::Message as _, v1 as pb};
 
 	use super::*;
 	use crate::{
@@ -332,6 +339,12 @@ mod tests {
 		fn url(&self, path: &str) -> String {
 			format!("{}{}", self.base_url, path)
 		}
+
+		fn channel(&self) -> Channel {
+			Endpoint::from_shared(self.base_url.clone())
+				.expect("test grpc endpoint")
+				.connect_lazy()
+		}
 	}
 
 	impl Drop for ApiHarness {
@@ -340,40 +353,48 @@ mod tests {
 		}
 	}
 
-	fn bearer(request: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
-		request.bearer_auth(token)
+	fn authed<T>(message: T, token: &str) -> Request<T> {
+		let mut request = Request::new(message);
+		let value = MetadataValue::try_from(format!("Bearer {token}")).expect("bearer metadata");
+		request.metadata_mut().insert("authorization", value);
+		request
 	}
 
-	async fn assert_error(
-		response: reqwest::Response,
-		status: StatusCode,
-		code: &str,
-		message: &str,
-	) {
-		assert_eq!(response.status(), status);
-		let body: Value = response.json().await.expect("error json body");
-		assert_eq!(body, json!({"code": code, "message": message}));
+	fn vmon_code(status: &tonic::Status) -> Option<String> {
+		status
+			.metadata()
+			.get("vmon-code")
+			.and_then(|value| value.to_str().ok())
+			.map(str::to_owned)
 	}
 
 	#[tokio::test]
-	async fn api_bearer_admin_succeeds_and_missing_token_gets_401_envelope() {
+	async fn api_bearer_admin_succeeds_and_missing_token_is_unauthenticated() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine).await;
+		let mut client = pb::system_service_client::SystemServiceClient::new(api.channel());
 
-		let response = bearer(api.client.get(api.url("/v1/info")), "admin-token")
-			.send()
+		let response = client
+			.info(authed(pb::InfoRequest {}, "admin-token"))
 			.await
 			.expect("admin info response");
-		assert_eq!(response.status(), StatusCode::OK);
-		let body: Value = response.json().await.expect("admin info json");
+		let body: Value = serde_json::from_str(&response.into_inner().json).expect("admin info json");
 		assert_eq!(body, json!({"version":"test"}));
 
+		let status = client
+			.info(Request::new(pb::InfoRequest {}))
+			.await
+			.expect_err("missing token rejected");
+		assert_eq!(status.code(), Code::Unauthenticated);
+
+		// The kept HTTP surface stays behind the same bearer guard with the JSON
+		// error envelope.
 		let response = api
 			.client
-			.get(api.url("/v1/info"))
+			.get(api.url("/metrics"))
 			.send()
 			.await
-			.expect("missing token response");
+			.expect("missing token metrics response");
 		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 		assert_eq!(
 			response.headers().get(reqwest::header::WWW_AUTHENTICATE),
@@ -384,31 +405,32 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn api_client_token_is_forbidden_from_admin_pool_and_migrate_routes() {
+	async fn api_client_token_is_forbidden_from_admin_pool_and_migrate_rpcs() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine.clone()).await;
 
-		let pool_response = bearer(
-			api.client
-				.put(api.url("/v1/pools/x"))
-				.json(&json!({"size": 1})),
-			"client-token",
-		)
-		.send()
-		.await
-		.expect("client pool response");
-		assert_error(pool_response, StatusCode::FORBIDDEN, "unauthorized", "forbidden").await;
+		let mut pools = pb::pool_service_client::PoolServiceClient::new(api.channel());
+		let status = pools
+			.set(authed(
+				pb::PoolSetRequest {
+					reference: "x".to_owned(),
+					body_json: json!({"size": 1}).to_string(),
+				},
+				"client-token",
+			))
+			.await
+			.expect_err("client pool set rejected");
+		assert_eq!(status.code(), Code::PermissionDenied);
 
-		let migrate_response = bearer(
-			api.client
-				.post(api.url("/v1/sandboxes/sb/migrate"))
-				.json(&json!({"target": "node-b"})),
-			"client-token",
-		)
-		.send()
-		.await
-		.expect("client migrate response");
-		assert_error(migrate_response, StatusCode::FORBIDDEN, "unauthorized", "forbidden").await;
+		let mut sandboxes = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
+		let status = sandboxes
+			.migrate(authed(
+				pb::MigrateRequest { id: "sb".to_owned(), target: "node-b".to_owned() },
+				"client-token",
+			))
+			.await
+			.expect_err("client migrate rejected");
+		assert_eq!(status.code(), Code::PermissionDenied);
 
 		let captures = engine.captures();
 		assert!(captures.pool_sets.is_empty());
@@ -419,6 +441,7 @@ mod tests {
 	async fn api_create_validation_rejects_python_compatible_bad_ports_cidrs_and_ha() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine.clone()).await;
+		let mut client = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
 		let cases = [
 			(
 				json!({"name": "bad-port", "ports": [65536]}),
@@ -435,68 +458,67 @@ mod tests {
 		];
 
 		for (payload, message) in cases {
-			let response =
-				bearer(api.client.post(api.url("/v1/sandboxes")).json(&payload), "admin-token")
-					.send()
-					.await
-					.expect("validation response");
-			assert_error(response, StatusCode::BAD_REQUEST, "invalid", message).await;
+			let status = client
+				.create(authed(
+					pb::CreateSandboxRequest { spec_json: payload.to_string() },
+					"admin-token",
+				))
+				.await
+				.expect_err("invalid create rejected");
+			assert_eq!(status.code(), Code::InvalidArgument);
+			assert_eq!(status.message(), message);
+			assert_eq!(vmon_code(&status).as_deref(), Some("invalid"));
 		}
 
 		assert!(engine.captures().creates.is_empty());
 	}
 
 	#[tokio::test]
-	async fn api_engine_errors_from_get_map_to_http_status_and_envelope_codes() {
+	async fn api_engine_errors_from_get_map_to_grpc_codes_and_vmon_code_metadata() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine.clone()).await;
+		let mut client = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
 		let cases = [
-			(ErrorCode::NotFound, StatusCode::NOT_FOUND),
-			(ErrorCode::NotRunning, StatusCode::CONFLICT),
-			(ErrorCode::Busy, StatusCode::CONFLICT),
-			(ErrorCode::Invalid, StatusCode::BAD_REQUEST),
-			(ErrorCode::Unsupported, StatusCode::NOT_IMPLEMENTED),
-			(ErrorCode::Unauthorized, StatusCode::UNAUTHORIZED),
-			(ErrorCode::Engine, StatusCode::SERVICE_UNAVAILABLE),
+			(ErrorCode::NotFound, Code::NotFound),
+			(ErrorCode::NotRunning, Code::FailedPrecondition),
+			(ErrorCode::Busy, Code::Aborted),
+			(ErrorCode::Invalid, Code::InvalidArgument),
+			(ErrorCode::Unsupported, Code::Unimplemented),
+			(ErrorCode::Unauthorized, Code::Unauthenticated),
+			(ErrorCode::Engine, Code::Unavailable),
 		];
 
-		for (code, status) in cases {
+		for (code, expected) in cases {
 			let message = format!("mapped {}", code.as_str());
 			engine.set_get_error(code, &message);
-			let response = bearer(api.client.get(api.url("/v1/sandboxes/sb")), "admin-token")
-				.send()
+			let status = client
+				.get(authed(pb::SandboxRef { id: "sb".to_owned() }, "admin-token"))
 				.await
-				.expect("engine error response");
-			assert_eq!(response.status(), status);
-			if code == ErrorCode::Unauthorized {
-				assert_eq!(
-					response.headers().get(reqwest::header::WWW_AUTHENTICATE),
-					Some(&reqwest::header::HeaderValue::from_static("Bearer"))
-				);
-			}
-			let body: Value = response.json().await.expect("engine error json");
-			assert_eq!(body, json!({"code": code.as_str(), "message": message}));
+				.expect_err("scripted engine error surfaces");
+			assert_eq!(status.code(), expected, "grpc code for {code:?}");
+			assert_eq!(status.message(), message);
+			assert_eq!(vmon_code(&status).as_deref(), Some(code.as_str()));
 		}
 	}
 
 	#[tokio::test]
-	async fn api_create_returns_201_with_engine_view_passthrough() {
+	async fn api_create_returns_engine_view_passthrough() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let view = json!({"id":"sb-1","state":"running","details":{"from":"fake"}});
 		engine.set_create_response(view.clone());
 		let api = ApiHarness::start(engine.clone()).await;
+		let mut client = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
 
-		let response = bearer(
-			api.client
-				.post(api.url("/v1/sandboxes"))
-				.json(&json!({"name": "sb-1", "ports": [8080]})),
-			"admin-token",
-		)
-		.send()
-		.await
-		.expect("create response");
-		assert_eq!(response.status(), StatusCode::CREATED);
-		let body: Value = response.json().await.expect("create json");
+		let response = client
+			.create(authed(
+				pb::CreateSandboxRequest {
+					spec_json: json!({"name": "sb-1", "ports": [8080]}).to_string(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("create response");
+		let body: Value = serde_json::from_str(&response.into_inner().json).expect("create json");
 		assert_eq!(body, view);
 
 		let captures = engine.captures();
@@ -506,18 +528,23 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn api_list_tag_query_passes_hash_map_to_engine() {
+	async fn api_list_tag_filters_pass_hash_map_to_engine() {
 		let engine = Arc::new(ScriptedEngine::new());
 		engine.set_list_response(vec![json!({"id":"sb-api"})]);
 		let api = ApiHarness::start(engine.clone()).await;
+		let mut client = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
 
-		let response = bearer(api.client.get(api.url("/v1/sandboxes?tag=role=api")), "admin-token")
-			.send()
+		let response = client
+			.list(authed(
+				pb::ListSandboxesRequest { tags: vec!["role=api".to_owned()] },
+				"admin-token",
+			))
 			.await
 			.expect("list response");
-		assert_eq!(response.status(), StatusCode::OK);
-		let body: Value = response.json().await.expect("list json");
-		assert_eq!(body, json!({"sandboxes":[{"id":"sb-api"}]}));
+		let sandboxes = response.into_inner().sandboxes_json;
+		assert_eq!(sandboxes.len(), 1);
+		let row: Value = serde_json::from_str(&sandboxes[0]).expect("list row json");
+		assert_eq!(row, json!({"id":"sb-api"}));
 
 		let captures = engine.captures();
 		assert_eq!(captures.list_tags.len(), 1);
@@ -529,26 +556,115 @@ mod tests {
 		);
 	}
 
+	async fn bridge_handshake(api: &ApiHarness, query: &str) -> std::io::Result<TcpStream> {
+		let addr = api
+			.base_url
+			.strip_prefix("http://")
+			.expect("http base url")
+			.to_owned();
+		let (host, port) = addr.rsplit_once(':').expect("host:port");
+		let port: u16 = port.parse().expect("port number");
+		let mut stream = TcpStream::connect((host, port)).await?;
+		ws::websocket_client_handshake(&mut stream, host, port, "grpc", query).await?;
+		Ok(stream)
+	}
+
+	async fn send_bridge_frame(stream: &mut TcpStream, frame: pb::bridge_frame::Frame) {
+		let frame = pb::BridgeFrame { frame: Some(frame) };
+		stream
+			.write_all(&ws::encode_ws_frame(2, &frame.encode_to_vec()))
+			.await
+			.expect("bridge frame written");
+	}
+
+	async fn recv_bridge_frame(stream: &mut TcpStream) -> pb::bridge_frame::Frame {
+		loop {
+			let (opcode, payload) = ws::read_ws_frame(stream).await.expect("bridge frame read");
+			match opcode {
+				0x2 => {
+					return pb::BridgeFrame::decode(payload.as_slice())
+						.expect("bridge frame decodes")
+						.frame
+						.expect("bridge frame set");
+				},
+				0x9 | 0xa => {},
+				other => panic!("unexpected websocket opcode {other}"),
+			}
+		}
+	}
+
 	#[tokio::test]
-	async fn api_events_is_sse_and_starts_with_keepalive_comment() {
+	async fn api_bridge_drives_unary_info_rpc_end_to_end() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine).await;
-
-		let mut response = bearer(api.client.get(api.url("/v1/events")), "admin-token")
-			.send()
+		let mut stream = bridge_handshake(&api, "token=admin-token")
 			.await
-			.expect("events response");
-		assert_eq!(response.status(), StatusCode::OK);
-		assert_eq!(
-			response.headers().get(reqwest::header::CONTENT_TYPE),
-			Some(&reqwest::header::HeaderValue::from_static("text/event-stream"))
-		);
+			.expect("bridge upgrade");
 
-		let first = response
-			.chunk()
+		send_bridge_frame(
+			&mut stream,
+			pb::bridge_frame::Frame::Call(pb::BridgeCall {
+				method:   "/vmon.v1.SystemService/Info".to_owned(),
+				metadata: HashMap::new(),
+			}),
+		)
+		.await;
+		// InfoRequest{} encodes to zero bytes.
+		send_bridge_frame(&mut stream, pb::bridge_frame::Frame::Message(Vec::new())).await;
+		send_bridge_frame(&mut stream, pb::bridge_frame::Frame::HalfClose(pb::BridgeHalfClose {}))
+			.await;
+
+		match recv_bridge_frame(&mut stream).await {
+			pb::bridge_frame::Frame::Message(payload) => {
+				let view = pb::JsonView::decode(payload.as_slice()).expect("info view decodes");
+				let body: Value = serde_json::from_str(&view.json).expect("info json");
+				assert_eq!(body, json!({"version":"test"}));
+			},
+			other => panic!("unexpected bridge frame: {other:?}"),
+		}
+		match recv_bridge_frame(&mut stream).await {
+			pb::bridge_frame::Frame::End(end) => {
+				assert_eq!(end.status, Code::Ok as i32);
+				assert!(end.message.is_empty());
+			},
+			other => panic!("unexpected bridge frame: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn api_bridge_upgrade_requires_a_token() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let err = bridge_handshake(&api, "")
 			.await
-			.expect("first sse chunk")
-			.expect("first sse chunk bytes");
-		assert!(first.starts_with(b": keepalive"));
+			.expect_err("unauthenticated bridge upgrade rejected");
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+	}
+
+	#[tokio::test]
+	async fn api_bridge_enforces_admin_rpcs_for_client_tokens() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine.clone()).await;
+		let mut stream = bridge_handshake(&api, "token=client-token")
+			.await
+			.expect("client bridge upgrade");
+
+		send_bridge_frame(
+			&mut stream,
+			pb::bridge_frame::Frame::Call(pb::BridgeCall {
+				method:   "/vmon.v1.PoolService/Set".to_owned(),
+				metadata: HashMap::new(),
+			}),
+		)
+		.await;
+
+		match recv_bridge_frame(&mut stream).await {
+			pb::bridge_frame::Frame::End(end) => {
+				assert_eq!(end.status, Code::PermissionDenied as i32);
+				assert_eq!(end.trailers.get("vmon-code").map(String::as_str), Some("unauthorized"));
+			},
+			other => panic!("unexpected bridge frame: {other:?}"),
+		}
+		assert!(engine.captures().pool_sets.is_empty());
 	}
 }

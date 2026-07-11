@@ -25,7 +25,7 @@ def test_bound_sandbox_round_trip_over_v1_stub(monkeypatch, mvm_home) -> None:
                 tags={"suite": "remote"},
             )
 
-            create_payload = server.last("POST", "/v1/sandboxes").json
+            create_payload = server.last_rpc("SandboxService/Create").json
             assert create_payload["cpus"] == 2
             assert create_payload["memory"] == 1024
             assert create_payload["env"] == {"HELLO": "world"}
@@ -50,7 +50,7 @@ def test_bound_sandbox_round_trip_over_v1_stub(monkeypatch, mvm_home) -> None:
             assert "sdk-1" not in server.sandboxes
 
 
-def test_api_error_preserves_server_code_and_status(monkeypatch, mvm_home) -> None:
+def test_api_error_preserves_server_code(monkeypatch, mvm_home) -> None:
     with V1StubServer() as server:
         configure_context(monkeypatch, mvm_home, server)
 
@@ -59,7 +59,6 @@ def test_api_error_preserves_server_code_and_status(monkeypatch, mvm_home) -> No
                 client.sandboxes.get("missing")
 
         assert exc_info.value.code == "not_found"
-        assert exc_info.value.status == 404
         assert "unknown sandbox missing" in str(exc_info.value)
 
 
@@ -78,19 +77,17 @@ def test_function_decorator_reuses_one_warm_session(monkeypatch, mvm_home, capsy
 
         assert capsys.readouterr().out == "remote ran\nremote ran\n"
 
-        create_request = server.last("POST", "/v1/sandboxes")
+        create_request = server.last_rpc("SandboxService/Create")
         assert create_request.json["image"] == "python:3.14-slim"
-        runner_writes = [
-            request
-            for request in server.recorded("PUT", "/v1/sandboxes/sb-1/files")
-            if request.query["path"] == ["/tmp/vmon-fn-runner.py"]
-        ]
+        runner_writes = server.rpcs(
+            "SandboxService/FileWrite", id="sb-1", path="/tmp/vmon-fn-runner.py"
+        )
         assert len(runner_writes) == 1
-        session_execs = server.recorded("WS", "/v1/sandboxes/sb-1/exec")
+        session_execs = server.rpcs("SandboxService/Exec", id="sb-1")
         assert len(session_execs) == 1, "two remote() calls must share one exec session"
         assert session_execs[0].json["cmd"][:2] == ["python3", "-u"]
-        assert len(server.recorded("POST", "/v1/sandboxes")) == 1
-        assert server.last("POST", "/v1/sandboxes/sb-1/terminate").json is None
+        assert len(server.rpcs("SandboxService/Create")) == 1
+        assert server.last_rpc("SandboxService/Terminate", id="sb-1") is not None
 
 
 def test_client_function_map_uses_ephemeral_workers_and_terminates_them(
@@ -113,10 +110,10 @@ def test_client_function_map_uses_ephemeral_workers_and_terminates_them(
                 {"value": 5, "triple": 15},
             ]
 
-        created = server.recorded("POST", "/v1/sandboxes")
+        created = server.rpcs("SandboxService/Create")
         assert 1 <= len(created) <= 3
         for index in range(1, len(created) + 1):
-            terminates = server.recorded("POST", f"/v1/sandboxes/sb-{index}/terminate")
+            terminates = server.rpcs("SandboxService/Terminate", id=f"sb-{index}")
             assert len(terminates) == 1, f"worker sb-{index} was not terminated"
 
 
@@ -188,10 +185,10 @@ def test_map_fail_fast_terminates_every_worker_sandbox(monkeypatch, mvm_home) ->
             list(explode_on.map([1, 2, 3, 4], concurrency=2))
         explode_on.terminate()
 
-        created = server.recorded("POST", "/v1/sandboxes")
+        created = server.rpcs("SandboxService/Create")
         assert created, "map must have created worker sandboxes"
         for index in range(1, len(created) + 1):
-            terminates = server.recorded("POST", f"/v1/sandboxes/sb-{index}/terminate")
+            terminates = server.rpcs("SandboxService/Terminate", id=f"sb-{index}")
             assert terminates, f"worker sb-{index} leaked after fail-fast"
 
 
@@ -316,7 +313,7 @@ def test_sandbox_death_between_calls_recreates_transparently(monkeypatch, mvm_ho
 
         assert ping.remote() == "pong"
         ping.terminate()
-        assert len(server.recorded("POST", "/v1/sandboxes")) == 2
+        assert len(server.rpcs("SandboxService/Create")) == 2
 
 
 def test_json_serializer_rejects_rich_arguments(monkeypatch, mvm_home) -> None:
@@ -333,7 +330,7 @@ def test_json_serializer_rejects_rich_arguments(monkeypatch, mvm_home) -> None:
         # Tuples stay JSON-legal (encoded as arrays), matching the old behavior.
         assert echo.remote((1, 2)) == [1, 2]
         # Only the tuple call reached the server; the set was rejected locally.
-        assert len(server.recorded("POST", "/v1/sandboxes")) == 1
+        assert len(server.rpcs("SandboxService/Create")) == 1
         echo.terminate()
 
 
@@ -358,6 +355,21 @@ def test_invalid_serializer_rejected_eagerly(monkeypatch, mvm_home) -> None:
         @function(serializer="msgpack")
         def nope() -> None:
             pass
+
+
+def test_pool_option_registers_warm_pool_on_create(monkeypatch, mvm_home) -> None:
+    with V1StubServer() as server:
+        configure_context(monkeypatch, mvm_home, server)
+
+        @function(image="python:3.14-slim", pool=2)
+        def ping() -> str:
+            return "pong"
+
+        assert ping.remote() == "pong"
+        ping.terminate()
+
+        create = server.last_rpc("SandboxService/Create")
+        assert create.json["pool_size"] == 2
 
 
 def test_cls_keeps_state_runs_hooks_and_guards_methods(monkeypatch, mvm_home, tmp_path) -> None:
@@ -401,7 +413,7 @@ def test_cls_keeps_state_runs_hooks_and_guards_methods(monkeypatch, mvm_home, tm
         counter.terminate()
         assert time.monotonic() - started < 10, "terminate must not exhaust the grace period"
         assert sentinel.read_text() == "110", "exit hook must run on terminate"
-        assert server.recorded("POST", "/v1/sandboxes/sb-1/terminate")
+        assert server.rpcs("SandboxService/Terminate", id="sb-1")
 
 
 def test_cls_map_initializes_each_worker(monkeypatch, mvm_home) -> None:

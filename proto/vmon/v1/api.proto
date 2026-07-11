@@ -1,0 +1,688 @@
+syntax = "proto3";
+
+package vmon.v1;
+
+option go_package = "github.com/can1357/vibemon/sdk/go/internal/pb";
+
+// gRPC surface of the vmon v1 API — the ONLY API. All clients speak gRPC:
+// native HTTP/2 (h2c over TCP or UDS) for CLI/Python/Go, and a
+// gRPC-over-WebSocket bridge (vmon/v1/bridge.proto, `GET /grpc`) for
+// browsers/TypeScript. Only infrastructure surfaces remain plain HTTP:
+// healthz, /metrics, the guest ports proxy, static UI, and mesh-internal
+// template distribution.
+//
+// Documents that are schemaless JSON in the engine (sandbox views, create
+// specs, bodies with flattened extras) travel as JSON strings — their schema
+// is owned by the engine, not this file. Fully-typed REST bodies are proto
+// messages here.
+//
+// Errors: RPCs fail with a gRPC status; the stable vmond error code
+// (vmond/src/error.rs: not_found, not_running, busy, invalid, unsupported,
+// unauthorized, engine) is carried in `vmon-code` response metadata.
+// Status mapping: not_found→NOT_FOUND, invalid→INVALID_ARGUMENT,
+// unauthorized→UNAUTHENTICATED, not_running→FAILED_PRECONDITION,
+// busy→ABORTED, unsupported→UNIMPLEMENTED, engine→UNAVAILABLE.
+
+// SandboxService provides RPCs to manage microVM sandboxes, perform file operations,
+// stream logs, manage networks, and execute interactive processes.
+service SandboxService {
+  // Creates a new microVM sandbox instance.
+  //
+  // Replaces: POST /v1/sandboxes
+  // Errors:
+  //   - `invalid` (INVALID_ARGUMENT): The create spec is invalid or malformed.
+  //   - `busy` (ABORTED): Required resources are locked.
+  //   - `engine` (UNAVAILABLE): Hypervisor allocation or creation failed.
+  rpc Create(CreateSandboxRequest) returns (JsonView);
+
+  // Lists all registered microVM sandboxes, optionally filtered by tags.
+  //
+  // Replaces: GET /v1/sandboxes
+  rpc List(ListSandboxesRequest) returns (ListSandboxesResponse);
+
+  // Retrieves the current state, metadata, and status of a specific microVM sandbox.
+  //
+  // Replaces: GET /v1/sandboxes/{id}
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Get(SandboxRef) returns (JsonView);
+
+  // Gracefully stops a running sandbox microVM.
+  // Sends a shutdown signal to the guest OS. If it fails to exit within a grace period,
+  // it may be forcefully terminated depending on configuration.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/stop
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is already stopped.
+  rpc Stop(StopSandboxRequest) returns (JsonView);
+
+  // Stops (if running) and removes a sandbox from the registry, freeing all non-persistent resources.
+  //
+  // Replaces: DELETE /v1/sandboxes/{id}
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Remove(SandboxRef) returns (JsonView);
+
+  // Immediately terminates a sandbox microVM hypervisor process without graceful shutdown.
+  // Equivalent to pulling the power plug.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/terminate
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Terminate(SandboxRef) returns (JsonView);
+
+  // Pauses the execution of all vCPUs in the sandbox.
+  // CPU threads are quiesced via signal (Linux) or hypervisor callback (macOS/HVF).
+  //
+  // Replaces: POST /v1/sandboxes/{id}/pause
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc Pause(SandboxRef) returns (JsonView);
+
+  // Resumes vCPU execution for a paused sandbox.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/resume
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+  rpc Resume(SandboxRef) returns (JsonView);
+
+  // Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/extend
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Extend(ExtendSandboxRequest) returns (JsonView);
+
+  // Retrieves real-time performance and utilization metrics for the microVM.
+  // Includes CPU utilization, memory footprint, virtio block/net throughput, and guest metrics.
+  //
+  // Replaces: GET /v1/sandboxes/{id}/metrics
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Metrics(SandboxRef) returns (JsonView);
+
+  // Streams the console log output of the microVM.
+  // Supports streaming historical logs (via `tail`) and real-time output (via `follow`).
+  //
+  // Replaces: GET /v1/sandboxes/{id}/logs
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Logs(LogsRequest) returns (stream LogChunk);
+
+  // Executes a non-interactive command inside the guest via the guest agent and captures
+  // its complete exit status, stdout, and stderr.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/exec
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
+  //   - `invalid` (INVALID_ARGUMENT): Invalid command or arguments.
+  rpc ExecCapture(ExecCaptureRequest) returns (ExecCaptureResponse);
+
+  // Opens a bidirectional, interactive execution stream inside the guest via the guest agent.
+  // Supports PTY/TTY allocation, real-time stdin write, resize, EOF signaling, and exit status streaming.
+  // The first `ExecInput` message sent MUST contain the `ExecStart` payload.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
+
+  // Opens an interactive shell session inside the guest.
+  // The first `ExecInput` message sent MUST contain the `shell_params_json` payload.
+  // The server emits a `Ready` frame containing the resolved sandbox ID before streaming I/O.
+  //
+  // Replaces: GET /v1/shell
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc Shell(stream ExecInput) returns (stream ExecOutput);
+
+  // Attaches a read-only stream to the microVM serial console, forwarding guest kernel output and boot logs.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Attach(SandboxRef) returns (stream ExecOutput);
+
+  // Reads the complete contents of a file inside the guest sandbox filesystem.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or the specified file does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc FileRead(FilePathRequest) returns (FileContent);
+
+  // Writes or overwrites a file inside the guest sandbox filesystem.
+  // Creates parent directories if they do not exist.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc FileWrite(FileWriteRequest) returns (Ok);
+
+  // Deletes a file or directory inside the guest sandbox filesystem.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or the specified file/directory does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc FileDelete(FileDeleteRequest) returns (Ok);
+
+  // Lists files and directories within a given directory inside the guest sandbox.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or the specified path does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc FileList(FilePathRequest) returns (JsonView);
+
+  // Performs a metadata query (stat) on a file inside the guest sandbox (size, type, permissions, times).
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or the specified file does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc FileStat(FilePathRequest) returns (JsonView);
+
+  // Retrieves the active network configuration, interfaces, and routing for the sandbox.
+  //
+  // Replaces: GET /v1/sandboxes/{id}/network
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc NetworkGet(SandboxRef) returns (JsonView);
+
+  // Updates the network access controls, allowed CIDRs, and allowed domains for the sandbox.
+  //
+  // Replaces: PUT /v1/sandboxes/{id}/network
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `invalid` (INVALID_ARGUMENT): Invalid network rules or CIDR formats.
+  rpc NetworkSet(NetworkSetRequest) returns (JsonView);
+
+  // Retrieves active network tunnels and port-forwardings mapped to the sandbox.
+  //
+  // Replaces: GET /v1/sandboxes/{id}/tunnels
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc Tunnels(SandboxRef) returns (JsonView);
+
+  // Initiates state migration of the sandbox to a target destination or host.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/migrate
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+  rpc Migrate(MigrateRequest) returns (JsonView);
+
+  // Captures a snapshot of the sandbox's memory, register, and device state.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/snapshot
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not currently running.
+  rpc Snapshot(SnapshotRequest) returns (JsonView);
+
+  // Triggers a filesystem freeze and creates a filesystem-level snapshot on disk.
+  //
+  // Replaces: POST /v1/sandboxes/{id}/snapshot-fs
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  rpc SnapshotFs(SnapshotFsRequest) returns (JsonView);
+}
+
+// SnapshotService manages saved microVM snapshots, enabling restorations and high-density forks.
+service SnapshotService {
+  // Lists all snapshots currently registered in the engine.
+  //
+  // Replaces: GET /v1/snapshots
+  rpc List(ListSnapshotsRequest) returns (SnapshotList);
+
+  // Restores a microVM sandbox instance from a previously captured snapshot.
+  //
+  // Replaces: POST /v1/snapshots/{name}/restore
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified snapshot name does not exist.
+  //   - `invalid` (INVALID_ARGUMENT): Invalid configuration parameters.
+  rpc Restore(RestoreSnapshotRequest) returns (JsonView);
+
+  // Rapidly forks one or more new sandbox instances from an existing snapshot.
+  // Under the hood, this utilizes copy-on-write sharing for high density and instant startup.
+  //
+  // Replaces: POST /v1/snapshots/{name}/fork
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified snapshot name does not exist.
+  //   - `invalid` (INVALID_ARGUMENT): Invalid count or target configuration.
+  rpc Fork(ForkSnapshotRequest) returns (JsonView);
+}
+
+// VolumeService provides RPCs for managing persistent block storage volumes.
+service VolumeService {
+  // Lists all persistent volumes currently registered in the engine registry.
+  //
+  // Replaces: GET /v1/volumes
+  rpc List(ListVolumesRequest) returns (VolumeList);
+
+  // Creates a new persistent block storage volume.
+  //
+  // Replaces: POST /v1/volumes
+  // Errors:
+  //   - `invalid` (INVALID_ARGUMENT): Invalid volume name, size, or parameters.
+  //   - `busy` (ABORTED): Volume with the same name already exists.
+  rpc Create(VolumeRef) returns (Ok);
+
+  // Deletes a persistent block storage volume, permanently freeing its underlying disk storage.
+  //
+  // Replaces: DELETE /v1/volumes/{name}
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified volume does not exist.
+  //   - `busy` (ABORTED): The volume is currently attached to a sandbox and cannot be deleted.
+  rpc Delete(VolumeRef) returns (Ok);
+}
+
+// PoolService manages warm pools of standby microVMs to eliminate cold-start latency.
+service PoolService {
+  // Lists configured warm pools and their standby microVM counts.
+  //
+  // Replaces: GET /v1/pools
+  rpc List(ListPoolsRequest) returns (JsonView);
+
+  // Creates or updates a warm pool configuration, adjusting the standby target size.
+  //
+  // Replaces: PUT /v1/pools/{reference}
+  // Errors:
+  //   - `invalid` (INVALID_ARGUMENT): Invalid pool definition or size.
+  rpc Set(PoolSetRequest) returns (JsonView);
+
+  // Deletes a warm pool and tears down all pre-warmed standby sandboxes within it.
+  //
+  // Replaces: DELETE /v1/pools/{reference}
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified pool reference does not exist.
+  rpc Delete(PoolRef) returns (Ok);
+}
+
+// SystemService provides administrative queries and streams engine-wide event feeds.
+service SystemService {
+  // Retrieves general status, version, capabilities, and system metrics from the host engine.
+  //
+  // Replaces: GET /v1/info
+  rpc Info(InfoRequest) returns (JsonView);
+
+  // Streams real-time engine-wide events (e.g. sandbox boots, shutdowns, updates).
+  //
+  // Replaces: GET /v1/events (SSE)
+  rpc Events(EventsRequest) returns (stream JsonView);
+
+  // Mesh roster/status document for SDK endpoint discovery.
+  //
+  // Replaces: GET /v1/mesh/status (other /v1/mesh/* admin routes are
+  // mesh-internal and remain HTTP).
+  rpc MeshStatus(MeshStatusRequest) returns (JsonView);
+}
+
+// JsonView represents a schemaless JSON document string.
+// Used for documents whose schemas are fully managed by the engine (e.g. sandbox view, metrics).
+message JsonView {
+  // The JSON-serialized object content.
+  string json = 1;
+}
+
+// Ok represents a successful empty response.
+message Ok {}
+
+// SandboxRef references a specific sandbox instance by its ID.
+message SandboxRef {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+}
+
+// CreateSandboxRequest wraps the configuration JSON for sandbox creation.
+message CreateSandboxRequest {
+  // SandboxCreate JSON document payload — matches the former REST schema.
+  string spec_json = 1;
+}
+
+// ListSandboxesRequest specifies filters for listing sandbox instances.
+message ListSandboxesRequest {
+  // Optional tag filter items (format: `key=value`). If empty, lists all sandboxes.
+  repeated string tags = 1;
+}
+
+// ListSandboxesResponse wraps the list of retrieved sandbox configurations.
+message ListSandboxesResponse {
+  // An array of JSON-serialized sandbox view documents.
+  repeated string sandboxes_json = 1;
+}
+
+// StopSandboxRequest represents parameters to gracefully stop a sandbox.
+message StopSandboxRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Optional exit/return code of the foreground CLI process to preserve in metrics and logs.
+  optional int64 returncode = 2;
+}
+
+// ExtendSandboxRequest represents parameters to extend the TTL of a sandbox.
+message ExtendSandboxRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // The duration to extend the sandbox's lifespan, in seconds.
+  uint64 secs = 2;
+}
+
+// LogsRequest represents criteria for streaming microVM logs.
+message LogsRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // If true, the stream remains open and continues to send new console lines in real time (follow).
+  bool follow = 2;
+
+  // If set, specifies the number of historical console lines to retrieve before streaming new logs.
+  optional uint64 tail = 3;
+}
+
+// LogChunk represents a binary slice of streamed console logs.
+message LogChunk {
+  // Raw byte payload containing the console output segment.
+  bytes data = 1;
+}
+
+// ExecStart defines execution parameters for a command run inside the guest.
+message ExecStart {
+  // The command-line command and its arguments to run (e.g., ["sh", "-c", "ls -l"]).
+  repeated string cmd = 1;
+
+  // Optional absolute path of the directory inside the guest to start execution in.
+  optional string workdir = 2;
+
+  // Optional key-value environment variables to inject into the executed process.
+  map<string, string> env = 3;
+
+  // Optional process timeout duration in seconds. If exceeded, the process is terminated.
+  optional double timeout = 4;
+
+  // If true, allocates a pseudoterminal (PTY/TTY) inside the guest for interactive sessions.
+  bool tty = 5;
+  // Target sandbox. Required in the first ExecInput of SandboxService.Exec
+  // (INVALID_ARGUMENT when empty); ignored under ExecCaptureRequest, whose
+  // own `id` is authoritative.
+  string sandbox_id = 6;
+}
+
+// ExecCaptureRequest represents execution parameters for buffered output capture.
+message ExecCaptureRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // The execution configuration.
+  ExecStart exec = 2;
+}
+
+// ExecCaptureResponse contains the final status and complete buffered outputs of a command.
+message ExecCaptureResponse {
+  // The process termination status exit code.
+  int64 code = 1;
+
+  // The POSIX signal that terminated the process, if applicable.
+  optional int64 signal = 2;
+
+  // Complete stdout buffer contents captured from the command.
+  bytes stdout = 3;
+
+  // Complete stderr buffer contents captured from the command (empty if TTY is allocated).
+  bytes stderr = 4;
+}
+
+// ExecInput represents the client-to-server payload in interactive execution streams.
+message ExecInput {
+  // The interactive input event.
+  oneof input {
+    // Required first message on the `/exec` stream to initiate execution.
+    ExecStart start = 1;
+
+    // Required first message on the `/shell` stream to initialize the shell.
+    // Contains JSON configuration (e.g. "{}" for defaults).
+    string shell_params_json = 2;
+
+    // A chunk of raw standard input (stdin) bytes to write to the guest process.
+    bytes stdin = 3;
+
+    // Signals the closing of the standard input stream (EOF) from the client.
+    Eof eof = 4;
+
+    // Requests a change in the guest's pseudoterminal (pty) window dimensions.
+    Resize resize = 5;
+  }
+}
+
+// ExecOutput represents the server-to-client payload in interactive execution streams.
+message ExecOutput {
+  // The interactive output event.
+  oneof output {
+    // A chunk of standard output or standard error streamed from the guest.
+    Output chunk = 1;
+
+    // Indicates that the guest process has terminated.
+    Exit exit = 2;
+
+    // Emitted exactly once upon successful session initialization before any chunks are sent.
+    Ready ready = 3;
+  }
+}
+
+// FilePathRequest specifies a file path within a sandbox's guest filesystem.
+message FilePathRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // The target absolute path inside the guest.
+  string path = 2;
+}
+
+// FileContent contains raw file data read from the guest.
+message FileContent {
+  // The raw file data payload.
+  bytes data = 1;
+}
+
+// FileWriteRequest encapsulates data to write to a path in the guest filesystem.
+message FileWriteRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // The target absolute path inside the guest.
+  string path = 2;
+
+  // The raw data payload to write.
+  bytes data = 3;
+}
+
+// FileDeleteRequest represents parameters for deleting a guest file.
+message FileDeleteRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // The target absolute path inside the guest.
+  string path = 2;
+
+  // If true, recursively deletes directories and their contents.
+  bool recursive = 3;
+}
+
+// StringList represents a list of string values. Used to distinguish between
+// an empty list and an omitted/absent list (for presence-aware updates).
+message StringList {
+  // The string values.
+  repeated string values = 1;
+}
+
+// NetworkSetRequest represents network firewall and access rules updates for a sandbox.
+message NetworkSetRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Optional: if set, blocks or allows external network access for the sandbox.
+  optional bool block_network = 2;
+
+  // Presence-aware CIDR block IP whitelist. If omitted, CIDR allowlist is left unchanged.
+  StringList cidr_allow = 3;
+
+  // Presence-aware domain name whitelist. If omitted, domain allowlist is left unchanged.
+  StringList domain_allow = 4;
+}
+
+// MigrateRequest represents parameters to migrate a sandbox.
+message MigrateRequest {
+  // The unique identifier of the target sandbox to migrate.
+  string id = 1;
+
+  // The destination address or host URI.
+  string target = 2;
+}
+
+// SnapshotRequest defines snapshot creation parameters.
+message SnapshotRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Optional name to assign to the snapshot. If omitted, an auto-generated name is used.
+  optional string name = 2;
+
+  // If true, stops the sandbox microVM immediately after taking the snapshot.
+  bool stop = 3;
+}
+
+// SnapshotFsRequest defines filesystem-level freeze/snapshot parameters.
+message SnapshotFsRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Optional name to assign to the filesystem snapshot.
+  optional string name = 2;
+}
+
+// ListSnapshotsRequest represents a request to list snapshots.
+message ListSnapshotsRequest {}
+
+// SnapshotList wraps the list of registered snapshots.
+message SnapshotList {
+  // The list of snapshot names.
+  repeated string snapshots = 1;
+}
+
+// RestoreSnapshotRequest represents parameters to restore a sandbox from a snapshot.
+message RestoreSnapshotRequest {
+  // The unique identifier or name of the target snapshot.
+  string name = 1;
+
+  // JSON configuration string mapping to RestoreBody (defines targets, pool assignments, and options).
+  string body_json = 2;
+}
+
+// ForkSnapshotRequest represents parameters to clone/fork a sandbox from a snapshot.
+message ForkSnapshotRequest {
+  // The unique identifier or name of the source snapshot.
+  string name = 1;
+
+  // JSON configuration string mapping to ForkBody (defines copy-on-write target counts and settings).
+  string body_json = 2;
+}
+
+// ListVolumesRequest represents a request to list persistent volumes.
+message ListVolumesRequest {}
+
+// VolumeList wraps the list of persistent volumes.
+message VolumeList {
+  // The list of persistent volume names.
+  repeated string volumes = 1;
+}
+
+// VolumeRef represents a reference to a persistent volume.
+message VolumeRef {
+  // The unique name of the persistent volume.
+  string name = 1;
+}
+
+// ListPoolsRequest represents a request to list warm pools.
+message ListPoolsRequest {}
+
+// PoolSetRequest represents configuration for creating/updating a warm pool.
+message PoolSetRequest {
+  // The reference identifier of the warm pool.
+  string reference = 1;
+
+  // JSON configuration string mapping to PoolPutBody (defines standby sandbox pool size and specs).
+  string body_json = 2;
+}
+
+// PoolRef represents a reference to a warm pool.
+message PoolRef {
+  // The reference identifier of the target warm pool.
+  string reference = 1;
+}
+
+// InfoRequest represents a request for server metadata.
+message InfoRequest {}
+
+// MeshStatusRequest represents a request for the mesh roster/status document.
+message MeshStatusRequest {}
+
+// EventsRequest represents a request to stream system events.
+message EventsRequest {}
+
+// Eof signals the completion of the standard input stream (EOF) from client to server.
+message Eof {}
+
+// Resize defines the dimensions of a pseudoterminal (pty) window.
+message Resize {
+  // The number of terminal rows. Must be in the range [1, 65535].
+  // Values outside this range will cause the server to reject the resize request.
+  uint32 rows = 1;
+
+  // The number of terminal columns. Must be in the range [1, 65535].
+  // Values outside this range will cause the server to reject the resize request.
+  uint32 cols = 2;
+}
+
+// Output encapsulates output data streamed from a running guest process or the hypervisor console.
+message Output {
+  // The stream source of the output data (stdout, stderr, or console).
+  Stream stream = 1;
+
+  // The raw byte payload of the output chunk.
+  bytes data = 2;
+}
+
+// Stream identifies the source channel of streamed output data.
+enum Stream {
+  // Unspecified stream. Used as a fallback or default value.
+  STREAM_UNSPECIFIED = 0;
+
+  // Standard output stream (stdout) of the executed process.
+  STREAM_STDOUT = 1;
+
+  // Standard error stream (stderr) of the executed process.
+  STREAM_STDERR = 2;
+
+  // Hypervisor-level raw serial console stream of the microVM.
+  STREAM_CONSOLE = 3;
+}
+
+// Exit represents the termination status of an executed guest process.
+message Exit {
+  // The process exit status code. Typically 0 for success, and non-zero for failures.
+  int64 code = 1;
+
+  // The POSIX signal number that terminated the process, if applicable (e.g. SIGKILL, SIGSEGV).
+  // Omitted if the process exited voluntarily.
+  optional int64 signal = 2;
+}
+
+// Ready signals that the interactive session has been initialized successfully.
+message Ready {
+  // The unique identifier of the active microVM sandbox.
+  string sandbox_id = 1;
+}

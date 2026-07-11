@@ -1,19 +1,20 @@
-"""Per-endpoint HTTP and WebSocket mechanics for the Rust v1 API."""
+"""Per-endpoint gRPC channel, HTTP, and WebSocket mechanics for the Rust v1 API."""
 
 from __future__ import annotations
 
-import base64
 import json
 import socket
 import ssl
 import threading
-from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
+import grpc
 import httpx
 
 from .errors import APIError, ProtocolError, TransportError
+from .v1 import api_pb2_grpc
 from .wsframe import (
     WebSocketHandshakeError,
     client_handshake,
@@ -44,6 +45,22 @@ def _safe_segment(value: str) -> str:
     return encoded.replace(".", "%2E") if encoded in {".", ".."} else encoded
 
 
+def dump_json(value: Any) -> str:
+    """Serialize a JSON request document with the SDK's canonical encoding."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def decode_view(payload: str, error: str) -> dict[str, Any]:
+    """Parse a ``JsonView`` document, requiring a JSON object."""
+    try:
+        value = json.loads(payload)
+    except ValueError as exc:
+        raise ProtocolError(error) from exc
+    if not isinstance(value, dict):
+        raise ProtocolError(error)
+    return value
+
+
 class WebSocketConnection:
     """Blocking RFC 6455 connection used by streaming SDK operations."""
 
@@ -56,10 +73,6 @@ class WebSocketConnection:
     def closed(self) -> bool:
         """Return whether this connection has been closed locally or remotely."""
         return self._closed
-
-    def send_json(self, value: dict[str, Any]) -> None:
-        """Send a deterministic JSON object as one text message."""
-        self.send_text(json.dumps(value, separators=(",", ":"), sort_keys=True))
 
     def send_text(self, text: str) -> None:
         """Send one UTF-8 text message."""
@@ -132,20 +145,6 @@ class WebSocketConnection:
             except UnicodeDecodeError as exc:
                 raise ProtocolError("invalid websocket text frame") from exc
 
-    def recv_json(self) -> dict[str, Any] | None:
-        """Receive one JSON object, returning ``None`` after a close frame."""
-        message = self.recv_message()
-        if message is None:
-            return None
-        try:
-            text = message.decode("utf-8") if isinstance(message, bytes) else message
-            value = json.loads(text)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProtocolError("invalid websocket JSON frame") from exc
-        if not isinstance(value, dict):
-            raise ProtocolError("invalid websocket frame")
-        return value
-
     def _release_socket(self) -> None:
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
@@ -176,47 +175,114 @@ class WebSocketConnection:
         self.close()
 
 
-class ResponseStream:
-    """Closeable streaming HTTP response returned by :class:`EndpointTransport`."""
+GRPC_MAX_MESSAGE = 64 * 1024 * 1024
 
-    def __init__(self, manager: Any, response: httpx.Response) -> None:
-        self._manager = manager
-        self.response = response
-        self._closed = False
+_GRPC_STATUS_TO_CODE = {
+    grpc.StatusCode.NOT_FOUND: "not_found",
+    grpc.StatusCode.INVALID_ARGUMENT: "invalid",
+    grpc.StatusCode.UNAUTHENTICATED: "unauthorized",
+    grpc.StatusCode.FAILED_PRECONDITION: "not_running",
+    grpc.StatusCode.ABORTED: "busy",
+    grpc.StatusCode.UNIMPLEMENTED: "unsupported",
+    grpc.StatusCode.UNAVAILABLE: "engine",
+}
 
-    def iter_lines(self) -> Iterator[str]:
-        """Yield decoded response lines and map read failures to transport errors."""
-        try:
-            yield from self.response.iter_lines()
-        except httpx.TimeoutException as exc:
-            raise TransportError("vmon API stream timed out") from exc
-        except httpx.HTTPError as exc:
-            raise TransportError(f"vmon API stream failed: {exc}") from exc
-        finally:
-            self.close()
 
-    def iter_bytes(self) -> Iterator[bytes]:
-        """Yield response chunks and map read failures to transport errors."""
-        try:
-            yield from self.response.iter_bytes()
-        except httpx.TimeoutException as exc:
-            raise TransportError("vmon API stream timed out") from exc
-        except httpx.HTTPError as exc:
-            raise TransportError(f"vmon API stream failed: {exc}") from exc
-        finally:
-            self.close()
+def translate_rpc_error(
+    exc: grpc.RpcError,
+    *,
+    endpoint: str | None = None,
+    fallback_message: str = "vmon API call failed",
+    fallback_code: str = "engine",
+) -> APIError | TransportError:
+    """Translate a gRPC failure into the SDK's stable error categories.
 
-    def close(self) -> None:
-        """Close the response stream idempotently."""
-        if not self._closed:
-            self._closed = True
-            self._manager.__exit__(None, None, None)
+    A ``vmon-code`` entry in the trailing metadata marks an error produced by
+    vmond itself and wins over the status-code reverse map; a bare UNAVAILABLE,
+    DEADLINE_EXCEEDED, or CANCELLED never reached a daemon and is a
+    :class:`TransportError`, which drives mesh failover.
+    """
+    status = exc.code() if isinstance(exc, grpc.Call) else None
+    message = (exc.details() or "") if isinstance(exc, grpc.Call) else str(exc)
+    trailing = exc.trailing_metadata() if isinstance(exc, grpc.Call) else None
+    code = next((value for key, value in trailing or () if key == "vmon-code"), None)
+    if code:
+        return APIError(message or fallback_message, code=str(code))
+    if status == grpc.StatusCode.UNAVAILABLE:
+        return TransportError(
+            f"cannot reach vmon daemon at {endpoint or 'endpoint'}: {message}",
+            endpoint=endpoint,
+        )
+    if status == grpc.StatusCode.DEADLINE_EXCEEDED:
+        return TransportError("vmon API request timed out", endpoint=endpoint)
+    if status == grpc.StatusCode.CANCELLED:
+        return TransportError("vmon API call was cancelled", endpoint=endpoint)
+    mapped = _GRPC_STATUS_TO_CODE.get(status) if status is not None else None
+    return APIError(message or fallback_message, code=mapped or fallback_code)
 
-    def __enter__(self) -> ResponseStream:
-        return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+@dataclass(frozen=True, slots=True)
+class _CallDetails(grpc.ClientCallDetails):
+    method: str
+    timeout: float | None
+    metadata: tuple[tuple[str, str], ...] | None
+    credentials: Any
+    wait_for_ready: Any
+    compression: Any
+
+
+class _AuthInterceptor(
+    grpc.UnaryUnaryClientInterceptor,
+    grpc.UnaryStreamClientInterceptor,
+    grpc.StreamUnaryClientInterceptor,
+    grpc.StreamStreamClientInterceptor,
+):
+    """Adds bearer-token metadata and a default deadline for non-streaming calls."""
+
+    def __init__(self, token: str | None, timeout: float) -> None:
+        self._metadata: tuple[tuple[str, str], ...] = (
+            (("authorization", f"Bearer {token}"),) if token else ()
+        )
+        self._timeout = timeout
+
+    def _augment(self, details: grpc.ClientCallDetails, *, deadline: bool) -> _CallDetails:
+        metadata = (*tuple(details.metadata or ()), *self._metadata)
+        timeout = details.timeout
+        if timeout is None and deadline:
+            timeout = self._timeout
+        return _CallDetails(
+            method=details.method,
+            timeout=timeout,
+            metadata=metadata or None,
+            credentials=details.credentials,
+            wait_for_ready=getattr(details, "wait_for_ready", None),
+            compression=getattr(details, "compression", None),
+        )
+
+    def intercept_unary_unary(self, continuation: Any, details: Any, request: Any) -> Any:
+        return continuation(self._augment(details, deadline=True), request)
+
+    def intercept_unary_stream(self, continuation: Any, details: Any, request: Any) -> Any:
+        return continuation(self._augment(details, deadline=False), request)
+
+    def intercept_stream_unary(self, continuation: Any, details: Any, request_iterator: Any) -> Any:
+        return continuation(self._augment(details, deadline=True), request_iterator)
+
+    def intercept_stream_stream(
+        self, continuation: Any, details: Any, request_iterator: Any
+    ) -> Any:
+        return continuation(self._augment(details, deadline=False), request_iterator)
+
+
+class GrpcStubs:
+    """Per-endpoint service stubs sharing one authenticated channel."""
+
+    def __init__(self, channel: grpc.Channel) -> None:
+        self.sandbox = api_pb2_grpc.SandboxServiceStub(channel)
+        self.snapshots = api_pb2_grpc.SnapshotServiceStub(channel)
+        self.volumes = api_pb2_grpc.VolumeServiceStub(channel)
+        self.pools = api_pb2_grpc.PoolServiceStub(channel)
+        self.system = api_pb2_grpc.SystemServiceStub(channel)
 
 
 class EndpointTransport:
@@ -246,6 +312,9 @@ class EndpointTransport:
             self._client = httpx.Client(
                 base_url=self.base_url, headers=headers, timeout=self.timeout
             )
+        self._grpc_lock = threading.Lock()
+        self._grpc_channel: grpc.Channel | None = None
+        self._grpc_stubs: GrpcStubs | None = None
 
     def clone(self) -> EndpointTransport:
         """Return an independent transport with the same endpoint and credentials."""
@@ -257,14 +326,50 @@ class EndpointTransport:
         )
 
     def close(self) -> None:
-        """Close pooled HTTP connections."""
+        """Close pooled HTTP connections and the gRPC channel."""
         self._client.close()
+        with self._grpc_lock:
+            channel = self._grpc_channel
+            self._grpc_channel = None
+            self._grpc_stubs = None
+        if channel is not None:
+            channel.close()
 
     def __enter__(self) -> EndpointTransport:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _grpc_target(self) -> str:
+        if self.uds is not None:
+            return f"unix:{self.uds}"
+        parsed = urlsplit(self.base_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return f"{host}:{port}"
+
+    @property
+    def stubs(self) -> GrpcStubs:
+        """Return the lazily-created service stubs for this endpoint."""
+        with self._grpc_lock:
+            if self._grpc_stubs is None:
+                options = (
+                    ("grpc.max_send_message_length", GRPC_MAX_MESSAGE),
+                    ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE),
+                )
+                target = self._grpc_target()
+                if self.uds is None and urlsplit(self.base_url).scheme == "https":
+                    channel = grpc.secure_channel(
+                        target, grpc.ssl_channel_credentials(), options=options
+                    )
+                else:
+                    channel = grpc.insecure_channel(target, options=options)
+                self._grpc_channel = channel
+                self._grpc_stubs = GrpcStubs(
+                    grpc.intercept_channel(channel, _AuthInterceptor(self.token, self.timeout))
+                )
+            return self._grpc_stubs
 
     def request(
         self,
@@ -302,53 +407,6 @@ class EndpointTransport:
             raise self._error_from_response(response)
         return response
 
-    def stream(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: Any | None = None,
-        json_body: Any | None = None,
-        content: bytes | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> ResponseStream:
-        """Open a streaming HTTP response that must be closed by the caller."""
-        request_headers, request_content = self._request_data(json_body, content, headers)
-        manager = self._client.stream(
-            method,
-            path,
-            params=params,
-            content=request_content,
-            headers=request_headers,
-        )
-        try:
-            response = manager.__enter__()
-        except httpx.ConnectError as exc:
-            target = self.uds if self.uds is not None else self.base_url
-            raise TransportError(
-                f"cannot reach vmon daemon at {target}: {exc}", endpoint=target
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise TransportError("vmon API request timed out", endpoint=self.base_url) from exc
-        except httpx.HTTPError as exc:
-            raise TransportError(
-                f"vmon API transport failed: {exc}", endpoint=self.base_url
-            ) from exc
-        if response.status_code >= 400:
-            try:
-                response.read()
-                error = self._error_from_response(response)
-            except httpx.TimeoutException as exc:
-                raise TransportError("vmon API stream timed out", endpoint=self.base_url) from exc
-            except httpx.HTTPError as exc:
-                raise TransportError(
-                    f"vmon API stream failed: {exc}", endpoint=self.base_url
-                ) from exc
-            finally:
-                manager.__exit__(None, None, None)
-            raise error
-        return ResponseStream(manager, response)
-
     def _request_data(
         self,
         json_body: Any | None,
@@ -366,23 +424,6 @@ class EndpointTransport:
                 json_body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
             ).encode("utf-8")
         return request_headers, content
-
-    def json(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = self.request(method, path, **kwargs)
-        if not response.content:
-            return {}
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise ProtocolError("vmon API returned invalid JSON") from exc
-
-    def text(self, method: str, path: str, **kwargs: Any) -> str:
-        response = self.request(method, path, **kwargs)
-        return response.text
-
-    def bytes(self, method: str, path: str, **kwargs: Any) -> bytes:
-        response = self.request(method, path, **kwargs)
-        return response.content
 
     def websocket(self, path: str, *, params: Any | None = None) -> WebSocketConnection:
         """Open an authenticated WebSocket connection."""
@@ -490,11 +531,3 @@ class EndpointTransport:
 
 def path_segment(value: str) -> str:
     return _safe_segment(value)
-
-
-def b64(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
-def unb64(text: str) -> bytes:
-    return base64.b64decode(text.encode("ascii"), validate=True)

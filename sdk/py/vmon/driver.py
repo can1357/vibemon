@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import json as jsonlib
 import math
 import os
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
+import grpc
 import httpx
 
-from ._endpoint import EndpointTransport, ResponseStream, WebSocketConnection, path_segment
+from ._endpoint import (
+    EndpointTransport,
+    GrpcStubs,
+    WebSocketConnection,
+    translate_rpc_error,
+)
 from .context import ContextStore, state_dir
 from .errors import APIError, ProtocolError, TransportError
+from .v1 import api_pb2
 
 DEFAULT_PORT = 8000
 DEFAULT_TIMEOUT = 60.0
@@ -47,6 +55,16 @@ class EndpointInfo:
 class Driver(Protocol):
     """Transport seam consumed by :class:`vmon.Client`."""
 
+    def call[T](
+        self,
+        fn: Callable[[GrpcStubs], T],
+        *,
+        endpoint: str | None = None,
+        stream: bool = False,
+    ) -> tuple[T, str]:
+        """Invoke one gRPC call with transport-only failover."""
+        ...
+
     def request(
         self,
         method: str,
@@ -56,11 +74,10 @@ class Driver(Protocol):
         json: Any | None = None,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
-        stream: bool = False,
         endpoint: str | None = None,
         raise_for_status: bool = True,
-    ) -> httpx.Response | ResponseStream:
-        """Issue one API request with transport-only failover."""
+    ) -> httpx.Response:
+        """Issue one HTTP request (ports proxy, health) with transport-only failover."""
         ...
 
     def websocket(
@@ -296,6 +313,58 @@ class MeshDriver:
         self._refreshing = False
         self._closed = False
 
+    def call[T](
+        self,
+        fn: Callable[[GrpcStubs], T],
+        *,
+        endpoint: str | None = None,
+        stream: bool = False,
+    ) -> tuple[T, str]:
+        """Invoke one gRPC call, retrying only failures that did not reach a daemon."""
+        return self._call(fn, endpoint=endpoint, stream=stream, trigger_refresh=True)
+
+    def _call[T](
+        self,
+        fn: Callable[[GrpcStubs], T],
+        *,
+        endpoint: str | None,
+        stream: bool,
+        trigger_refresh: bool,
+    ) -> tuple[T, str]:
+        candidates = self._candidates(endpoint)
+        last_error: TransportError | None = None
+        failed_over = False
+        for candidate in candidates:
+            transport = self._transport(candidate)
+            try:
+                result = fn(transport.stubs)
+                if stream:
+                    # Streaming calls return immediately; block until the server
+                    # accepts the stream so connect failures fail over here.
+                    rendezvous: Any = result
+                    rendezvous.initial_metadata()
+                    if rendezvous.done() and rendezvous.code() != grpc.StatusCode.OK:
+                        raise rendezvous
+            except grpc.RpcError as exc:
+                error = translate_rpc_error(exc, endpoint=candidate)
+                if isinstance(error, TransportError):
+                    last_error = error
+                    failed_over = True
+                    self._mark_failed(candidate)
+                    continue
+                self._mark_success(candidate)
+                if trigger_refresh:
+                    self._refresh_after_request(failed_over)
+                raise error from exc
+            self._mark_success(candidate)
+            if trigger_refresh:
+                self._refresh_after_request(failed_over)
+            return result, candidate
+
+        if last_error is not None:
+            raise last_error
+        raise TransportError("no vmon endpoints are currently available")
+
     def request(
         self,
         method: str,
@@ -305,64 +374,25 @@ class MeshDriver:
         json: Any | None = None,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
-        stream: bool = False,
         endpoint: str | None = None,
         raise_for_status: bool = True,
-    ) -> httpx.Response | ResponseStream:
-        """Issue one request, retrying only failures that did not reach HTTP."""
-        return self._request(
-            method,
-            path,
-            params=params,
-            json=json,
-            content=content,
-            headers=headers,
-            stream=stream,
-            endpoint=endpoint,
-            raise_for_status=raise_for_status,
-            trigger_refresh=True,
-        )
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: Any | None,
-        json: Any | None,
-        content: bytes | None,
-        headers: dict[str, str] | None,
-        stream: bool,
-        endpoint: str | None,
-        raise_for_status: bool,
-        trigger_refresh: bool,
-    ) -> httpx.Response | ResponseStream:
+    ) -> httpx.Response:
+        """Issue one HTTP request, retrying only failures that did not reach HTTP."""
         candidates = self._candidates(endpoint)
         last_error: TransportError | None = None
         failed_over = False
         for candidate in candidates:
             transport = self._transport(candidate)
             try:
-                result: httpx.Response | ResponseStream
-                if stream:
-                    result = transport.stream(
-                        method,
-                        path,
-                        params=params,
-                        json_body=json,
-                        content=content,
-                        headers=headers,
-                    )
-                else:
-                    result = transport.request(
-                        method,
-                        path,
-                        params=params,
-                        json_body=json,
-                        content=content,
-                        headers=headers,
-                        raise_for_status=raise_for_status,
-                    )
+                result = transport.request(
+                    method,
+                    path,
+                    params=params,
+                    json_body=json,
+                    content=content,
+                    headers=headers,
+                    raise_for_status=raise_for_status,
+                )
             except TransportError as exc:
                 last_error = exc
                 failed_over = True
@@ -370,15 +400,12 @@ class MeshDriver:
                 continue
             except APIError:
                 self._mark_success(candidate)
-                if trigger_refresh:
-                    self._refresh_after_request(failed_over)
+                self._refresh_after_request(failed_over)
                 raise
 
-            response = result.response if isinstance(result, ResponseStream) else result
-            response.extensions[_ENDPOINT_EXTENSION] = candidate
+            result.extensions[_ENDPOINT_EXTENSION] = candidate
             self._mark_success(candidate)
-            if trigger_refresh:
-                self._refresh_after_request(failed_over)
+            self._refresh_after_request(failed_over)
             return result
 
         if last_error is not None:
@@ -420,21 +447,19 @@ class MeshDriver:
         last_transport_error: TransportError | None = None
         for candidate in self._candidates(hint, include_cooling=True):
             try:
-                response = self._transport(candidate).request(
-                    "GET", f"/v1/sandboxes/{path_segment(sandbox_id)}"
-                )
-            except TransportError as exc:
-                last_transport_error = exc
-                self._mark_failed(candidate)
-                continue
-            except APIError as exc:
-                self._mark_success(candidate)
-                if exc.code == "not_found" or exc.status == 404:
-                    if original_not_found is None:
-                        original_not_found = exc
+                self._transport(candidate).stubs.sandbox.Get(api_pb2.SandboxRef(id=sandbox_id))
+            except grpc.RpcError as raw:
+                error = translate_rpc_error(raw, endpoint=candidate)
+                if isinstance(error, TransportError):
+                    last_transport_error = error
+                    self._mark_failed(candidate)
                     continue
-                raise
-            response.extensions[_ENDPOINT_EXTENSION] = candidate
+                self._mark_success(candidate)
+                if error.code == "not_found":
+                    if original_not_found is None:
+                        original_not_found = error
+                    continue
+                raise error from raw
             self._mark_success(candidate)
             return candidate
 
@@ -442,7 +467,7 @@ class MeshDriver:
             raise original_not_found
         if last_transport_error is not None:
             raise last_transport_error
-        raise APIError(f"sandbox {sandbox_id!r} was not found", code="not_found", status=404)
+        raise APIError(f"sandbox {sandbox_id!r} was not found", code="not_found")
 
     def endpoints(self) -> list[EndpointInfo]:
         """Return a detached roster snapshot in failover order."""
@@ -475,21 +500,13 @@ class MeshDriver:
 
         try:
             try:
-                result = self._request(
-                    "GET",
-                    "/v1/mesh/status",
-                    params=None,
-                    json=None,
-                    content=None,
-                    headers=None,
-                    stream=False,
+                view, _ = self._call(
+                    lambda stubs: stubs.system.MeshStatus(api_pb2.MeshStatusRequest()),
                     endpoint=None,
-                    raise_for_status=True,
+                    stream=False,
                     trigger_refresh=False,
                 )
-                if isinstance(result, ResponseStream):
-                    raise ProtocolError("mesh status unexpectedly returned a stream")
-                value = result.json()
+                value = jsonlib.loads(view.json)
                 if not isinstance(value, Mapping):
                     raise ProtocolError("mesh status returned a malformed response")
                 discovered = roster_from_status(value)
@@ -603,10 +620,9 @@ class MeshDriver:
             transport.close()
 
 
-def response_endpoint(response: httpx.Response | ResponseStream) -> str | None:
+def response_endpoint(response: httpx.Response) -> str | None:
     """Return the endpoint selected by a driver response when available."""
-    raw = response.response if isinstance(response, ResponseStream) else response
-    endpoint = raw.extensions.get(_ENDPOINT_EXTENSION)
+    endpoint = response.extensions.get(_ENDPOINT_EXTENSION)
     return endpoint if isinstance(endpoint, str) else None
 
 

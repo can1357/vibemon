@@ -1,39 +1,67 @@
-import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-  Client,
-  JsonValue,
-  RemoteFunctionFailureDetails,
-  RemoteFunctionInvocation,
-  RemoteFunctionResponse,
-  VmonFetch,
+import {
+  create,
+  type DescMessage,
+  fromBinary,
+  type MessageInitShape,
+  type MessageShape,
+  toBinary,
+} from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
+import type { Subprocess } from "bun";
+import type { Client } from "../src";
+import {
+  APIError,
+  connect,
+  DEFAULT_REMOTE_FUNCTION_IMAGE,
+  FunctionCall,
+  MISSING_NODE_HINT,
+  RemoteFunctionError,
+  Retries,
+  SESSION_RUNNER_PATH,
 } from "../src";
-import { APIError, connect, DEFAULT_REMOTE_FUNCTION_IMAGE, RemoteFunctionError } from "../src";
+import {
+  CreateSandboxRequestSchema,
+  ExecInputSchema,
+  ExecOutputSchema,
+  type ExecStart,
+  FileDeleteRequestSchema,
+  FileWriteRequestSchema,
+  JsonViewSchema,
+  OkSchema,
+  SandboxRefSchema,
+  Stream,
+} from "../src/gen/vmon/v1/api_pb";
+import { BridgeFrameSchema } from "../src/gen/vmon/v1/bridge_pb";
 
-class Gate {
-  readonly #promise: Promise<void>;
-  readonly #resolve: () => void;
-
-  constructor() {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    this.#promise = promise;
-    this.#resolve = resolve;
-  }
-
-  open(): void {
-    this.#resolve();
-  }
-
-  wait(): Promise<void> {
-    return this.#promise;
-  }
+const nodeBin = Bun.which("node");
+if (nodeBin === null) {
+  throw new Error("local Node.js is required to bridge fake exec sessions");
 }
 
-interface CountWaiter {
-  count: number;
-  resolve: () => void;
+const temporaryDirectories: string[] = [];
+const fakeServers: Bun.Server<BridgeWsState>[] = [];
+
+afterAll(async () => {
+  for (const server of fakeServers.splice(0)) server.stop(true);
+  await Promise.allSettled(
+    temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+async function scratchDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "vmon-ts-remote-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+interface RecordedExec {
+  sandboxId: string;
+  cmd: string[];
+  env: Record<string, string> | undefined;
 }
 
 interface FakeApiFailure {
@@ -42,241 +70,418 @@ interface FakeApiFailure {
   message: string;
 }
 
-interface RecordedRequest {
-  method: string;
-  path: string;
-  authorization: string | null;
-  body: string;
+/** One live fake exec session backed by a local `node <runner>` subprocess. */
+interface ExecSession {
+  sandboxId: string;
+  kill(): void;
+}
+
+type ExecOutputInit = MessageInitShape<typeof ExecOutputSchema>;
+
+function chunkOut(name: "stdout" | "stderr", data: Uint8Array): ExecOutputInit {
+  return {
+    output: {
+      case: "chunk",
+      value: { stream: name === "stderr" ? Stream.STDERR : Stream.STDOUT, data },
+    },
+  };
+}
+function exitOut(code: number): ExecOutputInit {
+  return { output: { case: "exit", value: { code: BigInt(code) } } };
+}
+
+/** Server side of one bridged RPC socket. */
+interface BridgeConn {
+  message(payload: Uint8Array): void;
+  end(status?: number, text?: string, trailers?: Record<string, string>): void;
+  close(): void;
+}
+interface RpcHandler {
+  onMessage(payload: Uint8Array): void;
+  onHalfClose?(): void;
+  onClose?(): void;
+}
+interface BridgeWsState {
+  handler: RpcHandler | null;
+}
+
+function bridgeFrameBytes(frame: MessageInitShape<typeof BridgeFrameSchema>["frame"]): Uint8Array {
+  return toBinary(BridgeFrameSchema, create(BridgeFrameSchema, { frame }));
+}
+
+/** A unary RPC over the bridge: one request message in, one response + end out. */
+function unaryHandler<I extends DescMessage, O extends DescMessage>(
+  conn: BridgeConn,
+  input: I,
+  output: O,
+  impl: (request: MessageShape<I>) => MessageInitShape<O>,
+): RpcHandler {
+  return {
+    onMessage: (payload) => {
+      try {
+        const response = impl(fromBinary(input, payload));
+        conn.message(toBinary(output, create(output, response)));
+        conn.end();
+      } catch (error) {
+        const failure = ConnectError.from(error);
+        const trailers: Record<string, string> = {};
+        failure.metadata.forEach((value, key) => {
+          trailers[key] = value;
+        });
+        conn.end(failure.code, failure.rawMessage, trailers);
+      }
+    },
+  };
 }
 
 class FakeVmonServer {
-  readonly requests: RecordedRequest[] = [];
   readonly createBodies: Record<string, unknown>[] = [];
-  readonly invocationArguments: JsonValue[][] = [];
-  readonly completedArguments: JsonValue[][] = [];
+  readonly execs: RecordedExec[] = [];
   readonly terminatedSandboxIds: string[] = [];
-  readonly terminationResponses: Response[] = [];
   createFailure: FakeApiFailure | null = null;
-  runnerSource: string | null = null;
+  nodeMissing = false;
   readonly #files = new Map<string, Map<string, string>>();
-  readonly #sandboxStatuses = new Map<string, string>();
-  readonly #gates = new Map<string, Gate>();
-  readonly #arrivalWaiters: CountWaiter[] = [];
-  readonly #completionWaiters: CountWaiter[] = [];
+  readonly #statuses = new Map<string, string>();
+  readonly #sessions = new Map<string, Set<ExecSession>>();
   #nextSandbox = 1;
-  #moduleSequence = 0;
 
-  readonly fetch: VmonFetch = async (input, init) => {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    const body = request.method === "GET" ? "" : await request.text();
-    this.requests.push({
-      method: request.method,
-      path: `${url.pathname}${url.search}`,
-      authorization: request.headers.get("authorization"),
-      body,
+  readonly #server: Bun.Server<BridgeWsState>;
+
+  constructor() {
+    this.#server = Bun.serve<BridgeWsState>({
+      port: 0,
+      fetch(request, server) {
+        const url = new URL(request.url);
+        if (url.pathname !== "/grpc") return new Response("not found", { status: 404 });
+        return server.upgrade(request, { data: { handler: null } })
+          ? undefined
+          : new Response("upgrade required", { status: 426 });
+      },
+      websocket: {
+        open() {},
+        message: (ws, message) => this.#onFrame(ws, message),
+        close: (ws) => ws.data.handler?.onClose?.(),
+      },
     });
-    if (request.headers.get("authorization") !== "Bearer test-token") {
-      return jsonResponse({ code: "unauthorized", message: "bad token" }, 401);
-    }
-
-    const segments = url.pathname
-      .split("/")
-      .filter((segment) => segment.length > 0)
-      .map((segment) => decodeURIComponent(segment));
-    if (request.method === "POST" && segments.join("/") === "v1/sandboxes") {
-      const createBody = recordBody(JSON.parse(body));
-      this.createBodies.push(createBody);
-      if (this.createFailure !== null) {
-        return jsonResponse(
-          { code: this.createFailure.code, message: this.createFailure.message },
-          this.createFailure.status,
-        );
-      }
-      const id = `sb-${this.#nextSandbox}`;
-      this.#nextSandbox += 1;
-      this.#files.set(id, new Map());
-      this.#sandboxStatuses.set(id, "running");
-      return jsonResponse({ id, name: id }, 201);
-    }
-    if (
-      request.method === "GET" &&
-      segments.length === 3 &&
-      segments[0] === "v1" &&
-      segments[1] === "sandboxes"
-    ) {
-      const id = segments[2];
-      const status = this.#sandboxStatuses.get(id);
-      if (status === undefined) {
-        return jsonResponse({ code: "not_found", message: `unknown sandbox ${id}` }, 404);
-      }
-      return jsonResponse({ id, name: id, status });
-    }
-    if (segments.length !== 4 || segments[0] !== "v1" || segments[1] !== "sandboxes") {
-      return jsonResponse({ code: "not_found", message: "unknown route" }, 404);
-    }
-
-    const sandboxId = segments[2];
-    const operation = segments[3];
-    if (request.method === "PUT" && operation === "files") {
-      const path = url.searchParams.get("path");
-      const files = this.#files.get(sandboxId);
-      if (path === null || files === undefined) {
-        return jsonResponse({ code: "not_found", message: "missing sandbox or path" }, 404);
-      }
-      files.set(path, body);
-      if (path === "/tmp/vmon-remote-function-runner.mjs") {
-        this.runnerSource = body;
-      }
-      return jsonResponse({ ok: true });
-    }
-    if (request.method === "DELETE" && operation === "files") {
-      const path = url.searchParams.get("path");
-      const files = this.#files.get(sandboxId);
-      if (path === null || files === undefined) {
-        return jsonResponse({ code: "not_found", message: "missing sandbox or path" }, 404);
-      }
-      files.delete(path);
-      return jsonResponse({ ok: true });
-    }
-    if (request.method === "POST" && operation === "terminate") {
-      this.terminatedSandboxIds.push(sandboxId);
-      const status = this.#sandboxStatuses.get(sandboxId);
-      const response =
-        status === undefined
-          ? jsonResponse({ code: "not_found", message: `unknown sandbox ${sandboxId}` }, 404)
-          : jsonResponse({ ok: true });
-      this.terminationResponses.push(response);
-      if (status !== undefined) {
-        this.#sandboxStatuses.set(sandboxId, "terminated");
-      }
-      return response;
-    }
-    if (request.method === "POST" && operation === "exec") {
-      return this.#exec(sandboxId, JSON.parse(body));
-    }
-    return jsonResponse({ code: "not_found", message: "unknown operation" }, 404);
-  };
-
-  setSandboxStatus(sandboxId: string, status: string): void {
-    if (!this.#sandboxStatuses.has(sandboxId)) {
-      throw new Error(`unknown fake sandbox ${sandboxId}`);
-    }
-    this.#sandboxStatuses.set(sandboxId, status);
+    fakeServers.push(this.#server);
   }
 
-  forgetSandbox(sandboxId: string): void {
-    this.#sandboxStatuses.delete(sandboxId);
-    this.#files.delete(sandboxId);
+  /** Base URL of the fake vmond node. */
+  get url(): string {
+    return `http://127.0.0.1:${this.#server.port}`;
   }
 
-  gateInvocation(value: JsonValue, gate: Gate): void {
-    this.#gates.set(JSON.stringify(value), gate);
-  }
-
-  waitForInvocations(count: number): Promise<void> {
-    if (this.invocationArguments.length >= count) {
-      return Promise.resolve();
+  #onFrame(ws: Bun.ServerWebSocket<BridgeWsState>, message: string | Buffer): void {
+    const conn: BridgeConn = {
+      message: (payload) => void ws.send(bridgeFrameBytes({ case: "message", value: payload })),
+      end: (status = 0, text = "", trailers = {}) => {
+        ws.send(bridgeFrameBytes({ case: "end", value: { status, message: text, trailers } }));
+        ws.close();
+      },
+      close: () => ws.close(),
+    };
+    if (typeof message === "string") {
+      conn.end(Code.Internal, "expected binary bridge frame");
+      return;
     }
-    const { promise, resolve } = Promise.withResolvers<void>();
-    this.#arrivalWaiters.push({ count, resolve });
-    return promise;
-  }
-
-  waitForCompletions(count: number): Promise<void> {
-    if (this.completedArguments.length >= count) {
-      return Promise.resolve();
-    }
-    const { promise, resolve } = Promise.withResolvers<void>();
-    this.#completionWaiters.push({ count, resolve });
-    return promise;
-  }
-
-  async #exec(sandboxId: string, body: unknown): Promise<Response> {
-    if (!isRecord(body) || !isStringArray(body.cmd)) {
-      return jsonResponse({ code: "invalid_request", message: "cmd must be strings" }, 400);
-    }
-    if (body.cmd[0] === "node" && body.cmd[1] === "--version") {
-      return captureResponse(0, "v22.0.0\n", "");
-    }
-    if (body.cmd[0] !== "node" || body.cmd.length !== 3) {
-      return captureResponse(127, "", "unsupported command");
-    }
-    const files = this.#files.get(sandboxId);
-    const payload = files?.get(body.cmd[2]);
-    if (payload === undefined) {
-      return captureResponse(1, "", "missing invocation payload");
-    }
-    const response = await this.#runInvocation(invocationBody(JSON.parse(payload)));
-    return captureResponse(0, JSON.stringify(response), "");
-  }
-
-  async #runInvocation(invocation: RemoteFunctionInvocation): Promise<RemoteFunctionResponse> {
-    this.invocationArguments.push(invocation.args);
-    notifyWaiters(this.#arrivalWaiters, this.invocationArguments.length);
-    const gate = this.#gates.get(JSON.stringify(invocation.args[0]));
-    if (gate !== undefined) {
-      await gate.wait();
-    }
-
-    let namespace: Record<string, unknown> | null = null;
-    try {
-      this.#moduleSequence += 1;
-      const moduleSource = `
-const __vmonFakeStdout = [];
-const console = {
-  log(...values) {
-    __vmonFakeStdout.push(values.map((value) => String(value)).join(" ") + "\\n");
-  },
-};
-${invocation.source}
-export { __vmonFakeStdout };
-//# sourceURL=vmon-fake-${this.#moduleSequence}.mjs
-`;
-      const moduleUrl = `data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`;
-      // The invocation supplies the module at runtime, so a static import cannot identify it.
-      const loaded: unknown = await import(moduleUrl);
-      if (!isRecord(loaded)) {
-        throw new TypeError("remote module namespace was not an object");
+    const frame = fromBinary(BridgeFrameSchema, new Uint8Array(message)).frame;
+    switch (frame.case) {
+      case "call": {
+        if (frame.value.metadata.authorization !== "Bearer test-token") {
+          conn.end(Code.Unauthenticated, "bad token", { "vmon-code": "unauthorized" });
+          return;
+        }
+        ws.data.handler = this.#route(frame.value.method, conn);
+        if (ws.data.handler === null)
+          conn.end(Code.Unimplemented, `unknown method ${frame.value.method}`, {
+            "vmon-code": "unsupported",
+          });
+        return;
       }
-      namespace = loaded;
-      const handler = namespace[invocation.exportName];
-      if (typeof handler !== "function") {
-        throw new TypeError(`missing exported handler ${invocation.exportName}`);
+      case "message":
+        ws.data.handler?.onMessage(frame.value);
+        return;
+      case "halfClose":
+        ws.data.handler?.onHalfClose?.();
+        return;
+      default:
+        conn.end(Code.Internal, "unexpected bridge frame");
+    }
+  }
+
+  #route(method: string, conn: BridgeConn): RpcHandler | null {
+    switch (method) {
+      case "/vmon.v1.SandboxService/Create":
+        return unaryHandler(conn, CreateSandboxRequestSchema, JsonViewSchema, (req) => {
+          const createBody: unknown = JSON.parse(req.specJson);
+          if (!isRecord(createBody))
+            throw new ConnectError("bad body", Code.InvalidArgument, { "vmon-code": "invalid" });
+          this.createBodies.push(createBody);
+          if (this.createFailure !== null) {
+            throw new ConnectError(
+              this.createFailure.message,
+              STATUS_GRPC_CODE[this.createFailure.status] ?? Code.Unknown,
+              { "vmon-code": this.createFailure.code },
+            );
+          }
+          const id = `sb-${this.#nextSandbox}`;
+          this.#nextSandbox += 1;
+          this.#files.set(id, new Map());
+          this.#statuses.set(id, "running");
+          return { json: JSON.stringify({ id, name: id }) };
+        });
+      case "/vmon.v1.SandboxService/Get":
+        return unaryHandler(conn, SandboxRefSchema, JsonViewSchema, (req) => {
+          const status = this.#statuses.get(req.id);
+          if (status === undefined) {
+            throw new ConnectError(`unknown sandbox ${req.id}`, Code.NotFound, {
+              "vmon-code": "not_found",
+            });
+          }
+          return { json: JSON.stringify({ id: req.id, name: req.id, status }) };
+        });
+      case "/vmon.v1.SandboxService/FileWrite":
+        return unaryHandler(conn, FileWriteRequestSchema, OkSchema, (req) => {
+          const files = this.#files.get(req.id);
+          if (files === undefined) {
+            throw new ConnectError("missing sandbox or path", Code.NotFound, {
+              "vmon-code": "not_found",
+            });
+          }
+          files.set(req.path, new TextDecoder().decode(req.data));
+          return {};
+        });
+      case "/vmon.v1.SandboxService/FileDelete":
+        return unaryHandler(conn, FileDeleteRequestSchema, OkSchema, (req) => {
+          this.#files.get(req.id)?.delete(req.path);
+          return {};
+        });
+      case "/vmon.v1.SandboxService/Terminate":
+        return unaryHandler(conn, SandboxRefSchema, JsonViewSchema, (req) => {
+          this.terminatedSandboxIds.push(req.id);
+          if (!this.#statuses.has(req.id)) {
+            throw new ConnectError(`unknown sandbox ${req.id}`, Code.NotFound, {
+              "vmon-code": "not_found",
+            });
+          }
+          this.#statuses.set(req.id, "terminated");
+          this.#killSessions(req.id);
+          return { json: "{}" };
+        });
+      case "/vmon.v1.SandboxService/Exec":
+        return this.#execHandler(conn);
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Bridges one Exec bidi stream to a real local `node <runner>` subprocess,
+   * mirroring vmond: ExecInput (start, stdin, eof) in, ExecOutput (chunk,
+   * exit) out, and a killed guest process when the socket goes away.
+   */
+  #execHandler(conn: BridgeConn): RpcHandler {
+    let child: Subprocess<"pipe", "pipe", "pipe"> | null = null;
+    let session: ExecSession | null = null;
+    let started = false;
+    let killed = false;
+    const pendingStdin: (Uint8Array | "eof")[] = [];
+    const deliverStdin = (
+      target: Subprocess<"pipe", "pipe", "pipe">,
+      data: Uint8Array | "eof",
+    ): void => {
+      if (data === "eof") {
+        target.stdin.end();
+        return;
       }
-      const result: unknown = await handler(...invocation.args);
-      return {
-        ok: true,
-        result: fakeJsonValue(result, "remote function result", new Set()),
-        stdout: namespaceStdout(namespace),
+      target.stdin.write(data);
+      target.stdin.flush();
+    };
+    const sendOutput = (output: ExecOutputInit): void =>
+      conn.message(toBinary(ExecOutputSchema, create(ExecOutputSchema, output)));
+    const run = async (start: ExecStart): Promise<void> => {
+      const env = Object.keys(start.env).length > 0 ? { ...start.env } : undefined;
+      this.execs.push({ sandboxId: start.sandboxId, cmd: [...start.cmd], env });
+      if (this.nodeMissing) {
+        sendOutput(chunkOut("stderr", new TextEncoder().encode("exec: node: not found\n")));
+        sendOutput(exitOut(127));
+        conn.end();
+        return;
+      }
+      const source = this.fileFor(start.sandboxId, SESSION_RUNNER_PATH);
+      if (start.cmd[0] !== "node" || start.cmd[1] !== SESSION_RUNNER_PATH || source === undefined) {
+        sendOutput(exitOut(127));
+        conn.end();
+        return;
+      }
+      const directory = await scratchDirectory();
+      const runnerPath = join(directory, "runner.js");
+      await writeFile(runnerPath, source);
+      const spawned = Bun.spawn([nodeBin as string, runnerPath], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, ...(env ?? {}) },
+      });
+      child = spawned;
+      const live: ExecSession = {
+        sandboxId: start.sandboxId,
+        kill: () => {
+          this.#releaseSession(live);
+          killed = true;
+          spawned.kill();
+          // Close without an end frame: the client surfaces a transport
+          // failure, matching a vmond node dying mid-session.
+          conn.close();
+        },
       };
-    } catch (error) {
-      return {
-        ok: false,
-        error: failureDetails(error),
-        stdout: namespaceStdout(namespace),
+      session = live;
+      this.#registerSession(live);
+      for (const queued of pendingStdin.splice(0)) deliverStdin(spawned, queued);
+      const pump = async (
+        stream: ReadableStream<Uint8Array>,
+        name: "stdout" | "stderr",
+      ): Promise<void> => {
+        const reader = stream.getReader();
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            sendOutput(chunkOut(name, value));
+          }
+        } finally {
+          reader.releaseLock();
+        }
       };
-    } finally {
-      this.completedArguments.push(invocation.args);
-      notifyWaiters(this.#completionWaiters, this.completedArguments.length);
-    }
+      const stdoutDone = pump(spawned.stdout, "stdout");
+      const stderrDone = pump(spawned.stderr, "stderr");
+      const code = await spawned.exited;
+      await stdoutDone;
+      await stderrDone;
+      this.#releaseSession(live);
+      if (!killed) {
+        sendOutput(exitOut(code));
+        conn.end();
+      }
+    };
+    return {
+      onMessage: (payload) => {
+        const input = fromBinary(ExecInputSchema, payload).input;
+        if (!started) {
+          started = true;
+          if (input.case !== "start") {
+            conn.end(Code.InvalidArgument, "expected start frame", { "vmon-code": "invalid" });
+            return;
+          }
+          void run(input.value);
+          return;
+        }
+        if (input.case === "stdin") {
+          if (child) deliverStdin(child, input.value);
+          else pendingStdin.push(input.value);
+        }
+        if (input.case === "eof") {
+          if (child) deliverStdin(child, "eof");
+          else pendingStdin.push("eof");
+        }
+      },
+      /** Client went away: SIGTERM the guest process, mirroring vmond. */
+      onClose: () => {
+        session?.kill();
+      },
+    };
+  }
+
+  fileFor(sandboxId: string, path: string): string | undefined {
+    return this.#files.get(sandboxId)?.get(path);
+  }
+
+  #registerSession(session: ExecSession): void {
+    const sessions = this.#sessions.get(session.sandboxId) ?? new Set();
+    sessions.add(session);
+    this.#sessions.set(session.sandboxId, sessions);
+  }
+
+  #releaseSession(session: ExecSession): void {
+    this.#sessions.get(session.sandboxId)?.delete(session);
+  }
+
+  /** Simulate a sandbox dying out from under the SDK. */
+  killSandbox(sandboxId: string): void {
+    this.#statuses.set(sandboxId, "terminated");
+    this.#killSessions(sandboxId);
+  }
+
+  liveSocketCount(): number {
+    let count = 0;
+    for (const sessions of this.#sessions.values()) count += sessions.size;
+    return count;
+  }
+
+  #killSessions(sandboxId: string): void {
+    for (const session of [...(this.#sessions.get(sandboxId) ?? [])]) session.kill();
   }
 }
 
 function clientFor(server: FakeVmonServer): Client {
-  return connect("https://vmon.test/root/..", {
-    token: "test-token",
-    fetch: server.fetch,
-    discover: false,
-  });
+  return connect(server.url, { token: "test-token", discover: false });
 }
 
-test("remote lazily reuses one sandbox and terminate is idempotent", async () => {
+async function collect<T>(iterator: AsyncIterable<T>): Promise<T[]> {
+  const values: T[] = [];
+  for await (const value of iterator) values.push(value);
+  return values;
+}
+
+function waitForFileSource(): string {
+  // This body is serialized and runs in a separate guest process, so the
+  // import target only resolves at runtime there; a static import in this
+  // test module cannot serve the shipped source.
+  return `
+export async function waitForFile(path, value) {
+  const fs = await import("node:fs/promises");
+  while (true) {
+    try {
+      await fs.access(path);
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  return value;
+}
+`;
+}
+
+function counterSource(): string {
+  // Serialized guest-side body: the module graph exists only in the runner
+  // process, so the import must be dynamic there.
+  return `
+export async function flaky(counterPath, succeedAt) {
+  const fs = await import("node:fs/promises");
+  let count = 0;
+  try {
+    count = Number.parseInt(await fs.readFile(counterPath, "utf8"), 10) || 0;
+  } catch {}
+  count += 1;
+  await fs.writeFile(counterPath, String(count));
+  if (count < succeedAt) throw new RangeError("attempt " + count + " failed");
+  return count;
+}
+`;
+}
+
+test("remote reuses one warm sandbox and session across calls", async () => {
   const server = new FakeVmonServer();
   const client = clientFor(server);
-  const add = client.remoteFunction(function add(left: number, right: number) {
-    return { sum: left + right };
-  });
+  const stdout: string[] = [];
+  const add = client.remoteFunction(
+    function add(left: number, right: number) {
+      console.log("adding", left, right);
+      return { sum: left + right };
+    },
+    { onStdout: (output) => stdout.push(output) },
+  );
 
   expect(server.createBodies).toHaveLength(0);
   await expect(add.remote(2, 5)).resolves.toEqual({ sum: 7 });
@@ -284,205 +489,60 @@ test("remote lazily reuses one sandbox and terminate is idempotent", async () =>
 
   expect(server.createBodies).toHaveLength(1);
   expect(server.createBodies[0]?.image).toBe(DEFAULT_REMOTE_FUNCTION_IMAGE);
-  expect(server.invocationArguments).toEqual([
-    [2, 5],
-    [10, 4],
-  ]);
-  expect(server.requests.every((request) => request.authorization === "Bearer test-token")).toBe(
-    true,
-  );
-  expect(
-    server.requests.some(
-      (request) =>
-        request.method === "PUT" &&
-        request.path.includes("path=%2Ftmp%2Fvmon-remote-function-runner.mjs"),
-    ),
-  ).toBe(true);
+  expect(server.execs).toHaveLength(1);
+  expect(server.execs[0]?.cmd).toEqual(["node", SESSION_RUNNER_PATH]);
+  expect(server.execs[0]?.env?.VMON_REMOTE).toBe("1");
+  expect(stdout).toEqual(["adding 2 5\n", "adding 10 4\n"]);
 
   await Promise.all([add.terminate(), add.terminate()]);
   await add.terminate();
   expect(server.terminatedSandboxIds).toEqual(["sb-1"]);
-  expect(server.terminationResponses.every((response) => response.bodyUsed)).toBe(true);
+  expect(server.liveSocketCount()).toBe(0);
 });
 
-test("remote reprovisions when its cached sandbox is terminal or missing", async () => {
+test("remote transparently replaces dead sandboxes and sessions", async () => {
   const server = new FakeVmonServer();
   const increment = clientFor(server).remoteFunction((value: number) => value + 1);
 
   await expect(increment.remote(1)).resolves.toBe(2);
-  server.setSandboxStatus("sb-1", "stopped");
+  server.killSandbox("sb-1");
   await expect(increment.remote(2)).resolves.toBe(3);
-  server.forgetSandbox("sb-2");
-  await expect(increment.remote(3)).resolves.toBe(4);
   await increment.terminate();
 
-  expect(server.createBodies).toHaveLength(3);
-  expect(server.terminatedSandboxIds).toEqual(["sb-1", "sb-2", "sb-3"]);
-  expect(server.terminationResponses.every((response) => response.bodyUsed)).toBe(true);
-  expect(
-    server.requests.filter((request) => request.method === "GET").map((request) => request.path),
-  ).toEqual(["/v1/sandboxes/sb-1", "/v1/sandboxes/sb-2"]);
-});
-
-test("source specs expose an exported handler without closure serialization", async () => {
-  const server = new FakeVmonServer();
-  const sourceFunction = clientFor(server).remoteFunctionFromSource<
-    [value: number],
-    { doubled: number }
-  >({
-    source: "export function handle(value) { return { doubled: value * 2 }; }",
-    exportName: "handle",
-  });
-
-  await expect(sourceFunction.remote(9)).resolves.toEqual({ doubled: 18 });
-  expect(server.invocationArguments).toEqual([[9]]);
-  await sourceFunction.terminate();
-});
-
-test("uploaded guest runner emits the documented stdout and error envelope", async () => {
-  const server = new FakeVmonServer();
-  const remote = clientFor(server).remoteFunction((value: number) => value);
-  let temporaryDirectory: string | null = null;
-
-  try {
-    await remote.remote(0);
-    const runnerSource = server.runnerSource;
-    if (runnerSource === null) {
-      throw new Error("runner source was not uploaded");
-    }
-    temporaryDirectory = await mkdtemp(join(tmpdir(), "vmon-ts-runner-"));
-    const runnerPath = join(temporaryDirectory, "runner.mjs");
-    const payloadPath = join(temporaryDirectory, "payload.json");
-    await Bun.write(runnerPath, runnerSource);
-    await Bun.write(
-      payloadPath,
-      JSON.stringify({
-        source:
-          "export function handle(value) { console.log('runner value', value); throw new TypeError('runner boom'); }",
-        exportName: "handle",
-        args: [7],
-      }),
-    );
-
-    const nodePath = Bun.which("node");
-    if (nodePath === null) {
-      throw new Error("local Node.js is required to validate the guest runner");
-    }
-    const child = Bun.spawn([nodePath, runnerPath, payloadPath], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    expect(exitCode).toBe(0);
-    expect(stderr).toBe("");
-    const response: unknown = JSON.parse(stdout);
-    if (!isRecord(response) || response.ok !== false || !isRecord(response.error)) {
-      throw new Error(`invalid runner response: ${stdout}`);
-    }
-    expect(response.stdout).toBe("runner value 7\n");
-    expect(response.error.type).toBe("TypeError");
-    expect(response.error.message).toBe("runner boom");
-    expect(response.error.stack).toContain("runner boom");
-  } finally {
-    await remote.terminate();
-    if (temporaryDirectory !== null) {
-      await rm(temporaryDirectory, { recursive: true, force: true });
-    }
-  }
-});
-
-test("daemon errors retain status and structured codes during provisioning", async () => {
-  const server = new FakeVmonServer();
-  server.createFailure = {
-    status: 503,
-    code: "capacity_exhausted",
-    message: "no VM slots",
-  };
-  const remote = clientFor(server).remoteFunction((value: number) => value);
-
-  try {
-    await remote.remote(1);
-    throw new Error("expected sandbox provisioning to fail");
-  } catch (error) {
-    expect(error).toBeInstanceOf(APIError);
-    if (!(error instanceof APIError)) {
-      throw error;
-    }
-    expect(error.status).toBe(503);
-    expect(error.code).toBe("capacity_exhausted");
-    expect(error.message).toBe("no VM slots");
-  }
-});
-
-test("map preserves input order with a bounded ephemeral pool", async () => {
-  const server = new FakeVmonServer();
-  const gates = [new Gate(), new Gate(), new Gate()];
-  server.gateInvocation(1, gates[0]);
-  server.gateInvocation(2, gates[1]);
-  server.gateInvocation(3, gates[2]);
-  const double = clientFor(server).remoteFunction(async function double(value: number) {
-    return value * 2;
-  });
-
-  const mapped = double.map([1, 2, 3], { concurrency: 3 });
-  await server.waitForInvocations(3);
-  gates[1].open();
-  await server.waitForCompletions(1);
-  gates[2].open();
-  await server.waitForCompletions(2);
-  gates[0].open();
-
-  await expect(mapped).resolves.toEqual([2, 4, 6]);
-  expect(server.completedArguments.map((args) => args[0])).toEqual([2, 3, 1]);
-  expect(server.createBodies).toHaveLength(3);
-  expect(server.terminatedSandboxIds).toEqual(["sb-1", "sb-2", "sb-3"]);
-});
-
-test("map can return explicit completion order", async () => {
-  const server = new FakeVmonServer();
-  const gates = [new Gate(), new Gate(), new Gate()];
-  server.gateInvocation(1, gates[0]);
-  server.gateInvocation(2, gates[1]);
-  server.gateInvocation(3, gates[2]);
-  const double = clientFor(server).remoteFunction(async function double(value: number) {
-    return value * 2;
-  });
-
-  const mapped = double.map([1, 2, 3], { concurrency: 3, ordered: false });
-  await server.waitForInvocations(3);
-  gates[1].open();
-  await server.waitForCompletions(1);
-  gates[2].open();
-  await server.waitForCompletions(2);
-  gates[0].open();
-
-  await expect(mapped).resolves.toEqual([4, 6, 2]);
-  expect(server.terminatedSandboxIds).toHaveLength(3);
-});
-
-test("map stops scheduling after failures and cleans every provisioned worker", async () => {
-  const server = new FakeVmonServer();
-  const explode = clientFor(server).remoteFunction(function explode(value: number) {
-    throw new Error(`boom ${value}`);
-  });
-
-  await expect(explode.map([1, 2, 3, 4], { concurrency: 2 })).rejects.toBeInstanceOf(
-    RemoteFunctionError,
-  );
-  expect(server.invocationArguments).toHaveLength(2);
-  expect(server.terminatedSandboxIds).toEqual(["sb-1", "sb-2"]);
   expect(server.createBodies).toHaveLength(2);
-  await expect(explode.map([1], { concurrency: 0 })).rejects.toThrow(
-    "concurrency must be an integer >= 1",
-  );
-  expect(server.createBodies).toHaveLength(2);
+  expect(server.execs).toHaveLength(2);
+  expect(server.terminatedSandboxIds).toContain("sb-2");
 });
 
-test("serialization rejects lossy values before sandbox creation", async () => {
+test("options forward pool_size, validate ranges, and compute backoff delays", async () => {
+  const server = new FakeVmonServer();
+  const client = clientFor(server);
+  const pooled = client.remoteFunction((value: number) => value, { pool: 3 });
+  await expect(pooled.remote(1)).resolves.toBe(1);
+  expect(server.createBodies[0]?.pool_size).toBe(3);
+  await pooled.terminate();
+
+  expect(() => client.remoteFunction((value: number) => value, { pool: -1 })).toThrow(RangeError);
+  expect(() => client.remoteFunction((value: number) => value, { timeout: 0 })).toThrow(RangeError);
+  expect(() => client.remoteFunction((value: number) => value, { retries: -1 })).toThrow(
+    "maxRetries must be an integer >= 0",
+  );
+  expect(() => new Retries({ maxRetries: 2, backoffCoefficient: 0.5 })).toThrow(RangeError);
+  expect(() => new Retries({ maxRetries: 2, maxDelay: 0.5 })).toThrow(RangeError);
+
+  const retries = new Retries({
+    maxRetries: 5,
+    initialDelay: 1,
+    backoffCoefficient: 2,
+    maxDelay: 5,
+  });
+  expect(retries.delayFor(1)).toBe(1);
+  expect(retries.delayFor(2)).toBe(2);
+  expect(retries.delayFor(3)).toBe(4);
+  expect(retries.delayFor(4)).toBe(5);
+});
+
+test("arguments are validated before any sandbox exists", async () => {
   const server = new FakeVmonServer();
   const echo = clientFor(server).remoteFunction(function echo(value: unknown) {
     return value;
@@ -512,177 +572,418 @@ test("serialization rejects lossy values before sandbox creation", async () => {
   );
 });
 
-test("stdout and structured guest errors propagate to the caller", async () => {
+test("builtin guest errors are reconstructed with the remote stack attached", async () => {
   const server = new FakeVmonServer();
-  const stdout: string[] = [];
-  const explode = clientFor(server).remoteFunction(
-    function explode(value: number): never {
-      console.log("guest value", value);
-      throw new RangeError(`bad value ${value}`);
-    },
-    { onStdout: (output) => stdout.push(output) },
-  );
+  const explode = clientFor(server).remoteFunction(function explode(value: number): never {
+    throw new RangeError(`bad value ${value}`);
+  });
 
   try {
     await explode.remote(7);
     throw new Error("expected the remote function to fail");
   } catch (error) {
-    expect(error).toBeInstanceOf(RemoteFunctionError);
-    if (!(error instanceof RemoteFunctionError)) {
-      throw error;
-    }
-    expect(error.message).toBe("bad value 7");
-    expect(error.remoteType).toBe("RangeError");
-    expect(error.remoteStack).toContain("bad value 7");
+    expect(error).toBeInstanceOf(RangeError);
+    expect(error).not.toBeInstanceOf(RemoteFunctionError);
+    const failure = error as RangeError & { remoteStack?: string };
+    expect(failure.message).toBe("bad value 7");
+    expect(failure.remoteStack).toContain("bad value 7");
+    expect(failure.stack).toContain("[vmon remote stack]");
   }
-  expect(stdout).toEqual(["guest value 7\n"]);
-  await explode.terminate();
-});
 
-test("missing captures and non-JSON results remain structured remote errors", async () => {
-  const server = new FakeVmonServer();
-  const closureCallable = (() => {
-    const hiddenCapture = { value: 11 };
-    return (value: number) => value + hiddenCapture.value;
-  })();
-  const closure = clientFor(server).remoteFunction(closureCallable);
-
-  try {
-    await closure.remote(1);
-    throw new Error("expected the missing capture to fail remotely");
-  } catch (error) {
-    expect(error).toBeInstanceOf(RemoteFunctionError);
-    if (!(error instanceof RemoteFunctionError)) {
-      throw error;
-    }
-    expect(error.remoteType).toBe("ReferenceError");
-    expect(error.remoteStack).toContain("hiddenCapture");
-  }
-  await closure.terminate();
-
-  const badResult = clientFor(server).remoteFunction(() => new Date(0));
-  try {
-    await badResult.remote();
-    throw new Error("expected the result serialization to fail remotely");
-  } catch (error) {
-    expect(error).toBeInstanceOf(RemoteFunctionError);
-    if (!(error instanceof RemoteFunctionError)) {
-      throw error;
-    }
-    expect(error.remoteType).toBe("TypeError");
-    expect(error.message).toContain("non-plain object");
-  }
-  await badResult.terminate();
-});
-
-function invocationBody(value: unknown): RemoteFunctionInvocation {
-  if (
-    !isRecord(value) ||
-    typeof value.source !== "string" ||
-    typeof value.exportName !== "string" ||
-    !Array.isArray(value.args)
-  ) {
-    throw new TypeError("invalid invocation body");
-  }
-  return {
-    source: value.source,
-    exportName: value.exportName,
-    args: value.args.map((item, index) => fakeJsonValue(item, `args[${index}]`, new Set())),
-  };
-}
-
-function fakeJsonValue(value: unknown, path: string, active: Set<object>): JsonValue {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new TypeError(`${path} contains a non-finite number`);
-    }
-    return value;
-  }
-  if (typeof value !== "object") {
-    throw new TypeError(`${path} contains a non-JSON value`);
-  }
-  if (active.has(value)) {
-    throw new TypeError(`${path} contains a cycle`);
-  }
-  active.add(value);
-  try {
-    if (Array.isArray(value)) {
-      const result: JsonValue[] = [];
-      for (let index = 0; index < value.length; index += 1) {
-        if (!(index in value)) {
-          throw new TypeError(`${path} contains a sparse array`);
-        }
-        result.push(fakeJsonValue(value[index], `${path}[${index}]`, active));
+  const custom = clientFor(server).remoteFunction(function custom(): never {
+    class CustomBoom extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "CustomBoom";
       }
-      return result;
     }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new TypeError(`${path} contains a non-plain object`);
-    }
-    const result: Record<string, JsonValue> = {};
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    for (const key of Object.keys(value).sort()) {
-      const descriptor = descriptors[key];
-      if (!("value" in descriptor)) {
-        throw new TypeError(`${path}.${key} is an accessor property`);
-      }
-      result[key] = fakeJsonValue(descriptor.value, `${path}.${key}`, active);
-    }
-    return result;
-  } finally {
-    active.delete(value);
-  }
-}
-
-function namespaceStdout(namespace: Record<string, unknown> | null): string {
-  const output = namespace?.__vmonFakeStdout;
-  if (!Array.isArray(output) || !output.every((value) => typeof value === "string")) {
-    return "";
-  }
-  return output.join("");
-}
-
-function failureDetails(error: unknown): RemoteFunctionFailureDetails {
-  if (error instanceof Error) {
-    return { type: error.name || "Error", message: error.message, stack: error.stack ?? "" };
-  }
-  return { type: "RemoteError", message: String(error), stack: "" };
-}
-
-function notifyWaiters(waiters: CountWaiter[], count: number): void {
-  for (let index = waiters.length - 1; index >= 0; index -= 1) {
-    if (count >= waiters[index].count) {
-      waiters[index].resolve();
-      waiters.splice(index, 1);
-    }
-  }
-}
-
-function recordBody(value: unknown): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw new TypeError("expected a JSON object body");
-  }
-  return value;
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return Response.json(body, { status });
-}
-
-function captureResponse(exit: number, stdout: string, stderr: string): Response {
-  return jsonResponse({
-    exit,
-    stdout_b64: Buffer.from(stdout).toString("base64"),
-    stderr_b64: Buffer.from(stderr).toString("base64"),
+    throw new CustomBoom("special failure");
   });
-}
+  try {
+    await custom.remote();
+    throw new Error("expected the remote function to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(RemoteFunctionError);
+    const failure = error as RemoteFunctionError;
+    expect(failure.remoteType).toBe("CustomBoom");
+    expect(failure.message).toBe("special failure");
+    expect(failure.code).toBe("remote");
+    expect(failure.remoteStack).toContain("CustomBoom");
+  }
 
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
+  await explode.terminate();
+  await custom.terminate();
+});
+
+test("remoteGen streams yields; early break kills only that session", async () => {
+  const server = new FakeVmonServer();
+  const client = clientFor(server);
+  const squares = client.remoteFunction(function* squares(limit: number) {
+    for (let index = 0; index < limit; index += 1) yield index * index;
+  });
+
+  await expect(squares.remote(3)).rejects.toThrow(
+    "a generator function cannot be called with .remote(); use .remoteGen()",
+  );
+
+  await expect(collect(squares.remoteGen(4))).resolves.toEqual([0, 1, 4, 9]);
+  await expect(collect(squares.remoteGen(2))).resolves.toEqual([0, 1]);
+  expect(server.execs).toHaveLength(1);
+
+  const partial: number[] = [];
+  for await (const value of squares.remoteGen(1000)) {
+    partial.push(value);
+    if (partial.length === 2) break;
+  }
+  expect(partial).toEqual([0, 1]);
+  // The abandoned stream killed its session; the next call gets a fresh one.
+  await expect(collect(squares.remoteGen(2))).resolves.toEqual([0, 1]);
+  expect(server.execs).toHaveLength(2);
+
+  const scalar = client.remoteFunction((value: number) => value);
+  await expect(collect(scalar.remoteGen(1))).rejects.toThrow(
+    "a non-generator function cannot be called with .remoteGen(); use .remote()",
+  );
+
+  const fromSource = client.remoteFunctionFromSource<[count: number], number>({
+    source: "export function* ticks(count) { for (let i = 0; i < count; i += 1) yield i; }",
+    exportName: "ticks",
+  });
+  await expect(collect(fromSource.remoteGen(3))).resolves.toEqual([0, 1, 2]);
+
+  await squares.terminate();
+  await fromSource.terminate();
+});
+
+test("map is lazy, ordered by default, and reuses at most `concurrency` workers", async () => {
+  const server = new FakeVmonServer();
+  const directory = await scratchDirectory();
+  const gate = join(directory, "map-gate");
+  const waiter = clientFor(server).remoteFunctionFromSource<[path: string, value: number], number>({
+    source: waitForFileSource(),
+    exportName: "waitForFile",
+  });
+  const pulled: number[] = [];
+  function* inputs(): Generator<[path: string, value: number]> {
+    for (let index = 0; index < 6; index += 1) {
+      pulled.push(index);
+      yield [gate, index];
+    }
+  }
+
+  const stream = waiter.starmap(inputs(), { concurrency: 2 });
+  const iterator = stream[Symbol.asyncIterator]();
+  const firstResult = iterator.next();
+  // Both workers are blocked on the gate holding one item each; the input
+  // iterator must not be drained beyond what workers claimed.
+  await pollUntil(() => pulled.length >= 2);
+  await Bun.sleep(50);
+  expect(pulled.length).toBe(2);
+
+  await writeFile(gate, "go");
+  const results: number[] = [(await firstResult).value as number];
+  for await (const value of { [Symbol.asyncIterator]: () => iterator }) results.push(value);
+  expect(results).toEqual([0, 1, 2, 3, 4, 5]);
+  expect(server.createBodies).toHaveLength(2);
+  expect([...server.terminatedSandboxIds].sort()).toEqual(["sb-1", "sb-2"]);
+  expect(server.liveSocketCount()).toBe(0);
+
+  const empty = await collect(waiter.starmap([]));
+  expect(empty).toEqual([]);
+});
+
+test("map emits completion order when orderOutputs is false", async () => {
+  const server = new FakeVmonServer();
+  const directory = await scratchDirectory();
+  const gateA = join(directory, "gate-a");
+  const gateB = join(directory, "gate-b");
+  const waiter = clientFor(server).remoteFunctionFromSource<[path: string, value: number], number>({
+    source: waitForFileSource(),
+    exportName: "waitForFile",
+  });
+
+  const stream = waiter.starmap(
+    [
+      [gateA, 1],
+      [gateB, 2],
+    ],
+    { concurrency: 2, orderOutputs: false },
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+  await writeFile(gateB, "go");
+  const first = await iterator.next();
+  expect(first.value).toBe(2);
+  await writeFile(gateA, "go");
+  const second = await iterator.next();
+  expect(second.value).toBe(1);
+  expect((await iterator.next()).done).toBe(true);
+  expect(server.liveSocketCount()).toBe(0);
+});
+
+test("map yields errors in place with returnExceptions and supports forEach", async () => {
+  const server = new FakeVmonServer();
+  const picky = clientFor(server).remoteFunction(function picky(value: number) {
+    if (value % 2 === 1) throw new RangeError(`odd ${value}`);
+    return value * 10;
+  });
+
+  const mixed = await collect(picky.map([1, 2, 3], { returnExceptions: true }));
+  expect(mixed).toHaveLength(3);
+  expect(mixed[0]).toBeInstanceOf(RangeError);
+  expect(mixed[1]).toBe(20);
+  expect(mixed[2]).toBeInstanceOf(RangeError);
+
+  await picky.forEach([1, 2, 3], { ignoreExceptions: true });
+  await expect(picky.forEach([1])).rejects.toThrow("odd 1");
+  expect(server.liveSocketCount()).toBe(0);
+});
+
+test("map fails fast and tears down every worker sandbox", async () => {
+  const server = new FakeVmonServer();
+  const explode = clientFor(server).remoteFunction(function explode(value: number): never {
+    throw new RangeError(`boom ${value}`);
+  });
+
+  await expect(collect(explode.map([1, 2, 3, 4], { concurrency: 2 }))).rejects.toBeInstanceOf(
+    RangeError,
+  );
+  expect(server.createBodies.length).toBeLessThanOrEqual(2);
+  expect([...server.terminatedSandboxIds].sort()).toEqual(
+    server.createBodies.map((_, index) => `sb-${index + 1}`).sort(),
+  );
+  expect(server.liveSocketCount()).toBe(0);
+
+  await expect(collect(explode.map([1], { concurrency: 0 }))).rejects.toThrow(
+    "concurrency must be an integer >= 1",
+  );
+
+  const doubler = clientFor(server).remoteFunction(function* generate(value: number) {
+    yield value;
+  });
+  expect(() => doubler.map([1])).toThrow("a generator function cannot be mapped");
+});
+
+test("starmap spreads argument tuples", async () => {
+  const server = new FakeVmonServer();
+  const add = clientFor(server).remoteFunction((left: number, right: number) => left + right);
+  await expect(
+    collect(
+      add.starmap([
+        [1, 2],
+        [3, 4],
+      ]),
+    ),
+  ).resolves.toEqual([3, 7]);
+  expect(server.liveSocketCount()).toBe(0);
+});
+
+test("spawn runs on dedicated sessions of one shared sandbox", async () => {
+  const server = new FakeVmonServer();
+  const directory = await scratchDirectory();
+  const gateA = join(directory, "spawn-a");
+  const gateB = join(directory, "spawn-b");
+  const client = clientFor(server);
+  const waiter = client.remoteFunctionFromSource<[path: string, value: number], number>({
+    source: waitForFileSource(),
+    exportName: "waitForFile",
+  });
+
+  const first = await waiter.spawn(gateA, 11);
+  const second = await waiter.spawn(gateB, 22);
+  expect(first.done()).toBe(false);
+  await expect(first.get(50)).rejects.toThrow("was not ready within 50ms");
+
+  await writeFile(gateA, "go");
+  await writeFile(gateB, "go");
+  await expect(FunctionCall.gather(first, second)).resolves.toEqual([11, 22]);
+  expect(first.done()).toBe(true);
+  // One shared sandbox, one exec session per spawn.
+  expect(server.createBodies).toHaveLength(1);
+  expect(server.execs).toHaveLength(2);
+
+  const generatorFn = client.remoteFunction(function* nope() {
+    yield 1;
+  });
+  await expect(generatorFn.spawn()).rejects.toThrow("cannot spawn a generator function");
+
+  await waiter.terminate();
+});
+
+test("cancel closes the spawned session and get rejects; gather can collect failures", async () => {
+  const server = new FakeVmonServer();
+  const directory = await scratchDirectory();
+  const gate = join(directory, "cancel-gate");
+  const client = clientFor(server);
+  const waiter = client.remoteFunctionFromSource<[path: string, value: number], number>({
+    source: waitForFileSource(),
+    exportName: "waitForFile",
+  });
+  const failer = client.remoteFunction(function failer(): never {
+    throw new TypeError("spawned failure");
+  });
+
+  const hanging = await waiter.spawn(gate, 1);
+  const failing = await failer.spawn();
+  hanging.cancel();
+  await expect(hanging.get()).rejects.toThrow("remote function call was cancelled");
+  expect(hanging.done()).toBe(true);
+
+  const gathered = await FunctionCall.gather(hanging, failing, { returnExceptions: true });
+  expect(gathered).toHaveLength(2);
+  expect(gathered[0]).toBeInstanceOf(RemoteFunctionError);
+  expect(gathered[1]).toBeInstanceOf(TypeError);
+  await expect(FunctionCall.gather(failing)).rejects.toThrow("spawned failure");
+
+  await waiter.terminate();
+  await failer.terminate();
+  expect(server.liveSocketCount()).toBe(0);
+});
+
+test("retries rerun guest failures with recorded policy delays", async () => {
+  const server = new FakeVmonServer();
+  const directory = await scratchDirectory();
+  const client = clientFor(server);
+
+  const fixedDelays: number[] = [];
+  const flakyFixed = client.remoteFunctionFromSource<[path: string, succeedAt: number], number>(
+    { source: counterSource(), exportName: "flaky" },
+    {
+      retries: 2,
+      retrySleep: (seconds) => {
+        fixedDelays.push(seconds);
+        return Promise.resolve();
+      },
+    },
+  );
+  await expect(flakyFixed.remote(join(directory, "count-fixed"), 3)).resolves.toBe(3);
+  expect(fixedDelays).toEqual([1, 1]);
+  expect(server.execs).toHaveLength(1);
+  await flakyFixed.terminate();
+
+  const backoffDelays: number[] = [];
+  const flakyBackoff = client.remoteFunctionFromSource<[path: string, succeedAt: number], number>(
+    { source: counterSource(), exportName: "flaky" },
+    {
+      retries: new Retries({
+        maxRetries: 3,
+        initialDelay: 0.5,
+        backoffCoefficient: 2,
+        maxDelay: 60,
+      }),
+      retrySleep: (seconds) => {
+        backoffDelays.push(seconds);
+        return Promise.resolve();
+      },
+    },
+  );
+  await expect(flakyBackoff.remote(join(directory, "count-backoff"), 3)).resolves.toBe(3);
+  expect(backoffDelays).toEqual([0.5, 1]);
+  await flakyBackoff.terminate();
+
+  const exhaustedDelays: number[] = [];
+  const alwaysFails = client.remoteFunction(
+    function alwaysFails(): never {
+      throw new RangeError("permanent");
+    },
+    {
+      retries: 1,
+      retrySleep: (seconds) => {
+        exhaustedDelays.push(seconds);
+        return Promise.resolve();
+      },
+    },
+  );
+  await expect(alwaysFails.remote()).rejects.toThrow("permanent");
+  expect(exhaustedDelays).toEqual([1]);
+  await alwaysFails.terminate();
+});
+
+test("per-call timeouts kill the session and the next call recovers", async () => {
+  const server = new FakeVmonServer();
+  const slow = clientFor(server).remoteFunction(
+    async function slow(value: number) {
+      if (value === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 60_000));
+      }
+      return value;
+    },
+    { timeout: 0.3 },
+  );
+
+  try {
+    await slow.remote(0);
+    throw new Error("expected the call to time out");
+  } catch (error) {
+    expect(error).toBeInstanceOf(RemoteFunctionError);
+    expect((error as RemoteFunctionError).code).toBe("timeout");
+    expect((error as RemoteFunctionError).message).toContain("timed out after 0.3s");
+  }
+
+  await expect(slow.remote(5)).resolves.toBe(5);
+  expect(server.execs).toHaveLength(2);
+  await slow.terminate();
+  expect(server.liveSocketCount()).toBe(0);
+});
+
+test("source specs expose an exported handler without closure serialization", async () => {
+  const server = new FakeVmonServer();
+  const sourceFunction = clientFor(server).remoteFunctionFromSource<
+    [value: number],
+    { doubled: number }
+  >({
+    source: "export function handle(value) { return { doubled: value * 2 }; }",
+    exportName: "handle",
+  });
+
+  await expect(sourceFunction.remote(9)).resolves.toEqual({ doubled: 18 });
+  await sourceFunction.terminate();
+});
+
+test("daemon errors retain status and structured codes during provisioning", async () => {
+  const server = new FakeVmonServer();
+  server.createFailure = { status: 503, code: "capacity_exhausted", message: "no VM slots" };
+  const remote = clientFor(server).remoteFunction((value: number) => value);
+
+  try {
+    await remote.remote(1);
+    throw new Error("expected sandbox provisioning to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(APIError);
+    const failure = error as APIError;
+    expect(failure.status).toBe(503);
+    expect(failure.code).toBe("capacity_exhausted");
+    expect(failure.message).toBe("no VM slots");
+  }
+  // Provisioning failures are not infra-retried.
+  expect(server.createBodies).toHaveLength(1);
+});
+
+test("images without Node.js produce the guidance error without retries", async () => {
+  const server = new FakeVmonServer();
+  server.nodeMissing = true;
+  const remote = clientFor(server).remoteFunction((value: number) => value, {
+    image: "alpine:3",
+  });
+
+  await expect(remote.remote(1)).rejects.toThrow(MISSING_NODE_HINT);
+  expect(server.createBodies).toHaveLength(1);
+  expect(server.execs).toHaveLength(1);
+});
+
+const STATUS_GRPC_CODE: Record<number, Code> = {
+  400: Code.InvalidArgument,
+  401: Code.Unauthenticated,
+  404: Code.NotFound,
+  409: Code.Aborted,
+  503: Code.Unavailable,
+};
+
+async function pollUntil(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("pollUntil condition never became true");
+    await Bun.sleep(5);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

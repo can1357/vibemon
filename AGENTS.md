@@ -13,8 +13,9 @@ Three runtime layers. The Rust server owns the registry and spawns one `vmon vmm
 
 ```
 Web UI / Rust CLI / Python SDK / TypeScript SDK / Go SDK
-   │ HTTP / WebSocket (or local HTTP-over-UDS)
-vmon serve (Rust axum API, vmond crate)
+   │ gRPC (h2c over TCP or UDS); browsers/TS ride a gRPC-over-WebSocket
+   │ bridge (`GET /grpc`, proto/vmon/v1/bridge.proto)
+vmon serve (Rust axum + tonic, vmond crate)
    │ Engine registry, image pipeline, pools, mesh, volumes
    │ spawns `vmon vmm ... --api-sock <sock>` per VM
 vmon vmm (Rust VMM crate)
@@ -28,20 +29,21 @@ vmon-agent (guest agent, Linux guest only)
 
 ## Key Directories
 
-- `src/` — Rust top-level `vmon` binary: CLI (`cli.rs`), local/remote transports (`transport.rs`), context storage (`contexts.rs`), and WebSocket client helpers (`ws.rs`).
+- `src/` — Rust top-level `vmon` binary: CLI (`cli.rs`), local/remote tonic transport (`transport.rs`), and context storage (`contexts.rs`).
 - `vmm/` — Rust VMM crate used by `vmon vmm`.
   - `vmm/src/hv/` — hypervisor seam; `kvm/` and `hvf/` backends selected by `#[cfg(target_os)]`.
   - `vmm/src/arch/` — architecture-specific boot/setup (`x86_64/`: MP table, GDT, MSR; `aarch64/`: FDT, GIC).
   - `vmm/src/virtio/` — virtio device model: `mod.rs` (trait + worker loop), `mmio.rs`, `pci.rs` (x86_64-only), `net.rs`, `block.rs`, `fs.rs`, `console.rs`.
   - `vmm/src/os/` — OS primitives (`EventFd`: real `eventfd(2)` on Linux, pipe-backed shim on macOS).
   - `vmm/src/devices/`, `vmm/src/snapshot/`.
-- `vmond/` — Rust server/engine crate used by `vmon serve`: HTTP API, registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
+- `proto/` — `vmon-proto` crate and the API contract: `vmon/v1/api.proto` (five gRPC services; the ONLY API) and `vmon/v1/bridge.proto` (browser WS bridge framing). Rust code generates at build time via protox + tonic; client codegen is checked in.
+- `vmond/` — Rust server/engine crate used by `vmon serve`: gRPC services (`api/grpc.rs`), WS bridge (`api/bridge.rs`), remaining HTTP surfaces (healthz, metrics, ports proxy, static UI), registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
-- `sdk/py/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
+- `sdk/py/vmon/` — thin Python SDK only (`_endpoint.py`, `client.py`, `driver.py`, `process.py`, `sandbox.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `v1/` generated protobuf/gRPC code, `__init__.py`).
 - `sdk/py/tests/`, `sdk/py/e2e.py` — Python SDK unit tests and real-VM SDK driver.
 - `sdk/ts/` — TypeScript SDK (bun).
-- `sdk/go/` — Go SDK (`go test`, `github.com/coder/websocket`).
+- `sdk/go/` — Go SDK (`go test`, `google.golang.org/grpc`; `github.com/coder/websocket` only for the ports tunnel).
 - `ui/` — React + Vite + TypeScript web panel; **builds into `vmond/web/`** for Rust embedding.
 - `demo/` — runnable demo and asset-fetch scripts (Ubuntu/arm64 boots, OCI→ext4, Lima bridge for macOS).
 
@@ -62,6 +64,7 @@ just cluster-e2e     # VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e
 just soak            # VMON_E2E=1 VMON_SOAK=1 cargo test --test soak -- --test-threads=1
 just fetch-assets    # ./demo/fetch-test-assets.sh  (kernels/images → target/test-assets/)
 just ui              # cd ui && bun install && bun run build  → vmond/web/
+just proto           # bunx @bufbuild/buf generate  (regenerate Go/Py/TS/UI client code from proto/)
 just agent-musl      # build static vmon-agent → target/test-assets/vmon-agent-<arch>
 just sdk-ts          # cd sdk/ts && bun install && bun run typecheck
 just sdk-ts-smoke    # cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
@@ -108,32 +111,33 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - After changing `requires-python` or dependency constraints, regenerate the
   root workspace lockfile `uv.lock` with `uv lock` (from the repo root); never
   hand-edit generated lockfile markers.
-- **Thin client boundary:** the Python package is a client SDK only. Keep HTTP/UDS/WebSocket mechanics in `_transport.py`/`wsframe.py`, context persistence in `context.py`, and user objects in `sandbox.py`, `volume.py`, and `secret.py`. Do not reintroduce SDK-side command entry points, daemon/server code, mesh control, image building, VMM orchestration, or asset bundling.
-- **Errors:** `DaemonError` carries server error codes across the transport boundary; SDK convenience layers may add narrow client-side exceptions such as `RemoteFunctionError`. Server/engine errors live in Rust (`vmond::error`) and are serialized over the API.
+- **Thin client boundary:** the Python package is a client SDK only. Keep gRPC channel/HTTP/ports-tunnel mechanics in `_endpoint.py`/`wsframe.py`, mesh failover in `driver.py`, context persistence in `context.py`, and user objects in `sandbox.py`, `volume.py`, and `secret.py`. Do not reintroduce SDK-side command entry points, daemon/server code, mesh control, image building, VMM orchestration, or asset bundling.
+- **Errors:** `DaemonError` carries stable server error codes across the transport boundary (`vmon-code` gRPC trailing metadata; gRPC status code as fallback); SDK convenience layers may add narrow client-side exceptions such as `RemoteFunctionError`. Server/engine errors live in Rust (`vmond::error`) and map onto gRPC statuses in `vmond/src/api/grpc.rs`.
 - **State:** contexts live under `$VMON_HOME` (`contexts.json` plus optional private token files). Secrets remain in memory and are sent only in create/exec requests; never persist them in SDK metadata.
 
-**UI** — React function components + hooks; same-origin `fetch` client (`api.ts`) with bearer auth and WebSocket exec; polling via hooks (`useSandboxes`); OKLCH dark-theme design tokens in `styles.css`. TypeScript strict, `verbatimModuleSyntax`, `noUnusedLocals/Parameters`.
+**UI** — React function components + hooks; gRPC client (`api.ts`) over the WebSocket bridge transport (`grpc-ws.ts`, one RPC per socket) with bearer auth; the terminal drives `SandboxService.Exec` bidi; polling via hooks (`useSandboxes`); OKLCH dark-theme design tokens in `styles.css`. TypeScript strict, `verbatimModuleSyntax`, `noUnusedLocals/Parameters`.
 
 ## Important Files
 
 - `src/main.rs` — single-binary dispatch; `vmon vmm` jumps into the VMM crate, every other subcommand uses the Rust CLI.
-- `src/cli.rs`, `src/transport.rs`, `src/contexts.rs`, `src/ws.rs` — user CLI, local/remote API transport, context storage, and WebSocket client code.
+- `src/cli.rs`, `src/transport.rs`, `src/contexts.rs` — user CLI, local/remote tonic transport (background runtime thread + UDS connector), and context storage.
 - `vmm/src/vmm.rs` — VMM lifecycle (build/start/pause/snapshot); owns vCPUs, devices, `PauseGate`.
 - `vmm/src/config.rs` — manual VMM CLI parser and all launch-time flags + hard caps.
 - `vmm/src/control.rs` — Unix-socket JSON control plane and `PauseGate`.
-- `vmond/src/lib.rs`, `vmond/src/api/`, `vmond/src/engine/`, `vmond/src/image/`, `vmond/src/mesh/` — Rust server core, HTTP routes, engine facade/spawn/control, OCI image pipeline, and cluster mesh.
+- `vmond/src/lib.rs`, `vmond/src/api/` (`grpc.rs` services, `bridge.rs` WS bridge, `routes.rs` remaining HTTP), `vmond/src/engine/`, `vmond/src/image/`, `vmond/src/mesh/` — Rust server core, gRPC + HTTP surfaces, engine facade/spawn/control, OCI image pipeline, and cluster mesh.
 - `agent/src/main.rs`, `agent/src/proto.rs` — guest agent and its frame protocol.
-- `sdk/py/vmon/sandbox.py`, `_transport.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
+- `sdk/py/vmon/sandbox.py`, `_endpoint.py`, `client.py`, `driver.py`, `process.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
 - `sdk/ts/package.json`, `sdk/ts/src/` — TypeScript SDK.
 - `sdk/go/go.mod`, `sdk/go/*.go` — Go SDK.
+- `proto/vmon/v1/api.proto`, `proto/vmon/v1/bridge.proto`, `buf.gen.yaml` — the API contract and client codegen config.
 - `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `sdk/py/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.
 
 ## Runtime/Tooling Preferences
 
 - **Rust:** pinned `nightly-2026-04-29` (`rust-toolchain.toml`, with rustfmt/clippy/rust-analyzer). Release profile: `opt-level = 2`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
-- **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `sdk/py` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependency is the HTTP client stack for the SDK (`httpx`).
+- **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `sdk/py` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependencies are the gRPC stack (`grpcio`, `protobuf`) plus `httpx` for the ports proxy.
 - **UI + TS SDK:** **bun** for everything (`bun.lock`; no `package-lock.json`). React/Vite/TS power the UI, which builds into `vmond/web/`; the TypeScript SDK lives in `sdk/ts` with `bun run typecheck` and `bun test`.
-- **Go SDK:** Go 1.23+ with standard `go fmt`/`go vet`/`go test`; `github.com/coder/websocket` is the sole runtime dependency.
+- **Go SDK:** Go 1.23+ with standard `go fmt`/`go vet`/`go test`; runtime dependencies are `google.golang.org/grpc`/`google.golang.org/protobuf` plus `github.com/coder/websocket` for the ports tunnel.
 - **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`. The Rust CLI/server locates the `vmon` binary from cargo target dirs, `$VMON_BIN`, or `PATH`.
 
 ## Testing & QA

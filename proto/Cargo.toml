@@ -1,0 +1,18 @@
+[package]
+name = "vmon-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Generated protobuf types for the vmon v1 WebSocket transport"
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = "0.14.4"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+prost-build = "0.14.4"
+protox = "0.9.1"
+tonic-prost-build = "0.14.6"

@@ -8,7 +8,9 @@ version = "0.3.0"
 description = "Thin Python SDK for the Rust vmon API"
 requires-python = ">=3.14"
 dependencies = [
+    "grpcio>=1.66",
     "httpx>=0.28",
+    "protobuf>=6",
 ]
 
 [project.optional-dependencies]
@@ -25,11 +27,12 @@ dev = [
 
 
 [tool.setuptools]
-packages = ["vmon"]
+packages = ["vmon", "vmon.v1"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py314"
+extend-exclude = ["vmon/v1"]
 
 [tool.ruff.lint]
 # pyflakes (F) + pycodestyle (E/W) + isort (I) + pyupgrade (UP) + bugbear (B)
@@ -49,6 +52,10 @@ exclude = ["^e2e\\.py$", "^tests/"]
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "vmon.v1.*"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

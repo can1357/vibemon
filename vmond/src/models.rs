@@ -8,12 +8,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use utoipa::ToSchema;
 
 /// `POST /v1/sandboxes` body: today's `SandboxCreate` field set plus
 /// `command` (foreground entrypoint override composed by the CLI).
 /// External `remote_page_*` fields are rejected by validation.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCreate {
 	pub image:                  Option<String>,
@@ -77,7 +76,7 @@ const fn default_timeout() -> Option<f64> {
 }
 
 /// `POST /{id}/exec` body and the first WS exec frame (§2.4).
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ExecBody {
 	#[serde(default)]
 	pub cmd:     Vec<String>,
@@ -91,7 +90,7 @@ pub struct ExecBody {
 }
 
 /// `POST /{id}/snapshots` body.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SnapshotBody {
 	pub name: Option<String>,
 	#[serde(default)]
@@ -99,26 +98,26 @@ pub struct SnapshotBody {
 }
 
 /// `POST /{id}/snapshots/fs` body.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SnapshotFsBody {
 	pub name: Option<String>,
 }
 
 /// `POST /{id}/extend` body.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExtendBody {
 	pub secs: u64,
 }
 
 /// Optional body for `POST /{id}/stop`, allowing foreground CLI runs to
 /// preserve the process exit code they just observed.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct StopBody {
 	pub returncode: Option<i64>,
 }
 
 /// `GET|PUT /{id}/network` body (same field names as today).
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct NetworkBody {
 	pub block_network: Option<bool>,
 	pub cidr_allow:    Option<Vec<String>>,
@@ -126,7 +125,7 @@ pub struct NetworkBody {
 }
 
 /// `POST /v1/snapshots/{name}/restore` body.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RestoreBody {
 	pub name:  Option<String>,
 	/// Wait for the guest agent before returning.
@@ -137,7 +136,7 @@ pub struct RestoreBody {
 }
 
 /// `POST /v1/snapshots/{name}/fork` body.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForkBody {
 	pub count: u32,
 	#[serde(flatten)]
@@ -145,7 +144,7 @@ pub struct ForkBody {
 }
 
 /// `PUT /v1/pools/{ref}` body (= today's `prewarm`).
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PoolPutBody {
 	pub size:  u32,
 	/// Template kwargs forwarded to the image pipeline.
@@ -154,7 +153,7 @@ pub struct PoolPutBody {
 }
 
 /// `POST /{id}/migrate` body (admin; mesh).
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MigrateBody {
 	pub target: String,
 }

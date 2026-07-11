@@ -198,22 +198,12 @@ func TestMeshDriverStreamSurvivesConfiguredTimeout(t *testing.T) {
 func TestMeshDriverLazyDiscoveryMergeAndFailover(t *testing.T) {
 	var seedURL string
 	var peerURL string
-	peer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/v1/mesh/status" {
-			response.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(response, `{"self":{"advertise":"`+peerURL+`"},"peers":[]}`)
-			return
-		}
+	peer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(response, "peer")
 	}))
 	defer peer.Close()
 	peerURL = peer.URL
-	seed := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/v1/mesh/status" {
-			response.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(response, `{"self":{"advertise":"`+seedURL+`"},"peers":[{"advertise":"`+peerURL+`"}]}`)
-			return
-		}
+	seed := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(response, "seed")
 	}))
 	seedURL = seed.URL
@@ -222,6 +212,11 @@ func TestMeshDriverLazyDiscoveryMergeAndFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer driver.Close()
+	// Discovery consumes the SystemService.MeshStatus document (installed by
+	// newClient in production).
+	driver.meshStatus = func(context.Context) ([]byte, error) {
+		return []byte(`{"self":{"advertise":"` + seedURL + `"},"peers":[{"advertise":"` + peerURL + `"}]}`), nil
+	}
 	response, endpoint, err := driver.Do(context.Background(), DriverRequest{Method: http.MethodGet, Path: "/work"})
 	if err != nil {
 		t.Fatal(err)
@@ -238,31 +233,6 @@ func TestMeshDriverLazyDiscoveryMergeAndFailover(t *testing.T) {
 	response.Body.Close()
 	if endpoint != peer.URL {
 		t.Fatalf("failover endpoint = %q, want %q", endpoint, peer.URL)
-	}
-}
-
-func TestMeshDriverResolveSandbox(t *testing.T) {
-	missing := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		response.Header().Set("Content-Type", "application/json")
-		response.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(response, `{"code":"not_found","message":"missing"}`)
-	}))
-	defer missing.Close()
-	found := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		_, _ = io.WriteString(response, `{}`)
-	}))
-	defer found.Close()
-	driver, err := newMeshDriver(DSNConfig{Endpoints: []string{missing.URL, found.URL}, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer driver.Close()
-	endpoint, err := driver.ResolveSandbox(context.Background(), "box/a", missing.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if endpoint != found.URL {
-		t.Fatalf("resolved endpoint = %q", endpoint)
 	}
 }
 

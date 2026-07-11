@@ -72,13 +72,15 @@ def test_selected_context_uses_environment_then_saved_token(monkeypatch, mvm_hom
 
         with connect() as client:
             assert client.sandboxes.list() == []
-        assert server.last("GET", "/v1/sandboxes").headers["authorization"] == "Bearer env-token"
+        assert server.last_rpc("SandboxService/List").headers["authorization"] == (
+            "Bearer env-token"
+        )
 
         server.required_token = "saved-token"
         monkeypatch.delenv("VMON_API_TOKEN")
         with connect() as client:
             assert client.sandboxes.list() == []
-        assert server.last("GET", "/v1/sandboxes").headers["authorization"] == (
+        assert server.last_rpc("SandboxService/List").headers["authorization"] == (
             "Bearer saved-token"
         )
 
@@ -99,9 +101,9 @@ def test_create_context_is_build_input_not_transport_selection(monkeypatch, mvm_
                 name="routed",
             )
             assert sandbox.id == "routed"
-        assert prod.last("POST", "/v1/sandboxes").json["context"] == "dev"
-        assert dev.recorded("POST", "/v1/sandboxes") == []
+        assert prod.last_rpc("SandboxService/Create").json["context"] == "dev"
+        assert dev.rpcs("SandboxService/Create") == []
 
         with connect("vmon+context://dev") as client:
             client.sandboxes.create(name="explicit-dev")
-        assert dev.last("POST", "/v1/sandboxes").json["name"] == "explicit-dev"
+        assert dev.last_rpc("SandboxService/Create").json["name"] == "explicit-dev"
