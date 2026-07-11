@@ -227,7 +227,7 @@ The low-level `vmon vmm` subcommand accepts the production lifecycle, agent, jai
 
 ## Self-hosted sandbox API
 
-The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine, serves the `vmon.v1` gRPC services over native h2c and a `/grpc` WebSocket bridge, keeps HTTP routes for health, metrics, and port proxying, embeds the React panel from `vmond/web/`, and exposes the local UDS endpoint the CLI and SDKs use. The top-level CLI (`vmon run`, `ps`, `logs`, `exec`, `stop`, `mesh`, `context`, and friends) is Rust code in the same binary; `vmon vmm` remains the low-level escape hatch for direct kernel/rootfs boots.
+The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine, serves the `vmon.v1` gRPC services over native h2c and a `/grpc` WebSocket bridge, keeps HTTP routes for health, metrics, and port proxying, embeds the React panel from `vmond/web/`, and exposes the local UDS endpoint used by the CLI plus the Python and Go SDKs. The top-level CLI (`vmon run`, `ps`, `logs`, `exec`, `stop`, `mesh`, `context`, and friends) is Rust code in the same binary; `vmon vmm` remains the low-level escape hatch for direct kernel/rootfs boots.
 
 | Command | What it does |
 | --- | --- |
@@ -246,7 +246,7 @@ All three SDKs accept the network forms below. Python and Go additionally suppor
 | `vmon+unix:///absolute/path/vmond.sock` | Local gRPC/HTTP-over-UDS endpoint (Python and Go). |
 | `vmon+context://prod` | Endpoints and optional token from the named vmon context. |
 
-`token`, `discover=on|off`, and `timeout=<seconds>` are optional query parameters. Outside browsers, an empty DSN resolves `$VMON_DSN`, then `$VMON_CONTEXT`, then the local `$VMON_HOME/vmond.sock`; a browser TypeScript client defaults to its page origin. Client construction performs no network I/O. Mesh discovery is lazy; after the first successful request, the driver learns advertised peers and fails over only on transport-level connection failures. Daemon gRPC statuses and HTTP responses are never replayed.
+`token`, `discover=on|off`, and `timeout=<seconds>` are optional query parameters. An empty Python or Go DSN resolves `$VMON_DSN`, then `$VMON_CONTEXT`, then the local `$VMON_HOME/vmond.sock`; TypeScript resolves those environment settings when available, then defaults to the page origin in a browser or `http://127.0.0.1:8000` elsewhere. Client construction performs no network I/O. Mesh discovery is lazy: after the first successful request, the driver learns advertised peers and fails over only on transport-level connection failures. Daemon gRPC statuses and HTTP responses are never replayed.
 
 ```python
 from vmon import Secret, connect
