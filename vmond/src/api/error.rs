@@ -53,7 +53,7 @@ impl ApiError {
 			"not_found" => StatusCode::NOT_FOUND,
 			"invalid" | "checksum" => StatusCode::BAD_REQUEST,
 			"unauthorized" => StatusCode::UNAUTHORIZED,
-			"actor_lost" | "unavailable_secret" => StatusCode::PRECONDITION_FAILED,
+			"actor_lost" | "unavailable_secret" | "ha_unavailable" => StatusCode::PRECONDITION_FAILED,
 			"busy" | "conflict" => StatusCode::CONFLICT,
 			"deadline" => StatusCode::GATEWAY_TIMEOUT,
 			"unsupported" => StatusCode::NOT_IMPLEMENTED,

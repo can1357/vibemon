@@ -322,6 +322,7 @@ mod tests {
 		base_url:          String,
 		client:            reqwest::Client,
 		template_revision: String,
+		functions:         Arc<FunctionDomain>,
 		handle:            tokio::task::JoinHandle<()>,
 		_temp:             tempfile::TempDir,
 	}
@@ -352,6 +353,21 @@ mod tests {
 			.expect("write test CAS pointer");
 			let engine_api: Arc<dyn EngineApi> = engine.clone();
 			let functions = FunctionDomain::open(home, engine_api).expect("open function domain");
+			let package = functions
+				.artifacts()
+				.put(b"api test package")
+				.expect("store test package");
+			functions
+				.store()
+				.record_artifact(
+					&package.digest,
+					package.size,
+					Some("application/octet-stream"),
+					package.path.to_str().expect("test package path"),
+					0,
+					None,
+				)
+				.expect("register test package");
 			let state = ApiState::new(engine, functions.clone(), config, Transport::Tcp);
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
 				.await
@@ -365,6 +381,7 @@ mod tests {
 				base_url: format!("http://{addr}"),
 				client: reqwest::Client::new(),
 				template_revision,
+				functions,
 				handle,
 				_temp: temp,
 			}
@@ -408,7 +425,22 @@ mod tests {
 				namespace: "tests".to_owned(),
 				name:      name.to_owned(),
 			}),
-			package: Some(pb::PackageSpec::default()),
+			package: Some(pb::PackageSpec {
+				source: Some(pb::ArtifactRef {
+					digest: Some(pb::Digest {
+						algorithm: pb::DigestAlgorithm::Sha256 as i32,
+						value:     Sha256::digest(b"api test package").to_vec(),
+					}),
+				}),
+				module: "api_test".to_owned(),
+				content_digest: Some(pb::Digest {
+					algorithm: pb::DigestAlgorithm::Sha256 as i32,
+					value:     Sha256::digest(b"api test package").to_vec(),
+				}),
+				mode: pb::PackageMode::Module as i32,
+				qualname: "invoke".to_owned(),
+				..Default::default()
+			}),
 			image: Some(pb::ImageSpec {
 				source: Some(pb::image_spec::Source::Template(pb::TemplateImageSource {
 					name:     "api-test".to_owned(),
@@ -799,6 +831,26 @@ mod tests {
 			.expect("get active function")
 			.into_inner();
 		assert_eq!(current.r#ref, Some(revision_ref.clone()));
+		let mut wrong_function_revision = revision_ref.clone();
+		wrong_function_revision.function =
+			Some(pb::FunctionRef { namespace: "tests".to_owned(), name: "not-echo".to_owned() });
+		assert_eq!(
+			functions
+				.get(authed(
+					pb::GetFunctionRequest {
+						function: Some(pb::FunctionSelector {
+							selection: Some(pb::function_selector::Selection::Pinned(
+								wrong_function_revision,
+							)),
+						}),
+					},
+					"client-token",
+				))
+				.await
+				.expect_err("pinned revision identity mismatch")
+				.code(),
+			Code::NotFound
+		);
 		let listed = functions
 			.list(authed(pb::ListFunctionsRequest::default(), "client-token"))
 			.await
@@ -870,6 +922,24 @@ mod tests {
 			.expect("get app")
 			.into_inner();
 		assert_eq!(current_app.r#ref, second_app.r#ref);
+		let mut wrong_app_revision = second_app.r#ref.clone().expect("app revision ref");
+		wrong_app_revision.app =
+			Some(pb::AppRef { namespace: "tests".to_owned(), name: "not-app".to_owned() });
+		assert_eq!(
+			functions
+				.get_app(authed(
+					pb::GetAppRequest {
+						app: Some(pb::AppSelector {
+							selection: Some(pb::app_selector::Selection::Pinned(wrong_app_revision)),
+						}),
+					},
+					"client-token",
+				))
+				.await
+				.expect_err("pinned app revision identity mismatch")
+				.code(),
+			Code::NotFound
+		);
 		functions
 			.rollback_app(authed(
 				pb::RollbackAppRequest {
@@ -947,6 +1017,30 @@ mod tests {
 			.expect("create call")
 			.into_inner();
 		let call_ref = call.r#ref.expect("call ref");
+		let mut follower = calls
+			.watch(authed(
+				pb::WatchCallRequest {
+					cursor: Some(pb::EventCursor {
+						call:           Some(call_ref.clone()),
+						after_sequence: 0,
+					}),
+					follow: true,
+				},
+				"client-token",
+			))
+			.await
+			.expect("follow pending call")
+			.into_inner();
+		let pending = follower
+			.message()
+			.await
+			.expect("pending event")
+			.expect("pending frame");
+		assert!(matches!(
+			pending.payload,
+			Some(pb::call_event::Payload::Status(status))
+				if status.status == pb::CallStatus::Pending as i32
+		));
 		let malformed = pb::StreamCallInputsRequest {
 			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
 				index:    0,
@@ -989,6 +1083,16 @@ mod tests {
 			.expect("input ack")
 			.expect("input frame");
 		assert_eq!(committed.committed_input_count, 1);
+		let queued = follower
+			.message()
+			.await
+			.expect("queued event")
+			.expect("queued frame");
+		assert!(matches!(
+			queued.payload,
+			Some(pb::call_event::Payload::Status(status))
+				if status.status == pb::CallStatus::Queued as i32
+		));
 		calls
 			.close_inputs(authed(
 				pb::CloseCallInputsRequest {
@@ -999,6 +1103,12 @@ mod tests {
 			))
 			.await
 			.expect("close call inputs");
+		let input_closed = follower
+			.message()
+			.await
+			.expect("input-closed event")
+			.expect("input-closed frame");
+		assert!(matches!(input_closed.payload, Some(pb::call_event::Payload::InputClosed(_))));
 		assert_eq!(
 			calls
 				.list(authed(pb::ListCallsRequest::default(), "client-token"))
@@ -1077,6 +1187,159 @@ mod tests {
 			.await
 			.expect("cloudpickle request");
 		assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+	}
+
+	#[tokio::test]
+	async fn register_reports_missing_transient_secrets_in_response_and_get() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut functions = pb::function_service_client::FunctionServiceClient::new(api.channel());
+		let mut spec = test_function_spec("secret-dependent", &api.template_revision);
+		spec.secrets = vec![
+			pb::SecretRef { name: "present".to_owned(), version_presence: None },
+			pb::SecretRef { name: "missing".to_owned(), version_presence: None },
+		];
+		let registered = functions
+			.register(authed(
+				pb::RegisterFunctionRequest {
+					spec:              Some(spec),
+					request_id:        "register-secret-dependent".to_owned(),
+					transient_secrets: vec![pb::TransientSecretMaterial {
+						secret: Some(pb::SecretRef {
+							name:             "present".to_owned(),
+							version_presence: None,
+						}),
+						value:  b"available".to_vec(),
+					}],
+				},
+				"admin-token",
+			))
+			.await
+			.expect("register secret-dependent function")
+			.into_inner();
+		assert_eq!(registered.status, pb::FunctionRevisionStatus::Unavailable as i32);
+		assert_eq!(registered.unavailable_secrets, vec![pb::SecretRef {
+			name:             "missing".to_owned(),
+			version_presence: None,
+		}]);
+		let revision = registered.r#ref.clone().expect("revision ref");
+		let fetched = functions
+			.get(authed(
+				pb::GetFunctionRequest {
+					function: Some(pb::FunctionSelector {
+						selection: Some(pb::function_selector::Selection::Pinned(revision)),
+					}),
+				},
+				"client-token",
+			))
+			.await
+			.expect("get secret-dependent revision")
+			.into_inner();
+		assert_eq!(fetched.status, pb::FunctionRevisionStatus::Unavailable as i32);
+		assert_eq!(fetched.unavailable_secrets, registered.unavailable_secrets);
+	}
+
+	#[tokio::test]
+	async fn call_watch_recovers_broadcast_lag_without_gaps_or_duplicates() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut functions = pb::function_service_client::FunctionServiceClient::new(api.channel());
+		let revision = functions
+			.register(authed(
+				pb::RegisterFunctionRequest {
+					spec:              Some(test_function_spec("lagged-watch", &api.template_revision)),
+					request_id:        "register-lagged-watch".to_owned(),
+					transient_secrets: Vec::new(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("register lagged-watch function")
+			.into_inner()
+			.r#ref
+			.expect("revision ref");
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_millis() as u64;
+		let call = api
+			.functions
+			.store()
+			.create_call(
+				&pb::CreateCallRequest {
+					r#type: pb::CallType::Unary as i32,
+					target: Some(pb::CallTarget { function: Some(revision.clone()), receiver: None }),
+					inputs: vec![pb::CallInput {
+						index:    0,
+						payload:  Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
+						input_id: "lagged-input".to_owned(),
+					}],
+					inputs_closed: true,
+					request_id: "lagged-call".to_owned(),
+					..Default::default()
+				},
+				now,
+			)
+			.expect("create lagged call");
+		let leased = api
+			.functions
+			.store()
+			.lease_next_for_revision(&revision.revision_id, "lagged-worker", now + 1, 60_000)
+			.expect("lease")
+			.expect("leased input");
+		api.functions
+			.store()
+			.mark_running(&leased.lease, now + 2, pb::StartupKind::Warm)
+			.expect("mark running");
+		let replay_frontier = api
+			.functions
+			.store()
+			.event_frontier(call.r#ref.as_ref().expect("call ref").call_id.as_str())
+			.expect("event frontier");
+		let call_ref = call.r#ref.expect("call ref");
+		let mut calls = pb::call_service_client::CallServiceClient::new(api.channel());
+		let mut watcher = calls
+			.watch(authed(
+				pb::WatchCallRequest {
+					cursor: Some(pb::EventCursor { call: Some(call_ref), after_sequence: 0 }),
+					follow: true,
+				},
+				"client-token",
+			))
+			.await
+			.expect("watch running call")
+			.into_inner();
+		for index in 0..300_u64 {
+			let event = api
+				.functions
+				.store()
+				.append_log(
+					&leased.lease,
+					pb::LogStream::Stdout,
+					index.to_le_bytes().to_vec(),
+					now + 3 + index,
+				)
+				.expect("append durable log");
+			api.functions.publish_call_event(event);
+		}
+		let sequences = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+			let expected_count = (replay_frontier + 300) as usize;
+			let mut sequences = Vec::with_capacity(expected_count);
+			while sequences.len() < expected_count {
+				sequences.push(
+					watcher
+						.message()
+						.await
+						.expect("watch status")
+						.expect("watch event")
+						.sequence,
+				);
+			}
+			sequences
+		})
+		.await
+		.expect("lag recovery timeout");
+		assert_eq!(sequences, (1..=replay_frontier + 300).collect::<Vec<_>>());
 	}
 
 	#[tokio::test]
@@ -1217,18 +1480,41 @@ mod tests {
 				media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
 					"application/octet-stream".to_owned(),
 				)),
-				ttl_millis_presence: None,
+				ttl_millis_presence: Some(pb::put_artifact_header::TtlMillisPresence::TtlMillis(5_000)),
 			})),
 		};
 		let data = pb::PutArtifactRequest {
 			frame: Some(pb::put_artifact_request::Frame::Data(bytes.clone())),
 		};
+		let (upload_tx, upload_rx) = tokio::sync::mpsc::channel(2);
+		upload_tx.send(header).await.expect("upload header");
+		let final_frame_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let sent_at = Arc::clone(&final_frame_sent);
+		tokio::spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+			let now = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("clock")
+				.as_millis() as u64;
+			sent_at.store(now, std::sync::atomic::Ordering::Release);
+			upload_tx.send(data).await.expect("upload data");
+		});
 		let record = client
-			.put(authed(tokio_stream::iter([header, data]), "admin-token"))
+			.put(authed(tokio_stream::wrappers::ReceiverStream::new(upload_rx), "admin-token"))
 			.await
 			.expect("artifact upload")
 			.into_inner();
 		assert_eq!(record.size_bytes, bytes.len() as u64);
+		assert!(
+			record.created_at_unix_millis
+				>= final_frame_sent.load(std::sync::atomic::Ordering::Acquire),
+			"artifact age must start after the final upload frame"
+		);
+		assert!(matches!(
+			record.expires_at_unix_millis_presence,
+			Some(pb::artifact_record::ExpiresAtUnixMillisPresence::ExpiresAtUnixMillis(expires))
+				if expires == record.created_at_unix_millis + 5_000
+		));
 		let conflicting_header = pb::PutArtifactRequest {
 			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
 				expected_digest:     Some(digest.clone()),

@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added validation for function High Availability (HA) configurations, rejecting invalid setups
 - Added application rollback support via `App.rollback` to revert to previous revisions
 - Added `egress` network policy options to `App.function` for granular outbound traffic control
 - Added `block_network` option to `App.function` to restrict sandbox network access
@@ -224,6 +225,9 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed durability of call event stream, ensuring reliable reconnection and recovery from lag
+- Fixed artifact download range and TTL metadata handling to ensure accuracy and consistency
+- Improved TTY-based command execution reliability and stdin handling
 - Fixed SDK JSON decoding to enforce strict object structures and reject malformed payloads
 - Fixed SDK `Sandbox.metrics` and `Sandbox.tunnels` to return typed objects instead of generic maps
 - Fixed `vmon+unix` DSN support removal in TS SDK, defaulting to `http://127.0.0.1:8000`

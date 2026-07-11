@@ -6,7 +6,13 @@
 //! vmond error code in `vmon-code` response metadata. Requests for sandboxes
 //! owned by a mesh peer are re-issued over a tonic channel to the owner.
 
-use std::{pin::Pin, sync::Arc, thread};
+use std::{
+	collections::HashSet,
+	io::{Read as _, Seek as _, SeekFrom},
+	pin::Pin,
+	sync::Arc,
+	thread,
+};
 
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
@@ -28,6 +34,7 @@ use super::{
 };
 use crate::{
 	engine::{EngineApi, ExecExit, ExecStream as EngineExecStream},
+	image::normalize_oci_arch,
 	mesh::{
 		proxy::{self, MeshError, MeshPeer, OwnerProxyDecision, OwnerRecord},
 		routes::MeshRouteState,
@@ -41,6 +48,92 @@ pub(super) const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const MESH_HOP_KEY: &str = "x-vmon-mesh-hop";
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+const ARTIFACT_CHUNK_SIZE: usize = 64 * 1024;
+
+fn stream_verified_artifact(
+	mut reader: crate::function::artifact::VerifiedArtifactReader,
+	offset: u64,
+	length: u64,
+) -> BoxStream<pb::ArtifactChunk> {
+	let (tx, rx) = mpsc::channel(8);
+	tokio::task::spawn_blocking(move || {
+		if let Err(error) = reader.seek(SeekFrom::Start(offset)) {
+			let _ = tx.blocking_send(Err(status_from(&ApiError::from(crate::EngineError::engine(
+				error.to_string(),
+			)))));
+			return;
+		}
+		if length == 0 {
+			let _ = tx.blocking_send(Ok(pb::ArtifactChunk { offset, data: Vec::new(), eof: true }));
+			return;
+		}
+		let mut remaining = length;
+		let mut frame_offset = offset;
+		while remaining != 0 {
+			let frame_len = remaining.min(ARTIFACT_CHUNK_SIZE as u64) as usize;
+			let mut data = vec![0_u8; frame_len];
+			if let Err(error) = reader.read_exact(&mut data) {
+				let _ = tx.blocking_send(Err(status_from(&ApiError::from(
+					crate::EngineError::engine(error.to_string()),
+				))));
+				return;
+			}
+			remaining -= frame_len as u64;
+			let frame = pb::ArtifactChunk { offset: frame_offset, data, eof: remaining == 0 };
+			frame_offset += frame_len as u64;
+			if tx.blocking_send(Ok(frame)).is_err() {
+				return;
+			}
+		}
+	});
+	Box::pin(ReceiverStream::new(rx))
+}
+
+fn stream_call_event_pages<F>(mut load_page: F, after_sequence: u64) -> BoxStream<pb::CallEvent>
+where
+	F: FnMut(u64) -> crate::Result<Vec<pb::CallEvent>> + Send + 'static,
+{
+	const PAGE_SIZE: usize = 10_000;
+	let (tx, rx) = mpsc::channel(32);
+	tokio::task::spawn_blocking(move || {
+		let mut cursor = after_sequence;
+		loop {
+			let events = match load_page(cursor) {
+				Ok(events) => events,
+				Err(error) => {
+					let _ = tx.blocking_send(Err(status_from(&ApiError::from(error))));
+					return;
+				},
+			};
+			let page_len = events.len();
+			for event in events {
+				if event.sequence <= cursor {
+					let _ = tx.blocking_send(Err(Status::internal("call event replay did not advance")));
+					return;
+				}
+				cursor = event.sequence;
+				if tx.blocking_send(Ok(event)).is_err() {
+					return;
+				}
+			}
+			if page_len < PAGE_SIZE {
+				return;
+			}
+		}
+	});
+	Box::pin(ReceiverStream::new(rx))
+}
+
+fn stream_persisted_call_events(
+	domain: Arc<crate::function::FunctionDomain>,
+	call_id: String,
+	after_sequence: u64,
+) -> BoxStream<pb::CallEvent> {
+	stream_call_event_pages(
+		move |cursor| domain.store().events_after(&call_id, cursor, 10_000),
+		after_sequence,
+	)
+}
 
 enum ArtifactUploadFrame {
 	Chunk(Vec<u8>),
@@ -55,7 +148,9 @@ pub fn status_from(err: &ApiError) -> Status {
 		"not_found" => Code::NotFound,
 		"invalid" => Code::InvalidArgument,
 		"unauthorized" => Code::Unauthenticated,
-		"not_running" | "actor_lost" | "unavailable_secret" => Code::FailedPrecondition,
+		"not_running" | "actor_lost" | "unavailable_secret" | "ha_unavailable" => {
+			Code::FailedPrecondition
+		},
 		"busy" | "conflict" => Code::Aborted,
 		"checksum" => Code::DataLoss,
 		"deadline" => Code::DeadlineExceeded,
@@ -239,6 +334,72 @@ fn mesh_api_error(err: MeshError) -> ApiError {
 	ApiError::new(err.status(), err.code, err.message)
 }
 
+fn function_ha_admission(
+	spec: &pb::FunctionSpec,
+	nodes: &[crate::mesh::state::NodeState],
+	remote_execution_available: bool,
+) -> ApiResult<()> {
+	let resources = spec.resources.as_ref();
+	let policy = resources
+		.and_then(|resources| pb::HighAvailabilityPolicy::try_from(resources.high_availability).ok())
+		.unwrap_or(pb::HighAvailabilityPolicy::Unspecified);
+	let scope = match policy {
+		pb::HighAvailabilityPolicy::Host => "host",
+		pb::HighAvailabilityPolicy::Zone => "zone",
+		pb::HighAvailabilityPolicy::Unspecified | pb::HighAvailabilityPolicy::None => return Ok(()),
+	};
+	let required_arch = resources
+		.and_then(|resources| pb::CpuArchitecture::try_from(resources.architecture).ok())
+		.and_then(|arch| match arch {
+			pb::CpuArchitecture::Amd64 => Some("x86_64"),
+			pb::CpuArchitecture::Arm64 => Some("aarch64"),
+			pb::CpuArchitecture::Unspecified => None,
+		});
+	let compatible = nodes
+		.iter()
+		.filter(|node| {
+			required_arch.is_none_or(|required| {
+				normalize_oci_arch(Some(&node.arch)).as_deref() == Some(required)
+			})
+		})
+		.collect::<Vec<_>>();
+	let domains = match policy {
+		pb::HighAvailabilityPolicy::Host => compatible
+			.iter()
+			.map(|node| node.node_id.as_str())
+			.filter(|host| !host.is_empty())
+			.collect::<HashSet<_>>(),
+		pb::HighAvailabilityPolicy::Zone => compatible
+			.iter()
+			.map(|node| node.region.as_str())
+			.filter(|zone| !zone.is_empty())
+			.collect::<HashSet<_>>(),
+		pb::HighAvailabilityPolicy::Unspecified | pb::HighAvailabilityPolicy::None => {
+			unreachable!("non-HA policies returned above")
+		},
+	};
+	if domains.len() < 2 {
+		return Err(ApiError::function(
+			"ha_unavailable",
+			format!(
+				"function HA {scope} requires at least 2 compatible mesh {scope}s; found {}; \
+				 cross-node function execution is unavailable",
+				domains.len()
+			),
+		));
+	}
+	if !remote_execution_available {
+		return Err(ApiError::function(
+			"ha_unavailable",
+			format!(
+				"function HA {scope} cannot be admitted: cross-node function execution is \
+				 unavailable; use HIGH_AVAILABILITY_POLICY_NONE"
+			),
+		));
+	}
+	Ok(())
+}
+
 /// Relay a forwarded server-stream response as this server's boxed stream,
 /// preserving response metadata; per-item statuses (incl. `vmon-code`) flow
 /// through untouched.
@@ -286,6 +447,17 @@ impl GrpcApi {
 			.await
 			.map_err(|err| status_from(&join_error(err)))?
 			.map_err(|err| status_from(&ApiError::from(err)))
+	}
+
+	fn admit_function_ha(&self, spec: &pb::FunctionSpec) -> Result<(), Status> {
+		let nodes = self
+			.state
+			.mesh
+			.as_ref()
+			.map_or_else(Vec::new, |mesh| mesh.function_placement_nodes());
+		// Sandbox forwarding has no function-worker equivalent: peer function
+		// stores, artifacts, call leases, and result streams are process-local.
+		function_ha_admission(spec, &nodes, false).map_err(|error| status_from(&error))
 	}
 
 	async fn function_call<T, F>(&self, call: F) -> Result<T, Status>
@@ -667,8 +839,6 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 		.await
 		.map_err(|error| status_from(&join_error(error)))?
 		.map_err(|error| status_from(&ApiError::from(error)))?;
-		let created_at = function_now_millis();
-		let expires_at = ttl_millis.map(|ttl| created_at.saturating_add(ttl));
 		let (tx, mut rx) = mpsc::channel::<ArtifactUploadFrame>(8);
 		let commit = tokio::task::spawn_blocking(move || {
 			let mut writer = writer;
@@ -686,6 +856,8 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 				.path
 				.to_str()
 				.ok_or_else(|| crate::EngineError::engine("artifact path is not valid UTF-8"))?;
+			let created_at = function_now_millis();
+			let expires_at = ttl_millis.map(|ttl| created_at.saturating_add(ttl));
 			domain.store().record_artifact(
 				&stored.digest,
 				stored.size,
@@ -723,16 +895,16 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 				},
 			};
 			if let Some(pb::put_artifact_request::Frame::Data(data)) = frame.frame {
-   					tx.send(ArtifactUploadFrame::Chunk(data))
-   						.await
-   						.map_err(|_| Status::cancelled("artifact writer stopped"))?;
-   				} else {
-   					let _ = tx.send(ArtifactUploadFrame::Abort).await;
-   					let _ = commit.await;
-   					return Err(status_from(&ApiError::invalid(
-   						"artifact upload frames after the header must contain data",
-   					)));
-   				}
+				tx.send(ArtifactUploadFrame::Chunk(data))
+					.await
+					.map_err(|_| Status::cancelled("artifact writer stopped"))?;
+			} else {
+				let _ = tx.send(ArtifactUploadFrame::Abort).await;
+				let _ = commit.await;
+				return Err(status_from(&ApiError::invalid(
+					"artifact upload frames after the header must contain data",
+				)));
+			}
 		}
 		let record = commit
 			.await
@@ -755,44 +927,24 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 		let request = request.into_inner();
 		let (_, digest) = artifact_digest(request.artifact.as_ref())?;
 		let artifacts = self.state.functions.artifacts().clone();
-		let mut bytes = tokio::task::spawn_blocking(move || artifacts.read(&digest, None))
+		let reader = tokio::task::spawn_blocking(move || artifacts.open_verified(&digest, None))
 			.await
 			.map_err(|error| status_from(&join_error(error)))?
 			.map_err(|error| status_from(&ApiError::from(error)))?;
-		let mut offset = 0_u64;
-		if let Some(pb::get_artifact_request::RangePresence::Range(range)) = request.range_presence {
-			let start = usize::try_from(range.offset)
-				.map_err(|_| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
-			let length = usize::try_from(range.length)
-				.map_err(|_| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
-			let end = start
-				.checked_add(length)
-				.filter(|end| *end <= bytes.len())
+		let size = reader.len();
+		let (offset, length) = if let Some(pb::get_artifact_request::RangePresence::Range(range)) =
+			request.range_presence
+		{
+			let end = range
+				.offset
+				.checked_add(range.length)
+				.filter(|end| *end <= size)
 				.ok_or_else(|| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
-			offset = range.offset;
-			bytes = bytes[start..end].to_vec();
-		}
-		let (tx, rx) = mpsc::channel(8);
-		tokio::spawn(async move {
-			if bytes.is_empty() {
-				let _ = tx
-					.send(Ok(pb::ArtifactChunk { offset, data: Vec::new(), eof: true }))
-					.await;
-				return;
-			}
-			let chunk_count = bytes.len().div_ceil(64 * 1024);
-			for (index, data) in bytes.chunks(64 * 1024).enumerate() {
-				let frame = pb::ArtifactChunk {
-					offset: offset + (index * 64 * 1024) as u64,
-					data:   data.to_vec(),
-					eof:    index + 1 == chunk_count,
-				};
-				if tx.send(Ok(frame)).await.is_err() {
-					break;
-				}
-			}
-		});
-		Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+			(range.offset, end - range.offset)
+		} else {
+			(0, size)
+		};
+		Ok(Response::new(stream_verified_artifact(reader, offset, length)))
 	}
 
 	async fn stat(
@@ -823,6 +975,11 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		request: Request<pb::RegisterFunctionRequest>,
 	) -> Result<Response<pb::FunctionRevision>, Status> {
 		let request = request.into_inner();
+		let spec = request
+			.spec
+			.as_ref()
+			.ok_or_else(|| status_from(&ApiError::invalid("function spec is required")))?;
+		self.admit_function_ha(spec)?;
 		let revision = self
 			.function_call(move |domain| {
 				let mut spec = request
@@ -855,7 +1012,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 					})?;
 					domain.set_secret(revision_id.clone(), &secret, material.value);
 				}
-				Ok(revision)
+				domain.refresh_revision_availability(&revision_id)
 			})
 			.await?;
 		Ok(Response::new(revision))
@@ -872,8 +1029,22 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 					Some(pb::function_selector::Selection::Current(function)) => {
 						domain.store().get_active_revision(&function)
 					},
-					Some(pb::function_selector::Selection::Pinned(revision)) => {
-						domain.store().get_revision(&revision.revision_id)
+					Some(pb::function_selector::Selection::Pinned(requested)) => {
+						let requested_function = requested.function.as_ref().ok_or_else(|| {
+							crate::EngineError::invalid("pinned revision function is required")
+						})?;
+						let loaded = domain.store().get_revision(&requested.revision_id)?;
+						if loaded
+							.r#ref
+							.as_ref()
+							.and_then(|reference| reference.function.as_ref())
+							!= Some(requested_function)
+						{
+							return Err(crate::EngineError::not_found(
+								"function revision does not belong to the requested function",
+							));
+						}
+						Ok(loaded)
 					},
 					None => Err(crate::EngineError::invalid("function selector is required")),
 				}
@@ -983,8 +1154,22 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		let revision = self
 			.function_call(move |domain| match request.app.and_then(|selector| selector.selection) {
 				Some(pb::app_selector::Selection::Current(app)) => domain.store().get_active_app(&app),
-				Some(pb::app_selector::Selection::Pinned(revision)) => {
-					domain.store().get_app_revision(&revision.revision_id)
+				Some(pb::app_selector::Selection::Pinned(requested)) => {
+					let requested_app = requested.app.as_ref().ok_or_else(|| {
+						crate::EngineError::invalid("pinned app revision app is required")
+					})?;
+					let loaded = domain.store().get_app_revision(&requested.revision_id)?;
+					if loaded
+						.r#ref
+						.as_ref()
+						.and_then(|reference| reference.app.as_ref())
+						!= Some(requested_app)
+					{
+						return Err(crate::EngineError::not_found(
+							"app revision does not belong to the requested app",
+						));
+					}
+					Ok(loaded)
 				},
 				None => Err(crate::EngineError::invalid("app selector is required")),
 			})
@@ -1065,6 +1250,22 @@ impl pb::call_service_server::CallService for GrpcApi {
 		request: Request<pb::CreateCallRequest>,
 	) -> Result<Response<pb::CallRecord>, Status> {
 		let request = request.into_inner();
+		if let Some(revision_id) = request
+			.target
+			.as_ref()
+			.and_then(|target| target.function.as_ref())
+			.map(|revision| revision.revision_id.clone())
+			.filter(|revision_id| !revision_id.is_empty())
+		{
+			let revision = self
+				.function_call(move |domain| domain.store().get_revision(&revision_id))
+				.await?;
+			let spec = revision
+				.spec
+				.as_ref()
+				.ok_or_else(|| Status::internal("function revision is missing its spec"))?;
+			self.admit_function_ha(spec)?;
+		}
 		let record = self
 			.function_call(move |domain| {
 				let record = domain
@@ -1136,10 +1337,17 @@ impl pb::call_service_server::CallService for GrpcApi {
 				let call_id = call.call_id.clone();
 				let commit_domain = domain.clone();
 				let result = tokio::task::spawn_blocking(move || {
+					let frontier = commit_domain.store().event_frontier(&call_id)?;
 					let committed =
 						commit_domain
 							.store()
 							.append_input(&call_id, &input, function_now_millis())?;
+					for event in commit_domain
+						.store()
+						.events_after(&call_id, frontier, 10_000)?
+					{
+						commit_domain.publish_call_event(event);
+					}
 					commit_domain.notify_work();
 					Ok::<_, crate::EngineError>(committed)
 				})
@@ -1185,11 +1393,18 @@ impl pb::call_service_server::CallService for GrpcApi {
 					.call
 					.as_ref()
 					.ok_or_else(|| crate::EngineError::invalid("call is required"))?;
+				let frontier = domain.store().event_frontier(&call.call_id)?;
 				let record = domain.store().close_inputs(
 					&call.call_id,
 					request.expected_input_count,
 					function_now_millis(),
 				)?;
+				for event in domain
+					.store()
+					.events_after(&call.call_id, frontier, 10_000)?
+				{
+					domain.publish_call_event(event);
+				}
 				domain.notify_work();
 				Ok(record)
 			})
@@ -1290,39 +1505,21 @@ impl pb::call_service_server::CallService for GrpcApi {
 				move |domain| domain.store().get_call(&call_id)
 			})
 			.await?;
-		if !request.follow {
-			let events = self
-				.function_call({
-					let call_id = call.call_id.clone();
-					move |domain| {
-						domain
-							.store()
-							.events_after(&call_id, cursor.after_sequence, 10_000)
-					}
-				})
-				.await?;
-			return Ok(Response::new(Box::pin(tokio_stream::iter(events.into_iter().map(Ok)))));
+		if !request.follow || terminal_call_status(current.status) {
+			return Ok(Response::new(stream_persisted_call_events(
+				Arc::clone(&self.state.functions),
+				call.call_id,
+				cursor.after_sequence,
+			)));
 		}
-		if terminal_call_status(current.status) {
-			let events = self
-				.function_call({
-					let call_id = call.call_id.clone();
-					move |domain| {
-						domain
-							.store()
-							.events_after(&call_id, cursor.after_sequence, 10_000)
-					}
-				})
-				.await?;
-			return Ok(Response::new(Box::pin(tokio_stream::iter(events.into_iter().map(Ok)))));
-		}
-		let mut watch = self
-			.state
-			.functions
-			.watch_call(&call.call_id, cursor.after_sequence)
+		let domain = Arc::clone(&self.state.functions);
+		let call_id = call.call_id;
+		let mut watch = domain
+			.watch_call(&call_id, cursor.after_sequence)
 			.map_err(|error| status_from(&ApiError::from(error)))?;
 		let (tx, rx) = mpsc::channel(32);
 		tokio::spawn(async move {
+			let mut last_sequence = cursor.after_sequence;
 			loop {
 				match watch.recv().await {
 					Ok(event) => {
@@ -1331,18 +1528,23 @@ impl pb::call_service_server::CallService for GrpcApi {
 							Some(pb::call_event::Payload::Status(status))
 								if terminal_call_status(status.status)
 						);
-						if tx.send(Ok(event)).await.is_err() || is_terminal {
+						let sequence = event.sequence;
+						if tx.send(Ok(event)).await.is_err() {
+							break;
+						}
+						last_sequence = sequence;
+						if is_terminal {
 							break;
 						}
 					},
-					// Lag is reconnectable from the caller's last durable cursor.
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-						let _ = tx
-							.send(Err(Status::resource_exhausted(
-								"call watcher fell behind; reconnect from the last sequence",
-							)))
-							.await;
-						break;
+						match domain.watch_call(&call_id, last_sequence) {
+							Ok(recovered) => watch = recovered,
+							Err(error) => {
+								let _ = tx.send(Err(status_from(&ApiError::from(error)))).await;
+								break;
+							},
+						}
 					},
 					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 				}
@@ -2054,6 +2256,7 @@ mod tests {
 		for (stable, expected) in [
 			("actor_lost", Code::FailedPrecondition),
 			("unavailable_secret", Code::FailedPrecondition),
+			("ha_unavailable", Code::FailedPrecondition),
 			("checksum", Code::DataLoss),
 			("conflict", Code::Aborted),
 			("deadline", Code::DeadlineExceeded),
@@ -2068,6 +2271,77 @@ mod tests {
 				Some(stable)
 			);
 		}
+	}
+
+	fn ha_spec(policy: pb::HighAvailabilityPolicy, arch: pb::CpuArchitecture) -> pb::FunctionSpec {
+		pb::FunctionSpec {
+			resources: Some(pb::ResourceSpec {
+				high_availability: policy.into(),
+				architecture: arch.into(),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+
+	fn topology_node(id: &str, zone: &str, arch: &str) -> crate::mesh::state::NodeState {
+		let mut node = crate::mesh::state::NodeState::new(id, format!("https://{id}"));
+		node.region = zone.into();
+		node.arch = arch.into();
+		node
+	}
+
+	#[test]
+	fn none_is_admitted_without_mesh_or_remote_executor() {
+		function_ha_admission(
+			&ha_spec(pb::HighAvailabilityPolicy::None, pb::CpuArchitecture::Arm64),
+			&[],
+			false,
+		)
+		.unwrap();
+	}
+
+	#[test]
+	fn host_and_zone_never_degrade_to_local_execution() {
+		let nodes = [
+			topology_node("host-a", "zone-a", "aarch64"),
+			topology_node("host-b", "zone-b", "aarch64"),
+		];
+		for policy in [pb::HighAvailabilityPolicy::Host, pb::HighAvailabilityPolicy::Zone] {
+			let error =
+				function_ha_admission(&ha_spec(policy, pb::CpuArchitecture::Arm64), &nodes, false)
+					.unwrap_err();
+			assert_eq!(error.code(), "ha_unavailable");
+			assert!(
+				error
+					.message()
+					.contains("cross-node function execution is unavailable")
+			);
+			assert_eq!(status_from(&error).code(), Code::FailedPrecondition);
+		}
+	}
+
+	#[test]
+	fn insufficient_and_arch_incompatible_topology_are_actionable() {
+		let nodes =
+			[topology_node("host-a", "zone-a", "x86_64"), topology_node("host-b", "zone-b", "x86_64")];
+		let error = function_ha_admission(
+			&ha_spec(pb::HighAvailabilityPolicy::Zone, pb::CpuArchitecture::Arm64),
+			&nodes,
+			false,
+		)
+		.unwrap_err();
+		assert_eq!(error.code(), "ha_unavailable");
+		assert!(
+			error
+				.message()
+				.contains("requires at least 2 compatible mesh zones; found 0")
+		);
+		assert!(
+			error
+				.message()
+				.contains("cross-node function execution is unavailable")
+		);
 	}
 	#[test]
 	fn mesh_transport_codes_map_to_unavailable_or_aborted() {
@@ -2220,5 +2494,65 @@ mod tests {
 		assert!(fork.is_err(), "fork requires count");
 		let garbage: Result<RestoreBody, Status> = parse_body_json("{nope");
 		assert!(garbage.is_err());
+	}
+	#[tokio::test]
+	async fn verified_artifact_range_streams_in_bounded_chunks() {
+		let temp = tempfile::tempdir().expect("temp dir");
+		let store = crate::function::artifact::ArtifactStore::open(temp.path()).expect("store");
+		let bytes = (0..(ARTIFACT_CHUNK_SIZE * 3 + 17))
+			.map(|index| (index % 251) as u8)
+			.collect::<Vec<_>>();
+		let stored = store.put(&bytes).expect("artifact");
+		let reader = store
+			.open_verified(&stored.digest, Some(stored.size))
+			.expect("verified reader");
+		let offset = 31_u64;
+		let length = (ARTIFACT_CHUNK_SIZE * 2 + 7) as u64;
+		let mut stream = stream_verified_artifact(reader, offset, length);
+		let mut chunks = Vec::new();
+		while let Some(chunk) = stream.next().await {
+			chunks.push(chunk.expect("chunk"));
+		}
+		assert_eq!(chunks.len(), 3);
+		assert!(
+			chunks
+				.iter()
+				.all(|chunk| chunk.data.len() <= ARTIFACT_CHUNK_SIZE)
+		);
+		assert_eq!(chunks[0].offset, offset);
+		assert_eq!(chunks[1].offset, offset + ARTIFACT_CHUNK_SIZE as u64);
+		assert_eq!(chunks[2].offset, offset + (ARTIFACT_CHUNK_SIZE * 2) as u64);
+		assert!(chunks[..2].iter().all(|chunk| !chunk.eof));
+		assert!(chunks[2].eof);
+		let streamed = chunks
+			.into_iter()
+			.flat_map(|chunk| chunk.data)
+			.collect::<Vec<_>>();
+		assert_eq!(streamed, bytes[offset as usize..(offset + length) as usize],);
+	}
+
+	#[tokio::test]
+	async fn persisted_event_stream_pages_past_ten_thousand() {
+		const EVENT_COUNT: u64 = 10_017;
+		let page_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let loads = Arc::clone(&page_loads);
+		let mut stream = stream_call_event_pages(
+			move |cursor| {
+				loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let end = (cursor + 10_000).min(EVENT_COUNT);
+				Ok((cursor + 1..=end)
+					.map(|sequence| pb::CallEvent { sequence, ..Default::default() })
+					.collect())
+			},
+			0,
+		);
+		let mut sequences = Vec::new();
+		while let Some(event) = stream.next().await {
+			sequences.push(event.expect("event").sequence);
+		}
+		assert_eq!(sequences.len(), EVENT_COUNT as usize);
+		assert_eq!(sequences.first(), Some(&1));
+		assert_eq!(sequences.last(), Some(&EVENT_COUNT));
+		assert_eq!(page_loads.load(std::sync::atomic::Ordering::Relaxed), 2);
 	}
 }

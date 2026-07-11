@@ -19,7 +19,6 @@ use super::{
 	ws,
 };
 use crate::{
-	EngineError,
 	engine::EngineApi,
 	mesh::{routes::MeshRouteState, transfer},
 };
@@ -133,11 +132,11 @@ async fn template_archive(
 	headers: HeaderMap,
 ) -> ApiResult<Response> {
 	require_template_auth(&state, &headers)?;
-	let archive = tokio::task::spawn_blocking(move || transfer::archive_for_digest(&digest))
+	let bundle = tokio::task::spawn_blocking(move || transfer::bundle_for_digest(&digest))
 		.await
 		.map_err(join_error)?
 		.map_err(ApiError::from)?;
-	template_archive_response(archive).await
+	stream_bundle_response(bundle)
 }
 
 async fn template_metadata_archive(
@@ -146,12 +145,11 @@ async fn template_metadata_archive(
 	headers: HeaderMap,
 ) -> ApiResult<Response> {
 	require_template_auth(&state, &headers)?;
-	let archive =
-		tokio::task::spawn_blocking(move || transfer::metadata_archive_for_digest(&digest))
-			.await
-			.map_err(join_error)?
-			.map_err(ApiError::from)?;
-	template_archive_response(archive).await
+	let bundle = tokio::task::spawn_blocking(move || transfer::metadata_bundle_for_digest(&digest))
+		.await
+		.map_err(join_error)?
+		.map_err(ApiError::from)?;
+	stream_bundle_response(bundle)
 }
 
 async fn template_page(
@@ -172,18 +170,18 @@ async fn template_page(
 		})
 }
 
-async fn template_archive_response(archive: transfer::TemplateArchive) -> ApiResult<Response> {
-	// Open, then unlink: the fd keeps the archive readable while it streams,
-	// so multi-GiB checkpoints never sit in server memory or leak temp files.
-	let file = tokio::fs::File::open(&archive.path)
-		.await
-		.map_err(EngineError::from)?;
-	let _ = tokio::fs::remove_file(&archive.path).await;
-	let stream = tokio_util::io::ReaderStream::with_capacity(file, 1 << 20);
+/// Stream a template bundle as the response body: compression runs on a
+/// blocking thread and overlaps the transfer, so multi-GiB checkpoints never
+/// touch server memory or disk.
+fn stream_bundle_response(bundle: transfer::TemplateBundle) -> ApiResult<Response> {
+	let (tx, rx) = tokio::sync::mpsc::channel(16);
+	let disposition = format!("attachment; filename=\"{}\"", bundle.filename);
+	let media_type = bundle.media_type;
+	tokio::task::spawn_blocking(move || transfer::stream_bundle(&bundle, tx));
 	Response::builder()
-		.header(header::CONTENT_TYPE, archive.media_type)
-		.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", archive.filename))
-		.body(Body::from_stream(stream))
+		.header(header::CONTENT_TYPE, media_type)
+		.header(header::CONTENT_DISPOSITION, disposition)
+		.body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
 		.map_err(|err| {
 			ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", err.to_string())
 		})
