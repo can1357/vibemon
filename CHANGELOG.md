@@ -27,6 +27,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Go SDK for client interaction with the Vibemon API
+- Added unified DSN support for Go, Python, and TypeScript SDKs, covering HTTP(S), UDS, and mesh contexts
+- Added lazy mesh discovery and automatic peer failover logic to SDK transport drivers
+- Added unified resource namespaces (`sandboxes`, `volumes`, `snapshots`, `pools`, `mesh`) to all SDKs
+- Added standardized remote function execution for Go, supporting warm pools and persistent workers
 - Added `@vmon.cls` stateful remote objects with lifecycle hooks for state persistence across calls
 - Added `Gather` and `Spawn` primitives for managing parallel remote execution sessions
 - Added `connect` client factory, replacing the legacy `VmonClient` constructor
@@ -91,6 +96,10 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated Python and TypeScript SDKs to use a unified `Client` interface and DSN-based connectivity
+- Refactored SDK object hierarchy to bind resources (sandboxes, volumes) to client sessions
+- Standardized sandbox execution and process management across all language SDKs
+- Streamlined SDK `exec` and `run` APIs to provide consistent `ExecExit` status reporting
 - Migrated SDK clients to a unified `Client` interface across Go, Python, and TypeScript
 - Streamlined remote function definitions to use persistent session runners instead of per-call execution
 - Upgraded TypeScript and Go remote SDK transport logic to use session-aware dispatching

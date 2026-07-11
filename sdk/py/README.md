@@ -5,7 +5,7 @@ Thin Python client SDK for the Rust `vmon` API. The Rust `vmon` binary owns the 
 ## Install
 
 ```sh
-cd python && uv sync
+uv sync
 ```
 
 Python 3.14+ is required. The SDK expects a running Rust daemon/server. By default it talks to the local Unix socket at `$VMON_HOME/vmond.sock` (or `~/.vmon/vmond.sock`). Named remote contexts are stored under `$VMON_HOME/contexts.json`, and bearer tokens can come from `VMON_API_TOKEN` or `$VMON_HOME/credentials/<context>.token`.
@@ -13,45 +13,42 @@ Python 3.14+ is required. The SDK expects a running Rust daemon/server. By defau
 ## Quick start
 
 ```python
-from vmon import Sandbox, Secret, Volume, health
+import vmon
 
-assert health()["ok"] is True
+with vmon.connect("vmon://node-a,node-b") as client:
+    assert client.health()["ok"] is True
 
-Volume("work").create()
-with Sandbox.create(
-    image="alpine:latest",
-    env={"APP_ENV": "dev"},
-    secrets=[Secret.from_env("API_TOKEN")],
-    volumes={"/data": Volume("work")},
-) as sandbox:
-    captured = sandbox.exec_capture("sh", "-lc", "printf captured")
-    assert captured.returncode == 0
-    assert captured.stdout == b"captured"
+    work = client.volumes.create("work")
+    with client.sandboxes.create(
+        image="alpine:latest",
+        env={"APP_ENV": "dev"},
+        secrets=[vmon.Secret.from_env("API_TOKEN")],
+        volumes={"/data": work},
+    ) as sandbox:
+        captured = sandbox.run("sh", "-lc", "printf captured")
+        assert captured.returncode == 0
+        assert captured.stdout == b"captured"
 
-    process = sandbox.exec("sh", "-lc", "echo hello > /data/out && cat /data/out")
-    assert process.wait(timeout=30) == 0
-    print(process.stdout.read().decode())
+        process = sandbox.exec("sh", "-lc", "echo hello > /data/out && cat /data/out")
+        assert process.wait(timeout=30).code == 0
+        print(process.stdout.read().decode())
 
-    snapshot = sandbox.snapshot_filesystem("alpine-ready")
+        template = sandbox.snapshot_filesystem("alpine-ready")
 
-restored = Sandbox.create(template=snapshot)
-restored.terminate()
+    restored = client.sandboxes.create(template=template)
+    restored.terminate()
 ```
 
 ## Public surface
 
-- `health`, `server_info`, `daemon_metrics`, `openapi_schema`, and `events` expose daemon health, metadata, metrics, the OpenAPI document, and the closeable JSON event stream.
-- `Sandbox` covers sandbox create/list/get/remove, stop/terminate, pause/resume, deadline extension, metrics, buffered and streaming logs, streaming or captured exec, console attachment, filesystem RPCs, network policy, migration, tunnels, HTTP/WebSocket port proxying, and full or filesystem snapshots.
-- `Sandbox.from_snapshot`, `Sandbox.fork`, and `list_snapshots` cover restore, ordered multi-clone fork results, and snapshot inventory.
-- `prewarm`, `pool_inventory`, `shutdown_prewarms`, and `shutdown_all_pools` manage server-owned warm pools. `WarmPoolHandle` is closeable and releases its HTTP transport when shut down.
-- `shell` opens the `/v1/shell` WebSocket. Closing its `Process` makes the server clean up an ephemeral shell sandbox.
-- `Volume` validates persistent volume names and calls the `/v1/volumes` API. `Secret` carries request-scoped values in memory; values are not copied into returned sandbox views or context files.
-- `Context`, `ContextStore`, `contexts_path`, `context_token_path`, `roster_from_status`, and `LOCAL` manage named endpoints. Remote HTTP and WebSocket requests send the selected context token as `Authorization: Bearer …`.
-- `DaemonError` preserves daemon error `code`, message, and HTTP `status` for buffered HTTP, streaming HTTP, and WebSocket upgrade or frame failures.
-- `sandbox.aio` provides thread-backed async forms of the instance operations without changing streaming `Process`, `ConsoleStream`, or `LogStream` semantics.
-- `function` and `RemoteFunction` package source-available Python callables for cached `remote` calls and bounded, ordered `map` calls.
-
-Sandbox, process, console, event, log, WebSocket, pool, and transport-backed objects support explicit `close` methods or context managers. `Sandbox.agent()` is intentionally unsupported: the stable v1 contract has no endpoint for direct guest-agent access; use exec, filesystem, tunnels, or port proxy operations instead.
+- `connect()` parses local, HTTP(S), multi-host mesh, Unix-socket, and named-context DSNs and returns a `Client`. `MeshDriver` discovers peer advertise URLs lazily, fails over only on transport errors, and keeps sandbox calls pinned to the node that owns them.
+- `Client` exposes `sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh` resource namespaces alongside health, server info, metrics, OpenAPI, events, and shell methods.
+- `Sandbox` is a bound resource. `run()` captures a command; `exec()` opens a streaming `Process`; `files` and `ports` expose bound filesystem and proxy operations. Lifecycle, snapshots, logs, metrics, networking, tunnels, migration, and readiness polling stay on the sandbox object.
+- `Process.wait()` returns `ExecExit`; stdin is available through `process.stdin`, and stdout/stderr remain closeable byte streams. Console, event, log, and file streams are closeable context managers.
+- `Volume` and `Secret` are validated request values. Server-side volume lifecycle lives under `client.volumes`; secret values stay in memory and are sent only in create and exec requests.
+- `APIError`, `TransportError`, and `ProtocolError` distinguish server envelopes, failover-eligible I/O failures, and malformed wire data.
+- `sandbox.aio`, `sandbox.files.aio`, and `sandbox.ports.aio` provide thread-backed async forms of the synchronous object hierarchy.
+- `client.function()` and the `@vmon.function` decorator bind source-available callables for cached `remote` calls and bounded `map` calls.
 
 ## Real-VM SDK smoke test
 

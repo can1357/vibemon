@@ -43,7 +43,7 @@ cd ..
 The single Rust `vmon` binary has three roles: the user-facing CLI, `vmon serve` (the Rust server from the `vmond` crate), and `vmon vmm` (the per-VM monitor from the `vmm` crate). The server owns the sandbox registry and spawns one `vmon vmm` child per microVM; the guest agent runs inside the VM and talks back over a virtio-console channel.
 
 ```
-Web UI / Rust CLI / Python SDK / TypeScript SDK
+Web UI / Rust CLI / Python SDK / TypeScript SDK / Go SDK
    │ HTTP / WebSocket (or local HTTP-over-UDS)
 vmon serve (Rust axum API, vmond crate)
    │ Engine registry, image pipeline, pools, mesh, volumes
@@ -235,40 +235,52 @@ The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine,
 | `vmon completion [bash|zsh|fish]` | Prints a sourceable shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
 | `vmon openapi` | Prints the generated OpenAPI document used by SDK generation and API smoke tests. |
 
-The Python package is now only a thin client SDK for that Rust API. It contains transport, context, sandbox, secret, volume, and WebSocket frame helpers; it does not ship a CLI, daemon, server, web bundle, guest-agent bundle, or Python VMM implementation.
+The Python, TypeScript, and Go packages are thin clients for the Rust API. Each exposes the same object hierarchy: a root client, resource namespaces (`sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh`), and sandbox-bound process, file, and port objects. They do not ship a CLI, daemon, server, web bundle, guest-agent bundle, or VMM implementation.
+
+Every SDK accepts the same connection strings:
+
+| DSN | Meaning |
+| --- | --- |
+| `vmon://host-a,host-b:9000/prefix` | HTTP gateways; port defaults to `8000`. |
+| `vmons://host-a,host-b` | HTTPS/WSS gateways. |
+| `http://host:8000` or `https://host` | One explicit gateway. |
+| `vmon+unix:///absolute/path/vmond.sock` | Local HTTP-over-UDS endpoint. |
+| `vmon+context://prod` | Endpoints and optional token from the named vmon context. |
+
+`token`, `discover=on|off`, and `timeout=<seconds>` are optional query parameters. An empty DSN resolves `$VMON_DSN`, then `$VMON_CONTEXT`, then the local `$VMON_HOME/vmond.sock`. Client construction performs no network I/O. Mesh discovery is lazy; after the first successful request, the driver learns advertised peers and fails over only when a request did not reach an HTTP server. HTTP error responses are never replayed.
 
 ```python
-from vmon import Sandbox, Secret, Volume
+from vmon import Secret, connect
 
-sb = Sandbox.create(
-    image="alpine",
-    timeout_secs=300,
-    volumes={"/data": Volume("agent_data")},
-    secrets=[Secret.from_env("TOKEN"), Secret.from_dict({"MODE": "ci"})],
-    tags={"kind": "oneshot"},
-    ports=[8080],
-    egress_allow_domains=["api.github.com"],
-    pool_size=2,
-)
+with connect("vmon+context://prod") as client:
+    volume = client.volumes.create("agent_data")
+    sandbox = client.sandboxes.create(
+        image="alpine",
+        timeout=300,
+        volumes={"/data": volume},
+        secrets=[Secret.from_env("TOKEN"), Secret.from_dict({"MODE": "ci"})],
+        tags={"kind": "oneshot"},
+        ports=[8080],
+        egress_allow_domains=["api.github.com"],
+        pool_size=2,
+    )
 
-proc = sb.exec("sh", "-c", "echo hello from the guest", pty=True)
-rc = proc.wait()
-print(proc.stdout.read().decode(), rc)
+    process = sandbox.exec(["sh", "-lc", "echo hello from the guest"], tty=True)
+    exit_status = process.wait()
+    print(process.stdout.read().decode(), exit_status.code)
 
-image = sb.snapshot_filesystem("img1")      # default TTL: 30 days
-clone = Sandbox.create(template=image)
-same = Sandbox.from_id(sb.name)
+    image = sandbox.snapshot_filesystem("img1")
+    clone = client.sandboxes.create(template=image)
+    same = client.sandboxes.get(sandbox.id)
 ```
 
-Named volumes persist outside snapshots and are protected by the Rust server's single-writer host lock (or mesh lease on clustered writable mounts). Secrets are merged into exec environments and are not written to VM metadata. `Sandbox.create` also accepts `block_network`, CIDR `egress_allow`, DNS-pinned `egress_allow_domains`, `inbound_cidr_allowlist`, `ha`, and `arch`; the domain allowlist is resolved to IP rules and is not live TLS-SNI filtering.
+Named volumes persist outside snapshots and are protected by the Rust server's single-writer host lock (or mesh lease on clustered writable mounts). Secrets are merged into exec environments and are not written to VM metadata. Sandbox creation also supports `block_network`, CIDR egress rules, DNS-pinned egress domains, inbound CIDR allowlists, `ha`, and `arch`; the domain allowlist resolves to IP rules and is not live TLS-SNI filtering.
 
-Exposed ports are available through `sb.tunnels()`. `sb.create_connect_token()` creates a bearer token for the REST proxy at `/v1/sandboxes/{id}/ports/{port}/...`. Runtime deadlines can be extended through `Sandbox.extend(secs)` or `POST /v1/sandboxes/{id}/extend`; `poll()` and `returncode` report the entry process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for terminate.
+Exposed ports are available through each sandbox's `tunnels` and `ports` APIs. Runtime deadlines can be extended through the bound sandbox object or `POST /v1/sandboxes/{id}/extend`; polling reports the entry-process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for termination.
 
 Remote functions remain client-side packaging helpers layered over sandbox create, file-write, exec, and terminate. Python exposes source-aware `@vmon.function` callables; TypeScript exposes `client.remoteFunction(fn)` plus `remoteFunctionFromSource(...)`; Go exposes typed `vmon.NewRemoteFunction[Result](...)` over explicit JavaScript module source because Go cannot recover source from a `func` value. Every SDK enforces JSON-serializable arguments/results, forwards guest stdout, preserves structured remote errors, reuses one sandbox for direct calls, and uses bounded ephemeral workers for ordered maps.
 
-The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install + typecheck and `just sdk-ts-smoke` for the HTTP smoke tests. Its real-VM remote-function test is gated by `VMON_TS_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
-
-The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`. It covers every stable OpenAPI operation, streaming WebSockets/SSE, structured errors, secrets/volumes, and remote functions. Run `just sdk-go` for its HTTP/WebSocket unit suite; the real-VM remote-function test additionally requires `VMON_GO_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
+The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for HTTP tests. The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`; run `just sdk-go` for its HTTP/WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
 
 ## Cluster
 
@@ -338,15 +350,14 @@ vmon context use local
 
 After `vmon context use prod`, ordinary `vmon run`, `vmon exec`, and `vmon ps` route across the cluster through the shared `Transport` plane (`LocalTransport` for the daemon, `MeshTransport` for gateway rosters). Failover happens only before delivery: idempotent detached `run`/`restore` calls carry a stable key and may walk the roster, while attached/interactive operations probe `/healthz` once and then run exactly once. `vmon context use local` returns the CLI to the local `vmond` daemon.
 
-The SDK uses the same context rules:
+The SDKs resolve named contexts through the same DSN:
 
 ```python
 import vmon
-from vmon import Sandbox
 
-client = vmon.connect("prod")
-sb = client.sandboxes.create(image="alpine")
-same_plane = Sandbox.create(image="alpine", context="prod")
+with vmon.connect("vmon+context://prod") as client:
+    sandbox = client.sandboxes.create(image="alpine")
+    same_plane = client.sandboxes.get(sandbox.id)
 ```
 
 An explicit missing context is an error; it does not fall back to local.
