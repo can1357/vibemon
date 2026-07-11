@@ -1,3 +1,11 @@
+import { remoteFunction, remoteFunctionFromSource } from "./remote";
+import type {
+  JsonValue,
+  RemoteCallable,
+  RemoteFunction,
+  RemoteFunctionOptions,
+  RemoteFunctionSourceSpec,
+} from "./remote";
 import type { components, operations } from "./schema";
 
 type JsonResponse<
@@ -15,9 +23,17 @@ type JsonRequest<Operation extends keyof operations> = operations[Operation] ext
   ? Body
   : never;
 
+/** Fetch-compatible transport used by {@link VmonClient}. */
+export type VmonFetch = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+/** Connection settings for a vmon HTTP client. */
 export interface VmonClientOptions {
   baseUrl: string;
   token: string;
+  fetch?: VmonFetch;
 }
 
 export interface VmonApiErrorShape {
@@ -103,10 +119,12 @@ export class Secret {
 export class VmonClient {
   readonly #baseUrl: string;
   readonly #token: string;
+  readonly #fetch: VmonFetch;
 
   constructor(options: VmonClientOptions) {
     this.#baseUrl = normalizeBaseUrl(options.baseUrl);
     this.#token = options.token;
+    this.#fetch = options.fetch ?? globalThis.fetch;
   }
 
   health(): Promise<HealthBody> {
@@ -144,6 +162,44 @@ export class VmonClient {
       jsonRequest("POST", execRequestBody(request, options.secrets)),
     );
   }
+  /** Write a file into a sandbox through the v1 filesystem endpoint. */
+  writeSandboxFile(id: string, path: string, contents: BodyInit): Promise<OkBody> {
+    return this.#requestJson(sandboxFileUrl(id, path), {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: contents,
+    });
+  }
+
+  /** Delete a file from a sandbox through the v1 filesystem endpoint. */
+  deleteSandboxFile(id: string, path: string): Promise<OkBody> {
+    return this.#requestJson(sandboxFileUrl(id, path), { method: "DELETE" });
+  }
+
+  /** Terminate a sandbox and discard its resources. */
+  async terminateSandbox(id: string): Promise<void> {
+    const response = await this.#request(
+      `/v1/sandboxes/${encodeURIComponent(id)}/terminate`,
+      { method: "POST" },
+    );
+    await response.arrayBuffer();
+  }
+
+  /** Package a source-serializable JavaScript function for remote execution. */
+  remoteFunction<Arguments extends unknown[], Result>(
+    fn: RemoteCallable<Arguments, Result>,
+    options: RemoteFunctionOptions = {},
+  ): RemoteFunction<Arguments, Result> {
+    return remoteFunction(this, fn, options);
+  }
+
+  /** Create a typed remote function from JavaScript module source and an exported handler. */
+  remoteFunctionFromSource<Arguments extends unknown[] = JsonValue[], Result = JsonValue>(
+    spec: RemoteFunctionSourceSpec,
+    options: RemoteFunctionOptions = {},
+  ): RemoteFunction<Arguments, Result> {
+    return remoteFunctionFromSource<Arguments, Result>(this, spec, options);
+  }
 
   async listVolumes(): Promise<VolumeName[]> {
     const body = await this.#requestJson<JsonResponse<"volume_list", 200>>("/v1/volumes");
@@ -158,11 +214,16 @@ export class VmonClient {
     return this.#requestJson(`/v1/volumes/${encodeURIComponent(name)}`, { method: "DELETE" });
   }
 
-  async #requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(this.#url(path), this.#withAuth(init));
+  async #request(path: string, init?: RequestInit): Promise<Response> {
+    const response = await this.#fetch(this.#url(path), this.#withAuth(init));
     if (!response.ok) {
       throw await apiError(response);
     }
+    return response;
+  }
+
+  async #requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+    const response = await this.#request(path, init);
     return response.json();
   }
 
@@ -259,6 +320,10 @@ function normalizeBaseUrl(baseUrl: string): string {
     throw new TypeError("baseUrl must not be empty");
   }
   return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+}
+
+function sandboxFileUrl(id: string, path: string): string {
+  return `/v1/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`;
 }
 
 function jsonRequest(method: "POST", body: unknown): RequestInit {

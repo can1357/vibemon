@@ -15,6 +15,27 @@ export {
   type SecretWire,
   type VmonApiErrorShape,
   type VmonClientOptions,
+  type VmonFetch,
   type VolumeName,
 } from "./client";
+export {
+  DEFAULT_REMOTE_FUNCTION_IMAGE,
+  RemoteFunction,
+  RemoteFunctionError,
+  remoteFunction,
+  remoteFunctionFromSource,
+  type JsonPrimitive,
+  type JsonValue,
+  type RemoteCallable,
+  type RemoteFunctionErrorDetails,
+  type RemoteFunctionFailure,
+  type RemoteFunctionFailureDetails,
+  type RemoteFunctionInvocation,
+  type RemoteFunctionOptions,
+  type RemoteFunctionResponse,
+  type RemoteFunctionSourceSpec,
+  type RemoteFunctionSuccess,
+  type RemoteMapOptions,
+  type RemoteStdoutHandler,
+} from "./remote";
 export type { components, operations, paths } from "./schema";
