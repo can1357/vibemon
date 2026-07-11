@@ -306,6 +306,13 @@ def test_ordered_batch_return_exceptions_is_per_item_and_then_exhausts() -> None
                         code="invalid",
                         message="bad item",
                         type="ValueError",
+                        frames=[
+                            api_pb2.ErrorFrame(
+                                file="worker.py",
+                                line=17,
+                                function="remote_double",
+                            )
+                        ],
                     ),
                 )
             if request.index == 1:
@@ -335,6 +342,9 @@ def test_ordered_batch_return_exceptions_is_per_item_and_then_exhausts() -> None
     assert len(values) == 2
     assert isinstance(values[0], RemoteFunctionError)
     assert values[0].code == "invalid"
+    assert "worker.py" in values[0].traceback
+    assert "remote_double" in values[0].traceback
+    assert values[0].__notes__ == [f"Remote traceback:\n{values[0].traceback}"]
     assert values[1] == 7
 
 
