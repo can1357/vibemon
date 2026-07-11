@@ -177,15 +177,20 @@ fn remote_pager_faults_pages_in_over_http() {
 
 	// Phase 3: restore with every page marked remote; the guest resumes and
 	// runs to completion purely off faulted-in pages.
+	let restore_sock = dir.join("restore.sock");
 	let args = vec![
 		"--restore".to_string(),
 		snap.display().to_string(),
 		"--remote-page-url".to_string(),
 		format!("http://{addr}/pages"),
+		"--api-sock".to_string(),
+		restore_sock.display().to_string(),
 	];
 	let refs = common::as_refs(&args);
 	let mut vm = common::spawn_vmm_with_env(&refs, &[("VMON_REMOTE_PAGE_TOKEN", "secret")]);
 	vm.wait_for("SNAPSHOT_AFTER_RESTORE", Duration::from_mins(2));
+	let mut control = common::ControlClient::connect(&restore_sock, Duration::from_secs(10));
+	assert_eq!(control.command("quit"), "OK");
 	let (status, output) = vm.wait(Duration::from_secs(30));
 	assert!(status.success(), "restored vmon exited with {status}; output:\n{output}");
 	common::assert_no_panic(&output);

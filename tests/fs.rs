@@ -54,8 +54,8 @@ fn virtiofs_volumes_rw_and_ro() {
 	args.push(format!("snap:{}:ro", snap.display()));
 
 	let refs = common::as_refs(&args);
-	let output = common::boot_capture(&refs, "VOLUME_", Duration::from_secs(90));
-	if output.contains("VOLUME_NODEV") {
+	let output = common::boot_capture(&refs, "VOLUME_RO_", Duration::from_secs(90));
+	if output.contains("VOLUME_RO_NODEV") {
 		eprintln!("SKIP virtiofs_volumes_rw_and_ro: guest kernel lacks virtio-fs");
 		return;
 	}

@@ -504,7 +504,7 @@ case "$mode" in
     mkdir -p /data /ro
     if ! out=$(mount -t virtiofs data /data 2>&1); then
       case "$out" in
-        *"No such device"*) echo "VOLUME_NODEV"; finish ;;
+        *"No such device"*) echo "VOLUME_RO_NODEV"; finish ;;
       esac
       fail "mount virtiofs data: $out"
     fi

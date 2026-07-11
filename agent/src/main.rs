@@ -151,17 +151,15 @@ mod linux_agent {
 			.open(HVC0)
 			.map_err(|err| format!("open {HVC0}: {err}"))?;
 		set_hvc_raw(&device)?;
-		// Announce readiness on the channel: input queued before the agent owns
-		// /dev/hvc0 is dropped by the guest tty layer (and set_hvc_raw flushes
-		// the rest), so the host defers a boot-time `--agent-exec` hand-off
-		// until this marker appears. The SYNC prefix realigns any frame reader;
-		// the ready frame is ignored by clients (no pending request id 0).
+		// Announce readiness with one complete alignment marker. The host bridge
+		// discards this marker before accepting clients, so no partial startup
+		// frame can leave a newly connected reader out of alignment.
 		{
 			let mut out = &device;
 			out.write_all(&proto::SYNC)
 				.map_err(|err| format!("write ready marker to {HVC0}: {err}"))?;
-			proto::write_frame(&mut out, proto::FRAME_RESP, 0, br#"{"ready":true}"#)
-				.map_err(|err| format!("write ready frame to {HVC0}: {err}"))?;
+			out.flush()
+				.map_err(|err| format!("flush ready marker to {HVC0}: {err}"))?;
 		}
 		let mut reader = device
 			.try_clone()
