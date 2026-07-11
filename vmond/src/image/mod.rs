@@ -12,6 +12,7 @@ use std::{
 	io::{Read, Seek, SeekFrom},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
+	sync::{LazyLock, Mutex},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -189,6 +190,10 @@ struct PreparedImage {
 	tools:         ImageTools,
 	arch:          String,
 }
+
+type PreparedImageCacheKey = (PathBuf, String, String);
+static PREPARED_IMAGES: LazyLock<Mutex<HashMap<PreparedImageCacheKey, PreparedImage>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Normalize an optional image reference, rejecting whitespace.
 pub fn parse_reference(reference: Option<&str>) -> Result<Option<String>> {
@@ -665,6 +670,7 @@ fn prepare_oci_image(
 	dockerfile: Option<&Path>,
 	context: &Path,
 ) -> Result<PreparedImage> {
+	let built = dockerfile.is_some();
 	let reference = if let Some(dockerfile) = dockerfile {
 		let tag = parse_reference(reference)?.unwrap_or_else(|| "vmon-build:latest".to_owned());
 		build::build_image(dockerfile, context, &tag, None)?
@@ -674,6 +680,26 @@ fn prepare_oci_image(
 	};
 	let tools = detect_image_tools()?;
 	let arch = skopeo_arch(None);
+	if !built && is_registry_reference(&reference) {
+		let key = (crate::home::state_dir(), reference.clone(), arch.clone());
+		let mut prepared = PREPARED_IMAGES
+			.lock()
+			.map_err(|_| EngineError::engine("prepared image cache lock poisoned"))?;
+		if let Some(image) = prepared.get(&key) {
+			return Ok(image.clone());
+		}
+		let image = inspect_prepared_image(reference, tools, arch)?;
+		prepared.insert(key, image.clone());
+		return Ok(image);
+	}
+	inspect_prepared_image(reference, tools, arch)
+}
+
+fn inspect_prepared_image(
+	reference: String,
+	tools: ImageTools,
+	arch: String,
+) -> Result<PreparedImage> {
 	let spec = inspect_oci(&tools, &reference, &arch)?;
 	let digest = image_digest_oci(&tools, &reference, &arch)?;
 	Ok(PreparedImage {
@@ -684,6 +710,13 @@ fn prepare_oci_image(
 		tools,
 		arch,
 	})
+}
+
+fn is_registry_reference(reference: &str) -> bool {
+	reference.starts_with("docker://")
+		|| !IMAGE_TRANSPORT_PREFIXES
+			.iter()
+			.any(|prefix| reference.starts_with(prefix))
 }
 
 fn inspect_oci(tools: &ImageTools, reference: &str, arch: &str) -> Result<ImageConfig> {
@@ -1059,13 +1092,18 @@ fn run_stdout(cmd: &[String]) -> Result<String> {
 	};
 	let output = Command::new(program).args(args).output()?;
 	if !output.status.success() {
-		return Err(EngineError::engine(format!(
-			"{program} failed with exit code {}",
-			output
-				.status
-				.code()
-				.map_or_else(|| "signal".to_owned(), |code| code.to_string())
-		)));
+		let code = output
+			.status
+			.code()
+			.map_or_else(|| "signal".to_owned(), |code| code.to_string());
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		let detail = stderr.trim();
+		let message = if detail.is_empty() {
+			format!("{program} failed with exit code {code}")
+		} else {
+			format!("{program} failed with exit code {code}: {detail}")
+		};
+		return Err(EngineError::engine(message));
 	}
 	String::from_utf8(output.stdout).map_err(|e| EngineError::engine(e.to_string()))
 }
@@ -1478,5 +1516,25 @@ mod tests {
 			mkfs_ext4_args(Path::new("mke2fs"), Path::new("rootfs"), Path::new("out.img")),
 			vec!["mke2fs", "-t", "ext4", "-q", "-F", "-d", "rootfs", "out.img"]
 		);
+	}
+	#[test]
+	fn registry_reference_detection_excludes_mutable_local_transports() {
+		assert!(is_registry_reference("alpine:latest"));
+		assert!(is_registry_reference("docker://registry.example/vmon:latest"));
+		assert!(!is_registry_reference("oci:/tmp/layout:latest"));
+		assert!(!is_registry_reference("dir:/tmp/image"));
+		assert!(!is_registry_reference("containers-storage:vmon:latest"));
+	}
+
+	#[test]
+	fn command_failure_reports_stderr() {
+		let error = run_stdout(&[
+			"sh".to_owned(),
+			"-c".to_owned(),
+			"printf registry-unavailable >&2; exit 7".to_owned(),
+		])
+		.unwrap_err();
+		assert!(error.message.contains("exit code 7"));
+		assert!(error.message.contains("registry-unavailable"));
 	}
 }

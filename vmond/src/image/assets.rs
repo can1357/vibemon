@@ -67,23 +67,13 @@ pub fn ensure_kernel() -> Result<PathBuf> {
 	Ok(dest)
 }
 
-/// Resolve the default guest kernel path.
+/// Resolve the operator override or the pinned guest kernel for this
+/// architecture.
 pub fn default_kernel() -> Result<PathBuf> {
 	if let Ok(env) = std::env::var("VMON_KERNEL")
 		&& !env.is_empty()
 	{
 		return Ok(expand_home(&env));
-	}
-	if cfg!(target_os = "linux") {
-		let release = fs::read_to_string("/proc/sys/kernel/osrelease")
-			.map(|text| text.trim().to_owned())
-			.unwrap_or_default();
-		if !release.is_empty() {
-			let kernel = PathBuf::from(format!("/boot/vmlinuz-{release}"));
-			if kernel.is_file() {
-				return Ok(kernel);
-			}
-		}
 	}
 	ensure_kernel()
 }

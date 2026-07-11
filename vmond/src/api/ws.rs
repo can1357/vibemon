@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+	collections::HashMap,
+	sync::Arc,
+	thread::{self, JoinHandle},
+};
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -319,9 +323,9 @@ async fn pump_exec_socket(stream: ExecStream, socket: WebSocket) {
 	let ExecStream { mut control, stdout, stderr, exit } = stream;
 	let (mut sender, mut receiver) = socket.split();
 	let (events_tx, mut events_rx) = mpsc::channel::<Value>(32);
-	spawn_stream_forward(stdout, "stdout", events_tx.clone());
-	spawn_stream_forward(stderr, "stderr", events_tx.clone());
-	spawn_exit_forward(exit, events_tx.clone());
+	let stdout_forward = spawn_stream_forward(stdout, "stdout", events_tx.clone());
+	let stderr_forward = spawn_stream_forward(stderr, "stderr", events_tx.clone());
+	spawn_exit_forward(exit, [stdout_forward, stderr_forward], events_tx.clone());
 	let output = async move {
 		while let Some(frame) = events_rx.recv().await {
 			let is_exit = frame.get("exit").is_some();
@@ -383,19 +387,31 @@ async fn pump_exec_socket(stream: ExecStream, socket: WebSocket) {
 	}
 }
 
-fn spawn_stream_forward(rx: flume::Receiver<Vec<u8>>, name: &'static str, tx: mpsc::Sender<Value>) {
-	std::thread::spawn(move || {
+fn spawn_stream_forward(
+	rx: flume::Receiver<Vec<u8>>,
+	name: &'static str,
+	tx: mpsc::Sender<Value>,
+) -> JoinHandle<()> {
+	thread::spawn(move || {
 		while let Ok(chunk) = rx.recv() {
 			if tx.blocking_send(encode_stream_frame(name, &chunk)).is_err() {
 				break;
 			}
 		}
-	});
+	})
 }
 
-fn spawn_exit_forward(rx: flume::Receiver<ExecExit>, tx: mpsc::Sender<Value>) {
-	std::thread::spawn(move || {
-		if let Ok(exit) = rx.recv() {
+fn spawn_exit_forward(
+	rx: flume::Receiver<ExecExit>,
+	streams: [JoinHandle<()>; 2],
+	tx: mpsc::Sender<Value>,
+) {
+	thread::spawn(move || {
+		let exit = rx.recv();
+		for stream in streams {
+			let _ = stream.join();
+		}
+		if let Ok(exit) = exit {
 			let _ = tx.blocking_send(encode_exit_frame(exit));
 		}
 	});
@@ -576,5 +592,41 @@ mod tests {
 			encode_exit_frame(ExecExit { code: 7, signal: None }),
 			json!({"exit":7,"signal":null})
 		);
+	}
+
+	#[test]
+	fn exit_frame_follows_all_stream_frames() {
+		let (stdout_tx, stdout_rx) = flume::unbounded();
+		let (stderr_tx, stderr_rx) = flume::unbounded();
+		let (exit_tx, exit_rx) = flume::bounded(1);
+		let (events_tx, mut events_rx) = mpsc::channel(4);
+		let streams = [
+			spawn_stream_forward(stdout_rx, "stdout", events_tx.clone()),
+			spawn_stream_forward(stderr_rx, "stderr", events_tx.clone()),
+		];
+		spawn_exit_forward(exit_rx, streams, events_tx);
+
+		stdout_tx.send(b"out".to_vec()).unwrap();
+		stderr_tx.send(b"err".to_vec()).unwrap();
+		drop(stdout_tx);
+		drop(stderr_tx);
+		exit_tx.send(ExecExit { code: 0, signal: None }).unwrap();
+
+		let frames = [
+			events_rx.blocking_recv().unwrap(),
+			events_rx.blocking_recv().unwrap(),
+			events_rx.blocking_recv().unwrap(),
+		];
+		assert!(
+			frames[..2]
+				.iter()
+				.any(|frame| frame.get("stream") == Some(&json!("stdout")))
+		);
+		assert!(
+			frames[..2]
+				.iter()
+				.any(|frame| frame.get("stream") == Some(&json!("stderr")))
+		);
+		assert_eq!(frames[2], json!({"exit": 0, "signal": null}));
 	}
 }
