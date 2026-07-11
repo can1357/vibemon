@@ -18,20 +18,18 @@ import io
 import json
 import os
 import platform
-import queue
 import shutil
-import signal
 import sys
 import tarfile
 import tempfile
 import threading
+import stat
 import time
 import traceback
 import types
 import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 PROTOCOL_VERSION = 2
 ENVELOPE_VERSION = 1
@@ -44,23 +42,56 @@ MAX_CHECKPOINT_BYTES = int(os.environ.get(
     "VMON_RUNNER_MAX_CHECKPOINT_BYTES", str(256 * 1024 * 1024)))
 MAX_PACKAGE_EXTRACT_BYTES = int(os.environ.get(
     "VMON_RUNNER_MAX_PACKAGE_EXTRACT_BYTES", str(512 * 1024 * 1024)))
+MAX_PACKAGE_ARCHIVE_BYTES = int(os.environ.get(
+    "VMON_RUNNER_MAX_PACKAGE_ARCHIVE_BYTES", str(64 * 1024 * 1024)))
+FUNCTION_ROOT = os.environ.get("VMON_RUNNER_FUNCTION_ROOT", "/opt/vmon")
 MAX_PACKAGE_FILES = int(os.environ.get("VMON_RUNNER_MAX_PACKAGE_FILES", "10000"))
 MAX_LOG_FRAGMENT_BYTES = int(os.environ.get("VMON_RUNNER_MAX_LOG_FRAGMENT_BYTES", "65536"))
 _DEFAULT_THREADS = max(1, min(32, int(os.environ.get("VMON_RUNNER_SYNC_THREADS", "8"))))
 _DEFAULT_TASKS = max(1, int(os.environ.get("VMON_RUNNER_ASYNC_TASKS", "128")))
+SPILL_THRESHOLD_BYTES = int(os.environ.get(
+    "VMON_RUNNER_SPILL_THRESHOLD_BYTES", str(512 * 1024)))
+SPILL_ROOT = os.environ.get("VMON_RUNNER_SPILL_ROOT", "/run/vmon/values")
+MAX_SPILL_BYTES = int(os.environ.get(
+    "VMON_RUNNER_MAX_SPILL_BYTES", str(512 * 1024 * 1024)))
+MAX_SPILL_FILES = int(os.environ.get("VMON_RUNNER_MAX_SPILL_FILES", "4096"))
 _CALL = contextvars.ContextVar("vmon_current_call", default=None)
 
 
+@dataclass(frozen=True)
+class CurrentCall:
+    call_id: str
+    function_id: str = ""
+    definition_id: str = ""
+    request_id: str = ""
+    input_id: str = ""
+    input_index: int = 0
+    attempt: int = 1
+    parent_request_id: Optional[str] = None
+    parent_call_id: Optional[str] = None
+    execution_mode: str = ""
+    actor_id: Optional[str] = None
+    deadline_unix_ms: Optional[int] = None
+
+
 def current_call():
-    """Return immutable metadata for the active call, or None outside a call."""
+    """Return SDK-compatible immutable metadata for the active call."""
     value = _CALL.get()
     if value is None:
-        return None
-    return {key: item for key, item in value.items() if not key.startswith("_")}
+        raise RuntimeError("current_call() is only available while executing a vmon call")
+    fields = {name: value.get(name) for name in CurrentCall.__dataclass_fields__}
+    fields["call_id"] = fields["call_id"] or ""
+    fields["function_id"] = fields["function_id"] or ""
+    fields["definition_id"] = fields["definition_id"] or ""
+    fields["request_id"] = fields["request_id"] or ""
+    fields["input_id"] = fields["input_id"] or ""
+    fields["input_index"] = fields["input_index"] or 0
+    return CurrentCall(**fields)
 
 
 def _canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
 
 
 def _checksum(data):
@@ -171,7 +202,67 @@ def decode_value(envelope, trusted=False):
     raise ValueError("unsupported value format %r; expected json, cbor, or cloudpickle" % value_format)
 
 
-def encode_value(value, value_format="json"):
+_SPILL_LOCK = threading.Lock()
+_SPILL_PATHS = set()
+
+
+def _spill_data(envelope, data):
+    os.makedirs(SPILL_ROOT, mode=0o700, exist_ok=True)
+    os.chmod(SPILL_ROOT, 0o700)
+    with _SPILL_LOCK:
+        total = 0
+        for existing in list(_SPILL_PATHS):
+            try:
+                total += os.path.getsize(existing)
+            except FileNotFoundError:
+                _SPILL_PATHS.remove(existing)
+        if len(_SPILL_PATHS) >= MAX_SPILL_FILES:
+            raise RuntimeError("result spill file limit of %d reached" % MAX_SPILL_FILES)
+        if total + len(data) > MAX_SPILL_BYTES:
+            raise RuntimeError("result spill byte limit of %d reached" % MAX_SPILL_BYTES)
+        fd, path = tempfile.mkstemp(prefix="value-", dir=SPILL_ROOT)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        except BaseException:
+            os.close(fd)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)
+        _SPILL_PATHS.add(path)
+    result = dict(envelope)
+    result.pop("inline_data", None)
+    result["path"] = path
+    result["remove_after_read"] = True
+    return result
+
+
+def _spill_envelope(envelope):
+    data = base64.b64decode(envelope["inline_data"].encode("ascii"), validate=True)
+    return _spill_data(envelope, data) if len(data) > SPILL_THRESHOLD_BYTES else envelope
+
+
+def _cleanup_spills():
+    with _SPILL_LOCK:
+        paths = list(_SPILL_PATHS)
+        _SPILL_PATHS.clear()
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def encode_value(value, value_format="json", spill=True):
+    secrets = _CALL.get().get("_secrets", set()) if _CALL.get() else set()
+    value = _redact(value, secrets)
     if value_format == "json":
         data = _canonical(value)
         extra = {}
@@ -189,12 +280,15 @@ def encode_value(value, value_format="json"):
         raise ValueError("unsupported output format %r" % value_format)
     if len(data) > MAX_VALUE_BYTES:
         raise ValueError("encoded value exceeds %d-byte limit" % MAX_VALUE_BYTES)
+    for secret in secrets:
+        if secret.encode("utf-8") in data:
+            raise ValueError("refusing to encode a value containing secret material")
     result = {"version": ENVELOPE_VERSION, "format": value_format,
               "inline_data": base64.b64encode(data).decode("ascii"),
               "uncompressed_size": len(data), "sha256": _checksum(data),
               "compression": "none"}
     result.update(extra)
-    return result
+    return _spill_data(result, data) if spill and len(data) > SPILL_THRESHOLD_BYTES else result
 
 
 class ActorLostError(RuntimeError):
@@ -222,6 +316,26 @@ def _decorator(name, lifecycle=None):
     return decorate
 
 
+def _method_decorator(function):
+    setattr(function, "__vmon_method__", True)
+    return function
+
+
+def _enter_decorator(function=None, *, snapshot=False):
+    def apply(target):
+        setattr(target, "__vmon_enter__", True)
+        setattr(target, "__vmon_snapshot_enter__", bool(snapshot))
+        return target
+    return apply(function) if function is not None else apply
+
+
+def _lifecycle_decorator(marker):
+    def apply(function):
+        setattr(function, marker, True)
+        return function
+    return apply
+
+
 def _install_vmon_shim():
     existing = sys.modules.get("vmon")
     if existing is not None and getattr(existing, "__vmon_guest_shim__", False):
@@ -231,13 +345,12 @@ def _install_vmon_shim():
     shim.function = _decorator("function")
     shim.cls = _decorator("cls")
     shim.service = _decorator("service")
-    shim.method = _decorator("method")
+    shim.method = _method_decorator
     shim.concurrent = _decorator("concurrent")
     shim.batched = _decorator("batched")
-    shim.enter = _decorator("enter", "enter")
-    shim.exit = _decorator("exit", "exit")
-    shim.before_snapshot = _decorator("before_snapshot", "before_snapshot")
-    shim.after_restore = _decorator("after_restore", "after_restore")
+    shim.enter = _enter_decorator
+    shim.exit = _lifecycle_decorator("__vmon_exit__")
+    shim.on_restore = _lifecycle_decorator("__vmon_restore__")
     shim.current_call = current_call
     shim.is_remote = lambda: True
     shim.ActorLostError = ActorLostError
@@ -342,7 +455,8 @@ class _ProtocolWriter:
                 self._seq[request_id] = seq + 1
                 frame.update({"request_id": request_id, "seq": seq})
                 if meta and meta.get("request_id") == request_id:
-                    for key in ("call_id", "input_id", "attempt", "parent_call_id"):
+                    for key in ("call_id", "function_id", "input_id", "input_index", "attempt",
+                                "parent_request_id", "parent_call_id"):
                         frame[key] = meta.get(key)
             frame.update(_redact(fields, secrets))
             payload = _canonical(frame) + b"\n"
@@ -366,12 +480,37 @@ class _ProtocolWriter:
 
 
 _WRITER = _ProtocolWriter()
+def _capture_native_fd(fd, stream):
+    reader_fd, writer_fd = os.pipe()
+    os.dup2(writer_fd, fd)
+    os.close(writer_fd)
+
+    def forward():
+        while True:
+            try:
+                chunk = os.read(reader_fd, MAX_LOG_FRAGMENT_BYTES)
+            except OSError:
+                return
+            if not chunk:
+                return
+            message = chunk.decode("utf-8", "replace").rstrip("\r\n")
+            if message:
+                _WRITER.emit("log", None, stream=stream, message=message,
+                             partial=not chunk.endswith((b"\n", b"\r")))
+
+    threading.Thread(target=forward, name="vmon-native-%s" % stream,
+                     daemon=True).start()
+
+
+_capture_native_fd(1, "stdout")
+_capture_native_fd(2, "stderr")
+
+
 
 
 class _CapturedStream(io.TextIOBase):
     def __init__(self, name):
         self.name = name
-        self._buffers = contextvars.ContextVar("vmon_%s_buffer" % name, default="")
 
     @property
     def encoding(self):
@@ -391,24 +530,20 @@ class _CapturedStream(io.TextIOBase):
             _WRITER.emit("log", None, stream=self.name, message=message,
                          partial=not text.endswith(("\n", "\r")))
             return len(text)
-        while len(message.encode("utf-8", "replace")) > MAX_LOG_FRAGMENT_BYTES:
-            fragment = message[:MAX_LOG_FRAGMENT_BYTES]
+        encoded = message.encode("utf-8", "replace")
+        while len(encoded) > MAX_LOG_FRAGMENT_BYTES:
+            fragment = encoded[:MAX_LOG_FRAGMENT_BYTES].decode("utf-8", "ignore")
             _WRITER.emit("log", meta["request_id"], stream=self.name,
                          message=fragment, partial=True)
-            message = message[MAX_LOG_FRAGMENT_BYTES:]
-        if message:
-            _WRITER.emit("log", meta["request_id"], stream=self.name, message=message,
+            encoded = encoded[MAX_LOG_FRAGMENT_BYTES:]
+        if encoded:
+            _WRITER.emit("log", meta["request_id"], stream=self.name,
+                         message=encoded.decode("utf-8", "replace"),
                          partial=not text.endswith(("\n", "\r")))
         return len(text)
 
     def flush(self):
-        text = self._buffers.get()
-        if text:
-            meta = _CALL.get()
-            _WRITER.emit("log", meta.get("request_id") if meta else None,
-                         call_id=meta.get("call_id") if meta else None,
-                         stream=self.name, message=text)
-            self._buffers.set("")
+        return None
 
 
 sys.stdout = _CapturedStream("stdout")
@@ -424,6 +559,7 @@ class Definition:
     root: Optional[str] = None
     cleanup_root: Optional[str] = None
     serialized_methods: bool = True
+    secrets: set = field(default_factory=set)
 
 
 @dataclass
@@ -435,14 +571,37 @@ class Actor:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+def _bounded_error_text(value, limit=131072, representation=False):
+    try:
+        text = repr(value) if representation else str(value)
+    except BaseException:
+        text = "<unprintable %s>" % type(value).__name__
+    meta = _CALL.get()
+    text = _redact(text, meta.get("_secrets", set()) if meta else set())
+    encoded = text.encode("utf-8", "replace")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", "ignore") + "... [truncated]"
+
+
+def _exception_traceback(exc):
+    try:
+        rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except BaseException:
+        rendered = "%s: <traceback formatting failed>" % type(exc).__name__
+    return _bounded_error_text(rendered)
+
+
 class Runner:
     def __init__(self, max_threads=_DEFAULT_THREADS, max_tasks=_DEFAULT_TASKS):
         self.definitions = {}
         self.actors = {}
         self.checkpoints = {}
+        self.package_cache = {}
         self.checkpoint_bytes = 0
         self.running = {}
         self.running_frames = {}
+        self.deadline_handles = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_threads,
                                                                thread_name_prefix="vmon-call")
         self.slots = asyncio.Semaphore(max_tasks)
@@ -453,9 +612,9 @@ class Runner:
             "error": {
                 "type": type(exc).__name__,
                 "module": type(exc).__module__,
-                "message": str(exc),
-                "repr": repr(exc),
-                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                "message": _bounded_error_text(exc),
+                "repr": _bounded_error_text(exc, representation=True),
+                "traceback": _exception_traceback(exc),
             }
         }
         if phase:
@@ -463,41 +622,106 @@ class Runner:
         cause = exc.__cause__ or exc.__context__
         if cause is not None:
             fields["error"]["cause"] = {"type": type(cause).__name__,
-                                          "module": type(cause).__module__,
-                                          "message": str(cause)}
+                                        "module": type(cause).__module__,
+                                        "message": _bounded_error_text(cause)}
         return fields
 
     def _extract_package(self, definition):
         root = definition.get("root")
-        archive = definition.get("archive")
-        if archive is None:
+        archive_path = definition.get("archive_path")
+        if archive_path is None:
+            if "archive" in definition:
+                raise ValueError("inline package archives are unsupported; use archive_path")
             if not root or not os.path.isdir(root):
                 raise ValueError("package definition root is not a directory: %r" % root)
             return os.path.abspath(root), None
-        archive_data = decode_value(archive, trusted=False)
-        if not isinstance(archive_data, str):
-            raise ValueError("package archive envelope must decode to base64 archive text")
-        raw = base64.b64decode(archive_data)
-        temporary = tempfile.mkdtemp(prefix="vmon-function-")
-        archive_path = os.path.join(temporary, "package")
+        if not isinstance(archive_path, str) or not os.path.isabs(archive_path):
+            raise ValueError("package archive_path must be absolute")
+        if ".." in archive_path.split(os.sep):
+            raise ValueError("package archive_path must not contain '..'")
+        allowed_root = os.path.abspath(FUNCTION_ROOT)
+        if os.path.realpath(allowed_root) != allowed_root or os.path.islink(allowed_root):
+            raise ValueError("function package root must not be a symlink")
+        lexical = os.path.abspath(os.path.normpath(archive_path))
         try:
-            with open(archive_path, "wb") as output:
-                output.write(raw)
-            extract_root = os.path.join(temporary, "root")
-            os.mkdir(extract_root)
-            if zipfile.is_zipfile(archive_path):
-                with zipfile.ZipFile(archive_path) as bundle:
-                    self._safe_zip_extract(bundle, extract_root)
-            elif tarfile.is_tarfile(archive_path):
-                with tarfile.open(archive_path) as bundle:
-                    self._safe_tar_extract(bundle, extract_root)
-            else:
-                raise ValueError("package archive is neither zip nor tar")
-            os.remove(archive_path)
-            return extract_root, temporary
+            if os.path.commonpath((allowed_root, lexical)) != allowed_root:
+                raise ValueError("package archive_path escapes function root")
+        except ValueError:
+            raise ValueError("package archive_path escapes function root")
+        current = allowed_root
+        relative = os.path.relpath(lexical, allowed_root)
+        for component in relative.split(os.sep):
+            current = os.path.join(current, component)
+            try:
+                entry = os.lstat(current)
+            except OSError as exc:
+                raise ValueError("cannot inspect package archive path %r: %s" %
+                                 (archive_path, exc)) from exc
+            if stat.S_ISLNK(entry.st_mode):
+                raise ValueError("package archive path contains symlink %r" % current)
+        if os.path.realpath(lexical) != lexical:
+            raise ValueError("resolved package archive_path escapes or aliases its lexical path")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(lexical, flags)
+        except OSError as exc:
+            raise ValueError("cannot securely open package archive %r: %s" %
+                             (archive_path, exc)) from exc
+        temporary = tempfile.mkdtemp(prefix="vmon-function-")
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("package archive_path is not a regular file")
+            if opened.st_size > MAX_PACKAGE_ARCHIVE_BYTES:
+                raise ValueError("package archive exceeds %d-byte input limit" %
+                                 MAX_PACKAGE_ARCHIVE_BYTES)
+            expected_size = definition.get("archive_size")
+            if expected_size is not None:
+                if isinstance(expected_size, bool) or not isinstance(expected_size, int):
+                    raise ValueError("package archive_size must be an integer")
+                if expected_size != opened.st_size:
+                    raise ValueError("package archive size mismatch: expected %d, opened %d" %
+                                     (expected_size, opened.st_size))
+            expected = definition.get("archive_sha256")
+            if (not isinstance(expected, str) or len(expected) != 64 or
+                    any(character not in "0123456789abcdef" for character in expected)):
+                raise ValueError("package archive_sha256 must be 64 lowercase hex characters")
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "rb", closefd=False) as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                if digest.hexdigest() != expected:
+                    raise ValueError("package archive SHA-256 mismatch")
+                cached = self.package_cache.get(expected)
+                if cached is not None:
+                    shutil.rmtree(temporary, ignore_errors=True)
+                    return cached, None
+                source.seek(0)
+                extract_root = os.path.join(temporary, "root")
+                os.mkdir(extract_root)
+                if zipfile.is_zipfile(source):
+                    source.seek(0)
+                    with zipfile.ZipFile(source) as bundle:
+                        self._safe_zip_extract(bundle, extract_root)
+                else:
+                    source.seek(0)
+                    try:
+                        with tarfile.open(fileobj=source) as bundle:
+                            self._safe_tar_extract(bundle, extract_root)
+                    except tarfile.TarError as exc:
+                        raise ValueError("package archive is neither a valid ZIP nor TAR") from exc
+            self.package_cache[expected] = extract_root
+            return extract_root, None
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _safe_zip_extract(bundle, root):
@@ -517,19 +741,34 @@ class Runner:
 
     @staticmethod
     def _safe_tar_extract(bundle, root):
-        members = bundle.getmembers()
-        if len(members) > MAX_PACKAGE_FILES:
-            raise ValueError("package archive exceeds %d-file limit" % MAX_PACKAGE_FILES)
-        if sum(member.size for member in members) > MAX_PACKAGE_EXTRACT_BYTES:
-            raise ValueError("package archive exceeds %d-byte extracted limit" %
-                             MAX_PACKAGE_EXTRACT_BYTES)
-        base = os.path.realpath(root) + os.sep
-        for member in members:
+        members = []
+        total = 0
+        for member in bundle:
+            members.append(member)
+            if len(members) > MAX_PACKAGE_FILES:
+                raise ValueError("package archive exceeds %d-file limit" % MAX_PACKAGE_FILES)
+            total += member.size
+            if total > MAX_PACKAGE_EXTRACT_BYTES:
+                raise ValueError("package archive exceeds %d-byte extracted limit" %
+                                 MAX_PACKAGE_EXTRACT_BYTES)
             destination = os.path.realpath(os.path.join(root, member.name))
+            base = os.path.realpath(root) + os.sep
             if (not destination.startswith(base) or member.issym() or member.islnk() or
                     not (member.isfile() or member.isdir())):
                 raise ValueError("package archive contains unsafe member %r" % member.name)
-        bundle.extractall(root)
+        bundle.extractall(root, members=members)
+
+    @staticmethod
+    def _callable_kind(target):
+        if not inspect.isclass(target) and not inspect.isfunction(target):
+            target = getattr(target, "__call__", target)
+        if inspect.isasyncgenfunction(target):
+            return "async_generator"
+        if inspect.iscoroutinefunction(target):
+            return "async"
+        if inspect.isgeneratorfunction(target):
+            return "generator"
+        return "sync"
 
     async def define(self, frame):
         request_id = frame.get("request_id")
@@ -542,8 +781,10 @@ class Runner:
             if old.revision != revision:
                 raise ValueError("definition %r is already initialized at revision %r; refusing revision %r" %
                                  (definition_id, old.revision, revision))
+            old.secrets = _secret_strings(frame.get("secrets", {}))
             _WRITER.emit("status", request_id, status="already_initialized",
-                         definition_id=definition_id, revision=revision)
+                         definition_id=definition_id, revision=revision,
+                         callable_kind=self._callable_kind(old.target))
             return
         if len(self.definitions) >= MAX_DEFINITIONS:
             raise RuntimeError("definition limit of %d reached" % MAX_DEFINITIONS)
@@ -570,17 +811,30 @@ class Runner:
         serialized_methods = spec.get("serialized_methods")
         if serialized_methods is None:
             serialized_methods = metadata.get("kind") != "concurrent"
+        definition_secrets = _secret_strings(frame.get("secrets", {}))
         self.definitions[definition_id] = Definition(
-            definition_id, revision, target, mode, root, cleanup_root, bool(serialized_methods))
+            definition_id, revision, target, mode, root, cleanup_root,
+            bool(serialized_methods), definition_secrets)
+        callable_kind = self._callable_kind(target)
         _WRITER.emit("status", request_id, status="initialized",
-                     definition_id=definition_id, revision=revision)
+                     definition_id=definition_id, revision=revision,
+                     callable_kind=callable_kind)
 
     def _call_meta(self, frame):
         secrets = _secret_strings(frame.get("secrets", {}))
+        definition_id = frame.get("definition_id")
+        if definition_id is None and frame.get("actor_id") in self.actors:
+            definition_id = self.actors[frame["actor_id"]].definition_id
+        definition = self.definitions.get(definition_id)
+        if definition is not None:
+            secrets.update(definition.secrets)
         return {
             "request_id": frame["request_id"],
             "input_id": frame.get("input_id"),
             "call_id": frame.get("call_id"),
+            "function_id": frame.get("function_id", frame.get("definition_id")),
+            "definition_id": frame.get("definition_id"),
+            "input_index": frame.get("input_index"),
             "attempt": frame.get("attempt", 1),
             "parent_request_id": frame.get("parent_request_id"),
             "parent_call_id": frame.get("parent_call_id"),
@@ -715,7 +969,6 @@ class Runner:
                 args, kwargs = self._decode_args(frame)
                 value = await self._invoke(definition.target, args, kwargs, frame)
                 actor = Actor(actor_id, definition_id, definition.revision, value)
-                self.actors[actor_id] = actor
                 hook = self._find_hook(value, "enter")
                 if hook:
                     entered = await self._invoke(hook, [], {}, frame)
@@ -724,6 +977,7 @@ class Runner:
                     entered = await self._invoke(hook, [], {}, frame) if hook else None
                 if entered is not None:
                     actor.value = entered
+                self.actors[actor_id] = actor
                 _WRITER.emit("result", request_id, actor_id=actor_id,
                              value=encode_value({"actor_id": actor_id},
                                                 frame.get("output_format",
@@ -732,7 +986,8 @@ class Runner:
             if actor_id not in self.actors and operation in ("actor_restore", "restore"):
                 if len(self.actors) >= MAX_ACTORS:
                     raise RuntimeError("actor limit of %d reached" % MAX_ACTORS)
-                envelope = frame.get("state") or self.checkpoints.get(frame.get("checkpoint_id"))
+                checkpoint_key = (actor_id, frame.get("checkpoint_id"))
+                envelope = frame.get("state") or self.checkpoints.get(checkpoint_key)
                 if envelope is None:
                     raise KeyError("checkpoint is unavailable; actor was not reinitialized")
                 definition_id = frame.get("definition_id")
@@ -743,8 +998,8 @@ class Runner:
                 value = definition.target.__new__(definition.target)
                 self._restore_actor_state(value, state)
                 actor = Actor(actor_id, definition_id, definition.revision, value)
-                self.actors[actor_id] = actor
                 await self._run_hook(value, "after_restore", frame)
+                self.actors[actor_id] = actor
                 _WRITER.emit("result", request_id, actor_id=actor_id,
                              value=encode_value({"restored": True, "recreated": True}))
                 return
@@ -764,29 +1019,34 @@ class Runner:
                 elif operation in ("actor_checkpoint", "checkpoint"):
                     await self._run_hook(actor.value, "before_snapshot", frame)
                     state = _redact(self._actor_state(actor.value), meta["_secrets"])
-                    envelope = encode_value(state, "cloudpickle")
+                    envelope = encode_value(state, "cloudpickle", spill=False)
                     checkpoint_id = frame.get("checkpoint_id") or request_id
-                    previous = self.checkpoints.pop(checkpoint_id, None)
+                    checkpoint_key = (actor_id, checkpoint_id)
+                    encoded_bytes = len(envelope["inline_data"])
+                    if encoded_bytes > MAX_CHECKPOINT_BYTES:
+                        raise ValueError("checkpoint exceeds runner checkpoint memory limit")
+                    previous = self.checkpoints.pop(checkpoint_key, None)
                     if previous is not None:
                         self.checkpoint_bytes -= len(previous["inline_data"])
-                    encoded_bytes = len(envelope["inline_data"])
                     while self.checkpoints and self.checkpoint_bytes + encoded_bytes > MAX_CHECKPOINT_BYTES:
                         oldest = next(iter(self.checkpoints))
                         removed = self.checkpoints.pop(oldest)
                         self.checkpoint_bytes -= len(removed["inline_data"])
-                    if encoded_bytes > MAX_CHECKPOINT_BYTES:
-                        raise ValueError("checkpoint exceeds runner checkpoint memory limit")
-                    self.checkpoints[checkpoint_id] = envelope
+                    self.checkpoints[checkpoint_key] = envelope
                     self.checkpoint_bytes += encoded_bytes
-                    _WRITER.emit("result", request_id, actor_id=actor_id, checkpoint_id=checkpoint_id,
-                                 value=envelope)
+                    _WRITER.emit("result", request_id, actor_id=actor_id,
+                                 checkpoint_id=checkpoint_id,
+                                 value=_spill_envelope(envelope))
                 elif operation in ("actor_restore", "restore"):
-                    envelope = frame.get("state") or self.checkpoints.get(frame.get("checkpoint_id"))
+                    checkpoint_key = (actor_id, frame.get("checkpoint_id"))
+                    envelope = frame.get("state") or self.checkpoints.get(checkpoint_key)
                     if envelope is None:
                         raise KeyError("checkpoint is unavailable; actor was not reinitialized")
                     state = decode_value(envelope, trusted=True)
-                    self._restore_actor_state(actor.value, state)
-                    await self._run_hook(actor.value, "after_restore", frame)
+                    candidate = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
+                    self._restore_actor_state(candidate, state)
+                    await self._run_hook(candidate, "after_restore", frame)
+                    actor.value = candidate
                     _WRITER.emit("result", request_id, actor_id=actor_id,
                                  value=encode_value({"restored": True}))
                 elif operation in ("actor_fork", "fork"):
@@ -795,12 +1055,10 @@ class Runner:
                         raise ValueError("fork requires a new child_actor_id")
                     if len(self.actors) >= MAX_ACTORS:
                         raise RuntimeError("actor limit of %d reached" % MAX_ACTORS)
-                    state = self._actor_state(actor.value)
                     child_value = _cloudpickle().loads(_cloudpickle().dumps(actor.value))
-                    self._restore_actor_state(child_value, state)
                     child = Actor(child_id, actor.definition_id, actor.revision, child_value)
-                    self.actors[child_id] = child
                     await self._run_hook(child.value, "after_restore", frame)
+                    self.actors[child_id] = child
                     _WRITER.emit("result", request_id, actor_id=actor_id, child_actor_id=child_id,
                                  value=encode_value({"actor_id": child_id}))
                 elif operation in ("actor_shutdown", "shutdown_actor"):
@@ -830,11 +1088,23 @@ class Runner:
         setter = getattr(value, "__setstate__", None)
         if setter:
             setter(state)
-        elif hasattr(value, "__dict__") and isinstance(state, dict):
+            return
+        dict_state = state
+        slot_state = None
+        if isinstance(state, tuple) and len(state) == 2:
+            dict_state, slot_state = state
+        if dict_state is not None:
+            if not isinstance(dict_state, dict) or not hasattr(value, "__dict__"):
+                raise TypeError("actor dictionary state cannot be restored")
             value.__dict__.clear()
-            value.__dict__.update(state)
-        else:
-            raise TypeError("actor does not support state restoration")
+            value.__dict__.update(dict_state)
+        if slot_state is not None:
+            if not isinstance(slot_state, dict):
+                raise TypeError("actor slot state must be an object")
+            for name, item in slot_state.items():
+                setattr(value, name, item)
+        if dict_state is None and slot_state is None:
+            return
 
     @staticmethod
     def _find_hook(value, name):
@@ -868,7 +1138,10 @@ class Runner:
         if not request_id:
             raise ValueError("lifecycle frame requires request_id")
         _WRITER.reset(request_id)
-        token = _CALL.set(self._call_meta(frame))
+        meta = self._call_meta(frame)
+        for definition in self.definitions.values():
+            meta["_secrets"].update(definition.secrets)
+        token = _CALL.set(meta)
         operation = frame.get("type") or frame.get("operation")
         hook_name = "before_snapshot" if operation == "before_snapshot" else "after_restore"
         try:
@@ -927,24 +1200,56 @@ class Runner:
             raise ValueError("%s requires request_id" % operation)
         if request_id in self.running:
             raise ValueError("request_id %r is already running" % request_id)
+        deadline = frame.get("deadline_unix_ms")
+        if deadline is not None and float(deadline) / 1000.0 <= time.time():
+            frame["_cancel_reason"] = "deadline_exceeded"
+            coroutine.close()
+            self._emit_prestart_cancel(frame)
+            return
         task = asyncio.create_task(self._bounded(coroutine))
         self.running[request_id] = task
         self.running_frames[request_id] = frame
-        def finished(done, rid=request_id):
+        def finished(done, rid=request_id, pending=coroutine, request_frame=frame):
             self.running.pop(rid, None)
             self.running_frames.pop(rid, None)
+            handle = self.deadline_handles.pop(rid, None)
+            if handle is not None:
+                handle.cancel()
+            if done.cancelled():
+                pending.close()
+                self._emit_prestart_cancel(request_frame)
         task.add_done_callback(finished)
-        deadline = frame.get("deadline_unix_ms")
         if deadline is not None:
             delay = max(0.0, float(deadline) / 1000.0 - time.time())
-            asyncio.get_running_loop().call_later(delay, self._deadline, request_id)
+            self.deadline_handles[request_id] = asyncio.get_running_loop().call_later(
+                delay, self._deadline, request_id)
+
+    def _emit_prestart_cancel(self, frame):
+        request_id = frame["request_id"]
+        _WRITER.reset(request_id)
+        token = _CALL.set(self._call_meta(frame))
+        try:
+            _WRITER.emit("cancelled", request_id,
+                         reason=frame.get("_cancel_reason", "cancelled"))
+        finally:
+            _CALL.reset(token)
+
 
     async def _guard_control(self, frame, function):
         request_id = frame.get("request_id")
+        if not request_id:
+            _WRITER.emit("error", None,
+                         **self._error_fields(ValueError("define requires request_id"),
+                                              "definition"))
+            return
+        _WRITER.reset(request_id)
+        token = _CALL.set(self._call_meta(frame))
         try:
             await function(frame)
         except BaseException as exc:
             _WRITER.emit("error", request_id, **self._error_fields(exc, "definition"))
+        finally:
+            _CALL.reset(token)
 
     async def _bounded(self, coroutine):
         async with self.slots:
@@ -963,15 +1268,26 @@ class Runner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         for actor in list(self.actors.values()):
+            frame = {"request_id": "shutdown", "definition_id": actor.definition_id}
+            token = _CALL.set(self._call_meta(frame))
             try:
-                await self._shutdown_actor(actor, {"request_id": "shutdown"})
+                await self._shutdown_actor(actor, frame)
             except BaseException:
                 pass
+            finally:
+                _CALL.reset(token)
         self.actors.clear()
         self.executor.shutdown(wait=False)
         for definition in self.definitions.values():
             if definition.cleanup_root:
                 shutil.rmtree(definition.cleanup_root, ignore_errors=True)
+        for extract_root in self.package_cache.values():
+            shutil.rmtree(os.path.dirname(extract_root), ignore_errors=True)
+        self.package_cache.clear()
+        for definition in self.definitions.values():
+            definition.secrets.clear()
+        self.definitions.clear()
+        _cleanup_spills()
 
 
 class _NullAsyncLock:
@@ -990,6 +1306,9 @@ def _reader_thread(loop, incoming):
                 asyncio.run_coroutine_threadsafe(incoming.put(None), loop).result()
                 return
             if len(raw) > MAX_FRAME_BYTES or not raw.endswith(b"\n"):
+                if len(raw) > MAX_FRAME_BYTES and not raw.endswith(b"\n"):
+                    while raw and not raw.endswith(b"\n"):
+                        raw = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
                 item = ValueError("input frame exceeds %d bytes or lacks newline" % MAX_FRAME_BYTES)
             else:
                 try:
@@ -1067,6 +1386,11 @@ async def _run_socket(runner, socket_path):
                 while not runner.stopping:
                     try:
                         raw = await reader.readline()
+                    except ValueError:
+                        await _process_item(
+                            runner, ValueError("input frame exceeds %d bytes" %
+                                               MAX_FRAME_BYTES))
+                        continue
                     except (ConnectionError, asyncio.CancelledError):
                         break
                     if not raw:

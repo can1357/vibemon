@@ -19,7 +19,9 @@ use axum::{
 use tokio::net::{UnixListener, UnixStream};
 
 use super::error::ApiError;
-use crate::{config::ServeConfig, engine::EngineApi, mesh::runtime::MeshRuntime};
+use crate::{
+	config::ServeConfig, engine::EngineApi, function::FunctionDomain, mesh::runtime::MeshRuntime,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
@@ -30,6 +32,7 @@ pub enum Transport {
 #[derive(Clone)]
 pub struct ApiState {
 	pub engine:        Arc<dyn EngineApi>,
+	pub functions:     Arc<FunctionDomain>,
 	pub config:        Arc<ServeConfig>,
 	pub auth_failures: Arc<AtomicU64>,
 	pub transport:     Transport,
@@ -37,9 +40,15 @@ pub struct ApiState {
 }
 
 impl ApiState {
-	pub fn new(engine: Arc<dyn EngineApi>, config: ServeConfig, transport: Transport) -> Self {
+	pub fn new(
+		engine: Arc<dyn EngineApi>,
+		functions: Arc<FunctionDomain>,
+		config: ServeConfig,
+		transport: Transport,
+	) -> Self {
 		Self {
 			engine,
+			functions,
 			config: Arc::new(config),
 			auth_failures: Arc::new(AtomicU64::new(0)),
 			transport,
@@ -132,12 +141,31 @@ async fn authorize_tcp(
 		|| token_configured(state.config.client_token.as_deref());
 	if tokens_configured && !(admin || client) {
 		state.count_auth_failure();
+		if request.uri().path().starts_with("/vmon.v1.") {
+			return Ok(grpc_auth_error("16", "unauthorized", true));
+		}
 		return Err(ApiError::unauthorized("unauthorized"));
 	}
 	if client && !admin && is_admin_path(request.uri().path()) {
+		if request.uri().path().starts_with("/vmon.v1.") {
+			return Ok(grpc_auth_error("7", "forbidden", false));
+		}
 		return Err(ApiError::forbidden("forbidden"));
 	}
 	Ok(next.run(request).await)
+}
+
+fn grpc_auth_error(status: &'static str, message: &'static str, authenticate: bool) -> Response {
+	let mut response = Response::new(Body::empty());
+	let headers = response.headers_mut();
+	headers.insert(header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/grpc"));
+	headers.insert("grpc-status", axum::http::HeaderValue::from_static(status));
+	headers.insert("grpc-message", axum::http::HeaderValue::from_static(message));
+	headers.insert("vmon-code", axum::http::HeaderValue::from_static("unauthorized"));
+	if authenticate {
+		headers.insert(header::WWW_AUTHENTICATE, axum::http::HeaderValue::from_static("Bearer"));
+	}
+	response
 }
 
 pub fn is_public_path(method: &Method, path: &str) -> bool {

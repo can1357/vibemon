@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 axum = { version = "0.8", features = ["http2", "ws"] }
 base64 = "0.22"
+chrono = "0.4"
+chrono-tz = "0.10"
+cron = "0.15"
 flume = { version = "0.11", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"

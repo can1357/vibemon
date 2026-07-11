@@ -109,6 +109,26 @@ impl ArtifactStore {
 		}
 	}
 
+	/// Delete expired, unreferenced artifacts using metadata compare-and-delete.
+	///
+	/// The database path is required to match the digest-derived path before
+	/// metadata is removed, preventing a corrupt row from escaping this root.
+	pub fn gc_expired(&self, store: &super::store::Store, now_ms: u64, limit: u32) -> Result<u64> {
+		let candidates = store.unreferenced_expired_artifacts(now_ms, limit)?;
+		let mut removed = 0;
+		for (digest, persisted_path) in candidates {
+			let expected = self.path_for(&digest)?;
+			if Path::new(&persisted_path) != expected {
+				return Err(EngineError::engine(format!("artifact {digest} has an invalid persisted path")));
+			}
+			if store.delete_unreferenced_artifact(&digest, now_ms)? {
+				self.remove(&digest)?;
+				removed += 1;
+			}
+		}
+		Ok(removed)
+	}
+
 	fn put_digest_hex(&self, digest: &str, bytes: &[u8]) -> Result<StoredArtifact> {
 		let path = self.path_for(digest)?;
 		let parent = path.parent().ok_or_else(|| EngineError::engine("artifact path has no parent"))?;
@@ -128,7 +148,7 @@ impl ArtifactStore {
 			file.sync_all()?;
 			match fs::rename(&temporary, &path) {
 				Ok(()) => {}
-				Err(error) if path.exists() => {
+				Err(_error) if path.exists() => {
 					let _ = fs::remove_file(&temporary);
 					let existing = self.read(digest, Some(bytes.len() as u64))?;
 					if existing != bytes {

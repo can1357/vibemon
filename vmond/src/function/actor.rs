@@ -58,9 +58,9 @@ impl ActorManager {
 	pub fn pin(&self, actor_id: &str, worker: Arc<dyn Worker>, checkpoint_id: Option<String>) -> Result<()> {
 		let mut actors = self.actors.write();
 		let slot = actors.entry(actor_id.to_owned()).or_insert_with(|| ActorSlot::new(None));
-		if slot.lost && checkpoint_id.is_none() && slot.checkpoint_id.is_none() {
+		if slot.lost && checkpoint_id.as_ref() != slot.checkpoint_id.as_ref() {
 			return Err(EngineError::not_running(format!(
-				"actor {actor_id} is lost and has no checkpoint"
+				"actor {actor_id} must be restored from its latest checkpoint"
 			)));
 		}
 		slot.worker = Some(worker);
@@ -158,5 +158,37 @@ impl ActorPermit {
 	/// Pinned worker on which the actor method must execute.
 	pub fn worker(&self) -> &Arc<dyn Worker> {
 		&self.worker
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn loss_requires_checkpoint_and_forks_diverge() {
+		let actors = ActorManager::new();
+		actors.register("unchecked".into(), None);
+		assert_eq!(actors.worker_lost("unchecked").unwrap(), ActorRecovery::Lost);
+
+		actors.register("source".into(), Some("checkpoint-1".into()));
+		actors.fork("source", "fork".into()).unwrap();
+		assert_eq!(
+			actors.worker_lost("source").unwrap(),
+			ActorRecovery::Restore { checkpoint_id: "checkpoint-1".into() }
+		);
+		actors.checkpoint_committed("fork", "checkpoint-2".into()).unwrap();
+		assert_eq!(
+			actors.worker_lost("fork").unwrap(),
+			ActorRecovery::Restore { checkpoint_id: "checkpoint-2".into() }
+		);
+	}
+
+	#[test]
+	fn never_silently_resets_lost_actor() {
+		let actors = ActorManager::new();
+		actors.register("actor".into(), None);
+		assert_eq!(actors.worker_lost("actor").unwrap(), ActorRecovery::Lost);
+		assert!(actors.fork("actor", "fork".into()).is_err());
 	}
 }

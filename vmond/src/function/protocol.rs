@@ -137,40 +137,42 @@ impl ProtocolSession {
 		stderr: flume::Receiver<Vec<u8>>,
 		exit: flume::Receiver<crate::engine::ExecExit>,
 	) {
-		tokio::spawn(async move {
-			let mut buffered = Vec::new();
-			loop {
-				tokio::select! {
-					chunk = stdout.recv_async() => match chunk {
-						Ok(chunk) => {
-							buffered.extend_from_slice(&chunk);
-							if buffered.len() > MAX_FRAME_BYTES && !buffered.contains(&b'\n') {
-								fail_all(&inner, ProtocolError::InvalidFrame("runner frame exceeds one MiB".into()));
-								return;
-							}
-							while let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
-								let line: Vec<u8> = buffered.drain(..=newline).collect();
-								if let Err(error) = dispatch(&inner, &line[..line.len() - 1]) {
-									fail_all(&inner, error);
-									return;
-								}
-							}
-						}
-						Err(_) => { fail_all(&inner, ProtocolError::Disconnected("runner stdout closed".into())); return; }
-					},
-					chunk = stderr.recv_async() => if let Ok(chunk) = chunk {
-						// Exec stderr is a platform diagnostic, never protocol data. It is
-						// intentionally not copied into request errors where it might contain secrets.
-						let _ = chunk;
-					},
-					status = exit.recv_async() => {
-						let message = status.map_or_else(|_| "runner exited".to_string(), |s| format!("runner exited with status {}", s.code));
-						fail_all(&inner, ProtocolError::Disconnected(message));
+		let diagnostics = stderr;
+		std::thread::Builder::new()
+			.name("vmon-runner-stderr".into())
+			.spawn(move || while diagnostics.recv().is_ok() {})
+			.expect("spawn runner stderr drain");
+		let exit_inner = Arc::clone(&inner);
+		std::thread::Builder::new()
+			.name("vmon-runner-exit".into())
+			.spawn(move || {
+				let message = exit
+					.recv()
+					.map_or_else(|_| "runner exited".to_string(), |status| format!("runner exited with status {}", status.code));
+				fail_all(&exit_inner, ProtocolError::Disconnected(message));
+			})
+			.expect("spawn runner exit watcher");
+		std::thread::Builder::new()
+			.name("vmon-runner-protocol".into())
+			.spawn(move || {
+				let mut buffered = Vec::new();
+				while let Ok(chunk) = stdout.recv() {
+					buffered.extend_from_slice(&chunk);
+					if buffered.len() > MAX_FRAME_BYTES && !buffered.contains(&b'\n') {
+						fail_all(&inner, ProtocolError::InvalidFrame("runner frame exceeds one MiB".into()));
 						return;
 					}
+					while let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
+						let line: Vec<u8> = buffered.drain(..=newline).collect();
+						if let Err(error) = dispatch(&inner, &line[..line.len() - 1]) {
+							fail_all(&inner, error);
+							return;
+						}
+					}
 				}
-			}
-		});
+				fail_all(&inner, ProtocolError::Disconnected("runner stdout closed".into()));
+			})
+			.expect("spawn runner protocol reader");
 	}
 
 	/// Submit one request. Duplicate IDs are rejected and each event buffer is bounded.
@@ -183,8 +185,12 @@ impl ProtocolSession {
 		frame["protocol"] = json!(PROTOCOL_VERSION);
 		let (events_tx, events) = flume::bounded(self.inner.event_capacity);
 		let (terminal, completion) = oneshot::channel();
-		if self.inner.pending.lock().insert(request_id.clone(), Pending { events: events_tx, terminal }).is_some() {
-			return Err(ProtocolError::InvalidFrame(format!("duplicate request_id {request_id}")));
+		{
+			let mut pending = self.inner.pending.lock();
+			if pending.contains_key(&request_id) {
+				return Err(ProtocolError::InvalidFrame(format!("duplicate request_id {request_id}")));
+			}
+			pending.insert(request_id.clone(), Pending { events: events_tx, terminal });
 		}
 		let mut encoded = match serde_json::to_vec(&frame) {
 			Ok(encoded) if encoded.len() <= MAX_FRAME_BYTES => encoded,
@@ -240,10 +246,11 @@ fn dispatch(inner: &Arc<Inner>, bytes: &[u8]) -> Result<(), ProtocolError> {
 	let terminal = frame.is_terminal();
 	let mut pending = inner.pending.lock();
 	let Some(entry) = pending.get(&request_id) else { return Ok(()); };
-	entry.events.try_send(frame.clone()).map_err(|_| ProtocolError::Backpressure(format!("event buffer full for request {request_id}")))?;
 	if terminal {
 		let entry = pending.remove(&request_id).expect("pending entry existed");
 		let _ = entry.terminal.send(Ok(frame));
+	} else {
+		entry.events.try_send(frame).map_err(|_| ProtocolError::Backpressure(format!("event buffer full for request {request_id}")))?;
 	}
 	Ok(())
 }
@@ -253,3 +260,7 @@ fn fail_all(inner: &Arc<Inner>, error: ProtocolError) {
 	if let Some(sender) = inner.hello.lock().take() { let _ = sender.send(Err(error.clone())); }
 	for (_, pending) in inner.pending.lock().drain() { let _ = pending.terminal.send(Err(error.clone())); }
 }
+
+#[cfg(test)]
+#[path = "protocol_test.rs"]
+mod tests;

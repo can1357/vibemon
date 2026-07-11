@@ -43,6 +43,25 @@ impl ApiError {
 		&self.body.message
 	}
 
+	/// Construct an API error from a stable function-runtime error code.
+	///
+	/// The HTTP status mirrors the gRPC mapping in `api::grpc::status_from`;
+	/// callers retain the stable code in either response representation.
+	pub fn function(code: impl Into<String>, message: impl Into<String>) -> Self {
+		let code = code.into();
+		let status = match code.as_str() {
+			"not_found" => StatusCode::NOT_FOUND,
+			"invalid" | "checksum" => StatusCode::BAD_REQUEST,
+			"unauthorized" => StatusCode::UNAUTHORIZED,
+			"actor_lost" | "unavailable_secret" => StatusCode::PRECONDITION_FAILED,
+			"busy" | "conflict" => StatusCode::CONFLICT,
+			"deadline" => StatusCode::GATEWAY_TIMEOUT,
+			"unsupported" => StatusCode::NOT_IMPLEMENTED,
+			_ => StatusCode::SERVICE_UNAVAILABLE,
+		};
+		Self::new(status, code, message)
+	}
+
 	pub fn unauthorized(message: impl Into<String>) -> Self {
 		Self { authenticate: true, ..Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message) }
 	}
@@ -58,6 +77,20 @@ impl ApiError {
 
 impl From<EngineError> for ApiError {
 	fn from(value: EngineError) -> Self {
+		if value.message.starts_with("actor_lost") || value.message.contains("actor is lost") {
+			return Self::function("actor_lost", value.message);
+		}
+		if value.message.starts_with("secret_unavailable")
+			|| value.message.starts_with("unavailable_secret")
+		{
+			return Self::function("unavailable_secret", value.message);
+		}
+		if value.message.contains("checksum mismatch") || value.message.contains("digest mismatch") {
+			return Self::function("checksum", value.message);
+		}
+		if value.message.contains("deadline exceeded") {
+			return Self::function("deadline", value.message);
+		}
 		let status = match value.code {
 			ErrorCode::NotFound => StatusCode::NOT_FOUND,
 			ErrorCode::NotRunning | ErrorCode::Busy => StatusCode::CONFLICT,

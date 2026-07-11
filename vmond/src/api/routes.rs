@@ -45,6 +45,7 @@ pub fn router(state: ApiState) -> Router {
 		.with_state(state.clone());
 
 	app = app.merge(super::grpc::routes(state.clone()));
+	app = app.merge(crate::function::gateway::router(state.functions.clone()));
 
 	if let Some(mesh) = &state.mesh {
 		let mesh_state = mesh.route_state();
@@ -77,6 +78,33 @@ async fn metrics(State(state): State<ApiState>) -> Response {
 	text.push_str("# HELP vmon_api_auth_failures_total API authentication failures.\n");
 	text.push_str("# TYPE vmon_api_auth_failures_total counter\n");
 	let _ = writeln!(text, "vmon_api_auth_failures_total {}", state.auth_failure_count());
+	let function = state.functions.metrics();
+	text.push_str("# TYPE vmon_function_inputs_started_total counter\n");
+	let _ = writeln!(text, "vmon_function_inputs_started_total {}", function.inputs_started);
+	text.push_str("# TYPE vmon_function_inputs_succeeded_total counter\n");
+	let _ = writeln!(text, "vmon_function_inputs_succeeded_total {}", function.inputs_succeeded);
+	text.push_str("# TYPE vmon_function_user_failures_total counter\n");
+	let _ = writeln!(text, "vmon_function_user_failures_total {}", function.user_failures);
+	text.push_str("# TYPE vmon_function_infrastructure_failures_total counter\n");
+	let _ = writeln!(
+		text,
+		"vmon_function_infrastructure_failures_total {}",
+		function.infrastructure_failures
+	);
+	text.push_str("# TYPE vmon_function_workers_started_total counter\n");
+	let _ = writeln!(text, "vmon_function_workers_started_total {}", function.workers_started);
+	text.push_str("# TYPE vmon_function_workers_retired_total counter\n");
+	let _ = writeln!(text, "vmon_function_workers_retired_total {}", function.workers_retired);
+	text.push_str("# TYPE vmon_function_queue_milliseconds_total counter\n");
+	let _ = writeln!(text, "vmon_function_queue_milliseconds_total {}", function.queue_millis);
+	text.push_str("# TYPE vmon_function_startup_milliseconds_total counter\n");
+	let _ = writeln!(text, "vmon_function_startup_milliseconds_total {}", function.startup_millis);
+	text.push_str("# TYPE vmon_function_execution_milliseconds_total counter\n");
+	let _ = writeln!(
+		text,
+		"vmon_function_execution_milliseconds_total {}",
+		function.execution_millis
+	);
 	Response::builder()
 		.header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
 		.body(Body::from(text))

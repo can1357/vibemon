@@ -27,6 +27,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added server-native durable function runtime with persistent workers and stateful actors
+- Added durable function invocation metrics for scheduling, startup, and execution
+- Added authenticated, portable JSON-only HTTP gateway for durable function invocation
+- Added SQLite-backed store for durable function state and task management
+- Added `vmon_function_*` metrics to the `vmon doctor` and stats endpoints
 - Added `Function` and `App` primitives for remote function and application lookup in TS SDK
 - Added portable `ValueEnvelope` serialization (JSON/CBOR) with artifact storage support for TS SDK
 - Added durable server-native function calls with at-least-once execution and retry support
@@ -123,6 +128,8 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated CLI to support durable function management commands and service-level interactions
+- Refactored runner protocol handling to improve stream stability and error reporting
 - Updated SDK function definition to support zero-deploy code or remote revision lookups
 - Refactored SDK core to support asynchronous execution via `grpc.aio`
 - Migrated all SDKs (Go, Python, TypeScript) to native gRPC communication
@@ -159,6 +166,7 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Resolved race conditions in actor state recovery and checkpointing
 - Fixed durability race conditions by enforcing stable call identifiers for persistence
 - Fixed TTY-based exec session handling and stdin/stdout multiplexing consistency
 - Fixed hanging `vmon exec` commands on TTY

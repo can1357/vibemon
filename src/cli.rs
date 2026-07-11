@@ -1,14 +1,18 @@
 use std::{
 	collections::HashMap,
 	fs,
-	io::{self, IsTerminal, Read, Write},
+	io::{self, Cursor, IsTerminal, Read, Write},
 	path::{Path, PathBuf},
+	process::{Command, Stdio},
+	sync::{atomic::{AtomicBool, Ordering}, mpsc},
 	thread,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
+use prost::Message;
+use sha2::{Digest as _, Sha256};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use vmon_proto::v1 as pb;
 
@@ -51,6 +55,18 @@ struct Cli {
 enum Commands {
 	/// Boot an image as a sandbox and stream its output unless detached.
 	Run(RunArgs),
+	/// Package, register, and atomically activate a durable application.
+	Deploy(DeployArgs),
+	/// Inspect and enter durable function revisions.
+	Function {
+		#[command(subcommand)]
+		command: FunctionCommands,
+	},
+	/// Inspect durable calls and their reconnectable logs.
+	Call {
+		#[command(subcommand)]
+		command: CallCommands,
+	},
 	/// List sandboxes.
 	Ps,
 	/// Run a command inside an agent-enabled sandbox.
@@ -117,6 +133,32 @@ enum Commands {
 	},
 	/// Print a shell completion script.
 	Completion(CompletionArgs),
+}
+
+#[derive(Args)]
+struct DeployArgs {
+	/// Python application file, optionally followed by `::qualname`.
+	target: String,
+}
+
+#[derive(Subcommand)]
+enum FunctionCommands {
+	/// List immutable function revisions.
+	Ls,
+	/// Resolve a current or pinned function and open an interactive worker shell.
+	Shell { reference: String },
+}
+
+#[derive(Subcommand)]
+enum CallCommands {
+	/// Print a durable call and its result or structured error.
+	Get { id: String },
+	/// Stream call logs, reconnecting from the last committed sequence.
+	Logs {
+		id: String,
+		#[arg(short, long)]
+		follow: bool,
+	},
 }
 
 #[derive(Args)]
@@ -320,6 +362,11 @@ enum DaemonCommands {
 
 #[derive(Args, Default)]
 struct ServeArgs {
+	/// Optional Python application target to deploy before serving.
+	target:                   Option<String>,
+	/// Redeploy changed function inputs while the daemon is running.
+	#[arg(long, requires = "target")]
+	watch:                    bool,
 	#[arg(long = "config")]
 	config_path:             Option<PathBuf>,
 	#[arg(long)]
@@ -465,6 +512,9 @@ pub fn run(raw_args: Vec<String>) -> Result<i32> {
 fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i32> {
 	match command {
 		Commands::Run(args) => cmd_run(args, transport_options),
+		Commands::Deploy(args) => cmd_deploy(args, transport_options),
+		Commands::Function { command } => cmd_function(command, transport_options),
+		Commands::Call { command } => cmd_call(command, transport_options),
 		Commands::Ps => cmd_ps(transport_options),
 		Commands::Exec(args) => cmd_exec(args, transport_options),
 		Commands::Shell(args) => cmd_shell(args, transport_options),
@@ -491,7 +541,7 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Pool { command } => cmd_pool(command, transport_options),
 		Commands::Doctor(args) => Ok(cmd_doctor(args)),
 		Commands::Daemon { command } => cmd_daemon(command),
-		Commands::Serve(args) => cmd_serve(args),
+		Commands::Serve(args) => cmd_serve(args, transport_options),
 		Commands::Context { command } => cmd_context(command),
 		Commands::Mesh { command } => cmd_mesh(command, transport_options),
 		Commands::Completion(args) => Ok(cmd_completion(args)),
@@ -550,7 +600,560 @@ fn client(options: &TransportOptions, autostart: bool) -> Result<ApiClient> {
 	remote_client_from_context(context, token)
 }
 
+const INSPECTION_MAGIC: &[u8; 8] = b"VMONCLI1";
+const ARTIFACT_CHUNK_SIZE: usize = 1024 * 1024;
+
+struct InspectedFunction {
+	binding: String,
+	package: Vec<u8>,
+	spec:    pb::FunctionSpec,
+}
+
+struct InspectedTarget {
+	namespace: String,
+	app:       String,
+	functions: Vec<InspectedFunction>,
+}
+
+fn read_inspection_field(cursor: &mut Cursor<Vec<u8>>, label: &str) -> Result<Vec<u8>> {
+	let mut size = [0_u8; 4];
+	cursor
+		.read_exact(&mut size)
+		.map_err(|_| CliError::new(format!("inspection output truncated before {label}")))?;
+	let size = u32::from_be_bytes(size) as usize;
+	let mut value = vec![0; size];
+	cursor
+		.read_exact(&mut value)
+		.map_err(|_| CliError::new(format!("inspection output truncated in {label}")))?;
+	Ok(value)
+}
+
+fn inspect_target(target: &str) -> Result<InspectedTarget> {
+	let path = target.split_once("::").map_or(target, |(path, _)| path);
+	if !Path::new(path).is_file() {
+		return err(format!("target is not an existing file: {path}"));
+	}
+	let python = std::env::var_os("VMON_PYTHON").unwrap_or_else(|| "python3".into());
+	let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk/py");
+	let existing = std::env::var_os("PYTHONPATH").unwrap_or_default();
+	let mut pythonpath = sdk.into_os_string();
+	if !existing.is_empty() {
+		pythonpath.push(":");
+		pythonpath.push(existing);
+	}
+	let output = Command::new(python)
+		.args(["-m", "vmon._cli_inspect", target])
+		.env("PYTHONPATH", pythonpath)
+		.stdin(Stdio::null())
+		.output()
+		.map_err(|error| CliError::new(format!("failed to start target inspector: {error}")))?;
+	if !output.status.success() {
+		let detail = String::from_utf8_lossy(&output.stderr);
+		return err(detail.trim().to_owned());
+	}
+	let mut cursor = Cursor::new(output.stdout);
+	let mut magic = [0_u8; 8];
+	cursor
+		.read_exact(&mut magic)
+		.map_err(|_| CliError::new("target inspector returned an empty response"))?;
+	if &magic != INSPECTION_MAGIC {
+		return err("target inspector returned an unsupported response");
+	}
+	let namespace = String::from_utf8(read_inspection_field(&mut cursor, "namespace")?)
+		.map_err(|error| CliError::new(format!("inspection namespace is not UTF-8: {error}")))?;
+	let app = String::from_utf8(read_inspection_field(&mut cursor, "app name")?)
+		.map_err(|error| CliError::new(format!("inspection app name is not UTF-8: {error}")))?;
+	let mut count = [0_u8; 4];
+	cursor
+		.read_exact(&mut count)
+		.map_err(|_| CliError::new("inspection output omitted definition count"))?;
+	let mut functions = Vec::with_capacity(u32::from_be_bytes(count) as usize);
+	for _ in 0..u32::from_be_bytes(count) {
+		let binding = String::from_utf8(read_inspection_field(&mut cursor, "binding")?)
+			.map_err(|error| CliError::new(format!("inspection binding is not UTF-8: {error}")))?;
+		let package = read_inspection_field(&mut cursor, "package")?;
+		let encoded = read_inspection_field(&mut cursor, "function spec")?;
+		let spec = pb::FunctionSpec::decode(encoded.as_slice())
+			.map_err(|error| CliError::new(format!("invalid function protobuf: {error}")))?;
+		functions.push(InspectedFunction { binding, package, spec });
+	}
+	if cursor.position() != cursor.get_ref().len() as u64 {
+		return err("target inspector returned trailing data");
+	}
+	Ok(InspectedTarget { namespace, app, functions })
+}
+
+fn sha256_digest(data: &[u8]) -> pb::Digest {
+	pb::Digest {
+		algorithm: pb::DigestAlgorithm::Sha256 as i32,
+		value: Sha256::digest(data).to_vec(),
+	}
+}
+
+fn artifact_ref(data: &[u8]) -> pb::ArtifactRef {
+	pb::ArtifactRef { digest: Some(sha256_digest(data)) }
+}
+
+fn upload_artifact(grpc: &Grpc, data: &[u8]) -> Result<pb::ArtifactRef> {
+	let artifact = artifact_ref(data);
+	let mut artifacts = grpc.artifacts();
+	match grpc.block_on(artifacts.stat(artifact.clone())) {
+		Ok(_) => return Ok(artifact),
+		Err(status) if status.code() == tonic::Code::NotFound => {},
+		Err(status) => return Err(status_error(status)),
+	}
+	let header = pb::PutArtifactHeader {
+		expected_digest: Some(sha256_digest(data)),
+		expected_size_bytes: data.len() as u64,
+		media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
+			"application/vnd.vmon.python-package".to_owned(),
+		)),
+	};
+	let mut frames = Vec::with_capacity(data.len() / ARTIFACT_CHUNK_SIZE + 2);
+	frames.push(pb::PutArtifactRequest {
+		frame: Some(pb::put_artifact_request::Frame::Header(header)),
+	});
+	frames.extend(data.chunks(ARTIFACT_CHUNK_SIZE).map(|chunk| pb::PutArtifactRequest {
+		frame: Some(pb::put_artifact_request::Frame::Data(chunk.to_vec())),
+	}));
+	grpc
+		.block_on(artifacts.put(ReceiverStream::new({
+			let (tx, rx) = tokio::sync::mpsc::channel(frames.len().max(1));
+			for frame in frames {
+				tx.blocking_send(frame)
+					.expect("artifact receiver remains alive until RPC starts");
+			}
+			drop(tx);
+			rx
+		})))
+		.map_err(status_error)?;
+	Ok(artifact)
+}
+
+fn request_id(prefix: &str, bytes: &[u8]) -> String {
+	format!("{prefix}-{:x}", Sha256::digest(bytes))
+}
+
+fn activation_request(
+	app: pb::AppRef,
+	mut bindings: Vec<pb::AppFunctionBinding>,
+) -> pb::ActivateAppRequest {
+	bindings.sort_by(|left, right| left.name.cmp(&right.name));
+	let encoded = bindings
+		.iter()
+		.flat_map(|binding| binding.encode_to_vec())
+		.collect::<Vec<_>>();
+	pb::ActivateAppRequest {
+		app: Some(app),
+		functions: bindings,
+		expected_current_presence: None,
+		request_id: request_id("cli-activate", &encoded),
+	}
+}
+
+fn deploy_target_mode(
+	target: &str,
+	options: &TransportOptions,
+	autostart: bool,
+	activate_app: bool,
+) -> Result<Vec<pb::RevisionRef>> {
+	let inspected = inspect_target(target)?;
+	let grpc = client(options, autostart)?.grpc()?;
+	let mut functions = grpc.functions();
+	let mut bindings = Vec::with_capacity(inspected.functions.len());
+	for inspected_function in inspected.functions {
+		let source = upload_artifact(&grpc, &inspected_function.package)?;
+		let mut spec = inspected_function.spec;
+		spec
+			.package
+			.as_mut()
+			.ok_or_else(|| CliError::new("inspected function omitted package"))?
+			.source = Some(source);
+		let encoded = spec.encode_to_vec();
+		let revision = grpc
+			.block_on(functions.register(pb::RegisterFunctionRequest {
+				spec: Some(spec),
+				request_id: request_id("cli-register", &encoded),
+				transient_secrets: Vec::new(),
+			}))
+			.map_err(status_error)?
+			.into_inner()
+			.r#ref
+			.ok_or_else(|| CliError::new("function registration omitted revision"))?;
+		bindings.push(pb::AppFunctionBinding {
+			name: inspected_function.binding,
+			revision: Some(revision),
+		});
+	}
+	if !activate_app {
+		let revisions = bindings
+			.into_iter()
+			.filter_map(|binding| binding.revision)
+			.collect::<Vec<_>>();
+		println!("registered {} function revision(s)", revisions.len());
+		return Ok(revisions);
+	}
+	let app = pb::AppRef { namespace: inspected.namespace, name: inspected.app };
+	let activated = grpc
+		.block_on(functions.activate_app(activation_request(app, bindings)))
+		.map_err(status_error)?
+		.into_inner();
+	let revision = activated
+		.r#ref
+		.as_ref()
+		.map(|value| value.revision_id.as_str())
+		.unwrap_or("-");
+	println!("deployed {} functions  app-revision={revision}", activated.functions.len());
+	Ok(activated.functions.into_iter().filter_map(|binding| binding.revision).collect())
+}
+
+fn deploy_target(target: &str, options: &TransportOptions) -> Result<Vec<pb::RevisionRef>> {
+	deploy_target_mode(target, options, true, true)
+}
+
+fn cmd_deploy(args: DeployArgs, options: &TransportOptions) -> Result<i32> {
+	deploy_target(&args.target, options)?;
+	Ok(0)
+}
+
+fn parse_function_ref(reference: &str) -> Result<(pb::FunctionRef, Option<String>)> {
+	let (name, revision) = reference
+		.split_once('@')
+		.map_or((reference, None), |(name, revision)| (name, Some(revision.to_owned())));
+	if name.is_empty() || revision.as_deref() == Some("") {
+		return err("function reference must be NAME or NAME@REVISION");
+	}
+	let (namespace, name) =
+		name.split_once('/').map_or(("default", name), |(namespace, name)| (namespace, name));
+	if namespace.is_empty() || name.is_empty() {
+		return err("function reference must contain non-empty namespace and name");
+	}
+	Ok((
+		pb::FunctionRef { namespace: namespace.to_owned(), name: name.to_owned() },
+		revision,
+	))
+}
+
+fn app_binding_reference(reference: &str) -> Option<(&str, &str)> {
+	if reference.contains('@') || reference.contains('/') {
+		return None;
+	}
+	let (app, binding) = reference.split_once('.')?;
+	(!app.is_empty() && !binding.is_empty()).then_some((app, binding))
+}
+
+fn lookup_revision(grpc: &Grpc, reference: &str) -> Result<pb::FunctionRevision> {
+	if let Some((app, binding)) = app_binding_reference(reference) {
+		let mut functions = grpc.functions();
+		let app_revision = grpc
+			.block_on(functions.get_app(pb::GetAppRequest {
+				app: Some(pb::AppSelector {
+					selection: Some(pb::app_selector::Selection::Current(pb::AppRef {
+						namespace: "default".to_owned(),
+						name: app.to_owned(),
+					})),
+				}),
+			}))
+			.map_err(status_error)?
+			.into_inner();
+		let revision = app_revision
+			.functions
+			.into_iter()
+			.find(|candidate| candidate.name == binding)
+			.and_then(|candidate| candidate.revision)
+			.ok_or_else(|| CliError::new(format!("app {app:?} has no function {binding:?}")))?;
+		return grpc
+			.block_on(functions.get(pb::GetFunctionRequest {
+				function: Some(pb::FunctionSelector {
+					selection: Some(pb::function_selector::Selection::Pinned(revision)),
+				}),
+			}))
+			.map(tonic::Response::into_inner)
+			.map_err(status_error);
+	}
+	let (function, revision) = parse_function_ref(reference)?;
+	let selection = revision.map_or_else(
+		|| pb::function_selector::Selection::Current(function.clone()),
+		|revision_id| {
+			pb::function_selector::Selection::Pinned(pb::RevisionRef {
+				function: Some(function.clone()),
+				revision_id,
+			})
+		},
+	);
+	let mut functions = grpc.functions();
+	match grpc.block_on(functions.get(pb::GetFunctionRequest {
+		function: Some(pb::FunctionSelector { selection: Some(selection) }),
+	})) {
+		Ok(response) => Ok(response.into_inner()),
+		Err(status) if status.code() == tonic::Code::NotFound && !reference.contains('@') => {
+			let mut page_token = String::new();
+			loop {
+				let response = grpc
+					.block_on(functions.list(pb::ListFunctionsRequest {
+						namespace_presence: None,
+						function_presence: None,
+						page_size: 200,
+						page_token,
+					}))
+					.map_err(status_error)?
+					.into_inner();
+				if let Some(revision) = response.revisions.into_iter().find(|revision| {
+					revision.r#ref.as_ref().is_some_and(|value| value.revision_id == reference)
+				}) {
+					return Ok(revision);
+				}
+				if response.next_page_token.is_empty() {
+					return Err(status_error(status));
+				}
+				page_token = response.next_page_token;
+			}
+		},
+		Err(status) => Err(status_error(status)),
+	}
+}
+
+fn json_envelope(value: &Value) -> Result<pb::ValueEnvelope> {
+	let encoded = serde_json::to_vec(value)?;
+	Ok(pb::ValueEnvelope {
+		schema_version: 1,
+		serializer: pb::ValueSerializer::Json as i32,
+		compression: pb::ValueCompression::None as i32,
+		checksum: Some(sha256_digest(&encoded)),
+		uncompressed_size_bytes: encoded.len() as u64,
+		storage: Some(pb::value_envelope::Storage::InlineData(encoded)),
+		python_presence: None,
+		type_name_presence: Some(pb::value_envelope::TypeNamePresence::TypeName(
+			"json".to_owned(),
+		)),
+	})
+}
+
+fn verify_artifact_data(data: Vec<u8>, expected: Option<&pb::Digest>) -> Result<Vec<u8>> {
+	if let Some(expected) = expected {
+		if expected.algorithm != pb::DigestAlgorithm::Sha256 as i32 {
+			return err("artifact uses an unsupported digest algorithm");
+		}
+		if expected.value != Sha256::digest(&data).as_slice() {
+			return err("artifact digest mismatch");
+		}
+	}
+	Ok(data)
+}
+
+fn download_artifact(grpc: &Grpc, artifact: pb::ArtifactRef) -> Result<Vec<u8>> {
+	let expected = artifact.digest.clone();
+	let mut artifacts = grpc.artifacts();
+	let mut stream = grpc
+		.block_on(artifacts.get(pb::GetArtifactRequest {
+			artifact: Some(artifact),
+			range_presence: None,
+		}))
+		.map_err(status_error)?
+		.into_inner();
+	let mut data = Vec::new();
+	loop {
+		match grpc.block_on(stream.message()) {
+			Ok(Some(chunk)) => {
+				if chunk.offset != data.len() as u64 {
+					return err("artifact download had a non-contiguous offset");
+				}
+				data.extend_from_slice(&chunk.data);
+				if chunk.eof {
+					return verify_artifact_data(data, expected.as_ref());
+				}
+			},
+			Ok(None) => return verify_artifact_data(data, expected.as_ref()),
+			Err(status) => return Err(status_error(status)),
+		}
+	}
+}
+
+fn envelope_json(grpc: &Grpc, envelope: &pb::ValueEnvelope) -> Result<Value> {
+	if envelope.serializer != pb::ValueSerializer::Json as i32 {
+		return err("call result is not portable JSON");
+	}
+	let stored = match envelope.storage.as_ref() {
+		Some(pb::value_envelope::Storage::InlineData(data)) => data.clone(),
+		Some(pb::value_envelope::Storage::Artifact(artifact)) => {
+			download_artifact(grpc, artifact.clone())?
+		},
+		None => return err("call result omitted value storage"),
+	};
+	let mut data = Vec::new();
+	match pb::ValueCompression::try_from(envelope.compression) {
+		Ok(pb::ValueCompression::None) => data = stored,
+		Ok(pb::ValueCompression::Gzip) => {
+			flate2::read::GzDecoder::new(stored.as_slice()).read_to_end(&mut data)?;
+		},
+		Ok(pb::ValueCompression::Zstd) => {
+			data = zstd::stream::decode_all(stored.as_slice())
+				.map_err(|error| CliError::new(format!("invalid zstd call result: {error}")))?;
+		},
+		_ => return err("call result uses an unknown compression codec"),
+	}
+	if data.len() as u64 != envelope.uncompressed_size_bytes {
+		return err("call result size does not match its envelope");
+	}
+	if let Some(checksum) = &envelope.checksum {
+		if checksum.value != Sha256::digest(&data).as_slice() {
+			return err("call result checksum mismatch");
+		}
+	}
+	serde_json::from_slice(&data).map_err(Into::into)
+}
+
+fn terminal_status(status: i32) -> bool {
+	matches!(
+		pb::CallStatus::try_from(status),
+		Ok(pb::CallStatus::Succeeded | pb::CallStatus::Failed | pb::CallStatus::Cancelled)
+	)
+}
+
+fn print_call_error(error: &pb::CallError) {
+	eprintln!("{}: {}", error.code, error.message);
+	for frame in &error.frames {
+		eprintln!("  at {} ({}:{})", frame.function, frame.file, frame.line);
+	}
+}
+
+static CALL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn interrupt_call(_: libc::c_int) {
+	CALL_INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn install_call_interrupt() {
+	CALL_INTERRUPTED.store(false, Ordering::SeqCst);
+	// SAFETY: the handler only performs an async-signal-safe atomic store.
+	unsafe {
+		libc::signal(libc::SIGINT, interrupt_call as *const () as usize);
+	}
+}
+
+fn outcome_exit_code(outcome: &pb::call_result::Outcome) -> i32 {
+	i32::from(matches!(outcome, pb::call_result::Outcome::Error(_)))
+}
+
+fn wait_call(grpc: &Grpc, call_id: &str) -> Result<i32> {
+	let mut calls = grpc.calls();
+	loop {
+		if CALL_INTERRUPTED.load(Ordering::SeqCst) {
+			grpc
+				.block_on(calls.cancel(pb::CancelCallRequest {
+					call: Some(pb::CallRef { call_id: call_id.to_owned() }),
+					reason: "client interrupted".to_owned(),
+					request_id: request_id("cli-cancel", call_id.as_bytes()),
+				}))
+				.map_err(status_error)?;
+			return Ok(130);
+		}
+		let record = grpc
+			.block_on(calls.get(pb::CallRef { call_id: call_id.to_owned() }))
+			.map_err(status_error)?
+			.into_inner();
+		if !terminal_status(record.status) {
+			thread::sleep(Duration::from_millis(100));
+			continue;
+		}
+		if record.status == pb::CallStatus::Succeeded as i32 {
+			let result = grpc
+				.block_on(calls.get_result(pb::GetCallResultRequest {
+					call: record.r#ref,
+					index: 0,
+				}))
+				.map_err(status_error)?
+				.into_inner();
+			let outcome = result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
+			let exit_code = outcome_exit_code(&outcome);
+			match outcome {
+				pb::call_result::Outcome::Value(value) => {
+					println!("{}", serde_json::to_string_pretty(&envelope_json(grpc, &value)?)?);
+				},
+				pb::call_result::Outcome::Error(error) => print_call_error(&error),
+			}
+			return Ok(exit_code);
+		}
+		if let Some(pb::call_record::ErrorPresence::Error(error)) = record.error_presence {
+			print_call_error(&error);
+		}
+		return Ok(if record.status == pb::CallStatus::Cancelled as i32 { 130 } else { 1 });
+	}
+}
+
+fn cmd_run_function(
+	target: String,
+	raw_args: Vec<String>,
+	options: &TransportOptions,
+) -> Result<i32> {
+	let values = raw_args
+		.into_iter()
+		.map(|value| {
+			serde_json::from_str(&value)
+				.map_err(|error| CliError::new(format!("invalid JSON argument {value:?}: {error}")))
+		})
+		.collect::<Result<Vec<Value>>>()?;
+	let revisions = deploy_target_mode(&target, options, true, false)?;
+	let revision = revisions
+		.into_iter()
+		.next()
+		.ok_or_else(|| CliError::new("target inspection returned no function"))?;
+	let grpc = client(options, true)?.grpc()?;
+	let input = json_envelope(&json!({"args": values, "kwargs": {}}))?;
+	let mut calls = grpc.calls();
+	install_call_interrupt();
+	let call = grpc
+		.block_on(calls.create(pb::CreateCallRequest {
+			r#type: pb::CallType::Unary as i32,
+			target: Some(pb::CallTarget {
+				function: Some(revision),
+				actor_presence: None,
+				actor_method_presence: None,
+			}),
+			inputs: vec![pb::CallInput {
+				index: 0,
+				value: Some(input),
+				input_id: String::new(),
+			}],
+			inputs_closed: true,
+			graph: Some(pb::CallGraph::default()),
+			request_id: request_id(
+				"cli-call",
+				format!(
+					"{target}:{}",
+					SystemTime::now()
+						.duration_since(UNIX_EPOCH)
+						.map_err(|error| CliError::new(error.to_string()))?
+						.as_nanos()
+				)
+				.as_bytes(),
+			),
+			labels: HashMap::new(),
+			client_cancellation: pb::ClientCancellationPolicy::Detach as i32,
+			result_ttl_millis_presence: None,
+			client_session_id_presence: None,
+		}))
+		.map_err(status_error)?
+		.into_inner();
+	let call_id = call
+		.r#ref
+		.ok_or_else(|| CliError::new("call creation omitted ID"))?
+		.call_id;
+	wait_call(&grpc, &call_id)
+}
+
 fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
+	if let Some(target) = args.image.as_ref().filter(|target| target.contains("::")) {
+		if args.dockerfile.is_some()
+			|| args.name.is_some()
+			|| args.detach
+			|| args.block_network
+			|| args.arch.is_some()
+		{
+			return err("sandbox options cannot be used with a durable function target");
+		}
+		return cmd_run_function(target.clone(), strip_dashdash(args.cmd), options);
+	}
 	if args.image.is_none() && args.dockerfile.is_none() {
 		return err("provide an image (for example: vmon run alpine)");
 	}
@@ -734,6 +1337,221 @@ fn cmd_logs(args: LogsArgs, options: &TransportOptions) -> Result<i32> {
 		}
 	}
 }
+fn function_shell(grpc: &Grpc, reference: &str, options: &TransportOptions) -> Result<i32> {
+	let revision = lookup_revision(grpc, reference)?;
+	let spec = revision
+		.spec
+		.as_ref()
+		.ok_or_else(|| CliError::new("function revision omitted its specification"))?;
+	let image = spec
+		.image
+		.as_ref()
+		.and_then(|image| image.source.as_ref())
+		.map(|source| match source {
+			pb::image_spec::Source::Registry(registry) => registry.reference.clone(),
+			pb::image_spec::Source::Python(python) => {
+				format!("python:{}-{}", python.python_version, python.variant)
+			},
+			pb::image_spec::Source::Template(template) => template.name.clone(),
+			pb::image_spec::Source::Dockerfile(_) => String::new(),
+		})
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| CliError::new("function revision has no shell-capable image"))?;
+	let source = spec
+		.package
+		.as_ref()
+		.and_then(|package| package.source.clone())
+		.ok_or_else(|| CliError::new("function revision omitted its source artifact"))?;
+	let package = download_artifact(grpc, source)?;
+	let mut sandboxes = grpc.sandboxes();
+	let view = json_view(
+		grpc
+			.block_on(sandboxes.create(pb::CreateSandboxRequest {
+				spec_json: json!({
+					"image": image,
+					"memory": 512,
+					"cpus": 1,
+					"disk_mb": 1024,
+					"timeout": 300.0,
+				})
+				.to_string(),
+			}))
+			.map_err(status_error)?
+			.into_inner(),
+	)?;
+	let sandbox = view_name(&view)?.to_owned();
+	if let Err(status) = grpc.block_on(sandboxes.file_write(pb::FileWriteRequest {
+		id: sandbox.clone(),
+		path: "/tmp/vmon-function.zip".to_owned(),
+		data: package,
+	})) {
+		let _ = grpc.block_on(sandboxes.remove(pb::SandboxRef { id: sandbox }));
+		return Err(status_error(status));
+	}
+	let result = cmd_shell(
+		ShellArgs {
+			reference: Some(sandbox.clone()),
+			command: None,
+			image: None,
+			env: vec!["PYTHONPATH=/tmp/vmon-function.zip".to_owned()],
+			mem: 512,
+			cpus: 1,
+			disk_mb: 1024,
+			timeout: 300.0,
+			pty: true,
+			no_pty: false,
+		},
+		options,
+	);
+	let _ = grpc.block_on(sandboxes.remove(pb::SandboxRef { id: sandbox }));
+	result
+}
+
+fn cmd_function(command: FunctionCommands, options: &TransportOptions) -> Result<i32> {
+	let grpc = client(options, true)?.grpc()?;
+	match command {
+		FunctionCommands::Ls => {
+			let mut functions = grpc.functions();
+			let mut page_token = String::new();
+			println!("{:<32} {:<28} STATUS", "FUNCTION", "REVISION");
+			loop {
+				let response = grpc
+					.block_on(functions.list(pb::ListFunctionsRequest {
+						namespace_presence: None,
+						function_presence: None,
+						page_size: 200,
+						page_token,
+					}))
+					.map_err(status_error)?
+					.into_inner();
+				for revision in response.revisions {
+					let Some(reference) = revision.r#ref else { continue };
+					let function = reference.function.unwrap_or_default();
+					let status = pb::FunctionRevisionStatus::try_from(revision.status)
+						.map_or("unknown", |status| status.as_str_name());
+					println!(
+						"{:<32} {:<28} {status}",
+						format!("{}/{}", function.namespace, function.name),
+						reference.revision_id
+					);
+				}
+				if response.next_page_token.is_empty() {
+					break;
+				}
+				page_token = response.next_page_token;
+			}
+			Ok(0)
+		},
+		FunctionCommands::Shell { reference } => function_shell(&grpc, &reference, options),
+	}
+}
+
+fn call_status_name(status: i32) -> &'static str {
+	pb::CallStatus::try_from(status).map_or("CALL_STATUS_UNKNOWN", |status| status.as_str_name())
+}
+
+fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
+	let grpc = client(options, true)?.grpc()?;
+	match command {
+		CallCommands::Get { id } => {
+			let mut calls = grpc.calls();
+			let record = grpc
+				.block_on(calls.get(pb::CallRef { call_id: id }))
+				.map_err(status_error)?
+				.into_inner();
+			let call_id =
+				record.r#ref.as_ref().map(|value| value.call_id.as_str()).unwrap_or("-");
+			println!(
+				"{}",
+				serde_json::to_string_pretty(&json!({
+					"call_id": call_id,
+					"status": call_status_name(record.status),
+					"input_count": record.input_count,
+					"result_count": record.result_count,
+					"created_at_unix_millis": record.created_at_unix_millis,
+					"updated_at_unix_millis": record.updated_at_unix_millis,
+				}))?
+			);
+			if record.status == pb::CallStatus::Succeeded as i32 && record.result_count > 0 {
+				let result = grpc
+					.block_on(calls.get_result(pb::GetCallResultRequest {
+						call: record.r#ref,
+						index: 0,
+					}))
+					.map_err(status_error)?
+					.into_inner();
+				let outcome =
+					result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
+				let exit_code = outcome_exit_code(&outcome);
+				match outcome {
+					pb::call_result::Outcome::Value(value) => {
+						println!("{}", serde_json::to_string_pretty(&envelope_json(&grpc, &value)?)?);
+					},
+					pb::call_result::Outcome::Error(error) => print_call_error(&error),
+				}
+				Ok(exit_code)
+			} else if let Some(pb::call_record::ErrorPresence::Error(error)) =
+				record.error_presence
+			{
+				print_call_error(&error);
+				Ok(1)
+			} else {
+				Ok(0)
+			}
+		},
+		CallCommands::Logs { id, follow } => follow_call_logs(&grpc, &id, follow),
+	}
+}
+
+fn follow_call_logs(grpc: &Grpc, call_id: &str, follow: bool) -> Result<i32> {
+	let mut after_sequence = 0;
+	loop {
+		let mut calls = grpc.calls();
+		let response = grpc.block_on(calls.watch(pb::WatchCallRequest {
+			cursor: Some(pb::EventCursor {
+				call: Some(pb::CallRef { call_id: call_id.to_owned() }),
+				after_sequence,
+			}),
+			follow,
+			client_session_id_presence: None,
+		}));
+		let mut stream = match response {
+			Ok(response) => response.into_inner(),
+			Err(status) if follow && status.code() == tonic::Code::Unavailable => {
+				thread::sleep(Duration::from_millis(100));
+				continue;
+			},
+			Err(status) => return Err(status_error(status)),
+		};
+		loop {
+			match grpc.block_on(stream.message()) {
+				Ok(Some(event)) => {
+					if !accept_event_sequence(&mut after_sequence, event.sequence) {
+						continue;
+					}
+					match event.payload {
+						Some(pb::call_event::Payload::Log(log)) => {
+							io::stdout().write_all(&log.data)?;
+							io::stdout().flush()?;
+						},
+						Some(pb::call_event::Payload::Status(status))
+							if terminal_status(status.status) =>
+						{
+							return Ok(0);
+						},
+						_ => {},
+					}
+				},
+				Ok(None) if follow => break,
+				Ok(None) => return Ok(0),
+				Err(status) if follow && status.code() == tonic::Code::Unavailable => break,
+				Err(status) => return Err(status_error(status)),
+			}
+		}
+		thread::sleep(Duration::from_millis(100));
+	}
+}
+
 
 enum LifecycleVerb {
 	Stop,
@@ -1095,9 +1913,67 @@ fn daemon_stop() -> Result<i32> {
 	Ok(0)
 }
 
-fn cmd_serve(args: ServeArgs) -> Result<i32> {
-	vmond::api::serve(args.overrides())?;
-	Ok(0)
+fn target_fingerprint(target: &str) -> Result<Vec<(String, Vec<u8>)>> {
+	let inspected = inspect_target(target)?;
+	let mut values = inspected
+		.functions
+		.into_iter()
+		.map(|function| {
+			let mut hasher = Sha256::new();
+			hasher.update(&function.package);
+			hasher.update(function.spec.encode_to_vec());
+			(function.binding, hasher.finalize().to_vec())
+		})
+		.collect::<Vec<_>>();
+	values.sort_by(|left, right| left.0.cmp(&right.0));
+	Ok(values)
+}
+
+fn cmd_serve(mut args: ServeArgs, options: &TransportOptions) -> Result<i32> {
+	let Some(target) = args.target.take() else {
+		vmond::api::serve(args.overrides())?;
+		return Ok(0);
+	};
+	let watch = args.watch;
+	let overrides = args.overrides();
+	let (server_tx, server_rx) = mpsc::sync_channel(1);
+	thread::Builder::new()
+		.name("vmon-serve".to_owned())
+		.spawn(move || {
+			let _ = server_tx.send(vmond::api::serve(overrides));
+		})
+		.map_err(|error| CliError::new(format!("failed to start vmond: {error}")))?;
+	let deadline = Instant::now() + Duration::from_secs(10);
+	loop {
+		if client(options, false).and_then(|client| client.grpc()).is_ok() {
+			break;
+		}
+		if let Ok(result) = server_rx.try_recv() {
+			result?;
+			return err("vmon serve exited before accepting connections");
+		}
+		if Instant::now() >= deadline {
+			return err("vmon serve did not become ready");
+		}
+		thread::sleep(Duration::from_millis(100));
+	}
+	let mut fingerprint = target_fingerprint(&target)?;
+	deploy_target_mode(&target, options, false, true)?;
+	loop {
+		if let Ok(result) = server_rx.try_recv() {
+			result?;
+			return err("vmon serve exited unexpectedly");
+		}
+		thread::sleep(Duration::from_millis(500));
+		if !watch {
+			continue;
+		}
+		let current = target_fingerprint(&target)?;
+		if !changed_function_bindings(&fingerprint, &current).is_empty() {
+			deploy_target_mode(&target, options, false, true)?;
+			fingerprint = current;
+		}
+	}
 }
 
 fn cmd_context(command: ContextCommands) -> Result<i32> {
@@ -1547,6 +2423,35 @@ fn print_json(value: &Value) -> Result<i32> {
 	Ok(0)
 }
 
+fn changed_function_bindings(
+	previous: &[(String, Vec<u8>)],
+	current: &[(String, Vec<u8>)],
+) -> Vec<String> {
+	let previous_map = previous.iter().cloned().collect::<HashMap<_, _>>();
+	let current_map = current.iter().cloned().collect::<HashMap<_, _>>();
+	let mut changed = current
+		.iter()
+		.filter(|(name, digest)| previous_map.get(name) != Some(digest))
+		.map(|(name, _)| name.clone())
+		.collect::<Vec<_>>();
+	changed.extend(
+		previous
+			.iter()
+			.filter(|(name, _)| !current_map.contains_key(name))
+			.map(|(name, _)| name.clone()),
+	);
+	changed.sort();
+	changed
+}
+
+fn accept_event_sequence(after_sequence: &mut u64, sequence: u64) -> bool {
+	if sequence <= *after_sequence {
+		return false;
+	}
+	*after_sequence = sequence;
+	true
+}
+
 fn print_checks(checks: Vec<vmond::doctor::Check>) -> i32 {
 	let mut failed = false;
 	println!("{:<8} {:<24} DETAIL", "STATUS", "CHECK");
@@ -1585,4 +2490,168 @@ fn read_pid() -> Option<String> {
 	fs::read_to_string(home.vmond_pid())
 		.ok()
 		.map(|text| text.trim().to_owned())
+}
+
+#[cfg(test)]
+mod durable_cli_tests {
+	use super::*;
+
+	#[test]
+	fn legacy_run_and_serve_shapes_are_unchanged() {
+		let run = Cli::try_parse_from(["vmon", "run", "alpine", "--", "echo", "ok"]).unwrap();
+		let Commands::Run(run) = run.command else { panic!("expected run") };
+		assert_eq!(run.image.as_deref(), Some("alpine"));
+		assert_eq!(run.cmd, ["echo", "ok"]);
+
+		let serve = Cli::try_parse_from(["vmon", "serve", "--port", "9000"]).unwrap();
+		let Commands::Serve(serve) = serve.command else { panic!("expected serve") };
+		assert_eq!(serve.port, Some(9000));
+		assert!(serve.target.is_none());
+		assert!(!serve.watch);
+	}
+
+	#[test]
+	fn durable_command_shapes_parse() {
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "deploy", "app.py"]).unwrap().command,
+			Commands::Deploy(DeployArgs { target }) if target == "app.py"
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "function", "ls"]).unwrap().command,
+			Commands::Function { command: FunctionCommands::Ls }
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "function", "shell", "demo/embed@r1"])
+				.unwrap()
+				.command,
+			Commands::Function {
+				command: FunctionCommands::Shell { reference }
+			} if reference == "demo/embed@r1"
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "call", "get", "call-1"]).unwrap().command,
+			Commands::Call { command: CallCommands::Get { id } } if id == "call-1"
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "call", "logs", "call-1", "--follow"])
+				.unwrap()
+				.command,
+			Commands::Call {
+				command: CallCommands::Logs { id, follow: true }
+			} if id == "call-1"
+		));
+		let serve = Cli::try_parse_from(["vmon", "serve", "app.py", "--watch"]).unwrap();
+		assert!(matches!(
+			serve.command,
+			Commands::Serve(ServeArgs { target: Some(target), watch: true, .. })
+				if target == "app.py"
+		));
+		let run = Cli::try_parse_from(["vmon", "run", "app.py::embed", "1", "{\"x\":2}"])
+			.unwrap();
+		assert!(matches!(
+			run.command,
+			Commands::Run(RunArgs { image: Some(target), cmd, .. })
+				if target == "app.py::embed" && cmd == ["1", "{\"x\":2}"]
+		));
+	}
+
+	#[test]
+	fn invalid_json_is_rejected_before_target_or_rpc_work() {
+		let error = cmd_run_function("missing.py::embed".to_owned(), vec!["{".to_owned()], &TransportOptions::default())
+			.unwrap_err();
+		assert!(error.to_string().contains("invalid JSON argument"));
+	}
+
+	#[test]
+	fn invalid_target_is_rejected_before_rpc_work() {
+		let error =
+			inspect_target("definitely-missing.py::embed").err().expect("target must fail");
+		assert!(error.to_string().contains("not an existing file"));
+	}
+
+	#[test]
+	fn run_result_and_error_outcomes_have_distinct_exit_codes() {
+		let value = pb::call_result::Outcome::Value(pb::ValueEnvelope::default());
+		let error = pb::call_result::Outcome::Error(pb::CallError::default());
+		assert_eq!(outcome_exit_code(&value), 0);
+		assert_eq!(outcome_exit_code(&error), 1);
+	}
+
+	#[test]
+	fn current_and_pinned_references_are_distinct() {
+		let (current, revision) = parse_function_ref("team/embed").unwrap();
+		assert_eq!((current.namespace.as_str(), current.name.as_str()), ("team", "embed"));
+		assert!(revision.is_none());
+		let (pinned, revision) = parse_function_ref("team/embed@rev-7").unwrap();
+		assert_eq!(pinned, current);
+		assert_eq!(revision.as_deref(), Some("rev-7"));
+		assert_eq!(app_binding_reference("demo.embed"), Some(("demo", "embed")));
+		assert_eq!(app_binding_reference("team/embed@rev-7"), None);
+	}
+
+	#[test]
+	fn log_cursor_rejects_replayed_sequences_after_reconnect() {
+		let mut cursor = 0;
+		assert!(accept_event_sequence(&mut cursor, 1));
+		assert!(accept_event_sequence(&mut cursor, 4));
+		assert!(!accept_event_sequence(&mut cursor, 4));
+		assert!(!accept_event_sequence(&mut cursor, 2));
+		assert!(accept_event_sequence(&mut cursor, 5));
+	}
+
+	#[test]
+	fn watch_invalidates_only_changed_function_inputs() {
+		let before = vec![
+			("a".to_owned(), vec![1]),
+			("b".to_owned(), vec![2]),
+		];
+		let after = vec![
+			("a".to_owned(), vec![1]),
+			("b".to_owned(), vec![3]),
+		];
+		assert_eq!(changed_function_bindings(&before, &after), ["b"]);
+		assert_eq!(changed_function_bindings(&before, &after[..1]), ["b"]);
+	}
+
+	#[test]
+	fn registration_and_activation_ids_are_deterministic_and_secret_free() {
+		let spec = pb::FunctionSpec {
+			function: Some(pb::FunctionRef {
+				namespace: "default".to_owned(),
+				name: "embed".to_owned(),
+			}),
+			..Default::default()
+		};
+		let encoded = spec.encode_to_vec();
+		assert_eq!(request_id("cli-register", &encoded), request_id("cli-register", &encoded));
+		let request = pb::RegisterFunctionRequest {
+			spec: Some(spec),
+			request_id: request_id("cli-register", &encoded),
+			transient_secrets: Vec::new(),
+		};
+		assert!(request.transient_secrets.is_empty());
+		assert!(!String::from_utf8_lossy(&request.encode_to_vec()).contains("secret-value"));
+
+		let revision = |name: &str, id: &str| pb::AppFunctionBinding {
+			name: name.to_owned(),
+			revision: Some(pb::RevisionRef {
+				function: Some(pb::FunctionRef {
+					namespace: "default".to_owned(),
+					name: name.to_owned(),
+				}),
+				revision_id: id.to_owned(),
+			}),
+		};
+		let activation = activation_request(
+			pb::AppRef { namespace: "default".to_owned(), name: "demo".to_owned() },
+			vec![revision("zeta", "r2"), revision("alpha", "r1")],
+		);
+		assert_eq!(
+			activation.functions.iter().map(|binding| binding.name.as_str()).collect::<Vec<_>>(),
+			["alpha", "zeta"]
+		);
+		assert!(activation.functions.iter().all(|binding| binding.revision.is_some()));
+		assert!(activation.expected_current_presence.is_none());
+		assert!(!String::from_utf8_lossy(&activation.encode_to_vec()).contains("secret-value"));
+	}
 }

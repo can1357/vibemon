@@ -39,7 +39,9 @@ mod tests {
 
 	use axum::http::StatusCode;
 	use serde_json::{Value, json};
+	use sha2::{Digest as _, Sha256};
 	use tokio::{io::AsyncWriteExt as _, net::TcpStream};
+	use tokio_stream::StreamExt as _;
 	use tonic::{
 		Code, Request,
 		metadata::MetadataValue,
@@ -52,6 +54,8 @@ mod tests {
 		EngineError, ErrorCode, Result,
 		config::ServeConfig,
 		engine::{EngineApi, ExecCapture, ExecRequest, ExecStream, ShellSession},
+		function::FunctionDomain,
+		home::Home,
 		models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
 	};
 
@@ -317,6 +321,7 @@ mod tests {
 		base_url: String,
 		client:   reqwest::Client,
 		handle:   tokio::task::JoinHandle<()>,
+		_temp:     tempfile::TempDir,
 	}
 
 	impl ApiHarness {
@@ -324,7 +329,11 @@ mod tests {
 			let mut config = ServeConfig::default();
 			config.token = Some("admin-token".to_owned());
 			config.client_token = Some("client-token".to_owned());
-			let state = ApiState::new(engine, config, Transport::Tcp);
+			let temp = tempfile::tempdir().expect("function domain tempdir");
+			let engine_api: Arc<dyn EngineApi> = engine.clone();
+			let functions =
+				FunctionDomain::open(Home::new(temp.path()), engine_api).expect("open function domain");
+			let state = ApiState::new(engine, functions.clone(), config, Transport::Tcp);
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
 				.await
 				.expect("bind test api listener");
@@ -333,7 +342,12 @@ mod tests {
 			let handle = tokio::spawn(async move {
 				axum::serve(listener, router).await.expect("serve test api");
 			});
-			Self { base_url: format!("http://{addr}"), client: reqwest::Client::new(), handle }
+			Self {
+				base_url: format!("http://{addr}"),
+				client: reqwest::Client::new(),
+				handle,
+				_temp: temp,
+			}
 		}
 
 		fn url(&self, path: &str) -> String {
@@ -366,6 +380,41 @@ mod tests {
 			.get("vmon-code")
 			.and_then(|value| value.to_str().ok())
 			.map(str::to_owned)
+	}
+
+	fn test_function_spec(name: &str) -> pb::FunctionSpec {
+		pb::FunctionSpec {
+			function: Some(pb::FunctionRef {
+				namespace: "tests".to_owned(),
+				name: name.to_owned(),
+			}),
+			package: Some(pb::PackageSpec::default()),
+			image: Some(pb::ImageSpec::default()),
+			resources: Some(pb::ResourceSpec::default()),
+			retry: Some(pb::RetryPolicy { max_attempts: 1, ..Default::default() }),
+			timeouts: Some(pb::TimeoutSpec::default()),
+			workers: Some(pb::WorkerSpec::default()),
+			concurrency: Some(pb::ConcurrencySpec::default()),
+			batching: Some(pb::BatchingSpec::default()),
+			serializer: Some(pb::SerializerSpec::default()),
+			..Default::default()
+		}
+	}
+
+	fn test_json_value(value: Value) -> pb::ValueEnvelope {
+		let bytes = serde_json::to_vec(&value).expect("test json");
+		pb::ValueEnvelope {
+			schema_version: 1,
+			serializer: pb::ValueSerializer::Json as i32,
+			compression: pb::ValueCompression::None as i32,
+			checksum: Some(pb::Digest {
+				algorithm: pb::DigestAlgorithm::Sha256 as i32,
+				value: Sha256::digest(&bytes).to_vec(),
+			}),
+			uncompressed_size_bytes: bytes.len() as u64,
+			storage: Some(pb::value_envelope::Storage::InlineData(bytes)),
+			..Default::default()
+		}
 	}
 
 	#[tokio::test]
@@ -666,5 +715,598 @@ mod tests {
 			other => panic!("unexpected bridge frame: {other:?}"),
 		}
 		assert!(engine.captures().pool_sets.is_empty());
+	}
+
+
+	#[tokio::test]
+	async fn function_app_schedule_and_call_rpcs_round_trip() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut functions = pb::function_service_client::FunctionServiceClient::new(api.channel());
+
+		let revision = functions
+			.register(authed(
+				pb::RegisterFunctionRequest {
+					spec: Some(test_function_spec("echo")),
+					request_id: "register-echo".to_owned(),
+					transient_secrets: Vec::new(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("register function")
+			.into_inner();
+		let revision_ref = revision.r#ref.clone().expect("revision ref");
+		functions
+			.activate(authed(
+				pb::ActivateFunctionRequest {
+					revision: Some(revision_ref.clone()),
+					expected_current_presence: None,
+				},
+				"admin-token",
+			))
+			.await
+			.expect("activate function");
+		let current = functions
+			.get(authed(
+				pb::GetFunctionRequest {
+					function: Some(pb::FunctionSelector {
+						selection: Some(pb::function_selector::Selection::Current(
+							revision_ref.function.clone().expect("function ref"),
+						)),
+					}),
+				},
+				"client-token",
+			))
+			.await
+			.expect("get active function")
+			.into_inner();
+		assert_eq!(current.r#ref, Some(revision_ref.clone()));
+		let listed = functions
+			.list(authed(pb::ListFunctionsRequest::default(), "client-token"))
+			.await
+			.expect("list functions")
+			.into_inner();
+		assert_eq!(listed.revisions.len(), 1);
+
+		let inactive = functions
+			.register(authed(
+				pb::RegisterFunctionRequest {
+					spec: Some(test_function_spec("delete-me")),
+					request_id: "register-delete".to_owned(),
+					transient_secrets: Vec::new(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("register inactive function")
+			.into_inner()
+			.r#ref
+			.expect("inactive revision ref");
+		functions
+			.delete(authed(
+				pb::DeleteFunctionRequest { revision: Some(inactive) },
+				"admin-token",
+			))
+			.await
+			.expect("delete inactive revision");
+
+		let app = pb::AppRef { namespace: "tests".to_owned(), name: "app".to_owned() };
+		let binding =
+			pb::AppFunctionBinding { name: "echo".to_owned(), revision: Some(revision_ref.clone()) };
+		let first_app = functions
+			.activate_app(authed(
+				pb::ActivateAppRequest {
+					app: Some(app.clone()),
+					functions: vec![binding.clone()],
+					expected_current_presence: None,
+					request_id: "app-1".to_owned(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("activate app")
+			.into_inner();
+		let second_app = functions
+			.activate_app(authed(
+				pb::ActivateAppRequest {
+					app: Some(app.clone()),
+					functions: vec![binding],
+					expected_current_presence: None,
+					request_id: "app-2".to_owned(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("second app activation")
+			.into_inner();
+		assert_ne!(first_app.r#ref, second_app.r#ref);
+		let current_app = functions
+			.get_app(authed(
+				pb::GetAppRequest {
+					app: Some(pb::AppSelector {
+						selection: Some(pb::app_selector::Selection::Current(app.clone())),
+					}),
+				},
+				"client-token",
+			))
+			.await
+			.expect("get app")
+			.into_inner();
+		assert_eq!(current_app.r#ref, second_app.r#ref);
+		functions
+			.rollback_app(authed(
+				pb::RollbackAppRequest {
+					target: first_app.r#ref.clone(),
+					expected_current_presence: None,
+					request_id: "rollback".to_owned(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("rollback app");
+
+		let schedule = functions
+			.create_schedule(authed(
+				pb::CreateScheduleRequest {
+					schedule_id_presence: Some(
+						pb::create_schedule_request::ScheduleIdPresence::ScheduleId(
+							"periodic".to_owned(),
+						),
+					),
+					spec: Some(pb::ScheduleSpec {
+						name: "periodic".to_owned(),
+						app: first_app.r#ref.clone(),
+						target: Some(pb::ScheduleTarget {
+							function: Some(revision_ref.clone()),
+							input: Some(test_json_value(json!({"scheduled": true}))),
+						}),
+						timing: Some(pb::schedule_spec::Timing::Period(pb::PeriodSchedule {
+							period_millis: 60_000,
+							anchor_unix_millis: 1,
+						})),
+						status: pb::ScheduleStatus::Active as i32,
+						labels: Default::default(),
+					}),
+					request_id: "schedule".to_owned(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("create schedule")
+			.into_inner();
+		let schedule_ref = schedule.r#ref.expect("schedule ref");
+		functions
+			.get_schedule(authed(schedule_ref.clone(), "client-token"))
+			.await
+			.expect("get schedule");
+		assert_eq!(
+			functions
+				.list_schedules(authed(pb::ListSchedulesRequest::default(), "client-token"))
+				.await
+				.expect("list schedules")
+				.into_inner()
+				.schedules
+				.len(),
+			1
+		);
+		functions
+			.delete_schedule(authed(schedule_ref, "admin-token"))
+			.await
+			.expect("delete schedule");
+
+		let mut calls = pb::call_service_client::CallServiceClient::new(api.channel());
+		let call = calls
+			.create(authed(
+				pb::CreateCallRequest {
+					r#type: pb::CallType::Batch as i32,
+					target: Some(pb::CallTarget {
+						function: Some(revision_ref),
+						actor_presence: None,
+						actor_method_presence: None,
+					}),
+					inputs_closed: false,
+					request_id: "open-call".to_owned(),
+					client_cancellation: pb::ClientCancellationPolicy::Detach as i32,
+					..Default::default()
+				},
+				"client-token",
+			))
+			.await
+			.expect("create call")
+			.into_inner();
+		let call_ref = call.r#ref.expect("call ref");
+		let malformed = pb::StreamCallInputsRequest {
+			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
+				index: 0,
+				value: Some(test_json_value(json!(1))),
+				..Default::default()
+			})),
+		};
+		let status = calls
+			.stream_inputs(authed(tokio_stream::iter([malformed]), "client-token"))
+			.await
+			.expect_err("input before call opener rejected");
+		assert_eq!(status.code(), Code::InvalidArgument);
+		let opener = pb::StreamCallInputsRequest {
+			frame: Some(pb::stream_call_inputs_request::Frame::Call(call_ref.clone())),
+		};
+		let input = pb::StreamCallInputsRequest {
+			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
+				index: 0,
+				value: Some(test_json_value(json!(1))),
+				..Default::default()
+			})),
+		};
+		let committed = calls
+			.stream_inputs(authed(tokio_stream::iter([opener, input]), "client-token"))
+			.await
+			.expect("stream input")
+			.into_inner();
+		assert_eq!(committed.committed_input_count, 1);
+		calls
+			.close_inputs(authed(
+				pb::CloseCallInputsRequest {
+					call: Some(call_ref.clone()),
+					expected_input_count: 1,
+				},
+				"client-token",
+			))
+			.await
+			.expect("close call inputs");
+		assert_eq!(
+			calls
+				.list(authed(pb::ListCallsRequest::default(), "client-token"))
+				.await
+				.expect("list calls")
+				.into_inner()
+				.calls
+				.len(),
+			1
+		);
+		let watched: Vec<_> = calls
+			.watch(authed(
+				pb::WatchCallRequest {
+					cursor: Some(pb::EventCursor {
+						call: Some(call_ref.clone()),
+						after_sequence: 0,
+					}),
+					follow: false,
+					client_session_id_presence: None,
+				},
+				"client-token",
+			))
+			.await
+			.expect("watch replay")
+			.into_inner()
+			.collect::<Result<Vec<_>, _>>()
+			.await
+			.expect("watch events");
+		assert!(!watched.is_empty());
+		calls
+			.cancel(authed(
+				pb::CancelCallRequest {
+					call: Some(call_ref.clone()),
+					reason: "test".to_owned(),
+					request_id: "cancel".to_owned(),
+				},
+				"client-token",
+			))
+			.await
+			.expect("cancel call");
+		calls
+			.get(authed(call_ref.clone(), "client-token"))
+			.await
+			.expect("get call");
+		let missing = calls
+			.get_result(authed(
+				pb::GetCallResultRequest { call: Some(call_ref), index: 99 },
+				"client-token",
+			))
+			.await
+			.expect_err("missing result");
+		assert_eq!(missing.code(), Code::NotFound);
+
+		let response = api
+			.client
+			.post(api.url("/v1/functions/tests/echo/invoke"))
+			.header(reqwest::header::AUTHORIZATION, "Bearer client-token")
+			.header(reqwest::header::CONTENT_TYPE, "application/x-python-cloudpickle")
+			.body(vec![0_u8; 8])
+			.send()
+			.await
+			.expect("cloudpickle request");
+		assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+	}
+
+	#[tokio::test]
+	async fn watch_disconnect_honors_cancel_and_detach_policies() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut functions = pb::function_service_client::FunctionServiceClient::new(api.channel());
+		let revision = functions
+			.register(authed(
+				pb::RegisterFunctionRequest {
+					spec: Some(test_function_spec("disconnect")),
+					request_id: "register-disconnect".to_owned(),
+					transient_secrets: Vec::new(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("register disconnect function")
+			.into_inner()
+			.r#ref
+			.expect("revision ref");
+		let mut calls = pb::call_service_client::CallServiceClient::new(api.channel());
+		for (name, policy, watch_session, should_cancel) in [
+			("cancel-match", pb::ClientCancellationPolicy::Cancel, Some("creator"), true),
+			("cancel-mismatch", pb::ClientCancellationPolicy::Cancel, Some("observer"), false),
+			("cancel-empty", pb::ClientCancellationPolicy::Cancel, None, false),
+			("detach", pb::ClientCancellationPolicy::Detach, Some("creator"), false),
+		] {
+			let call = calls
+				.create(authed(
+					pb::CreateCallRequest {
+						r#type: pb::CallType::Batch as i32,
+						target: Some(pb::CallTarget {
+							function: Some(revision.clone()),
+							actor_presence: None,
+							actor_method_presence: None,
+						}),
+						inputs_closed: false,
+						request_id: format!("{name}-call"),
+						client_cancellation: policy as i32,
+						client_session_id_presence: (policy == pb::ClientCancellationPolicy::Cancel)
+							.then(|| {
+								pb::create_call_request::ClientSessionIdPresence::ClientSessionId(
+									"creator".to_owned(),
+								)
+							}),
+						..Default::default()
+					},
+					"client-token",
+				))
+				.await
+				.expect("create watched call")
+				.into_inner()
+				.r#ref
+				.expect("call ref");
+			let stream = calls
+				.watch(authed(
+					pb::WatchCallRequest {
+						cursor: Some(pb::EventCursor {
+							call: Some(call.clone()),
+							after_sequence: 0,
+						}),
+						follow: true,
+						client_session_id_presence: watch_session.map(|session| {
+							pb::watch_call_request::ClientSessionIdPresence::ClientSessionId(
+								session.to_owned(),
+							)
+						}),
+					},
+					"client-token",
+				))
+				.await
+				.expect("open follow watch")
+				.into_inner();
+			drop(stream);
+			tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+			let status = calls
+				.get(authed(call, "client-token"))
+				.await
+				.expect("get watched call")
+				.into_inner()
+				.status;
+			let status = pb::CallStatus::try_from(status).expect("valid call status");
+			if should_cancel {
+				assert!(
+					matches!(status, pb::CallStatus::Cancelling | pb::CallStatus::Cancelled),
+					"{name}: {status:?}"
+				);
+			} else {
+				assert_eq!(status, pb::CallStatus::Pending);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn actor_rpc_surface_returns_stable_missing_resource_errors() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut actors = pb::actor_service_client::ActorServiceClient::new(api.channel());
+		let missing_actor = pb::ActorRef { actor_id: "missing".to_owned() };
+		let missing_checkpoint =
+			pb::ActorCheckpointRef { checkpoint_id: "missing".to_owned() };
+		let missing_revision = pb::RevisionRef {
+			function: Some(pb::FunctionRef {
+				namespace: "tests".to_owned(),
+				name: "actor".to_owned(),
+			}),
+			revision_id: "missing".to_owned(),
+		};
+
+		let create = actors
+			.create(authed(
+				pb::CreateActorRequest {
+					function: Some(missing_revision),
+					request_id: "create-missing".to_owned(),
+					..Default::default()
+				},
+				"client-token",
+			))
+			.await
+			.expect_err("missing actor revision");
+		assert_eq!(create.code(), Code::NotFound);
+		assert_eq!(
+			actors
+				.get(authed(missing_actor.clone(), "client-token"))
+				.await
+				.expect_err("missing actor")
+				.code(),
+			Code::NotFound
+		);
+		assert_eq!(
+			actors
+				.checkpoint(authed(
+					pb::CheckpointActorRequest {
+						actor: Some(missing_actor.clone()),
+						request_id: "checkpoint".to_owned(),
+					},
+					"client-token",
+				))
+				.await
+				.expect_err("missing checkpoint actor")
+				.code(),
+			Code::NotFound
+		);
+		assert_eq!(
+			actors
+				.restore(authed(
+					pb::RestoreActorRequest {
+						actor: Some(missing_actor.clone()),
+						checkpoint: Some(missing_checkpoint.clone()),
+						request_id: "restore".to_owned(),
+					},
+					"client-token",
+				))
+				.await
+				.expect_err("missing restore actor")
+				.code(),
+			Code::NotFound
+		);
+		assert_eq!(
+			actors
+				.fork(authed(
+					pb::ForkActorRequest {
+						checkpoint: Some(missing_checkpoint),
+						request_id: "fork".to_owned(),
+						labels: Default::default(),
+					},
+					"client-token",
+				))
+				.await
+				.expect_err("missing fork checkpoint")
+				.code(),
+			Code::NotFound
+		);
+		assert_eq!(
+			actors
+				.delete(authed(missing_actor, "client-token"))
+				.await
+				.expect_err("missing actor delete")
+				.code(),
+			Code::NotFound
+		);
+	}
+	#[tokio::test]
+	async fn artifact_rpc_enforces_stream_contract_checksum_and_round_trips() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine).await;
+		let mut client = pb::artifact_service_client::ArtifactServiceClient::new(api.channel())
+			.max_decoding_message_size(64 * 1024 * 1024)
+			.max_encoding_message_size(64 * 1024 * 1024);
+
+		let malformed = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Data(b"bad".to_vec())),
+		};
+		let status = client
+			.put(authed(tokio_stream::iter([malformed]), "admin-token"))
+			.await
+			.expect_err("data before header is rejected");
+		assert_eq!(status.code(), Code::InvalidArgument);
+
+		let oversized = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest: Some(pb::Digest {
+					algorithm: pb::DigestAlgorithm::Sha256 as i32,
+					value: vec![0; 32],
+				}),
+				expected_size_bytes: 64 * 1024 * 1024 + 1,
+				media_type_presence: None,
+			})),
+		};
+		let status = client
+			.put(authed(tokio_stream::iter([oversized]), "admin-token"))
+			.await
+			.expect_err("uploads over 64 MiB are rejected");
+		assert_eq!(status.code(), Code::ResourceExhausted);
+
+		let bytes = b"durable artifact".to_vec();
+		let bad_header = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest: Some(pb::Digest {
+					algorithm: pb::DigestAlgorithm::Sha256 as i32,
+					value: vec![0; 32],
+				}),
+				expected_size_bytes: bytes.len() as u64,
+				media_type_presence: None,
+			})),
+		};
+		let data = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Data(bytes.clone())),
+		};
+		let status = client
+			.put(authed(tokio_stream::iter([bad_header, data]), "admin-token"))
+			.await
+			.expect_err("checksum mismatch is rejected");
+		assert_eq!(status.code(), Code::DataLoss);
+		assert_eq!(vmon_code(&status).as_deref(), Some("checksum"));
+
+		let digest = pb::Digest {
+			algorithm: pb::DigestAlgorithm::Sha256 as i32,
+			value: Sha256::digest(&bytes).to_vec(),
+		};
+		let header = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest: Some(digest.clone()),
+				expected_size_bytes: bytes.len() as u64,
+				media_type_presence: Some(
+					pb::put_artifact_header::MediaTypePresence::MediaType(
+						"application/octet-stream".to_owned(),
+					),
+				),
+			})),
+		};
+		let data = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Data(bytes.clone())),
+		};
+		let record = client
+			.put(authed(tokio_stream::iter([header, data]), "admin-token"))
+			.await
+			.expect("artifact upload")
+			.into_inner();
+		assert_eq!(record.size_bytes, bytes.len() as u64);
+
+		let reference = pb::ArtifactRef { digest: Some(digest) };
+		let stat = client
+			.stat(authed(reference.clone(), "client-token"))
+			.await
+			.expect("client token may stat")
+			.into_inner();
+		assert_eq!(stat.size_bytes, bytes.len() as u64);
+		assert!(matches!(
+			stat.media_type_presence,
+			Some(pb::artifact_record::MediaTypePresence::MediaType(value))
+				if value == "application/octet-stream"
+		));
+
+		let mut download = client
+			.get(authed(
+				pb::GetArtifactRequest { artifact: Some(reference), range_presence: None },
+				"client-token",
+			))
+			.await
+			.expect("artifact download")
+			.into_inner();
+		let mut downloaded = Vec::new();
+		let mut saw_eof = false;
+		while let Some(chunk) = download.message().await.expect("download frame") {
+			downloaded.extend_from_slice(&chunk.data);
+			saw_eof = chunk.eof;
+		}
+		assert_eq!(downloaded, bytes);
+		assert!(saw_eof);
 	}
 }

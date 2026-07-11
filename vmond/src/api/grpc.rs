@@ -6,7 +6,15 @@
 //! vmond error code in `vmon-code` response metadata. Requests for sandboxes
 //! owned by a mesh peer are re-issued over a tonic channel to the owner.
 
-use std::{pin::Pin, sync::Arc, thread};
+use std::{
+	pin::Pin,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	task::{Context, Poll},
+	thread,
+};
 
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
@@ -42,6 +50,41 @@ const MESH_HOP_KEY: &str = "x-vmon-mesh-hop";
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+struct CallWatchStream {
+	inner:    ReceiverStream<Result<pb::CallEvent, Status>>,
+	cancel:   Option<(Arc<crate::function::FunctionDomain>, String)>,
+	terminal: Arc<AtomicBool>,
+}
+
+impl Stream for CallWatchStream {
+	type Item = Result<pb::CallEvent, Status>;
+
+	fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		Pin::new(&mut self.inner).poll_next(context)
+	}
+}
+
+impl Drop for CallWatchStream {
+	fn drop(&mut self) {
+		if self.terminal.load(Ordering::Acquire) {
+			return;
+		}
+		let Some((domain, call_id)) = self.cancel.take() else {
+			return;
+		};
+		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+			runtime.spawn(async move {
+				if let Err(error) = domain
+					.cancel_call(&call_id, "client disconnected", "")
+					.await
+				{
+					tracing::warn!(%error, %call_id, "failed to persist disconnect cancellation");
+				}
+			});
+		}
+	}
+}
+
 /// Map an [`ApiError`] onto the contract's gRPC status table and attach the
 /// stable vmond code as `vmon-code` metadata.
 pub fn status_from(err: &ApiError) -> Status {
@@ -70,9 +113,8 @@ impl From<ApiError> for Status {
 	}
 }
 
-/// Build the tonic service set: all five services with 64 MiB message
-/// limits. Dispatched natively over h2c and in-process by the `/grpc`
-/// WebSocket bridge.
+/// Build every v1 service with uniform 64 MiB message limits. The same
+/// [`Routes`] instance shape serves native h2c and the `/grpc` bridge.
 pub(super) fn service(state: ApiState) -> Routes {
 	let api = GrpcApi::new(state);
 	Routes::default()
@@ -93,6 +135,26 @@ pub(super) fn service(state: ApiState) -> Routes {
 		)
 		.add_service(
 			pb::pool_service_server::PoolServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::artifact_service_server::ArtifactServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::function_service_server::FunctionServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::call_service_server::CallServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::actor_service_server::ActorServiceServer::new(api.clone())
 				.max_decoding_message_size(MAX_MESSAGE_SIZE)
 				.max_encoding_message_size(MAX_MESSAGE_SIZE),
 		)
@@ -263,6 +325,18 @@ impl GrpcApi {
 			.map_err(|err| status_from(&ApiError::from(err)))
 	}
 
+	async fn function_call<T, F>(&self, call: F) -> Result<T, Status>
+	where
+		T: Send + 'static,
+		F: FnOnce(Arc<crate::function::FunctionDomain>) -> crate::Result<T> + Send + 'static,
+	{
+		let domain = self.state.functions.clone();
+		tokio::task::spawn_blocking(move || call(domain))
+			.await
+			.map_err(|err| status_from(&join_error(err)))?
+			.map_err(|err| status_from(&ApiError::from(err)))
+	}
+
 	/// Resolve the mesh owner hop for a sandbox-scoped RPC. `None` means serve
 	/// locally: mesh disabled, request already a hop, sandbox present here, or
 	/// no owner known anywhere.
@@ -296,6 +370,7 @@ impl GrpcApi {
 			OwnerProxyDecision::Forward { peer_url, .. } => {
 				let endpoint = Endpoint::from_shared(peer_url).map_err(|err| {
 					status_from(&mesh_api_error(MeshError::unreachable(format!(
+
 						"invalid peer URL: {err}"
 					))))
 				})?;
@@ -306,6 +381,35 @@ impl GrpcApi {
 			},
 		}
 	}
+}
+
+fn function_now_millis() -> u64 {
+	use std::time::{SystemTime, UNIX_EPOCH};
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
+}
+
+fn artifact_digest(reference: Option<&pb::ArtifactRef>) -> Result<(Vec<u8>, String), Status> {
+	let digest = reference
+		.and_then(|reference| reference.digest.as_ref())
+		.ok_or_else(|| status_from(&ApiError::invalid("artifact digest is required")))?;
+	if digest.algorithm != pb::DigestAlgorithm::Sha256 as i32 || digest.value.len() != 32 {
+		return Err(status_from(&ApiError::invalid(
+			"artifact digest must be a 32-byte SHA-256 value",
+		)));
+	}
+	Ok((digest.value.clone(), hex::encode(&digest.value)))
+}
+
+fn terminal_call_status(status: i32) -> bool {
+	matches!(
+		pb::CallStatus::try_from(status).unwrap_or(pb::CallStatus::Unspecified),
+		pb::CallStatus::Succeeded | pb::CallStatus::Failed | pb::CallStatus::Cancelled
+	)
 }
 
 fn annotate_local_mesh_node(state: &ApiState, view: Value) -> Value {
@@ -544,6 +648,724 @@ fn pump_exec(
 		shell_cleanup(&engine, cleanup).await;
 	});
 	Box::pin(ReceiverStream::new(out_rx))
+}
+
+#[tonic::async_trait]
+impl pb::artifact_service_server::ArtifactService for GrpcApi {
+	async fn put(
+		&self,
+		request: Request<Streaming<pb::PutArtifactRequest>>,
+	) -> Result<Response<pb::ArtifactRecord>, Status> {
+		let mut stream = request.into_inner();
+		let first = stream
+			.message()
+			.await?
+			.ok_or_else(|| status_from(&ApiError::invalid("artifact upload requires a header")))?;
+		let header = match first.frame {
+			Some(pb::put_artifact_request::Frame::Header(header)) => header,
+			_ => {
+				return Err(status_from(&ApiError::invalid(
+					"artifact upload first frame must be a header",
+				)));
+			},
+		};
+		let digest = header
+			.expected_digest
+			.as_ref()
+			.ok_or_else(|| status_from(&ApiError::invalid("expected digest is required")))?;
+		if digest.algorithm != pb::DigestAlgorithm::Sha256 as i32 || digest.value.len() != 32 {
+			return Err(status_from(&ApiError::invalid(
+				"expected digest must be a 32-byte SHA-256 value",
+			)));
+		}
+		if header.expected_size_bytes > MAX_MESSAGE_SIZE as u64 {
+			return Err(Status::resource_exhausted("artifact upload exceeds the 64 MiB limit"));
+		}
+		let mut bytes = Vec::with_capacity(header.expected_size_bytes as usize);
+		while let Some(frame) = stream.message().await? {
+			let chunk = match frame.frame {
+				Some(pb::put_artifact_request::Frame::Data(data)) => data,
+				_ => {
+					return Err(status_from(&ApiError::invalid(
+						"artifact upload frames after the header must contain data",
+					)));
+				},
+			};
+			if bytes.len().saturating_add(chunk.len()) > header.expected_size_bytes as usize {
+				return Err(status_from(&ApiError::function(
+					"checksum",
+					"artifact upload exceeds its declared size",
+				)));
+			}
+			bytes.extend_from_slice(&chunk);
+		}
+		if bytes.len() != header.expected_size_bytes as usize {
+			return Err(status_from(&ApiError::function(
+				"checksum",
+				"artifact upload does not match its declared size",
+			)));
+		}
+		let expected = digest.value.clone();
+		let returned_digest = digest.clone();
+		let media_type = header.media_type_presence.map(|presence| match presence {
+			pb::put_artifact_header::MediaTypePresence::MediaType(value) => value,
+		});
+		let domain = self.state.functions.clone();
+		let created_at = function_now_millis();
+		let record = tokio::task::spawn_blocking(move || {
+			let stored =
+				domain.artifacts().put_verified(&expected, header.expected_size_bytes, &bytes)?;
+			let path = stored.path.to_str().ok_or_else(|| {
+				crate::EngineError::engine("artifact path is not valid UTF-8")
+			})?;
+			domain.store().record_artifact(
+				&stored.digest,
+				stored.size,
+				media_type.as_deref(),
+				path,
+				created_at,
+				None,
+			)?;
+			Ok::<_, crate::EngineError>(pb::ArtifactRecord {
+				r#ref: Some(pb::ArtifactRef { digest: Some(returned_digest) }),
+				size_bytes: stored.size,
+				stored_size_bytes: stored.size,
+				media_type_presence: media_type
+					.map(pb::artifact_record::MediaTypePresence::MediaType),
+				created_at_unix_millis: created_at,
+			})
+		})
+		.await
+		.map_err(|error| status_from(&join_error(error)))?
+		.map_err(|error| {
+			if error.message.contains("digest mismatch") || error.message.contains("size mismatch") {
+				status_from(&ApiError::function("checksum", error.message))
+			} else {
+				status_from(&ApiError::from(error))
+			}
+		})?;
+		Ok(Response::new(record))
+	}
+
+	type GetStream = BoxStream<pb::ArtifactChunk>;
+
+	async fn get(
+		&self,
+		request: Request<pb::GetArtifactRequest>,
+	) -> Result<Response<Self::GetStream>, Status> {
+		let request = request.into_inner();
+		let (_, digest) = artifact_digest(request.artifact.as_ref())?;
+		let artifacts = self.state.functions.artifacts().clone();
+		let mut bytes = tokio::task::spawn_blocking(move || artifacts.read(&digest, None))
+			.await
+			.map_err(|error| status_from(&join_error(error)))?
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		let mut offset = 0_u64;
+		if let Some(pb::get_artifact_request::RangePresence::Range(range)) =
+			request.range_presence
+		{
+			let start = usize::try_from(range.offset)
+				.map_err(|_| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
+			let length = usize::try_from(range.length)
+				.map_err(|_| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
+			let end = start
+				.checked_add(length)
+				.filter(|end| *end <= bytes.len())
+				.ok_or_else(|| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
+			offset = range.offset;
+			bytes = bytes[start..end].to_vec();
+		}
+		let (tx, rx) = mpsc::channel(8);
+		tokio::spawn(async move {
+			if bytes.is_empty() {
+				let _ = tx.send(Ok(pb::ArtifactChunk { offset, data: Vec::new(), eof: true })).await;
+				return;
+			}
+			let chunk_count = bytes.len().div_ceil(64 * 1024);
+			for (index, data) in bytes.chunks(64 * 1024).enumerate() {
+				let frame = pb::ArtifactChunk {
+					offset: offset + (index * 64 * 1024) as u64,
+					data: data.to_vec(),
+					eof: index + 1 == chunk_count,
+				};
+				if tx.send(Ok(frame)).await.is_err() {
+					break;
+				}
+			}
+		});
+		Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+	}
+
+	async fn stat(
+		&self,
+		request: Request<pb::ArtifactRef>,
+	) -> Result<Response<pb::ArtifactRecord>, Status> {
+		let reference = request.into_inner();
+		let (_, digest) = artifact_digest(Some(&reference))?;
+		let (size, media_type, created_at, _expires_at, _path) = self
+			.function_call(move |domain| domain.store().stat_artifact(&digest))
+			.await?;
+		Ok(Response::new(pb::ArtifactRecord {
+			r#ref: Some(reference),
+			size_bytes: size,
+			stored_size_bytes: size,
+			media_type_presence: media_type
+				.map(pb::artifact_record::MediaTypePresence::MediaType),
+			created_at_unix_millis: created_at,
+		}))
+	}
+}
+
+#[tonic::async_trait]
+impl pb::function_service_server::FunctionService for GrpcApi {
+	async fn register(
+		&self,
+		request: Request<pb::RegisterFunctionRequest>,
+	) -> Result<Response<pb::FunctionRevision>, Status> {
+		let request = request.into_inner();
+		let revision = self
+			.function_call(move |domain| {
+				let spec = request
+					.spec
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("function spec is required"))?;
+				let revision =
+					domain.store().register_function(spec, &request.request_id, function_now_millis())?;
+				for material in request.transient_secrets {
+					let secret = material.secret.ok_or_else(|| {
+						crate::EngineError::invalid("transient secret reference is required")
+					})?;
+					domain.set_secret(secret.name, material.value);
+				}
+				Ok(revision)
+			})
+			.await?;
+		Ok(Response::new(revision))
+	}
+
+	async fn get(
+		&self,
+		request: Request<pb::GetFunctionRequest>,
+	) -> Result<Response<pb::FunctionRevision>, Status> {
+		let request = request.into_inner();
+		let revision = self
+			.function_call(move |domain| match request.function.and_then(|selector| selector.selection) {
+				Some(pb::function_selector::Selection::Current(function)) => {
+					domain.store().get_active_revision(&function)
+				},
+				Some(pb::function_selector::Selection::Pinned(revision)) => {
+					domain.store().get_revision(&revision.revision_id)
+				},
+				None => Err(crate::EngineError::invalid("function selector is required")),
+			})
+			.await?;
+		Ok(Response::new(revision))
+	}
+
+	async fn list(
+		&self,
+		request: Request<pb::ListFunctionsRequest>,
+	) -> Result<Response<pb::ListFunctionsResponse>, Status> {
+		let request = request.into_inner();
+		let page = self
+			.function_call(move |domain| {
+				let namespace = request.namespace_presence.as_ref().map(|presence| match presence {
+					pb::list_functions_request::NamespacePresence::Namespace(value) => value.as_str(),
+				});
+				let mut page =
+					domain.store().list_revisions(namespace, request.page_size, &request.page_token)?;
+				if let Some(pb::list_functions_request::FunctionPresence::Function(function)) =
+					request.function_presence
+				{
+					page.items.retain(|revision| {
+						revision
+							.r#ref
+							.as_ref()
+							.and_then(|reference| reference.function.as_ref())
+							== Some(&function)
+					});
+				}
+				Ok(page)
+			})
+			.await?;
+		Ok(Response::new(pb::ListFunctionsResponse {
+			revisions: page.items,
+			next_page_token: page.next_page_token,
+		}))
+	}
+
+	async fn activate(
+		&self,
+		request: Request<pb::ActivateFunctionRequest>,
+	) -> Result<Response<pb::FunctionRecord>, Status> {
+		let request = request.into_inner();
+		let record = self
+			.function_call(move |domain| {
+				let revision = request
+					.revision
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("revision is required"))?;
+				let expected = request.expected_current_presence.as_ref().map(|presence| match presence {
+					pb::activate_function_request::ExpectedCurrentPresence::ExpectedCurrent(value) => {
+						value
+					},
+				});
+				domain.store().activate_function(revision, expected, function_now_millis())
+			})
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	async fn delete(
+		&self,
+		request: Request<pb::DeleteFunctionRequest>,
+	) -> Result<Response<pb::Ok>, Status> {
+		let request = request.into_inner();
+		self.function_call(move |domain| {
+			let revision = request
+				.revision
+				.as_ref()
+				.ok_or_else(|| crate::EngineError::invalid("revision is required"))?;
+			domain.store().delete_revision(revision)
+		})
+		.await?;
+		Ok(Response::new(pb::Ok {}))
+	}
+
+	async fn activate_app(
+		&self,
+		request: Request<pb::ActivateAppRequest>,
+	) -> Result<Response<pb::AppRevision>, Status> {
+		let request = request.into_inner();
+		let revision = self
+			.function_call(move |domain| {
+				domain.store().activate_app(&request, function_now_millis())
+			})
+			.await?;
+		Ok(Response::new(revision))
+	}
+
+	async fn get_app(
+		&self,
+		request: Request<pb::GetAppRequest>,
+	) -> Result<Response<pb::AppRevision>, Status> {
+		let request = request.into_inner();
+		let revision = self
+			.function_call(move |domain| match request.app.and_then(|selector| selector.selection) {
+				Some(pb::app_selector::Selection::Current(app)) => {
+					domain.store().get_active_app(&app)
+				},
+				Some(pb::app_selector::Selection::Pinned(revision)) => {
+					domain.store().get_app_revision(&revision.revision_id)
+				},
+				None => Err(crate::EngineError::invalid("app selector is required")),
+			})
+			.await?;
+		Ok(Response::new(revision))
+	}
+
+	async fn rollback_app(
+		&self,
+		request: Request<pb::RollbackAppRequest>,
+	) -> Result<Response<pb::AppRevision>, Status> {
+		let request = request.into_inner();
+		let revision = self
+			.function_call(move |domain| {
+				domain.store().rollback_app(&request, function_now_millis())
+			})
+			.await?;
+		Ok(Response::new(revision))
+	}
+
+	async fn create_schedule(
+		&self,
+		request: Request<pb::CreateScheduleRequest>,
+	) -> Result<Response<pb::ScheduleRecord>, Status> {
+		let request = request.into_inner();
+		let domain = self.state.functions.clone();
+		let schedule = tokio::task::spawn_blocking(move || {
+			domain.create_schedule(&request, function_now_millis())
+		})
+		.await
+		.map_err(|error| status_from(&join_error(error)))?
+		.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(schedule))
+	}
+
+	async fn get_schedule(
+		&self,
+		request: Request<pb::ScheduleRef>,
+	) -> Result<Response<pb::ScheduleRecord>, Status> {
+		let reference = request.into_inner();
+		let schedule = self
+			.function_call(move |domain| domain.store().get_schedule(&reference.schedule_id))
+			.await?;
+		Ok(Response::new(schedule))
+	}
+
+	async fn list_schedules(
+		&self,
+		request: Request<pb::ListSchedulesRequest>,
+	) -> Result<Response<pb::ListSchedulesResponse>, Status> {
+		let request = request.into_inner();
+		let page = self
+			.function_call(move |domain| domain.store().list_schedules(&request))
+			.await?;
+		Ok(Response::new(pb::ListSchedulesResponse {
+			schedules: page.items,
+			next_page_token: page.next_page_token,
+		}))
+	}
+
+	async fn delete_schedule(
+		&self,
+		request: Request<pb::ScheduleRef>,
+	) -> Result<Response<pb::Ok>, Status> {
+		let reference = request.into_inner();
+		self.function_call(move |domain| domain.store().delete_schedule(&reference.schedule_id))
+			.await?;
+		Ok(Response::new(pb::Ok {}))
+	}
+}
+
+#[tonic::async_trait]
+impl pb::call_service_server::CallService for GrpcApi {
+	async fn create(
+		&self,
+		request: Request<pb::CreateCallRequest>,
+	) -> Result<Response<pb::CallRecord>, Status> {
+		let request = request.into_inner();
+		let record = self
+			.function_call(move |domain| {
+				let record = domain.store().create_call(&request, function_now_millis())?;
+				domain.notify_work();
+				Ok(record)
+			})
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	async fn stream_inputs(
+		&self,
+		request: Request<Streaming<pb::StreamCallInputsRequest>>,
+	) -> Result<Response<pb::StreamCallInputsResponse>, Status> {
+		let mut stream = request.into_inner();
+		let first = stream
+			.message()
+			.await?
+			.ok_or_else(|| status_from(&ApiError::invalid("input stream requires a call frame")))?;
+		let call = match first.frame {
+			Some(pb::stream_call_inputs_request::Frame::Call(call)) if !call.call_id.is_empty() => {
+				call
+			},
+			_ => {
+				return Err(status_from(&ApiError::invalid(
+					"input stream first frame must be a call reference",
+				)));
+			},
+		};
+		let mut committed = self
+			.function_call({
+				let call_id = call.call_id.clone();
+				move |domain| Ok(domain.store().get_call(&call_id)?.input_count)
+			})
+			.await?;
+		while let Some(frame) = stream.message().await? {
+			let input = match frame.frame {
+				Some(pb::stream_call_inputs_request::Frame::Input(input)) => input,
+				_ => {
+					return Err(status_from(&ApiError::invalid(
+						"input frames after the opener must contain an input",
+					)));
+				},
+			};
+			let call_id = call.call_id.clone();
+			committed = self
+				.function_call(move |domain| {
+					let committed =
+						domain.store().append_input(&call_id, &input, function_now_millis())?;
+					domain.notify_work();
+					Ok(committed)
+				})
+				.await?;
+		}
+		Ok(Response::new(pb::StreamCallInputsResponse {
+			call: Some(call),
+			committed_input_count: committed,
+		}))
+	}
+
+	async fn close_inputs(
+		&self,
+		request: Request<pb::CloseCallInputsRequest>,
+	) -> Result<Response<pb::CallRecord>, Status> {
+		let request = request.into_inner();
+		let record = self
+			.function_call(move |domain| {
+				let call = request
+					.call
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("call is required"))?;
+				let record = domain.store().close_inputs(
+					&call.call_id,
+					request.expected_input_count,
+					function_now_millis(),
+				)?;
+				domain.notify_work();
+				Ok(record)
+			})
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	async fn get(
+		&self,
+		request: Request<pb::CallRef>,
+	) -> Result<Response<pb::CallRecord>, Status> {
+		let call = request.into_inner();
+		let record = self
+			.function_call(move |domain| domain.store().get_call(&call.call_id))
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	async fn list(
+		&self,
+		request: Request<pb::ListCallsRequest>,
+	) -> Result<Response<pb::ListCallsResponse>, Status> {
+		let request = request.into_inner();
+		let page = self
+			.function_call(move |domain| domain.store().list_calls(&request))
+			.await?;
+		Ok(Response::new(pb::ListCallsResponse {
+			calls: page.items,
+			next_page_token: page.next_page_token,
+		}))
+	}
+
+	async fn get_result(
+		&self,
+		request: Request<pb::GetCallResultRequest>,
+	) -> Result<Response<pb::CallResult>, Status> {
+		let request = request.into_inner();
+		let result = self
+			.function_call(move |domain| {
+				let call = request
+					.call
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("call is required"))?;
+				domain.store().get_result(&call.call_id, request.index)
+			})
+			.await?;
+		Ok(Response::new(result))
+	}
+
+	type WatchStream = BoxStream<pb::CallEvent>;
+
+	async fn watch(
+		&self,
+		request: Request<pb::WatchCallRequest>,
+	) -> Result<Response<Self::WatchStream>, Status> {
+		let request = request.into_inner();
+		let watcher_session = request.client_session_id_presence.as_ref().map(|presence| match presence {
+			pb::watch_call_request::ClientSessionIdPresence::ClientSessionId(value) => value.as_str(),
+		});
+		let cursor = request
+			.cursor
+			.ok_or_else(|| status_from(&ApiError::invalid("event cursor is required")))?;
+		let call = cursor
+			.call
+			.ok_or_else(|| status_from(&ApiError::invalid("cursor call is required")))?;
+		if call.call_id.is_empty() {
+			return Err(status_from(&ApiError::invalid("call id is required")));
+		}
+		let current = self
+			.function_call({
+				let call_id = call.call_id.clone();
+				move |domain| domain.store().get_call(&call_id)
+			})
+			.await?;
+		if !request.follow {
+			let events = self
+				.function_call({
+					let call_id = call.call_id.clone();
+					move |domain| domain.store().events_after(&call_id, cursor.after_sequence, 10_000)
+				})
+				.await?;
+			return Ok(Response::new(Box::pin(tokio_stream::iter(
+				events.into_iter().map(Ok),
+			))));
+		}
+		if terminal_call_status(current.status) {
+			let events = self
+				.function_call({
+					let call_id = call.call_id.clone();
+					move |domain| domain.store().events_after(&call_id, cursor.after_sequence, 10_000)
+				})
+				.await?;
+			return Ok(Response::new(Box::pin(tokio_stream::iter(
+				events.into_iter().map(Ok),
+			))));
+		}
+		let (cancellation, creator_session) = self
+			.function_call({
+				let call_id = call.call_id.clone();
+				move |domain| domain.store().client_cancellation(&call_id)
+			})
+			.await?;
+		let mut watch = self
+			.state
+			.functions
+			.watch_call(&call.call_id, cursor.after_sequence)
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		let (tx, rx) = mpsc::channel(32);
+		let terminal = Arc::new(AtomicBool::new(false));
+		let pump_terminal = terminal.clone();
+		tokio::spawn(async move {
+			loop {
+				match watch.recv().await {
+					Ok(event) => {
+						let is_terminal = matches!(
+							event.payload.as_ref(),
+							Some(pb::call_event::Payload::Status(status))
+								if terminal_call_status(status.status)
+						);
+						if is_terminal {
+							pump_terminal.store(true, Ordering::Release);
+						}
+						if tx.send(Ok(event)).await.is_err() || is_terminal {
+							break;
+						}
+					},
+					// A server-side watcher failure is reconnectable and must not
+					// consume the creator's cancellation capability.
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+						pump_terminal.store(true, Ordering::Release);
+						let _ = tx
+							.send(Err(Status::resource_exhausted(
+								"call watcher fell behind; reconnect from the last sequence",
+							)))
+							.await;
+						break;
+					},
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+						pump_terminal.store(true, Ordering::Release);
+						break;
+					},
+				}
+			}
+		});
+		let can_cancel = cancellation == pb::ClientCancellationPolicy::Cancel
+			&& creator_session.as_deref().is_some_and(|creator| !creator.is_empty())
+			&& watcher_session == creator_session.as_deref();
+		let cancel = can_cancel.then(|| (self.state.functions.clone(), call.call_id));
+		Ok(Response::new(Box::pin(CallWatchStream {
+			inner: ReceiverStream::new(rx),
+			cancel,
+			terminal,
+		})))
+	}
+
+	async fn cancel(
+		&self,
+		request: Request<pb::CancelCallRequest>,
+	) -> Result<Response<pb::CallRecord>, Status> {
+		let request = request.into_inner();
+		let call = request
+			.call
+			.as_ref()
+			.ok_or_else(|| status_from(&ApiError::invalid("call is required")))?;
+		let record = self
+			.state
+			.functions
+			.cancel_call(&call.call_id, &request.reason, &request.request_id)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(record))
+	}
+}
+
+#[tonic::async_trait]
+impl pb::actor_service_server::ActorService for GrpcApi {
+	async fn create(
+		&self,
+		request: Request<pb::CreateActorRequest>,
+	) -> Result<Response<pb::ActorRecord>, Status> {
+		let request = request.into_inner();
+		let actor = self
+			.state
+			.functions
+			.create_actor(&request)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(actor))
+	}
+
+	async fn get(
+		&self,
+		request: Request<pb::ActorRef>,
+	) -> Result<Response<pb::ActorRecord>, Status> {
+		let actor = request.into_inner();
+		let record = self
+			.function_call(move |domain| domain.store().get_actor(&actor.actor_id))
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	async fn checkpoint(
+		&self,
+		request: Request<pb::CheckpointActorRequest>,
+	) -> Result<Response<pb::ActorCheckpoint>, Status> {
+		let request = request.into_inner();
+		let checkpoint = self
+			.state
+			.functions
+			.checkpoint_actor(&request)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(checkpoint))
+	}
+
+	async fn restore(
+		&self,
+		request: Request<pb::RestoreActorRequest>,
+	) -> Result<Response<pb::ActorRecord>, Status> {
+		let request = request.into_inner();
+		let actor = self
+			.state
+			.functions
+			.restore_actor(&request)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(actor))
+	}
+
+	async fn fork(
+		&self,
+		request: Request<pb::ForkActorRequest>,
+	) -> Result<Response<pb::ActorRecord>, Status> {
+		let request = request.into_inner();
+		let actor = self
+			.state
+			.functions
+			.fork_actor(&request)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(actor))
+	}
+
+	async fn delete(
+		&self,
+		request: Request<pb::ActorRef>,
+	) -> Result<Response<pb::Ok>, Status> {
+		let actor = request.into_inner();
+		self.state
+			.functions
+			.delete_actor(&actor.actor_id)
+			.await
+			.map_err(|error| status_from(&ApiError::from(error)))?;
+		Ok(Response::new(pb::Ok {}))
+	}
 }
 
 #[tonic::async_trait]

@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
 
 use super::metrics::FunctionMetrics;
+use super::worker::{Interruptibility, Worker};
 
 /// Immutable worker-pool limits for one function revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +184,138 @@ impl FairQueue {
 	}
 }
 
+#[derive(Clone, Debug)]
+struct WorkerSlot {
+	id: String,
+	active: usize,
+	completed_calls: u64,
+	last_idle_ms: u64,
+	retiring: bool,
+}
+
+/// Admission and retirement accounting for one immutable revision pool.
+#[derive(Debug)]
+pub struct WorkerPool {
+	policy: PoolPolicy,
+	workers: Vec<WorkerSlot>,
+}
+
+impl WorkerPool {
+	/// Create empty pool accounting for a revision.
+	pub fn new(policy: PoolPolicy) -> Self {
+		Self { policy: policy.normalized(), workers: Vec::new() }
+	}
+
+	/// Number of tracked live workers, including workers draining for retirement.
+	pub fn worker_count(&self) -> usize {
+		self.workers.len()
+	}
+
+	/// Desired worker count for the current queued demand.
+	///
+	/// This starts workers lazily and retains configured minimum and burst
+	/// buffer capacity without exceeding the immutable maximum.
+	pub fn desired_workers(&self, queued_inputs: usize) -> usize {
+		let demand = queued_inputs.div_ceil(self.policy.max_outstanding);
+		let warm = if queued_inputs == 0 {
+			self.policy.min_workers
+		} else {
+			demand.saturating_add(self.policy.buffer_workers).max(self.policy.min_workers)
+		};
+		warm.min(self.policy.max_workers)
+	}
+
+	/// Add a worker after successful executor startup.
+	pub fn add_worker(&mut self, worker_id: String, now_ms: u64) -> bool {
+		if self.workers.len() >= self.policy.max_workers
+			|| self.workers.iter().any(|worker| worker.id == worker_id)
+		{
+			return false;
+		}
+		self.workers.push(WorkerSlot {
+			id: worker_id,
+			active: 0,
+			completed_calls: 0,
+			last_idle_ms: now_ms,
+			retiring: false,
+		});
+		true
+	}
+
+	/// Reserve capacity on the least-loaded non-retiring worker.
+	pub fn admit(&mut self) -> Option<String> {
+		let worker = self
+			.workers
+			.iter_mut()
+			.filter(|worker| !worker.retiring && worker.active < self.policy.capacity)
+			.min_by_key(|worker| (worker.active, worker.completed_calls))?;
+		worker.active += 1;
+		Some(worker.id.clone())
+	}
+
+	/// Release a reservation for which no durable lease was obtained.
+	pub fn abandon(&mut self, worker_id: &str, now_ms: u64) -> bool {
+		let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == worker_id) else {
+			return false;
+		};
+		worker.active = worker.active.saturating_sub(1);
+		if worker.active == 0 {
+			worker.last_idle_ms = now_ms;
+		}
+		true
+	}
+
+	/// Release one reservation and update call-count retirement state.
+	pub fn complete(&mut self, worker_id: &str, now_ms: u64) -> bool {
+		let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == worker_id) else {
+			return false;
+		};
+		worker.active = worker.active.saturating_sub(1);
+		worker.completed_calls = worker.completed_calls.saturating_add(1);
+		if worker.active == 0 {
+			worker.last_idle_ms = now_ms;
+			if self.policy.max_calls > 0 && worker.completed_calls >= self.policy.max_calls {
+				worker.retiring = true;
+			}
+		}
+		true
+	}
+
+	/// Mark idle or call-limited workers for retirement and return their IDs.
+	pub fn retire_ready(&mut self, now_ms: u64) -> Vec<String> {
+		let keep = self.policy.min_workers;
+		let idle_timeout_ms = self.policy.idle_timeout.as_millis().try_into().unwrap_or(u64::MAX);
+		let mut removable = self.workers.len().saturating_sub(keep);
+		let mut ids = Vec::new();
+		for worker in &mut self.workers {
+			if removable == 0 || worker.active != 0 {
+				continue;
+			}
+			let expired = now_ms.saturating_sub(worker.last_idle_ms) >= idle_timeout_ms;
+			if worker.retiring || expired {
+				worker.retiring = true;
+				ids.push(worker.id.clone());
+				removable -= 1;
+			}
+		}
+		ids
+	}
+
+	/// Forget a worker only after executor retirement or confirmed loss.
+	pub fn remove_worker(&mut self, worker_id: &str) -> bool {
+		let Some(index) = self.workers.iter().position(|worker| worker.id == worker_id) else {
+			return false;
+		};
+		self.workers.swap_remove(index);
+		true
+	}
+}
+
+/// Select cancellation semantics reported by the initialized worker definition.
+pub fn execution_interruptibility(worker: &dyn Worker) -> Interruptibility {
+	worker.interruptibility()
+}
+
 /// Compute a bounded exponential delay for a one-based retry attempt.
 pub fn retry_backoff(policy_initial_ms: u64, policy_max_ms: u64, multiplier: f64, attempt: u32) -> Duration {
 	let exponent = attempt.saturating_sub(1) as i32;
@@ -284,5 +417,105 @@ mod tests {
 		assert_eq!(retry_backoff(100, 1_000, 2.0, 1), Duration::from_millis(100));
 		assert_eq!(retry_backoff(100, 1_000, 2.0, 3), Duration::from_millis(400));
 		assert_eq!(retry_backoff(100, 1_000, 2.0, 8), Duration::from_millis(1_000));
+	}
+
+	#[test]
+	fn pool_scales_lazily_and_retires_without_leaking() {
+		let policy = PoolPolicy {
+			min_workers: 1,
+			max_workers: 3,
+			buffer_workers: 1,
+			capacity: 2,
+			max_outstanding: 2,
+			idle_timeout: Duration::from_millis(10),
+			max_calls: 2,
+			..PoolPolicy::default()
+		};
+		let mut pool = WorkerPool::new(policy);
+		assert_eq!(pool.desired_workers(0), 1);
+		assert_eq!(pool.desired_workers(1), 2);
+		assert_eq!(pool.desired_workers(5), 3);
+		assert!(pool.add_worker("w1".into(), 0));
+		assert!(pool.add_worker("w2".into(), 0));
+		assert_eq!(pool.admit().as_deref(), Some("w1"));
+		assert_eq!(pool.admit().as_deref(), Some("w2"));
+		assert_eq!(pool.admit().as_deref(), Some("w1"));
+		assert!(pool.complete("w1", 1));
+		assert!(pool.complete("w1", 2));
+		assert_eq!(pool.retire_ready(2), vec!["w1"]);
+		assert!(pool.remove_worker("w1"));
+		assert!(pool.retire_ready(20).is_empty(), "configured minimum worker must be retained");
+		assert!(pool.remove_worker("w2"));
+		assert_eq!(pool.worker_count(), 0);
+	}
+
+	struct InterruptibilityWorker(Interruptibility);
+
+	impl Worker for InterruptibilityWorker {
+		fn id(&self) -> &str {
+			"test-worker"
+		}
+
+		fn revision_id(&self) -> &str {
+			"test-revision"
+		}
+
+		fn capacity(&self) -> usize {
+			1
+		}
+
+		fn interruptibility(&self) -> Interruptibility {
+			self.0
+		}
+
+		fn execute(
+			&self,
+			_: super::super::worker::ExecuteRequest,
+		) -> super::super::worker::BoxFuture<Result<super::super::worker::Execution, super::super::worker::WorkerError>> {
+			Box::pin(async {
+				Err(super::super::worker::WorkerError::platform("unused", "unused"))
+			})
+		}
+
+		fn cancel(
+			&self,
+			_: &str,
+		) -> super::super::worker::BoxFuture<Result<(), super::super::worker::WorkerError>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn snapshot(
+			&self,
+			_: super::super::worker::SnapshotReason,
+		) -> super::super::worker::BoxFuture<Result<super::super::worker::WorkerSnapshot, super::super::worker::WorkerError>> {
+			Box::pin(async {
+				Err(super::super::worker::WorkerError::platform("unused", "unused"))
+			})
+		}
+
+		fn actor(
+			&self,
+			_: super::super::worker::ActorRequest,
+		) -> super::super::worker::BoxFuture<Result<super::super::worker::Execution, super::super::worker::WorkerError>> {
+			Box::pin(async {
+				Err(super::super::worker::WorkerError::platform("unused", "unused"))
+			})
+		}
+
+		fn retire(&self) -> super::super::worker::BoxFuture<Result<(), super::super::worker::WorkerError>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn initial_snapshot(&self) -> Option<super::super::worker::WorkerSnapshot> {
+			None
+		}
+	}
+
+	#[test]
+	fn dispatch_uses_initialized_callable_interruptibility() {
+		let asynchronous = InterruptibilityWorker(Interruptibility::Async);
+		let synchronous = InterruptibilityWorker(Interruptibility::Sync);
+		assert_eq!(execution_interruptibility(&asynchronous), Interruptibility::Async);
+		assert_eq!(execution_interruptibility(&synchronous), Interruptibility::Sync);
 	}
 }

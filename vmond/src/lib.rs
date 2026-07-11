@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod home;
+pub mod function;
 pub mod image;
 pub mod mesh;
 pub mod models;

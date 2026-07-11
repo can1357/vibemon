@@ -13,6 +13,7 @@ use crate::{
 	EngineError, Result,
 	config::{ServeConfig, resolve_serve_config},
 	engine::{Engine, EngineApi},
+	function::FunctionDomain,
 	home::{Home, OwnerLock},
 	mesh::runtime::MeshRuntime,
 };
@@ -53,9 +54,17 @@ async fn run_listeners(
 	mesh: Arc<MeshRuntime>,
 ) -> Result<()> {
 	let uds = bind_uds(&home)?;
+	let tcp_listener = if tcp_enabled(&config) {
+		let addr = format!("{}:{}", config.host, config.port);
+		Some(TcpListener::bind(&addr).await.map_err(EngineError::from)?)
+	} else {
+		None
+	};
 	let server_uid = current_uid();
 	let uds_listener = UdsPeerListener::new(uds, server_uid);
-	let base_state = ApiState::new(engine, config.clone(), Transport::Unix).with_mesh(mesh.clone());
+	let functions = FunctionDomain::open(home.clone(), engine.clone())?;
+	let base_state =
+		ApiState::new(engine, functions.clone(), config.clone(), Transport::Unix).with_mesh(mesh.clone());
 	let uds_router = routes::router(base_state.with_transport(Transport::Unix));
 	let (shutdown_tx, _) = broadcast::channel::<()>(4);
 	let signal_tx = shutdown_tx.clone();
@@ -73,9 +82,7 @@ async fn run_listeners(
 			})
 			.await
 	}));
-	if tcp_enabled(&config) {
-		let addr = format!("{}:{}", config.host, config.port);
-		let listener = TcpListener::bind(&addr).await.map_err(EngineError::from)?;
+	if let Some(listener) = tcp_listener {
 		let tcp_router = routes::router(base_state.with_transport(Transport::Tcp));
 		let mut tcp_shutdown = shutdown_tx.subscribe();
 		tasks.push(tokio::spawn(async move {
@@ -102,6 +109,7 @@ async fn run_listeners(
 			},
 		}
 	}
+	functions.shutdown().await;
 	if let Some(err) = first_error {
 		Err(err)
 	} else {

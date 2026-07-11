@@ -17,6 +17,8 @@ use tonic::{
 	transport::{Channel, Endpoint as GrpcEndpoint, Uri},
 };
 use vmon_proto::v1::{
+	actor_service_client::ActorServiceClient, artifact_service_client::ArtifactServiceClient,
+	call_service_client::CallServiceClient, function_service_client::FunctionServiceClient,
 	pool_service_client::PoolServiceClient, sandbox_service_client::SandboxServiceClient,
 	snapshot_service_client::SnapshotServiceClient, system_service_client::SystemServiceClient,
 	volume_service_client::VolumeServiceClient,
@@ -28,6 +30,14 @@ use crate::error::{CliError, Result, err};
 /// output).
 const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Authenticated typed client for immutable artifacts.
+pub type ArtifactClient = ArtifactServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+/// Authenticated typed client for durable function revisions.
+pub type FunctionClient = FunctionServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+/// Authenticated typed client for durable calls.
+pub type CallClient = CallServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+/// Authenticated typed client for durable actors.
+pub type ActorClient = ActorServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type SandboxClient = SandboxServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type SnapshotClient = SnapshotServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type VolumeClient = VolumeServiceClient<InterceptedService<Channel, AuthInterceptor>>;
@@ -76,6 +86,26 @@ impl Grpc {
 		self.handle.block_on(future)
 	}
 
+	/// Creates an artifact service client with the CLI message limits.
+	pub fn artifacts(&self) -> ArtifactClient {
+		self.client(ArtifactServiceClient::with_interceptor)
+	}
+
+	/// Creates a function service client with the CLI message limits.
+	pub fn functions(&self) -> FunctionClient {
+		self.client(FunctionServiceClient::with_interceptor)
+	}
+
+	/// Creates a call service client with the CLI message limits.
+	pub fn calls(&self) -> CallClient {
+		self.client(CallServiceClient::with_interceptor)
+	}
+
+	/// Creates an actor service client with the CLI message limits.
+	pub fn actors(&self) -> ActorClient {
+		self.client(ActorServiceClient::with_interceptor)
+	}
+
 	pub fn sandboxes(&self) -> SandboxClient {
 		self.client(SandboxServiceClient::with_interceptor)
 	}
@@ -121,7 +151,17 @@ macro_rules! impl_message_limits {
 	};
 }
 
-impl_message_limits!(SandboxClient, SnapshotClient, VolumeClient, PoolClient, SystemClient);
+impl_message_limits!(
+	SandboxClient,
+	SnapshotClient,
+	VolumeClient,
+	PoolClient,
+	SystemClient,
+	ArtifactClient,
+	FunctionClient,
+	CallClient,
+	ActorClient,
+);
 
 /// Rebuilds a `CliError` from a gRPC status: the stable vmond code travels in
 /// `vmon-code` metadata; the gRPC code is the fallback mapping.
