@@ -156,15 +156,15 @@ async fn serve_connection(
 			Err(error) => return Err(error),
 		};
 		let (response_ty, response) = if ty == proto::REQ {
-  			match serde_json::from_slice::<proto::Request>(&payload) {
-  				Ok(request) => dispatch(request, &mounts).await?,
-  				Err(error) => {
-  					error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?
-  				},
-  			}
-  		} else {
-  			error_response("bad_request", "expected S3 proxy request frame")?
-  		};
+			match serde_json::from_slice::<proto::Request>(&payload) {
+				Ok(request) => dispatch(request, &mounts).await?,
+				Err(error) => {
+					error_response("bad_request", &format!("invalid S3 proxy request: {error}"))?
+				},
+			}
+		} else {
+			error_response("bad_request", "expected S3 proxy request frame")?
+		};
 		write_frame(&mut stream, response_ty, id, &response).await?;
 	}
 }

@@ -5312,9 +5312,7 @@ mod tests {
 			app: Some(app_a.clone()),
 			functions: vec![],
 			expected_current_presence: Some(
-				activate_app_request::ExpectedCurrentPresence::ExpectedCurrent(
-					first.r#ref.unwrap(),
-				),
+				activate_app_request::ExpectedCurrentPresence::ExpectedCurrent(first.r#ref.unwrap()),
 			),
 			request_id: "redeploy-a".into(),
 		};

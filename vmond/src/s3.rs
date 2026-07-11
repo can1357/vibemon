@@ -1,9 +1,9 @@
 //! Lazy, signed S3 object access for remote virtio-fs mounts.
 //!
 //! [`S3Client`] owns all S3-specific behavior: addressing, `SigV4` signing,
-//! `ListObjectsV2` parsing, short-lived metadata caches, and bounded ranged-read
-//! caching. The VMM only exchanges the compact proxy protocol defined by its
-//! remote filesystem device.
+//! `ListObjectsV2` parsing, short-lived metadata caches, and bounded
+//! ranged-read caching. The VMM only exchanges the compact proxy protocol
+//! defined by its remote filesystem device.
 
 use std::{
 	collections::{BTreeMap, HashMap},

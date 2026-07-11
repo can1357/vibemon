@@ -766,7 +766,8 @@ fn validate_local_oci_reference(home: &Home, reference: &str) -> Result<()> {
 		.or_else(|| {
 			body
 				.match_indices(':')
-				.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok()).rfind(|path| path.is_dir())
+				.filter_map(|(index, _)| Path::new(&body[..index]).canonicalize().ok())
+				.rfind(|path| path.is_dir())
 		})
 		.ok_or_else(|| EngineError::not_found("resolved local OCI cache entry is missing"))?;
 	let owned = [home.root().join("builds"), home.images_dir()]
@@ -1069,7 +1070,10 @@ const fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static
 			return Ok("amd64");
 			#[cfg(target_arch = "aarch64")]
 			return Ok("arm64");
-			#[allow(unreachable_code, reason = "native targets return above; fallback supports future targets")]
+			#[allow(
+				unreachable_code,
+				reason = "native targets return above; fallback supports future targets"
+			)]
 			Err(EngineError::unsupported(
 				"server compile-target architecture is unsupported for function images",
 			))
@@ -1515,7 +1519,7 @@ mod tests {
 		let expected_template = format!("warm@{revision}");
 		let template = pb::ImageSpec {
 			source: Some(pb::image_spec::Source::Template(pb::TemplateImageSource {
-				name:     "warm".into(),
+				name: "warm".into(),
 				revision,
 			})),
 			..Default::default()
