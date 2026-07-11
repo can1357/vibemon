@@ -218,18 +218,25 @@ class ServerInfo:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ServerInfo:
         """Parse stable server information while retaining the full response."""
+        version = data.get("version")
+        if not isinstance(version, str) or not version:
+            raise ProtocolError("server info response did not include a version")
+        for field_name in ("platform", "arch", "backend"):
+            value = data.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise ProtocolError(f"server info {field_name} field must be a string")
         capabilities_value = data.get("capabilities")
-        capabilities = (
-            {
-                str(key): value
-                for key, value in capabilities_value.items()
-                if isinstance(key, str) and isinstance(value, bool)
-            }
-            if isinstance(capabilities_value, Mapping)
-            else {}
-        )
+        if capabilities_value is None:
+            capabilities: dict[str, bool] = {}
+        elif isinstance(capabilities_value, Mapping) and all(
+            isinstance(key, str) and isinstance(value, bool)
+            for key, value in capabilities_value.items()
+        ):
+            capabilities = dict(capabilities_value)
+        else:
+            raise ProtocolError("server info capabilities field must be a boolean object")
         return cls(
-            version=_string(data.get("version")),
+            version=version,
             platform=_string(data.get("platform")),
             arch=_string(data.get("arch")),
             backend=_string(data.get("backend")),

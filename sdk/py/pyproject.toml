@@ -32,6 +32,9 @@ dev = [
 [tool.setuptools]
 packages = ["vmon", "vmon.v1"]
 
+[tool.setuptools.package-data]
+vmon = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py314"
@@ -50,8 +53,8 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.14"
-files = ["vmon"]
-exclude = ["^e2e\\.py$", "^tests/"]
+files = ["vmon", "tests/typing_remote.py"]
+exclude = ["^e2e\\.py$"]
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true

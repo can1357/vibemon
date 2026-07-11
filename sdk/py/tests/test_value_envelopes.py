@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import pytest
 
 from vmon.values import (
+    PYTHON_ABI,
     ABIMismatchError,
     ArtifactPayload,
     CodecMismatchError,
@@ -51,6 +53,8 @@ def test_cloudpickle_is_explicit_and_decode_requires_trust():
     value = CustomValue(8)
     envelope = encode_value(value, codec="cloudpickle")
     assert envelope.codec is ValueCodec.CLOUDPICKLE
+    assert envelope.python_abi == f"cp{sys.version_info.major}{sys.version_info.minor}"
+    assert envelope.python_abi == PYTHON_ABI
     with pytest.raises(PermissionError, match="trusted=True"):
         decode_value(envelope)
     assert decode_value(envelope, trusted=True) == value
@@ -131,3 +135,36 @@ def test_json_decode_rejects_values_outside_ijson_profile(raw):
     )
     with pytest.raises(JSONProfileError):
         decode_value(envelope)
+
+
+@pytest.mark.parametrize("raw", [b'"\\ud800"', b'"\\udfff"', b'{"\\ud800":"value"}'])
+def test_json_decode_rejects_escaped_lone_surrogates(raw):
+    base = encode_value({}, codec="json", compress=False)
+    envelope = replace(
+        base,
+        inline=raw,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        uncompressed_size=len(raw),
+    )
+
+    with pytest.raises(JSONProfileError, match="surrogate code point"):
+        decode_value(envelope)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (b'"\\ud83d\\ude00"', "\N{GRINNING FACE}"),
+        ('"\N{GRINNING FACE}"'.encode(), "\N{GRINNING FACE}"),
+    ],
+)
+def test_json_decode_accepts_surrogate_pairs_and_unicode_scalars(raw, expected):
+    base = encode_value({}, codec="json", compress=False)
+    envelope = replace(
+        base,
+        inline=raw,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        uncompressed_size=len(raw),
+    )
+
+    assert decode_value(envelope) == expected

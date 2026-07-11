@@ -31,7 +31,9 @@ import { decodeValue, encodeValue } from "./function-values";
 
 /** Converts application values to and from the portable JSON/CBOR data model. */
 export interface FunctionValueAdapter<Value> {
+  /** Encode one application value into the portable wire model. */
   toPortable(value: Value): PortableValue;
+  /** Decode one portable wire value into the application model. */
   fromPortable(value: PortableValue): Value;
 }
 /** Per-call settings copied into the durable call record. */
@@ -93,6 +95,7 @@ export class FunctionExecutionError extends Error {
   readonly retryable: boolean;
   readonly frames: readonly { file: string; line: number; functionName: string }[];
   readonly details: Readonly<Record<string, string>>;
+  /** Reconstruct a nested durable-call failure. */
   constructor(failure: CallError) {
     super(
       failure.message,
@@ -184,14 +187,13 @@ class DriverArtifactStore implements ValueArtifactStore {
       output.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    if (!ref.digest || ref.digest.algorithm !== 1)
-      throw new Error("artifact reference requires a SHA-256 digest");
+    const digest = ref.digest;
+    if (digest?.algorithm !== 1) throw new Error("artifact reference requires a SHA-256 digest");
     const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", output));
-    if (actual.byteLength !== ref.digest.value.byteLength)
-      throw new Error("artifact digest mismatch");
+    if (actual.byteLength !== digest.value.byteLength) throw new Error("artifact digest mismatch");
     let difference = 0;
     for (let index = 0; index < actual.byteLength; index += 1)
-      difference |= actual[index] ^ ref.digest.value[index];
+      difference |= actual[index] ^ digest.value[index];
     if (difference !== 0) throw new Error("artifact digest mismatch");
     return output;
   }
@@ -244,6 +246,7 @@ export class FunctionCall<Result = PortableValue> {
   readonly #client: Client;
   readonly #codec: BoundValueCodec<Result>;
   #endpoint?: string;
+  /** Bind an immutable call identifier to its client and result codec. */
   constructor(client: Client, id: string, codec: BoundValueCodec<Result>, endpoint?: string) {
     if (!id) throw new TypeError("call id cannot be empty");
     this.#client = client;
@@ -451,6 +454,7 @@ export class FunctionCall<Result = PortableValue> {
       cursor = response.message.nextCursor;
     }
   }
+  /** Decode one durable result while preserving correlation metadata. */
   protected async decodeResult(result: CallResult): Promise<FunctionResult<Result>> {
     if (result.outcome.case === "error") throw new FunctionExecutionError(result.outcome.value);
     if (result.outcome.case !== "value") throw new Error("call result has no outcome");
@@ -475,20 +479,35 @@ export class BatchCall<Result = PortableValue>
   implements AsyncIterable<Result>
 {
   readonly #submitted: Promise<void>;
+  readonly #feeder: AbortController;
+  /** Bind an indexed batch call and its pending input submission. */
   constructor(
     client: Client,
     id: string,
     codec: BoundValueCodec<Result>,
     submitted: Promise<void> = Promise.resolve(),
     endpoint?: string,
+    feeder: AbortController = new AbortController(),
   ) {
     super(client, id, codec, endpoint);
     this.#submitted = submitted;
+    this.#feeder = feeder;
+    void submitted.catch(() => {});
   }
   /** Reconnect to a durable batch from another process. */
   static fromId(client: Client, id: string): BatchCall<PortableValue> {
     const store = new DriverArtifactStore(client);
     return new BatchCall(client, id, bindCodec(store, {}, portableAdapter));
+  }
+  /** Stop local input production before requesting durable server cancellation. */
+  override async cancel(reason = "cancelled by client"): Promise<CallRecord> {
+    this.#feeder.abort();
+    try {
+      await this.#submitted;
+    } catch {
+      // Feeder failures issue their own durable cancellation.
+    }
+    return super.cancel(reason);
   }
   /** Await one result by its input index. */
   override async result(index: number): Promise<Result> {
@@ -502,6 +521,7 @@ export class BatchCall<Result = PortableValue>
   }
   /** Stream results in input order without accumulating an unbounded output list. */
   async *[Symbol.asyncIterator](): AsyncGenerator<Result> {
+    const maximumPending = 32;
     let nextIndex = 0n;
     const pending = new Map<bigint, FunctionResult<Result>>();
     for await (const event of this.events()) {
@@ -516,11 +536,20 @@ export class BatchCall<Result = PortableValue>
           nextIndex += 1n;
           yield ready.value;
         }
+        if (pending.size >= maximumPending) {
+          yield await super.result(Number(nextIndex));
+          pending.delete(nextIndex);
+          nextIndex += 1n;
+        }
       }
       if (event.payload.case === "status" && terminal(event.payload.value.status)) break;
     }
     await this.#submitted;
     const record = await this.status();
+    if (record.errorPresence.case === "error")
+      throw new FunctionExecutionError(record.errorPresence.value);
+    if (record.status === CallStatus.CANCELLED)
+      throw new FunctionExecutionError(cancelledFailure());
     if (record.inputCount > BigInt(Number.MAX_SAFE_INTEGER))
       throw new RangeError("batch input count exceeds JavaScript safe integer range");
     while (nextIndex < record.inputCount) {
@@ -544,6 +573,7 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
   readonly #result: BoundValueCodec<Result>;
   readonly #options: FunctionCallOptions;
   readonly #endpoint?: string;
+  /** Bind a pinned function revision and its input/result codecs. */
   constructor(
     client: Client,
     revision: RevisionRef,
@@ -559,6 +589,7 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
     this.#options = options;
     this.#endpoint = endpoint;
   }
+  /** Resolve and pin a deployed function by name. */
   static async fromName<Input, Result>(
     client: Client,
     name: string,
@@ -732,8 +763,9 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
     );
     if (!response.message.ref) throw new Error("batch creation returned no durable id");
     const id = response.message.ref.callId;
-    const submitted = this.#submitInputs(id, inputs, inputCodec, merged.signal, response.endpoint);
-    const call = new BatchCall(this.#client, id, resultCodec, submitted, response.endpoint);
+    const feeder = new AbortController();
+    const submitted = this.#submitInputs(id, inputs, inputCodec, feeder.signal, response.endpoint);
+    const call = new BatchCall(this.#client, id, resultCodec, submitted, response.endpoint, feeder);
     bindAbort(call, merged.signal);
     return call;
   }
@@ -751,81 +783,99 @@ export class RemoteFunction<Input = PortableValue, Result = PortableValue> {
     signal?: AbortSignal,
     endpoint?: string,
   ): Promise<void> {
-    const requests = new AsyncQueue<MessageInitShape<typeof StreamCallInputsRequestSchema>>();
-    requests.push({ frame: { case: "call", value: { callId: id } } });
-    const handle = await this.#client.driver.duplex(CallService.method.streamInputs, requests, {
-      endpoint,
-    });
-    const onAbort = () => {
-      requests.end();
-      handle.cancel();
-    };
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener("abort", onAbort, { once: true });
-    const acknowledgements = handle.stream[Symbol.asyncIterator]();
-    let acknowledged = 0n;
     let sent = 0n;
-    let maximum = 1n;
-    const sentIds = new Map<bigint, string>();
-    const receiveAck = async (): Promise<void> => {
-      const next = await acknowledgements.next();
-      if (next.done) throw new Error("batch input stream closed before final acknowledgement");
-      const committed = next.value.committedInputCount;
-      if (committed < acknowledged || committed > sent)
-        throw new Error("batch input acknowledgement frontier is invalid");
-      if (
-        !Number.isSafeInteger(next.value.maxInputsOutstanding) ||
-        next.value.maxInputsOutstanding < 1
-      ) {
-        throw new Error("batch input acknowledgement advertised an invalid outstanding limit");
-      }
-      if (next.value.lastInputPresence.case === "lastInput") {
-        const last = next.value.lastInputPresence.value;
-        if (last.inputIndex + 1n !== committed || sentIds.get(last.inputIndex) !== last.inputId) {
-          throw new Error("batch input acknowledgement identified the wrong input");
-        }
-      }
-      for (let index = acknowledged; index < committed; index += 1n) sentIds.delete(index);
-      acknowledged = committed;
-      maximum = BigInt(next.value.maxInputsOutstanding);
-    };
-    await receiveAck();
     try {
-      for await (const input of inputs) {
-        if (signal?.aborted) break;
-        while (sent - acknowledged >= maximum) await receiveAck();
-        const value = await codec.encode(input);
-        rejectCloudpickle(value);
-        if (signal?.aborted) break;
-        const inputId = crypto.randomUUID();
-        sentIds.set(sent, inputId);
-        requests.push({
-          frame: {
-            case: "input",
-            value: {
-              index: sent,
-              payload: { case: "value", value },
-              inputId,
+      const requests = new AsyncQueue<MessageInitShape<typeof StreamCallInputsRequestSchema>>();
+      requests.push({ frame: { case: "call", value: { callId: id } } });
+      const handle = await this.#client.driver.duplex(CallService.method.streamInputs, requests, {
+        endpoint,
+      });
+      const onAbort = () => {
+        requests.end();
+        handle.cancel();
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+      const acknowledgements = handle.stream[Symbol.asyncIterator]();
+      let acknowledged = 0n;
+      let maximum = 1n;
+      const sentIds = new Map<bigint, string>();
+      const receiveAck = async (): Promise<void> => {
+        const next = await acknowledgements.next();
+        if (next.done) throw new Error("batch input stream closed before final acknowledgement");
+        const committed = next.value.committedInputCount;
+        if (committed < acknowledged || committed > sent)
+          throw new Error("batch input acknowledgement frontier is invalid");
+        if (
+          !Number.isSafeInteger(next.value.maxInputsOutstanding) ||
+          next.value.maxInputsOutstanding < 1
+        ) {
+          throw new Error("batch input acknowledgement advertised an invalid outstanding limit");
+        }
+        if (next.value.lastInputPresence.case === "lastInput") {
+          const last = next.value.lastInputPresence.value;
+          if (last.inputIndex + 1n !== committed || sentIds.get(last.inputIndex) !== last.inputId) {
+            throw new Error("batch input acknowledgement identified the wrong input");
+          }
+        }
+        for (let index = acknowledged; index < committed; index += 1n) sentIds.delete(index);
+        acknowledged = committed;
+        maximum = BigInt(next.value.maxInputsOutstanding);
+      };
+      try {
+        await receiveAck();
+        for await (const input of inputs) {
+          if (signal?.aborted) return;
+          while (sent - acknowledged >= maximum) await receiveAck();
+          const value = await codec.encode(input);
+          rejectCloudpickle(value);
+          if (signal?.aborted) return;
+          const inputId = crypto.randomUUID();
+          sentIds.set(sent, inputId);
+          requests.push({
+            frame: {
+              case: "input",
+              value: {
+                index: sent,
+                payload: { case: "value", value },
+                inputId,
+              },
             },
-          },
-        });
-        sent += 1n;
+          });
+          sent += 1n;
+        }
+        requests.end();
+        while (acknowledged < sent) await receiveAck();
+      } finally {
+        requests.end();
+        handle.cancel();
+        signal?.removeEventListener("abort", onAbort);
       }
-      requests.end();
-      while (acknowledged < sent) await receiveAck();
-    } finally {
-      requests.end();
-      handle.cancel();
-      signal?.removeEventListener("abort", onAbort);
+      await this.#client.driver.call(
+        CallService.method.closeInputs,
+        {
+          call: { callId: id },
+          expectedInputCount: sent,
+        },
+        { endpoint },
+      );
+    } catch (error) {
+      if (signal?.aborted) return;
+      try {
+        await this.#client.driver.call(
+          CallService.method.cancel,
+          {
+            call: { callId: id },
+            reason: "batch input submission failed",
+            requestId: crypto.randomUUID(),
+          },
+          { endpoint },
+        );
+      } catch {
+        // Preserve the feeder failure that caused cancellation.
+      }
+      throw error;
     }
-    await this.#client.driver.call(
-      CallService.method.closeInputs,
-      {
-        call: { callId: id },
-        expectedInputCount: sent,
-      },
-      { endpoint },
-    );
   }
 }
 
@@ -834,6 +884,7 @@ export class App {
   readonly revision: AppRevision;
   readonly #client: Client;
   readonly #endpoint?: string;
+  /** Bind a pinned application revision to its client. */
   constructor(client: Client, revision: AppRevision, endpoint?: string) {
     this.#client = client;
     this.revision = revision;

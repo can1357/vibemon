@@ -185,6 +185,7 @@ class V1StubServer:
         self.events: list[object] = [{"type": "ready", "sequence": 1}]
         self.health_response: object = {"ok": True}
         self.sandbox_metrics_response: object = {"vcpu_exits": 7}
+        self.server_info_response: object = {"version": "test", "capabilities": {}}
         self.required_token: str | None = None
         self.drop_requests = False
         self.node_id = node_id
@@ -950,7 +951,7 @@ class _SystemService(api_pb2_grpc.SystemServiceServicer):
 
     def Info(self, request: api_pb2.InfoRequest, context: Any) -> api_pb2.JsonView:
         self._enter(context, "Info", {})
-        return _view_json({"version": "test", "capabilities": {}})
+        return _view_json(self._stub.server_info_response)
 
     def Events(self, request: api_pb2.EventsRequest, context: Any) -> Any:
         self._enter(context, "Events", {})

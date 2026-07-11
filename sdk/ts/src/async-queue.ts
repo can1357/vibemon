@@ -15,20 +15,24 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   readonly #waiters: Array<Resolver<IteratorResult<T>>> = [];
   #error: unknown;
   #done = false;
+  /** Deliver one value to the oldest waiter or enqueue it. */
   push(value: T): void {
     const waiter = this.#waiters.shift();
     if (waiter) waiter.resolve({ value, done: false });
     else this.#values.push(value);
   }
+  /** End the queue and resolve every pending waiter. */
   end(): void {
     this.#done = true;
     for (const waiter of this.#waiters.splice(0)) waiter.resolve({ value: undefined, done: true });
   }
+  /** Fail the queue and reject every pending waiter. */
   fail(error: unknown): void {
     this.#error = error;
     this.#done = true;
     for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
   }
+  /** Consume queued and future values until the queue ends. */
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: async () => {

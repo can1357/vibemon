@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import queue
 import threading
 from collections.abc import Callable, Iterable, Iterator
@@ -11,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import grpc
 
-from ._endpoint import translate_rpc_error
+from ._endpoint import decode_view, translate_rpc_error
 from .errors import ProtocolError, TransportError
 from .models import EventRecord
 from .v1 import api_pb2
@@ -440,12 +439,7 @@ class EventStream(Iterable[EventRecord]):
 
     @staticmethod
     def _decode(payload: str) -> EventRecord:
-        try:
-            value = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ProtocolError("vmon event stream returned invalid JSON") from exc
-        if not isinstance(value, dict):
-            raise ProtocolError("vmon event stream returned a non-object event")
+        value = decode_view(payload, "vmon event stream returned malformed data")
         return EventRecord.from_dict(value)
 
     def close(self) -> None:

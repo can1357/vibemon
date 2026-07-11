@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import inspect
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from ._endpoint import GrpcStubs, decode_view, dump_json
 from .driver import (
@@ -31,7 +40,13 @@ from .volume import Volume
 if TYPE_CHECKING:
     from .models import Health, MeshNode, MeshStatus, PoolStats, ServerInfo
     from .process import EventStream, Process
-    from .remote import RemoteFunction
+    from .remote import (
+        AsyncGeneratorRemoteFunction,
+        AsyncRemoteFunction,
+        GeneratorRemoteFunction,
+        RemoteFunction,
+        SyncRemoteFunction,
+    )
 
 
 class Client:
@@ -51,12 +66,7 @@ class Client:
         from .models import Health
 
         response = self.driver.request("GET", "/healthz")
-        try:
-            value = response.json()
-        except ValueError as exc:
-            raise ProtocolError("health check returned malformed JSON") from exc
-        if not isinstance(value, Mapping):
-            raise ProtocolError("health check returned a non-object response")
+        value = decode_view(response.text, "health check returned malformed data")
         return Health.from_dict(value)
 
     def info(self) -> ServerInfo:
@@ -126,6 +136,86 @@ class Client:
             thread_name="vmon-shell",
         )
 
+    @overload
+    def function[**P, Y](  # type: ignore[overload-overlap]
+        self,
+        function: Callable[P, Iterator[Y]],
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> GeneratorRemoteFunction[P, Y]: ...
+
+    @overload
+    def function[**P, Y](  # type: ignore[overload-overlap]
+        self,
+        function: Callable[P, AsyncIterator[Y]],
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> AsyncGeneratorRemoteFunction[P, Y]: ...
+
+    @overload
+    def function[**P, Y](  # type: ignore[overload-overlap]
+        self,
+        function: Callable[P, Coroutine[Any, Any, Y]],
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> AsyncRemoteFunction[P, Y]: ...
+
+    @overload
+    def function[**P, R](
+        self,
+        function: Callable[P, R],
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> SyncRemoteFunction[P, R]: ...
+
+    @overload
+    def function(
+        self,
+        function: None = None,
+        *,
+        name: str | None = None,
+        namespace: str = "default",
+        revision: str | None = None,
+        options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
+        include: Iterable[str] = (),
+        exclude: Iterable[str] = (),
+        local_packages: Iterable[str] = (),
+    ) -> RemoteFunction[..., Any]: ...
+
     def function(
         self,
         function: Callable[..., Any] | None = None,
@@ -141,9 +231,25 @@ class Client:
         local_packages: Iterable[str] = (),
     ) -> RemoteFunction:
         """Bind zero-deploy code or look up a deployed function revision."""
-        from .remote import RemoteFunction
+        from .remote import (
+            AsyncGeneratorRemoteFunction,
+            AsyncRemoteFunction,
+            GeneratorRemoteFunction,
+            RemoteFunction,
+            SyncRemoteFunction,
+        )
 
-        return RemoteFunction(
+        wrapper = RemoteFunction
+        if function is not None:
+            if inspect.isasyncgenfunction(function):
+                wrapper = AsyncGeneratorRemoteFunction
+            elif inspect.isgeneratorfunction(function):
+                wrapper = GeneratorRemoteFunction
+            elif inspect.iscoroutinefunction(function):
+                wrapper = AsyncRemoteFunction
+            else:
+                wrapper = SyncRemoteFunction
+        return wrapper(
             function,
             client=self,
             name=name,

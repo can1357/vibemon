@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
+from typing import TYPE_CHECKING, Any, ParamSpec, Protocol, TypeVar, overload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .image import Image
@@ -25,11 +25,37 @@ from .v1 import api_pb2
 from .values import ValueCodec
 
 if TYPE_CHECKING:
-    from .remote import RemoteFunction
+    from .remote import (
+        AsyncGeneratorRemoteFunction,
+        AsyncRemoteFunction,
+        GeneratorRemoteFunction,
+        RemoteFunction,
+        SyncRemoteFunction,
+    )
 
 P = ParamSpec("P")
 R = TypeVar("R")
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+class _AppFunctionDecorator(Protocol):
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, Iterator[T]], /
+    ) -> GeneratorRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, AsyncIterator[T]], /
+    ) -> AsyncGeneratorRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, Coroutine[Any, Any, T]], /
+    ) -> AsyncRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +172,22 @@ class App:
         return definition
 
     @overload
-    def function(self, fn: Callable[P, R], /) -> RemoteFunction[P, R]: ...
+    def function(  # type: ignore[overload-overlap]
+        self, fn: Callable[P, Iterator[R]], /
+    ) -> GeneratorRemoteFunction[P, R]: ...
+
+    @overload
+    def function(  # type: ignore[overload-overlap]
+        self, fn: Callable[P, AsyncIterator[R]], /
+    ) -> AsyncGeneratorRemoteFunction[P, R]: ...
+
+    @overload
+    def function(  # type: ignore[overload-overlap]
+        self, fn: Callable[P, Coroutine[Any, Any, R]], /
+    ) -> AsyncRemoteFunction[P, R]: ...
+
+    @overload
+    def function(self, fn: Callable[P, R], /) -> SyncRemoteFunction[P, R]: ...
 
     @overload
     def function(
@@ -186,11 +227,11 @@ class App:
         include: Iterable[str] = (),
         exclude: Iterable[str] = (),
         local_packages: Iterable[str] = (),
-    ) -> Callable[[Callable[P, R]], RemoteFunction[P, R]]: ...
+    ) -> _AppFunctionDecorator: ...
 
     def function(
         self,
-        fn: Callable[P, R] | None = None,
+        fn: Callable[..., Any] | None = None,
         /,
         *,
         name: str | None = None,
@@ -225,12 +266,12 @@ class App:
         include: Iterable[str] = (),
         exclude: Iterable[str] = (),
         local_packages: Iterable[str] = (),
-    ) -> RemoteFunction[P, R] | Callable[[Callable[P, R]], RemoteFunction[P, R]]:
+    ) -> Any:
         """Decorate and add a function using the standard typed option surface."""
 
         from .remote import function
 
-        def decorate(inner: Callable[P, R]) -> RemoteFunction[P, R]:
+        def decorate(inner: Callable[..., Any]) -> RemoteFunction[..., Any]:
             configured = function(
                 client=self.client,
                 namespace=self.namespace,
@@ -452,6 +493,20 @@ class App:
         record, _ = selected.driver.call(lambda stubs: stubs.functions.CreateSchedule(request))
         return _schedule(record, binding)
 
+    def get_schedule(self, schedule: str | Schedule, *, client: Any = None) -> Schedule:
+        """Resolve one durable schedule and its application-local function binding."""
+        selected = client or self.client
+        if selected is None:
+            raise ValueError("schedule lookup requires a client")
+        schedule_id = schedule.id if isinstance(schedule, Schedule) else schedule
+        if not schedule_id:
+            raise ValueError("schedule id must be non-empty")
+        record, _ = selected.driver.call(
+            lambda stubs: stubs.functions.GetSchedule(api_pb2.ScheduleRef(schedule_id=schedule_id))
+        )
+        manifest = _pinned_app_manifest(selected, record.spec.app)
+        return _schedule(record, _schedule_binding(record, manifest))
+
     def list_schedules(
         self,
         *,
@@ -473,7 +528,32 @@ class App:
                 )
             )
         )
-        return tuple(_schedule(record) for record in response.schedules), response.next_page_token
+        manifests: dict[tuple[str, str, str], AppManifest] = {}
+        for record in response.schedules:
+            app = record.spec.app
+            key = (app.app.namespace, app.app.name, app.revision_id)
+            if key not in manifests:
+                manifests[key] = _pinned_app_manifest(selected, app)
+
+        return (
+            tuple(
+                _schedule(
+                    record,
+                    _schedule_binding(
+                        record,
+                        manifests[
+                            (
+                                record.spec.app.app.namespace,
+                                record.spec.app.app.name,
+                                record.spec.app.revision_id,
+                            )
+                        ],
+                    ),
+                )
+                for record in response.schedules
+            ),
+            response.next_page_token,
+        )
 
     def delete_schedule(self, schedule: str | Schedule, *, client: Any = None) -> None:
         """Permanently delete a durable schedule by stable ID."""
@@ -573,6 +653,30 @@ def _json_envelope(value: object) -> api_pb2.ValueEnvelope:
         uncompressed_size_bytes=len(raw),
         inline_data=raw,
         type_name=type(value).__qualname__,
+    )
+
+
+def _pinned_app_manifest(client: Any, ref: Any) -> AppManifest:
+    response, _ = client.driver.call(
+        lambda stubs: stubs.functions.GetApp(
+            api_pb2.GetAppRequest(app=api_pb2.AppSelector(pinned=ref))
+        )
+    )
+    return _app_revision(response).manifest
+
+
+def _schedule_binding(value: Any, manifest: AppManifest) -> AppBinding:
+    target = value.spec.target.function
+    for binding in manifest.functions:
+        if (
+            binding.namespace == target.function.namespace
+            and binding.function_name == target.function.name
+            and binding.revision_id == target.revision_id
+        ):
+            return binding
+    raise ValueError(
+        f"schedule {value.ref.schedule_id!r} target is absent from pinned app revision "
+        f"{value.spec.app.revision_id!r}"
     )
 
 

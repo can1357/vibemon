@@ -37,20 +37,39 @@ def test_typed_responses_reject_malformed_payloads(monkeypatch, mvm_home) -> Non
     with V1StubServer() as server:
         configure_context(monkeypatch, mvm_home, server)
         with connect() as client:
-            for response in ({}, [], None):
+            health_responses: tuple[object, ...] = (
+                {},
+                [],
+                None,
+                {"ok": True, "bad": float("nan")},
+            )
+            for response in health_responses:
                 server.health_response = response
                 with pytest.raises(ProtocolError):
                     client.health()
 
+            server.server_info_response = {}
+            with pytest.raises(ProtocolError):
+                client.info()
+
             sandbox = client.sandboxes.create(name="malformed")
-            for response in ([], None):
+            metric_responses: tuple[object, ...] = (
+                [],
+                None,
+                {"bad": float("nan")},
+            )
+            for response in metric_responses:
                 server.sandbox_metrics_response = response
                 with pytest.raises(ProtocolError):
                     sandbox.metrics()
-
-            server.events = [[]]
-            with client.events() as stream, pytest.raises(ProtocolError):
-                list(stream)
+            event_responses: tuple[list[object], ...] = (
+                [[]],
+                [{"bad": float("nan")}],
+            )
+            for response in event_responses:
+                server.events = response
+                with client.events() as stream, pytest.raises(ProtocolError):
+                    list(stream)
 
             server.sandboxes["malformed"]["network"] = {"block_network": "false"}
             with pytest.raises(ProtocolError):
@@ -235,7 +254,7 @@ def test_shell_and_aio_preserve_streaming_semantics(monkeypatch, mvm_home) -> No
             async def exercise() -> None:
                 result = await sandbox.aio.run("printf", "async-output")
                 assert result.stdout == b"async-output"
-                assert (await sandbox.aio.network())["block_network"] is False
+                assert (await sandbox.aio.network()).block_network is False
                 assert (await sandbox.aio.pause()).status == "paused"
                 assert (await sandbox.aio.resume()).status == "running"
                 await sandbox.aio.files.write_text("/tmp/value", "value")

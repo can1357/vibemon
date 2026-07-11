@@ -101,6 +101,7 @@ export class Client {
 /** Deployed function lookup operations. */
 export class FunctionAPI {
   readonly #client: Client;
+  /** Bind deployed-function lookups to a client. */
   constructor(client: Client) {
     this.#client = client;
   }
@@ -141,6 +142,7 @@ export class FunctionAPI {
 /** Deployed application lookup operations. */
 export class AppAPI {
   readonly #client: Client;
+  /** Bind deployed-application lookups to a client. */
   constructor(client: Client) {
     this.#client = client;
   }

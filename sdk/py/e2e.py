@@ -19,8 +19,8 @@ user-facing feature in a single run:
   * warm pools (pre-forked clones)
   * server-enforced timeouts (return code 124) and live deadline ``extend``
   * the async (``aio``) facade
-  * remote functions: warm session calls, rich-type args, streaming generators,
-    spawn/gather, lazy map, and stateful ``@vmon.cls`` instances
+  * durable functions: warm workers, rich-type arguments, streaming generators,
+    detached calls, bounded maps, and stateful ``@vmon.cls`` actors
 
 This complements the pytest suite in ``tests/test_e2e.py`` with a single
 self-contained driver that prints a PASS/FAIL/SKIP table and returns a
@@ -74,11 +74,15 @@ from vmon import (
     APIError,
     Client,
     FunctionCall,
+    RemoteFunctionError,
     Sandbox,
     Secret,
+    SerializerPolicy,
+    ValueCodec,
     Volume,
     connect,
 )
+from e2e_remote import RemoteCounter, remote_add, remote_double, remote_shift, remote_ticks
 
 IMAGE = os.environ.get("VMON_E2E_IMAGE", "alpine:latest")
 RUN = f"e2e{os.getpid()}"
@@ -307,7 +311,7 @@ class VmonServer:
         if check.returncode != 0:
             raise RuntimeError(f"`vmon doctor` failed:\n{check.stdout.strip()}")
 
-    def healthz(self) -> dict[str, object]:
+    def healthz(self) -> vmon.Health:
         with connect(f"vmon+unix://{self.sock}", discover=False) as client:
             return client.health()
 
@@ -340,7 +344,7 @@ class VmonServer:
                     f"`vmon serve` exited with {self.proc.returncode}; log:\n{_tail(self.log_path)}"
                 )
             try:
-                if self.healthz().get("ok") is True:
+                if self.healthz().ok:
                     self.run_doctor()
                     return
             except BaseException as exc:
@@ -1015,153 +1019,146 @@ def t_extend(_):
             sb.remove()
 
 
-def _py_image() -> str:
-    return os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim")
+def _py_image() -> vmon.Image:
+    return vmon.Image.from_registry(os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"))
 
 
-def _remote_double(value: int) -> int:
-    print(f"doubling {value}")
-    if value < 0:
-        raise ValueError("value must be non-negative")
-    return value * 2
+vmon.enter(RemoteCounter._mark)
+vmon.method(RemoteCounter.bump)
+vmon.exit(RemoteCounter._farewell)
 
 
-def _remote_shift(stamp, pair):
-    import datetime
-
-    return stamp + datetime.timedelta(days=1), (pair[1], pair[0])
-
-
-def _remote_ticks():
-    import time
-
-    for index in range(3):
-        yield index
-        time.sleep(0.2)
-
-
-def _remote_add(a, b):
-    return a + b
-
-
-@vmon.cls(image=os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"), block_network=True)
-class _RemoteCounter:
-    def __init__(self, start: int = 0) -> None:
-        self.value = start
-        self.entered = False
-
-    @vmon.enter
-    def _mark(self) -> None:
-        self.entered = True
-
-    @vmon.method
-    def bump(self) -> int:
-        assert self.entered, "enter hook must run before methods"
-        self.value += 1
-        return self.value
-
-    @vmon.exit
-    def _farewell(self) -> None:
-        print("counter exiting")
+_RemoteCounter = vmon.cls(
+    RemoteCounter,
+    options=vmon.FunctionOptions(
+        image=_py_image(),
+        resources=vmon.ResourcePolicy(
+            network=vmon.NetworkPolicy(block_network=True),
+        ),
+    ),
+)
 
 
 @e2e
 def t_remote_function(_):
-    """Warm session calls with live stdout, original exceptions, and ms redispatch."""
-    remote = sdk().function(_remote_double, image=_py_image(), block_network=True)
-    output = io.StringIO()
+    """Durable calls preserve warm execution and structured remote failures."""
+    remote = vmon.function(
+        remote_double,
+        client=sdk(),
+        image=_py_image(),
+        block_network=True,
+        execution_timeout=120,
+        min_workers=1,
+    )
+    cold_started = time.monotonic()
+    assert remote.remote(21) == 42
+    cold = time.monotonic() - cold_started
+    warm_started = time.monotonic()
+    assert remote.remote(4) == 8
+    warm = time.monotonic() - warm_started
     try:
-        with contextlib.redirect_stdout(output):
-            cold_started = time.monotonic()
-            assert remote.remote(21, timeout=120) == 42
-            cold = time.monotonic() - cold_started
-            warm_started = time.monotonic()
-            assert remote.remote(4, timeout=120) == 8
-            warm = time.monotonic() - warm_started
-            try:
-                remote.remote(-1, timeout=120)
-            except ValueError as exc:
-                assert "non-negative" in str(exc)
-                notes = "\n".join(getattr(exc, "__notes__", ()))
-                assert "[vmon remote traceback]" in notes
-                assert "_remote_double" in notes
-            else:
-                raise AssertionError("remote exception was not propagated")
-        assert output.getvalue() == "doubling 21\ndoubling 4\ndoubling -1\n"
-        print(f"    remote(): cold={cold:.3f}s warm={warm:.4f}s ({cold / max(warm, 1e-9):.0f}x)")
-        assert warm < cold / 10, f"warm call too slow: cold={cold:.3f}s warm={warm:.3f}s"
-    finally:
-        remote.terminate()
+        remote.remote(-1)
+    except RemoteFunctionError as exc:
+        assert "non-negative" in str(exc)
+        assert exc.remote_type.endswith("ValueError")
+        assert "remote_double" in exc.traceback
+    else:
+        raise AssertionError("remote exception was not propagated")
+    print(f"    remote(): cold={cold:.3f}s warm={warm:.4f}s ({cold / max(warm, 1e-9):.0f}x)")
+    assert warm < cold / 10, f"warm call too slow: cold={cold:.3f}s warm={warm:.3f}s"
 
 
 @e2e
 def t_remote_function_rich_args(_):
-    """serializer='auto' round-trips datetimes and tuples with type fidelity."""
+    """Explicit trusted-Python serialization preserves rich Python values."""
     import datetime
 
-    remote = sdk().function(_remote_shift, image=_py_image(), block_network=True)
-    try:
-        stamp = datetime.datetime(2026, 7, 11, 8, 30, 0)
-        shifted, swapped = remote.remote(stamp, (1, 2), timeout=120)
-        assert shifted == stamp + datetime.timedelta(days=1), f"datetime lost: {shifted!r}"
-        assert swapped == (2, 1) and isinstance(swapped, tuple), f"tuple lost: {swapped!r}"
-    finally:
-        remote.terminate()
+    remote = vmon.function(
+        remote_shift,
+        client=sdk(),
+        image=_py_image().uv_install("cloudpickle==3.1.2"),
+        block_network=True,
+        execution_timeout=120,
+        serializer=SerializerPolicy(
+            input_serializer=ValueCodec.CLOUDPICKLE,
+            result_serializer=ValueCodec.CLOUDPICKLE,
+            allow_trusted_python=True,
+        ),
+    )
+    stamp = datetime.datetime(2026, 7, 11, 8, 30, 0)
+    shifted, swapped = remote.remote(stamp, (1, 2))
+    assert shifted == stamp + datetime.timedelta(days=1), f"datetime lost: {shifted!r}"
+    assert swapped == (2, 1) and isinstance(swapped, tuple), f"tuple lost: {swapped!r}"
 
 
 @e2e
 def t_remote_function_stream(_):
-    """remote_gen yields arrive incrementally, not after the generator finishes."""
-    remote = sdk().function(_remote_ticks, image=_py_image(), block_network=True)
-    try:
-        started = time.monotonic()
-        arrivals: list[tuple[int, float]] = []
-        for value in remote.remote_gen(timeout=120):
-            arrivals.append((value, time.monotonic() - started))
-        assert [value for value, _at in arrivals] == [0, 1, 2]
-        total = arrivals[-1][1]
-        first = arrivals[0][1]
-        assert total >= 0.35, f"generator finished too fast to prove streaming: {total:.3f}s"
-        assert first < total - 0.3, (
-            f"first yield arrived late: first={first:.3f}s total={total:.3f}s"
-        )
-    finally:
-        remote.terminate()
+    """Durable generator yields arrive incrementally."""
+    remote = vmon.function(
+        remote_ticks,
+        client=sdk(),
+        image=_py_image(),
+        block_network=True,
+        execution_timeout=120,
+    )
+    started = time.monotonic()
+    arrivals: list[tuple[int, float]] = []
+    for value in remote.remote_gen():
+        arrivals.append((value, time.monotonic() - started))
+    assert [value for value, _at in arrivals] == [0, 1, 2]
+    total = arrivals[-1][1]
+    first = arrivals[0][1]
+    assert total >= 0.35, f"generator finished too fast to prove streaming: {total:.3f}s"
+    assert first < total - 0.3, f"first yield arrived late: first={first:.3f}s total={total:.3f}s"
 
 
 @e2e
 def t_remote_function_spawn_map(_):
-    """spawn handles gather across concurrent sessions; lazy map keeps input order."""
-    remote = sdk().function(_remote_add, image=_py_image(), block_network=True)
-    try:
-        first = remote.spawn(1, 2)
-        second = remote.spawn(30, 12)
-        assert FunctionCall.gather(first, second) == [3, 42]
-        assert first.done() and second.done()
+    """Detached calls reconstruct by ID and lazy maps preserve input order."""
+    remote = vmon.function(
+        remote_add,
+        client=sdk(),
+        image=_py_image(),
+        block_network=True,
+        execution_timeout=120,
+    )
+    first = remote.spawn(1, 2)
+    second = remote.spawn(30, 12)
+    reconstructed = FunctionCall.from_id(first.id, client=sdk())
+    assert FunctionCall.gather(reconstructed, second) == [3, 42]
+    assert first.done() and second.done()
 
-        assert list(remote.map(range(6), kwargs={"b": 10}, concurrency=2)) == [
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-        ]
-        mixed = list(remote.map([1, "x"], kwargs={"b": 1}, return_exceptions=True, concurrency=1))
-        assert mixed[0] == 2
-        assert isinstance(mixed[1], TypeError), f"expected TypeError slot, got {mixed[1]!r}"
-    finally:
-        remote.terminate()
+    assert list(remote.map(range(6), kwargs={"b": 10}, max_in_flight=2)) == [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+    ]
+    mixed = list(
+        remote.map(
+            [1, "x"],
+            kwargs={"b": 1},
+            return_exceptions=True,
+            max_in_flight=1,
+        )
+    )
+    assert mixed[0] == 2
+    assert isinstance(mixed[1], TypeError), f"expected TypeError slot, got {mixed[1]!r}"
 
 
 @e2e
 def t_remote_cls(_):
-    """@vmon.cls keeps guest state across calls; terminate runs exit hooks in grace."""
+    """A durable actor preserves state and is explicitly deleted."""
+    app = vmon.App("python-e2e-actors", client=sdk())
+    app.add(_RemoteCounter)
+    app.deploy()
     counter = _RemoteCounter(start=40)
-    terminated = False
+    deleted = False
     try:
-        assert counter.bump.remote(timeout=120) == 41, "constructor + enter hook must run"
-        assert counter.bump.remote(timeout=120) == 42, "state must persist across calls"
+        assert counter.bump.remote() == 41, "constructor + enter hook must run"
+        assert counter.bump.remote() == 42, "state must persist across calls"
         try:
             _ = counter.value
         except AttributeError as exc:
@@ -1169,14 +1166,14 @@ def t_remote_cls(_):
         else:
             raise AssertionError("untagged attribute access must fail")
         started = time.monotonic()
-        counter.terminate()
-        terminated = True
+        counter.delete()
+        deleted = True
         elapsed = time.monotonic() - started
-        assert elapsed < 10, f"terminate exceeded the exit-hook grace period: {elapsed:.1f}s"
+        assert elapsed < 10, f"delete exceeded the exit-hook grace period: {elapsed:.1f}s"
     finally:
-        if not terminated:
+        if not deleted:
             with contextlib.suppress(Exception):
-                counter.terminate()
+                counter.delete()
 
 
 @e2e

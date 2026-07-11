@@ -1,26 +1,90 @@
-import type { components } from "./schema";
-import type { PortableValue } from "./function-values";
+import type { JsonValue } from "./function-values";
+import type { SecretWire } from "./values";
 
 /** Daemon health response. */
-export type Health = components["schemas"]["HealthBody"];
-/** Sandbox creation request. */
-export type SandboxCreateRequest = components["schemas"]["SandboxCreate"];
+export interface Health {
+  ok: boolean;
+}
+
+/** Sandbox creation request accepted by the gRPC create operation. */
+export interface SandboxCreateRequest {
+  arch?: string | null;
+  block_network?: boolean;
+  command?: string[] | null;
+  context?: string;
+  cpus?: number;
+  disk_mb?: number;
+  dockerfile?: string | null;
+  egress_allow?: string[] | null;
+  egress_allow_domains?: string[] | null;
+  env?: Record<string, string> | null;
+  fs_dir?: string | null;
+  ha?: string | null;
+  idempotency_key?: string | null;
+  image?: string | null;
+  inbound_cidr_allowlist?: string[] | null;
+  memory?: number;
+  name?: string | null;
+  pool_size?: number;
+  ports?: number[] | null;
+  readiness_probe?: number | string | { port: number } | null;
+  secrets?: SecretWire[] | null;
+  tags?: Record<string, string> | null;
+  template?: string | null;
+  timeout?: number | null;
+  timeout_secs?: number | null;
+  volumes?: Record<string, string | { name: string; read_only?: boolean }> | null;
+  workdir?: string | null;
+}
+
 /** Captured or streaming exec request. */
-export type ExecRequest = components["schemas"]["ExecBody"];
+export interface ExecRequest {
+  cmd?: string[];
+  env?: Record<string, string> | null;
+  timeout?: number | null;
+  tty?: boolean;
+  workdir?: string | null;
+}
+
 /** Captured exec result. */
-export type ExecResult = components["schemas"]["ExecCaptureBody"];
+export interface ExecResult {
+  exit: number;
+  stderr_b64: string;
+  stdout_b64: string;
+}
+
 /** Sandbox network policy. */
-export type NetworkPolicy = components["schemas"]["NetworkBody"];
+export interface NetworkPolicy {
+  block_network?: boolean | null;
+  cidr_allow?: string[] | null;
+  domain_allow?: string[] | null;
+}
+
 /** Full VM snapshot request. */
-export type SnapshotRequest = components["schemas"]["SnapshotBody"];
+export interface SnapshotRequest {
+  name?: string | null;
+  stop?: boolean;
+}
+
 /** Filesystem snapshot request. */
-export type SnapshotFilesystemRequest = components["schemas"]["SnapshotFsBody"];
+export interface SnapshotFilesystemRequest {
+  name?: string | null;
+}
+
 /** Snapshot restore request. */
-export type RestoreRequest = components["schemas"]["RestoreBody"];
+export type RestoreRequest = Partial<SandboxCreateRequest> & {
+  agent?: boolean | null;
+};
+
 /** Snapshot fork request. */
-export type ForkRequest = components["schemas"]["ForkBody"];
+export type ForkRequest = Partial<SandboxCreateRequest> & {
+  count: number;
+};
+
 /** Warm-pool update request. */
-export type PoolSetRequest = components["schemas"]["PoolPutBody"];
+export type PoolSetRequest = Partial<SandboxCreateRequest> & {
+  size: number;
+};
 
 /** Tolerant sandbox view returned by the daemon. */
 export interface SandboxInfo {
@@ -77,12 +141,12 @@ export interface PoolStats {
 
 /** Open sandbox runtime metrics keyed by subsystem or counter name. */
 export interface SandboxMetrics {
-  [key: string]: PortableValue;
+  [key: string]: JsonValue;
 }
 
 /** Daemon build, host, and capability information. */
 export interface ServerInfo {
-  version?: string;
+  version: string;
   platform?: string;
   arch?: string;
   backend?: string;
@@ -106,5 +170,5 @@ export interface TunnelSet {
 
 /** One daemon event payload. */
 export interface EventRecord {
-  [key: string]: PortableValue;
+  [key: string]: JsonValue;
 }

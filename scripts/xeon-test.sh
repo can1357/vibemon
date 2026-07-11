@@ -156,12 +156,25 @@ sdk_e2e() {
         return 1
     fi
 
+    echo '==> deploying portable JSON and CBOR echo functions'
+    uv sync
+    deployment_env=$server_home/portable-functions.env
+    deployment_namespace="xeon-sdk-$(date +%s)-$$"
+    timeout 180 uv run python scripts/deploy_portable_echo.py \
+        --server-url "http://127.0.0.1:$port" \
+        --api-token xeon-sdk-e2e \
+        --namespace "$deployment_namespace" \
+        --python-image "$python_image" \
+        >"$deployment_env"
+    # The helper validates every value before emitting shell assignments.
+    . "$deployment_env"
+    echo "xeon-test: deployed namespace=$VMON_REMOTE_NAMESPACE json=$VMON_REMOTE_JSON_NAME@$VMON_REMOTE_JSON_REVISION cbor=$VMON_REMOTE_CBOR_NAME@$VMON_REMOTE_CBOR_REVISION"
+
     (
         cd sdk/go
         VMON_GO_REMOTE_SMOKE=1 \
         VMON_SERVER_URL="http://127.0.0.1:$port" \
         VMON_API_TOKEN=xeon-sdk-e2e \
-        VMON_GO_REMOTE_IMAGE="$node_image" \
             go test -v ./...
     )
     (
@@ -171,7 +184,6 @@ sdk_e2e() {
         VMON_TS_REMOTE_SMOKE=1 \
         VMON_SERVER_URL="http://127.0.0.1:$port" \
         VMON_API_TOKEN=xeon-sdk-e2e \
-        VMON_TS_REMOTE_IMAGE="$node_image" \
             bun test
     )
 

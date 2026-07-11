@@ -161,4 +161,3 @@ test("sandbox transparently relocates once after pinned not_found", async () => 
   const absent = new Sandbox(new Client(driver), { id: "absent" }, A_8000);
   await expect(absent.refresh()).rejects.toBeInstanceOf(APIError);
 });
-

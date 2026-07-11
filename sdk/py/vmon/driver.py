@@ -325,10 +325,11 @@ class MeshDriver:
 
     def aio_endpoint(
         self, endpoint: str | None = None
-    ) -> tuple[Any, tuple[tuple[str, str], ...], float]:
-        """Return native async stubs, auth metadata, and the default deadline."""
-        transport = self._transport(endpoint or self._preferred)
-        return transport.aio_stubs, transport.aio_metadata, self.timeout
+    ) -> tuple[Any, tuple[tuple[str, str], ...], float, str]:
+        """Return native async stubs, auth metadata, the deadline, and selected endpoint."""
+        selected = endpoint or self._preferred
+        transport = self._transport(selected)
+        return transport.aio_stubs, transport.aio_metadata, self.timeout, selected
 
     def _call[T](
         self,
@@ -475,6 +476,33 @@ class MeshDriver:
         if last_transport_error is not None:
             raise last_transport_error
         raise APIError(f"sandbox {sandbox_id!r} was not found", code="not_found")
+
+    def resolve_call(self, call_id: str, hint: str | None = None) -> str:
+        """Walk the roster until an endpoint reports that the durable call exists."""
+        original_not_found: APIError | None = None
+        last_transport_error: TransportError | None = None
+        for candidate in self._candidates(hint, include_cooling=True):
+            try:
+                self._transport(candidate).stubs.calls.Get(api_pb2.CallRef(call_id=call_id))
+            except grpc.RpcError as raw:
+                error = translate_rpc_error(raw, endpoint=candidate)
+                if isinstance(error, TransportError):
+                    last_transport_error = error
+                    self._mark_failed(candidate)
+                    continue
+                self._mark_success(candidate)
+                if error.code == "not_found":
+                    original_not_found = original_not_found or error
+                    continue
+                raise error from raw
+            self._mark_success(candidate)
+            return candidate
+
+        if original_not_found is not None:
+            raise original_not_found
+        if last_transport_error is not None:
+            raise last_transport_error
+        raise APIError(f"call {call_id!r} was not found", code="not_found")
 
     def endpoints(self) -> list[EndpointInfo]:
         """Return a detached roster snapshot in failover order."""

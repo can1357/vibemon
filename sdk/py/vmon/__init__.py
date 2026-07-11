@@ -64,7 +64,17 @@ from .package import (
     package_callable,
 )
 from .process import ConsoleStream, EventStream, LogStream, Process
-from .remote import BatchCall, FunctionCall, RemoteFunction, function, is_remote
+from .remote import (
+    AsyncGeneratorRemoteFunction,
+    AsyncRemoteFunction,
+    BatchCall,
+    FunctionCall,
+    GeneratorRemoteFunction,
+    RemoteFunction,
+    SyncRemoteFunction,
+    function,
+    is_remote,
+)
 from .sandbox import ExecResult, Files, Sandbox
 from .secret import Secret
 from .values import (
@@ -100,6 +110,8 @@ __all__ = [
     "AppManifest",
     "AppRevision",
     "ArtifactPayload",
+    "AsyncGeneratorRemoteFunction",
+    "AsyncRemoteFunction",
     "BatchCall",
     "BatchingPolicy",
     "CallGroup",
@@ -122,6 +134,7 @@ __all__ = [
     "FunctionCall",
     "FunctionOptions",
     "FunctionVolumeMount",
+    "GeneratorRemoteFunction",
     "HighAvailabilityPolicy",
     "Health",
     "Image",
@@ -161,6 +174,7 @@ __all__ = [
     "SerializerPolicy",
     "ServerInfo",
     "TimeoutPolicy",
+    "SyncRemoteFunction",
     "TransportError",
     "TunnelSet",
     "TunnelTarget",

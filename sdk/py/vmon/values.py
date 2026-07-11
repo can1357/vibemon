@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-PYTHON_ABI = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
+PYTHON_ABI = f"cp{sys.version_info.major}{sys.version_info.minor}"
 JSON_SAFE_INTEGER_MAX = 2**53 - 1
 
 
@@ -254,7 +254,12 @@ def _encode_json(value: object) -> bytes:
 
 
 def _validate_ijson(value: object, path: str = "$") -> None:
-    if value is None or isinstance(value, (str, bool)):
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        for character in value:
+            if 0xD800 <= ord(character) <= 0xDFFF:
+                raise JSONProfileError(f"surrogate code point at {path} is not valid I-JSON")
         return
     if isinstance(value, int):
         if not -JSON_SAFE_INTEGER_MAX <= value <= JSON_SAFE_INTEGER_MAX:
@@ -272,6 +277,7 @@ def _validate_ijson(value: object, path: str = "$") -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise JSONProfileError(f"object key at {path} must be a string")
+            _validate_ijson(key, f"{path} (object key)")
             _validate_ijson(item, f"{path}.{key}")
         return
     raise JSONProfileError(f"value at {path} is not JSON-compatible")

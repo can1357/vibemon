@@ -746,20 +746,44 @@ fn request_id(prefix: &str, bytes: &[u8]) -> String {
 	format!("{prefix}-{:x}", Sha256::digest(bytes))
 }
 
+fn deploy_request_id() -> Result<String> {
+	let mut bytes = [0_u8; 16];
+	fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	Ok(format!(
+		"cli-activate-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:\
+		 02x}{:02x}{:02x}{:02x}",
+		bytes[0],
+		bytes[1],
+		bytes[2],
+		bytes[3],
+		bytes[4],
+		bytes[5],
+		bytes[6],
+		bytes[7],
+		bytes[8],
+		bytes[9],
+		bytes[10],
+		bytes[11],
+		bytes[12],
+		bytes[13],
+		bytes[14],
+		bytes[15],
+	))
+}
+
 fn activation_request(
 	app: pb::AppRef,
 	mut bindings: Vec<pb::AppFunctionBinding>,
+	request_id: String,
 ) -> pb::ActivateAppRequest {
 	bindings.sort_by(|left, right| left.name.cmp(&right.name));
-	let encoded = bindings
-		.iter()
-		.flat_map(|binding| binding.encode_to_vec())
-		.collect::<Vec<_>>();
 	pb::ActivateAppRequest {
 		app: Some(app),
 		functions: bindings,
 		expected_current_presence: None,
-		request_id: request_id("cli-activate", &encoded),
+		request_id,
 	}
 }
 
@@ -806,8 +830,9 @@ fn deploy_target_mode(
 		return Ok(revisions);
 	}
 	let app = pb::AppRef { namespace: inspected.namespace, name: inspected.app };
+	let activation_request_id = deploy_request_id()?;
 	let activated = grpc
-		.block_on(functions.activate_app(activation_request(app, bindings)))
+		.block_on(functions.activate_app(activation_request(app, bindings, activation_request_id)))
 		.map_err(status_error)?
 		.into_inner();
 	let revision = activated
@@ -1012,9 +1037,10 @@ fn envelope_json(grpc: &Grpc, envelope: &pb::ValueEnvelope) -> Result<Value> {
 		return err("call result size does not match its envelope");
 	}
 	if let Some(checksum) = &envelope.checksum
-		&& checksum.value != Sha256::digest(&data).as_slice() {
-			return err("call result checksum mismatch");
-		}
+		&& checksum.value != Sha256::digest(&data).as_slice()
+	{
+		return err("call result checksum mismatch");
+	}
 	serde_json::from_slice(&data).map_err(Into::into)
 }
 
@@ -2699,7 +2725,7 @@ mod durable_cli_tests {
 	}
 
 	#[test]
-	fn registration_and_activation_ids_are_deterministic_and_secret_free() {
+	fn registration_is_deterministic_and_activation_is_fresh_per_command() {
 		let spec = pb::FunctionSpec {
 			function: Some(pb::FunctionRef {
 				namespace: "default".to_owned(),
@@ -2727,10 +2753,21 @@ mod durable_cli_tests {
 				revision_id: id.to_owned(),
 			}),
 		};
+		let first_command_id = deploy_request_id().unwrap();
+		let second_command_id = deploy_request_id().unwrap();
+		assert_ne!(first_command_id, second_command_id);
+		assert!(first_command_id.starts_with("cli-activate-"));
+
+		let app = pb::AppRef { namespace: "default".to_owned(), name: "demo".to_owned() };
 		let activation = activation_request(
-			pb::AppRef { namespace: "default".to_owned(), name: "demo".to_owned() },
+			app.clone(),
 			vec![revision("zeta", "r2"), revision("alpha", "r1")],
+			first_command_id.clone(),
 		);
+		let retry = activation.clone();
+		assert_eq!(activation.request_id, first_command_id);
+		assert_eq!(retry.request_id, activation.request_id);
+		assert_eq!(activation.app.as_ref(), Some(&app));
 		assert_eq!(
 			activation
 				.functions
@@ -2745,6 +2782,7 @@ mod durable_cli_tests {
 				.iter()
 				.all(|binding| binding.revision.is_some())
 		);
+		assert_eq!(activation.request_id.len(), "cli-activate-".len() + 36);
 		assert!(activation.expected_current_presence.is_none());
 		assert!(!String::from_utf8_lossy(&activation.encode_to_vec()).contains("secret-value"));
 	}

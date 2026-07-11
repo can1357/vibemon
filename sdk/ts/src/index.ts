@@ -29,7 +29,6 @@ export {
 } from "./driver";
 export { type DsnConfig, type DsnEndpoint, type ParseDsnOptions, parseDsn } from "./dsn";
 export { APIError, type APIErrorShape, ProtocolError, TransportError } from "./errors";
-export { createWsBridgeTransport, type WsBridgeTransportOptions } from "./grpc-ws";
 export type {
   EventRecord,
   ExecExit,
@@ -83,6 +82,7 @@ export {
   decodeValue,
   type EncodeValueOptions,
   encodeValue,
+  type JsonValue,
   type PortableValue,
   type ValueArtifactStore,
   parseJsonValue,
@@ -98,5 +98,4 @@ export {
   type SandboxListOptions,
   type WaitReadyOptions,
 } from "./sandbox";
-export type { components, operations, paths } from "./schema";
 export { Secret, type SecretInput, type SecretWire, Volume } from "./values";

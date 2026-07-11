@@ -225,14 +225,14 @@ test("pool list rejects malformed server data", async () => {
 
 test("typed response models reject malformed payloads", async () => {
   const { state, transport } = fakeVmon();
-  let health: unknown = {};
+  let healthBody = "{}";
   const client = new Client(
     new MeshDriver("http://node-a", {
       discover: false,
       transport,
       fetch: () =>
         Promise.resolve(
-          new Response(JSON.stringify(health), {
+          new Response(healthBody, {
             status: 200,
             headers: { "content-type": "application/json" },
           }),
@@ -240,16 +240,14 @@ test("typed response models reject malformed payloads", async () => {
     }),
   );
 
-  for (const response of [{}, [], null]) {
-    health = response;
+  for (const response of ["{}", "[]", "null", '{"ok":true,"bad":NaN}']) {
+    healthBody = response;
     await expect(client.health()).rejects.toBeInstanceOf(ProtocolError);
   }
 
   state.view = {};
   await expect(client.info()).rejects.toBeInstanceOf(ProtocolError);
-  await expect(client.sandboxes.create({ image: "alpine" })).rejects.toBeInstanceOf(
-    ProtocolError,
-  );
+  await expect(client.sandboxes.create({ image: "alpine" })).rejects.toBeInstanceOf(ProtocolError);
   state.rows = [null];
   await expect(client.sandboxes.list()).rejects.toBeInstanceOf(ProtocolError);
   await expect(client.mesh.status()).rejects.toBeInstanceOf(ProtocolError);

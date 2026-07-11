@@ -1,17 +1,28 @@
 import type { ArtifactRef, ValueEnvelope } from "./gen/vmon/v1/api_pb";
 import { DigestAlgorithm, ValueCompression, ValueSerializer } from "./gen/vmon/v1/api_pb";
 
+/** Values represented by one strict JSON document. */
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 /** Values accepted by the portable JSON and CBOR function codecs. */
 export type PortableValue =
   | null
   | boolean
   | number
+  | bigint
   | string
+  | Uint8Array
   | PortableValue[]
   | { [key: string]: PortableValue };
 
-/** Parse one strict JSON value without widening it to `any`. */
-export function parseJsonValue(text: string): PortableValue {
+/** Parse one strict JSON value while preserving its recursive value type. */
+export function parseJsonValue(text: string): JsonValue {
   return new JsonReader(text).parse();
 }
 /** Portable serializers supported by this SDK. */
@@ -20,7 +31,9 @@ export type ValueSerializerName = "json" | "cbor";
 export type ValueCompressionName = "none" | "gzip";
 /** Artifact operations used when a value is too large to inline. */
 export interface ValueArtifactStore {
+  /** Persist bytes and return their immutable artifact reference. */
   put(data: Uint8Array, mediaType: string): Promise<ArtifactRef>;
+  /** Load the bytes addressed by an artifact reference. */
   get(ref: ArtifactRef): Promise<Uint8Array>;
 }
 /** Value encoding settings. */
@@ -53,10 +66,13 @@ export async function encodeValue(
   const compression = options.compression ?? "none";
   if (compression !== "none" && compression !== "gzip")
     throw new Error(`unsupported value compression ${String(compression)}`);
-  const raw =
-    serializer === "json"
-      ? encodeJson(value)
-      : (checkPortable(value, "$", new Set<object>(), false), encodeCbor(value));
+  let raw: Uint8Array;
+  if (serializer === "json") {
+    raw = encodeJson(value);
+  } else {
+    checkPortable(value, "$", new Set<object>(), false);
+    raw = encodeCbor(value);
+  }
   const stored = compression === "gzip" ? await transformBytes(raw, "gzip", true) : raw;
   const checksum = await sha256(raw);
   const inlineLimit = options.inlineLimit ?? 256 * 1024;
@@ -147,7 +163,9 @@ function writeJson(value: unknown, path: string, active: Set<object>): string {
     }
     return JSON.stringify(value);
   }
+  if (typeof value === "bigint") throw new TypeError(`${path} bigint is not supported by JSON`);
   if (typeof value !== "object") throw new TypeError(`${path} is not a portable value`);
+  if (value instanceof Uint8Array) throw new TypeError(`${path} bytes are not supported by JSON`);
   if (active.has(value)) throw new TypeError(`${path} contains a cycle`);
   active.add(value);
   let encoded: string;
@@ -193,7 +211,17 @@ function checkPortable(
     }
     return;
   }
+  if (typeof value === "bigint") {
+    if (iJson) throw new TypeError(`${path} bigint is not supported by JSON`);
+    if (value < -0x1_0000_0000_0000_0000n || value > 0xffff_ffff_ffff_ffffn)
+      throw new TypeError(`${path} bigint exceeds the CBOR 64-bit integer range`);
+    return;
+  }
   if (typeof value !== "object") throw new TypeError(`${path} is not a portable value`);
+  if (value instanceof Uint8Array) {
+    if (iJson) throw new TypeError(`${path} bytes are not supported by JSON`);
+    return;
+  }
   if (active.has(value)) throw new TypeError(`${path} contains a cycle`);
   active.add(value);
   if (Array.isArray(value)) {
@@ -265,10 +293,19 @@ function writeCbor(value: PortableValue, output: number[]): void {
     }
     return;
   }
+  if (typeof value === "bigint") {
+    writeBigIntHead(value >= 0n ? 0 : 1, value >= 0n ? value : -1n - value, output);
+    return;
+  }
   if (typeof value === "string") {
     const bytes = textEncoder.encode(value);
     writeHead(3, bytes.byteLength, output);
     output.push(...bytes);
+    return;
+  }
+  if (value instanceof Uint8Array) {
+    writeHead(2, value.byteLength, output);
+    output.push(...value);
     return;
   }
   if (Array.isArray(value)) {
@@ -320,6 +357,15 @@ function writeHead(major: number, value: number, output: number[]): void {
     low & 0xff,
   );
 }
+function writeBigIntHead(major: number, value: bigint, output: number[]): void {
+  if (value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    writeHead(major, Number(value), output);
+    return;
+  }
+  output.push((major << 5) | 27);
+  for (let shift = 56n; shift >= 0n; shift -= 8n) output.push(Number((value >> shift) & 0xffn));
+}
+
 function decodeCbor(data: Uint8Array): PortableValue {
   const reader = new CborReader(data);
   const value = reader.value();
@@ -351,13 +397,13 @@ async function verifyArtifact(ref: ArtifactRef, data: Uint8Array): Promise<void>
 class JsonReader {
   #offset = 0;
   constructor(readonly text: string) {}
-  parse(): PortableValue {
+  parse(): JsonValue {
     const value = this.value("$");
     this.whitespace();
     if (this.#offset !== this.text.length) throw new Error("trailing data in JSON value");
     return value;
   }
-  value(path: string): PortableValue {
+  value(path: string): JsonValue {
     this.whitespace();
     const char = this.text[this.#offset];
     if (char === '"') return this.string(path);
@@ -413,9 +459,9 @@ class JsonReader {
     }
     throw new Error("unterminated JSON string");
   }
-  array(path: string): PortableValue[] {
+  array(path: string): JsonValue[] {
     this.#offset += 1;
-    const result: PortableValue[] = [];
+    const result: JsonValue[] = [];
     this.whitespace();
     if (this.text[this.#offset] === "]") {
       this.#offset += 1;
@@ -429,9 +475,9 @@ class JsonReader {
       if (delimiter !== ",") throw new Error("invalid JSON array delimiter");
     }
   }
-  object(path: string): Record<string, PortableValue> {
+  object(path: string): Record<string, JsonValue> {
     this.#offset += 1;
-    const result: Record<string, PortableValue> = {};
+    const result: Record<string, JsonValue> = {};
     this.whitespace();
     if (this.text[this.#offset] === "}") {
       this.#offset += 1;
@@ -487,8 +533,12 @@ class CborReader {
     const head = this.byte();
     const major = head >>> 5;
     const additional = head & 31;
-    if (major === 0) return this.length(additional);
-    if (major === 1) return -1 - this.length(additional);
+    if (major === 0) return this.integer(additional);
+    if (major === 1) {
+      const value = this.integer(additional);
+      return typeof value === "bigint" ? -1n - value : -1 - value;
+    }
+    if (major === 2) return this.bytes(this.length(additional)).slice();
     if (major === 3) return textDecoder.decode(this.bytes(this.length(additional)));
     if (major === 4) {
       const count = this.length(additional);
@@ -518,6 +568,15 @@ class CborReader {
     if (major === 7 && additional === 27) return this.float64();
     throw new Error("unsupported CBOR value");
   }
+  integer(additional: number): number | bigint {
+    if (additional !== 27) return this.length(additional);
+    const high =
+      this.byte() * 0x1_000000 + this.byte() * 0x10000 + this.byte() * 0x100 + this.byte();
+    const low =
+      this.byte() * 0x1_000000 + this.byte() * 0x10000 + this.byte() * 0x100 + this.byte();
+    const value = (BigInt(high) << 32n) | BigInt(low);
+    return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
+  }
   length(additional: number): number {
     if (additional < 24) return additional;
     if (additional === 24) return this.byte();
@@ -531,7 +590,7 @@ class CborReader {
         this.byte() * 0x1_000000 + this.byte() * 0x10000 + this.byte() * 0x100 + this.byte();
       const value = high * 0x1_0000_0000 + low;
       if (!Number.isSafeInteger(value))
-        throw new Error("CBOR integer exceeds JavaScript safe integer range");
+        throw new Error("CBOR length exceeds JavaScript safe range");
       return value;
     }
     throw new Error("indefinite CBOR values are not supported");

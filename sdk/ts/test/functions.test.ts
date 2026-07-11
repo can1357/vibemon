@@ -10,7 +10,12 @@ import {
   decodeValue,
   encodeValue,
 } from "../src";
-import type { ArtifactRef, CallError, ValueEnvelope } from "../src/gen/vmon/v1/api_pb";
+import type {
+  ArtifactRef,
+  CallError,
+  CallResultSchema,
+  ValueEnvelope,
+} from "../src/gen/vmon/v1/api_pb";
 import {
   ArtifactService,
   CallService,
@@ -19,7 +24,6 @@ import {
   FunctionService,
   LogStream,
   CallEventSchema,
-  CallResultSchema,
   CallRecordSchema,
   CreateCallRequestSchema,
   FunctionRevisionSchema,
@@ -50,6 +54,9 @@ interface HarnessState {
   artifacts: Map<string, Uint8Array>;
   serializers: number[];
   failures: Map<string, CallError>;
+  cancelledCalls: Set<string>;
+  getResultCount: number;
+  inputReceived: Promise<void>;
 }
 
 function callError(message: string): CallError {
@@ -74,18 +81,13 @@ function callError(message: string): CallError {
 }
 
 function makeClient(): { client: Client; state: HarnessState } {
-  let resolveCancellation = () => {};
-  const cancelled = new Promise<void>((resolve) => {
-    resolveCancellation = resolve;
-  });
+  const { promise: cancelled, resolve: resolveCancellation } = Promise.withResolvers<void>();
+  const { promise: inputReceived, resolve: resolveInputReceived } = Promise.withResolvers<void>();
   const artifactKey = (ref: ArtifactRef): string => {
     if (!ref.digest) throw new Error("artifact reference missing digest");
     return Array.from(ref.digest.value, (byte) => byte.toString(16).padStart(2, "0")).join("");
   };
-  let resolveBatchClosed = () => {};
-  const batchClosed = new Promise<void>((resolve) => {
-    resolveBatchClosed = resolve;
-  });
+  const { promise: batchClosed, resolve: resolveBatchClosed } = Promise.withResolvers<void>();
   const state: HarnessState = {
     nextId: 1,
     cancelCount: 0,
@@ -98,6 +100,9 @@ function makeClient(): { client: Client; state: HarnessState } {
     serializers: [],
     artifacts: new Map(),
     failures: new Map(),
+    cancelledCalls: new Set(),
+    getResultCount: 0,
+    inputReceived,
   };
   const artifactStore: ValueArtifactStore = {
     async put(data) {
@@ -229,6 +234,7 @@ function makeClient(): { client: Client; state: HarnessState } {
             throw new Error("invalid input frame");
           const value = await decodeValue(request.frame.value.payload.value);
           state.inputs.get(id)?.push(value);
+          resolveInputReceived();
           state.results
             .get(id)
             ?.push(await encodeValue(typeof value === "number" ? value * 2 : value));
@@ -268,10 +274,15 @@ function makeClient(): { client: Client; state: HarnessState } {
         const id = request.callId;
         const count = BigInt(state.inputs.get(id)?.length ?? 0);
         const failure = state.failures.get(id);
+        const cancelled = state.cancelledCalls.has(id);
         return {
           ref: { callId: id },
           type: count > 1n ? CallType.BATCH : CallType.UNARY,
-          status: failure ? CallStatus.FAILED : CallStatus.SUCCEEDED,
+          status: cancelled
+            ? CallStatus.CANCELLED
+            : failure
+              ? CallStatus.FAILED
+              : CallStatus.SUCCEEDED,
           inputsClosed: true,
           inputCount: count,
           resultCount: BigInt(state.results.get(id)?.length ?? 0),
@@ -295,6 +306,7 @@ function makeClient(): { client: Client; state: HarnessState } {
         };
       },
       getResult(request) {
+        state.getResultCount += 1;
         const id = request.call?.callId ?? "";
         const index = Number(request.index);
         const value = state.results.get(id)?.[index];
@@ -372,7 +384,12 @@ function makeClient(): { client: Client; state: HarnessState } {
             sequence: BigInt(values.length + 1),
             createdAtUnixMillis: 3n,
             type: 1,
-            payload: { case: "status", value: { status: CallStatus.SUCCEEDED } },
+            payload: {
+              case: "status",
+              value: {
+                status: state.cancelledCalls.has(id) ? CallStatus.CANCELLED : CallStatus.SUCCEEDED,
+              },
+            },
             inputIdPresence: { case: undefined },
             inputIndexPresence: { case: undefined },
             attemptIdPresence: { case: undefined },
@@ -434,6 +451,9 @@ function makeClient(): { client: Client; state: HarnessState } {
           };
       },
       cancel(request) {
+        const id = request.call?.callId ?? "";
+        state.cancelledCalls.add(id);
+        resolveBatchClosed();
         state.cancelCount += 1;
         resolveCancellation();
         return {
@@ -525,6 +545,72 @@ test("streamed batches preserve input order and indexed access", async () => {
     yieldIndex: undefined,
     sequence: 2n,
   });
+});
+
+test("batch cancellation stops feeder pulls and requests durable cancellation", async () => {
+  const { client, state } = makeClient();
+  const fn = await client.functions.fromName("double");
+  let pulls = 0;
+  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+  async function* slowInputs() {
+    pulls += 1;
+    await gate;
+    yield 1;
+    pulls += 1;
+    yield 2;
+  }
+  const batch = await fn.spawnMap(slowInputs());
+  const cancelling = batch.cancel();
+  release();
+  await cancelling;
+  expect(pulls).toBe(0);
+  expect(state.cancelCount).toBe(1);
+  expect(state.inputs.get(batch.id)).toEqual([]);
+});
+
+test("throwing batch sources cancel the durable call and settle submission", async () => {
+  const { client, state } = makeClient();
+  const fn = await client.functions.fromName("double");
+  async function* throwingInputs() {
+    yield 1;
+    throw new Error("source failed");
+  }
+  const batch = await fn.spawnMap(throwingInputs());
+  await expect(batch.result(0)).rejects.toThrow("source failed");
+  expect(state.cancelCount).toBe(1);
+  expect(state.cancelledCalls.has(batch.id)).toBeTrue();
+});
+
+test("empty and partially completed cancelled batches are terminal errors", async () => {
+  const { client } = makeClient();
+  const fn = await client.functions.fromName("double");
+  const empty = await fn.spawnMap([]);
+  await empty.cancel();
+  const consumeEmpty = async () => {
+    for await (const value of empty) void value;
+  };
+  await expect(consumeEmpty()).rejects.toThrow("function call was cancelled");
+
+  const partial = await fn.spawnMap([1]);
+  expect(await partial.result(0)).toBe(2);
+  await partial.cancel();
+  const iterator = partial[Symbol.asyncIterator]();
+  expect(await iterator.next()).toEqual({ done: false, value: 2 });
+  await expect(iterator.next()).rejects.toThrow("function call was cancelled");
+});
+
+test("ordered batch iteration bounds an out-of-order completion suffix", async () => {
+  const { client, state } = makeClient();
+  const fn = await client.functions.fromName("double", {
+    input: numberAdapter,
+    result: numberAdapter,
+  });
+  const inputs = Array.from({ length: 40 }, (_, index) => index);
+  const batch = await fn.spawnMap(inputs);
+  const values: number[] = [];
+  for await (const value of batch) values.push(value);
+  expect(values).toEqual(inputs.map((value) => value * 2));
+  expect(state.getResultCount).toBeGreaterThan(0);
 });
 
 test("artifact-backed results verify the referenced stored-byte digest", async () => {

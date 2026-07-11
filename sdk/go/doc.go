@@ -4,6 +4,8 @@
 // It discovers advertised peers lazily and fails over only on transport-level
 // connection failures. NewClient binds the same object model to an injected Driver.
 // Sandbox operations live on values returned by Client.Sandboxes.
+// Health, server, mesh, sandbox-metric, and event responses use exported models;
+// malformed response envelopes return ProtocolError.
 //
 // # Deployed functions
 //

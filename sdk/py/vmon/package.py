@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import importlib
 import inspect
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 from collections.abc import Callable
@@ -16,7 +16,7 @@ from types import ModuleType
 from typing import Literal
 
 MANIFEST_PATH = "vmon-package.json"
-PYTHON_ABI = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
+PYTHON_ABI = f"cp{sys.version_info.major}{sys.version_info.minor}"
 _DEFAULT_EXCLUDES = (
     ".git/**",
     ".hg/**",
@@ -245,9 +245,10 @@ def package_callable(
 
 def _module_root(module_file: Path, module_name: str) -> Path:
     path = module_file.resolve()
-    components = module_name.split(".")
     root = path.parent
-    for _ in range(max(0, len(components) - 1)):
+    module_depth = len(module_name.split("."))
+    levels = module_depth if path.name == "__init__.py" else module_depth - 1
+    for _ in range(max(0, levels)):
         root = root.parent
     return root
 
@@ -266,11 +267,11 @@ def _collect_tree(
             continue
         relative = path.relative_to(relative_to).as_posix()
         archive_path = PurePosixPath(prefix, relative).as_posix() if prefix else relative
-        if _matches(archive_path, _DEFAULT_EXCLUDES) or _matches(relative, _DEFAULT_EXCLUDES):
+        if _matches(archive_path, _DEFAULT_EXCLUDES):
             continue
-        if exclude and (_matches(archive_path, exclude) or _matches(relative, exclude)):
+        if exclude and _matches(archive_path, exclude):
             continue
-        if include and not (_matches(archive_path, include) or _matches(relative, include)):
+        if include and not _matches(archive_path, include):
             continue
         if archive_path == MANIFEST_PATH:
             raise PackageError(f"{MANIFEST_PATH} is reserved")
@@ -280,16 +281,55 @@ def _collect_tree(
 
 
 def _matches(path: str, patterns: tuple[str, ...]) -> bool:
-    parts = PurePosixPath(path).parts
-    suffixes = ("/".join(parts[index:]) for index in range(len(parts)))
-    candidates = tuple(suffixes)
     for pattern in patterns:
-        normalized = pattern.replace("\\", "/").lstrip("/")
-        if any(fnmatch.fnmatchcase(candidate, normalized) for candidate in candidates):
-            return True
-        if "/" not in normalized and any(fnmatch.fnmatchcase(part, normalized) for part in parts):
+        normalized = pattern.replace("\\", "/")
+        anchored = normalized.startswith("/")
+        normalized = normalized.lstrip("/")
+        if not normalized:
+            continue
+        expression = _glob_regex(normalized)
+        if anchored:
+            if re.fullmatch(expression, path):
+                return True
+        elif re.search(rf"(?:^|/){expression}\Z", path):
             return True
     return False
+
+
+def _glob_regex(pattern: str) -> str:
+    """Translate a portable path glob without allowing ``*`` to cross ``/``."""
+    result: list[str] = []
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                index += 2
+                if index < len(pattern) and pattern[index] == "/":
+                    result.append("(?:.*/)?")
+                    index += 1
+                else:
+                    result.append(".*")
+                continue
+            result.append("[^/]*")
+        elif character == "?":
+            result.append("[^/]")
+        elif character == "[":
+            closing = pattern.find("]", index + 1)
+            if closing == -1:
+                result.append(r"\[")
+            else:
+                content = pattern[index + 1 : closing]
+                if content.startswith("!"):
+                    content = "^" + content[1:]
+                elif content.startswith("^"):
+                    content = "\\" + content
+                result.append("[" + content + "]")
+                index = closing
+        else:
+            result.append(re.escape(character))
+        index += 1
+    return "".join(result)
 
 
 def _write_zip_entry(archive: zipfile.ZipFile, path: str, data: bytes) -> None:

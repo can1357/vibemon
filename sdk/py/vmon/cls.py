@@ -89,7 +89,11 @@ class RemoteClass:
         name: str | None = None,
         revision: str | None = None,
         options: FunctionOptions | None = None,
+        package_mode: str = "package",
+        package_root: str | None = None,
         include: Sequence[str] = (),
+        exclude: Sequence[str] = (),
+        local_packages: Sequence[str] = (),
         service: bool = False,
         snapshot_after_initialize: bool = False,
         snapshot_on_worker_retire: bool = True,
@@ -153,7 +157,11 @@ class RemoteClass:
             name=self.name,
             revision=revision,
             options=configured,
+            package_mode=package_mode,
+            package_root=package_root,
             include=include,
+            exclude=exclude,
+            local_packages=local_packages,
         )
         self._function.__vmon_class_lifecycle__ = self.lifecycle
         self._function.__vmon_lifecycle_metadata__ = self.metadata

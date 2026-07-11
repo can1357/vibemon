@@ -5,8 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 import vmon
-from vmon._function_proto import value_from_proto
+from vmon._function_proto import artifact_ref, value_from_proto
 from vmon.decorators import CurrentCall, _use_current_call
+from vmon.package import package_callable
 from vmon.v1 import api_pb2 as pb
 
 
@@ -23,6 +24,8 @@ class FunctionStub:
         self.activate = None
         self.created_schedule = None
         self.deleted_schedule = None
+        self.get_app_requests = []
+
         self.rollback = None
 
     def ActivateApp(self, request):
@@ -34,9 +37,21 @@ class FunctionStub:
         )
 
     def GetApp(self, request):
+        self.get_app_requests.append(request)
         app = request.app.pinned.app if request.app.HasField("pinned") else request.app.current
         revision = request.app.pinned.revision_id if request.app.HasField("pinned") else "current-r"
-        return pb.AppRevision(ref=pb.AppRevisionRef(app=app, revision_id=revision))
+        return pb.AppRevision(
+            ref=pb.AppRevisionRef(app=app, revision_id=revision),
+            functions=[
+                pb.AppFunctionBinding(
+                    name="job",
+                    revision=pb.RevisionRef(
+                        function=pb.FunctionRef(namespace="ns", name="worker"),
+                        revision_id="fn-r1",
+                    ),
+                )
+            ],
+        )
 
     def RollbackApp(self, request):
         self.rollback = request
@@ -55,26 +70,36 @@ class FunctionStub:
             next_run_unix_millis=3,
         )
 
+    def GetSchedule(self, request):
+        return pb.ScheduleRecord(
+            ref=request,
+            spec=pb.ScheduleSpec(
+                name="tick",
+                app=pb.AppRevisionRef(
+                    app=pb.AppRef(namespace="ns", name="api"), revision_id="app-r1"
+                ),
+                target=pb.ScheduleTarget(
+                    function=pb.RevisionRef(
+                        function=pb.FunctionRef(namespace="ns", name="worker"),
+                        revision_id="fn-r1",
+                    ),
+                    input=pb.ValueEnvelope(inline_data=b"null"),
+                ),
+                cron=pb.CronSchedule(expression="* * * * *", time_zone="UTC"),
+            ),
+            created_at_unix_millis=1,
+            updated_at_unix_millis=2,
+            next_run_unix_millis=3,
+        )
+
     def ListSchedules(self, request):
+        record = self.GetSchedule(pb.ScheduleRef(schedule_id="schedule-1"))
+        record.spec.app.app.CopyFrom(request.app)
+        second = pb.ScheduleRecord()
+        second.CopyFrom(record)
+        second.ref.schedule_id = "schedule-2"
         return pb.ListSchedulesResponse(
-            schedules=[
-                self.CreateSchedule(
-                    pb.CreateScheduleRequest(
-                        spec=pb.ScheduleSpec(
-                            name="tick",
-                            app=pb.AppRevisionRef(app=request.app, revision_id="app-r1"),
-                            target=pb.ScheduleTarget(
-                                function=pb.RevisionRef(
-                                    function=pb.FunctionRef(namespace="ns", name="worker"),
-                                    revision_id="fn-r1",
-                                ),
-                                input=pb.ValueEnvelope(inline_data=b"null"),
-                            ),
-                            cron=pb.CronSchedule(expression="* * * * *", time_zone="UTC"),
-                        )
-                    )
-                )
-            ],
+            schedules=[record, second],
             next_page_token="next",
         )
 
@@ -178,11 +203,25 @@ def test_app_schedule_uses_pinned_revisions_and_server_owned_rpc():
 
     request = functions.created_schedule
     assert schedule.id == "stable"
+    assert schedule.function.name == "job"
+
     assert request.spec.app.revision_id == "app-r1"
     assert request.spec.target.function.revision_id == "fn-r1"
     assert request.spec.target.input.serializer == pb.VALUE_SERIALIZER_JSON
+    fetched = app.get_schedule(schedule)
+    assert fetched.function.name == "job"
+    assert fetched.app_revision_id == "app-r1"
+    pinned_lookup = functions.get_app_requests[-1].app.pinned
+    assert (pinned_lookup.app.namespace, pinned_lookup.app.name) == ("ns", "api")
+    assert pinned_lookup.revision_id == "app-r1"
+
+    functions.get_app_requests.clear()
+
     records, token = app.list_schedules()
     assert records[0].timing == vmon.Cron("* * * * *") and token == "next"
+    assert [record.function.name for record in records] == ["job", "job"]
+    assert all(record.app_revision_id == "app-r1" for record in records)
+    assert len(functions.get_app_requests) == 1
     app.delete_schedule(schedule)
     assert functions.deleted_schedule.schedule_id == "stable"
 
@@ -333,6 +372,24 @@ class Counter:
     def add(self, value):
         self.value += value
         return self.value
+
+
+def test_remote_class_snapshot_policy_reaches_function_spec():
+    definition = vmon.RemoteClass(
+        Counter,
+        snapshot_after_initialize=True,
+        snapshot_on_worker_retire=True,
+    )
+    package = package_callable(Counter)
+    spec = definition._function._make_spec(
+        package,
+        artifact_ref(package.sha256),
+        {},
+    )
+
+    assert spec.lifecycle == pb.FUNCTION_LIFECYCLE_ACTOR
+    assert spec.lifecycle_hooks.snapshot_after_initialize is True
+    assert spec.lifecycle_hooks.snapshot_on_worker_retire is True
 
 
 def test_actor_recovery_targets_lifecycle_and_service_distinction():

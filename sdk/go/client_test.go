@@ -124,7 +124,7 @@ func TestClientServicesAndBoundSandbox(t *testing.T) {
 }
 
 func TestTypedResponsesRejectMalformedPayloads(t *testing.T) {
-	for _, body := range []string{"{}", "[]", "null", "not-json"} {
+	for _, body := range []string{"{}", "[]", "null", "not-json", `{"ok":true,"bad":NaN}`} {
 		t.Run("health "+body, func(t *testing.T) {
 			driver := &stubDriver{do: func(context.Context, DriverRequest) (*http.Response, string, error) {
 				return jsonResponse(http.StatusOK, body), "http://node", nil

@@ -50,10 +50,14 @@ def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
 def decode_view(payload: str, error: str) -> dict[str, Any]:
     """Parse a ``JsonView`` document, requiring a JSON object."""
     try:
-        value = json.loads(payload)
+        value = json.loads(payload, parse_constant=_reject_json_constant)
     except ValueError as exc:
         raise ProtocolError(error) from exc
     if not isinstance(value, dict):

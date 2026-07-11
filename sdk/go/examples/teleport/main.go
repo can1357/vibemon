@@ -60,6 +60,7 @@ func main() {
 		Command:        []string{"sleep", "600"},
 		MemoryMiB:      uint32(*memMiB),
 		TimeoutSeconds: &timeout,
+		HA:             "off",
 	})
 	if err != nil {
 		log.Fatalf("create sandbox: %v", err)

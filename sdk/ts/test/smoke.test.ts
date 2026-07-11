@@ -5,9 +5,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 
-import { type Client, connect } from "../src";
+import { type Client, FunctionCall, connect } from "../src";
 
 const wantsSmoke = process.env.VMON_TS_SMOKE === "1";
+const wantsRemoteSmoke = process.env.VMON_TS_REMOTE_SMOKE === "1";
 const configuredUrl = process.env.VMON_SERVER_URL;
 const configuredToken = process.env.VMON_API_TOKEN;
 const localBinary = resolve(import.meta.dir, "../../../target/debug/vmon");
@@ -44,6 +45,46 @@ if (!wantsSmoke) {
 } else {
   console.log(`SKIP sdk-ts smoke: VMON_TS_SMOKE=1 but ${localBinary} does not exist`);
   test.skip("gated vmon API smoke", () => {});
+}
+
+if (!wantsRemoteSmoke) {
+  console.log(
+    "SKIP sdk-ts remote function smoke: set VMON_TS_REMOTE_SMOKE=1 to use deployed functions",
+  );
+  test.skip("gated portable remote function smoke", () => {});
+} else {
+  test("portable deployed functions survive detached call reconstruction", async () => {
+    const serverUrl = requiredEnvironment("VMON_SERVER_URL");
+    const token = requiredEnvironment("VMON_API_TOKEN");
+    const namespace = requiredEnvironment("VMON_REMOTE_NAMESPACE");
+    const jsonName = requiredEnvironment("VMON_REMOTE_JSON_NAME");
+    const jsonRevision = requiredEnvironment("VMON_REMOTE_JSON_REVISION");
+    const cborName = requiredEnvironment("VMON_REMOTE_CBOR_NAME");
+    const cborRevision = requiredEnvironment("VMON_REMOTE_CBOR_REVISION");
+    const client = connect(serverUrl, { token, discover: false });
+
+    const jsonFunction = await client.functions.fromName(jsonName, { namespace });
+    expect(jsonFunction.revision.revisionId).toBe(jsonRevision);
+    expect(await jsonFunction.remote({ language: "typescript", portable: true })).toEqual({
+      language: "typescript",
+      portable: true,
+    });
+    const spawned = await jsonFunction.spawn({ durable: "same-result" });
+    expect(spawned.id.length).toBeGreaterThan(0);
+    const reconstructed = FunctionCall.fromId(client, spawned.id);
+    expect(await reconstructed.get()).toEqual({ durable: "same-result" });
+
+    const cborFunction = await client.functions.fromName(cborName, {
+      namespace,
+      serializer: "cbor",
+    });
+    expect(cborFunction.revision.revisionId).toBe(cborRevision);
+    const cborValue = {
+      bytes: new Uint8Array([0, 1, 255]),
+      wide: 2n ** 53n,
+    };
+    expect(await cborFunction.remote(cborValue)).toEqual(cborValue);
+  }, 180_000);
 }
 
 afterAll(async () => {
@@ -175,4 +216,10 @@ function childExit(child: ChildProcess): Promise<void> {
 
 function serverFailureMessage(message: string): string {
   return `${message}\nstdout:\n${spawnedStdout}\nstderr:\n${spawnedStderr}`;
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required when VMON_TS_REMOTE_SMOKE=1`);
+  return value;
 }

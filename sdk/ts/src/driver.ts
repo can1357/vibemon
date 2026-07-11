@@ -111,6 +111,7 @@ export interface DriverOptions extends ParseDsnOptions {
   fetch?: VmonFetch;
   websocket?: typeof WebSocket;
   transport?: TransportFactory;
+  /** Clock override used by deterministic cooldown tests. */
   now?: () => number;
 }
 

@@ -1,10 +1,13 @@
 package vmon
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"os"
 	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	"google.golang.org/grpc"
@@ -177,4 +180,90 @@ func TestWatchCursorAndCancel(t *testing.T) {
 	if request == nil || request.RequestId == "" {
 		t.Fatal("cancel request omitted idempotency request_id")
 	}
+}
+
+type portableCBORValue struct {
+	Bytes []byte `cbor:"bytes"`
+	Wide  uint64 `cbor:"wide"`
+}
+
+func TestRemoteDaemonPortableFunctions(t *testing.T) {
+	if os.Getenv("VMON_GO_REMOTE_SMOKE") != "1" {
+		t.Skip("set VMON_GO_REMOTE_SMOKE=1 to run real-daemon function smoke")
+	}
+	serverURL := requiredRemoteSmokeEnv(t, "VMON_SERVER_URL")
+	token := requiredRemoteSmokeEnv(t, "VMON_API_TOKEN")
+	namespace := requiredRemoteSmokeEnv(t, "VMON_REMOTE_NAMESPACE")
+	jsonName := requiredRemoteSmokeEnv(t, "VMON_REMOTE_JSON_NAME")
+	jsonRevision := requiredRemoteSmokeEnv(t, "VMON_REMOTE_JSON_REVISION")
+	cborName := requiredRemoteSmokeEnv(t, "VMON_REMOTE_CBOR_NAME")
+	cborRevision := requiredRemoteSmokeEnv(t, "VMON_REMOTE_CBOR_REVISION")
+
+	client, err := Connect(serverURL, WithToken(token), WithDiscovery(false))
+	if err != nil {
+		t.Fatalf("connect to %s: %v", serverURL, err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	jsonFunction, err := LookupFunction[map[string]any](ctx, client, namespace, jsonName)
+	if err != nil {
+		t.Fatalf("lookup JSON function %s/%s: %v", namespace, jsonName, err)
+	}
+	if jsonFunction.RevisionID() != jsonRevision {
+		t.Fatalf("JSON revision = %q, deployed %q", jsonFunction.RevisionID(), jsonRevision)
+	}
+	remoteJSON, err := jsonFunction.Remote(ctx, map[string]any{"language": "go", "portable": true})
+	if err != nil {
+		t.Fatalf("JSON Remote: %v", err)
+	}
+	if remoteJSON["language"] != "go" || remoteJSON["portable"] != true {
+		t.Fatalf("JSON Remote result = %#v", remoteJSON)
+	}
+	spawned, err := jsonFunction.Spawn(ctx, map[string]any{"durable": "same-result"})
+	if err != nil {
+		t.Fatalf("JSON Spawn: %v", err)
+	}
+	callID := spawned.ID()
+	if callID == "" {
+		t.Fatal("JSON Spawn returned empty call ID")
+	}
+	reconstructed, err := FunctionCallFromID[map[string]any](client, callID)
+	if err != nil {
+		t.Fatalf("reconstruct call %q: %v", callID, err)
+	}
+	durableJSON, err := reconstructed.Get(ctx)
+	if err != nil {
+		t.Fatalf("get reconstructed call %q: %v", callID, err)
+	}
+	if durableJSON["durable"] != "same-result" {
+		t.Fatalf("reconstructed JSON result = %#v", durableJSON)
+	}
+
+	cborFunction, err := LookupFunction[portableCBORValue](ctx, client, namespace, cborName)
+	if err != nil {
+		t.Fatalf("lookup CBOR function %s/%s: %v", namespace, cborName, err)
+	}
+	if cborFunction.RevisionID() != cborRevision {
+		t.Fatalf("CBOR revision = %q, deployed %q", cborFunction.RevisionID(), cborRevision)
+	}
+	cborFunction = cborFunction.WithOptions(WithValueEncoding(ValueCBOR, CompressionNone))
+	portable := portableCBORValue{Bytes: []byte{0, 1, 255}, Wide: uint64(1) << 53}
+	remoteCBOR, err := cborFunction.Remote(ctx, portable)
+	if err != nil {
+		t.Fatalf("CBOR Remote: %v", err)
+	}
+	if !bytes.Equal(remoteCBOR.Bytes, portable.Bytes) || remoteCBOR.Wide != portable.Wide {
+		t.Fatalf("CBOR Remote result = %#v, want %#v", remoteCBOR, portable)
+	}
+}
+
+func requiredRemoteSmokeEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := os.Getenv(name)
+	if value == "" {
+		t.Fatalf("%s is required when VMON_GO_REMOTE_SMOKE=1", name)
+	}
+	return value
 }

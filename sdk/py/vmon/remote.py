@@ -15,9 +15,19 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+)
+from contextlib import suppress
 from dataclasses import replace
-from typing import Any, TypeVar, cast, overload
+from typing import Any, Protocol, Self, TypeVar, cast, overload
 
 import grpc
 
@@ -78,6 +88,17 @@ def _call_owner(
 ) -> tuple[Any, str | None]:
     value = client.driver.call(operation, endpoint=endpoint)
     return value if isinstance(value, tuple) and len(value) == 2 else (value, endpoint)
+
+
+def _reconnectable_rpc(error: BaseException) -> bool:
+    if isinstance(error, TransportError):
+        return True
+    if not isinstance(error, grpc.RpcError):
+        return False
+    return error.code() in {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+    }
 
 
 def _watch_call(stubs: Any, *, request: pb.WatchCallRequest) -> Any:
@@ -249,14 +270,20 @@ async def _run_blocking[R](function: Callable[..., R], *args: Any, **kwargs: Any
     return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
 
 
-def _aio_endpoint(client: Any, endpoint: str | None = None) -> tuple[Any, Any, float] | None:
+def _aio_endpoint(
+    client: Any, endpoint: str | None = None
+) -> tuple[Any, Any, float, str | None] | None:
     provider = getattr(client.driver, "aio_endpoint", None)
     if provider is None:
         return None
     try:
-        return provider(endpoint)
+        selected = provider(endpoint)
     except TypeError:
-        return provider()
+        selected = provider()
+    if len(selected) == 4:
+        return selected
+    stubs, metadata, deadline = selected
+    return stubs, metadata, deadline, endpoint
 
 
 def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
@@ -264,6 +291,44 @@ def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
         return True, next(iterator)
     except StopIteration:
         return False, None
+
+
+async def _iterate_async(
+    source: Iterable[Any] | AsyncIterable[Any],
+) -> AsyncGenerator[Any]:
+    if isinstance(source, AsyncIterable):
+        iterator = source.__aiter__()
+        try:
+            while True:
+                try:
+                    yield await anext(iterator)
+                except StopAsyncIteration:
+                    return
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+    else:
+        for item in source:
+            yield item
+
+
+async def _zip_async(
+    sources: tuple[Iterable[Any] | AsyncIterable[Any], ...],
+) -> AsyncIterator[tuple[Any, ...]]:
+    iterators = [_iterate_async(source) for source in sources]
+    try:
+        while True:
+            row = []
+            for iterator in iterators:
+                try:
+                    row.append(await anext(iterator))
+                except StopAsyncIteration:
+                    return
+            yield tuple(row)
+    finally:
+        for iterator in iterators:
+            await iterator.aclose()
 
 
 def _raise(error: pb.CallError) -> None:
@@ -287,7 +352,13 @@ def _invocation(args: Iterable[Any], kwargs: Mapping[str, Any]) -> dict[str, Any
     }
 
 
-def _result_value(client: Any, result: pb.CallResult, *, trusted: bool) -> Any:
+def _result_value(
+    client: Any,
+    result: pb.CallResult,
+    *,
+    trusted: bool,
+    endpoint: str | None = None,
+) -> Any:
     if result.WhichOneof("outcome") == "error":
         _raise(result.error)
     envelope = result.value
@@ -297,6 +368,7 @@ def _result_value(client: Any, result: pb.CallResult, *, trusted: bool) -> Any:
             client,
             lambda s: s.artifacts.Get(pb.GetArtifactRequest(artifact=envelope.artifact)),
             stream=True,
+            endpoint=endpoint,
         )
         data = b"".join(chunk.data for chunk in chunks)
     return decode_value(value_from_proto(envelope, data), trusted=trusted)
@@ -312,10 +384,17 @@ def _encode_input(
     return value_to_proto(envelope), data
 
 
-def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.ArtifactRef:
+def _upload(
+    client: Any,
+    data: bytes,
+    sha256: str,
+    media_type: str,
+    *,
+    endpoint: str | None = None,
+) -> pb.ArtifactRef:
     ref = artifact_ref(sha256, len(data))
     try:
-        _call(client, lambda stubs: stubs.artifacts.Stat(ref))
+        _call(client, lambda stubs: stubs.artifacts.Stat(ref), endpoint=endpoint)
         return ref
     except APIError as exc:
         if exc.code != "not_found" and exc.status != 404:
@@ -332,7 +411,11 @@ def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.Artifa
         for offset in range(0, len(data), 256 * 1024):
             yield pb.PutArtifactRequest(data=data[offset : offset + 256 * 1024])
 
-    record = _call(client, lambda stubs: stubs.artifacts.Put(frames()))
+    record = _call(
+        client,
+        lambda stubs: stubs.artifacts.Put(frames()),
+        endpoint=endpoint,
+    )
     return record.ref
 
 
@@ -344,6 +427,7 @@ def _arguments(
     codec: ValueCodec,
     trusted: bool,
     compression: Any,
+    endpoint: str | None = None,
 ) -> pb.InvocationArguments:
     message = pb.InvocationArguments()
     for value in args:
@@ -354,6 +438,7 @@ def _arguments(
                 artifact,
                 envelope.artifact.digest.value.hex(),
                 "application/vnd.vmon.value",
+                endpoint=endpoint,
             )
             envelope.artifact.CopyFrom(ref)
         message.positional.append(envelope)
@@ -365,6 +450,7 @@ def _arguments(
                 artifact,
                 envelope.artifact.digest.value.hex(),
                 "application/vnd.vmon.value",
+                endpoint=endpoint,
             )
             envelope.artifact.CopyFrom(ref)
         message.named[name].CopyFrom(envelope)
@@ -490,16 +576,50 @@ class FunctionCall[R]:
         bound_client = _client(client)
         if not hasattr(bound_client, "driver"):
             return cls(call_id, bound_client, trusted=trusted)
-        record, endpoint = _call_owner(
-            bound_client,
-            lambda stubs: stubs.calls.Get(pb.CallRef(call_id=call_id)),
-        )
+        resolver = getattr(bound_client.driver, "resolve_call", None)
+        if callable(resolver):
+            endpoint = resolver(call_id)
+            _call(
+                bound_client,
+                lambda stubs: stubs.calls.Get(pb.CallRef(call_id=call_id)),
+                endpoint=endpoint,
+            )
+        else:
+            _, endpoint = _call_owner(
+                bound_client,
+                lambda stubs: stubs.calls.Get(pb.CallRef(call_id=call_id)),
+            )
         return cls(call_id, bound_client, trusted=trusted, endpoint=endpoint)
 
     @property
     def aio(self) -> _AsyncCall[R]:
         """Return the native asynchronous facade for this durable call."""
         return _AsyncCall(self)
+
+    def _invoke(self, operation: Callable[[Any], Any], *, stream: bool = False) -> Any:
+        try:
+            return _call(
+                self._client,
+                operation,
+                stream=stream,
+                endpoint=self._endpoint,
+            )
+        except APIError as error:
+            if error.code != "not_found" and error.status != 404:
+                raise
+            resolver = getattr(self._client.driver, "resolve_call", None)
+            if not callable(resolver):
+                raise
+            try:
+                self._endpoint = resolver(self.call_id, self._endpoint)
+            except TypeError:
+                self._endpoint = resolver(self.call_id)
+            return _call(
+                self._client,
+                operation,
+                stream=stream,
+                endpoint=self._endpoint,
+            )
 
     def status(self) -> int:
         return self.get_record().status
@@ -509,11 +629,7 @@ class FunctionCall[R]:
         return self.status() in _TERMINAL
 
     def get_record(self) -> pb.CallRecord:
-        return _call(
-            self._client,
-            lambda stubs: stubs.calls.Get(pb.CallRef(call_id=self.call_id)),
-            endpoint=self._endpoint,
-        )
+        return self._invoke(lambda stubs: stubs.calls.Get(pb.CallRef(call_id=self.call_id)))
 
     def stats(self) -> pb.CallStats:
         return self.get_record().stats
@@ -522,16 +638,14 @@ class FunctionCall[R]:
         return self.get_record().graph
 
     def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
-        return _call(
-            self._client,
+        return self._invoke(
             lambda stubs: stubs.calls.Cancel(
                 pb.CancelCallRequest(
                     call=pb.CallRef(call_id=self.call_id),
                     reason=reason,
                     request_id=str(uuid.uuid4()),
                 )
-            ),
-            endpoint=self._endpoint,
+            )
         )
 
     def events(self, *, after_sequence: int = 0, follow: bool = True) -> Iterator[pb.CallEvent]:
@@ -546,11 +660,9 @@ class FunctionCall[R]:
                     ),
                     follow=follow,
                 )
-                stream = _call(
-                    self._client,
+                stream = self._invoke(
                     functools.partial(_watch_call, request=request),
                     stream=True,
-                    endpoint=self._endpoint,
                 )
                 failures = 0
                 for event in stream:
@@ -560,10 +672,18 @@ class FunctionCall[R]:
                     yield event
                 if not follow or self.status() in _TERMINAL:
                     return
-            except TransportError:
+            except (TransportError, grpc.RpcError) as error:
+                if not _reconnectable_rpc(error):
+                    raise
                 failures += 1
                 if failures > 5:
                     raise
+                resolver = getattr(self._client.driver, "resolve_call", None)
+                if callable(resolver):
+                    try:
+                        self._endpoint = resolver(self.call_id, self._endpoint)
+                    except TypeError:
+                        self._endpoint = resolver(self.call_id)
                 time.sleep(min(0.05 * (2 ** (failures - 1)), 1.0))
 
     def logs(self, *, after_sequence: int = 0, follow: bool = True) -> Iterator[bytes]:
@@ -575,7 +695,13 @@ class FunctionCall[R]:
         for event in self.events(after_sequence=after_sequence):
             if event.WhichOneof("payload") == "yield_result":
                 yield cast(
-                    R, _result_value(self._client, event.yield_result, trusted=self._trusted)
+                    R,
+                    _result_value(
+                        self._client,
+                        event.yield_result,
+                        trusted=self._trusted,
+                        endpoint=self._endpoint,
+                    ),
                 )
 
     def get(self, timeout: float | None = None) -> R:
@@ -592,11 +718,18 @@ class FunctionCall[R]:
                         code="cancelled",
                     )
                 request = pb.GetCallResultRequest(call=record.ref, index=0)
-                item = _call(
-                    self._client,
+                item = self._invoke(
                     functools.partial(_get_call_result, request=request),
                 )
-                return cast(R, _result_value(self._client, item, trusted=self._trusted))
+                return cast(
+                    R,
+                    _result_value(
+                        self._client,
+                        item,
+                        trusted=self._trusted,
+                        endpoint=self._endpoint,
+                    ),
+                )
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"call {self.call_id} did not complete within {timeout} seconds")
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -654,9 +787,9 @@ class BatchCall[R]:
         return self._call.cancel(reason)
 
     @property
-    def aio(self) -> _AsyncCall[Any]:
+    def aio(self) -> _AsyncBatchCall[R]:
         """Return the native asynchronous facade for this durable batch."""
-        return _AsyncCall(self._call)
+        return _AsyncBatchCall(self._call)
 
     def results(
         self,
@@ -664,10 +797,91 @@ class BatchCall[R]:
         order_outputs: bool = True,
         return_exceptions: bool = False,
     ) -> Iterator[R]:
-        pending: dict[int, Any] = {}
-        next_index = 0
-        after_sequence = 0
         try:
+            if order_outputs:
+                next_index = 0
+                while True:
+                    request = pb.GetCallResultRequest(
+                        call=pb.CallRef(call_id=self.id),
+                        index=next_index,
+                    )
+                    try:
+                        item = _call(
+                            self._call._client,
+                            functools.partial(_get_call_result, request=request),
+                            endpoint=self._call._endpoint,
+                        )
+                    except (APIError, grpc.RpcError) as error:
+                        not_found = (
+                            isinstance(error, APIError)
+                            and (error.code == "not_found" or error.status == 404)
+                        ) or (
+                            isinstance(error, grpc.RpcError)
+                            and error.code() == grpc.StatusCode.NOT_FOUND
+                        )
+                        if not not_found:
+                            raise
+                        # A missing result is the normal pending state.  Probe the
+                        # pinned owner before asking the driver to re-resolve it.
+                        try:
+                            record = _call(
+                                self._call._client,
+                                lambda stubs: stubs.calls.Get(pb.CallRef(call_id=self.id)),
+                                endpoint=self._call._endpoint,
+                            )
+                        except (APIError, grpc.RpcError) as record_error:
+                            owner_missing = (
+                                isinstance(record_error, APIError)
+                                and (record_error.code == "not_found" or record_error.status == 404)
+                            ) or (
+                                isinstance(record_error, grpc.RpcError)
+                                and record_error.code() == grpc.StatusCode.NOT_FOUND
+                            )
+                            if not owner_missing:
+                                raise
+                            record = self._call.get_record()
+                        if self._feeder_errors:
+                            raise self._feeder_errors[0]
+                        if record.status not in _TERMINAL:
+                            time.sleep(0.02)
+                            continue
+                        failure: BaseException | None = None
+                        if record.HasField("error"):
+                            failure = RemoteFunctionError(
+                                record.error.message or "remote batch failed",
+                                code=record.error.code,
+                                remote_type=record.error.type,
+                            )
+                        elif record.status == pb.CALL_STATUS_CANCELLED:
+                            failure = RemoteFunctionError(
+                                "remote batch was cancelled", code="cancelled"
+                            )
+                        elif record.status != pb.CALL_STATUS_SUCCEEDED:
+                            failure = RemoteFunctionError(
+                                f"remote batch ended with status {record.status}",
+                                code="remote_error",
+                            )
+                        if failure is not None:
+                            if return_exceptions:
+                                yield cast(R, failure)
+                                return
+                            raise failure
+                        return
+                    try:
+                        value = _result_value(
+                            self._call._client,
+                            item,
+                            trusted=self._call._trusted,
+                            endpoint=self._call._endpoint,
+                        )
+                    except Exception as exc:
+                        if not return_exceptions:
+                            raise
+                        value = exc
+                    yield value
+                    next_index += 1
+
+            after_sequence = 0
             while True:
                 request = pb.ListCallResultsRequest(
                     cursor=pb.ResultCursor(
@@ -676,51 +890,48 @@ class BatchCall[R]:
                     ),
                     page_size=128,
                 )
-                page = _call(
-                    self._call._client,
+                page = self._call._invoke(
                     functools.partial(_list_call_results, request=request),
-                    endpoint=self._call._endpoint,
                 )
                 for item in page.results:
                     after_sequence = max(after_sequence, item.sequence)
                     try:
-                        value = _result_value(self._call._client, item, trusted=self._call._trusted)
+                        value = _result_value(
+                            self._call._client,
+                            item,
+                            trusted=self._call._trusted,
+                            endpoint=self._call._endpoint,
+                        )
                     except Exception as exc:
                         if not return_exceptions:
                             raise
                         value = exc
-                    if not order_outputs:
-                        yield value
-                        continue
-                    pending[item.input_index] = value
-                    while next_index in pending:
-                        yield pending.pop(next_index)
-                        next_index += 1
+                    yield value
                 if self._feeder_errors:
                     raise self._feeder_errors[0]
                 if page.end and self.done():
                     record = self._call.get_record()
-                    failure: BaseException | None = None
+                    terminal_failure: BaseException | None = None
                     if record.HasField("error"):
-                        failure = RemoteFunctionError(
+                        terminal_failure = RemoteFunctionError(
                             record.error.message or "remote batch failed",
                             code=record.error.code,
                             remote_type=record.error.type,
                         )
                     elif record.status == pb.CALL_STATUS_CANCELLED:
-                        failure = RemoteFunctionError(
+                        terminal_failure = RemoteFunctionError(
                             "remote batch was cancelled", code="cancelled"
                         )
                     elif record.status != pb.CALL_STATUS_SUCCEEDED:
-                        failure = RemoteFunctionError(
+                        terminal_failure = RemoteFunctionError(
                             f"remote batch ended with status {record.status}",
                             code="remote_error",
                         )
-                    if failure is not None:
+                    if terminal_failure is not None:
                         if return_exceptions:
-                            yield cast(R, failure)
+                            yield cast(R, terminal_failure)
                             return
-                        raise failure
+                        raise terminal_failure
                     return
                 time.sleep(0.02)
         except GeneratorExit:
@@ -739,7 +950,8 @@ class _AsyncCall[R]:
         endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
         if endpoint is None:
             return await _run_blocking(self._call.cancel, reason)
-        stubs, metadata, deadline = endpoint
+        stubs, metadata, deadline, selected = endpoint
+        self._call._endpoint = selected
         return await stubs.calls.Cancel(
             pb.CancelCallRequest(
                 call=pb.CallRef(call_id=self._call.id),
@@ -750,6 +962,67 @@ class _AsyncCall[R]:
             timeout=deadline,
         )
 
+    async def _events(
+        self,
+        *,
+        after_sequence: int = 0,
+        follow: bool = True,
+    ) -> AsyncIterator[tuple[pb.CallEvent, Any, Any, float]]:
+        cursor = after_sequence
+        failures = 0
+        while True:
+            endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
+            if endpoint is None:
+                raise TransportError("native async endpoint became unavailable")
+            stubs, metadata, deadline, selected = endpoint
+            self._call._endpoint = selected
+            try:
+                stream = stubs.calls.Watch(
+                    pb.WatchCallRequest(
+                        cursor=pb.EventCursor(
+                            call=pb.CallRef(call_id=self._call.id),
+                            after_sequence=cursor,
+                        ),
+                        follow=follow,
+                    ),
+                    metadata=metadata,
+                )
+                async for event in stream:
+                    failures = 0
+                    if event.sequence <= cursor:
+                        continue
+                    cursor = event.sequence
+                    yield event, stubs, metadata, deadline
+                if not follow:
+                    return
+                record = await stubs.calls.Get(
+                    pb.CallRef(call_id=self._call.id),
+                    metadata=metadata,
+                    timeout=deadline,
+                )
+                if record.status in _TERMINAL:
+                    return
+            except grpc.RpcError as error:
+                if not _reconnectable_rpc(error):
+                    raise
+                failures += 1
+                if failures > 5:
+                    raise
+                resolver = getattr(self._call._client.driver, "resolve_call", None)
+                if callable(resolver):
+                    try:
+                        self._call._endpoint = await _run_blocking(
+                            resolver,
+                            self._call.id,
+                            self._call._endpoint,
+                        )
+                    except TypeError:
+                        self._call._endpoint = await _run_blocking(
+                            resolver,
+                            self._call.id,
+                        )
+                await asyncio.sleep(min(0.05 * (2 ** (failures - 1)), 1.0))
+
     async def get(self, timeout: float | None = None) -> R:
         endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
         if endpoint is None:
@@ -759,58 +1032,94 @@ class _AsyncCall[R]:
             except asyncio.CancelledError:
                 await asyncio.shield(self.cancel("async task cancelled"))
                 raise
-        stubs, metadata, deadline = endpoint
 
         async def wait() -> R:
             cursor = 0
+            failures = 0
             while True:
-                stream = stubs.calls.Watch(
-                    pb.WatchCallRequest(
-                        cursor=pb.EventCursor(
-                            call=pb.CallRef(call_id=self._call.id),
-                            after_sequence=cursor,
+                current = _aio_endpoint(self._call._client, self._call._endpoint)
+                if current is None:
+                    return await _run_blocking(self._call.get)
+                stubs, metadata, deadline, selected = current
+                self._call._endpoint = selected
+                try:
+                    stream = stubs.calls.Watch(
+                        pb.WatchCallRequest(
+                            cursor=pb.EventCursor(
+                                call=pb.CallRef(call_id=self._call.id),
+                                after_sequence=cursor,
+                            ),
+                            follow=True,
                         ),
-                        follow=True,
-                    ),
-                    metadata=metadata,
-                )
-                async for event in stream:
-                    cursor = max(cursor, event.sequence)
-                    kind = event.WhichOneof("payload")
-                    if kind == "result":
+                        metadata=metadata,
+                    )
+                    async for event in stream:
+                        failures = 0
+                        cursor = max(cursor, event.sequence)
+                        kind = event.WhichOneof("payload")
+                        if kind == "result":
+                            return cast(
+                                R,
+                                await _async_result_value(
+                                    stubs,
+                                    metadata,
+                                    event.result,
+                                    trusted=self._call._trusted,
+                                ),
+                            )
+                        if kind == "error":
+                            _raise(event.error)
+                    record = await stubs.calls.Get(
+                        pb.CallRef(call_id=self._call.id),
+                        metadata=metadata,
+                        timeout=deadline,
+                    )
+                    if record.status in _TERMINAL:
+                        if record.HasField("error"):
+                            _raise(record.error)
+                        if record.status == pb.CALL_STATUS_CANCELLED:
+                            raise RemoteFunctionError(
+                                "remote call was cancelled",
+                                code="cancelled",
+                            )
+                        if record.status != pb.CALL_STATUS_SUCCEEDED:
+                            raise RemoteFunctionError(
+                                f"remote call ended with status {record.status}",
+                            )
+                        result = await stubs.calls.GetResult(
+                            pb.GetCallResultRequest(call=record.ref, index=0),
+                            metadata=metadata,
+                            timeout=deadline,
+                        )
                         return cast(
                             R,
                             await _async_result_value(
                                 stubs,
                                 metadata,
-                                event.result,
+                                result,
                                 trusted=self._call._trusted,
                             ),
                         )
-                    if kind == "error":
-                        _raise(event.error)
-                record = await stubs.calls.Get(
-                    pb.CallRef(call_id=self._call.id),
-                    metadata=metadata,
-                    timeout=deadline,
-                )
-                if record.status in _TERMINAL:
-                    if record.HasField("error"):
-                        _raise(record.error)
-                    result = await stubs.calls.GetResult(
-                        pb.GetCallResultRequest(call=record.ref, index=0),
-                        metadata=metadata,
-                        timeout=deadline,
-                    )
-                    return cast(
-                        R,
-                        await _async_result_value(
-                            stubs,
-                            metadata,
-                            result,
-                            trusted=self._call._trusted,
-                        ),
-                    )
+                except grpc.RpcError as error:
+                    if not _reconnectable_rpc(error):
+                        raise
+                    failures += 1
+                    if failures > 5:
+                        raise
+                    resolver = getattr(self._call._client.driver, "resolve_call", None)
+                    if callable(resolver):
+                        try:
+                            self._call._endpoint = await _run_blocking(
+                                resolver,
+                                self._call.id,
+                                self._call._endpoint,
+                            )
+                        except TypeError:
+                            self._call._endpoint = await _run_blocking(
+                                resolver,
+                                self._call.id,
+                            )
+                    await asyncio.sleep(min(0.05 * (2 ** (failures - 1)), 1.0))
 
         try:
             if timeout is None:
@@ -823,6 +1132,244 @@ class _AsyncCall[R]:
             ) from None
         except asyncio.CancelledError:
             await asyncio.shield(self.cancel("async task cancelled"))
+            raise
+
+
+class _AsyncBatchCall[R]:
+    """Native asynchronous access to a detached durable batch."""
+
+    def __init__(
+        self,
+        call: FunctionCall[Any],
+        *,
+        feeder: asyncio.Task[None] | None = None,
+    ) -> None:
+        self._call = call
+        self._feeder = feeder
+
+    @property
+    def id(self) -> str:
+        return self._call.id
+
+    async def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
+        if self._feeder is not None and not self._feeder.done():
+            self._feeder.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._feeder
+        return await _AsyncCall(self._call).cancel(reason)
+
+    async def status(self) -> int:
+        endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
+        if endpoint is None:
+            return await _run_blocking(self._call.status)
+        stubs, metadata, deadline, selected = endpoint
+        self._call._endpoint = selected
+        record = await stubs.calls.Get(
+            pb.CallRef(call_id=self.id),
+            metadata=metadata,
+            timeout=deadline,
+        )
+        return record.status
+
+    async def done(self) -> bool:
+        return await self.status() in _TERMINAL
+
+    async def results(
+        self,
+        *,
+        order_outputs: bool = True,
+        return_exceptions: bool = False,
+    ) -> AsyncIterator[R]:
+        try:
+            endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
+            if endpoint is None:
+                iterator = BatchCall[R](self._call).results(
+                    order_outputs=order_outputs,
+                    return_exceptions=return_exceptions,
+                )
+                while True:
+                    present, value = await _run_blocking(_next_or_done, iterator)
+                    if not present:
+                        return
+                    yield value
+
+            if order_outputs:
+                next_index = 0
+                failures = 0
+                while True:
+                    current = _aio_endpoint(self._call._client, self._call._endpoint)
+                    if current is None:
+                        iterator = BatchCall[R](self._call).results(
+                            order_outputs=True,
+                            return_exceptions=return_exceptions,
+                        )
+                        while True:
+                            present, value = await _run_blocking(_next_or_done, iterator)
+                            if not present:
+                                return
+                            yield value
+                    stubs, metadata, deadline, selected = current
+                    self._call._endpoint = selected
+                    try:
+                        item = await stubs.calls.GetResult(
+                            pb.GetCallResultRequest(
+                                call=pb.CallRef(call_id=self.id),
+                                index=next_index,
+                            ),
+                            metadata=metadata,
+                            timeout=deadline,
+                        )
+                        failures = 0
+                    except grpc.RpcError as error:
+                        if error.code() == grpc.StatusCode.NOT_FOUND:
+                            try:
+                                record = await stubs.calls.Get(
+                                    pb.CallRef(call_id=self.id),
+                                    metadata=metadata,
+                                    timeout=deadline,
+                                )
+                            except grpc.RpcError as record_error:
+                                if record_error.code() != grpc.StatusCode.NOT_FOUND:
+                                    raise
+                                resolver = getattr(
+                                    self._call._client.driver,
+                                    "resolve_call",
+                                    None,
+                                )
+                                if not callable(resolver):
+                                    raise
+                                try:
+                                    self._call._endpoint = await _run_blocking(
+                                        resolver,
+                                        self._call.id,
+                                        self._call._endpoint,
+                                    )
+                                except TypeError:
+                                    self._call._endpoint = await _run_blocking(
+                                        resolver,
+                                        self._call.id,
+                                    )
+                                continue
+                            failures = 0
+                            if record.status not in _TERMINAL:
+                                await asyncio.sleep(0.02)
+                                continue
+                            if self._feeder is not None:
+                                await self._feeder
+                            failure: BaseException | None = None
+                            if record.HasField("error"):
+                                failure = RemoteFunctionError(
+                                    record.error.message or "remote batch failed",
+                                    code=record.error.code,
+                                    remote_type=record.error.type,
+                                )
+                            elif record.status == pb.CALL_STATUS_CANCELLED:
+                                failure = RemoteFunctionError(
+                                    "remote batch was cancelled",
+                                    code="cancelled",
+                                )
+                            elif record.status != pb.CALL_STATUS_SUCCEEDED:
+                                failure = RemoteFunctionError(
+                                    f"remote batch ended with status {record.status}",
+                                )
+                            if failure is not None:
+                                if return_exceptions:
+                                    yield cast(R, failure)
+                                    return
+                                raise failure
+                            return
+                        if not _reconnectable_rpc(error):
+                            raise
+                        failures += 1
+                        if failures > 5:
+                            raise
+                        resolver = getattr(self._call._client.driver, "resolve_call", None)
+                        if callable(resolver):
+                            try:
+                                self._call._endpoint = await _run_blocking(
+                                    resolver,
+                                    self._call.id,
+                                    self._call._endpoint,
+                                )
+                            except TypeError:
+                                self._call._endpoint = await _run_blocking(
+                                    resolver,
+                                    self._call.id,
+                                )
+                        await asyncio.sleep(min(0.05 * (2 ** (failures - 1)), 1.0))
+                        continue
+                    try:
+                        value = await _async_result_value(
+                            stubs,
+                            metadata,
+                            item,
+                            trusted=self._call._trusted,
+                        )
+                    except Exception as exc:
+                        if not return_exceptions:
+                            raise
+                        value = exc
+                    yield value
+                    next_index += 1
+
+            async for event, stubs, metadata, deadline in _AsyncCall(self._call)._events():
+                kind = event.WhichOneof("payload")
+                if kind == "result":
+                    try:
+                        value = await _async_result_value(
+                            stubs,
+                            metadata,
+                            event.result,
+                            trusted=self._call._trusted,
+                        )
+                    except Exception as exc:
+                        if not return_exceptions:
+                            raise
+                        value = exc
+                    yield value
+                elif kind == "error":
+                    if return_exceptions:
+                        yield cast(
+                            R,
+                            RemoteFunctionError(
+                                event.error.message,
+                                code=event.error.code,
+                                remote_type=event.error.type,
+                            ),
+                        )
+                        continue
+                    _raise(event.error)
+                elif kind == "status" and event.status.status in _TERMINAL:
+                    if self._feeder is not None:
+                        await self._feeder
+                    if event.status.status == pb.CALL_STATUS_SUCCEEDED:
+                        return
+                    record = await stubs.calls.Get(
+                        pb.CallRef(call_id=self.id),
+                        metadata=metadata,
+                        timeout=deadline,
+                    )
+                    if record.HasField("error"):
+                        terminal_error = RemoteFunctionError(
+                            record.error.message or "remote batch failed",
+                            code=record.error.code,
+                            remote_type=record.error.type,
+                        )
+                    elif record.status == pb.CALL_STATUS_CANCELLED:
+                        terminal_error = RemoteFunctionError(
+                            "remote batch was cancelled",
+                            code="cancelled",
+                        )
+                    else:
+                        terminal_error = RemoteFunctionError(
+                            f"remote batch ended with status {record.status}",
+                        )
+                    if return_exceptions:
+                        yield cast(R, terminal_error)
+                        return
+                    raise terminal_error
+        except asyncio.CancelledError, GeneratorExit:
+            await asyncio.shield(self.cancel("async batch result consumer closed"))
             raise
 
 
@@ -839,7 +1386,8 @@ class _AsyncRemoteFunction[**P, R]:
         endpoint = _aio_endpoint(client, function._endpoint)
         if endpoint is None:
             return _AsyncCall(await _run_blocking(function.spawn, *args, **kwargs))
-        stubs, metadata, deadline = endpoint
+        stubs, metadata, deadline, selected = endpoint
+        function._endpoint = selected
         revision = await function._resolve_async(stubs, metadata, deadline)
         trusted = function.options.serializer.allow_trusted_python
         arguments = await _async_arguments(
@@ -869,24 +1417,19 @@ class _AsyncRemoteFunction[**P, R]:
                 client,
                 trusted=trusted,
                 generator=function._is_generator,
+                endpoint=selected,
             )
         )
 
     async def remote(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        if self._function._is_generator:
+            raise ValueError("generator functions must use remote_gen()")
         call = await self.spawn(*args, **kwargs)
         return await call.get()
 
-    @overload
-    def remote_gen(
-        self: _AsyncRemoteFunction[P, Iterator[Y]],
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> AsyncIterator[Y]: ...
-
-    @overload
-    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[Any]: ...
-
-    async def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[Any]:
+    async def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[R]:
+        if not self._function._is_generator:
+            raise ValueError("non-generator functions must use remote()")
         async_call = await self.spawn(*args, **kwargs)
         call = async_call._call
         endpoint = _aio_endpoint(call._client, call._endpoint)
@@ -898,58 +1441,56 @@ class _AsyncRemoteFunction[**P, R]:
                     return
                 yield value
             return
-        stubs, metadata, _ = endpoint
-        cursor = 0
         try:
-            while True:
-                stream = stubs.calls.Watch(
-                    pb.WatchCallRequest(
-                        cursor=pb.EventCursor(
-                            call=pb.CallRef(call_id=call.id),
-                            after_sequence=cursor,
-                        ),
-                        follow=True,
-                    ),
-                    metadata=metadata,
-                )
-                async for event in stream:
-                    cursor = max(cursor, event.sequence)
-                    kind = event.WhichOneof("payload")
-                    if kind == "yield_result":
-                        yield await _async_result_value(
-                            stubs,
-                            metadata,
-                            event.yield_result,
-                            trusted=call._trusted,
-                        )
-                    elif kind == "error":
-                        _raise(event.error)
-                    elif kind == "status" and event.status.status in _TERMINAL:
-                        return
+            async for event, stubs, metadata, _ in async_call._events():
+                kind = event.WhichOneof("payload")
+                if kind == "yield_result":
+                    yield await _async_result_value(
+                        stubs,
+                        metadata,
+                        event.yield_result,
+                        trusted=call._trusted,
+                    )
+                elif kind == "error":
+                    _raise(event.error)
+                elif kind == "status" and event.status.status in _TERMINAL:
+                    return
         except asyncio.CancelledError:
             await asyncio.shield(async_call.cancel("async generator cancelled"))
             raise
 
-    async def map(
-        self, iterable: Iterable[Any] | AsyncIterable[Any], **kwargs: Any
-    ) -> AsyncIterator[R]:
+    async def spawn_map(
+        self,
+        iterable: Iterable[Any] | AsyncIterable[Any],
+        *,
+        kwargs: Mapping[str, Any] | None = None,
+        starmap: bool = False,
+        max_in_flight: int | None = None,
+    ) -> _AsyncBatchCall[R]:
+        if max_in_flight is not None and (
+            isinstance(max_in_flight, bool)
+            or not isinstance(max_in_flight, int)
+            or max_in_flight < 1
+        ):
+            raise ValueError("max_in_flight must be a positive integer")
         function = self._function
         client = _client(function._client)
         function._client = client
         endpoint = _aio_endpoint(client, function._endpoint)
         if endpoint is None:
-            batch = await _run_blocking(function.spawn_map, iterable, **kwargs)
-            iterator = batch.results(
-                order_outputs=kwargs.get("order_outputs", True),
-                return_exceptions=kwargs.get("return_exceptions", False),
+            if isinstance(iterable, AsyncIterable):
+                raise RuntimeError("AsyncIterable map inputs require a native async driver")
+            batch = await _run_blocking(
+                function.spawn_map,
+                iterable,
+                kwargs=kwargs,
+                starmap=starmap,
+                max_in_flight=max_in_flight,
             )
-            while True:
-                present, value = await _run_blocking(_next_or_done, iterator)
-                if not present:
-                    return
-                yield value
-            return
-        stubs, metadata, deadline = endpoint
+            return batch.aio
+
+        stubs, metadata, deadline, selected = endpoint
+        function._endpoint = selected
         revision = await function._resolve_async(stubs, metadata, deadline)
         record = await stubs.calls.Create(
             pb.CreateCallRequest(
@@ -961,114 +1502,159 @@ class _AsyncRemoteFunction[**P, R]:
             metadata=metadata,
             timeout=deadline,
         )
-        call: _AsyncCall[Any] = _AsyncCall(
-            FunctionCall(
-                record.ref.call_id,
-                client,
-                trusted=function.options.serializer.allow_trusted_python,
-            )
+        call = FunctionCall[Any](
+            record.ref.call_id,
+            client,
+            trusted=function.options.serializer.allow_trusted_python,
+            endpoint=selected,
         )
+        slots = asyncio.Semaphore(0)
+        opener_acknowledged = asyncio.Event()
         count = 0
+        call_kwargs = dict(kwargs or {})
 
         async def inputs() -> AsyncIterator[pb.StreamCallInputsRequest]:
             nonlocal count
             yield pb.StreamCallInputsRequest(call=record.ref)
-            if hasattr(iterable, "__aiter__"):
-                source = cast(AsyncIterable[Any], iterable)
-            else:
-                assert isinstance(iterable, Iterable)
-
-                async def sync_source() -> AsyncIterator[Any]:
-                    for value in iterable:
-                        yield value
-
-                source = sync_source()
-            async for item in source:
-                args = (item,)
-                if function._signature:
-                    function._signature.bind(*args)
-                arguments = await _async_arguments(
-                    stubs,
-                    metadata,
-                    deadline,
-                    args,
-                    {},
-                    codec=function.options.serializer.input_serializer,
-                    trusted=function.options.serializer.allow_trusted_python,
-                    compression=function.options.serializer.compression,
-                )
-                yield pb.StreamCallInputsRequest(
-                    input=pb.CallInput(
-                        index=count,
-                        input_id=str(uuid.uuid4()),
-                        arguments=arguments,
+            await opener_acknowledged.wait()
+            source = _iterate_async(iterable)
+            try:
+                while True:
+                    await slots.acquire()
+                    try:
+                        item = await anext(source)
+                    except StopAsyncIteration:
+                        return
+                    args = tuple(item) if starmap else (item,)
+                    if function._signature:
+                        function._signature.bind(*args, **call_kwargs)
+                    arguments = await _async_arguments(
+                        stubs,
+                        metadata,
+                        deadline,
+                        args,
+                        call_kwargs,
+                        codec=function.options.serializer.input_serializer,
+                        trusted=function.options.serializer.allow_trusted_python,
+                        compression=function.options.serializer.compression,
                     )
-                )
-                count += 1
+                    index = count
+                    count += 1
+                    yield pb.StreamCallInputsRequest(
+                        input=pb.CallInput(
+                            index=index,
+                            input_id=str(uuid.uuid4()),
+                            arguments=arguments,
+                        )
+                    )
+            finally:
+                await source.aclose()
 
         async def feed() -> None:
             try:
-                async for _ in stubs.calls.StreamInputs(
-                    inputs(), metadata=metadata, timeout=deadline
-                ):
-                    pass
-                await stubs.calls.CloseInputs(
-                    pb.CloseCallInputsRequest(call=record.ref, expected_input_count=count),
+                first = True
+                responses = stubs.calls.StreamInputs(
+                    inputs(),
                     metadata=metadata,
                     timeout=deadline,
                 )
-            except BaseException:
-                await asyncio.shield(call.cancel("async batch input feeder failed"))
-                raise
-
-        feeder = asyncio.create_task(feed())
-        cursor = 0
-        pending: dict[int, Any] = {}
-        next_index = 0
-        ordered = kwargs.get("order_outputs", True)
-        return_exceptions = kwargs.get("return_exceptions", False)
-        try:
-            while True:
-                stream = stubs.calls.Watch(
-                    pb.WatchCallRequest(
-                        cursor=pb.EventCursor(call=record.ref, after_sequence=cursor),
-                        follow=True,
+                async for response in responses:
+                    if first:
+                        advertised = max(1, response.max_inputs_outstanding)
+                        window = (
+                            advertised if max_in_flight is None else min(advertised, max_in_flight)
+                        )
+                        for _ in range(window):
+                            slots.release()
+                        opener_acknowledged.set()
+                        first = False
+                    elif response.HasField("last_input"):
+                        slots.release()
+                if first:
+                    raise RuntimeError("input stream ended before opener acknowledgement")
+                await stubs.calls.CloseInputs(
+                    pb.CloseCallInputsRequest(
+                        call=record.ref,
+                        expected_input_count=count,
                     ),
                     metadata=metadata,
+                    timeout=deadline,
                 )
-                async for event in stream:
-                    cursor = max(cursor, event.sequence)
-                    kind = event.WhichOneof("payload")
-                    if kind == "result":
-                        result = event.result
-                        try:
-                            value = await _async_result_value(
-                                stubs,
-                                metadata,
-                                result,
-                                trusted=function.options.serializer.allow_trusted_python,
-                            )
-                        except Exception as exc:
-                            if not return_exceptions:
-                                raise
-                            value = exc
-                        if not ordered:
-                            yield value
-                        else:
-                            index = result.input_index if result.input_id else result.index
-                            pending[index] = value
-                            while next_index in pending:
-                                yield pending.pop(next_index)
-                                next_index += 1
-                    elif kind == "error":
-                        _raise(event.error)
-                    elif kind == "status" and event.status.status in _TERMINAL:
-                        await feeder
-                        return
-        except asyncio.CancelledError, GeneratorExit:
-            feeder.cancel()
-            await asyncio.shield(call.cancel("async map consumer closed"))
-            raise
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                await asyncio.shield(_AsyncCall(call).cancel("async batch input feeder failed"))
+                raise
+
+        feeder = asyncio.create_task(feed(), name=f"vmon-batch-feeder-{call.id}")
+        return _AsyncBatchCall(call, feeder=feeder)
+
+    async def map(
+        self,
+        *iterables: Iterable[Any] | AsyncIterable[Any],
+        **options: Any,
+    ) -> AsyncIterator[R]:
+        if not iterables:
+            raise ValueError("map requires at least one iterable")
+        call_kwargs = options.pop("kwargs", None)
+        if call_kwargs is not None and not isinstance(call_kwargs, Mapping):
+            raise TypeError("kwargs must be a mapping")
+        ordered = bool(options.pop("order_outputs", True))
+        return_exceptions = bool(options.pop("return_exceptions", False))
+        max_in_flight = options.pop("max_in_flight", None)
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported async map options: {unknown}")
+        iterable: Iterable[Any] | AsyncIterable[Any]
+        if len(iterables) == 1:
+            iterable = iterables[0]
+        else:
+            iterable = _zip_async(iterables)
+        batch = await self.spawn_map(
+            iterable,
+            kwargs=call_kwargs,
+            starmap=len(iterables) > 1,
+            max_in_flight=max_in_flight,
+        )
+        async for value in batch.results(
+            order_outputs=ordered,
+            return_exceptions=return_exceptions,
+        ):
+            yield value
+
+    async def starmap(
+        self,
+        iterable: Iterable[Iterable[Any]] | AsyncIterable[Iterable[Any]],
+        **options: Any,
+    ) -> AsyncIterator[R]:
+        call_kwargs = options.pop("kwargs", None)
+        if call_kwargs is not None and not isinstance(call_kwargs, Mapping):
+            raise TypeError("kwargs must be a mapping")
+        ordered = bool(options.pop("order_outputs", True))
+        return_exceptions = bool(options.pop("return_exceptions", False))
+        max_in_flight = options.pop("max_in_flight", None)
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported async starmap options: {unknown}")
+        batch = await self.spawn_map(
+            iterable,
+            kwargs=call_kwargs,
+            starmap=True,
+            max_in_flight=max_in_flight,
+        )
+        async for value in batch.results(
+            order_outputs=ordered,
+            return_exceptions=return_exceptions,
+        ):
+            yield value
+
+    async def for_each(
+        self,
+        *iterables: Iterable[Any] | AsyncIterable[Any],
+        **kwargs: Any,
+    ) -> None:
+        async for _ in self.map(*iterables, **kwargs):
+            pass
 
 
 class RemoteFunction[**P, R]:
@@ -1079,7 +1665,7 @@ class RemoteFunction[**P, R]:
 
     def __init__(
         self,
-        function: Callable[P, R] | None = None,
+        function: Callable[P, Any] | None = None,
         *,
         client: Any | None = None,
         namespace: str = "default",
@@ -1155,9 +1741,7 @@ class RemoteFunction[**P, R]:
             generator=generator,
         )
 
-    def with_options(
-        self, options: FunctionOptions | None = None, **changes: Any
-    ) -> RemoteFunction[P, R]:
+    def with_options(self, options: FunctionOptions | None = None, **changes: Any) -> Self:
         updated = options or replace(self.options, **changes)
         return type(self)(
             self._function,
@@ -1202,18 +1786,21 @@ class RemoteFunction[**P, R]:
     def aio(self) -> _AsyncRemoteFunction[P, R]:
         return _AsyncRemoteFunction(self)
 
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Any:
         if self._function is None:
             raise TypeError("deployed function references cannot run locally")
         return self._function(*args, **kwargs)
 
-    def local(self, *args: P.args, **kwargs: P.kwargs) -> R:
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> Any:
         return self(*args, **kwargs)
 
     def _make_spec(
-        self, package: PackageArtifact | SerializedCallable, source: pb.ArtifactRef
+        self,
+        package: PackageArtifact | SerializedCallable,
+        source: pb.ArtifactRef,
+        image_refs: dict[str, pb.ArtifactRef],
     ) -> pb.FunctionSpec:
-        fields = options_to_proto(self.options)
+        fields = options_to_proto(self.options, image_refs)
         lifecycle_name = getattr(self, "__vmon_class_lifecycle__", None)
         metadata = getattr(self, "__vmon_lifecycle_metadata__", None)
         lifecycle = (
@@ -1241,13 +1828,34 @@ class RemoteFunction[**P, R]:
                 hooks.snapshot.CopyFrom(hook(metadata.snapshot_enter[0]))
             if metadata.restore:
                 hooks.restore.CopyFrom(hook(metadata.restore[0]))
+        if metadata is not None:
             hooks.snapshot_after_initialize = metadata.snapshot_after_initialize
             hooks.snapshot_on_worker_retire = metadata.snapshot_on_worker_retire
+        python_abi = (
+            package.manifest.python_abi
+            if isinstance(package, PackageArtifact)
+            else package.python_abi
+        )
+        reproducibility = pb.ReproducibilitySpec(
+            build_inputs_digest=digest(self.options.canonical_digest(package)),
+            builder_id="vmon.python.function",
+            builder_version="1",
+            source_date_epoch=315_532_800,
+            environment={
+                "PACKAGE_MODE": package.codec,
+                "PYTHON_ABI": python_abi,
+            },
+        )
         return pb.FunctionSpec(
             function=pb.FunctionRef(namespace=self.namespace, name=self.name),
-            package=package_to_proto(package, source),
+            package=package_to_proto(
+                package,
+                source,
+                trusted_serialization=self.options.serializer.allow_trusted_python,
+            ),
             lifecycle=lifecycle,
             lifecycle_hooks=hooks,
+            reproducibility=reproducibility,
             **fields,
         )
 
@@ -1292,7 +1900,17 @@ class RemoteFunction[**P, R]:
             package.sha256,
             "application/vnd.vmon.python-package",
         )
-        spec = self._make_spec(package, source)
+        image_refs: dict[str, pb.ArtifactRef] = {}
+        for artifact in self.options.image.artifacts():
+            image_refs[artifact.key] = await _async_upload(
+                stubs,
+                metadata,
+                deadline,
+                artifact.data,
+                artifact.sha256,
+                artifact.media_type,
+            )
+        spec = self._make_spec(package, source, image_refs)
         request_id = hashlib.sha256(spec.SerializeToString(deterministic=True)).hexdigest()
         self._registered = await stubs.functions.Register(
             pb.RegisterFunctionRequest(spec=spec, request_id=request_id),
@@ -1339,7 +1957,16 @@ class RemoteFunction[**P, R]:
             source = _upload(
                 client, package.data, package.sha256, "application/vnd.vmon.python-package"
             )
-            spec = self._make_spec(package, source)
+            image_refs: dict[str, pb.ArtifactRef] = {}
+            for artifact in self.options.image.artifacts():
+                image_refs[artifact.key] = _upload(
+                    client,
+                    artifact.data,
+                    artifact.sha256,
+                    artifact.media_type,
+                    endpoint=self._endpoint,
+                )
+            spec = self._make_spec(package, source, image_refs)
             request_id = hashlib.sha256(spec.SerializeToString(deterministic=True)).hexdigest()
             self._registered, self._endpoint = _call_owner(
                 client,
@@ -1375,6 +2002,7 @@ class RemoteFunction[**P, R]:
             codec=codec,
             trusted=trusted,
             compression=self.options.serializer.compression,
+            endpoint=self._endpoint,
         )
         call_type = pb.CALL_TYPE_GENERATOR if self._is_generator else pb.CALL_TYPE_UNARY
         request = pb.CreateCallRequest(
@@ -1410,6 +2038,7 @@ class RemoteFunction[**P, R]:
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
+            endpoint=self._endpoint,
         )
         request = pb.CreateCallRequest(
             type=pb.CALL_TYPE_ACTOR,
@@ -1447,6 +2076,7 @@ class RemoteFunction[**P, R]:
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
+            endpoint=self._endpoint,
         )
         arguments = _arguments(
             client,
@@ -1455,6 +2085,7 @@ class RemoteFunction[**P, R]:
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
+            endpoint=self._endpoint,
         )
         request = pb.CreateCallRequest(
             type=pb.CALL_TYPE_UNARY,
@@ -1475,22 +2106,12 @@ class RemoteFunction[**P, R]:
         )
         return FunctionCall(record.ref.call_id, client, trusted=trusted, endpoint=endpoint)
 
-    def remote(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> R:
+    def remote(self, *args: P.args, **kwargs: P.kwargs) -> R:
         if self._is_generator:
             raise ValueError("generator functions must use remote_gen()")
-        return self.spawn(*args, **kwargs).get(timeout)
+        return self.spawn(*args, **kwargs).get()
 
-    @overload
-    def remote_gen(
-        self: RemoteFunction[P, Iterator[Y]],
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> Iterator[Y]: ...
-
-    @overload
-    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[Any]: ...
-
-    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[Any]:
+    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[R]:
         if not self._is_generator:
             raise ValueError("non-generator functions must use remote()")
         return self.spawn(*args, **kwargs).iter_yields()
@@ -1503,8 +2124,12 @@ class RemoteFunction[**P, R]:
         starmap: bool = False,
         max_in_flight: int | None = None,
     ) -> BatchCall[R]:
-        if max_in_flight is not None and max_in_flight < 1:
-            raise ValueError("max_in_flight must be at least one")
+        if max_in_flight is not None and (
+            isinstance(max_in_flight, bool)
+            or not isinstance(max_in_flight, int)
+            or max_in_flight < 1
+        ):
+            raise ValueError("max_in_flight must be a positive integer")
         revision = self._resolve()
         client = _client(self._client)
         trusted = self.options.serializer.allow_trusted_python
@@ -1527,16 +2152,27 @@ class RemoteFunction[**P, R]:
 
         def feed() -> None:
             count = 0
+            condition = threading.Condition()
+            acknowledged = 0
+            window = 0
+            call_kwargs = dict(kwargs or {})
+            source = iter(iterable)
             try:
 
                 def frames() -> Iterator[pb.StreamCallInputsRequest]:
                     nonlocal count
                     yield pb.StreamCallInputsRequest(call=record.ref)
-                    for item in iterable:
-                        if stop.is_set():
+                    while True:
+                        with condition:
+                            while not stop.is_set() and count - acknowledged >= window:
+                                condition.wait(0.05)
+                            if stop.is_set():
+                                return
+                        try:
+                            item = next(source)
+                        except StopIteration:
                             return
                         args = tuple(item) if starmap else (item,)
-                        call_kwargs = dict(kwargs or {})
                         if self._signature:
                             self._signature.bind(*args, **call_kwargs)
                         arguments = _arguments(
@@ -1546,15 +2182,17 @@ class RemoteFunction[**P, R]:
                             codec=self.options.serializer.input_serializer,
                             trusted=trusted,
                             compression=self.options.serializer.compression,
+                            endpoint=endpoint,
                         )
+                        index = count
+                        count += 1
                         yield pb.StreamCallInputsRequest(
                             input=pb.CallInput(
-                                index=count,
+                                index=index,
                                 input_id=str(uuid.uuid4()),
                                 arguments=arguments,
                             )
                         )
-                        count += 1
 
                 responses = _call(
                     client,
@@ -1562,9 +2200,27 @@ class RemoteFunction[**P, R]:
                     stream=True,
                     endpoint=endpoint,
                 )
-                for _ in responses:
+                first = True
+                for response in responses:
+                    with condition:
+                        if first:
+                            advertised = max(1, response.max_inputs_outstanding)
+                            window = (
+                                advertised
+                                if max_in_flight is None
+                                else min(advertised, max_in_flight)
+                            )
+                            first = False
+                        else:
+                            acknowledged = max(
+                                acknowledged,
+                                response.committed_input_count,
+                            )
+                        condition.notify_all()
                     if stop.is_set():
                         break
+                if first and not stop.is_set():
+                    raise RuntimeError("input stream ended before opener acknowledgement")
                 if not stop.is_set():
                     _call(
                         client,
@@ -1599,19 +2255,43 @@ class RemoteFunction[**P, R]:
         ).start()
         return batch
 
-    def map(self, *iterables: Iterable[Any], **kwargs: Any) -> Iterator[R]:
+    def map(self, *iterables: Iterable[Any], **options: Any) -> Iterator[R]:
         if not iterables:
             raise ValueError("map requires at least one iterable")
+        call_kwargs = options.pop("kwargs", None)
+        max_in_flight = options.pop("max_in_flight", None)
+        order_outputs = bool(options.pop("order_outputs", True))
+        return_exceptions = bool(options.pop("return_exceptions", False))
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported map options: {unknown}")
         items = iterables[0] if len(iterables) == 1 else zip(*iterables, strict=False)
         return self.spawn_map(
-            items, kwargs=kwargs.pop("kwargs", None), starmap=len(iterables) > 1
+            items,
+            kwargs=call_kwargs,
+            starmap=len(iterables) > 1,
+            max_in_flight=max_in_flight,
         ).results(
-            **{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}}
+            order_outputs=order_outputs,
+            return_exceptions=return_exceptions,
         )
 
-    def starmap(self, iterable: Iterable[Iterable[Any]], **kwargs: Any) -> Iterator[R]:
-        return self.spawn_map(iterable, kwargs=kwargs.pop("kwargs", None), starmap=True).results(
-            **{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}}
+    def starmap(self, iterable: Iterable[Iterable[Any]], **options: Any) -> Iterator[R]:
+        call_kwargs = options.pop("kwargs", None)
+        max_in_flight = options.pop("max_in_flight", None)
+        order_outputs = bool(options.pop("order_outputs", True))
+        return_exceptions = bool(options.pop("return_exceptions", False))
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported starmap options: {unknown}")
+        return self.spawn_map(
+            iterable,
+            kwargs=call_kwargs,
+            starmap=True,
+            max_in_flight=max_in_flight,
+        ).results(
+            order_outputs=order_outputs,
+            return_exceptions=return_exceptions,
         )
 
     def for_each(self, *iterables: Iterable[Any], **kwargs: Any) -> None:
@@ -1619,10 +2299,94 @@ class RemoteFunction[**P, R]:
             pass
 
 
+class SyncRemoteFunction[**P, R](RemoteFunction[P, R]):
+    """Typed wrapper whose local implementation is a synchronous function."""
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        return super().__call__(*args, **kwargs)
+
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        return self(*args, **kwargs)
+
+
+class AsyncRemoteFunction[**P, R](RemoteFunction[P, R]):
+    """Typed wrapper whose local implementation is a coroutine function."""
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Coroutine[Any, Any, R]:
+        if self._function is None:
+            raise TypeError("deployed function references cannot run locally")
+        return self._function(*args, **kwargs)
+
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> Coroutine[Any, Any, R]:
+        return self(*args, **kwargs)
+
+
+class GeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
+    """Typed wrapper whose local implementation is a synchronous generator."""
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[R]:
+        if self._function is None:
+            raise TypeError("deployed function references cannot run locally")
+        return self._function(*args, **kwargs)
+
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[R]:
+        return self(*args, **kwargs)
+
+
+class AsyncGeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
+    """Typed wrapper whose local implementation is an asynchronous generator."""
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[R]:
+        if self._function is None:
+            raise TypeError("deployed function references cannot run locally")
+        return self._function(*args, **kwargs)
+
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[R]:
+        return self(*args, **kwargs)
+
+
+class _FunctionDecorator(Protocol):
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, Iterator[T]], /
+    ) -> GeneratorRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, AsyncIterator[T]], /
+    ) -> AsyncGeneratorRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](  # type: ignore[overload-overlap]
+        self, function: Callable[Q, Coroutine[Any, Any, T]], /
+    ) -> AsyncRemoteFunction[Q, T]: ...
+
+    @overload
+    def __call__[**Q, T](self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
+
+
 @overload
-def function[**P, R](function: Callable[P, R], /) -> RemoteFunction[P, R]: ...
+def function[**P, Y](  # type: ignore[overload-overlap]
+    function: Callable[P, Iterator[Y]], /
+) -> GeneratorRemoteFunction[P, Y]: ...
+
+
 @overload
-def function[**P, R](
+def function[**P, Y](  # type: ignore[overload-overlap]
+    function: Callable[P, AsyncIterator[Y]], /
+) -> AsyncGeneratorRemoteFunction[P, Y]: ...
+
+
+@overload
+def function[**P, Y](  # type: ignore[overload-overlap]
+    function: Callable[P, Coroutine[Any, Any, Y]], /
+) -> AsyncRemoteFunction[P, Y]: ...
+
+
+@overload
+def function[**P, R](function: Callable[P, R], /) -> SyncRemoteFunction[P, R]: ...
+@overload
+def function(
     function: None = None,
     /,
     *,
@@ -1660,9 +2424,9 @@ def function[**P, R](
     include: Iterable[str] = (),
     exclude: Iterable[str] = (),
     local_packages: Iterable[str] = (),
-) -> Callable[[Callable[P, R]], RemoteFunction[P, R]]: ...
-def function[**P, R](
-    function: Callable[P, R] | None = None,
+) -> _FunctionDecorator: ...
+def function(
+    function: Callable[..., Any] | None = None,
     /,
     *,
     client: Any | None = None,
@@ -1699,7 +2463,7 @@ def function[**P, R](
     include: Iterable[str] = (),
     exclude: Iterable[str] = (),
     local_packages: Iterable[str] = (),
-) -> RemoteFunction[P, R] | Callable[[Callable[P, R]], RemoteFunction[P, R]]:
+) -> Any:
     """Decorate a Python callable as a typed, durable remote function."""
     has_explicit_options = options is not None or any(
         value is not None
@@ -1760,8 +2524,17 @@ def function[**P, R](
         serializer=serializer,
     )
 
-    def decorate(inner: Callable[P, R]) -> RemoteFunction[P, R]:
-        return RemoteFunction(
+    def decorate(inner: Callable[..., Any]) -> RemoteFunction[..., Any]:
+        wrapper: type[RemoteFunction[..., Any]]
+        if inspect.isasyncgenfunction(inner):
+            wrapper = AsyncGeneratorRemoteFunction
+        elif inspect.isgeneratorfunction(inner):
+            wrapper = GeneratorRemoteFunction
+        elif inspect.iscoroutinefunction(inner):
+            wrapper = AsyncRemoteFunction
+        else:
+            wrapper = SyncRemoteFunction
+        return wrapper(
             inner,
             client=client,
             namespace=namespace,

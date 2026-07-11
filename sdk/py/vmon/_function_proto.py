@@ -4,6 +4,7 @@ import importlib.util
 import platform
 from typing import Any
 
+from .image import command_argv
 from .options import FunctionOptions
 from .package import PackageArtifact, SerializedCallable
 from .v1 import api_pb2 as pb
@@ -92,8 +93,12 @@ def value_from_proto(
 
 
 def package_to_proto(
-    package: PackageArtifact | SerializedCallable, source: pb.ArtifactRef
+    package: PackageArtifact | SerializedCallable,
+    source: pb.ArtifactRef,
+    *,
+    trusted_serialization: bool = False,
 ) -> pb.PackageSpec:
+    included: list[str]
     if isinstance(package, PackageArtifact):
         module = package.manifest.module
         qualname = package.manifest.qualname
@@ -116,6 +121,10 @@ def package_to_proto(
     )
     if codec_version:
         python.cloudpickle_version = codec_version
+    elif trusted_serialization:
+        import cloudpickle
+
+        python.cloudpickle_version = cloudpickle.__version__
     return pb.PackageSpec(
         source=source,
         module=module,
@@ -127,7 +136,10 @@ def package_to_proto(
     )
 
 
-def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
+def options_to_proto(
+    options: FunctionOptions,
+    image_refs: dict[str, pb.ArtifactRef] | None = None,
+) -> dict[str, Any]:
     r, t, w, c, b, s, resources = (
         options.retry,
         options.timeouts,
@@ -149,6 +161,7 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
         "zone": pb.HIGH_AVAILABILITY_POLICY_ZONE,
     }[resources.high_availability.value]
     image = pb.ImageSpec()
+    image_refs = image_refs or {}
     src = options.image.source
     if src.kind == "python":
         version, _, variant = src.value.partition("-")
@@ -156,12 +169,28 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
     elif src.kind == "registry":
         image.registry.CopyFrom(pb.RegistryImageSource(reference=src.value))
     elif src.kind == "template":
-        image.template.CopyFrom(pb.TemplateImageSource(name=src.value))
-    # Local Docker contexts and file steps require separate artifact uploads;
-    # reject them here rather than persisting caller-local paths.
-    else:
-        raise ValueError("Dockerfile image contexts must be uploaded before function registration")
-    for step in options.image.steps:
+        if src.revision is None:
+            raise ValueError("template image requires an immutable SHA-256 revision")
+        image.template.CopyFrom(pb.TemplateImageSource(name=src.value, revision=src.revision))
+    elif src.kind == "dockerfile":
+        ref = image_refs.get("dockerfile_context")
+        if ref is None:
+            raise ValueError(
+                "Dockerfile image context must be uploaded before function registration"
+            )
+        from pathlib import Path
+
+        context = Path(src.context or ".").resolve()
+        dockerfile = Path(src.value)
+        if not dockerfile.is_absolute():
+            dockerfile = (context / dockerfile).resolve()
+        image.dockerfile.CopyFrom(
+            pb.DockerfileImageSource(
+                context=ref,
+                dockerfile_path=dockerfile.relative_to(context).as_posix(),
+            )
+        )
+    for step_index, step in enumerate(options.image.steps):
         if step.kind == "apt_install":
             for item in step.values:
                 name, sep, version = item.partition("=")
@@ -174,9 +203,30 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
             image.environment.update(dict(zip(step.values[::2], step.values[1::2], strict=True)))
         elif step.kind == "run_commands":
             for command in step.values:
-                image.commands.append(pb.ImageBuildCommand(argv=["/bin/sh", "-c", command]))
+                image.commands.append(pb.ImageBuildCommand(argv=command_argv(command)))
+        elif step.kind == "uv_sync":
+            ref = image_refs.get(f"step:{step_index}")
+            if ref is None:
+                raise ValueError("uv_sync project must be uploaded before function registration")
+            destination = f"/opt/vmon/projects/{ref.digest.value.hex()}"
+            image.local_artifact_mounts.append(
+                pb.LocalArtifactMount(artifact=ref, path=destination, read_only=True)
+            )
+            argv = ["python", "-m", "uv", "sync", "--project", destination]
+            if step.values[1] == "frozen":
+                argv.append("--frozen")
+            for group in step.values[2:]:
+                argv.extend(("--group", group))
+            image.commands.append(pb.ImageBuildCommand(argv=argv))
+        elif step.kind in {"add_local_file", "add_local_python_source"}:
+            ref = image_refs.get(f"step:{step_index}")
+            if ref is None:
+                raise ValueError(f"{step.kind} input must be uploaded before function registration")
+            image.local_artifact_mounts.append(
+                pb.LocalArtifactMount(artifact=ref, path=step.values[1], read_only=True)
+            )
         else:
-            raise ValueError(f"image step {step.kind!r} requires artifact build support")
+            raise ValueError(f"unsupported image step {step.kind!r}")
     return dict(
         image=image,
         resources=pb.ResourceSpec(

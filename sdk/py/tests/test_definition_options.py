@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from vmon._function_proto import artifact_ref, options_to_proto
 from vmon.image import Image, ImageError
 from vmon.options import (
     BatchingPolicy,
@@ -20,7 +21,53 @@ from vmon.options import (
     TimeoutPolicy,
     WorkerPolicy,
 )
+from vmon.package import package_callable
+from vmon.remote import RemoteFunction
 from vmon.values import ValueCodec
+
+
+def _provenance_target(value: int) -> int:
+    return value + 1
+
+
+def _other_provenance_target(value: int) -> int:
+    return value + 2
+
+
+def test_function_specs_record_stable_complete_reproducibility() -> None:
+    package = package_callable(_provenance_target)
+    function = RemoteFunction(_provenance_target)
+    spec = function._make_spec(package, artifact_ref(package.sha256), {})
+    repeated = function._make_spec(package, artifact_ref(package.sha256), {})
+
+    assert spec.reproducibility == repeated.reproducibility
+    assert spec.reproducibility.build_inputs_digest.value == bytes.fromhex(
+        function.options.canonical_digest(package)
+    )
+    assert spec.reproducibility.builder_id == "vmon.python.function"
+    assert spec.reproducibility.builder_version == "1"
+    assert spec.reproducibility.source_date_epoch == 315_532_800
+    assert spec.reproducibility.environment == {
+        "PACKAGE_MODE": "zip",
+        "PYTHON_ABI": package.manifest.python_abi,
+    }
+
+    changed_options = function.with_options(
+        replace(function.options, resources=ResourcePolicy(memory_bytes=2 << 30))
+    )
+    changed_spec = changed_options._make_spec(package, artifact_ref(package.sha256), {})
+    other_package = package_callable(_other_provenance_target)
+    other_spec = RemoteFunction(_other_provenance_target)._make_spec(
+        other_package,
+        artifact_ref(other_package.sha256),
+        {},
+    )
+    assert (
+        changed_spec.reproducibility.build_inputs_digest != spec.reproducibility.build_inputs_digest
+    )
+    assert (
+        other_spec.reproducibility.build_inputs_digest != spec.reproducibility.build_inputs_digest
+    )
 
 
 def test_images_are_immutable_declarations_and_side_effect_free(tmp_path):
@@ -48,12 +95,66 @@ def test_all_image_sources_and_validation_are_declarative(tmp_path):
     assert Image.from_registry("ghcr.io/acme/python:latest").source.kind == "registry"
     docker = Image.from_dockerfile(tmp_path / "Missingfile", context=tmp_path / "missing")
     assert docker.source.kind == "dockerfile"
-    assert Image.from_template("base-small").source.kind == "template"
+    revision = "a" * 64
+    assert Image.from_template("base-small", revision=revision).source.kind == "template"
+    with pytest.raises(ImageError, match="immutable"):
+        Image.from_template("base-small")
     assert not (tmp_path / "missing").exists()
     with pytest.raises(ImageError):
         Image.python("latest")
     with pytest.raises(ImageError):
         Image.python().add_local_file("x", "relative/path")
+
+
+def test_image_local_inputs_are_content_addressed_and_server_typed(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    config = tmp_path / "config.toml"
+    config.write_text("value = 1\n", encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    image = (
+        Image.from_dockerfile("Dockerfile", context=context)
+        .uv_sync(project=source)
+        .run_commands("python -VV")
+        .add_local_file(config, "/etc/demo/config.toml")
+        .add_local_python_source(source)
+    )
+    artifacts = image.artifacts()
+    refs = {item.key: artifact_ref(item.sha256) for item in artifacts}
+    spec = options_to_proto(FunctionOptions(image=image), refs)["image"]
+
+    assert spec.dockerfile.context == refs["dockerfile_context"]
+    assert spec.dockerfile.dockerfile_path == "Dockerfile"
+    assert [list(command.argv) for command in spec.commands] == [
+        [
+            "python",
+            "-m",
+            "uv",
+            "sync",
+            "--project",
+            f"/opt/vmon/projects/{refs['step:0'].digest.value.hex()}",
+            "--frozen",
+        ],
+        ["python", "-VV"],
+    ]
+    assert [mount.artifact for mount in spec.local_artifact_mounts] == [
+        refs["step:0"],
+        refs["step:2"],
+        refs["step:3"],
+    ]
+    before = image.digest
+    (source / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+    assert image.digest != before
+
+
+@pytest.mark.parametrize(("slim", "variant"), [(True, "slim"), (False, "bookworm")])
+def test_python_image_variants_are_server_valid(slim, variant):
+    spec = options_to_proto(FunctionOptions(image=Image.python(slim=slim)))["image"]
+    assert spec.python.python_version == "3.14"
+    assert spec.python.variant == variant
 
 
 @pytest.mark.parametrize(

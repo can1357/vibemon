@@ -29,6 +29,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Python/TypeScript SDK support for durable function workers and stateful actors
+- Added `RemoteFunction` and `BatchCall` primitives for remote function life-cycle management
+- Added support for rich-type arguments, streaming generators, and lazy-map remote execution
+- Added `@vmon.cls` decorators for stateful remote object definitions in Python
 - Added `v1/apps/{namespace}/{app}/functions/{binding}/invoke` endpoint for app-bound invocations
 - Added runtime protocol negotiation ensuring runner capabilities match function requirements
 - Added I-JSON serialization safety checks, rejecting lone UTF-16 surrogates and non-string keys

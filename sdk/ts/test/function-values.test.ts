@@ -34,6 +34,15 @@ const sample: PortableValue = {
 };
 
 const serializers: ValueSerializerName[] = ["json", "cbor"];
+async function cborFixture(bytes: number[]): Promise<ValueEnvelope> {
+  const raw = Uint8Array.from(bytes);
+  const envelope = await encodeValue(null, { serializer: "cbor" });
+  envelope.storage = { case: "inlineData", value: raw };
+  envelope.uncompressedSizeBytes = BigInt(raw.byteLength);
+  if (!envelope.checksum) throw new Error("missing checksum");
+  envelope.checksum.value = new Uint8Array(await crypto.subtle.digest("SHA-256", raw));
+  return envelope;
+}
 
 test("JSON and CBOR envelopes round-trip with checksum and gzip", async () => {
   for (const serializer of serializers) {
@@ -81,4 +90,30 @@ test("I-JSON enforces safe integer boundaries while CBOR preserves larger exact 
     );
     expect(await decodeValue(await encodeValue(value, { serializer: "cbor" }))).toBe(value);
   }
+});
+
+test("CBOR bytes and 64-bit integers interoperate with shared codec fixtures", async () => {
+  // Python cbor2.dumps([b"\x00\x01\xff", 2**53, -(2**53)-1], canonical=True)
+  // and Go's canonical value codec produce these same bytes.
+  const fixture = [
+    0x83, 0x43, 0x00, 0x01, 0xff, 0x1b, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3b, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ];
+  const value: PortableValue = [new Uint8Array([0, 1, 255]), 2n ** 53n, -(2n ** 53n) - 1n];
+  expect(await decodeValue(await cborFixture(fixture))).toEqual(value);
+
+  const encoded = await encodeValue(value, { serializer: "cbor" });
+  expect(encoded.storage.case).toBe("inlineData");
+  if (encoded.storage.case !== "inlineData") throw new Error("expected inline CBOR");
+  expect(Array.from(encoded.storage.value)).toEqual(fixture);
+  expect(await decodeValue(encoded)).toEqual(value);
+});
+
+test("JSON rejects CBOR-only bytes and bigint values", async () => {
+  await expect(encodeValue(new Uint8Array([1]), { serializer: "json" })).rejects.toThrow(
+    "not supported by JSON",
+  );
+  await expect(encodeValue(2n ** 53n, { serializer: "json" })).rejects.toThrow(
+    "not supported by JSON",
+  );
 });

@@ -36,6 +36,7 @@ def test_package_zip_is_deterministic_and_excludes_sensitive_files(tmp_path):
     assert first.data == second.data
     assert first.sha256 == second.sha256
     manifest = inspect_manifest(first.data)
+    assert first.manifest.python_abi == f"cp{sys.version_info.major}{sys.version_info.minor}"
     assert manifest == first.manifest
     assert [entry.path for entry in manifest.files] == [
         "demo/__init__.py",
@@ -116,6 +117,7 @@ def test_closures_require_explicit_trusted_cloudpickle_mode():
         package_callable(closure)
 
     artifact = package_callable(closure, mode="cloudpickle")
+    assert artifact.python_abi == f"cp{sys.version_info.major}{sys.version_info.minor}"
     with pytest.raises(PermissionError, match="trusted=True"):
         artifact.load()
     assert artifact.load(trusted=True)(3) == 12

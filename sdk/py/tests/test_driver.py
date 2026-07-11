@@ -116,7 +116,7 @@ def test_explicit_token_overrides_dsn_and_environment(monkeypatch) -> None:
             token="explicit",
             discover=False,
         ) as client:
-            assert client.health() == {"ok": True}
+            assert client.health().ok is True
         assert server.last("GET", "/healthz").headers["authorization"] == "Bearer explicit"
 
 
@@ -128,7 +128,7 @@ def test_failover_and_discovery() -> None:
             client_b.sandboxes.create(name="on-b", image="alpine")
 
         with connect(server_a.url) as client:
-            assert client.health() == {"ok": True}
+            assert client.health().ok is True
             assert [entry.url for entry in client.driver.endpoints()] == [
                 server_a.url,
                 server_b.url,
@@ -172,9 +172,9 @@ def test_sticky_preferred_endpoint_and_cooldown() -> None:
     try:
         server_a.drop_requests = True
         with connect(_multi_dsn(server_a, server_b, discover="off")) as client:
-            assert client.health() == {"ok": True}
+            assert client.health().ok is True
             server_a.drop_requests = False
-            assert client.health() == {"ok": True}
+            assert client.health().ok is True
 
         assert len(server_a.recorded("GET", "/healthz")) == 1
         assert len(server_b.recorded("GET", "/healthz")) == 2

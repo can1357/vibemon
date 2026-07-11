@@ -815,9 +815,7 @@ class Sandbox:
         )
         return SandboxNetworkPolicy.from_dict(value)
 
-    def set_network(
-        self, policy: SandboxNetworkPolicy | Mapping[str, Any]
-    ) -> SandboxNetworkPolicy:
+    def set_network(self, policy: SandboxNetworkPolicy | Mapping[str, Any]) -> SandboxNetworkPolicy:
         """Replace supplied fields in the sandbox network policy."""
         from .models import SandboxNetworkPolicy
 

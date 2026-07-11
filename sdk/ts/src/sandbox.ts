@@ -43,19 +43,22 @@ export interface SandboxListOptions {
   node?: string;
 }
 
+const sandboxChannel = Symbol("vmon.sandbox.channel");
+const sandboxToken = Symbol("vmon.sandbox.token");
+
 /** A sandbox bound to its client and serving mesh endpoint. */
 export class Sandbox {
   readonly #client: Client;
   #info: SandboxInfo;
-  #endpoint?: string;
-  #connectToken?: string;
+  readonly [sandboxChannel]: SandboxChannel;
+  [sandboxToken]?: string;
   readonly files: Files;
   readonly ports: Ports;
   /** Bind a sandbox view or identifier to a client and endpoint. */
   constructor(client: Client, info: SandboxInfo | string, endpoint?: string) {
     this.#client = client;
     this.#info = typeof info === "string" ? { id: info } : info;
-    this.#endpoint = endpoint;
+    this[sandboxChannel] = new SandboxChannel(client, this.id, endpoint);
     this.files = new Files(this);
     this.ports = new Ports(this);
   }
@@ -73,7 +76,7 @@ export class Sandbox {
   }
   /** Preferred serving endpoint. */
   get endpoint(): string | undefined {
-    return this.#endpoint;
+    return channelFor(this).endpoint;
   }
   /** Owning root client. */
   get client(): Client {
@@ -82,7 +85,7 @@ export class Sandbox {
 
   /** Refresh and merge the sandbox view. */
   async refresh(): Promise<SandboxInfo> {
-    const view = await this.call(SandboxService.method.get, { id: this.id });
+    const view = await channelFor(this).call(SandboxService.method.get, { id: this.id });
     this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;
   }
@@ -91,11 +94,11 @@ export class Sandbox {
     const { secrets, ...request } = options;
     const body: ExecRequest = { ...request, cmd };
     if (secrets) body.env = { ...(body.env ?? {}), ...mergeSecretEnv(secrets) };
-    const result = await this.call(SandboxService.method.execCapture, {
+    const result = await channelFor(this).call(SandboxService.method.execCapture, {
       id: this.id,
       exec: {
         cmd,
-        workdir: body.workdir ?? body.cwd ?? undefined,
+        workdir: body.workdir ?? undefined,
         env: body.env ?? {},
         timeout: body.timeout ?? undefined,
         tty: body.tty ?? false,
@@ -113,13 +116,13 @@ export class Sandbox {
     const body: ExecRequest = { ...request, cmd };
     if (secrets) body.env = { ...(body.env ?? {}), ...mergeSecretEnv(secrets) };
     return new Process(
-      (inputs) => this.duplex(SandboxService.method.exec, inputs),
+      (inputs) => channelFor(this).duplex(SandboxService.method.exec, inputs),
       {
         case: "start",
         value: {
           sandboxId: this.id,
           cmd,
-          workdir: body.workdir ?? body.cwd ?? undefined,
+          workdir: body.workdir ?? undefined,
           env: body.env ?? {},
           timeout: body.timeout ?? undefined,
           tty: body.tty ?? false,
@@ -130,11 +133,16 @@ export class Sandbox {
   }
   /** Attach a read-only console stream. */
   async attach(): Promise<ConsoleStream> {
-    return new ConsoleStream(() => this.stream(SandboxService.method.attach, { id: this.id }));
+    return new ConsoleStream(() =>
+      channelFor(this).stream(SandboxService.method.attach, { id: this.id }),
+    );
   }
   /** Fetch current logs as text. */
   async logs(): Promise<string> {
-    const handle = await this.stream(SandboxService.method.logs, { id: this.id, follow: false });
+    const handle = await channelFor(this).stream(SandboxService.method.logs, {
+      id: this.id,
+      follow: false,
+    });
     const decoder = new TextDecoder();
     let text = "";
     for await (const chunk of handle.stream) text += decoder.decode(chunk.data, { stream: true });
@@ -143,12 +151,14 @@ export class Sandbox {
   /** Follow logs as a stream. */
   async followLogs(): Promise<LogStream> {
     return new LogStream(
-      await this.stream(SandboxService.method.logs, { id: this.id, follow: true }),
+      await channelFor(this).stream(SandboxService.method.logs, { id: this.id, follow: true }),
     );
   }
   /** Fetch sandbox metrics. */
   async metrics(): Promise<SandboxMetrics> {
-    const value = parseResponseJson((await this.call(SandboxService.method.metrics, { id: this.id })).json);
+    const value = parseResponseJson(
+      (await channelFor(this).call(SandboxService.method.metrics, { id: this.id })).json,
+    );
     if (value === null || typeof value !== "object" || Array.isArray(value))
       throw new ProtocolError("sandbox metrics must be an object");
     return value;
@@ -157,25 +167,29 @@ export class Sandbox {
   async stop(wait = true): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseResponseJson((await this.call(SandboxService.method.stop, { id: this.id })).json),
+      parseResponseJson(
+        (await channelFor(this).call(SandboxService.method.stop, { id: this.id })).json,
+      ),
     );
     if (wait) await this.#waitForState(new Set(["stopped", "exited"]));
     return this.#info;
   }
   /** Forcefully terminate the sandbox. */
   async terminate(wait = true): Promise<void> {
-    await this.call(SandboxService.method.terminate, { id: this.id });
+    await channelFor(this).call(SandboxService.method.terminate, { id: this.id });
     if (wait) await this.#waitForState(new Set(["terminated", "stopped", "exited"]));
   }
   /** Remove the sandbox record. */
   async remove(): Promise<void> {
-    await this.call(SandboxService.method.remove, { id: this.id });
+    await channelFor(this).call(SandboxService.method.remove, { id: this.id });
   }
   /** Pause sandbox execution. */
   async pause(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseResponseJson((await this.call(SandboxService.method.pause, { id: this.id })).json),
+      parseResponseJson(
+        (await channelFor(this).call(SandboxService.method.pause, { id: this.id })).json,
+      ),
     );
     return this.#info;
   }
@@ -183,13 +197,15 @@ export class Sandbox {
   async resume(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseResponseJson((await this.call(SandboxService.method.resume, { id: this.id })).json),
+      parseResponseJson(
+        (await channelFor(this).call(SandboxService.method.resume, { id: this.id })).json,
+      ),
     );
     return this.#info;
   }
   /** Extend the sandbox lease. */
   async extend(secs: number): Promise<SandboxInfo> {
-    const view = await this.call(SandboxService.method.extend, {
+    const view = await channelFor(this).call(SandboxService.method.extend, {
       id: this.id,
       secs: BigInt(secs),
     });
@@ -198,14 +214,17 @@ export class Sandbox {
   }
   /** Migrate and re-pin the sandbox. */
   async migrate(target: string): Promise<SandboxInfo> {
-    const view = await this.call(SandboxService.method.migrate, { id: this.id, target });
+    const view = await channelFor(this).call(SandboxService.method.migrate, {
+      id: this.id,
+      target,
+    });
     this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
-    this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
+    await channelFor(this).relocate();
     return this.#info;
   }
   /** Create a full VM snapshot. */
   async snapshot(name?: string, stop = false): Promise<string> {
-    const view = await this.call(SandboxService.method.snapshot, {
+    const view = await channelFor(this).call(SandboxService.method.snapshot, {
       id: this.id,
       name: name ?? undefined,
       stop,
@@ -214,7 +233,7 @@ export class Sandbox {
   }
   /** Create a filesystem snapshot. */
   async snapshotFilesystem(name?: string): Promise<string> {
-    const view = await this.call(SandboxService.method.snapshotFs, {
+    const view = await channelFor(this).call(SandboxService.method.snapshotFs, {
       id: this.id,
       name: name ?? undefined,
     });
@@ -223,12 +242,14 @@ export class Sandbox {
   /** Fetch the network policy. */
   async network(): Promise<NetworkPolicy> {
     return networkPolicy(
-      parseResponseJson((await this.call(SandboxService.method.networkGet, { id: this.id })).json),
+      parseResponseJson(
+        (await channelFor(this).call(SandboxService.method.networkGet, { id: this.id })).json,
+      ),
     );
   }
   /** Replace the network policy. */
   async setNetwork(policy: NetworkPolicy): Promise<NetworkPolicy> {
-    const view = await this.call(SandboxService.method.networkSet, {
+    const view = await channelFor(this).call(SandboxService.method.networkSet, {
       id: this.id,
       blockNetwork: policy.block_network ?? undefined,
       cidrAllow: policy.cidr_allow != null ? { values: policy.cidr_allow } : undefined,
@@ -238,10 +259,10 @@ export class Sandbox {
   }
   /** Fetch tunnels and cache the proxy token. */
   async tunnels(): Promise<TunnelSet> {
-    const view = await this.call(SandboxService.method.tunnels, { id: this.id });
+    const view = await channelFor(this).call(SandboxService.method.tunnels, { id: this.id });
     const value = parseResponseJson(view.json);
     if (!isTunnelSet(value)) throw new ProtocolError("tunnel response must be an object");
-    if (typeof value.connect_token === "string") this.#connectToken = value.connect_token;
+    if (typeof value.connect_token === "string") this[sandboxToken] = value.connect_token;
     return value;
   }
   /** Wait for a command or port readiness probe. */
@@ -276,17 +297,37 @@ export class Sandbox {
       lastError === undefined ? undefined : { cause: lastError },
     );
   }
-  /** Resolve and cache the proxy connect token. */
-  async connectToken(): Promise<string> {
-    if (!this.#connectToken) await this.tunnels();
-    if (!this.#connectToken) throw new ProtocolError("server did not return a connect token");
-    return this.#connectToken;
+  async #waitForState(states: Set<string>): Promise<void> {
+    const deadline = Date.now() + 300_000;
+    while (Date.now() < deadline) {
+      const info = await this.refresh();
+      const state = typeof info.state === "string" ? info.state : info.status;
+      if (state && states.has(state)) return;
+      await sleep(250);
+    }
+    throw new Error(`sandbox state wait timed out after 300 seconds`);
   }
-  /** Encoded API path for this sandbox. */
-  get path(): string {
-    return `/v1/sandboxes/${encodeURIComponent(this.id)}`;
+}
+
+class SandboxChannel {
+  readonly #client: Client;
+  readonly id: string;
+  #endpoint?: string;
+
+  constructor(client: Client, id: string, endpoint?: string) {
+    this.#client = client;
+    this.id = id;
+    this.#endpoint = endpoint;
   }
-  /** Perform a sandbox-affine unary RPC with not_found relocation. */
+
+  get endpoint(): string | undefined {
+    return this.#endpoint;
+  }
+
+  async relocate(): Promise<void> {
+    this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
+  }
+
   async call<I extends DescMessage, O extends DescMessage>(
     method: DescMethodUnary<I, O>,
     input: MessageInitShape<I>,
@@ -298,7 +339,7 @@ export class Sandbox {
     };
     return this.#relocating(execute);
   }
-  /** Open a sandbox-affine server-streaming RPC with not_found relocation. */
+
   async stream<I extends DescMessage, O extends DescMessage>(
     method: DescMethodServerStreaming<I, O>,
     input: MessageInitShape<I>,
@@ -312,7 +353,7 @@ export class Sandbox {
     };
     return this.#relocating(execute);
   }
-  /** Open a sandbox-affine bidi-streaming RPC with not_found relocation. */
+
   async duplex<I extends DescMessage, O extends DescMessage>(
     method: DescMethodBiDiStreaming<I, O>,
     input: AsyncIterable<MessageInitShape<I>>,
@@ -326,41 +367,21 @@ export class Sandbox {
     };
     return this.#relocating(execute);
   }
-  async #relocating<T>(execute: () => Promise<T>): Promise<T> {
-    try {
-      return await execute();
-    } catch (error) {
-      if (
-        !(error instanceof APIError) ||
-        error.code !== "not_found" ||
-        this.#client.driver.endpoints().length <= 1
-      )
-        throw error;
-      this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
-      return execute();
-    }
-  }
-  /** Perform a sandbox HTTP request and reject API errors. */
-  async request(
-    method: string,
-    suffix: string,
-    options: DriverRequestOptions = {},
-  ): Promise<DriverResponse> {
-    const response = await this.requestRaw(method, suffix, options);
-    if (!response.ok) throw await apiError(response);
-    return response;
-  }
-  /** Perform a sandbox request while preserving downstream HTTP statuses. */
+
   async requestRaw(
     method: string,
     suffix: string,
     options: DriverRequestOptions = {},
   ): Promise<DriverResponse> {
     const execute = async () => {
-      const response = await this.#client.driver.request(method, `${this.path}${suffix}`, {
-        ...options,
-        endpoint: this.#endpoint,
-      });
+      const response = await this.#client.driver.request(
+        method,
+        `/v1/sandboxes/${encodeURIComponent(this.id)}${suffix}`,
+        {
+          ...options,
+          endpoint: this.#endpoint,
+        },
+      );
       this.#endpoint = response.endpoint;
       return response;
     };
@@ -368,19 +389,22 @@ export class Sandbox {
     if (response.status !== 404 || this.#client.driver.endpoints().length <= 1) return response;
     const error = await apiError(response.clone());
     if (error.code !== "not_found") return response;
-    this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
+    await this.relocate();
     return execute();
   }
-  /** Open an affinity-aware sandbox WebSocket with relocation. */
+
   async websocket(
     suffix: string,
     query?: URLSearchParams | Record<string, string>,
   ): Promise<[WebSocket, string]> {
     const execute = async () => {
-      const result = await this.#client.driver.websocket(`${this.path}${suffix}`, {
-        query,
-        endpoint: this.#endpoint,
-      });
+      const result = await this.#client.driver.websocket(
+        `/v1/sandboxes/${encodeURIComponent(this.id)}${suffix}`,
+        {
+          query,
+          endpoint: this.#endpoint,
+        },
+      );
       this.#endpoint = result[1];
       return result;
     };
@@ -393,20 +417,39 @@ export class Sandbox {
         this.#client.driver.endpoints().length <= 1
       )
         throw error;
-      this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
+      await this.relocate();
       return execute();
     }
   }
-  async #waitForState(states: Set<string>): Promise<void> {
-    const deadline = Date.now() + 300_000;
-    while (Date.now() < deadline) {
-      const info = await this.refresh();
-      const state = typeof info.state === "string" ? info.state : info.status;
-      if (state && states.has(state)) return;
-      await sleep(250);
+
+  async #relocating<T>(execute: () => Promise<T>): Promise<T> {
+    try {
+      return await execute();
+    } catch (error) {
+      if (
+        !(error instanceof APIError) ||
+        error.code !== "not_found" ||
+        this.#client.driver.endpoints().length <= 1
+      )
+        throw error;
+      await this.relocate();
+      return execute();
     }
-    throw new Error(`sandbox state wait timed out after 300 seconds`);
   }
+}
+
+function channelFor(sandbox: Sandbox): SandboxChannel {
+  return sandbox[sandboxChannel];
+}
+
+async function proxyToken(sandbox: Sandbox): Promise<string> {
+  let token = sandbox[sandboxToken];
+  if (!token) {
+    await sandbox.tunnels();
+    token = sandbox[sandboxToken];
+  }
+  if (!token) throw new ProtocolError("server did not return a connect token");
+  return token;
 }
 
 /** Bound guest filesystem operations. */
@@ -418,7 +461,7 @@ export class Files {
   }
   /** Read raw guest file bytes. */
   async read(path: string): Promise<Uint8Array> {
-    const content = await this.#sandbox.call(SandboxService.method.fileRead, {
+    const content = await channelFor(this.#sandbox).call(SandboxService.method.fileRead, {
       id: this.#sandbox.id,
       path,
     });
@@ -431,7 +474,7 @@ export class Files {
   /** Write raw guest file content. */
   async write(path: string, content: BodyInit): Promise<void> {
     const data = new Uint8Array(await new Response(content).arrayBuffer());
-    await this.#sandbox.call(SandboxService.method.fileWrite, {
+    await channelFor(this.#sandbox).call(SandboxService.method.fileWrite, {
       id: this.#sandbox.id,
       path,
       data,
@@ -443,7 +486,7 @@ export class Files {
   }
   /** List guest directory entries. */
   async list(path = "."): Promise<FileInfo[]> {
-    const view = await this.#sandbox.call(SandboxService.method.fileList, {
+    const view = await channelFor(this.#sandbox).call(SandboxService.method.fileList, {
       id: this.#sandbox.id,
       path,
     });
@@ -460,7 +503,7 @@ export class Files {
   }
   /** Stat a guest filesystem path. */
   async stat(path: string): Promise<FileInfo> {
-    const view = await this.#sandbox.call(SandboxService.method.fileStat, {
+    const view = await channelFor(this.#sandbox).call(SandboxService.method.fileStat, {
       id: this.#sandbox.id,
       path,
     });
@@ -470,7 +513,7 @@ export class Files {
   }
   /** Delete a guest path, optionally recursively. */
   async delete(path: string, recursive = false): Promise<void> {
-    await this.#sandbox.call(SandboxService.method.fileDelete, {
+    await channelFor(this.#sandbox).call(SandboxService.method.fileDelete, {
       id: this.#sandbox.id,
       path,
       recursive,
@@ -514,12 +557,16 @@ export class Ports {
   ): Promise<Response> {
     validatePort(port);
     const params = sanitizedParams(options.params);
-    const token = await this.#sandbox.connectToken();
+    const token = await proxyToken(this.#sandbox);
     if (token) params.set("connect_token", token);
-    return this.#sandbox.requestRaw(method, `/ports/${port}/${path.replace(/^\//, "")}`, {
-      ...options,
-      params,
-    });
+    return channelFor(this.#sandbox).requestRaw(
+      method,
+      `/ports/${port}/${path.replace(/^\//, "")}`,
+      {
+        ...options,
+        params,
+      },
+    );
   }
   /** Proxy a WebSocket to an exposed guest port. */
   async websocket(
@@ -529,9 +576,9 @@ export class Ports {
   ): Promise<WebSocket> {
     validatePort(port);
     const params = sanitizedParams(query);
-    const token = await this.#sandbox.connectToken();
+    const token = await proxyToken(this.#sandbox);
     if (token) params.set("connect_token", token);
-    const [socket] = await this.#sandbox.websocket(
+    const [socket] = await channelFor(this.#sandbox).websocket(
       `/ports/${port}/ws/${path.replace(/^\//, "")}`,
       params,
     );

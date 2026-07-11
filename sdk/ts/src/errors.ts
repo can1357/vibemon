@@ -1,6 +1,6 @@
 import type { ConnectError } from "@connectrpc/connect";
 import { Code } from "@connectrpc/connect";
-import type { PortableValue } from "./function-values";
+import type { JsonValue } from "./function-values";
 import { parseJsonValue } from "./function-values";
 
 /** Structured server error fields. */
@@ -35,7 +35,7 @@ export class ProtocolError extends Error {
 }
 
 /** Parse a strict JSON response and normalize decoder failures. */
-export function parseResponseJson(text: string): PortableValue {
+export function parseResponseJson(text: string): JsonValue {
   try {
     return parseJsonValue(text);
   } catch (error) {

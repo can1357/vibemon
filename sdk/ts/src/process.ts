@@ -12,7 +12,9 @@ export interface ExecEvent {
 }
 /** Optional process output callbacks. */
 export interface ProcessOptions {
+  /** Receive each stdout chunk as it arrives. */
   onStdout?: (data: Uint8Array) => void;
+  /** Receive each stderr chunk as it arrives. */
   onStderr?: (data: Uint8Array) => void;
 }
 

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
-import { Code } from "@connectrpc/connect";
+import { Code, createRouterTransport } from "@connectrpc/connect";
 import type { Driver, DriverRequestOptions, DriverResponse, EndpointInfo } from "../src";
 import { APIError, Client, EventStream, LogStream, MeshDriver, Sandbox } from "../src";
 import {
@@ -8,6 +8,7 @@ import {
   ExecInputSchema,
   ExecOutputSchema,
   JsonViewSchema,
+  SandboxService,
   SandboxRefSchema,
   Stream,
 } from "../src/gen/vmon/v1/api_pb";
@@ -225,9 +226,21 @@ test("attach opens the console stream and close cancels it", async () => {
   await called.promise;
 });
 
-test("sandbox WebSocket helper relocates a migrated sandbox after not_found", async () => {
-  const socket = {} as WebSocket;
+test("port WebSockets relocate a migrated sandbox after not_found", async () => {
+  const server = bridgeServer({});
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/grpc`);
   let attempts = 0;
+  const rpcTransport = createRouterTransport(({ service }) => {
+    service(SandboxService, {
+      tunnels() {
+        return { json: '{"connect_token":"token","tunnels":{}}' };
+      },
+    });
+  });
+  const rpcDriver = new MeshDriver("http://node-a", {
+    discover: false,
+    transport: () => rpcTransport,
+  });
   const driver: Driver = {
     request(
       _method: string,
@@ -236,9 +249,7 @@ test("sandbox WebSocket helper relocates a migrated sandbox after not_found", as
     ): Promise<DriverResponse> {
       throw new Error("unexpected HTTP request");
     },
-    call(): never {
-      throw new Error("unexpected RPC");
-    },
+    call: rpcDriver.call.bind(rpcDriver),
     serverStream(): never {
       throw new Error("unexpected streaming RPC");
     },
@@ -265,8 +276,9 @@ test("sandbox WebSocket helper relocates a migrated sandbox after not_found", as
     close() {},
   };
   const sandbox = new Sandbox(new Client(driver), { id: "moved" }, "http://node-a");
-  expect(await sandbox.websocket("/attach")).toEqual([socket, "http://node-b"]);
+  expect(await sandbox.ports.websocket(8080, "attach")).toBe(socket);
   expect(sandbox.endpoint).toBe("http://node-b");
+  socket.close();
 });
 
 test("stream close cancels the underlying RPC handle", async () => {

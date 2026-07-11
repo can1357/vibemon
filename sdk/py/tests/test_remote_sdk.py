@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from vmon._function_proto import value_from_proto, value_to_proto
+import vmon.remote as remote_module
+from vmon.errors import APIError, RemoteFunctionError
+from vmon._function_proto import artifact_ref, package_to_proto, value_from_proto, value_to_proto
+from vmon.package import package_callable
 from vmon.remote import BatchCall, FunctionCall, RemoteFunction, _invocation, function
 from vmon.v1 import api_pb2
 from vmon.values import ValueCodec, decode_value, encode_value
@@ -51,6 +54,31 @@ def test_cloudpickle_remains_explicitly_trusted() -> None:
     with pytest.raises(PermissionError, match="trusted"):
         decode_value(restored)
     assert decode_value(restored, trusted=True) == {1, 2}
+
+
+def test_trusted_serialization_declares_cloudpickle_for_normal_packages() -> None:
+    import cloudpickle
+
+    package = package_callable(test_trusted_serialization_declares_cloudpickle_for_normal_packages)
+    spec = package_to_proto(
+        package,
+        artifact_ref(package.sha256),
+        trusted_serialization=True,
+    )
+    assert spec.python.cloudpickle_version == cloudpickle.__version__
+
+    serialized = package_callable(
+        test_trusted_serialization_declares_cloudpickle_for_normal_packages,
+        mode="cloudpickle",
+    )
+    serialized_spec = package_to_proto(
+        serialized,
+        artifact_ref(serialized.sha256),
+        trusted_serialization=True,
+    )
+    assert serialized_spec.mode == api_pb2.PACKAGE_MODE_TRUSTED_SERIALIZED
+    assert not serialized_spec.included_paths
+    assert serialized_spec.python.cloudpickle_version == cloudpickle.__version__
 
 
 def test_python_invocation_abi_is_versioned_and_collision_safe() -> None:
@@ -109,6 +137,9 @@ def test_batch_terminal_cancellation_is_not_silently_discarded() -> None:
         def ListResults(self, request):
             return api_pb2.ListCallResultsResponse(next_cursor=request.cursor, end=True)
 
+        def GetResult(self, request):
+            raise APIError("pending", code="not_found", status=404)
+
         def Get(self, request):
             return api_pb2.CallRecord(ref=request, status=api_pb2.CALL_STATUS_CANCELLED)
 
@@ -165,3 +196,143 @@ def test_sync_batch_producer_failure_durably_cancels_call() -> None:
 
     function.spawn_map(failing())
     assert cancelled.wait(1)
+
+
+def test_ordered_batch_fetches_only_next_index_and_cancels_partial_consumer(
+    monkeypatch,
+) -> None:
+    release_first = threading.Event()
+    first_requested = threading.Event()
+    cancelled = threading.Event()
+    requested: list[int] = []
+    decoded: list[int] = []
+
+    class Calls:
+        terminal = False
+        completed_suffix = range(1, 5_001)
+
+        def GetResult(self, request):
+            requested.append(request.index)
+            if request.index == 0 and not release_first.is_set():
+                first_requested.set()
+                raise APIError("pending", code="not_found", status=404)
+            if request.index == 0:
+                envelope = encode_value(0, codec=ValueCodec.JSON, compress=False)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-0",
+                    input_index=0,
+                    value=value_to_proto(envelope),
+                )
+            if request.index in self.completed_suffix:
+                envelope = encode_value(request.index, codec=ValueCodec.JSON, compress=False)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id=f"input-{request.index}",
+                    input_index=request.index,
+                    value=value_to_proto(envelope),
+                )
+            raise APIError("exhausted", code="not_found", status=404)
+
+        def Get(self, request):
+            return api_pb2.CallRecord(
+                ref=request,
+                status=(
+                    api_pb2.CALL_STATUS_SUCCEEDED if self.terminal else api_pb2.CALL_STATUS_RUNNING
+                ),
+            )
+
+        def ListResults(self, request):
+            raise AssertionError("ordered iteration must not list completed suffixes")
+
+        def Cancel(self, request):
+            cancelled.set()
+            return api_pb2.CallRecord(
+                ref=request.call,
+                status=api_pb2.CALL_STATUS_CANCELLED,
+            )
+
+    calls = Calls()
+
+    class Driver:
+        resolve_count = 0
+
+        def call(self, operation, *, endpoint=None, stream=False):
+            return operation(SimpleNamespace(calls=calls)), "owner"
+
+        def resolve_call(self, call_id, endpoint=None):
+            self.resolve_count += 1
+            return "owner"
+
+    driver = Driver()
+    batch = BatchCall.from_id("bounded", client=SimpleNamespace(driver=driver))
+    assert batch.input_count is None
+    initial_resolve_count = driver.resolve_count
+    original = remote_module._result_value
+
+    def track_decode(*args, **kwargs):
+        result = args[1]
+        decoded.append(result.input_index)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(remote_module, "_result_value", track_decode)
+    iterator = batch.results()
+    yielded: list[object] = []
+    consumer = threading.Thread(target=lambda: yielded.append(next(iterator)))
+    consumer.start()
+    assert first_requested.wait(1)
+    assert set(requested) == {0}
+    assert decoded == []
+    assert driver.resolve_count == initial_resolve_count
+
+    release_first.set()
+    consumer.join(1)
+    assert not consumer.is_alive()
+    assert yielded == [0]
+    assert decoded == [0]
+    iterator.close()
+    assert cancelled.wait(1)
+
+
+def test_ordered_batch_return_exceptions_is_per_item_and_then_exhausts() -> None:
+    class Calls:
+        def GetResult(self, request):
+            if request.index == 0:
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-0",
+                    input_index=0,
+                    error=api_pb2.CallError(
+                        code="invalid",
+                        message="bad item",
+                        type="ValueError",
+                    ),
+                )
+            if request.index == 1:
+                envelope = encode_value(7, codec=ValueCodec.JSON, compress=False)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-1",
+                    input_index=1,
+                    value=value_to_proto(envelope),
+                )
+            raise APIError("exhausted", code="not_found", status=404)
+
+        def Get(self, request):
+            return api_pb2.CallRecord(
+                ref=request,
+                status=api_pb2.CALL_STATUS_SUCCEEDED,
+            )
+
+    calls = Calls()
+
+    class Driver:
+        def call(self, operation, *, endpoint=None, stream=False):
+            return operation(SimpleNamespace(calls=calls)), "owner"
+
+    batch = BatchCall.from_id("item-errors", client=SimpleNamespace(driver=Driver()))
+    values = list(batch.results(return_exceptions=True))
+    assert len(values) == 2
+    assert isinstance(values[0], RemoteFunctionError)
+    assert values[0].code == "invalid"
+    assert values[1] == 7
