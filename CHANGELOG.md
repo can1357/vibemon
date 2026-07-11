@@ -27,6 +27,12 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `ListResults` API for fetching paginated durable call results
+- Added support for named and positional invocation arguments in durable calls
+- Added `AttemptFailureKind` to categorize execution failures as user-level or infrastructure-level
+- Added retention TTL support for artifacts via `PutArtifactHeader` and `ArtifactRecord`
+- Added backpressure signaling for durable input streams with `max_inputs_outstanding`
+- Added `max_inputs_outstanding` and input acknowledgments to the `StreamInputs` flow
 - Added server-native durable function runtime with persistent workers and stateful actors
 - Added durable function invocation metrics for scheduling, startup, and execution
 - Added authenticated, portable JSON-only HTTP gateway for durable function invocation
@@ -128,6 +134,12 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated durable call execution stats to distinguish between user-triggered and infra-level retries
+- Changed `ResourceSpec` CPU quota definition from `cpu_millis` to total virtual CPUs (`cpus`)
+- Refactored durable function snapshot records to include reloadable provenance and validation metadata
+- Simplified `CallTarget` by consolidating actor and service receivers into a single `receiver` field
+- Updated `CallInput` to support structured invocation arguments alongside scalar values
+- Replaced the deprecated `BLAKE3` digest algorithm with `SHA256` for function snapshots
 - Updated CLI to support durable function management commands and service-level interactions
 - Refactored runner protocol handling to improve stream stability and error reporting
 - Updated SDK function definition to support zero-deploy code or remote revision lookups

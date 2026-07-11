@@ -731,8 +731,8 @@ service FunctionService {
 service CallService {
   // Create durably records a call before any execution is eligible to begin.
   rpc Create(CreateCallRequest) returns (CallRecord);
-  // StreamInputs durably appends ordered inputs to an open generator or batch call.
-  rpc StreamInputs(stream StreamCallInputsRequest) returns (StreamCallInputsResponse);
+  // StreamInputs bidirectionally appends ordered inputs and acknowledges the opener and every committed input.
+  rpc StreamInputs(stream StreamCallInputsRequest) returns (stream StreamCallInputsResponse);
   // CloseInputs marks an input stream complete so execution can finish.
   rpc CloseInputs(CloseCallInputsRequest) returns (CallRecord);
   // Get returns the latest durable state of a call.
@@ -741,6 +741,8 @@ service CallService {
   rpc List(ListCallsRequest) returns (ListCallsResponse);
   // GetResult returns one durable result by its input or yield index.
   rpc GetResult(GetCallResultRequest) returns (CallResult);
+  // ListResults returns a bounded page after a durable result sequence cursor.
+  rpc ListResults(ListCallResultsRequest) returns (ListCallResultsResponse);
   // Watch streams events after a durable sequence cursor and may follow new events.
   rpc Watch(WatchCallRequest) returns (stream CallEvent);
   // Cancel durably requests cancellation of a call and its unfinished work.
@@ -769,15 +771,13 @@ enum DigestAlgorithm {
   DIGEST_ALGORITHM_UNSPECIFIED = 0;
   // DIGEST_ALGORITHM_SHA256 is SHA-256 over the uncompressed bytes.
   DIGEST_ALGORITHM_SHA256 = 1;
-  // DIGEST_ALGORITHM_BLAKE3 is BLAKE3 over the uncompressed bytes.
-  DIGEST_ALGORITHM_BLAKE3 = 2;
 }
 
 // ValueSerializer identifies the codec used by a ValueEnvelope.
 enum ValueSerializer {
   // VALUE_SERIALIZER_UNSPECIFIED indicates that no codec was selected.
   VALUE_SERIALIZER_UNSPECIFIED = 0;
-  // VALUE_SERIALIZER_JSON is portable RFC 8259 JSON encoded as UTF-8.
+  // VALUE_SERIALIZER_JSON is portable I-JSON UTF-8 with integers restricted to the interoperable safe range.
   VALUE_SERIALIZER_JSON = 1;
   // VALUE_SERIALIZER_CBOR is portable RFC 8949 CBOR.
   VALUE_SERIALIZER_CBOR = 2;
@@ -842,15 +842,6 @@ enum HighAvailabilityPolicy {
 }
 
 
-// ClientCancellationPolicy controls what happens when the creating client disconnects.
-enum ClientCancellationPolicy {
-  // CLIENT_CANCELLATION_POLICY_UNSPECIFIED selects the durable detached default.
-  CLIENT_CANCELLATION_POLICY_UNSPECIFIED = 0;
-  // CLIENT_CANCELLATION_POLICY_DETACH leaves the durable call running.
-  CLIENT_CANCELLATION_POLICY_DETACH = 1;
-  // CLIENT_CANCELLATION_POLICY_CANCEL requests cancellation on client disconnect.
-  CLIENT_CANCELLATION_POLICY_CANCEL = 2;
-}
 
 // CallType identifies the execution and result-indexing model of a call.
 enum CallType {
@@ -1003,6 +994,11 @@ message ArtifactRecord {
   }
   // CreatedAtUnixMillis is the server commit time in Unix milliseconds.
   uint64 created_at_unix_millis = 5;
+  // ExpiresAtUnixMillis is present when the artifact has a retention deadline.
+  oneof expires_at_unix_millis_presence {
+    // ExpiresAtUnixMillis is the artifact expiration time in Unix milliseconds.
+    uint64 expires_at_unix_millis = 6;
+  }
 }
 
 // PutArtifactHeader declares metadata that must precede uploaded chunks.
@@ -1015,6 +1011,11 @@ message PutArtifactHeader {
   oneof media_type_presence {
     // MediaType is the supplied IANA media type.
     string media_type = 3;
+  }
+  // TtlMillis is present to request expiration relative to the commit time.
+  oneof ttl_millis_presence {
+    // TtlMillis is the requested artifact retention duration.
+    uint64 ttl_millis = 4;
   }
 }
 
@@ -1213,8 +1214,8 @@ message ImageSpec {
 
 // ResourceSpec declares per-worker resource limits.
 message ResourceSpec {
-  // CpuMillis is the CPU quota in thousandths of one core.
-  uint32 cpu_millis = 1;
+  // Cpus is the required number of whole virtual CPUs.
+  uint32 cpus = 1;
   // MemoryBytes is the worker memory limit.
   uint64 memory_bytes = 2;
   // EphemeralDiskBytes is the writable ephemeral disk limit.
@@ -1489,20 +1490,34 @@ message LifecycleHooks {
   bool snapshot_on_worker_retire = 6;
 }
 
-// FunctionSnapshotProvenance records the immutable inputs of a worker snapshot.
-message FunctionSnapshotProvenance {
-  // Snapshot identifies the immutable worker snapshot artifact.
-  ArtifactRef snapshot = 1;
+// FunctionSnapshotRef identifies a persisted worker snapshot.
+message FunctionSnapshotRef {
+  // SnapshotId is the stable server-assigned snapshot identifier.
+  string snapshot_id = 1;
+}
+ 
+// FunctionSnapshotRecord is a persisted, reloadable worker snapshot with validation provenance.
+message FunctionSnapshotRecord {
+  // Ref identifies the persisted function snapshot.
+  FunctionSnapshotRef ref = 1;
+  // Revision pins the function revision represented by the snapshot.
+  RevisionRef revision = 2;
+  // Artifact contains the immutable worker snapshot bytes.
+  ArtifactRef artifact = 3;
+  // ProtocolVersion is the snapshot protocol version required by the loader.
+  uint32 protocol_version = 4;
+  // RunnerDigest pins the runner binary or package that created and must validate the snapshot.
+  Digest runner_digest = 5;
   // ImageDigest pins the OCI image used to create the snapshot.
-  Digest image_digest = 2;
+  Digest image_digest = 6;
   // PackageDigest pins the normalized function package.
-  Digest package_digest = 3;
+  Digest package_digest = 7;
   // CreatedAtUnixMillis is the snapshot commit time.
-  uint64 created_at_unix_millis = 4;
+  uint64 created_at_unix_millis = 8;
   // InitializeHook is present when snapshot creation ran an initialization hook.
   oneof initialize_hook_presence {
     // InitializeHook identifies the hook used to prepare snapshot state.
-    LifecycleHookRef initialize_hook = 5;
+    LifecycleHookRef initialize_hook = 9;
   }
 }
 
@@ -1554,10 +1569,10 @@ message FunctionRevision {
   FunctionRevisionStatus status = 5;
   // UnavailableSecrets lists persisted references that currently cannot be resolved.
   repeated SecretRef unavailable_secrets = 6;
-  // SnapshotProvenance is present when registration produced a reusable worker snapshot.
-  oneof snapshot_provenance_presence {
-    // SnapshotProvenance records immutable snapshot inputs.
-    FunctionSnapshotProvenance snapshot_provenance = 7;
+  // Snapshot is present when registration produced a persisted reusable worker snapshot.
+  oneof snapshot_presence {
+    // Snapshot contains reload and validation provenance.
+    FunctionSnapshotRecord snapshot = 7;
   }
 }
 
@@ -1808,19 +1823,50 @@ message ActorRef {
   string actor_id = 1;
 }
 
-// CallTarget pins the executable and optionally a durable actor.
+// InvocationArguments carries typed positional and named callable arguments.
+message InvocationArguments {
+  // Positional contains arguments in invocation order.
+  repeated ValueEnvelope positional = 1;
+  // Named maps parameter names to typed values.
+  map<string, ValueEnvelope> named = 2;
+}
+
+// ActorTarget invokes a method on an existing durable actor.
+message ActorTarget {
+  // Actor identifies the durable actor receiver.
+  ActorRef actor = 1;
+  // Method is the exported actor method name.
+  string method = 2;
+}
+
+// ServiceTarget invokes a method on a deterministic service instance.
+message ServiceTarget {
+  // ServiceKey deterministically identifies the service instance.
+  string service_key = 1;
+  // Method is the exported service method name.
+  string method = 2;
+  // Constructor contains deterministic arguments used when the service instance is first created.
+  InvocationArguments constructor = 3;
+}
+
+// ParentEdge identifies the exact parent input that created a child call.
+message ParentEdge {
+  // CallId identifies the direct parent call.
+  string call_id = 1;
+  // InputId identifies the direct parent input.
+  string input_id = 2;
+}
+
+// CallTarget pins the executable and optional typed receiver.
 message CallTarget {
   // Function pins the immutable function revision.
   RevisionRef function = 1;
-  // Actor is present only for actor calls.
-  oneof actor_presence {
-    // Actor identifies the durable actor receiving the call.
-    ActorRef actor = 2;
-  }
-  // ActorMethod is present only for actor method dispatch.
-  oneof actor_method_presence {
-    // ActorMethod is the exported actor method name.
-    string actor_method = 3;
+  // Receiver optionally targets a durable actor or deterministic service instance.
+  oneof receiver {
+    // Actor invokes a method on an existing durable actor.
+    ActorTarget actor = 2;
+    // Service invokes a method on a deterministic service instance.
+    ServiceTarget service = 3;
   }
 }
 
@@ -1828,23 +1874,34 @@ message CallTarget {
 message CallInput {
   // Index is zero for unary calls and monotonically increasing for batch inputs.
   uint64 index = 1;
-  // Value is the typed input envelope.
-  ValueEnvelope value = 2;
-  // InputId is a stable identifier; the server assigns one when the client leaves it empty.
+  // Payload contains one scalar value or structured invocation arguments.
+  oneof payload {
+    // Value is one serialized positional value.
+    ValueEnvelope value = 2;
+    // Arguments contains positional and named invocation arguments.
+    InvocationArguments arguments = 4;
+  }
+  // InputId is a required stable identifier generated by the client.
   string input_id = 3;
+}
+
+// InputRef identifies one durable call input by stable ID and index.
+message InputRef {
+  // InputId is the required client-generated stable identifier.
+  string input_id = 1;
+  // InputIndex is the input's zero-based index within the call.
+  uint64 input_index = 2;
 }
 
 // CallGraph records durable parent relationships between calls.
 message CallGraph {
-  // ParentCallIds contains direct parent calls in deterministic order.
-  repeated string parent_call_ids = 1;
+  // Parents contains typed parent call/input edges in deterministic order.
+  repeated ParentEdge parents = 1;
   // RootCallId is present for a descendant in a call graph.
   oneof root_call_id_presence {
     // RootCallId identifies the graph root.
     string root_call_id = 2;
   }
-  // ParentInputIds aligns with ParentCallIds and identifies the parent input that created each edge.
-  repeated string parent_input_ids = 3;
 }
 
 // CreateCallRequest describes a call that must be persisted before execution.
@@ -1863,17 +1920,10 @@ message CreateCallRequest {
   string request_id = 6;
   // Labels are user-defined lookup metadata.
   map<string, string> labels = 7;
-  // ClientCancellation controls whether creator disconnect cancels the durable call.
-  ClientCancellationPolicy client_cancellation = 8;
   // ResultTtlMillis overrides the function result retention only when present.
   oneof result_ttl_millis_presence {
     // ResultTtlMillis is the per-call durable result retention duration.
     uint64 result_ttl_millis = 9;
-  }
-  // ClientSessionId is required and nonempty when ClientCancellation is CANCEL.
-  oneof client_session_id_presence {
-    // ClientSessionId is the creator capability persisted for authenticated watch-drop cancellation.
-    string client_session_id = 10;
   }
 }
 
@@ -1929,6 +1979,13 @@ message StreamCallInputsResponse {
   CallRef call = 1;
   // CommittedInputCount is the number of contiguous committed inputs.
   uint64 committed_input_count = 2;
+  // LastInput is absent on the opener acknowledgement and present after an input commit.
+  oneof last_input_presence {
+    // LastInput identifies the input acknowledged by this response.
+    InputRef last_input = 3;
+  }
+  // MaxInputsOutstanding is the server-advertised bound for sent but unacknowledged inputs.
+  uint32 max_inputs_outstanding = 4;
 }
 
 // CloseCallInputsRequest closes a durable generator or batch input stream.
@@ -2027,17 +2084,30 @@ message EventCursor {
   uint64 after_sequence = 2;
 }
 
+// ListCallResultsRequest requests a bounded durable result page.
+message ListCallResultsRequest {
+  // Cursor identifies the call and last consumed result sequence.
+  ResultCursor cursor = 1;
+  // PageSize is bounded by the server; zero selects the server default.
+  uint32 page_size = 2;
+}
+
+// ListCallResultsResponse contains one bounded durable result page.
+message ListCallResultsResponse {
+  // Results are ordered by strictly increasing result sequence.
+  repeated CallResult results = 1;
+  // NextCursor resumes after the final returned result.
+  ResultCursor next_cursor = 2;
+  // End is true when no committed result follows NextCursor at response time.
+  bool end = 3;
+}
+
 // WatchCallRequest resumes an ordered call event stream.
 message WatchCallRequest {
   // Cursor identifies the call and last processed sequence.
   EventCursor cursor = 1;
   // Follow waits for new events after replaying committed history.
   bool follow = 2;
-  // ClientSessionId is omitted by observers and reattached consumers.
-  oneof client_session_id_presence {
-    // ClientSessionId may trigger drop cancellation only for a follow watch when it exactly matches the creator session.
-    string client_session_id = 3;
-  }
 }
 
 // StatusEvent records a durable lifecycle transition.
@@ -2054,21 +2124,39 @@ message LogEvent {
   bytes data = 2;
 }
 
+// AttemptFailureKind classifies why an execution attempt ended.
+enum AttemptFailureKind {
+  // ATTEMPT_FAILURE_KIND_UNSPECIFIED means no failure or an unknown failure class.
+  ATTEMPT_FAILURE_KIND_UNSPECIFIED = 0;
+  // ATTEMPT_FAILURE_KIND_USER is a policy-visible user-code failure.
+  ATTEMPT_FAILURE_KIND_USER = 1;
+  // ATTEMPT_FAILURE_KIND_INFRASTRUCTURE is a transparent platform failure.
+  ATTEMPT_FAILURE_KIND_INFRASTRUCTURE = 2;
+  // ATTEMPT_FAILURE_KIND_CANCELLED is cooperative or forced cancellation.
+  ATTEMPT_FAILURE_KIND_CANCELLED = 3;
+}
+
 // AttemptEvent records an execution attempt transition.
 message AttemptEvent {
-  // Attempt is one-based and increases for each retry.
-  uint32 attempt = 1;
+  // AttemptId is the stable identifier shared by all events and stats for this attempt.
+  string attempt_id = 1;
+  // UserAttempt counts policy-visible retries caused by user execution failures.
+  uint32 user_attempt = 2;
+  // InfraAttempt counts transparent retries caused by infrastructure failures.
+  uint32 infra_attempt = 3;
   // Status is the attempt transition.
-  AttemptStatus status = 2;
+  AttemptStatus status = 4;
   // Startup identifies cold, warm, or snapshot preparation.
-  StartupKind startup = 3;
+  StartupKind startup = 5;
   // WorkerId is the diagnostic worker identity.
-  string worker_id = 4;
+  string worker_id = 6;
   // Error is present when the attempt failed.
   oneof error_presence {
     // Error is the attempt's structured failure.
-    CallError error = 5;
+    CallError error = 7;
   }
+  // FailureKind distinguishes user failures from transparent infrastructure failures.
+  AttemptFailureKind failure_kind = 8;
 }
 
 // CallEvent is one immutable event in a call's sequence-numbered log.
@@ -2087,11 +2175,11 @@ message CallEvent {
     StatusEvent status = 5;
     // Log records worker output.
     LogEvent log = 6;
-    // Yield records an indexed generator yield.
-    CallResult yield = 7;
+    // YieldResult records an indexed generator yield.
+    CallResult yield_result = 7;
     // Result records an indexed final result.
     CallResult result = 8;
-    // Attempt records an attempt transition.
+    // AttemptEvent records an attempt transition.
     AttemptEvent attempt_event = 9;
     // Error records a structured execution error.
     CallError error = 10;
@@ -2110,10 +2198,10 @@ message CallEvent {
     // InputIndex is the owning input's index.
     uint64 input_index = 14;
   }
-  // Attempt is present when the event is attributable to one execution attempt.
-  oneof attempt_presence {
-    // Attempt is the one-based execution attempt number.
-    uint32 attempt = 15;
+  // AttemptId is present when the event is attributable to one execution attempt.
+  oneof attempt_id_presence {
+    // AttemptId is the stable execution attempt identifier.
+    string attempt_id = 15;
   }
 }
 
@@ -2155,20 +2243,26 @@ message CallError {
 
 // AttemptStats contains timing and resource usage for one attempt.
 message AttemptStats {
-  // Attempt is the one-based attempt number.
-  uint32 attempt = 1;
+  // AttemptId is the stable identifier shared with attempt events.
+  string attempt_id = 1;
+  // UserAttempt counts policy-visible user-code retries.
+  uint32 user_attempt = 2;
+  // InfraAttempt counts transparent infrastructure retries.
+  uint32 infra_attempt = 3;
   // Startup identifies cold, warm, or snapshot preparation.
-  StartupKind startup = 2;
+  StartupKind startup = 4;
+  // FailureKind classifies the failure that ended this attempt, if any.
+  AttemptFailureKind failure_kind = 5;
   // QueuedMillis is time spent awaiting worker assignment.
-  uint64 queued_millis = 3;
+  uint64 queued_millis = 6;
   // StartupMillis is time spent preparing the worker.
-  uint64 startup_millis = 4;
+  uint64 startup_millis = 7;
   // ExecutionMillis is time spent running user code.
-  uint64 execution_millis = 5;
+  uint64 execution_millis = 8;
   // CpuMillis is metered CPU time.
-  uint64 cpu_millis = 6;
+  uint64 cpu_millis = 9;
   // PeakMemoryBytes is peak resident memory.
-  uint64 peak_memory_bytes = 7;
+  uint64 peak_memory_bytes = 10;
 }
 
 // CallStats contains durable aggregate timing and resource usage.
@@ -2246,10 +2340,12 @@ message ActorCheckpoint {
 message CreateActorRequest {
   // Function pins an actor-lifecycle function revision.
   RevisionRef function = 1;
-  // InitialState is present when actor construction receives serialized state.
-  oneof initial_state_presence {
-    // InitialState is the actor's initial serialized state.
-    ValueEnvelope initial_state = 2;
+  // InitialPayload is absent for a no-argument constructor.
+  oneof initial_payload {
+    // InitialValue is one serialized constructor value.
+    ValueEnvelope initial_value = 2;
+    // InitialArguments contains positional and named constructor arguments.
+    InvocationArguments initial_arguments = 5;
   }
   // RequestId provides idempotency for retried creation.
   string request_id = 3;
