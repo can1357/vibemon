@@ -362,8 +362,7 @@ where
 		let (mem_regions, delta) = match base {
 			None => (dump_memory_file(&memory_tmp, mem)?, None),
 			Some(b) => {
-				let (r, d) =
-					dump_delta_memory_file(&memory_tmp, dir, b, mem, guest_dirty.as_deref())?;
+				let (r, d) = dump_delta_memory_file(&memory_tmp, dir, b, mem, guest_dirty.as_deref())?;
 				(r, Some(d))
 			},
 		};
@@ -1166,11 +1165,7 @@ impl FileMap {
 			)
 		};
 		if ptr == libc::MAP_FAILED {
-			return Err(err(format!(
-				"mmap {}: {}",
-				path.display(),
-				std::io::Error::last_os_error()
-			)));
+			return Err(err(format!("mmap {}: {}", path.display(), std::io::Error::last_os_error())));
 		}
 		Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
 	}
@@ -1592,10 +1587,12 @@ pub fn load_memory_chain(dir: &Path, image: &SnapshotImage, mem: &GuestMemoryMma
 	load_layer(dir, image, mem, &expected, 0)
 }
 
-/// Map a delta snapshot's guest RAM lazily: the deepest FULL layer's memory
-/// file becomes a `MAP_PRIVATE` mapping (clean pages shared with the host page
-/// cache) and each delta layer is applied on top, faulting private copies of
-/// only the changed pages. Restore cost scales with the delta, not guest RAM.
+/// Map a delta snapshot's guest RAM lazily.
+///
+/// The deepest FULL layer's memory file becomes a `MAP_PRIVATE` mapping
+/// (clean pages shared with the host page cache) and each delta layer is
+/// applied on top, faulting private copies of only the changed pages, so
+/// restore cost scales with the delta instead of guest RAM.
 ///
 /// The chain directories MUST outlive the VM — the live-migration receiver
 /// keeps both installed — because unfaulted pages are read from the base file
@@ -1608,7 +1605,9 @@ pub fn map_memory_chain_private(dir: &Path, image: &SnapshotImage) -> Result<Gue
 	let mut layer = read_snapshot(&layer_dir)?;
 	while let Some(delta) = &layer.snapshot().delta {
 		if deltas.len() >= MAX_DELTA_CHAIN_DEPTH {
-			return Err(err(format!("snapshot delta chain exceeds max depth {MAX_DELTA_CHAIN_DEPTH}")));
+			return Err(err(format!(
+				"snapshot delta chain exceeds max depth {MAX_DELTA_CHAIN_DEPTH}"
+			)));
 		}
 		if !same_layout(&layer.snapshot().mem_regions, &expected) {
 			return Err(err("delta chain layer RAM layout differs from top snapshot"));
@@ -1620,8 +1619,10 @@ pub fn map_memory_chain_private(dir: &Path, image: &SnapshotImage) -> Result<Gue
 	if !same_layout(&layer.snapshot().mem_regions, &expected) {
 		return Err(err("delta chain base RAM layout differs from top snapshot"));
 	}
-	let regions: Vec<(u64, u64, u64)> =
-		expected.iter().map(|r| (r.gpa, r.len, r.file_offset)).collect();
+	let regions: Vec<(u64, u64, u64)> = expected
+		.iter()
+		.map(|r| (r.gpa, r.len, r.file_offset))
+		.collect();
 	let mem = memory::create_guest_memory_private(layer.memory_file(), &regions)?;
 	for delta_layer in deltas.iter().rev() {
 		let descriptor = delta_layer

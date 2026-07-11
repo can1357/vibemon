@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
+use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{IoEventAddress, Kvm, NoDatamatch, VmFd};
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 

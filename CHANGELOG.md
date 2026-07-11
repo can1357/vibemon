@@ -28,6 +28,12 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added deterministic function image resolution and validation for `Registry`, `Dockerfile`, `Python`, and `Template` sources
+- Added build-time security validation for Dockerfiles, including forbidden directives and secret-masking
+- Added pinned artifact mounting for functions, ensuring reproducible build environments
+- Added automatic architecture-specific OCI resolution for function image builds
+- Added cache-locking and deterministic digest verification for function image builds to prevent redundant work
+- Added `vmond` image resolution logic, enabling secure server-side function image construction
 - Added live-migration support with lazy RAM restoration and optimized memory delta transfers
 - Added guest-write dirty page tracking to accelerate delta snapshot generation
 - Added parallel block-level disk diffing to speed up migration synchronization

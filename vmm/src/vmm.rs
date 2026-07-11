@@ -191,7 +191,7 @@ pub struct Vmm {
 	/// Snapshot name a dirty-tracking window is armed against: a delta against
 	/// exactly this base may use the hypervisor log + host-write bitmap
 	/// instead of a full RAM scan. Consumed (cleared) by that delta.
-	dirty_base:    Mutex<Option<String>>,
+	dirty_base:     Mutex<Option<String>>,
 	/// Active hard deadline; armed at serve start, reset live by `extend`.
 	deadline:       Option<Instant>,
 	/// Control-plane socket path; `status.json` is written beside it on exit.

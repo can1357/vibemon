@@ -190,6 +190,54 @@ struct PreparedImage {
 	tools:         ImageTools,
 	arch:          String,
 }
+/// Immutable OCI identity returned by the registry resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedOciImage {
+	/// Caller-facing reference pinned to the selected manifest digest.
+	pub reference: String,
+	/// Lowercase SHA-256 manifest digest without the `sha256:` prefix.
+	pub digest:    String,
+	/// Selected Linux OCI platform.
+	pub platform:  String,
+}
+
+/// Resolve an OCI reference for one architecture without consulting the
+/// prepared-image cache. Mutable tags are deliberately inspected on every
+/// call so registration observes tag movement.
+pub fn resolve_oci_reference(reference: &str, arch: Option<&str>) -> Result<ResolvedOciImage> {
+	let reference = parse_reference(Some(reference))?
+		.ok_or_else(|| EngineError::invalid("OCI image reference is required"))?;
+	let tools = detect_image_tools()?;
+	let arch = skopeo_arch(arch);
+	let stdout = run_stdout(&skopeo_inspect_digest_args(&tools.skopeo, &reference, &arch)).map_err(
+		|error| EngineError::engine(format!("failed to resolve OCI image for linux/{arch}: {error}")),
+	)?;
+	let info: Value = serde_json::from_str(&stdout)?;
+	let digest = info
+		.get("Digest")
+		.and_then(Value::as_str)
+		.and_then(|value| value.strip_prefix("sha256:"))
+		.ok_or_else(|| EngineError::engine("image source did not return a sha256 manifest digest"))?;
+	if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+		return Err(EngineError::engine("registry returned an invalid sha256 manifest digest"));
+	}
+	let digest = digest.to_ascii_lowercase();
+	let pinned = if is_registry_reference(&reference) {
+		let unqualified = reference.strip_prefix("docker://").unwrap_or(&reference);
+		let repository = unqualified
+			.split_once('@')
+			.map_or(unqualified, |(repository, _)| repository);
+		let last_slash = repository.rfind('/').map_or(0, |index| index + 1);
+		let tag = repository[last_slash..]
+			.find(':')
+			.map(|index| last_slash + index);
+		let repository = &repository[..tag.unwrap_or(repository.len())];
+		format!("{repository}@sha256:{digest}")
+	} else {
+		reference
+	};
+	Ok(ResolvedOciImage { reference: pinned, digest, platform: format!("linux/{arch}") })
+}
 
 type PreparedImageCacheKey = (PathBuf, String, String);
 static PREPARED_IMAGES: LazyLock<Mutex<HashMap<PreparedImageCacheKey, PreparedImage>>> =

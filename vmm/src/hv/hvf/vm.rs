@@ -96,11 +96,21 @@ impl Vm {
 
 	/// HVF has no guest-write dirty log; live-migration deltas fall back to a
 	/// full parallel page diff on this backend.
+	#[allow(
+		clippy::unused_self,
+		clippy::unnecessary_wraps,
+		reason = "mirrors the fallible KVM surface so call sites stay monomorphic"
+	)]
 	pub fn arm_dirty_tracking(&self) -> Result<bool> {
 		Ok(false)
 	}
 
 	/// Always `None` on HVF (see [`Self::arm_dirty_tracking`]).
+	#[allow(
+		clippy::unused_self,
+		clippy::unnecessary_wraps,
+		reason = "mirrors the fallible KVM surface so call sites stay monomorphic"
+	)]
 	pub fn take_dirty_log(&self) -> Result<Option<Vec<Vec<u64>>>> {
 		Ok(None)
 	}

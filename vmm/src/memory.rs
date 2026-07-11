@@ -21,7 +21,7 @@ pub type GuestMemoryMmap = VmGuestMemoryMmap<AtomicBitmap>;
 
 /// Mark `[gpa, gpa + len)` dirty in the host-write bitmap.
 ///
-/// Raw-pointer DMA paths (io_uring iovecs, TAP reads) write guest RAM without
+/// Raw-pointer DMA paths (`io_uring` iovecs) write guest RAM without
 /// going through vm-memory's tracked writers and MUST call this on completion,
 /// or a live-migration delta may miss their writes.
 #[cfg_attr(
@@ -33,7 +33,9 @@ pub fn mark_dirty(mem: &GuestMemoryMmap, gpa: GuestAddress, len: usize) {
 	let mut addr = gpa;
 	let mut remaining = len;
 	while remaining > 0 {
-		let Some(region) = mem.find_region(addr) else { return };
+		let Some(region) = mem.find_region(addr) else {
+			return;
+		};
 		let offset = (addr.raw_value() - region.start_addr().raw_value()) as usize;
 		let region_len = usize::try_from(region.len()).unwrap_or(usize::MAX);
 		let in_region = region_len.saturating_sub(offset).min(remaining);
@@ -42,7 +44,9 @@ pub fn mark_dirty(mem: &GuestMemoryMmap, gpa: GuestAddress, len: usize) {
 		}
 		region.bitmap().mark_dirty(offset, in_region);
 		remaining -= in_region;
-		let Some(next) = addr.checked_add(in_region as u64) else { return };
+		let Some(next) = addr.checked_add(in_region as u64) else {
+			return;
+		};
 		addr = next;
 	}
 }

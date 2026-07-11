@@ -1210,14 +1210,14 @@ mod tests {
 		const RANGE_LEN: usize = 0x4_0000;
 		let mem =
 			GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).expect("guest memory");
-		let ranges = [(GuestAddress(0), RANGE_LEN as u32), (GuestAddress(0x8_0000), RANGE_LEN as u32)];
+		let ranges =
+			[(GuestAddress(0), RANGE_LEN as u32), (GuestAddress(0x8_0000), RANGE_LEN as u32)];
 
 		// One byte spills past the first range into the second.
 		mark_guest_ranges_dirty(&mem, &ranges, RANGE_LEN + 1);
 
 		let region = mem.iter().next().expect("region");
-		let bitmap: &vm_memory::bitmap::AtomicBitmap =
-			vm_memory::mmap::MmapRegion::bitmap(region);
+		let bitmap: &vm_memory::bitmap::AtomicBitmap = vm_memory::mmap::MmapRegion::bitmap(region);
 		assert!(bitmap.dirty_at(0), "first range start must be dirty");
 		assert!(bitmap.dirty_at(RANGE_LEN - 1), "first range end must be dirty");
 		assert!(bitmap.dirty_at(0x8_0000), "spill byte in second range must be dirty");
@@ -1239,8 +1239,7 @@ mod tests {
 		mark_guest_ranges_dirty(&mem, &ranges, 1);
 
 		let region = mem.iter().next().expect("region");
-		let bitmap: &vm_memory::bitmap::AtomicBitmap =
-			vm_memory::mmap::MmapRegion::bitmap(region);
+		let bitmap: &vm_memory::bitmap::AtomicBitmap = vm_memory::mmap::MmapRegion::bitmap(region);
 		assert!(bitmap.dirty_at(0), "the single written byte must be dirty");
 		assert!(!bitmap.dirty_at(0x6_0000), "bytes past the short read must stay clean");
 		assert!(!bitmap.dirty_at(0x8_0000), "the second range must stay clean");
