@@ -28,8 +28,8 @@ __pycache__
 # Node deps for the web UI (ui/) and TypeScript SDK (sdk/ts/); built UI
 # assets are committed into vmond/web/ for Rust embedding.
 node_modules/
-python/vmon.egg-info/
-python/build
+sdk/py/vmon.egg-info/
+sdk/py/build
 
 # Python tooling caches and virtualenvs
 .pytest_cache/

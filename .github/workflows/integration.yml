@@ -33,7 +33,7 @@ jobs:
         run: VMON_E2E=1 cargo test --tests -- --test-threads=1
 
       - name: Run Python SDK real-VM e2e
-        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py
+        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py
 
       - name: Run Rust cluster e2e
         run: VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
@@ -92,7 +92,7 @@ jobs:
         run: cargo test --tests -- --test-threads=1
 
       - name: Run Python SDK real-VM e2e
-        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py
+        run: VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py
 
       - name: Run Rust cluster e2e
         env:

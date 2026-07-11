@@ -64,7 +64,7 @@ This is the part you can run right now on your Mac.
 ```sh
 cd ui
 bun install
-bun run build      # outputs into python/vmon/web so `vmon serve` can serve it
+bun run build      # outputs into vmond/web so `vmon serve` can serve it
 ```
 
 ### Step 2 — install the server dependencies (once)
@@ -527,7 +527,7 @@ Advertise the matching `https://...` URL when forming or joining the mesh. When 
 
 ### Step 9: test the real cluster path
 
-Run `VMON_CLUSTER_E2E=1 just cluster-e2e` on a KVM/HVF host to exercise the gated cluster end-to-end suite. CI runs the KVM and macOS/HVF cluster paths on self-hosted hypervisor runners. `mesh-soak.yml` runs the nightly three-node tc-netem soak, and `python/tests/test_faults.py` / `test_invariants.py` cover the fault-injection contracts with `cluster_harness.py`.
+Run `VMON_CLUSTER_E2E=1 just cluster-e2e` on a KVM/HVF host to exercise the gated cluster end-to-end suite (`tests/cluster_e2e.rs`, incl. live migration). CI runs the KVM and macOS/HVF cluster paths on self-hosted hypervisor runners. `mesh-soak.yml` runs the nightly three-node tc-netem soak, and `vmond/tests/mesh_fault_routes.rs` covers the fault-injection contracts.
 
 ### Security
 

@@ -184,22 +184,22 @@ lint-rust:
 check-rust:
     cargo check --workspace --all-targets
 
-# -- Python (python/) --
+# -- Python (sdk/py) --
 fmt-py:
-    cd python && uv run ruff format .
+    cd sdk/py && uv run ruff format .
 
 fmt-check-py:
-    cd python && uv run ruff format --check .
+    cd sdk/py && uv run ruff format --check .
 
 lint-py:
-    cd python && uv run ruff check .
+    cd sdk/py && uv run ruff check .
 
 check-py:
-    cd python && uv run mypy
+    cd sdk/py && uv run mypy
 
 # Python SDK test suite.
 test-py:
-    cd python && uv run pytest
+    cd sdk/py && uv run pytest
 
 # Gated cluster e2e (real hypervisor required; skips otherwise).
 [linux]

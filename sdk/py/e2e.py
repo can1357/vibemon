@@ -37,11 +37,11 @@ on Linux. The tunnel test remains TAP-only because macOS user-net has no inbound
 port forwarding.
 
 Usage:
-  python3.14 python/e2e.py                 # run everything
-  python3.14 python/e2e.py exec snapshot   # run a subset (substring match)
-  python3.14 python/e2e.py --list          # list test names
-  python3.14 python/e2e.py --keep          # leave the temp VMON_HOME in place
-  VMON_E2E_IMAGE=alpine:latest python3.14 python/e2e.py
+  python3.14 sdk/py/e2e.py                 # run everything
+  python3.14 sdk/py/e2e.py exec snapshot   # run a subset (substring match)
+  python3.14 sdk/py/e2e.py --list          # list test names
+  python3.14 sdk/py/e2e.py --keep          # leave the temp VMON_HOME in place
+  VMON_E2E_IMAGE=alpine:latest python3.14 sdk/py/e2e.py
 """
 
 import argparse

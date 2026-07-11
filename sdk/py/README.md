@@ -58,5 +58,5 @@ Sandbox, process, console, event, log, WebSocket, pool, and transport-backed obj
 From the repository root, after building the Rust binary and enabling real-VM e2e prerequisites:
 
 ```sh
-VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py
+VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py
 ```

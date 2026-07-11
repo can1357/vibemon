@@ -4,7 +4,7 @@ The contract for the vmon compute mesh: ownership, epochs, placement,
 durability tiers, eligibility rules, and defaults. This document is normative —
 when code and this document disagree, one of them is a bug. Each invariant
 stated here is (or must become) a mechanical assertion in the test suite; the
-gated cluster e2e (`python/tests/test_cluster_e2e.py`) is the hardware-level
+gated cluster e2e (`tests/cluster_e2e.rs`) is the hardware-level
 arbiter. User-facing docs live in README.md.
 
 ## System shape

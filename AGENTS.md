@@ -38,8 +38,8 @@ vmon-agent (guest agent, Linux guest only)
 - `vmond/` — Rust server/engine crate used by `vmon serve`: HTTP API, registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
-- `python/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
-- `python/tests/`, `python/e2e.py` — Python SDK unit tests and real-VM SDK driver.
+- `sdk/py/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
+- `sdk/py/tests/`, `sdk/py/e2e.py` — Python SDK unit tests and real-VM SDK driver.
 - `sdk/ts/` — TypeScript SDK (bun).
 - `sdk/go/` — Go SDK (`go test`, `github.com/coder/websocket`).
 - `ui/` — React + Vite + TypeScript web panel; **builds into `vmond/web/`** for Rust embedding.
@@ -70,7 +70,7 @@ just sdk-go          # cd sdk/go && go test ./...
 
 macOS HVF requires the `vmon` binary to be ad-hoc codesigned with `hvf.entitlements` (`com.apple.security.hypervisor`) before running — `just codesign` / `just build` handle this. Hypervisor.framework needs no root; only vmnet networking needs `sudo`.
 
-A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] members = ["python"]`) makes the `python/` SDK package resolve from the repository root, so a single root `.venv` + root `uv.lock` serve both `uv run <cmd>` from the repo root (e.g. `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`) and `cd python && uv run <cmd>`. The package's own `pyproject.toml` stays in `python/`. Python tooling for the SDK: `uv run ruff check`, `uv run mypy`, `uv run pytest` — from the root or `python/`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`); SDK recipes are `just sdk-ts`, `just sdk-ts-smoke`, and `just sdk-go`.
+A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] members = ["sdk/py"]`) makes the `sdk/py` SDK package resolve from the repository root, so a single root `.venv` + root `uv.lock` serve both `uv run <cmd>` from the repo root (e.g. `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py`) and `cd sdk/py && uv run <cmd>`. The package's own `pyproject.toml` stays in `sdk/py`. Python tooling for the SDK: `uv run ruff check`, `uv run mypy`, `uv run pytest` — from the root or `sdk/py`. UI dev server: `cd ui && bun run dev` (proxies API to `:8000`). Per-language recipes are suffixed `-rust`/`-py`/`-ui` (e.g. `just lint-py`, `just fmt-ui`, `just check-rust`, `just test-py`); SDK recipes are `just sdk-ts`, `just sdk-ts-smoke`, and `just sdk-go`.
 
 ## Code Conventions & Common Patterns
 
@@ -123,15 +123,15 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `vmm/src/control.rs` — Unix-socket JSON control plane and `PauseGate`.
 - `vmond/src/lib.rs`, `vmond/src/api/`, `vmond/src/engine/`, `vmond/src/image/`, `vmond/src/mesh/` — Rust server core, HTTP routes, engine facade/spawn/control, OCI image pipeline, and cluster mesh.
 - `agent/src/main.rs`, `agent/src/proto.rs` — guest agent and its frame protocol.
-- `python/vmon/sandbox.py`, `_transport.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
+- `sdk/py/vmon/sandbox.py`, `_transport.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
 - `sdk/ts/package.json`, `sdk/ts/src/` — TypeScript SDK.
 - `sdk/go/go.mod`, `sdk/go/*.go` — Go SDK.
-- `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `python/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.
+- `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `sdk/py/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.
 
 ## Runtime/Tooling Preferences
 
 - **Rust:** pinned `nightly-2026-04-29` (`rust-toolchain.toml`, with rustfmt/clippy/rust-analyzer). Release profile: `opt-level = 2`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
-- **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `python/` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependency is the HTTP client stack for the SDK (`httpx`).
+- **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `sdk/py` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependency is the HTTP client stack for the SDK (`httpx`).
 - **UI + TS SDK:** **bun** for everything (`bun.lock`; no `package-lock.json`). React/Vite/TS power the UI, which builds into `vmond/web/`; the TypeScript SDK lives in `sdk/ts` with `bun run typecheck` and `bun test`.
 - **Go SDK:** Go 1.23+ with standard `go fmt`/`go vet`/`go test`; `github.com/coder/websocket` is the sole runtime dependency.
 - **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`. The Rust CLI/server locates the `vmon` binary from cargo target dirs, `$VMON_BIN`, or `PATH`.
@@ -143,7 +143,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `boot.rs`, `blk.rs`, `lifecycle.rs`, `net.rs`, `pager.rs`, `snapshot.rs`, `timeout.rs`, `uefi.rs`, `server_e2e.rs`, `cluster_e2e.rs`, `soak.rs` — one concern each (boot markers, block I/O, control protocol, networking, pager eviction, snapshot/fork, timeout self-kill, UEFI boot, server API, cluster failover, stability).
 - Integration runs single-threaded (`--test-threads=1`). Boot tests require assets from `just fetch-assets` (cached in `target/test-assets/`). macOS uses `demo/hvf-test-runner.sh` to codesign spawned test binaries.
 
-**Python** — thin SDK unit tests live under `python/tests/` and run with `cd python && uv run pytest`. The real-VM SDK driver is `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python python/e2e.py`, including the Python remote-function path.
+**Python** — thin SDK unit tests live under `sdk/py/tests/` and run with `cd sdk/py && uv run pytest`. The real-VM SDK driver is `VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py`, including the Python remote-function path.
 
 **TypeScript and Go** — package tests run with `cd sdk/ts && bun test` and `cd sdk/go && go test ./...`. Real-VM remote-function tests require a running server plus `VMON_TS_REMOTE_SMOKE=1` or `VMON_GO_REMOTE_SMOKE=1`, `VMON_SERVER_URL`, and `VMON_API_TOKEN`.
 

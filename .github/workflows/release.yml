@@ -66,7 +66,7 @@ jobs:
           python-version: '3.14'
 
       - name: Build wheel and sdist
-        working-directory: python
+        working-directory: sdk/py
         run: |
           python -m pip install --upgrade build
           python -m build
@@ -75,7 +75,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: python-sdk-package
-          path: python/dist/*
+          path: sdk/py/dist/*
 
   publish:
     name: Publish GitHub release

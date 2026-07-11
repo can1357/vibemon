@@ -79,11 +79,14 @@ func main() {
 	//   - a marker on the writable rootfs (disk block delta),
 	//   - a counter loop whose value lives in a shell process's memory.
 	nonce := fmt.Sprintf("nonce-%d", time.Now().UnixNano())
+	// The counter loop is fully detached (</dev/null, >/dev/null) so the
+	// seeding exec's captured output pipe closes and the call returns.
 	seed := fmt.Sprintf(
 		"mkdir -p /dev/shm && mount -t tmpfs tmpfs /dev/shm"+
 			" && printf %%s '%s' > /dev/shm/teleport"+
 			" && printf %%s '%s' > /root/teleport && sync"+
-			" && (i=0; while :; do i=$((i+1)); printf %%s $i > /tmp/count; sleep 0.05; done) &",
+			" && (i=0; while :; do i=$((i+1)); printf %%s $i > /tmp/count; sleep 0.05; done)"+
+			" </dev/null >/dev/null 2>&1 &",
 		nonce, nonce,
 	)
 	sh(ctx, source, name, "seed guest state", seed)

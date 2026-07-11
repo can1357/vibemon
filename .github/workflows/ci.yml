@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: python
+        working-directory: sdk/py
     steps:
       - name: Checkout
         uses: actions/checkout@v4
