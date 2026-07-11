@@ -40,6 +40,15 @@ pub fn run_cli(args: Vec<String>) -> result::Result<()> {
 	}
 	let config = Config::from_args(args)?;
 	init_logging(&config)?;
+	tracing::info!(
+		boot_mode = ?config.boot_mode,
+		transport = config.transport.as_str(),
+		cpus = config.cpus,
+		memory_mib = config.mem_mib,
+		restoring = config.restore.is_some(),
+		forking = config.fork_from.is_some(),
+		"starting virtual machine monitor"
+	);
 	vmm::run(config)
 }
 

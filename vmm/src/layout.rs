@@ -42,9 +42,12 @@ mod x86_64 {
 	/// Legacy PCI config mechanism #1 ports (0xcf8 address + 0xcfc data).
 	pub const PCI_CONFIG_IO_BASE: u64 = 0x0cf8;
 	pub const PCI_CONFIG_IO_SIZE: u64 = 0x8;
-	/// Fixed preallocated virtio-pci BAR aperture inside the existing MMIO gap.
+	/// PCI Express ECAM/MMCONFIG window for bus 0.
+	pub const PCI_ECAM_BASE: u64 = 0xe000_0000;
+	pub const PCI_ECAM_SIZE: u64 = 0x0010_0000;
+	/// Fixed virtio-pci BAR aperture below the disjoint ECAM window.
 	pub const PCI_VIRTIO_MMIO_START: u64 = MMIO_MEM_START;
-	pub const PCI_VIRTIO_MMIO_SIZE: u64 = MEM_32BIT_GAP_SIZE;
+	pub const PCI_VIRTIO_MMIO_SIZE: u64 = PCI_ECAM_BASE - PCI_VIRTIO_MMIO_START;
 	pub const PCI_VIRTIO_BAR_SIZE: u64 = 0x1_0000;
 	/// Local / IO APIC default physical bases (from `apicdef.h`).
 	pub const APIC_DEFAULT_PHYS_BASE: u32 = 0xfee0_0000;

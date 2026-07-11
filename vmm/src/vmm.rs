@@ -36,13 +36,11 @@ use vmon_agent::proto;
 use crate::hv::Gic;
 #[cfg(target_arch = "x86_64")]
 use crate::layout::{
-	PCI_CONFIG_IO_BASE, PCI_CONFIG_IO_SIZE, PCI_VIRTIO_BAR_SIZE, PCI_VIRTIO_MMIO_SIZE,
-	PCI_VIRTIO_MMIO_START,
+	PCI_CONFIG_IO_BASE, PCI_CONFIG_IO_SIZE, PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_VIRTIO_BAR_SIZE,
+	PCI_VIRTIO_MMIO_SIZE, PCI_VIRTIO_MMIO_START,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::virtio::pci::{
-	PCI_ECAM_BASE, PCI_ECAM_SIZE, PciCommonState, PciEcam, PciMmioDispatcher, PciRoot, PciTransport,
-};
+use crate::virtio::pci::{PciCommonState, PciEcam, PciMmioDispatcher, PciRoot, PciTransport};
 use crate::{
 	arch,
 	config::{BootMode, Config, MAX_COUNT, Transport},
@@ -582,7 +580,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	} else {
 		(boot_exec, None)
 	};
-	let agent_bridge = match spawn_agent_bridge(agent_socket, &vmm, deferred_exec) {
+	let agent_bridge = match spawn_agent_bridge(agent_socket, &vmm, deferred_exec, warm) {
 		Ok(handle) => handle,
 		Err(e) => {
 			let shutdown = vmm.shutdown_threads();
@@ -694,22 +692,21 @@ fn boot_exec_frames(line: &str) -> Vec<u8> {
 	frames
 }
 
-/// Streaming matcher latching on the guest agent's readiness SYNC marker in
-/// consumed guest output. Disarmed (free) when no boot exec is pending.
+/// Streaming matcher that latches once the guest agent's readiness marker is
+/// consumed.
 struct SyncScan {
 	window: [u8; proto::HEADER_LEN],
 	filled: usize,
-	armed:  bool,
 	seen:   bool,
 }
 
 impl SyncScan {
-	const fn new(armed: bool) -> Self {
-		Self { window: [0; proto::HEADER_LEN], filled: 0, armed, seen: false }
+	const fn new(seen: bool) -> Self {
+		Self { window: [0; proto::HEADER_LEN], filled: 0, seen }
 	}
 
 	fn feed(&mut self, bytes: &[u8]) {
-		if !self.armed || self.seen {
+		if self.seen {
 			return;
 		}
 		for &byte in bytes {
@@ -732,6 +729,7 @@ fn spawn_agent_bridge(
 	agent_socket: Option<AgentSocket>,
 	vmm: &Vmm,
 	boot_exec: Option<Vec<u8>>,
+	agent_ready: bool,
 ) -> Result<Option<JoinHandle<()>>> {
 	let Some(socket) = agent_socket else {
 		return Ok(None);
@@ -763,6 +761,7 @@ fn spawn_agent_bridge(
 				drain_resume_evt,
 				gate,
 				boot_exec,
+				agent_ready,
 			) {
 				warn!("agent bridge exited: {e}");
 			}
@@ -900,12 +899,13 @@ fn agent_bridge_loop(
 	drain_resume_evt: EventFd,
 	gate: Arc<PauseGate>,
 	boot_exec: Option<Vec<u8>>,
+	agent_ready: bool,
 ) -> io::Result<()> {
 	socket.listener.set_nonblocking(true)?;
 	let mut client: Option<UnixStream> = None;
 	let mut input_buf = vec![0u8; 64 * 1024];
 	let mut boot_exec = boot_exec;
-	let mut scan = SyncScan::new(boot_exec.is_some());
+	let mut scan = SyncScan::new(agent_ready);
 
 	loop {
 		if gate.state() == RunState::Stopping {
@@ -927,7 +927,7 @@ fn agent_bridge_loop(
 		let had_client = client.is_some();
 
 		let mut pollfds = Vec::with_capacity(3);
-		let listener_index = if client.is_none() {
+		let listener_index = if client.is_none() && scan.seen {
 			let index = pollfds.len();
 			pollfds.push(libc::pollfd {
 				fd:      socket.listener.as_raw_fd(),
@@ -3803,8 +3803,8 @@ fn configure_and_boot(
 			arch::boot::configure_uefi_system(
 				vm.memory(),
 				u8::try_from(vcpus.len()).unwrap(),
-				crate::virtio::pci::PCI_ECAM_BASE,
-				crate::virtio::pci::PCI_ECAM_SIZE,
+				PCI_ECAM_BASE,
+				PCI_ECAM_SIZE,
 			)?;
 			for (id, vcpu) in vcpus.iter().enumerate() {
 				arch::boot::configure_uefi_vcpu(vcpu, vm.supported_cpuid(), id as u8, loaded.entry)?;

@@ -93,12 +93,6 @@ const MSIX_TABLE_SIZE_MASK: u16 = 0x07ff;
 const MSIX_FUNCTION_MASK: u16 = 0x4000;
 const MSIX_ENABLE: u16 = 0x8000;
 
-/// PCI Express ECAM/MMCONFIG window for bus 0. It is registered before the
-/// catch-all virtio BAR dispatcher, so config-space MMIO accesses take priority
-/// over the preallocated BAR aperture that shares the x86 32-bit MMIO gap.
-pub const PCI_ECAM_BASE: u64 = 0xe000_0000;
-pub const PCI_ECAM_SIZE: u64 = 0x0010_0000;
-
 /// Legacy PCI config mechanism #1 (0xcf8/0xcfc) host bridge.
 pub struct PciRoot {
 	config_address: u32,
