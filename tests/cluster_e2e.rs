@@ -1206,6 +1206,128 @@ fn two_node_readonly_volume_ha_materializes_on_survivor() {
 }
 
 #[test]
+fn two_node_migrate_moves_running_sandbox() {
+	if !require_cluster_e2e() {
+		return;
+	}
+	let token = unique("cluster-e2e");
+	let home_a = short_home("vcm-a-");
+	let home_b = short_home("vcm-b-");
+	let sid = unique("mig");
+	let ram_marker = format!("ram-{sid}");
+	let disk_marker = format!("disk-{sid}");
+	let mut gateway_a = start_node(home_a, free_port(), &[], "mig-a", &token, false);
+	let mut gateway_b = start_node(home_b, free_port(), &[], "mig-b", &token, false);
+
+	let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		let setup = mesh_setup(&mut gateway_a);
+		let join = mesh_join(
+			&mut gateway_b,
+			setup
+				.get("blob")
+				.and_then(Value::as_str)
+				.expect("join blob"),
+		);
+		let node_a = setup
+			.get("node_id")
+			.and_then(Value::as_str)
+			.expect("node a id")
+			.to_owned();
+		let node_b = join
+			.get("node_id")
+			.and_then(Value::as_str)
+			.expect("node b id")
+			.to_owned();
+		wait_healthy(&[&gateway_a, &gateway_b], Duration::from_mins(1));
+		gateway_b.restart();
+		gateway_a.restart();
+		wait_healthy(&[&gateway_a, &gateway_b], Duration::from_mins(1));
+
+		let row = create_sandbox(
+			&gateway_a,
+			&json!({
+				"image": e2e_image(),
+				"name": sid,
+				"command": ["sleep", "600"],
+				"block_network": true,
+				"timeout_secs": 900,
+				"ha": "off",
+				"idempotency_key": format!("{sid}-create"),
+			}),
+		)
+		.unwrap_or_else(|err| panic!("creating migrate sandbox failed: {err}"));
+		assert_eq!(row.get("status").and_then(Value::as_str), Some("running"));
+		// Idempotent placement may pick either node; migrate from wherever the
+		// sandbox landed to the other node.
+		let owner_node = row
+			.get("node")
+			.and_then(Value::as_str)
+			.expect("owner node")
+			.to_owned();
+		let (source, target, target_node) = if owner_node == node_a {
+			(&gateway_a, &gateway_b, node_b.as_str())
+		} else {
+			(&gateway_b, &gateway_a, node_a.as_str())
+		};
+
+		// One marker in guest RAM (tmpfs) and one on the writable rootfs: live
+		// migration must ship both the final RAM delta and the disk block delta.
+		let write_markers = format!(
+			"mkdir -p /dev/shm && mount -t tmpfs tmpfs /dev/shm && printf %s '{ram_marker}' > \
+			 /dev/shm/teleport && printf %s '{disk_marker}' > /root/teleport && sync"
+		);
+		let (exit, stdout, stderr) =
+			exec_capture(source, &sid, &["/bin/sh", "-c", &write_markers], Duration::from_secs(30));
+		assert_eq!(exit, 0, "writing markers failed stdout={stdout:?} stderr={stderr:?}");
+
+		let migrate_path = format!("/v1/sandboxes/{}/migrate", percent_encode(&sid));
+		source.api_json(
+			"POST",
+			&migrate_path,
+			Some(&json!({"target": target_node})),
+			&[],
+			BOOT_TIMEOUT,
+		);
+
+		let moved =
+			eventually("migrated sandbox to run on target", RESTORE_TIMEOUT, POLL_INTERVAL, || {
+				let listing = target
+					.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
+					.ok()?;
+				let row = sandbox_row(&listing, &sid)?;
+				(row.get("node").and_then(Value::as_str) == Some(target_node)
+					&& row.get("status").and_then(Value::as_str) == Some("running"))
+				.then_some(row)
+			});
+		assert_eq!(moved.get("node").and_then(Value::as_str), Some(target_node));
+
+		let (exit, stdout, stderr) =
+			exec_capture(target, &sid, &["cat", "/dev/shm/teleport"], Duration::from_secs(30));
+		assert_eq!(exit, 0, "RAM marker read failed stdout={stdout:?} stderr={stderr:?}");
+		assert_eq!(stdout, ram_marker, "RAM marker changed across migration");
+		let (exit, stdout, stderr) =
+			exec_capture(target, &sid, &["cat", "/root/teleport"], Duration::from_secs(30));
+		assert_eq!(exit, 0, "disk marker read failed stdout={stdout:?} stderr={stderr:?}");
+		assert_eq!(stdout, disk_marker, "disk marker changed across migration");
+
+		eventually("source node to drop migrated sandbox", FAST_TIMEOUT, POLL_INTERVAL, || {
+			let listing = source
+				.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
+				.ok()?;
+			sandbox_row(&listing, &sid).is_none().then_some(())
+		});
+	}));
+	remove_sandbox_best_effort(&[&gateway_a, &gateway_b], &sid);
+	gateway_a.stop();
+	gateway_b.stop();
+	let _ = fs::remove_dir_all(&gateway_a.home);
+	let _ = fs::remove_dir_all(&gateway_b.home);
+	if let Err(payload) = result {
+		std::panic::resume_unwind(payload);
+	}
+}
+
+#[test]
 fn three_node_writable_volume_quorum_ha() {
 	if !require_cluster_e2e() {
 		return;
