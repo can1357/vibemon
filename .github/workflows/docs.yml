@@ -28,7 +28,6 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-
       - name: Install mdBook
         uses: taiki-e/install-action@mdbook
 
@@ -39,54 +38,3 @@ jobs:
         uses: lycheeverse/lychee-action@v2
         with:
           args: --offline --no-progress 'docs/**/*.md'
-      - name: Preserve built documentation
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: documentation
-          path: docs/book
-
-
-  package-pages:
-    name: Package Pages artifact
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    steps:
-      - name: Download built documentation
-        uses: actions/download-artifact@v4
-        with:
-          name: documentation
-          path: docs/book
-
-      - name: Set up and enable Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/book
-
-  deploy:
-    name: Deploy documentation
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: package-pages
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: github-pages
-      cancel-in-progress: false
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
