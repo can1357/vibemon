@@ -60,6 +60,28 @@ test("discovers a peer, fails over, and sticks to the successful endpoint", asyn
   expect(bCalls).toBeGreaterThanOrEqual(2);
 });
 
+test("successful retry clears seed cooldown before discovery expands the roster", async () => {
+  let seedCalls = 0;
+  const router = meshStatusRouter(() => ({
+    self: { node_id: "seed", advertise: A },
+    peers: [{ node_id: "peer", advertise: B }],
+  }));
+  const driver = new MeshDriver(A, {
+    now: () => 0,
+    transport: () => router,
+    fetch: (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.host === "node-a" && seedCalls++ > 0) return Promise.resolve(json({ ok: true }));
+      return Promise.reject(new TypeError("connection refused"));
+    },
+  });
+
+  await expect(driver.request("GET", "/healthz")).rejects.toBeInstanceOf(TransportError);
+  expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ ok: true });
+  expect(driver.endpoints()).toContainEqual({ url: A, healthy: true, source: "seed" });
+  expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ ok: true });
+});
+
 test("refresh drops discovered peers absent from the latest mesh status", async () => {
   let includePeer = true;
   const router = meshStatusRouter(() => ({

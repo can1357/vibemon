@@ -25,7 +25,7 @@ just release                      # target/release/vmon
 ./target/release/vmon fork tpl --count 5           # ~3 ms per CoW clone
 ```
 
-The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch the embedded web panel + REST API (any platform):
+The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch the embedded web panel and gRPC/HTTP API (any platform):
 
 ```sh
 cd ui && bun install && bun run build   # writes vmond/web/
@@ -44,8 +44,8 @@ The single Rust `vmon` binary has three roles: the user-facing CLI, `vmon serve`
 
 ```
 Web UI / Rust CLI / Python SDK / TypeScript SDK / Go SDK
-   │ HTTP / WebSocket (or local HTTP-over-UDS)
-vmon serve (Rust axum API, vmond crate)
+   │ gRPC (native h2c or WebSocket bridge); HTTP health, metrics, and port proxy
+vmon serve (Rust axum + tonic API, vmond crate; local UDS supported)
    │ Engine registry, image pipeline, pools, mesh, volumes
    │ spawns `vmon vmm ... --api-sock <sock>` per VM
 vmon vmm (Rust VMM crate)
@@ -227,27 +227,26 @@ The low-level `vmon vmm` subcommand accepts the production lifecycle, agent, jai
 
 ## Self-hosted sandbox API
 
-The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine, serves the v1 HTTP/WebSocket API, embeds the React panel from `vmond/web/`, and also exposes the local HTTP-over-UDS endpoint the CLI and SDKs use. The top-level CLI (`vmon run`, `ps`, `logs`, `exec`, `stop`, `mesh`, `context`, and friends) is Rust code in the same binary; `vmon vmm` remains the low-level escape hatch for direct kernel/rootfs boots.
+The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine, serves the `vmon.v1` gRPC services over native h2c and a `/grpc` WebSocket bridge, keeps HTTP routes for health, metrics, and port proxying, embeds the React panel from `vmond/web/`, and exposes the local UDS endpoint the CLI and SDKs use. The top-level CLI (`vmon run`, `ps`, `logs`, `exec`, `stop`, `mesh`, `context`, and friends) is Rust code in the same binary; `vmon vmm` remains the low-level escape hatch for direct kernel/rootfs boots.
 
 | Command | What it does |
 | --- | --- |
 | `vmon doctor` | Prints the local prerequisite checklist (vmon binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, guest agent, daemon, and host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
 | `vmon completion [bash|zsh|fish]` | Prints a sourceable shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
-| `vmon openapi` | Prints the generated OpenAPI document used by SDK generation and API smoke tests. |
 
 The Python, TypeScript, and Go packages are thin clients for the Rust API. Each exposes the same object hierarchy: a root client, resource namespaces (`sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh`), and sandbox-bound process, file, and port objects. They do not ship a CLI, daemon, server, web bundle, guest-agent bundle, or VMM implementation.
 
-Every SDK accepts the same connection strings:
+All three SDKs accept the network forms below. Python and Go additionally support the local UDS form; browser builds of the TypeScript SDK are deliberately network-only.
 
 | DSN | Meaning |
 | --- | --- |
-| `vmon://host-a,host-b:9000/prefix` | HTTP gateways; port defaults to `8000`. |
-| `vmons://host-a,host-b` | HTTPS/WSS gateways. |
-| `http://host:8000` or `https://host` | One explicit gateway. |
-| `vmon+unix:///absolute/path/vmond.sock` | Local HTTP-over-UDS endpoint. |
+| `vmon://host-a,host-b:9000/prefix` | Plaintext gRPC/HTTP endpoints; port defaults to `8000`. |
+| `vmons://host-a,host-b` | TLS gRPC/HTTPS/WSS endpoints. |
+| `http://host:8000` or `https://host` | One explicit endpoint. |
+| `vmon+unix:///absolute/path/vmond.sock` | Local gRPC/HTTP-over-UDS endpoint (Python and Go). |
 | `vmon+context://prod` | Endpoints and optional token from the named vmon context. |
 
-`token`, `discover=on|off`, and `timeout=<seconds>` are optional query parameters. An empty DSN resolves `$VMON_DSN`, then `$VMON_CONTEXT`, then the local `$VMON_HOME/vmond.sock`. Client construction performs no network I/O. Mesh discovery is lazy; after the first successful request, the driver learns advertised peers and fails over only when a request did not reach an HTTP server. HTTP error responses are never replayed.
+`token`, `discover=on|off`, and `timeout=<seconds>` are optional query parameters. Outside browsers, an empty DSN resolves `$VMON_DSN`, then `$VMON_CONTEXT`, then the local `$VMON_HOME/vmond.sock`; a browser TypeScript client defaults to its page origin. Client construction performs no network I/O. Mesh discovery is lazy; after the first successful request, the driver learns advertised peers and fails over only on transport-level connection failures. Daemon gRPC statuses and HTTP responses are never replayed.
 
 ```python
 from vmon import Secret, connect
@@ -276,11 +275,11 @@ with connect("vmon+context://prod") as client:
 
 Named volumes persist outside snapshots and are protected by the Rust server's single-writer host lock (or mesh lease on clustered writable mounts). Secrets are merged into exec environments and are not written to VM metadata. Sandbox creation also supports `block_network`, CIDR egress rules, DNS-pinned egress domains, inbound CIDR allowlists, `ha`, and `arch`; the domain allowlist resolves to IP rules and is not live TLS-SNI filtering.
 
-Exposed ports are available through each sandbox's `tunnels` and `ports` APIs. Runtime deadlines can be extended through the bound sandbox object or `POST /v1/sandboxes/{id}/extend`; polling reports the entry-process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for termination.
+Exposed ports are available through each sandbox's `tunnels` and `ports` APIs. Runtime deadlines can be extended through the bound sandbox object; polling reports the entry-process exit code when known, otherwise VMM status codes such as `124` for timeout and `137` for termination.
 
 Remote functions remain client-side packaging helpers layered over sandbox create, file-write, exec, and terminate. Python exposes source-aware `@vmon.function` callables (plus stateful `@vmon.cls` classes) running against a persistent in-guest session with spawn handles, streaming generators, lazy maps, and retries; TypeScript exposes `client.remoteFunction(fn)` plus `remoteFunctionFromSource(...)`; Go exposes typed `vmon.NewRemoteFunction[Result](...)` over explicit JavaScript module source, and native Go dispatch via `vmon.Register`/`vmon.Takeover()` self-binary re-exec. TypeScript and Go enforce JSON-serializable arguments/results; Python auto-upgrades to stdlib-pickle for richer types. Every SDK forwards guest stdout, preserves structured remote errors, reuses one warm sandbox for direct calls, and uses bounded ephemeral workers for maps.
 
-The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for HTTP tests. The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`; run `just sdk-go` for its HTTP/WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
+The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for its live API smoke. The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`; run `just sdk-go` for its gRPC, HTTP, and WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
 
 ## Cluster
 

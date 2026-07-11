@@ -1,8 +1,8 @@
 // Package vmon provides a driver-backed client for the vmon gRPC API.
 //
 // Connect accepts local UDS, HTTP(S), multi-host mesh, and named-context DSNs.
-// It discovers advertised peers lazily and fails over only when a request did not
-// reach an HTTP server. NewClient binds the same object model to an injected Driver.
+// It discovers advertised peers lazily and fails over only on transport-level
+// connection failures. NewClient binds the same object model to an injected Driver.
 // Sandbox operations live on values returned by Client.Sandboxes.
 //
 // # Remote functions

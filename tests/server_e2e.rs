@@ -291,7 +291,7 @@ fn exec(server: &Server, id: &str, cmd: &[&str]) -> (i64, String, String) {
 	)
 }
 
-/// Remove is idempotent for the tests: Ok or NotFound both pass.
+/// Remove is idempotent for the tests: `Ok` or `NotFound` both pass.
 fn remove_sandbox(server: &Server, id: &str) {
 	let grpc = server.grpc();
 	let mut sandboxes = grpc.sandboxes();
@@ -437,7 +437,7 @@ fn snapshot_restore_preserves_disk_state() {
 		snaps.snapshots
 	);
 
-	let restore = pb::RestoreSnapshotRequest { name: snap.clone(), body_json: "{}".to_owned() };
+	let restore = pb::RestoreSnapshotRequest { name: snap, body_json: "{}".to_owned() };
 	let restored = grpc
 		.block_on(snapshots.restore(restore))
 		.unwrap_or_else(|status| {
@@ -479,10 +479,8 @@ fn fork_clones_are_cow_isolated() {
 	remove_sandbox(&server, &id);
 
 	let mut snapshots = grpc.snapshots();
-	let fork = pb::ForkSnapshotRequest {
-		name:      snap.clone(),
-		body_json: json!({"count": 2}).to_string(),
-	};
+	let fork =
+		pb::ForkSnapshotRequest { name: snap, body_json: json!({"count": 2}).to_string() };
 	let forked = grpc
 		.block_on(snapshots.fork(fork))
 		.unwrap_or_else(|status| {
@@ -551,7 +549,7 @@ fn volumes_rw_and_ro_roundtrip() {
 	remove_sandbox(&server, &rid);
 
 	grpc
-		.block_on(volumes.delete(pb::VolumeRef { name: volume.clone() }))
+		.block_on(volumes.delete(pb::VolumeRef { name: volume }))
 		.unwrap_or_else(|status| {
 			panic!(
 				"volume delete after unmount should succeed: {}",

@@ -188,6 +188,7 @@ export class MeshDriver implements Driver {
       try {
         const fetched = await this.#fetchEndpoint(entry, method, path, options);
         const response = new EndpointResponse(fetched, entry.url);
+        entry.failedUntil = 0;
         const index = this.#roster.indexOf(entry);
         if (index >= 0) this.#preferred = index;
         if (failedOver && markFailover && this.#discover) await this.refresh(true);
@@ -240,6 +241,7 @@ export class MeshDriver implements Driver {
           this.token ? { authorization: `Bearer ${this.token}` } : undefined,
           input,
         );
+        entry.failedUntil = 0;
         const index = this.#roster.indexOf(entry);
         if (index >= 0) this.#preferred = index;
         if (failedOver && markFailover && this.#discover) await this.refresh(true);
@@ -301,6 +303,7 @@ export class MeshDriver implements Driver {
           this.token ? { authorization: `Bearer ${this.token}` } : undefined,
           input,
         );
+        entry.failedUntil = 0;
         const index = this.#roster.indexOf(entry);
         if (index >= 0) this.#preferred = index;
         return {
@@ -429,6 +432,7 @@ export class MeshDriver implements Driver {
             { once: true },
           );
         });
+        entry.failedUntil = 0;
         const index = this.#roster.indexOf(entry);
         if (index >= 0) this.#preferred = index;
         return [socket, entry.url];

@@ -34,7 +34,12 @@ if (!wantsSmoke) {
     const target = await spawnLocalServer(localBinary);
     const client = connect(target.baseUrl, { token: target.token });
     await waitForHealth(client);
-    await exerciseApi(client);
+    try {
+      await exerciseApi(client);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(serverFailureMessage(message), { cause: error });
+    }
   });
 } else {
   console.log(`SKIP sdk-ts smoke: VMON_TS_SMOKE=1 but ${localBinary} does not exist`);

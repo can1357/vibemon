@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import json
 import socket
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -217,11 +218,14 @@ class Files:
     def list(self, path: str = ".") -> list[FileInfo]:
         """List typed directory entries at a guest path."""
         sandbox = self._sandbox
-        value = sandbox._view_rpc(
-            lambda stubs: stubs.sandbox.FileList(api_pb2.FilePathRequest(id=sandbox.id, path=path)),
-            error="file list returned a malformed response",
-        )
-        entries = value.get("entries", value)
+        payload = sandbox._rpc(
+            lambda stubs: stubs.sandbox.FileList(api_pb2.FilePathRequest(id=sandbox.id, path=path))
+        ).json
+        try:
+            value = json.loads(payload)
+        except ValueError as exc:
+            raise ProtocolError("file list returned a malformed response") from exc
+        entries = value.get("entries", value) if isinstance(value, Mapping) else value
         if not isinstance(entries, list) or not all(isinstance(item, Mapping) for item in entries):
             raise ProtocolError("file list returned a malformed response")
         from .models import FileInfo

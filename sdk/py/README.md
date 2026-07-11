@@ -1,6 +1,6 @@
 # vmon Python SDK
 
-Thin Python client SDK for the Rust `vmon` API. The Rust `vmon` binary owns the CLI, `vmon serve` HTTP/WebSocket server, and VMM runtime; this package only provides Python objects for talking to that API.
+Thin Python client SDK for the Rust `vmon` API. The Rust `vmon` binary owns the CLI, `vmon serve` gRPC/HTTP/WebSocket server, and VMM runtime; this package only provides Python objects for talking to that API.
 
 ## Install
 
@@ -42,7 +42,7 @@ with vmon.connect("vmon://node-a,node-b") as client:
 ## Public surface
 
 - `connect()` parses local, HTTP(S), multi-host mesh, Unix-socket, and named-context DSNs and returns a `Client`. `MeshDriver` discovers peer advertise URLs lazily, fails over only on transport errors, and keeps sandbox calls pinned to the node that owns them.
-- `Client` exposes `sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh` resource namespaces alongside health, server info, metrics, OpenAPI, events, and shell methods.
+- `Client` exposes `sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh` resource namespaces alongside health, server info, metrics, events, and shell methods.
 - `Sandbox` is a bound resource. `run()` captures a command; `exec()` opens a streaming `Process`; `files` and `ports` expose bound filesystem and proxy operations. Lifecycle, snapshots, logs, metrics, networking, tunnels, migration, and readiness polling stay on the sandbox object.
 - `Process.wait()` returns `ExecExit`; stdin is available through `process.stdin`, and stdout/stderr remain closeable byte streams. Console, event, log, and file streams are closeable context managers.
 - `Volume` and `Secret` are validated request values. Server-side volume lifecycle lives under `client.volumes`; secret values stay in memory and are sent only in create and exec requests.

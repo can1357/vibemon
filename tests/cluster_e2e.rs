@@ -23,11 +23,10 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
+use vmon_proto::v1 as pb;
 
 const LOOPBACK: &str = "127.0.0.1";
-const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 const REPLICA_TIMEOUT: Duration = Duration::from_mins(2);
 const RESTORE_TIMEOUT: Duration = Duration::from_mins(3);
 const FAST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -528,6 +527,16 @@ impl NodeProc {
 		format!("http://{LOOPBACK}:{}", self.port)
 	}
 
+	/// Fresh gRPC channel through the public (fault-proxied) port.
+	fn grpc(&self) -> Result<common::api::Grpc, String> {
+		common::api::Grpc::connect_tcp(self.port, Some(&self.token))
+	}
+
+	/// Fresh gRPC channel straight to the backend, bypassing the fault proxy.
+	fn grpc_backend(&self) -> Result<common::api::Grpc, String> {
+		common::api::Grpc::connect_tcp(self.backend_port, Some(&self.token))
+	}
+
 	fn api_json(
 		&self,
 		method: &str,
@@ -857,31 +866,57 @@ fn sandbox_row(listing: &Value, sid: &str) -> Option<Value> {
 		.cloned()
 }
 
-fn percent_encode(segment: &str) -> String {
-	const HEX: &[u8; 16] = b"0123456789ABCDEF";
+/// `GET /v1/sandboxes` equivalent: list via gRPC and rebuild the JSON listing
+/// shape (`{"sandboxes": [...]}`) the assertions consume.
+fn try_list_sandboxes(node: &NodeProc) -> Result<Value, String> {
+	list_sandboxes_via(node.grpc()?, false)
+}
 
-	let mut out = String::new();
-	for byte in segment.bytes() {
-		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-			out.push(byte as char);
-		} else {
-			out.push('%');
-			out.push(HEX[(byte >> 4) as usize] as char);
-			out.push(HEX[(byte & 0x0f) as usize] as char);
-		}
+/// Listing against the backend port with the mesh-hop marker, so a
+/// partitioned node answers locally instead of proxying.
+fn try_list_sandboxes_backend(node: &NodeProc) -> Result<Value, String> {
+	list_sandboxes_via(node.grpc_backend()?, true)
+}
+
+fn list_sandboxes_via(grpc: common::api::Grpc, mesh_hop: bool) -> Result<Value, String> {
+	let mut sandboxes = grpc.sandboxes();
+	let mut request = tonic::Request::new(pb::ListSandboxesRequest { tags: Vec::new() });
+	if mesh_hop {
+		request
+			.metadata_mut()
+			.insert("x-vmon-mesh-hop", "1".parse().expect("static metadata value"));
 	}
-	out
+	let response = grpc
+		.block_on(sandboxes.list(request))
+		.map_err(|status| common::api::status_detail(&status))?
+		.into_inner();
+	let rows = response
+		.sandboxes_json
+		.iter()
+		.map(|row| serde_json::from_str::<Value>(row))
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|err| format!("invalid sandbox view JSON: {err}"))?;
+	Ok(json!({ "sandboxes": rows }))
 }
 
 fn remove_sandbox_best_effort(nodes: &[&NodeProc], sid: &str) {
-	let path = format!("/v1/sandboxes/{}", percent_encode(sid));
 	for node in nodes {
-		let _ = node.try_api_json("DELETE", &path, None, &[], Duration::from_secs(10));
+		let Ok(grpc) = node.grpc() else {
+			continue;
+		};
+		let mut sandboxes = grpc.sandboxes();
+		let _ = grpc.block_on(sandboxes.remove(pb::SandboxRef { id: sid.to_owned() }));
 	}
 }
 
 fn create_sandbox(node: &NodeProc, body: &Value) -> Result<Value, String> {
-	node.try_api_json("POST", "/v1/sandboxes", Some(body), &[], BOOT_TIMEOUT)
+	let grpc = node.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let view = grpc
+		.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json: body.to_string() }))
+		.map_err(|status| common::api::status_detail(&status))?
+		.into_inner();
+	serde_json::from_str(&view.json).map_err(|err| format!("invalid create view JSON: {err}"))
 }
 
 fn replica_list(node: &NodeProc) -> Vec<String> {
@@ -902,27 +937,34 @@ fn exec_capture(
 	cmd: &[&str],
 	timeout: Duration,
 ) -> (i64, String, String) {
-	let path = format!("/v1/sandboxes/{}/exec", percent_encode(sid));
-	let response = node.api_json(
-		"POST",
-		&path,
-		Some(&json!({"cmd": cmd, "timeout": timeout.as_secs_f64()})),
-		&[],
-		timeout + Duration::from_secs(10),
-	);
-	let stdout = response
-		.get("stdout_b64")
-		.and_then(Value::as_str)
-		.and_then(|text| B64.decode(text).ok())
-		.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-		.unwrap_or_default();
-	let stderr = response
-		.get("stderr_b64")
-		.and_then(Value::as_str)
-		.and_then(|text| B64.decode(text).ok())
-		.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-		.unwrap_or_default();
-	(response.get("exit").and_then(Value::as_i64).unwrap_or(-1), stdout, stderr)
+	let grpc = node.grpc().unwrap_or_else(|err| {
+		panic!("gRPC connect to {} failed: {err}\nlog tail:\n{}", node.name, node.log_tail())
+	});
+	let mut sandboxes = grpc.sandboxes();
+	let request = pb::ExecCaptureRequest {
+		id:   sid.to_owned(),
+		exec: Some(pb::ExecStart {
+			cmd: cmd.iter().map(|&part| part.to_owned()).collect(),
+			timeout: Some(timeout.as_secs_f64()),
+			..Default::default()
+		}),
+	};
+	let response = grpc
+		.block_on(sandboxes.exec_capture(request))
+		.unwrap_or_else(|status| {
+			panic!(
+				"exec {cmd:?} via {} failed: {}\nlog tail:\n{}",
+				node.name,
+				common::api::status_detail(&status),
+				node.log_tail()
+			)
+		})
+		.into_inner();
+	(
+		response.code,
+		String::from_utf8_lossy(&response.stdout).into_owned(),
+		String::from_utf8_lossy(&response.stderr).into_owned(),
+	)
 }
 
 fn volume_lease(row: &Value, volume: &str) -> Value {
@@ -1071,9 +1113,7 @@ fn two_node_failover_and_restore() {
 			Duration::from_mins(2),
 			POLL_INTERVAL,
 			|| {
-				let listing = survivor
-					.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
-					.ok()?;
+				let listing = try_list_sandboxes(survivor).ok()?;
 				let row = sandbox_row(&listing, &sid)?;
 				(row.get("node").and_then(Value::as_str) == Some(survivor_node)
 					&& row.get("status").and_then(Value::as_str) == Some("running"))
@@ -1168,9 +1208,7 @@ fn two_node_readonly_volume_ha_materializes_on_survivor() {
 			Duration::from_mins(2),
 			POLL_INTERVAL,
 			|| {
-				let listing = gateway_b
-					.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
-					.ok()?;
+				let listing = try_list_sandboxes(&gateway_b).ok()?;
 				let row = sandbox_row(&listing, &sid)?;
 				(row.get("node").and_then(Value::as_str) == Some(node_b.as_str())
 					&& row.get("status").and_then(Value::as_str) == Some("running"))
@@ -1280,14 +1318,28 @@ fn two_node_migrate_moves_running_sandbox() {
 			exec_capture(source, &sid, &["/bin/sh", "-c", &write_markers], Duration::from_secs(30));
 		assert_eq!(exit, 0, "writing markers failed stdout={stdout:?} stderr={stderr:?}");
 
-		let migrate_path = format!("/v1/sandboxes/{}/migrate", percent_encode(&sid));
-		let migrated = source.api_json(
-			"POST",
-			&migrate_path,
-			Some(&json!({"target": target_node})),
-			&[],
-			BOOT_TIMEOUT,
-		);
+		let migrated = {
+			let grpc = source
+				.grpc()
+				.unwrap_or_else(|err| panic!("gRPC connect to {} failed: {err}", source.name));
+			let mut sandboxes = grpc.sandboxes();
+			let view =
+				grpc
+					.block_on(sandboxes.migrate(pb::MigrateRequest {
+						id:     sid.clone(),
+						target: target_node.to_owned(),
+					}))
+					.unwrap_or_else(|status| {
+						panic!(
+							"migrate via {} failed: {}\nlog tail:\n{}",
+							source.name,
+							common::api::status_detail(&status),
+							source.log_tail()
+						)
+					})
+					.into_inner();
+			serde_json::from_str::<Value>(&view.json).expect("migrate view JSON")
+		};
 		let timing = migrated
 			.get("migration")
 			.unwrap_or_else(|| panic!("migrate response missing timing object: {migrated}"));
@@ -1304,9 +1356,7 @@ fn two_node_migrate_moves_running_sandbox() {
 
 		let moved =
 			eventually("migrated sandbox to run on target", RESTORE_TIMEOUT, POLL_INTERVAL, || {
-				let listing = target
-					.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
-					.ok()?;
+				let listing = try_list_sandboxes(target).ok()?;
 				let row = sandbox_row(&listing, &sid)?;
 				(row.get("node").and_then(Value::as_str) == Some(target_node)
 					&& row.get("status").and_then(Value::as_str) == Some("running"))
@@ -1324,9 +1374,7 @@ fn two_node_migrate_moves_running_sandbox() {
 		assert_eq!(stdout, disk_marker, "disk marker changed across migration");
 
 		eventually("source node to drop migrated sandbox", FAST_TIMEOUT, POLL_INTERVAL, || {
-			let listing = source
-				.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
-				.ok()?;
+			let listing = try_list_sandboxes(source).ok()?;
 			sandbox_row(&listing, &sid).is_none().then_some(())
 		});
 	}));
@@ -1430,13 +1478,7 @@ fn three_node_writable_volume_quorum_ha() {
 			POLL_INTERVAL,
 			|| {
 				for index in 1..gateways.len() {
-					let Ok(listing) = gateways[index].try_api_json(
-						"GET",
-						"/v1/sandboxes",
-						None,
-						&[],
-						Duration::from_secs(5),
-					) else {
+					let Ok(listing) = try_list_sandboxes(&gateways[index]) else {
 						continue;
 					};
 					let Some(row) = sandbox_row(&listing, &sid) else {
@@ -1552,9 +1594,7 @@ fn macos_user_net_failover_restores_gateway_reachability() {
 			Duration::from_mins(2),
 			POLL_INTERVAL,
 			|| {
-				let listing = survivor
-					.try_api_json("GET", "/v1/sandboxes", None, &[], Duration::from_secs(5))
-					.ok()?;
+				let listing = try_list_sandboxes(survivor).ok()?;
 				let row = sandbox_row(&listing, &sid)?;
 				(row.get("node").and_then(Value::as_str) == Some(survivor_node)
 					&& row.get("status").and_then(Value::as_str) == Some("running"))
@@ -1653,15 +1693,7 @@ fn writable_volume_lease_handoff_has_no_active_overlap() {
 			Duration::from_mins(2),
 			POLL_INTERVAL,
 			|| {
-				let listing = gateways[0]
-					.try_backend_api_json(
-						"GET",
-						"/v1/sandboxes",
-						None,
-						&[("X-Vmon-Mesh-Hop", "1")],
-						Duration::from_secs(5),
-					)
-					.ok()?;
+				let listing = try_list_sandboxes_backend(&gateways[0]).ok()?;
 				let row = sandbox_row(&listing, &sid)?;
 				(row.get("status").and_then(Value::as_str) != Some("running")).then_some(row)
 			},
@@ -1685,13 +1717,7 @@ fn writable_volume_lease_handoff_has_no_active_overlap() {
 			POLL_INTERVAL,
 			|| {
 				for index in 1..gateways.len() {
-					let Ok(listing) = gateways[index].try_backend_api_json(
-						"GET",
-						"/v1/sandboxes",
-						None,
-						&[("X-Vmon-Mesh-Hop", "1")],
-						Duration::from_secs(5),
-					) else {
+					let Ok(listing) = try_list_sandboxes_backend(&gateways[index]) else {
 						continue;
 					};
 					let Some(row) = sandbox_row(&listing, &sid) else {
