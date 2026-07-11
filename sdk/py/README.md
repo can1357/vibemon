@@ -48,7 +48,7 @@ with vmon.connect("vmon://node-a,node-b") as client:
 - `Volume` and `Secret` are validated request values. Server-side volume lifecycle lives under `client.volumes`; secret values stay in memory and are sent only in create and exec requests.
 - `APIError`, `TransportError`, and `ProtocolError` distinguish server envelopes, failover-eligible I/O failures, and malformed wire data.
 - `sandbox.aio`, `sandbox.files.aio`, and `sandbox.ports.aio` provide thread-backed async forms of the synchronous object hierarchy.
-- `client.function()` and the `@vmon.function` decorator bind source-available callables for cached `remote` calls and bounded `map` calls.
+- `client.function()` and the `@vmon.function` decorator bind source-available callables to a persistent in-guest session: warm `remote()` calls, streaming `remote_gen()` generators, `spawn()`/`FunctionCall.gather()` handles, lazy `map()`/`starmap()`/`for_each()` over auto-scaling workers, `Retries` policies, and per-call timeouts. Arguments/results travel as JSON when possible and stdlib pickle otherwise; remote exceptions re-raise as their original type with the guest traceback attached as a note. `@vmon.cls` adds stateful classes with `@vmon.method`/`@vmon.enter`/`@vmon.exit` lifecycle hooks, and `vmon.is_remote()` reports guest-side execution.
 
 ## Real-VM SDK smoke test
 

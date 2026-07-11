@@ -641,30 +641,32 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     const startWorker = (): void => {
       active += 1;
       const task = (async () => {
-        let sandbox: Sandbox | null = null;
-        let session: WorkerSession | null = null;
+        const held: { sandbox: Sandbox | null; session: WorkerSession | null } = {
+          sandbox: null,
+          session: null,
+        };
+        const dropSession = (): void => {
+          if (held.session !== null) {
+            liveSessions.delete(held.session);
+            held.session.close();
+            held.session = null;
+          }
+        };
         const target: DispatchTarget = {
           acquire: async () => {
-            if (session !== null && session.alive) return session;
-            if (session !== null) {
-              liveSessions.delete(session);
-              session.close();
-              session = null;
-            }
-            sandbox ??= await this.#provisionSandbox();
-            session = await WorkerSession.start(sandbox);
+            if (held.session !== null && held.session.alive) return held.session;
+            dropSession();
+            held.sandbox ??= await this.#provisionSandbox();
+            const session = await WorkerSession.start(held.sandbox);
+            held.session = session;
             liveSessions.add(session);
             return session;
           },
           invalidate: async (fresh) => {
-            if (session !== null) {
-              liveSessions.delete(session);
-              session.close();
-              session = null;
-            }
-            if (fresh && sandbox !== null) {
-              const dying = sandbox;
-              sandbox = null;
+            dropSession();
+            if (fresh && held.sandbox !== null) {
+              const dying = held.sandbox;
+              held.sandbox = null;
               await dying.terminate(false).catch(() => undefined);
             }
           },
@@ -698,11 +700,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
           stopped = true;
           completions.fail(error);
         } finally {
-          if (session !== null) {
-            liveSessions.delete(session);
-            session.close();
-          }
-          if (sandbox !== null) await sandbox.terminate(false).catch(() => undefined);
+          dropSession();
+          if (held.sandbox !== null) await held.sandbox.terminate(false).catch(() => undefined);
           active -= 1;
           if (active === 0) completions.end();
         }

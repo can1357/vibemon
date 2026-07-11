@@ -38,7 +38,7 @@ vmon-agent (guest agent, Linux guest only)
 - `vmond/` — Rust server/engine crate used by `vmon serve`: HTTP API, registry, image pipeline, mesh, pools, volumes, and VM spawn/control.
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
-- `sdk/py/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
+- `sdk/py/vmon/` — thin Python SDK only (`_transport.py`, `sandbox.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `__init__.py`).
 - `sdk/py/tests/`, `sdk/py/e2e.py` — Python SDK unit tests and real-VM SDK driver.
 - `sdk/ts/` — TypeScript SDK (bun).
 - `sdk/go/` — Go SDK (`go test`, `github.com/coder/websocket`).
@@ -123,7 +123,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - `vmm/src/control.rs` — Unix-socket JSON control plane and `PauseGate`.
 - `vmond/src/lib.rs`, `vmond/src/api/`, `vmond/src/engine/`, `vmond/src/image/`, `vmond/src/mesh/` — Rust server core, HTTP routes, engine facade/spawn/control, OCI image pipeline, and cluster mesh.
 - `agent/src/main.rs`, `agent/src/proto.rs` — guest agent and its frame protocol.
-- `sdk/py/vmon/sandbox.py`, `_transport.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
+- `sdk/py/vmon/sandbox.py`, `_transport.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `context.py`, `secret.py`, `volume.py`, `wsframe.py` — thin Python SDK.
 - `sdk/ts/package.json`, `sdk/ts/src/` — TypeScript SDK.
 - `sdk/go/go.mod`, `sdk/go/*.go` — Go SDK.
 - `Cargo.toml` (workspace + lints + profiles), `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `sdk/py/pyproject.toml`, `ui/vite.config.ts`, `hvf.entitlements`.

@@ -27,6 +27,10 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Python SDK support for `@vmon.cls` stateful remote classes with lifecycle hooks
+- Added streaming generators, lazy maps, and retries to Python SDK remote functions
+- Added `vmon.is_remote()` to detect guest-side execution in Python SDK
+- Added Python SDK support for automatic `stdlib.pickle` serialization of rich types
 - Added Go SDK for client interaction with the Vibemon API
 - Added unified DSN support for Go, Python, and TypeScript SDKs, covering HTTP(S), UDS, and mesh contexts
 - Added lazy mesh discovery and automatic peer failover logic to SDK transport drivers

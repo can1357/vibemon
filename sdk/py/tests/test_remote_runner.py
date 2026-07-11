@@ -5,10 +5,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import pickle
 import subprocess
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -67,7 +67,7 @@ def big(size):
 
 class CustomBoom(Exception):
     def __init__(self, message, code):
-        super().__init__(message)
+        super().__init__(message, code)
         self.code = code
 
 
@@ -106,13 +106,29 @@ class Greeter:
 CLASS_HASH = hashlib.sha256(CLASS_SOURCE.encode()).hexdigest()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def host_runnermod():
+    """Mirror the caller side: the shipped module must exist on the host too.
+
+    Unpickling guest exceptions/instances resolves classes through
+    ``sys.modules["runnermod"]`` exactly as a real caller's module would.
+    """
+    import types
+
+    module = types.ModuleType("runnermod")
+    sys.modules["runnermod"] = module  # before exec: @dataclass resolves via sys.modules
+    exec(MODULE_SOURCE, module.__dict__)
+    yield module
+    sys.modules.pop("runnermod", None)
+
+
 class Runner:
     """One live runner subprocess speaking the NDJSON protocol."""
 
     def __init__(self, tmp_path: Path, env: dict[str, str] | None = None):
         script = tmp_path / "runner.py"
         script.write_text(_SESSION_RUNNER)
-        merged = dict(**__import__("os").environ)
+        merged = dict(os.environ)
         merged.update(env or {})
         self.proc = subprocess.Popen(
             [sys.executable, "-u", str(script)],
@@ -231,23 +247,14 @@ def test_tuple_and_datetime_fidelity_via_pickle(runner) -> None:
     assert value == (2, 1) and isinstance(value, tuple)
 
 
-def test_dataclass_instances_unpickle_via_module_registration() -> None:
+def test_dataclass_instances_pickle_against_registered_module(runner) -> None:
     # The runner registers shipped source under its real module name, so
-    # pickled instances of shipped classes resolve on both sides.
-    import os
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp:
-        runner = Runner(Path(tmp))
-        try:
-            events = runner.call("make_point", [3, 4])
-            frame = events[-1]
-            assert "pickle" in frame, frame
-            raw = base64.b64decode(frame["pickle"])
-            assert b"runnermod" in raw, "instance must reference the registered module"
-            os.environ  # keep flake quiet about unused import style
-        finally:
-            runner.close()
+    # pickled instances of shipped classes resolve by module path on both
+    # sides; here we assert the payload references that module.
+    events = runner.call("make_point", [3, 4])
+    frame = events[-1]
+    assert "pickle" in frame, frame
+    assert b"runnermod" in base64.b64decode(frame["pickle"])
 
 
 def test_generator_streams_in_order_then_null_result(runner) -> None:
@@ -357,9 +364,9 @@ def test_init_enter_call_shutdown_lifecycle(runner) -> None:
         events.append(event)
         if event["event"] == "result":
             break
-    assert any(
-        event["event"] == "out" and "bye ada" in event["data"] for event in events
-    ), "exit hook output must stream before the shutdown ack"
+    assert any(event["event"] == "out" and "bye ada" in event["data"] for event in events), (
+        "exit hook output must stream before the shutdown ack"
+    )
     assert runner.proc.wait(timeout=5) == 0
 
 
