@@ -5,7 +5,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tonic_prost_build::configure()
 		.enum_attribute(
 			".vmon.v1.StreamCallInputsRequest.frame",
-			"#[allow(clippy::large_enum_variant, reason = \"generated protobuf frame avoids per-input heap allocation\")]",
+			"#[allow(clippy::large_enum_variant, reason = \"generated protobuf frame avoids \
+			 per-input heap allocation\")]",
 		)
 		.compile_fds(fds)?;
 	Ok(())
