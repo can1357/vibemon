@@ -34,6 +34,7 @@ pub(crate) use state::{ApiState, Transport};
 mod tests {
 	use std::{
 		collections::HashMap,
+		fs,
 		sync::{Arc, Mutex},
 	};
 
@@ -318,10 +319,11 @@ mod tests {
 	}
 
 	struct ApiHarness {
-		base_url: String,
-		client:   reqwest::Client,
-		handle:   tokio::task::JoinHandle<()>,
-		_temp:     tempfile::TempDir,
+		base_url:          String,
+		client:            reqwest::Client,
+		template_revision: String,
+		handle:            tokio::task::JoinHandle<()>,
+		_temp:             tempfile::TempDir,
 	}
 
 	impl ApiHarness {
@@ -330,9 +332,26 @@ mod tests {
 			config.token = Some("admin-token".to_owned());
 			config.client_token = Some("client-token".to_owned());
 			let temp = tempfile::tempdir().expect("function domain tempdir");
+			let home = Home::new(temp.path());
+			let template = home.templates_dir().join("api-test");
+			fs::create_dir_all(&template).expect("create test template");
+			fs::write(template.join("rootfs.img"), b"test rootfs").expect("write test rootfs");
+			fs::write(template.join("agent-ready.json"), b"{}").expect("write test marker");
+			let template_revision =
+				crate::image::cas::template_digest(&template).expect("digest test template");
+			fs::create_dir_all(home.cas_dir()).expect("create test CAS");
+			let pointer = crate::image::cas::CasPointer {
+				template_dir: template.to_string_lossy().into_owned(),
+				tpl_name:     "api-test".to_owned(),
+				created_unix: 0,
+			};
+			fs::write(
+				home.cas_dir().join(format!("{template_revision}.json")),
+				serde_json::to_vec(&pointer).expect("encode test CAS pointer"),
+			)
+			.expect("write test CAS pointer");
 			let engine_api: Arc<dyn EngineApi> = engine.clone();
-			let functions =
-				FunctionDomain::open(Home::new(temp.path()), engine_api).expect("open function domain");
+			let functions = FunctionDomain::open(home, engine_api).expect("open function domain");
 			let state = ApiState::new(engine, functions.clone(), config, Transport::Tcp);
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
 				.await
@@ -345,6 +364,7 @@ mod tests {
 			Self {
 				base_url: format!("http://{addr}"),
 				client: reqwest::Client::new(),
+				template_revision,
 				handle,
 				_temp: temp,
 			}
@@ -369,7 +389,7 @@ mod tests {
 
 	fn authed<T>(message: T, token: &str) -> Request<T> {
 		let mut request = Request::new(message);
-		let value = MetadataValue::try_from(format!("Bearer {token}")).expect("bearer metadata");
+		let value = MetadataValue::try_from(format!("Bearer {token}")).expect("valid auth metadata");
 		request.metadata_mut().insert("authorization", value);
 		request
 	}
@@ -382,21 +402,39 @@ mod tests {
 			.map(str::to_owned)
 	}
 
-	fn test_function_spec(name: &str) -> pb::FunctionSpec {
+	fn test_function_spec(name: &str, template_revision: &str) -> pb::FunctionSpec {
 		pb::FunctionSpec {
 			function: Some(pb::FunctionRef {
 				namespace: "tests".to_owned(),
-				name: name.to_owned(),
+				name:      name.to_owned(),
 			}),
 			package: Some(pb::PackageSpec::default()),
-			image: Some(pb::ImageSpec::default()),
-			resources: Some(pb::ResourceSpec::default()),
+			image: Some(pb::ImageSpec {
+				source: Some(pb::image_spec::Source::Template(pb::TemplateImageSource {
+					name:     "api-test".to_owned(),
+					revision: template_revision.to_owned(),
+				})),
+				..Default::default()
+			}),
+			resources: Some(pb::ResourceSpec {
+				architecture: if std::env::consts::ARCH == "aarch64" {
+					pb::CpuArchitecture::Arm64 as i32
+				} else {
+					pb::CpuArchitecture::Amd64 as i32
+				},
+				..Default::default()
+			}),
 			retry: Some(pb::RetryPolicy { max_attempts: 1, ..Default::default() }),
 			timeouts: Some(pb::TimeoutSpec::default()),
 			workers: Some(pb::WorkerSpec::default()),
 			concurrency: Some(pb::ConcurrencySpec::default()),
 			batching: Some(pb::BatchingSpec::default()),
-			serializer: Some(pb::SerializerSpec::default()),
+			serializer: Some(pb::SerializerSpec {
+				input_serializer:     pb::ValueSerializer::Json as i32,
+				result_serializer:    pb::ValueSerializer::Json as i32,
+				compression:          pb::ValueCompression::None as i32,
+				allow_trusted_python: false,
+			}),
 			..Default::default()
 		}
 	}
@@ -409,7 +447,7 @@ mod tests {
 			compression: pb::ValueCompression::None as i32,
 			checksum: Some(pb::Digest {
 				algorithm: pb::DigestAlgorithm::Sha256 as i32,
-				value: Sha256::digest(&bytes).to_vec(),
+				value:     Sha256::digest(&bytes).to_vec(),
 			}),
 			uncompressed_size_bytes: bytes.len() as u64,
 			storage: Some(pb::value_envelope::Storage::InlineData(bytes)),
@@ -717,7 +755,6 @@ mod tests {
 		assert!(engine.captures().pool_sets.is_empty());
 	}
 
-
 	#[tokio::test]
 	async fn function_app_schedule_and_call_rpcs_round_trip() {
 		let engine = Arc::new(ScriptedEngine::new());
@@ -727,8 +764,8 @@ mod tests {
 		let revision = functions
 			.register(authed(
 				pb::RegisterFunctionRequest {
-					spec: Some(test_function_spec("echo")),
-					request_id: "register-echo".to_owned(),
+					spec:              Some(test_function_spec("echo", &api.template_revision)),
+					request_id:        "register-echo".to_owned(),
 					transient_secrets: Vec::new(),
 				},
 				"admin-token",
@@ -740,7 +777,7 @@ mod tests {
 		functions
 			.activate(authed(
 				pb::ActivateFunctionRequest {
-					revision: Some(revision_ref.clone()),
+					revision:                  Some(revision_ref.clone()),
 					expected_current_presence: None,
 				},
 				"admin-token",
@@ -772,8 +809,8 @@ mod tests {
 		let inactive = functions
 			.register(authed(
 				pb::RegisterFunctionRequest {
-					spec: Some(test_function_spec("delete-me")),
-					request_id: "register-delete".to_owned(),
+					spec:              Some(test_function_spec("delete-me", &api.template_revision)),
+					request_id:        "register-delete".to_owned(),
 					transient_secrets: Vec::new(),
 				},
 				"admin-token",
@@ -784,16 +821,15 @@ mod tests {
 			.r#ref
 			.expect("inactive revision ref");
 		functions
-			.delete(authed(
-				pb::DeleteFunctionRequest { revision: Some(inactive) },
-				"admin-token",
-			))
+			.delete(authed(pb::DeleteFunctionRequest { revision: Some(inactive) }, "admin-token"))
 			.await
 			.expect("delete inactive revision");
 
 		let app = pb::AppRef { namespace: "tests".to_owned(), name: "app".to_owned() };
-		let binding =
-			pb::AppFunctionBinding { name: "echo".to_owned(), revision: Some(revision_ref.clone()) };
+		let binding = pb::AppFunctionBinding {
+			name:     "echo".to_owned(),
+			revision: Some(revision_ref.clone()),
+		};
 		let first_app = functions
 			.activate_app(authed(
 				pb::ActivateAppRequest {
@@ -837,9 +873,9 @@ mod tests {
 		functions
 			.rollback_app(authed(
 				pb::RollbackAppRequest {
-					target: first_app.r#ref.clone(),
+					target:                    first_app.r#ref.clone(),
 					expected_current_presence: None,
-					request_id: "rollback".to_owned(),
+					request_id:                "rollback".to_owned(),
 				},
 				"admin-token",
 			))
@@ -854,21 +890,21 @@ mod tests {
 							"periodic".to_owned(),
 						),
 					),
-					spec: Some(pb::ScheduleSpec {
-						name: "periodic".to_owned(),
-						app: first_app.r#ref.clone(),
+					spec:                 Some(pb::ScheduleSpec {
+						name:   "periodic".to_owned(),
+						app:    first_app.r#ref.clone(),
 						target: Some(pb::ScheduleTarget {
 							function: Some(revision_ref.clone()),
-							input: Some(test_json_value(json!({"scheduled": true}))),
+							input:    Some(test_json_value(json!({"scheduled": true}))),
 						}),
 						timing: Some(pb::schedule_spec::Timing::Period(pb::PeriodSchedule {
-							period_millis: 60_000,
+							period_millis:      60_000,
 							anchor_unix_millis: 1,
 						})),
 						status: pb::ScheduleStatus::Active as i32,
 						labels: Default::default(),
 					}),
-					request_id: "schedule".to_owned(),
+					request_id:           "schedule".to_owned(),
 				},
 				"admin-token",
 			))
@@ -913,8 +949,8 @@ mod tests {
 		let call_ref = call.r#ref.expect("call ref");
 		let malformed = pb::StreamCallInputsRequest {
 			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
-				index: 0,
-				payload: Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
+				index:    0,
+				payload:  Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
 				input_id: "malformed-input".to_owned(),
 			})),
 		};
@@ -928,8 +964,11 @@ mod tests {
 		};
 		let input = pb::StreamCallInputsRequest {
 			frame: Some(pb::stream_call_inputs_request::Frame::Input(pb::CallInput {
-				index: 0,
-				payload: Some(pb::call_input::Payload::Value(test_json_value(json!(1)))),
+				index:    0,
+				payload:  Some(pb::call_input::Payload::Arguments(pb::InvocationArguments {
+					positional: vec![test_json_value(json!(1))],
+					named:      HashMap::from([("named".to_owned(), test_json_value(json!(2)))]),
+				})),
 				input_id: "input-0".to_owned(),
 			})),
 		};
@@ -938,14 +977,22 @@ mod tests {
 			.await
 			.expect("stream input")
 			.into_inner();
-		let opener_ack = acknowledgements.message().await.expect("opener ack").expect("opener frame");
+		let opener_ack = acknowledgements
+			.message()
+			.await
+			.expect("opener ack")
+			.expect("opener frame");
 		assert_eq!(opener_ack.committed_input_count, 0);
-		let committed = acknowledgements.message().await.expect("input ack").expect("input frame");
+		let committed = acknowledgements
+			.message()
+			.await
+			.expect("input ack")
+			.expect("input frame");
 		assert_eq!(committed.committed_input_count, 1);
 		calls
 			.close_inputs(authed(
 				pb::CloseCallInputsRequest {
-					call: Some(call_ref.clone()),
+					call:                 Some(call_ref.clone()),
 					expected_input_count: 1,
 				},
 				"client-token",
@@ -966,7 +1013,7 @@ mod tests {
 			.watch(authed(
 				pb::WatchCallRequest {
 					cursor: Some(pb::EventCursor {
-						call: Some(call_ref.clone()),
+						call:           Some(call_ref.clone()),
 						after_sequence: 0,
 					}),
 					follow: false,
@@ -983,8 +1030,8 @@ mod tests {
 		calls
 			.cancel(authed(
 				pb::CancelCallRequest {
-					call: Some(call_ref.clone()),
-					reason: "test".to_owned(),
+					call:       Some(call_ref.clone()),
+					reason:     "test".to_owned(),
 					request_id: "cancel".to_owned(),
 				},
 				"client-token",
@@ -1006,8 +1053,8 @@ mod tests {
 		let result_page = calls
 			.list_results(authed(
 				pb::ListCallResultsRequest {
-					cursor: Some(pb::ResultCursor {
-						call: Some(call_ref),
+					cursor:    Some(pb::ResultCursor {
+						call:           Some(call_ref),
 						after_sequence: 0,
 					}),
 					page_size: 10,
@@ -1032,19 +1079,17 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 	}
 
-
 	#[tokio::test]
 	async fn actor_rpc_surface_returns_stable_missing_resource_errors() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine).await;
 		let mut actors = pb::actor_service_client::ActorServiceClient::new(api.channel());
 		let missing_actor = pb::ActorRef { actor_id: "missing".to_owned() };
-		let missing_checkpoint =
-			pb::ActorCheckpointRef { checkpoint_id: "missing".to_owned() };
+		let missing_checkpoint = pb::ActorCheckpointRef { checkpoint_id: "missing".to_owned() };
 		let missing_revision = pb::RevisionRef {
-			function: Some(pb::FunctionRef {
+			function:    Some(pb::FunctionRef {
 				namespace: "tests".to_owned(),
-				name: "actor".to_owned(),
+				name:      "actor".to_owned(),
 			}),
 			revision_id: "missing".to_owned(),
 		};
@@ -1073,7 +1118,7 @@ mod tests {
 			actors
 				.checkpoint(authed(
 					pb::CheckpointActorRequest {
-						actor: Some(missing_actor.clone()),
+						actor:      Some(missing_actor.clone()),
 						request_id: "checkpoint".to_owned(),
 					},
 					"client-token",
@@ -1087,7 +1132,7 @@ mod tests {
 			actors
 				.restore(authed(
 					pb::RestoreActorRequest {
-						actor: Some(missing_actor.clone()),
+						actor:      Some(missing_actor.clone()),
 						checkpoint: Some(missing_checkpoint.clone()),
 						request_id: "restore".to_owned(),
 					},
@@ -1104,7 +1149,7 @@ mod tests {
 					pb::ForkActorRequest {
 						checkpoint: Some(missing_checkpoint),
 						request_id: "fork".to_owned(),
-						labels: Default::default(),
+						labels:     Default::default(),
 					},
 					"client-token",
 				))
@@ -1139,31 +1184,16 @@ mod tests {
 			.expect_err("data before header is rejected");
 		assert_eq!(status.code(), Code::InvalidArgument);
 
-		let oversized = pb::PutArtifactRequest {
-			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
-				expected_digest: Some(pb::Digest {
-					algorithm: pb::DigestAlgorithm::Sha256 as i32,
-					value: vec![0; 32],
-				}),
-				expected_size_bytes: 64 * 1024 * 1024 + 1,
-				media_type_presence: None,
-			})),
-		};
-		let status = client
-			.put(authed(tokio_stream::iter([oversized]), "admin-token"))
-			.await
-			.expect_err("uploads over 64 MiB are rejected");
-		assert_eq!(status.code(), Code::ResourceExhausted);
-
 		let bytes = b"durable artifact".to_vec();
 		let bad_header = pb::PutArtifactRequest {
 			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
-				expected_digest: Some(pb::Digest {
+				expected_digest:     Some(pb::Digest {
 					algorithm: pb::DigestAlgorithm::Sha256 as i32,
-					value: vec![0; 32],
+					value:     vec![0; 32],
 				}),
 				expected_size_bytes: bytes.len() as u64,
 				media_type_presence: None,
+				ttl_millis_presence: None,
 			})),
 		};
 		let data = pb::PutArtifactRequest {
@@ -1178,17 +1208,16 @@ mod tests {
 
 		let digest = pb::Digest {
 			algorithm: pb::DigestAlgorithm::Sha256 as i32,
-			value: Sha256::digest(&bytes).to_vec(),
+			value:     Sha256::digest(&bytes).to_vec(),
 		};
 		let header = pb::PutArtifactRequest {
 			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
-				expected_digest: Some(digest.clone()),
+				expected_digest:     Some(digest.clone()),
 				expected_size_bytes: bytes.len() as u64,
-				media_type_presence: Some(
-					pb::put_artifact_header::MediaTypePresence::MediaType(
-						"application/octet-stream".to_owned(),
-					),
-				),
+				media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
+					"application/octet-stream".to_owned(),
+				)),
+				ttl_millis_presence: None,
 			})),
 		};
 		let data = pb::PutArtifactRequest {
@@ -1200,6 +1229,27 @@ mod tests {
 			.expect("artifact upload")
 			.into_inner();
 		assert_eq!(record.size_bytes, bytes.len() as u64);
+		let conflicting_header = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest:     Some(digest.clone()),
+				expected_size_bytes: bytes.len() as u64,
+				media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
+					"application/octet-stream".to_owned(),
+				)),
+				ttl_millis_presence: Some(pb::put_artifact_header::TtlMillisPresence::TtlMillis(
+					60_000,
+				)),
+			})),
+		};
+		let conflicting_data = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Data(bytes.clone())),
+		};
+		let deduped = client
+			.put(authed(tokio_stream::iter([conflicting_header, conflicting_data]), "admin-token"))
+			.await
+			.expect("dedupe returns canonical metadata")
+			.into_inner();
+		assert_eq!(deduped, record);
 
 		let reference = pb::ArtifactRef { digest: Some(digest) };
 		let stat = client
@@ -1230,5 +1280,61 @@ mod tests {
 		}
 		assert_eq!(downloaded, bytes);
 		assert!(saw_eof);
+
+		let chunk_size = 1024 * 1024;
+		let chunk_count = 65_u64;
+		let chunk = vec![0xa5; chunk_size];
+		let mut hasher = Sha256::new();
+		for _ in 0..chunk_count {
+			hasher.update(&chunk);
+		}
+		let large_digest = pb::Digest {
+			algorithm: pb::DigestAlgorithm::Sha256 as i32,
+			value:     hasher.finalize().to_vec(),
+		};
+		let interrupted_header = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest:     Some(large_digest.clone()),
+				expected_size_bytes: chunk_count * chunk_size as u64,
+				media_type_presence: None,
+				ttl_millis_presence: None,
+			})),
+		};
+		let interrupted = [
+			interrupted_header.clone(),
+			pb::PutArtifactRequest {
+				frame: Some(pb::put_artifact_request::Frame::Data(chunk.clone())),
+			},
+			interrupted_header,
+		];
+		let status = client
+			.put(authed(tokio_stream::iter(interrupted), "admin-token"))
+			.await
+			.expect_err("interrupted upload rejected");
+		assert_eq!(status.code(), Code::InvalidArgument);
+		let missing = client
+			.stat(authed(pb::ArtifactRef { digest: Some(large_digest.clone()) }, "client-token"))
+			.await
+			.expect_err("interrupted upload is not committed");
+		assert_eq!(missing.code(), Code::NotFound);
+		let large_header = pb::PutArtifactRequest {
+			frame: Some(pb::put_artifact_request::Frame::Header(pb::PutArtifactHeader {
+				expected_digest:     Some(large_digest),
+				expected_size_bytes: chunk_count * chunk_size as u64,
+				media_type_presence: None,
+				ttl_millis_presence: None,
+			})),
+		};
+		let frames = std::iter::once(large_header).chain((0..chunk_count).map(move |_| {
+			pb::PutArtifactRequest {
+				frame: Some(pb::put_artifact_request::Frame::Data(vec![0xa5; chunk_size])),
+			}
+		}));
+		let large = client
+			.put(authed(tokio_stream::iter(frames), "admin-token"))
+			.await
+			.expect("multi-message upload larger than one gRPC message")
+			.into_inner();
+		assert_eq!(large.size_bytes, chunk_count * chunk_size as u64);
 	}
 }

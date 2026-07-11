@@ -100,11 +100,8 @@ async fn metrics(State(state): State<ApiState>) -> Response {
 	text.push_str("# TYPE vmon_function_startup_milliseconds_total counter\n");
 	let _ = writeln!(text, "vmon_function_startup_milliseconds_total {}", function.startup_millis);
 	text.push_str("# TYPE vmon_function_execution_milliseconds_total counter\n");
-	let _ = writeln!(
-		text,
-		"vmon_function_execution_milliseconds_total {}",
-		function.execution_millis
-	);
+	let _ =
+		writeln!(text, "vmon_function_execution_milliseconds_total {}", function.execution_millis);
 	Response::builder()
 		.header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
 		.body(Body::from(text))

@@ -1,19 +1,18 @@
 //! Actor pinning and serialized admission.
 //!
-//! The durable actor record and checkpoints are owned by [`super::store::Store`].
-//! This registry contains only live worker pins and serialization permits. A
-//! missing worker never implies fresh actor state: callers must restore the
-//! returned checkpoint or persist an explicit lost state.
+//! The durable actor record and checkpoints are owned by
+//! [`super::store::Store`]. This registry contains only live worker pins and
+//! serialization permits. A missing worker never implies fresh actor state:
+//! callers must restore the returned checkpoint or persist an explicit lost
+//! state.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{EngineError, Result};
-
 use super::worker::Worker;
+use crate::{EngineError, Result};
 
 /// Required action after an actor's pinned worker is lost.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,10 +24,10 @@ pub enum ActorRecovery {
 }
 
 struct ActorSlot {
-	worker: Option<Arc<dyn Worker>>,
+	worker:        Option<Arc<dyn Worker>>,
 	checkpoint_id: Option<String>,
-	gate: Arc<Semaphore>,
-	lost: bool,
+	gate:          Arc<Semaphore>,
+	lost:          bool,
 }
 
 impl ActorSlot {
@@ -44,20 +43,32 @@ pub struct ActorManager {
 }
 
 impl ActorManager {
-	/// Create an empty registry. Durable actors are loaded lazily from the store.
+	/// Create an empty registry. Durable actors are loaded lazily from the
+	/// store.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Register a durable actor without inventing in-memory state.
 	pub fn register(&self, actor_id: String, checkpoint_id: Option<String>) {
-		self.actors.write().entry(actor_id).or_insert_with(|| ActorSlot::new(checkpoint_id));
+		self
+			.actors
+			.write()
+			.entry(actor_id)
+			.or_insert_with(|| ActorSlot::new(checkpoint_id));
 	}
 
 	/// Pin an initialized or restored worker to an actor.
-	pub fn pin(&self, actor_id: &str, worker: Arc<dyn Worker>, checkpoint_id: Option<String>) -> Result<()> {
+	pub fn pin(
+		&self,
+		actor_id: &str,
+		worker: Arc<dyn Worker>,
+		checkpoint_id: Option<String>,
+	) -> Result<()> {
 		let mut actors = self.actors.write();
-		let slot = actors.entry(actor_id.to_owned()).or_insert_with(|| ActorSlot::new(None));
+		let slot = actors
+			.entry(actor_id.to_owned())
+			.or_insert_with(|| ActorSlot::new(None));
 		if slot.lost && checkpoint_id.as_ref() != slot.checkpoint_id.as_ref() {
 			return Err(EngineError::not_running(format!(
 				"actor {actor_id} must be restored from its latest checkpoint"
@@ -145,8 +156,8 @@ impl ActorManager {
 /// Exclusive admission to one actor's currently pinned worker.
 pub struct ActorPermit {
 	actor_id: String,
-	worker: Arc<dyn Worker>,
-	_permit: OwnedSemaphorePermit,
+	worker:   Arc<dyn Worker>,
+	_permit:  OwnedSemaphorePermit,
 }
 
 impl ActorPermit {
@@ -173,15 +184,15 @@ mod tests {
 
 		actors.register("source".into(), Some("checkpoint-1".into()));
 		actors.fork("source", "fork".into()).unwrap();
-		assert_eq!(
-			actors.worker_lost("source").unwrap(),
-			ActorRecovery::Restore { checkpoint_id: "checkpoint-1".into() }
-		);
-		actors.checkpoint_committed("fork", "checkpoint-2".into()).unwrap();
-		assert_eq!(
-			actors.worker_lost("fork").unwrap(),
-			ActorRecovery::Restore { checkpoint_id: "checkpoint-2".into() }
-		);
+		assert_eq!(actors.worker_lost("source").unwrap(), ActorRecovery::Restore {
+			checkpoint_id: "checkpoint-1".into(),
+		});
+		actors
+			.checkpoint_committed("fork", "checkpoint-2".into())
+			.unwrap();
+		assert_eq!(actors.worker_lost("fork").unwrap(), ActorRecovery::Restore {
+			checkpoint_id: "checkpoint-2".into(),
+		});
 	}
 
 	#[test]

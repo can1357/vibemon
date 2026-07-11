@@ -42,6 +42,11 @@ const MESH_HOP_KEY: &str = "x-vmon-mesh-hop";
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+enum ArtifactUploadFrame {
+	Chunk(Vec<u8>),
+	Finish,
+	Abort,
+}
 
 /// Map an [`ApiError`] onto the contract's gRPC status table and attach the
 /// stable vmond code as `vmon-code` metadata.
@@ -328,7 +333,6 @@ impl GrpcApi {
 			OwnerProxyDecision::Forward { peer_url, .. } => {
 				let endpoint = Endpoint::from_shared(peer_url).map_err(|err| {
 					status_from(&mesh_api_error(MeshError::unreachable(format!(
-
 						"invalid peer URL: {err}"
 					))))
 				})?;
@@ -610,6 +614,8 @@ fn pump_exec(
 
 #[tonic::async_trait]
 impl pb::artifact_service_server::ArtifactService for GrpcApi {
+	type GetStream = BoxStream<pb::ArtifactChunk>;
+
 	async fn put(
 		&self,
 		request: Request<Streaming<pb::PutArtifactRequest>>,
@@ -636,76 +642,117 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 				"expected digest must be a 32-byte SHA-256 value",
 			)));
 		}
-		if header.expected_size_bytes > MAX_MESSAGE_SIZE as u64 {
-			return Err(Status::resource_exhausted("artifact upload exceeds the 64 MiB limit"));
-		}
-		let mut bytes = Vec::with_capacity(header.expected_size_bytes as usize);
-		while let Some(frame) = stream.message().await? {
-			let chunk = match frame.frame {
-				Some(pb::put_artifact_request::Frame::Data(data)) => data,
-				_ => {
-					return Err(status_from(&ApiError::invalid(
-						"artifact upload frames after the header must contain data",
-					)));
-				},
-			};
-			if bytes.len().saturating_add(chunk.len()) > header.expected_size_bytes as usize {
-				return Err(status_from(&ApiError::function(
-					"checksum",
-					"artifact upload exceeds its declared size",
-				)));
-			}
-			bytes.extend_from_slice(&chunk);
-		}
-		if bytes.len() != header.expected_size_bytes as usize {
-			return Err(status_from(&ApiError::function(
-				"checksum",
-				"artifact upload does not match its declared size",
-			)));
+		let artifact_quota = self.state.config.function_artifact_max_bytes;
+		if header.expected_size_bytes > artifact_quota {
+			let mut status = Status::resource_exhausted(format!(
+				"artifact size {} exceeds configured quota {artifact_quota}",
+				header.expected_size_bytes
+			));
+			status
+				.metadata_mut()
+				.insert("vmon-code", MetadataValue::from_static("artifact_quota"));
+			return Err(status);
 		}
 		let expected = digest.value.clone();
 		let returned_digest = digest.clone();
 		let media_type = header.media_type_presence.map(|presence| match presence {
 			pb::put_artifact_header::MediaTypePresence::MediaType(value) => value,
 		});
+		let ttl_millis = header.ttl_millis_presence.map(|presence| match presence {
+			pb::put_artifact_header::TtlMillisPresence::TtlMillis(value) => value,
+		});
 		let domain = self.state.functions.clone();
+		let artifacts = domain.artifacts().clone();
+		let expected_size = header.expected_size_bytes;
+		let writer = tokio::task::spawn_blocking(move || {
+			artifacts.begin_put(&expected, expected_size, artifact_quota)
+		})
+		.await
+		.map_err(|error| status_from(&join_error(error)))?
+		.map_err(|error| status_from(&ApiError::from(error)))?;
 		let created_at = function_now_millis();
-		let record = tokio::task::spawn_blocking(move || {
-			let stored =
-				domain.artifacts().put_verified(&expected, header.expected_size_bytes, &bytes)?;
-			let path = stored.path.to_str().ok_or_else(|| {
-				crate::EngineError::engine("artifact path is not valid UTF-8")
-			})?;
+		let expires_at = ttl_millis.map(|ttl| created_at.saturating_add(ttl));
+		let (tx, mut rx) = mpsc::channel::<ArtifactUploadFrame>(8);
+		let commit = tokio::task::spawn_blocking(move || {
+			let mut writer = writer;
+			loop {
+				match rx.blocking_recv() {
+					Some(ArtifactUploadFrame::Chunk(chunk)) => writer.write_chunk(&chunk)?,
+					Some(ArtifactUploadFrame::Finish) => break,
+					Some(ArtifactUploadFrame::Abort) | None => {
+						return Err(crate::EngineError::invalid("artifact upload interrupted"));
+					},
+				}
+			}
+			let stored = writer.finalize()?;
+			let path = stored
+				.path
+				.to_str()
+				.ok_or_else(|| crate::EngineError::engine("artifact path is not valid UTF-8"))?;
 			domain.store().record_artifact(
 				&stored.digest,
 				stored.size,
 				media_type.as_deref(),
 				path,
 				created_at,
-				None,
+				expires_at,
 			)?;
+			let (size, canonical_media, canonical_created, canonical_expires, _) =
+				domain.store().stat_artifact(&stored.digest)?;
 			Ok::<_, crate::EngineError>(pb::ArtifactRecord {
 				r#ref: Some(pb::ArtifactRef { digest: Some(returned_digest) }),
-				size_bytes: stored.size,
-				stored_size_bytes: stored.size,
-				media_type_presence: media_type
+				size_bytes: size,
+				stored_size_bytes: size,
+				media_type_presence: canonical_media
 					.map(pb::artifact_record::MediaTypePresence::MediaType),
-				created_at_unix_millis: created_at,
+				created_at_unix_millis: canonical_created,
+				expires_at_unix_millis_presence: canonical_expires
+					.map(pb::artifact_record::ExpiresAtUnixMillisPresence::ExpiresAtUnixMillis),
 			})
-		})
-		.await
-		.map_err(|error| status_from(&join_error(error)))?
-		.map_err(|error| {
-			if error.message.contains("digest mismatch") || error.message.contains("size mismatch") {
-				status_from(&ApiError::function("checksum", error.message))
-			} else {
-				status_from(&ApiError::from(error))
+		});
+		loop {
+			let frame = match stream.message().await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => {
+					tx.send(ArtifactUploadFrame::Finish)
+						.await
+						.map_err(|_| Status::cancelled("artifact writer stopped"))?;
+					break;
+				},
+				Err(error) => {
+					let _ = tx.send(ArtifactUploadFrame::Abort).await;
+					let _ = commit.await;
+					return Err(error);
+				},
+			};
+			match frame.frame {
+				Some(pb::put_artifact_request::Frame::Data(data)) => {
+					tx.send(ArtifactUploadFrame::Chunk(data))
+						.await
+						.map_err(|_| Status::cancelled("artifact writer stopped"))?;
+				},
+				_ => {
+					let _ = tx.send(ArtifactUploadFrame::Abort).await;
+					let _ = commit.await;
+					return Err(status_from(&ApiError::invalid(
+						"artifact upload frames after the header must contain data",
+					)));
+				},
 			}
-		})?;
+		}
+		let record = commit
+			.await
+			.map_err(|error| status_from(&join_error(error)))?
+			.map_err(|error| {
+				if error.message.contains("digest mismatch") || error.message.contains("size mismatch")
+				{
+					status_from(&ApiError::function("checksum", error.message))
+				} else {
+					status_from(&ApiError::from(error))
+				}
+			})?;
 		Ok(Response::new(record))
 	}
-
-	type GetStream = BoxStream<pb::ArtifactChunk>;
 
 	async fn get(
 		&self,
@@ -719,9 +766,7 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 			.map_err(|error| status_from(&join_error(error)))?
 			.map_err(|error| status_from(&ApiError::from(error)))?;
 		let mut offset = 0_u64;
-		if let Some(pb::get_artifact_request::RangePresence::Range(range)) =
-			request.range_presence
-		{
+		if let Some(pb::get_artifact_request::RangePresence::Range(range)) = request.range_presence {
 			let start = usize::try_from(range.offset)
 				.map_err(|_| status_from(&ApiError::invalid("artifact range is out of bounds")))?;
 			let length = usize::try_from(range.length)
@@ -736,15 +781,17 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 		let (tx, rx) = mpsc::channel(8);
 		tokio::spawn(async move {
 			if bytes.is_empty() {
-				let _ = tx.send(Ok(pb::ArtifactChunk { offset, data: Vec::new(), eof: true })).await;
+				let _ = tx
+					.send(Ok(pb::ArtifactChunk { offset, data: Vec::new(), eof: true }))
+					.await;
 				return;
 			}
 			let chunk_count = bytes.len().div_ceil(64 * 1024);
 			for (index, data) in bytes.chunks(64 * 1024).enumerate() {
 				let frame = pb::ArtifactChunk {
 					offset: offset + (index * 64 * 1024) as u64,
-					data: data.to_vec(),
-					eof: index + 1 == chunk_count,
+					data:   data.to_vec(),
+					eof:    index + 1 == chunk_count,
 				};
 				if tx.send(Ok(frame)).await.is_err() {
 					break;
@@ -760,16 +807,17 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 	) -> Result<Response<pb::ArtifactRecord>, Status> {
 		let reference = request.into_inner();
 		let (_, digest) = artifact_digest(Some(&reference))?;
-		let (size, media_type, created_at, _expires_at, _path) = self
+		let (size, media_type, created_at, expires_at, _path) = self
 			.function_call(move |domain| domain.store().stat_artifact(&digest))
 			.await?;
 		Ok(Response::new(pb::ArtifactRecord {
 			r#ref: Some(reference),
 			size_bytes: size,
 			stored_size_bytes: size,
-			media_type_presence: media_type
-				.map(pb::artifact_record::MediaTypePresence::MediaType),
+			media_type_presence: media_type.map(pb::artifact_record::MediaTypePresence::MediaType),
 			created_at_unix_millis: created_at,
+			expires_at_unix_millis_presence: expires_at
+				.map(pb::artifact_record::ExpiresAtUnixMillisPresence::ExpiresAtUnixMillis),
 		}))
 	}
 }
@@ -783,17 +831,35 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		let request = request.into_inner();
 		let revision = self
 			.function_call(move |domain| {
-				let spec = request
+				let mut spec = request
 					.spec
-					.as_ref()
+					.clone()
 					.ok_or_else(|| crate::EngineError::invalid("function spec is required"))?;
-				let revision =
-					domain.store().register_function(spec, &request.request_id, function_now_millis())?;
+				let architecture = spec
+					.resources
+					.as_ref()
+					.and_then(|resources| pb::CpuArchitecture::try_from(resources.architecture).ok())
+					.unwrap_or(pb::CpuArchitecture::Unspecified);
+				let image = spec
+					.image
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("function image is required"))?;
+				spec.image = Some(domain.realize_image(image, architecture)?);
+				let revision = domain.store().register_function(
+					&spec,
+					&request.request_id,
+					function_now_millis(),
+				)?;
+				let revision_id = revision
+					.r#ref
+					.as_ref()
+					.map(|reference| reference.revision_id.clone())
+					.ok_or_else(|| crate::EngineError::engine("registered revision has no identity"))?;
 				for material in request.transient_secrets {
 					let secret = material.secret.ok_or_else(|| {
 						crate::EngineError::invalid("transient secret reference is required")
 					})?;
-					domain.set_secret(secret.name, material.value);
+					domain.set_secret(revision_id.clone(), &secret, material.value);
 				}
 				Ok(revision)
 			})
@@ -807,14 +873,16 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 	) -> Result<Response<pb::FunctionRevision>, Status> {
 		let request = request.into_inner();
 		let revision = self
-			.function_call(move |domain| match request.function.and_then(|selector| selector.selection) {
-				Some(pb::function_selector::Selection::Current(function)) => {
-					domain.store().get_active_revision(&function)
-				},
-				Some(pb::function_selector::Selection::Pinned(revision)) => {
-					domain.store().get_revision(&revision.revision_id)
-				},
-				None => Err(crate::EngineError::invalid("function selector is required")),
+			.function_call(move |domain| {
+				match request.function.and_then(|selector| selector.selection) {
+					Some(pb::function_selector::Selection::Current(function)) => {
+						domain.store().get_active_revision(&function)
+					},
+					Some(pb::function_selector::Selection::Pinned(revision)) => {
+						domain.store().get_revision(&revision.revision_id)
+					},
+					None => Err(crate::EngineError::invalid("function selector is required")),
+				}
 			})
 			.await?;
 		Ok(Response::new(revision))
@@ -827,11 +895,16 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		let request = request.into_inner();
 		let page = self
 			.function_call(move |domain| {
-				let namespace = request.namespace_presence.as_ref().map(|presence| match presence {
-					pb::list_functions_request::NamespacePresence::Namespace(value) => value.as_str(),
-				});
+				let namespace = request
+					.namespace_presence
+					.as_ref()
+					.map(|presence| match presence {
+						pb::list_functions_request::NamespacePresence::Namespace(value) => value.as_str(),
+					});
 				let mut page =
-					domain.store().list_revisions(namespace, request.page_size, &request.page_token)?;
+					domain
+						.store()
+						.list_revisions(namespace, request.page_size, &request.page_token)?;
 				if let Some(pb::list_functions_request::FunctionPresence::Function(function)) =
 					request.function_presence
 				{
@@ -847,7 +920,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 			})
 			.await?;
 		Ok(Response::new(pb::ListFunctionsResponse {
-			revisions: page.items,
+			revisions:       page.items,
 			next_page_token: page.next_page_token,
 		}))
 	}
@@ -863,12 +936,18 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 					.revision
 					.as_ref()
 					.ok_or_else(|| crate::EngineError::invalid("revision is required"))?;
-				let expected = request.expected_current_presence.as_ref().map(|presence| match presence {
-					pb::activate_function_request::ExpectedCurrentPresence::ExpectedCurrent(value) => {
-						value
-					},
-				});
-				domain.store().activate_function(revision, expected, function_now_millis())
+				let expected =
+					request
+						.expected_current_presence
+						.as_ref()
+						.map(|presence| match presence {
+							pb::activate_function_request::ExpectedCurrentPresence::ExpectedCurrent(
+								value,
+							) => value,
+						});
+				domain
+					.store()
+					.activate_function(revision, expected, function_now_millis())
 			})
 			.await?;
 		Ok(Response::new(record))
@@ -879,14 +958,15 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		request: Request<pb::DeleteFunctionRequest>,
 	) -> Result<Response<pb::Ok>, Status> {
 		let request = request.into_inner();
-		self.function_call(move |domain| {
-			let revision = request
-				.revision
-				.as_ref()
-				.ok_or_else(|| crate::EngineError::invalid("revision is required"))?;
-			domain.store().delete_revision(revision)
-		})
-		.await?;
+		self
+			.function_call(move |domain| {
+				let revision = request
+					.revision
+					.as_ref()
+					.ok_or_else(|| crate::EngineError::invalid("revision is required"))?;
+				domain.store().delete_revision(revision)
+			})
+			.await?;
 		Ok(Response::new(pb::Ok {}))
 	}
 
@@ -896,9 +976,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 	) -> Result<Response<pb::AppRevision>, Status> {
 		let request = request.into_inner();
 		let revision = self
-			.function_call(move |domain| {
-				domain.store().activate_app(&request, function_now_millis())
-			})
+			.function_call(move |domain| domain.store().activate_app(&request, function_now_millis()))
 			.await?;
 		Ok(Response::new(revision))
 	}
@@ -910,9 +988,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		let request = request.into_inner();
 		let revision = self
 			.function_call(move |domain| match request.app.and_then(|selector| selector.selection) {
-				Some(pb::app_selector::Selection::Current(app)) => {
-					domain.store().get_active_app(&app)
-				},
+				Some(pb::app_selector::Selection::Current(app)) => domain.store().get_active_app(&app),
 				Some(pb::app_selector::Selection::Pinned(revision)) => {
 					domain.store().get_app_revision(&revision.revision_id)
 				},
@@ -928,9 +1004,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 	) -> Result<Response<pb::AppRevision>, Status> {
 		let request = request.into_inner();
 		let revision = self
-			.function_call(move |domain| {
-				domain.store().rollback_app(&request, function_now_millis())
-			})
+			.function_call(move |domain| domain.store().rollback_app(&request, function_now_millis()))
 			.await?;
 		Ok(Response::new(revision))
 	}
@@ -970,7 +1044,7 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 			.function_call(move |domain| domain.store().list_schedules(&request))
 			.await?;
 		Ok(Response::new(pb::ListSchedulesResponse {
-			schedules: page.items,
+			schedules:       page.items,
 			next_page_token: page.next_page_token,
 		}))
 	}
@@ -980,7 +1054,8 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 		request: Request<pb::ScheduleRef>,
 	) -> Result<Response<pb::Ok>, Status> {
 		let reference = request.into_inner();
-		self.function_call(move |domain| domain.store().delete_schedule(&reference.schedule_id))
+		self
+			.function_call(move |domain| domain.store().delete_schedule(&reference.schedule_id))
 			.await?;
 		Ok(Response::new(pb::Ok {}))
 	}
@@ -988,6 +1063,9 @@ impl pb::function_service_server::FunctionService for GrpcApi {
 
 #[tonic::async_trait]
 impl pb::call_service_server::CallService for GrpcApi {
+	type StreamInputsStream = BoxStream<pb::StreamCallInputsResponse>;
+	type WatchStream = BoxStream<pb::CallEvent>;
+
 	async fn create(
 		&self,
 		request: Request<pb::CreateCallRequest>,
@@ -995,15 +1073,15 @@ impl pb::call_service_server::CallService for GrpcApi {
 		let request = request.into_inner();
 		let record = self
 			.function_call(move |domain| {
-				let record = domain.store().create_call(&request, function_now_millis())?;
+				let record = domain
+					.store()
+					.create_call(&request, function_now_millis())?;
 				domain.notify_work();
 				Ok(record)
 			})
 			.await?;
 		Ok(Response::new(record))
 	}
-
-	type StreamInputsStream = BoxStream<pb::StreamCallInputsResponse>;
 
 	async fn stream_inputs(
 		&self,
@@ -1033,9 +1111,9 @@ impl pb::call_service_server::CallService for GrpcApi {
 			.await?;
 		let (tx, rx) = mpsc::channel(INPUT_WINDOW as usize);
 		tx.send(Ok(pb::StreamCallInputsResponse {
-			call: Some(call.clone()),
-			committed_input_count: committed,
-			last_input_presence: None,
+			call:                   Some(call.clone()),
+			committed_input_count:  committed,
+			last_input_presence:    None,
 			max_inputs_outstanding: INPUT_WINDOW,
 		}))
 		.await
@@ -1062,15 +1140,15 @@ impl pb::call_service_server::CallService for GrpcApi {
 						break;
 					},
 				};
-				let input_ref = pb::InputRef {
-					input_id: input.input_id.clone(),
-					input_index: input.index,
-				};
+				let input_ref =
+					pb::InputRef { input_id: input.input_id.clone(), input_index: input.index };
 				let call_id = call.call_id.clone();
 				let commit_domain = domain.clone();
 				let result = tokio::task::spawn_blocking(move || {
 					let committed =
-						commit_domain.store().append_input(&call_id, &input, function_now_millis())?;
+						commit_domain
+							.store()
+							.append_input(&call_id, &input, function_now_millis())?;
 					commit_domain.notify_work();
 					Ok::<_, crate::EngineError>(committed)
 				})
@@ -1088,9 +1166,9 @@ impl pb::call_service_server::CallService for GrpcApi {
 				};
 				if tx
 					.send(Ok(pb::StreamCallInputsResponse {
-						call: Some(call.clone()),
-						committed_input_count: committed,
-						last_input_presence: Some(
+						call:                   Some(call.clone()),
+						committed_input_count:  committed,
+						last_input_presence:    Some(
 							pb::stream_call_inputs_response::LastInputPresence::LastInput(input_ref),
 						),
 						max_inputs_outstanding: INPUT_WINDOW,
@@ -1128,10 +1206,7 @@ impl pb::call_service_server::CallService for GrpcApi {
 		Ok(Response::new(record))
 	}
 
-	async fn get(
-		&self,
-		request: Request<pb::CallRef>,
-	) -> Result<Response<pb::CallRecord>, Status> {
+	async fn get(&self, request: Request<pb::CallRef>) -> Result<Response<pb::CallRecord>, Status> {
 		let call = request.into_inner();
 		let record = self
 			.function_call(move |domain| domain.store().get_call(&call.call_id))
@@ -1148,7 +1223,7 @@ impl pb::call_service_server::CallService for GrpcApi {
 			.function_call(move |domain| domain.store().list_calls(&request))
 			.await?;
 		Ok(Response::new(pb::ListCallsResponse {
-			calls: page.items,
+			calls:           page.items,
 			next_page_token: page.next_page_token,
 		}))
 	}
@@ -1181,7 +1256,11 @@ impl pb::call_service_server::CallService for GrpcApi {
 		let call = cursor
 			.call
 			.ok_or_else(|| status_from(&ApiError::invalid("cursor call is required")))?;
-		let page_size = if request.page_size == 0 { 100 } else { request.page_size.min(1000) };
+		let page_size = if request.page_size == 0 {
+			100
+		} else {
+			request.page_size.min(1000)
+		};
 		let call_id = call.call_id.clone();
 		let after = cursor.after_sequence;
 		let (results, end) = self
@@ -1195,15 +1274,10 @@ impl pb::call_service_server::CallService for GrpcApi {
 		let after_sequence = results.last().map_or(after, |result| result.sequence);
 		Ok(Response::new(pb::ListCallResultsResponse {
 			results,
-			next_cursor: Some(pb::ResultCursor {
-				call: Some(call),
-				after_sequence,
-			}),
+			next_cursor: Some(pb::ResultCursor { call: Some(call), after_sequence }),
 			end,
 		}))
 	}
-
-	type WatchStream = BoxStream<pb::CallEvent>;
 
 	async fn watch(
 		&self,
@@ -1229,23 +1303,27 @@ impl pb::call_service_server::CallService for GrpcApi {
 			let events = self
 				.function_call({
 					let call_id = call.call_id.clone();
-					move |domain| domain.store().events_after(&call_id, cursor.after_sequence, 10_000)
+					move |domain| {
+						domain
+							.store()
+							.events_after(&call_id, cursor.after_sequence, 10_000)
+					}
 				})
 				.await?;
-			return Ok(Response::new(Box::pin(tokio_stream::iter(
-				events.into_iter().map(Ok),
-			))));
+			return Ok(Response::new(Box::pin(tokio_stream::iter(events.into_iter().map(Ok)))));
 		}
 		if terminal_call_status(current.status) {
 			let events = self
 				.function_call({
 					let call_id = call.call_id.clone();
-					move |domain| domain.store().events_after(&call_id, cursor.after_sequence, 10_000)
+					move |domain| {
+						domain
+							.store()
+							.events_after(&call_id, cursor.after_sequence, 10_000)
+					}
 				})
 				.await?;
-			return Ok(Response::new(Box::pin(tokio_stream::iter(
-				events.into_iter().map(Ok),
-			))));
+			return Ok(Response::new(Box::pin(tokio_stream::iter(events.into_iter().map(Ok)))));
 		}
 		let mut watch = self
 			.state
@@ -1370,12 +1448,10 @@ impl pb::actor_service_server::ActorService for GrpcApi {
 		Ok(Response::new(actor))
 	}
 
-	async fn delete(
-		&self,
-		request: Request<pb::ActorRef>,
-	) -> Result<Response<pb::Ok>, Status> {
+	async fn delete(&self, request: Request<pb::ActorRef>) -> Result<Response<pb::Ok>, Status> {
 		let actor = request.into_inner();
-		self.state
+		self
+			.state
 			.functions
 			.delete_actor(&actor.actor_id)
 			.await
@@ -1982,7 +2058,6 @@ mod tests {
 		}
 	}
 
-
 	#[test]
 	fn function_errors_have_stable_grpc_codes_and_metadata() {
 		for (stable, expected) in [
@@ -1992,11 +2067,13 @@ mod tests {
 			("conflict", Code::Aborted),
 			("deadline", Code::DeadlineExceeded),
 		] {
-			let status =
-				status_from(&ApiError::new(axum::http::StatusCode::CONFLICT, stable, "boom"));
+			let status = status_from(&ApiError::new(axum::http::StatusCode::CONFLICT, stable, "boom"));
 			assert_eq!(status.code(), expected, "{stable}");
 			assert_eq!(
-				status.metadata().get("vmon-code").and_then(|value| value.to_str().ok()),
+				status
+					.metadata()
+					.get("vmon-code")
+					.and_then(|value| value.to_str().ok()),
 				Some(stable)
 			);
 		}

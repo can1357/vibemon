@@ -63,8 +63,8 @@ async fn run_listeners(
 	let server_uid = current_uid();
 	let uds_listener = UdsPeerListener::new(uds, server_uid);
 	let functions = FunctionDomain::open(home.clone(), engine.clone())?;
-	let base_state =
-		ApiState::new(engine, functions.clone(), config.clone(), Transport::Unix).with_mesh(mesh.clone());
+	let base_state = ApiState::new(engine, functions.clone(), config.clone(), Transport::Unix)
+		.with_mesh(mesh.clone());
 	let uds_router = routes::router(base_state.with_transport(Transport::Unix));
 	let (shutdown_tx, _) = broadcast::channel::<()>(4);
 	let signal_tx = shutdown_tx.clone();

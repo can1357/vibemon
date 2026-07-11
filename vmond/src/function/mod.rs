@@ -8,42 +8,44 @@
 pub mod actor;
 pub mod artifact;
 pub mod gateway;
+pub mod image;
 pub mod metrics;
 pub mod protocol;
 pub mod scheduler;
 pub mod store;
 pub mod worker;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+	collections::{HashMap, HashSet},
+	sync::Arc,
+	time::{Duration, UNIX_EPOCH},
+};
 
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use vmon_proto::v1 as pb;
 
-use crate::engine::EngineApi;
-use crate::home::Home;
-use crate::{EngineError, Result};
-
-use self::actor::ActorManager;
-use self::artifact::ArtifactStore;
-use self::metrics::{FunctionMetrics, MetricsSnapshot, ReproducibilityDescription};
-use self::scheduler::{PoolPolicy, SchedulerControl, WorkerPool};
-use self::store::{LeasedInput, Store};
-use self::worker::{
-	ActorOperation, ActorRequest, AttemptStats as WorkerAttemptStats, BatchExecuteRequest,
-	BatchExecution, BatchWorkerEvent, EngineExecutor, ExecuteRequest, ExecutionMode, Executor,
-	SecretValues, ServiceDispatch, Worker, WorkerError, WorkerEvent, WorkerOutcome, WorkerSnapshot,
+use self::{
+	actor::ActorManager,
+	artifact::ArtifactStore,
+	metrics::{FunctionMetrics, MetricsSnapshot, ReproducibilityDescription},
+	scheduler::{PoolPolicy, SchedulerControl, WorkerPool},
+	store::{LeasedInput, Store},
+	worker::{
+		ActorOperation, ActorRequest, AttemptStats as WorkerAttemptStats, BatchExecuteRequest,
+		BatchExecution, BatchWorkerEvent, EngineExecutor, ExecuteRequest, ExecutionMode, Executor,
+		SecretValues, ServiceDispatch, SnapshotProvenance, SnapshotReason, Worker, WorkerError,
+		WorkerEvent, WorkerOutcome, WorkerSnapshot,
+	},
 };
+use crate::{EngineError, Result, engine::EngineApi, home::Home};
 
 const EVENT_REPLAY_LIMIT: u32 = 10_000;
 const LEASE_MILLIS: u64 = 30_000;
 const GLOBAL_WORKER_LIMIT: usize = 64;
 
 struct ActiveExecution {
-	worker: Arc<dyn Worker>,
+	worker:     Arc<dyn Worker>,
 	request_id: String,
 }
 type SecretKey = (String, String, Option<String>);
@@ -51,8 +53,8 @@ type ActiveKey = (String, String);
 
 /// Replay plus live subscription returned by [`FunctionDomain::watch_call`].
 pub struct CallWatch {
-	replay: std::collections::VecDeque<pb::CallEvent>,
-	receiver: broadcast::Receiver<pb::CallEvent>,
+	replay:        std::collections::VecDeque<pb::CallEvent>,
+	receiver:      broadcast::Receiver<pb::CallEvent>,
 	last_sequence: u64,
 }
 
@@ -76,25 +78,26 @@ impl CallWatch {
 
 /// Shared ownership root for the durable function runtime.
 pub struct FunctionDomain {
-	home: Home,
-	store: Arc<Store>,
+	home:      Home,
+	store:     Arc<Store>,
 	artifacts: ArtifactStore,
-	executor: Arc<dyn Executor>,
-	actors: ActorManager,
-	metrics: Arc<FunctionMetrics>,
-	secrets: RwLock<HashMap<SecretKey, Vec<u8>>>,
+	executor:  Arc<dyn Executor>,
+	actors:    ActorManager,
+	metrics:   Arc<FunctionMetrics>,
+	secrets:   RwLock<HashMap<SecretKey, Vec<u8>>>,
 	snapshots: RwLock<HashMap<String, WorkerSnapshot>>,
-	watchers: Mutex<HashMap<String, broadcast::Sender<pb::CallEvent>>>,
-	pools: Mutex<HashMap<String, WorkerPool>>,
-	workers: Mutex<HashMap<String, Arc<dyn Worker>>>,
-	active: Mutex<HashMap<ActiveKey, ActiveExecution>>,
-	control: Arc<SchedulerControl>,
-	shutdown: broadcast::Sender<()>,
-	tasks: Mutex<Vec<JoinHandle<()>>>,
+	watchers:  Mutex<HashMap<String, broadcast::Sender<pb::CallEvent>>>,
+	pools:     Mutex<HashMap<String, WorkerPool>>,
+	workers:   Mutex<HashMap<String, Arc<dyn Worker>>>,
+	active:    Mutex<HashMap<ActiveKey, ActiveExecution>>,
+	control:   Arc<SchedulerControl>,
+	shutdown:  broadcast::Sender<()>,
+	tasks:     Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl FunctionDomain {
-	/// Open durable state and start lease-recovery, scheduler, schedule, and GC tasks.
+	/// Open durable state and start lease-recovery, scheduler, schedule, and GC
+	/// tasks.
 	pub fn open(home: Home, engine: Arc<dyn EngineApi>) -> Result<Arc<Self>> {
 		let _runtime = tokio::runtime::Handle::try_current()
 			.map_err(|_| EngineError::engine("FunctionDomain::open requires a Tokio runtime"))?;
@@ -123,6 +126,8 @@ impl FunctionDomain {
 			shutdown,
 			tasks: Mutex::new(Vec::new()),
 		});
+		domain.refresh_all_revision_availability()?;
+		domain.reload_function_snapshots()?;
 		domain.start_background_tasks();
 		Ok(domain)
 	}
@@ -153,6 +158,16 @@ impl FunctionDomain {
 		Ok(metrics::describe_reproducibility(&revision))
 	}
 
+	/// Resolve and verify an image at registration time, returning its pinned
+	/// spec.
+	pub fn realize_image(
+		&self,
+		spec: &pb::ImageSpec,
+		architecture: pb::CpuArchitecture,
+	) -> Result<pb::ImageSpec> {
+		Ok(image::realize(&self.home, spec, architecture)?.resolved_spec)
+	}
+
 	/// Wake the scheduler after a transaction creates or requeues work.
 	pub fn notify_work(&self) {
 		self.control.notify.notify_one();
@@ -162,31 +177,198 @@ impl FunctionDomain {
 	///
 	/// The bytes are keyed by revision, name, and optional provider version,
 	/// never passed to the store, and overwritten in memory on replacement.
-	pub fn set_secret(&self, revision_id: impl Into<String>, secret: &pb::SecretRef, value: Vec<u8>) {
-		let key = (revision_id.into(), secret.name.clone(), secret_version(secret));
+	pub fn set_secret(
+		&self,
+		revision_id: impl Into<String>,
+		secret: &pb::SecretRef,
+		value: Vec<u8>,
+	) {
+		let revision_id = revision_id.into();
+		let key = (revision_id.clone(), secret.name.clone(), secret_version(secret));
 		if let Some(mut old) = self.secrets.write().insert(key, value) {
 			old.fill(0);
+		}
+		if let Err(error) = self.refresh_revision_availability(&revision_id) {
+			tracing::warn!(%error, %revision_id, "revision availability refresh failed");
 		}
 	}
 
 	/// Remove all transient secret bytes from memory.
 	pub fn clear_secrets(&self) {
-		let mut secrets = self.secrets.write();
-		for value in secrets.values_mut() {
-			value.fill(0);
+		{
+			let mut secrets = self.secrets.write();
+			for value in secrets.values_mut() {
+				value.fill(0);
+			}
+			secrets.clear();
 		}
-		secrets.clear();
+		if let Err(error) = self.refresh_all_revision_availability() {
+			tracing::warn!(%error, "revision availability refresh failed after clearing secrets");
+		}
 	}
 
-	/// Record a reusable snapshot after its engine snapshot and provenance exist.
+	/// Recompute one revision's persisted availability from the memory-only
+	/// registry.
+	pub fn refresh_revision_availability(&self, revision_id: &str) -> Result<pb::FunctionRevision> {
+		let revision = self.store.get_revision(revision_id)?;
+		let registry = self.secrets.read();
+		let unavailable = revision
+			.spec
+			.as_ref()
+			.map(|spec| {
+				spec
+					.secrets
+					.iter()
+					.filter(|secret| {
+						let key = (revision_id.to_owned(), secret.name.clone(), secret_version(secret));
+						!registry.contains_key(&key)
+					})
+					.cloned()
+					.collect()
+			})
+			.unwrap_or_default();
+		drop(registry);
+		self
+			.store
+			.set_revision_availability(revision_id, unavailable)
+	}
+
+	fn refresh_all_revision_availability(&self) -> Result<()> {
+		let mut page_token = String::new();
+		loop {
+			let page = self.store.list_revisions(None, 1_000, &page_token)?;
+			for revision in page.items {
+				if let Some(revision_id) = revision
+					.r#ref
+					.as_ref()
+					.map(|reference| reference.revision_id.as_str())
+				{
+					self.refresh_revision_availability(revision_id)?;
+				}
+			}
+			if page.next_page_token.is_empty() {
+				return Ok(());
+			}
+			page_token = page.next_page_token;
+		}
+	}
+
+	/// Record a reusable snapshot after its engine snapshot and provenance
+	/// exist.
 	pub fn record_snapshot(&self, snapshot: WorkerSnapshot) {
-		self.snapshots.write().insert(snapshot.provenance.revision_id.clone(), snapshot);
+		self
+			.snapshots
+			.write()
+			.insert(snapshot.provenance.revision_id.clone(), snapshot);
+	}
+
+	/// Persist a captured worker snapshot and attach its verified record to the
+	/// revision.
+	pub fn persist_snapshot(
+		&self,
+		snapshot: WorkerSnapshot,
+		revision: &pb::FunctionRevision,
+	) -> Result<pb::FunctionSnapshotRecord> {
+		if !snapshot.provenance.matches(revision) {
+			return Err(EngineError::invalid("snapshot provenance does not match revision"));
+		}
+		if revision
+			.spec
+			.as_ref()
+			.is_some_and(|spec| !spec.secrets.is_empty())
+		{
+			return Err(EngineError::unsupported(
+				"snapshots with transient secret material are unsupported",
+			));
+		}
+		let artifact = self.artifacts.put(snapshot.engine_snapshot.as_bytes())?;
+		self.store.record_artifact(
+			&artifact.digest,
+			artifact.size,
+			Some("application/vnd.vmon.engine-snapshot-name"),
+			artifact
+				.path
+				.to_str()
+				.ok_or_else(|| EngineError::engine("snapshot artifact path is not UTF-8"))?,
+			snapshot.created_at_unix_millis,
+			None,
+		)?;
+		let artifact_ref = pb::ArtifactRef {
+			digest: Some(pb::Digest {
+				algorithm: pb::DigestAlgorithm::Sha256 as i32,
+				value:     hex::decode(&artifact.digest)
+					.map_err(|error| EngineError::engine(error.to_string()))?,
+			}),
+		};
+		let snapshot_id =
+			format!("{}:{}", snapshot.provenance.revision_id, snapshot.created_at_unix_millis);
+		let record = snapshot.to_record(snapshot_id, artifact_ref);
+		let record = self.store.put_function_snapshot(&record)?;
+		self.record_snapshot(snapshot);
+		Ok(record)
+	}
+
+	fn reload_function_snapshots(&self) -> Result<()> {
+		let mut page_token = String::new();
+		loop {
+			let page = self.store.list_revisions(None, 1_000, &page_token)?;
+			for revision in page.items {
+				let record = match revision.snapshot_presence.as_ref() {
+					Some(pb::function_revision::SnapshotPresence::Snapshot(record)) => record,
+					None => continue,
+				};
+				let expected = SnapshotProvenance::for_revision(&revision)
+					.map_err(|error| EngineError::engine(error.to_string()))?;
+				if record.revision.as_ref() != revision.r#ref.as_ref()
+					|| record.protocol_version != expected.runner_protocol as u32
+					|| record
+						.runner_digest
+						.as_ref()
+						.map(|digest| digest.value.as_slice())
+						!= Some(expected.runner_digest.as_slice())
+					|| record
+						.image_digest
+						.as_ref()
+						.map(|digest| digest.value.as_slice())
+						!= Some(expected.image_digest.as_slice())
+					|| record
+						.package_digest
+						.as_ref()
+						.map(|digest| digest.value.as_slice())
+						!= Some(expected.package_digest.as_slice())
+				{
+					return Err(EngineError::engine(format!(
+						"snapshot provenance mismatch for revision {}",
+						expected.revision_id
+					)));
+				}
+				let digest = record
+					.artifact
+					.as_ref()
+					.and_then(|artifact| artifact.digest.as_ref())
+					.ok_or_else(|| EngineError::engine("snapshot record missing artifact digest"))?;
+				let bytes = self.artifacts.read(&hex::encode(&digest.value), None)?;
+				let engine_snapshot =
+					String::from_utf8(bytes).map_err(|error| EngineError::engine(error.to_string()))?;
+				self.record_snapshot(WorkerSnapshot {
+					engine_snapshot,
+					provenance: expected,
+					reason: SnapshotReason::PostInitialize,
+					created_at_unix_millis: record.created_at_unix_millis,
+				});
+			}
+			if page.next_page_token.is_empty() {
+				return Ok(());
+			}
+			page_token = page.next_page_token;
+		}
 	}
 
 	/// Return a reusable snapshot only for the exact immutable revision.
 	pub fn snapshot_for(&self, revision: &pb::FunctionRevision) -> Option<WorkerSnapshot> {
 		let revision_id = revision.r#ref.as_ref()?.revision_id.as_str();
-		self.snapshots
+		self
+			.snapshots
 			.read()
 			.get(revision_id)
 			.filter(|snapshot| snapshot.provenance.matches(revision))
@@ -205,7 +387,11 @@ impl FunctionDomain {
 			.as_ref()
 			.map(|reference| reference.revision_id.as_str())
 			.ok_or_else(|| EngineError::invalid("revision id is required"))?;
-		let required = revision.spec.as_ref().map(|spec| spec.secrets.as_slice()).unwrap_or_default();
+		let required = revision
+			.spec
+			.as_ref()
+			.map(|spec| spec.secrets.as_slice())
+			.unwrap_or_default();
 		let registry = self.secrets.read();
 		let mut values = SecretValues::new();
 		for secret in required {
@@ -218,15 +404,32 @@ impl FunctionDomain {
 		Ok(values)
 	}
 
-	/// Subscribe before replaying durable events, eliminating the reconnect race.
+	/// Subscribe before replaying durable events, eliminating the reconnect
+	/// race.
 	pub fn watch_call(&self, call_id: &str, after_sequence: u64) -> Result<CallWatch> {
 		let receiver = self.subscribe_call(call_id);
-		let replay = self.store.events_after(call_id, after_sequence, EVENT_REPLAY_LIMIT)?;
-		Ok(CallWatch {
-			replay: replay.into(),
-			receiver,
-			last_sequence: after_sequence,
-		})
+		let frontier = self.store.event_frontier(call_id)?;
+		let mut cursor = after_sequence;
+		let mut replay = std::collections::VecDeque::new();
+		while cursor < frontier {
+			let page = self
+				.store
+				.events_after(call_id, cursor, EVENT_REPLAY_LIMIT)?;
+			let previous = cursor;
+			for event in page
+				.into_iter()
+				.take_while(|event| event.sequence <= frontier)
+			{
+				cursor = event.sequence;
+				replay.push_back(event);
+			}
+			if cursor == previous {
+				return Err(EngineError::engine(format!(
+					"call {call_id} event replay did not reach subscribed frontier {frontier}"
+				)));
+			}
+		}
+		Ok(CallWatch { replay, receiver, last_sequence: after_sequence })
 	}
 
 	/// Subscribe to newly published events for one call.
@@ -240,7 +443,9 @@ impl FunctionDomain {
 
 	/// Publish an event after its store transaction commits.
 	pub fn publish_call_event(&self, event: pb::CallEvent) {
-		let Some(call_id) = event.call.as_ref().map(|call| call.call_id.clone()) else { return };
+		let Some(call_id) = event.call.as_ref().map(|call| call.call_id.clone()) else {
+			return;
+		};
 		let mut watchers = self.watchers.lock();
 		if let Some(sender) = watchers.get(&call_id) {
 			let _ = sender.send(event);
@@ -259,23 +464,28 @@ impl FunctionDomain {
 				for event in events {
 					self.publish_call_event(event);
 				}
-			}
+			},
 			Err(error) => tracing::warn!(%error, %call_id, "call event publication failed"),
 		}
 	}
 
-	/// Create or replace a typed schedule with its first durable firing frontier.
-	pub fn create_schedule(&self, request: &pb::CreateScheduleRequest, now_ms: u64) -> Result<pb::ScheduleRecord> {
+	/// Create or replace a typed schedule with its first durable firing
+	/// frontier.
+	pub fn create_schedule(
+		&self,
+		request: &pb::CreateScheduleRequest,
+		now_ms: u64,
+	) -> Result<pb::ScheduleRecord> {
 		let spec = request
 			.spec
 			.clone()
 			.ok_or_else(|| EngineError::invalid("schedule spec is required"))?;
 		let provisional = pb::ScheduleRecord {
-			r#ref: None,
-			spec: Some(spec),
+			r#ref:                  None,
+			spec:                   Some(spec),
 			created_at_unix_millis: now_ms,
 			updated_at_unix_millis: now_ms,
-			next_run_presence: None,
+			next_run_presence:      None,
 		};
 		let next_run = store::next_schedule_run(&provisional, now_ms)?;
 		let schedule = self.store.put_schedule(request, next_run, now_ms)?;
@@ -298,19 +508,30 @@ impl FunctionDomain {
 			if status == pb::ActorStatus::Ready && self.actors.acquire(&actor_id).await.is_ok() {
 				return Ok(actor);
 			}
-			let checkpoint_id = actor.latest_checkpoint_presence.as_ref().map(|presence| match presence {
-				pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint) => {
-					checkpoint.checkpoint_id.clone()
-				}
-			});
+			let checkpoint_id =
+				actor
+					.latest_checkpoint_presence
+					.as_ref()
+					.map(|presence| match presence {
+						pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint) => {
+							checkpoint.checkpoint_id.clone()
+						},
+					});
 			if matches!(status, pb::ActorStatus::Ready | pb::ActorStatus::Stopped) {
 				if let Some(checkpoint_id) = checkpoint_id {
 					return self
-						.restore_actor_checkpoint(&actor_id, &checkpoint_id, &format!("recover:{}", request.request_id))
+						.restore_actor_checkpoint(
+							&actor_id,
+							&checkpoint_id,
+							&format!("recover:{}", request.request_id),
+						)
 						.await;
 				}
 			}
-			let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
+			let _ =
+				self
+					.store
+					.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
 			return Err(EngineError::not_running(format!(
 				"actor {actor_id} has no recoverable live state"
 			)));
@@ -323,25 +544,34 @@ impl FunctionDomain {
 		let secrets = match self.secrets_for(&revision) {
 			Ok(secrets) => secrets,
 			Err(error) => {
-				let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
+				let _ =
+					self
+						.store
+						.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
 				return Err(error);
-			}
+			},
 		};
 		let worker = match self.executor.spawn(revision, secrets).await {
 			Ok(worker) => worker,
 			Err(error) => {
-				let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
+				let _ =
+					self
+						.store
+						.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
 				return Err(EngineError::engine(error.to_string()));
-			}
+			},
 		};
-		let input = request.initial_payload.as_ref().map(|payload| match payload {
-			pb::create_actor_request::InitialPayload::InitialValue(value) => {
-				pb::call_input::Payload::Value(value.clone())
-			}
-			pb::create_actor_request::InitialPayload::InitialArguments(arguments) => {
-				pb::call_input::Payload::Arguments(arguments.clone())
-			}
-		});
+		let input = request
+			.initial_payload
+			.as_ref()
+			.map(|payload| match payload {
+				pb::create_actor_request::InitialPayload::InitialValue(value) => {
+					pb::call_input::Payload::Value(value.clone())
+				},
+				pb::create_actor_request::InitialPayload::InitialArguments(arguments) => {
+					pb::call_input::Payload::Arguments(arguments.clone())
+				},
+			});
 		let execution = worker
 			.actor(ActorRequest {
 				request_id: request.request_id.clone(),
@@ -353,21 +583,37 @@ impl FunctionDomain {
 			})
 			.await
 			.map_err(|error| EngineError::engine(error.to_string()))?;
-		match execution.completion.await.map_err(|error| EngineError::engine(error.to_string()))? {
+		match execution
+			.completion
+			.await
+			.map_err(|error| EngineError::engine(error.to_string()))?
+		{
 			WorkerOutcome::Success { .. } => {
 				self.actors.register(actor_id.clone(), None);
 				self.actors.pin(&actor_id, Arc::clone(&worker), None)?;
-				self.store.set_actor_status(&actor_id, pb::ActorStatus::Ready, Some(worker.id()), unix_millis())
-			}
+				self.store.set_actor_status(
+					&actor_id,
+					pb::ActorStatus::Ready,
+					Some(worker.id()),
+					unix_millis(),
+				)
+			},
 			outcome => {
-				let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
+				let _ =
+					self
+						.store
+						.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
 				Err(EngineError::engine(actor_outcome_message(&outcome)))
-			}
+			},
 		}
 	}
 
-	/// Capture and durably commit an immutable checkpoint from the pinned actor worker.
-	pub async fn checkpoint_actor(&self, request: &pb::CheckpointActorRequest) -> Result<pb::ActorCheckpoint> {
+	/// Capture and durably commit an immutable checkpoint from the pinned actor
+	/// worker.
+	pub async fn checkpoint_actor(
+		&self,
+		request: &pb::CheckpointActorRequest,
+	) -> Result<pb::ActorCheckpoint> {
 		let actor_id = request
 			.actor
 			.as_ref()
@@ -376,22 +622,38 @@ impl FunctionDomain {
 			.clone();
 		let actor = self.store.get_actor(&actor_id)?;
 		let permit = self.actors.acquire(&actor_id).await?;
+		let sequence = self
+			.store
+			.allocate_actor_operation(&actor_id, unix_millis())?;
 		let checkpoint_id = format!("{}:{}", actor_id, request.request_id);
-		let execution = permit
+		let execution = match permit
 			.worker()
 			.actor(ActorRequest {
 				request_id: request.request_id.clone(),
-				call_id: None,
-				actor_id: actor_id.clone(),
-				operation: ActorOperation::Checkpoint { checkpoint_id: checkpoint_id.clone() },
-				input: None,
-				deadline: None,
+				call_id:    None,
+				actor_id:   actor_id.clone(),
+				operation:  ActorOperation::Checkpoint { checkpoint_id: checkpoint_id.clone() },
+				input:      None,
+				deadline:   None,
 			})
 			.await
-			.map_err(|error| EngineError::engine(error.to_string()))?;
-		let state = match execution.completion.await.map_err(|error| EngineError::engine(error.to_string()))? {
-			WorkerOutcome::Success { value, .. } => value,
-			outcome => return Err(EngineError::engine(actor_outcome_message(&outcome))),
+		{
+			Ok(execution) => execution,
+			Err(error) => {
+				self.complete_actor_operation(&actor_id, sequence);
+				return Err(EngineError::engine(error.to_string()));
+			},
+		};
+		let state = match execution.completion.await {
+			Ok(WorkerOutcome::Success { value, .. }) => value,
+			Ok(outcome) => {
+				self.complete_actor_operation(&actor_id, sequence);
+				return Err(EngineError::engine(actor_outcome_message(&outcome)));
+			},
+			Err(error) => {
+				self.mark_actor_worker_lost(&actor_id);
+				return Err(EngineError::engine(error.to_string()));
+			},
 		};
 		let now = unix_millis();
 		let checkpoint = pb::ActorCheckpoint {
@@ -399,15 +661,20 @@ impl FunctionDomain {
 			actor: actor.r#ref,
 			function: actor.function,
 			state: Some(state),
-			sequence: now,
+			sequence,
 			created_at_unix_millis: now,
 		};
-		let checkpoint = self.store.put_checkpoint(&checkpoint, &request.request_id, now)?;
+		let persisted = self
+			.store
+			.put_checkpoint(&checkpoint, &request.request_id, now);
+		self.complete_actor_operation(&actor_id, sequence);
+		let checkpoint = persisted?;
 		self.actors.checkpoint_committed(&actor_id, checkpoint_id)?;
 		Ok(checkpoint)
 	}
 
-	/// Restore an actor only after its compatible checkpoint is loaded by a worker.
+	/// Restore an actor only after its compatible checkpoint is loaded by a
+	/// worker.
 	pub async fn restore_actor(&self, request: &pb::RestoreActorRequest) -> Result<pb::ActorRecord> {
 		let actor_id = request
 			.actor
@@ -421,20 +688,13 @@ impl FunctionDomain {
 			.ok_or_else(|| EngineError::invalid("checkpoint is required"))?
 			.checkpoint_id
 			.clone();
-		if let Ok(permit) = self.actors.acquire(&actor_id).await {
-			let old_worker = Arc::clone(permit.worker());
-			drop(permit);
-			let _ = old_worker.retire().await;
-			let _ = self.actors.worker_lost(&actor_id);
-		}
-		let restored = self.restore_actor_checkpoint(&actor_id, &checkpoint_id, &request.request_id).await;
-		if restored.is_err() {
-			let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
-		}
-		restored
+		self
+			.restore_actor_checkpoint(&actor_id, &checkpoint_id, &request.request_id)
+			.await
 	}
 
-	/// Fork a checkpoint into a new actor with an independent worker and checkpoint frontier.
+	/// Fork a checkpoint into a new actor with an independent worker and
+	/// checkpoint frontier.
 	pub async fn fork_actor(&self, request: &pb::ForkActorRequest) -> Result<pb::ActorRecord> {
 		let checkpoint_id = request
 			.checkpoint
@@ -442,32 +702,25 @@ impl FunctionDomain {
 			.ok_or_else(|| EngineError::invalid("checkpoint is required"))?
 			.checkpoint_id
 			.clone();
-		let checkpoint = self.store.get_checkpoint(&checkpoint_id)?;
-		let create = pb::CreateActorRequest {
-			function: checkpoint.function.clone(),
-			initial_payload: checkpoint
-				.state
-				.clone()
-				.map(pb::create_actor_request::InitialPayload::InitialValue),
-			request_id: request.request_id.clone(),
-			labels: request.labels.clone(),
-		};
-		let actor = self.create_actor(&create).await?;
+		let actor = self
+			.store
+			.fork_actor_from_checkpoint(request, unix_millis())?;
 		let actor_id = actor
 			.r#ref
 			.as_ref()
 			.ok_or_else(|| EngineError::engine("forked actor missing ref"))?
 			.actor_id
 			.clone();
-		if let Ok(permit) = self.actors.acquire(&actor_id).await {
-			let old_worker = Arc::clone(permit.worker());
-			drop(permit);
-			let _ = old_worker.retire().await;
-		}
-		self.restore_actor_checkpoint(&actor_id, &checkpoint_id, &request.request_id).await
+		self
+			.actors
+			.register(actor_id.clone(), Some(checkpoint_id.clone()));
+		self
+			.restore_actor_checkpoint(&actor_id, &checkpoint_id, &request.request_id)
+			.await
 	}
 
-	/// Durably delete an actor, retire its live worker, and remove its process-local pin.
+	/// Durably delete an actor, retire its live worker, and remove its
+	/// process-local pin.
 	pub async fn delete_actor(&self, actor_id: &str) -> Result<pb::ActorRecord> {
 		let deleted = self.store.delete_actor(actor_id, unix_millis())?;
 		if let Ok(permit) = self.actors.acquire(actor_id).await {
@@ -479,45 +732,89 @@ impl FunctionDomain {
 		Ok(deleted)
 	}
 
-	async fn restore_actor_checkpoint(&self, actor_id: &str, checkpoint_id: &str, request_id: &str) -> Result<pb::ActorRecord> {
+	async fn restore_actor_checkpoint(
+		&self,
+		actor_id: &str,
+		checkpoint_id: &str,
+		request_id: &str,
+	) -> Result<pb::ActorRecord> {
 		let checkpoint = self.store.get_checkpoint(checkpoint_id)?;
 		let actor = self.store.get_actor(actor_id)?;
 		if actor.function != checkpoint.function {
 			return Err(EngineError::invalid("checkpoint is incompatible with actor function"));
 		}
-		let function = actor.function.as_ref().ok_or_else(|| EngineError::engine("actor missing function"))?;
+		let function = actor
+			.function
+			.as_ref()
+			.ok_or_else(|| EngineError::engine("actor missing function"))?;
+		let old_permit = self.actors.acquire(actor_id).await.ok();
+		let old_worker = old_permit
+			.as_ref()
+			.map(|permit| Arc::clone(permit.worker()));
 		let revision = Arc::new(self.store.get_revision(&function.revision_id)?);
 		let worker = self
 			.executor
 			.spawn(Arc::clone(&revision), self.secrets_for(&revision)?)
 			.await
 			.map_err(|error| EngineError::engine(error.to_string()))?;
-		let state = checkpoint.state.clone().ok_or_else(|| EngineError::engine("checkpoint missing state"))?;
+		let state = checkpoint
+			.state
+			.clone()
+			.ok_or_else(|| EngineError::engine("checkpoint missing state"))?;
 		let execution = worker
 			.actor(ActorRequest {
 				request_id: request_id.to_owned(),
-				call_id: None,
-				actor_id: actor_id.to_owned(),
-				operation: ActorOperation::Restore { checkpoint_id: checkpoint_id.to_owned(), state },
-				input: None,
-				deadline: None,
+				call_id:    None,
+				actor_id:   actor_id.to_owned(),
+				operation:  ActorOperation::Restore { checkpoint_id: checkpoint_id.to_owned(), state },
+				input:      None,
+				deadline:   None,
 			})
 			.await
 			.map_err(|error| EngineError::engine(error.to_string()))?;
-		match execution.completion.await.map_err(|error| EngineError::engine(error.to_string()))? {
+		match execution
+			.completion
+			.await
+			.map_err(|error| EngineError::engine(error.to_string()))?
+		{
 			WorkerOutcome::Success { .. } => {
-				let restored = self.store.restore_actor(actor_id, checkpoint_id, request_id, unix_millis())?;
-				self.actors.register(actor_id.to_owned(), Some(checkpoint_id.to_owned()));
-				self.actors.pin(actor_id, worker, Some(checkpoint_id.to_owned()))?;
-				Ok(restored)
-			}
+				self
+					.store
+					.restore_actor(actor_id, checkpoint_id, request_id, unix_millis())?;
+				let worker_id = worker.id().to_owned();
+				self
+					.actors
+					.register(actor_id.to_owned(), Some(checkpoint_id.to_owned()));
+				self
+					.actors
+					.pin(actor_id, worker, Some(checkpoint_id.to_owned()))?;
+				let ready = self.store.set_actor_status_if(
+					actor_id,
+					pb::ActorStatus::Stopped,
+					pb::ActorStatus::Ready,
+					Some(&worker_id),
+					unix_millis(),
+				)?;
+				drop(old_permit);
+				if let Some(old_worker) = old_worker {
+					let _ = old_worker.retire().await;
+				}
+				Ok(ready)
+			},
 			outcome => Err(EngineError::engine(actor_outcome_message(&outcome))),
 		}
 	}
 
 	/// Persist a cancellation request before signaling an active worker.
-	pub async fn cancel_call(&self, call_id: &str, reason: &str, request_id: &str) -> Result<pb::CallRecord> {
-		let call = self.store.cancel_call(call_id, reason, request_id, unix_millis())?;
+	pub async fn cancel_call(
+		&self,
+		call_id: &str,
+		reason: &str,
+		request_id: &str,
+	) -> Result<pb::CallRecord> {
+		let call = self
+			.store
+			.cancel_call(call_id, reason, request_id, unix_millis())?;
 		let active = {
 			let executions = self.active.lock();
 			let mut seen = HashSet::new();
@@ -525,9 +822,9 @@ impl FunctionDomain {
 				.iter()
 				.filter(|((active_call_id, _), _)| active_call_id == call_id)
 				.filter_map(|(_, execution)| {
-					seen.insert(execution.request_id.clone()).then(|| {
-						(Arc::clone(&execution.worker), execution.request_id.clone())
-					})
+					seen
+						.insert(execution.request_id.clone())
+						.then(|| (Arc::clone(&execution.worker), execution.request_id.clone()))
 				})
 				.collect::<Vec<_>>()
 		};
@@ -540,7 +837,6 @@ impl FunctionDomain {
 		self.notify_work();
 		Ok(call)
 	}
-
 
 	/// Ask every background task to stop and wait for clean termination.
 	pub async fn shutdown(&self) {
@@ -591,7 +887,7 @@ impl FunctionDomain {
 			Err(error) => {
 				tracing::warn!(%error, "function queue scan failed");
 				return;
-			}
+			},
 		};
 		for queued in revisions {
 			let revision = match self.store.get_revision(&queued.revision_id) {
@@ -599,15 +895,20 @@ impl FunctionDomain {
 				Err(error) => {
 					tracing::warn!(%error, revision_id = %queued.revision_id, "queued revision is unavailable");
 					continue;
-				}
+				},
 			};
 			let policy = pool_policy(&revision);
-			self.pools
+			self
+				.pools
 				.lock()
 				.entry(queued.revision_id.clone())
 				.or_insert_with(|| WorkerPool::new(policy));
 
-			let mut worker_id = self.pools.lock().get_mut(&queued.revision_id).and_then(WorkerPool::admit);
+			let mut worker_id = self
+				.pools
+				.lock()
+				.get_mut(&queued.revision_id)
+				.and_then(WorkerPool::admit);
 			if worker_id.is_none() {
 				let should_spawn = {
 					let pools = self.pools.lock();
@@ -627,38 +928,60 @@ impl FunctionDomain {
 								now,
 								LEASE_MILLIS,
 							) {
-								let _ = self.store.mark_running(&leased.lease, now, pb::StartupKind::Unspecified);
+								let _ = self.store.mark_running(
+									&leased.lease,
+									now,
+									pb::StartupKind::Unspecified,
+								);
 								let unavailable = WorkerError::platform(
 									"secret_unavailable",
 									"required transient secret material is unavailable",
 								);
-								let _ = self.store.fail_user(&leased.lease, &call_error(&unavailable), now);
+								let _ = self
+									.store
+									.fail_user(&leased.lease, &call_error(&unavailable), now);
 							}
 							continue;
-						}
+						},
 					};
 					let started = std::time::Instant::now();
 					let spawned = if let Some(snapshot) = self.snapshot_for(&revision) {
-						self.executor.restore(Arc::clone(&revision), snapshot, secrets).await
+						self
+							.executor
+							.restore(Arc::clone(&revision), snapshot, secrets)
+							.await
 					} else {
 						self.executor.spawn(Arc::clone(&revision), secrets).await
 					};
 					match spawned {
 						Ok(worker) => {
-							self.metrics.worker_started(started.elapsed().as_millis() as u64);
+							self
+								.metrics
+								.worker_started(started.elapsed().as_millis() as u64);
 							if let Some(snapshot) = worker.initial_snapshot() {
-								self.record_snapshot(snapshot);
+								if let Err(error) = self.persist_snapshot(snapshot, &revision) {
+									tracing::warn!(%error, revision_id = %queued.revision_id, "initial function snapshot persistence failed");
+								}
 							}
 							let id = worker.id().to_owned();
 							self.workers.lock().insert(id.clone(), worker);
-							self.pools.lock().get_mut(&queued.revision_id).expect("pool inserted").add_worker(id, now);
-							worker_id = self.pools.lock().get_mut(&queued.revision_id).and_then(WorkerPool::admit);
-						}
+							self
+								.pools
+								.lock()
+								.get_mut(&queued.revision_id)
+								.expect("pool inserted")
+								.add_worker(id, now);
+							worker_id = self
+								.pools
+								.lock()
+								.get_mut(&queued.revision_id)
+								.and_then(WorkerPool::admit);
+						},
 						Err(error) => {
 							tracing::warn!(%error, revision_id = %queued.revision_id, "worker startup failed");
 							self.metrics.infrastructure_failure();
 							continue;
-						}
+						},
 					}
 				}
 			}
@@ -675,11 +998,22 @@ impl FunctionDomain {
 				.and_then(|spec| spec.batching.as_ref())
 				.filter(|batching| batching.enabled);
 			if let Some(batching) = batching {
-				let frontier = self.store.queued_batch_for_revision(&queued.revision_id, now);
-				let ready = frontier.as_ref().ok().and_then(Option::as_ref).is_some_and(|frontier| {
-					frontier.queued_inputs >= u64::from(batching.max_batch_size.max(1))
-						|| now.saturating_sub(frontier.oldest_available_ms) >= batching.max_wait_millis
-				});
+				let frontier = self
+					.store
+					.queued_batch_for_revision(&queued.revision_id, now);
+				let ready = frontier
+					.as_ref()
+					.ok()
+					.and_then(Option::as_ref)
+					.is_some_and(|frontier| {
+						scheduler::dynamic_batch_ready(
+							frontier.queued_inputs,
+							frontier.oldest_available_ms,
+							now,
+							batching.max_batch_size,
+							batching.max_wait_millis,
+						)
+					});
 				if ready {
 					match self.store.lease_batch_for_revision(
 						&queued.revision_id,
@@ -691,29 +1025,45 @@ impl FunctionDomain {
 						Ok(leased) if !leased.is_empty() => {
 							self.start_batch_execution(leased, Arc::clone(&worker));
 							continue;
-						}
-						Ok(_) => {}
+						},
+						Ok(_) => {},
 						Err(error) => tracing::warn!(%error, "dynamic batch lease failed"),
 					}
 				}
 			}
 			let leased = if batching.is_some() {
-				self.store
-					.lease_next_non_batch_for_revision(&queued.revision_id, &worker_id, now, LEASE_MILLIS)
+				self.store.lease_next_non_batch_for_revision(
+					&queued.revision_id,
+					&worker_id,
+					now,
+					LEASE_MILLIS,
+				)
 			} else {
-				self.store.lease_next_for_revision(&queued.revision_id, &worker_id, now, LEASE_MILLIS)
+				self
+					.store
+					.lease_next_for_revision(&queued.revision_id, &worker_id, now, LEASE_MILLIS)
 			};
 			let leased = match leased {
 				Ok(Some(leased)) => leased,
 				Ok(None) => {
-					self.pools.lock().get_mut(&queued.revision_id).expect("pool inserted").abandon(&worker_id, now);
+					self
+						.pools
+						.lock()
+						.get_mut(&queued.revision_id)
+						.expect("pool inserted")
+						.abandon(&worker_id, now);
 					continue;
-				}
+				},
 				Err(error) => {
-					self.pools.lock().get_mut(&queued.revision_id).expect("pool inserted").abandon(&worker_id, now);
+					self
+						.pools
+						.lock()
+						.get_mut(&queued.revision_id)
+						.expect("pool inserted")
+						.abandon(&worker_id, now);
 					tracing::warn!(%error, "input lease failed");
 					continue;
-				}
+				},
 			};
 			self.start_execution(leased, worker);
 		}
@@ -722,7 +1072,10 @@ impl FunctionDomain {
 
 	fn start_execution(self: &Arc<Self>, leased: LeasedInput, worker: Arc<dyn Worker>) {
 		let domain = Arc::clone(self);
-		let request_id = format!("{}:{}:{}", leased.lease.call_id, leased.lease.input_index, leased.lease.lease_generation);
+		let request_id = format!(
+			"{}:{}:{}",
+			leased.lease.call_id, leased.lease.input_index, leased.lease.lease_generation
+		);
 		self.active.lock().insert(
 			(leased.lease.call_id.clone(), leased.input.input_id.clone()),
 			ActiveExecution { worker: Arc::clone(&worker), request_id: request_id.clone() },
@@ -735,11 +1088,7 @@ impl FunctionDomain {
 
 	fn start_batch_execution(self: &Arc<Self>, leased: Vec<LeasedInput>, worker: Arc<dyn Worker>) {
 		let Some(first) = leased.first() else { return };
-		let request_id = format!(
-			"batch:{}:{}",
-			first.lease.call_id,
-			first.lease.lease_generation
-		);
+		let request_id = format!("batch:{}:{}", first.lease.call_id, first.lease.lease_generation);
 		for item in &leased {
 			self.active.lock().insert(
 				(item.lease.call_id.clone(), item.input.input_id.clone()),
@@ -748,38 +1097,61 @@ impl FunctionDomain {
 		}
 		let domain = Arc::clone(self);
 		let task = tokio::spawn(async move {
-			domain.execute_batch_leased(leased, worker, request_id).await;
+			domain
+				.execute_batch_leased(leased, worker, request_id)
+				.await;
 		});
 		self.tasks.lock().push(task);
 	}
 
-	async fn execute_leased(&self, leased: LeasedInput, worker: Arc<dyn Worker>, request_id: String) {
+	async fn execute_leased(
+		&self,
+		leased: LeasedInput,
+		worker: Arc<dyn Worker>,
+		request_id: String,
+	) {
 		let now = unix_millis();
-		let startup = if worker.initial_snapshot().is_some() { pb::StartupKind::Snapshot } else { pb::StartupKind::Warm };
+		let startup = if worker.initial_snapshot().is_some() {
+			pb::StartupKind::Snapshot
+		} else {
+			pb::StartupKind::Warm
+		};
 		if let Err(error) = self.store.mark_running(&leased.lease, now, startup) {
 			tracing::warn!(%error, "leased input could not enter running state");
 			self.finish_worker_slot(&leased, worker.id());
 			return;
 		}
 		self.publish_committed_events(&leased.lease.call_id);
-		self.metrics.input_started(now.saturating_sub(leased.call.created_at_unix_millis));
+		self
+			.metrics
+			.input_started(now.saturating_sub(leased.call.created_at_unix_millis));
 		let call_type = pb::CallType::try_from(leased.call.r#type).unwrap_or(pb::CallType::Unary);
 		if !lifecycle_accepts(&leased.revision, call_type) {
 			self.commit_worker_error(
 				&leased,
-				&WorkerError::platform("lifecycle_mismatch", "call type is incompatible with function lifecycle"),
+				&WorkerError::platform(
+					"lifecycle_mismatch",
+					"call type is incompatible with function lifecycle",
+				),
 			);
 			self.finish_worker_slot(&leased, worker.id());
 			return;
 		}
 		let mode = scheduler::input_execution_mode(call_type);
 		let Some(input) = leased.input.payload.clone() else {
-			let _ = self.store.fail_user(&leased.lease, &call_error(&WorkerError::platform("invalid_input", "input payload is required")), unix_millis());
+			let _ = self.store.fail_user(
+				&leased.lease,
+				&call_error(&WorkerError::platform("invalid_input", "input payload is required")),
+				unix_millis(),
+			);
 			self.finish_worker_slot(&leased, worker.id());
 			return;
 		};
-		let deadline = leased.execution_deadline_ms.map(|millis| UNIX_EPOCH + Duration::from_millis(millis));
+		let deadline = leased
+			.execution_deadline_ms
+			.map(|millis| UNIX_EPOCH + Duration::from_millis(millis));
 		let mut _actor_permit = None;
+		let mut actor_operation: Option<(String, u64)> = None;
 		let execution_result = if call_type == pb::CallType::Actor {
 			let actor_target = leased
 				.call
@@ -791,8 +1163,12 @@ impl FunctionDomain {
 					pb::call_target::Receiver::Service(_) => None,
 				})
 				.flatten();
-			let actor_id = actor_target.and_then(|target| target.actor.as_ref()).map(|actor| actor.actor_id.clone());
-			let method = actor_target.map(|target| target.method.clone()).filter(|method| !method.is_empty());
+			let actor_id = actor_target
+				.and_then(|target| target.actor.as_ref())
+				.map(|actor| actor.actor_id.clone());
+			let method = actor_target
+				.map(|target| target.method.clone())
+				.filter(|method| !method.is_empty());
 			let (Some(actor_id), Some(method)) = (actor_id, method) else {
 				let error = WorkerError::actor_lost("actor call target is incomplete");
 				self.commit_worker_error(&leased, &error);
@@ -804,41 +1180,81 @@ impl FunctionDomain {
 				Err(_) => {
 					let record = self.store.get_actor(&actor_id);
 					let checkpoint_id = record.ok().and_then(|record| {
-						record.latest_checkpoint_presence.map(|presence| match presence {
-							pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint) => checkpoint.checkpoint_id,
-						})
+						record
+							.latest_checkpoint_presence
+							.map(|presence| match presence {
+								pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(
+									checkpoint,
+								) => checkpoint.checkpoint_id,
+							})
 					});
 					if let Some(checkpoint_id) = checkpoint_id {
 						if self
-							.restore_actor_checkpoint(&actor_id, &checkpoint_id, &format!("recover:{request_id}"))
+							.restore_actor_checkpoint(
+								&actor_id,
+								&checkpoint_id,
+								&format!("recover:{request_id}"),
+							)
 							.await
 							.is_ok()
 						{
 							match self.actors.acquire(&actor_id).await {
 								Ok(permit) => permit,
 								Err(error) => {
-									self.commit_worker_error(&leased, &WorkerError::actor_lost(error.to_string()));
+									self.commit_worker_error(
+										&leased,
+										&WorkerError::actor_lost(error.to_string()),
+									);
 									self.finish_worker_slot(&leased, worker.id());
 									return;
-								}
+								},
 							}
 						} else {
-							self.commit_worker_error(&leased, &WorkerError::actor_lost("actor checkpoint restore failed"));
+							self.commit_worker_error(
+								&leased,
+								&WorkerError::actor_lost("actor checkpoint restore failed"),
+							);
 							self.finish_worker_slot(&leased, worker.id());
 							return;
 						}
 					} else {
-						let _ = self.store.set_actor_status(&actor_id, pb::ActorStatus::Failed, None, unix_millis());
-						self.commit_worker_error(&leased, &WorkerError::actor_lost("actor worker was lost without a checkpoint"));
+						let _ = self.store.set_actor_status(
+							&actor_id,
+							pb::ActorStatus::Failed,
+							None,
+							unix_millis(),
+						);
+						self.commit_worker_error(
+							&leased,
+							&WorkerError::actor_lost("actor worker was lost without a checkpoint"),
+						);
 						self.finish_worker_slot(&leased, worker.id());
 						return;
 					}
-				}
+				},
 			};
+			let sequence = match self
+				.store
+				.allocate_actor_operation(&actor_id, unix_millis())
+			{
+				Ok(sequence) => sequence,
+				Err(error) => {
+					self.commit_worker_error(
+						&leased,
+						&WorkerError::platform("actor_busy", error.to_string()),
+					);
+					self.finish_worker_slot(&leased, worker.id());
+					return;
+				},
+			};
+			actor_operation = Some((actor_id.clone(), sequence));
 			let actor_worker = Arc::clone(permit.worker());
 			self.active.lock().insert(
 				(leased.lease.call_id.clone(), leased.input.input_id.clone()),
-				ActiveExecution { worker: Arc::clone(&actor_worker), request_id: request_id.clone() },
+				ActiveExecution {
+					worker:     Arc::clone(&actor_worker),
+					request_id: request_id.clone(),
+				},
 			);
 			let result = actor_worker
 				.actor(ActorRequest {
@@ -881,8 +1297,11 @@ impl FunctionDomain {
 			Err(error) => {
 				self.commit_worker_error(&leased, &error);
 				self.finish_worker_slot(&leased, worker.id());
+				if let Some((actor_id, _)) = &actor_operation {
+					self.mark_actor_worker_lost(actor_id);
+				}
 				return;
-			}
+			},
 		};
 		let events = execution.events;
 		let mut completion = execution.completion;
@@ -910,56 +1329,77 @@ impl FunctionDomain {
 		match outcome {
 			Ok(WorkerOutcome::Success { value, stats }) => {
 				let result = pb::CallResult {
-					call: None,
-					index: leased.lease.input_index,
-					outcome: Some(pb::call_result::Outcome::Value(value)),
+					call:                   None,
+					index:                  leased.lease.input_index,
+					outcome:                Some(pb::call_result::Outcome::Value(value)),
 					created_at_unix_millis: 0,
-					sequence: 0,
-					input_id: leased.input.input_id.clone(),
-					input_index: leased.lease.input_index,
-					yield_index_presence: None,
+					sequence:               0,
+					input_id:               leased.input.input_id.clone(),
+					input_index:            leased.lease.input_index,
+					yield_index_presence:   None,
 				};
-				let proto_stats = attempt_stats(stats, startup);
-				if let Err(error) = self.store.succeed(&leased.lease, &result, Some(&proto_stats), unix_millis()) {
+				let proto_stats = attempt_stats(stats, startup, &leased);
+				if let Err(error) =
+					self
+						.store
+						.succeed(&leased.lease, &result, Some(&proto_stats), unix_millis())
+				{
 					tracing::warn!(%error, "result commit failed");
 				} else {
 					self.metrics.input_succeeded(stats.execution_millis);
 				}
 				self.publish_committed_events(&leased.lease.call_id);
-			}
+				if let Some((actor_id, sequence)) = &actor_operation {
+					self.complete_actor_operation(actor_id, *sequence);
+				}
+			},
 			Ok(WorkerOutcome::Cancelled { reason, .. }) => {
-				if let Err(error) = self.store.finish_cancelled(&leased.lease, &reason, unix_millis()) {
+				if let Err(error) = self
+					.store
+					.finish_cancelled(&leased.lease, &reason, unix_millis())
+				{
 					tracing::warn!(%error, "cancellation completion commit failed");
 				}
 				self.publish_committed_events(&leased.lease.call_id);
-			}
-			Ok(WorkerOutcome::UserError { error, stats } | WorkerOutcome::PlatformError { error, stats }) => {
+				if let Some((actor_id, sequence)) = &actor_operation {
+					self.complete_actor_operation(actor_id, *sequence);
+				}
+			},
+			Ok(
+				WorkerOutcome::UserError { error, stats }
+				| WorkerOutcome::PlatformError { error, stats },
+			) => {
 				self.metrics.user_failure(stats.execution_millis);
 				self.commit_worker_error(&leased, &error);
-			}
+				if let Some((actor_id, sequence)) = &actor_operation {
+					self.complete_actor_operation(actor_id, *sequence);
+				}
+			},
 			Ok(WorkerOutcome::ActorLost { error, stats }) => {
 				self.metrics.user_failure(stats.execution_millis);
-				if let Some(actor_id) = call_actor_id(&leased.call) {
-					let recovery = self.actors.worker_lost(&actor_id).ok();
-					let status = if matches!(recovery, Some(actor::ActorRecovery::Restore { .. })) {
-						pb::ActorStatus::Stopped
-					} else {
-						pb::ActorStatus::Failed
-					};
-					let _ = self.store.set_actor_status(&actor_id, status, None, unix_millis());
+				if let Some((actor_id, _)) = &actor_operation {
+					self.mark_actor_worker_lost(actor_id);
 				}
 				self.commit_worker_error(&leased, &error);
-			}
+			},
 			Ok(WorkerOutcome::InfrastructureError { error, .. }) | Err(error) => {
 				self.metrics.infrastructure_failure();
 				self.commit_worker_error(&leased, &error);
-			}
+				if let Some((actor_id, _)) = &actor_operation {
+					self.mark_actor_worker_lost(actor_id);
+				}
+			},
 		}
 		self.finish_worker_slot(&leased, worker.id());
 		self.notify_work();
 	}
 
-	async fn execute_batch_leased(&self, leased: Vec<LeasedInput>, worker: Arc<dyn Worker>, request_id: String) {
+	async fn execute_batch_leased(
+		&self,
+		leased: Vec<LeasedInput>,
+		worker: Arc<dyn Worker>,
+		request_id: String,
+	) {
 		let Some(first) = leased.first() else { return };
 		let startup = if worker.initial_snapshot().is_some() {
 			pb::StartupKind::Snapshot
@@ -970,7 +1410,10 @@ impl FunctionDomain {
 			for item in &leased {
 				self.commit_worker_error(
 					item,
-					&WorkerError::platform("lifecycle_mismatch", "batch call is incompatible with actor lifecycle"),
+					&WorkerError::platform(
+						"lifecycle_mismatch",
+						"batch call is incompatible with actor lifecycle",
+					),
 				);
 			}
 			self.finish_worker_slot(first, worker.id());
@@ -981,13 +1424,16 @@ impl FunctionDomain {
 			if let Err(error) = self.store.mark_running(&item.lease, now, startup) {
 				tracing::warn!(%error, input_index = item.lease.input_index, "batch input could not enter running state");
 				for leased_item in &leased {
-					let failure = WorkerError::infrastructure("batch_admission", "grouped batch admission failed");
+					let failure =
+						WorkerError::infrastructure("batch_admission", "grouped batch admission failed");
 					self.commit_worker_error(leased_item, &failure);
 				}
 				self.finish_worker_slot(first, worker.id());
 				return;
 			}
-			self.metrics.input_started(now.saturating_sub(item.call.created_at_unix_millis));
+			self
+				.metrics
+				.input_started(now.saturating_sub(item.call.created_at_unix_millis));
 			self.publish_committed_events(&item.lease.call_id);
 		}
 		let mut inputs = Vec::with_capacity(leased.len());
@@ -1005,9 +1451,7 @@ impl FunctionDomain {
 			inputs.push(ExecuteRequest {
 				request_id: format!(
 					"{}:{}:{}",
-					item.lease.call_id,
-					item.lease.input_index,
-					item.lease.lease_generation
+					item.lease.call_id, item.lease.input_index, item.lease.lease_generation
 				),
 				function_id: item
 					.revision
@@ -1021,7 +1465,9 @@ impl FunctionDomain {
 				attempt: item.user_attempts.saturating_add(1),
 				mode: ExecutionMode::Batch,
 				input,
-				deadline: item.execution_deadline_ms.map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
+				deadline: item
+					.execution_deadline_ms
+					.map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
 				parent_call_id: parent_edge(&item.call).map(|parent| parent.call_id.clone()),
 				parent_request_id: parent_edge(&item.call).map(|parent| parent.input_id.clone()),
 				interruptibility: scheduler::execution_interruptibility(worker.as_ref()),
@@ -1040,7 +1486,7 @@ impl FunctionDomain {
 				self.finish_worker_slot(first, worker.id());
 				self.notify_work();
 				return;
-			}
+			},
 		};
 		let mut heartbeat = tokio::time::interval(Duration::from_millis(LEASE_MILLIS / 3));
 		let outcome = loop {
@@ -1071,68 +1517,102 @@ impl FunctionDomain {
 					match terminal.outcome {
 						WorkerOutcome::Success { value, stats } => {
 							let result = pb::CallResult {
-								call: None,
-								index: item.lease.input_index,
-								outcome: Some(pb::call_result::Outcome::Value(value)),
+								call:                   None,
+								index:                  item.lease.input_index,
+								outcome:                Some(pb::call_result::Outcome::Value(value)),
 								created_at_unix_millis: 0,
-								sequence: 0,
-								input_id: item.input.input_id.clone(),
-								input_index: item.lease.input_index,
-								yield_index_presence: None,
+								sequence:               0,
+								input_id:               item.input.input_id.clone(),
+								input_index:            item.lease.input_index,
+								yield_index_presence:   None,
 							};
-							let proto_stats = attempt_stats(stats, startup);
-							if self.store.succeed(&item.lease, &result, Some(&proto_stats), unix_millis()).is_ok() {
+							let proto_stats = attempt_stats(stats, startup, item);
+							if self
+								.store
+								.succeed(&item.lease, &result, Some(&proto_stats), unix_millis())
+								.is_ok()
+							{
 								self.metrics.input_succeeded(stats.execution_millis);
 							}
-						}
+						},
 						WorkerOutcome::Cancelled { reason, .. } => {
-							let _ = self.store.finish_cancelled(&item.lease, &reason, unix_millis());
-						}
+							let _ = self
+								.store
+								.finish_cancelled(&item.lease, &reason, unix_millis());
+						},
 						WorkerOutcome::UserError { error, stats }
 						| WorkerOutcome::PlatformError { error, stats }
 						| WorkerOutcome::ActorLost { error, stats } => {
 							self.metrics.user_failure(stats.execution_millis);
 							self.commit_worker_error(item, &error);
-						}
+						},
 						WorkerOutcome::InfrastructureError { error, .. } => {
 							self.metrics.infrastructure_failure();
 							self.commit_worker_error(item, &error);
-						}
+						},
 					}
 					self.publish_committed_events(&item.lease.call_id);
 				}
-			}
+			},
 			Err(error) => {
 				for item in &leased {
 					self.metrics.infrastructure_failure();
 					self.commit_worker_error(item, &error);
 				}
-			}
+			},
 		}
 		for item in &leased {
-			self.active.lock().remove(&(item.lease.call_id.clone(), item.input.input_id.clone()));
+			self
+				.active
+				.lock()
+				.remove(&(item.lease.call_id.clone(), item.input.input_id.clone()));
 		}
 		self.finish_worker_slot(first, worker.id());
 		self.notify_work();
 	}
 
+	fn complete_actor_operation(&self, actor_id: &str, sequence: u64) {
+		if let Err(error) = self
+			.store
+			.complete_actor_operation(actor_id, sequence, unix_millis())
+		{
+			tracing::warn!(%error, %actor_id, sequence, "actor READY transition failed");
+		}
+	}
+
+	fn mark_actor_worker_lost(&self, actor_id: &str) {
+		let _ = self.actors.worker_lost(actor_id);
+		if let Err(error) = self.store.mark_actor_worker_lost(actor_id, unix_millis()) {
+			tracing::warn!(%error, %actor_id, "actor loss transition failed");
+		}
+	}
+
 	fn commit_batch_worker_event(&self, leased: &[LeasedInput], event: BatchWorkerEvent) {
-		if let Some(item) = leased.iter().find(|item| item.lease.input_index == event.input_index) {
+		if let Some(item) = leased
+			.iter()
+			.find(|item| item.lease.input_index == event.input_index)
+		{
 			self.commit_worker_event(item, event.event);
 		}
 	}
 
 	fn commit_worker_event(&self, leased: &LeasedInput, event: WorkerEvent) {
 		let committed = match event {
-			WorkerEvent::Yield { index, value } => self.store.commit_yield(&leased.lease, index, value, unix_millis()),
+			WorkerEvent::Yield { index, value } => {
+				self
+					.store
+					.commit_yield(&leased.lease, index, value, unix_millis())
+			},
 			WorkerEvent::Log { stream, message } => {
 				let stream = match stream.as_str() {
 					"stderr" => pb::LogStream::Stderr,
 					"structured" => pb::LogStream::Structured,
 					_ => pb::LogStream::Stdout,
 				};
-				self.store.append_log(&leased.lease, stream, message.into_bytes(), unix_millis())
-			}
+				self
+					.store
+					.append_log(&leased.lease, stream, message.into_bytes(), unix_millis())
+			},
 			WorkerEvent::Status { .. } => return,
 		};
 		match committed {
@@ -1145,11 +1625,17 @@ impl FunctionDomain {
 		let now = unix_millis();
 		let proto = call_error(error);
 		if error.kind == self::worker::WorkerErrorKind::Infrastructure {
-			let retry_at = now.saturating_add(scheduler::retry_backoff(100, 30_000, 2.0, leased.infra_attempts).as_millis() as u64);
+			let retry_at = now.saturating_add(
+				scheduler::retry_backoff(100, 30_000, 2.0, leased.infra_attempts).as_millis() as u64,
+			);
 			let _ = self.store.fail_infra(&leased.lease, &proto, retry_at, now);
 			return;
 		}
-		let retry = leased.revision.spec.as_ref().and_then(|spec| spec.retry.as_ref());
+		let retry = leased
+			.revision
+			.spec
+			.as_ref()
+			.and_then(|spec| spec.retry.as_ref());
 		let attempt = leased.user_attempts.saturating_add(1);
 		let allowed = retry.is_some_and(|policy| {
 			error.retryable
@@ -1175,8 +1661,16 @@ impl FunctionDomain {
 	}
 
 	fn finish_worker_slot(&self, leased: &LeasedInput, worker_id: &str) {
-		self.active.lock().remove(&(leased.lease.call_id.clone(), leased.input.input_id.clone()));
-		if let Some(revision_id) = leased.revision.r#ref.as_ref().map(|reference| reference.revision_id.as_str()) {
+		self
+			.active
+			.lock()
+			.remove(&(leased.lease.call_id.clone(), leased.input.input_id.clone()));
+		if let Some(revision_id) = leased
+			.revision
+			.r#ref
+			.as_ref()
+			.map(|reference| reference.revision_id.as_str())
+		{
 			if let Some(pool) = self.pools.lock().get_mut(revision_id) {
 				pool.complete(worker_id, unix_millis());
 			}
@@ -1194,23 +1688,16 @@ impl FunctionDomain {
 					pool.remove_worker(&worker_id);
 				}
 				self.metrics.worker_retired();
-				tokio::spawn(async move { let _ = worker.retire().await; });
+				tokio::spawn(async move {
+					let _ = worker.retire().await;
+				});
 			}
 		}
 	}
 
-
 	/// Vibemon home that owns this domain.
 	pub fn home(&self) -> &Home {
 		&self.home
-	}
-}
-
-fn call_actor_id(call: &pb::CallRecord) -> Option<String> {
-	let receiver = call.target.as_ref()?.receiver.as_ref()?;
-	match receiver {
-		pb::call_target::Receiver::Actor(target) => target.actor.as_ref().map(|actor| actor.actor_id.clone()),
-		pb::call_target::Receiver::Service(_) => None,
 	}
 }
 
@@ -1224,7 +1711,7 @@ fn service_dispatch(call: &pb::CallRecord) -> Option<ServiceDispatch> {
 		pb::call_target::Receiver::Actor(_) => None,
 		pb::call_target::Receiver::Service(service) => Some(ServiceDispatch {
 			service_key: service.service_key.clone(),
-			method: service.method.clone(),
+			method:      service.method.clone(),
 			constructor: service.constructor.clone(),
 		}),
 	}
@@ -1235,29 +1722,60 @@ fn pool_policy(revision: &pb::FunctionRevision) -> PoolPolicy {
 	let workers = spec.and_then(|spec| spec.workers.as_ref());
 	let concurrency = spec.and_then(|spec| spec.concurrency.as_ref());
 	let batching = spec.and_then(|spec| spec.batching.as_ref());
-	let capacity = concurrency.map_or(1, |value| value.max_concurrent_calls.max(1)) as usize;
+	let stateless = spec.is_none_or(|spec| {
+		pb::FunctionLifecycle::try_from(spec.lifecycle).unwrap_or(pb::FunctionLifecycle::Stateless)
+			== pb::FunctionLifecycle::Stateless
+	});
+	let capacity = if stateless {
+		1
+	} else {
+		concurrency.map_or(1, |value| value.max_concurrent_calls.max(1)) as usize
+	};
 	PoolPolicy {
-		min_workers: workers.map_or(0, |value| value.min_workers) as usize,
+		min_workers: if stateless {
+			0
+		} else {
+			workers.map_or(0, |value| value.min_workers) as usize
+		},
 		max_workers: workers.map_or(1, |value| value.max_workers.max(1)) as usize,
-		buffer_workers: workers.map_or(0, |value| value.buffer_workers) as usize,
+		buffer_workers: if stateless {
+			0
+		} else {
+			workers.map_or(0, |value| value.buffer_workers) as usize
+		},
 		capacity,
-		max_outstanding: workers
-			.map_or(capacity, |value| value.max_outstanding_inputs.max(capacity as u32) as usize),
+		max_outstanding: if stateless {
+			1
+		} else {
+			workers
+				.map_or(capacity, |value| value.max_outstanding_inputs.max(capacity as u32) as usize)
+		},
 		idle_timeout: Duration::from_millis(workers.map_or(60_000, |value| {
-			if value.idle_timeout_millis == 0 { 60_000 } else { value.idle_timeout_millis }
+			if value.idle_timeout_millis == 0 {
+				60_000
+			} else {
+				value.idle_timeout_millis
+			}
 		})),
-		max_calls: if spec.is_some_and(|spec| {
-			pb::FunctionLifecycle::try_from(spec.lifecycle)
-				.unwrap_or(pb::FunctionLifecycle::Stateless)
-				== pb::FunctionLifecycle::Stateless
-		}) {
+		max_calls: if stateless {
 			1
 		} else {
 			workers.map_or(0, |value| value.max_calls_per_worker)
 		},
-		max_batch_size: batching.filter(|value| value.enabled).map_or(1, |value| value.max_batch_size.max(1)) as usize,
+		max_batch_size: batching
+			.filter(|value| value.enabled)
+			.map_or(1, |value| value.max_batch_size.max(1)) as usize,
 		batch_wait: Duration::from_millis(batching.map_or(0, |value| value.max_wait_millis)),
 	}
+}
+
+fn secret_version(secret: &pb::SecretRef) -> Option<String> {
+	secret
+		.version_presence
+		.as_ref()
+		.map(|version| match version {
+			pb::secret_ref::VersionPresence::Version(value) => value.clone(),
+		})
 }
 
 fn lifecycle_accepts(revision: &pb::FunctionRevision, call_type: pb::CallType) -> bool {
@@ -1269,35 +1787,57 @@ fn lifecycle_accepts(revision: &pb::FunctionRevision, call_type: pb::CallType) -
 	(lifecycle == pb::FunctionLifecycle::Actor) == (call_type == pb::CallType::Actor)
 }
 
-fn attempt_stats(stats: WorkerAttemptStats, startup: pb::StartupKind) -> pb::AttemptStats {
+fn attempt_stats(
+	stats: WorkerAttemptStats,
+	startup: pb::StartupKind,
+	leased: &LeasedInput,
+) -> pb::AttemptStats {
 	pb::AttemptStats {
-		attempt: stats.attempt,
-		startup: startup as i32,
-		queued_millis: 0,
-		startup_millis: stats.startup_millis,
-		execution_millis: stats.execution_millis,
-		cpu_millis: stats.cpu_millis,
+		attempt_id:        format!(
+			"{}:{}:{}",
+			leased.lease.call_id, leased.lease.input_index, leased.lease.lease_generation
+		),
+		user_attempt:      leased.user_attempts.saturating_add(1),
+		infra_attempt:     leased.infra_attempts,
+		startup:           startup as i32,
+		failure_kind:      pb::AttemptFailureKind::Unspecified as i32,
+		queued_millis:     0,
+		startup_millis:    stats.startup_millis,
+		execution_millis:  stats.execution_millis,
+		cpu_millis:        stats.cpu_millis,
 		peak_memory_bytes: stats.peak_memory_bytes,
 	}
 }
 
 fn call_error(error: &WorkerError) -> pb::CallError {
 	pb::CallError {
-		code: error.code.clone(),
-		message: error.message.clone(),
-		r#type: match error.kind {
-			self::worker::WorkerErrorKind::User => "UserError",
-			self::worker::WorkerErrorKind::Platform => "PlatformError",
-			self::worker::WorkerErrorKind::Infrastructure => "InfrastructureError",
-			self::worker::WorkerErrorKind::ActorLost => "ActorLost",
-			self::worker::WorkerErrorKind::Cancelled => "Cancelled",
-			self::worker::WorkerErrorKind::Timeout => "Timeout",
-		}
-		.into(),
-		retryable: error.retryable,
-		frames: Vec::new(),
-		cause_presence: None,
-		details: HashMap::new(),
+		code:           error.code.clone(),
+		message:        error.message.clone(),
+		r#type:         if error.error_type.is_empty() {
+			match error.kind {
+				self::worker::WorkerErrorKind::User => "UserError",
+				self::worker::WorkerErrorKind::Platform => "PlatformError",
+				self::worker::WorkerErrorKind::Infrastructure => "InfrastructureError",
+				self::worker::WorkerErrorKind::ActorLost => "ActorLost",
+				self::worker::WorkerErrorKind::Cancelled => "Cancelled",
+				self::worker::WorkerErrorKind::Timeout => "Timeout",
+			}
+			.into()
+		} else {
+			error.error_type.clone()
+		},
+		retryable:      error.retryable,
+		frames:         error.frames.iter().take(128).cloned().collect(),
+		cause_presence: error
+			.cause
+			.as_ref()
+			.map(|cause| pb::call_error::CausePresence::Cause(Box::new(call_error(cause)))),
+		details:        error
+			.details
+			.iter()
+			.take(128)
+			.map(|(key, value)| (key.clone(), value.clone()))
+			.collect(),
 	}
 }
 
