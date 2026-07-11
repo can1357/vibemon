@@ -545,10 +545,10 @@ export class WorkerSession {
   }
 
   #decodeValue(frame: Record<string, unknown>): JsonValue {
-    if (!Object.hasOwn(frame, "json")) {
+    if (!Object.hasOwn(frame, "json") || !isJsonValue(frame.json)) {
       throw this.#violation("unsupported value frame; expected a json value");
     }
-    return frame.json as JsonValue;
+    return frame.json;
   }
 
   #forward(frame: Record<string, unknown>, output: SessionOutputSink | null): void {
@@ -633,11 +633,11 @@ export class WorkerSession {
       this.#frames.fail(this.#violation("malformed frame"));
       return false;
     }
-    if (typeof frame !== "object" || frame === null || Array.isArray(frame)) {
+    if (!isRecord(frame)) {
       this.#frames.fail(this.#violation("non-object frame"));
       return false;
     }
-    this.#frames.push(frame as Record<string, unknown>);
+    this.#frames.push(frame);
     return true;
   }
 
@@ -741,7 +741,8 @@ export function isRemoteUserFailure(error: unknown): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
-    (error as Record<PropertyKey, unknown>)[REMOTE_USER_FAILURE] === true
+    REMOTE_USER_FAILURE in error &&
+    error[REMOTE_USER_FAILURE] === true
   );
 }
 
@@ -770,4 +771,17 @@ export function classifyFailure(error: unknown): FailureKind {
 
 function deadlineFor(timeout: number | null): number | null {
   return timeout === null ? null : Date.now() + timeout * 1000;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (!isRecord(value)) return false;
+  for (const key in value) if (!isJsonValue(value[key])) return false;
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

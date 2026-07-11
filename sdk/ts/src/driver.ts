@@ -7,8 +7,10 @@ import type {
   MessageInitShape,
   MessageShape,
 } from "@bufbuild/protobuf";
-import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import { type DsnConfig, type DsnEndpoint, type ParseDsnOptions, parseDsn } from "./dsn";
+import type { Transport } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
+import type { DsnConfig, DsnEndpoint, ParseDsnOptions } from "./dsn";
+import { parseDsn } from "./dsn";
 import { APIError, rpcError, TransportError } from "./errors";
 import { SandboxService, SystemService } from "./gen/vmon/v1/api_pb";
 import { createWsBridgeTransport } from "./grpc-ws";
@@ -52,6 +54,7 @@ export interface RpcResult<T> {
 export interface RpcStream<T> {
   stream: AsyncIterable<T>;
   endpoint: string;
+  /** Cancel the underlying server stream. */
   cancel(): void;
 }
 /** Per-endpoint gRPC-web transport factory (test seam). */

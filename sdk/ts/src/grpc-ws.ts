@@ -1,22 +1,16 @@
-import {
-  create,
-  type DescMessage,
-  type DescMethodStreaming,
-  type DescMethodUnary,
-  fromBinary,
-  type MessageInitShape,
-  type MessageShape,
-  toBinary,
+import type {
+  DescMessage,
+  DescMethodStreaming,
+  DescMethodUnary,
+  MessageInitShape,
+  MessageShape,
 } from "@bufbuild/protobuf";
-import {
-  Code,
-  ConnectError,
-  type StreamResponse,
-  type Transport,
-  type UnaryResponse,
-} from "@connectrpc/connect";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import type { StreamResponse, Transport, UnaryResponse } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { AsyncQueue } from "./async-queue";
-import { type BridgeFrame, BridgeFrameSchema } from "./gen/vmon/v1/bridge_pb";
+import type { BridgeFrame } from "./gen/vmon/v1/bridge_pb";
+import { BridgeFrameSchema } from "./gen/vmon/v1/bridge_pb";
 
 /** Options for the gRPC-over-WebSocket bridge transport. */
 export interface WsBridgeTransportOptions {
@@ -150,7 +144,7 @@ async function openBridge(
   socket.addEventListener("message", (event) => {
     let frame: BridgeFrame;
     try {
-      frame = decodeBridgeFrame((event as MessageEvent).data);
+      frame = decodeBridgeFrame(event.data);
     } catch (error) {
       finish(ConnectError.from(error, Code.Internal));
       return;
@@ -163,7 +157,7 @@ async function openBridge(
         const end = frame.frame.value;
         for (const key in end.trailers) trailer.set(key, end.trailers[key]);
         if (end.status !== 0)
-          finish(new ConnectError(end.message || "RPC failed", end.status as Code, end.trailers));
+          finish(new ConnectError(end.message || "RPC failed", grpcCode(end.status), end.trailers));
         else finish();
         return;
       }
@@ -242,4 +236,43 @@ function decodeBridgeFrame(data: unknown): BridgeFrame {
   if (data instanceof Uint8Array) return fromBinary(BridgeFrameSchema, data);
   if (data instanceof ArrayBuffer) return fromBinary(BridgeFrameSchema, new Uint8Array(data));
   throw new ConnectError("unsupported WebSocket frame type", Code.Internal);
+}
+
+function grpcCode(status: number): Code {
+  switch (status) {
+    case Code.Canceled:
+      return Code.Canceled;
+    case Code.Unknown:
+      return Code.Unknown;
+    case Code.InvalidArgument:
+      return Code.InvalidArgument;
+    case Code.DeadlineExceeded:
+      return Code.DeadlineExceeded;
+    case Code.NotFound:
+      return Code.NotFound;
+    case Code.AlreadyExists:
+      return Code.AlreadyExists;
+    case Code.PermissionDenied:
+      return Code.PermissionDenied;
+    case Code.ResourceExhausted:
+      return Code.ResourceExhausted;
+    case Code.FailedPrecondition:
+      return Code.FailedPrecondition;
+    case Code.Aborted:
+      return Code.Aborted;
+    case Code.OutOfRange:
+      return Code.OutOfRange;
+    case Code.Unimplemented:
+      return Code.Unimplemented;
+    case Code.Internal:
+      return Code.Internal;
+    case Code.Unavailable:
+      return Code.Unavailable;
+    case Code.DataLoss:
+      return Code.DataLoss;
+    case Code.Unauthenticated:
+      return Code.Unauthenticated;
+    default:
+      return Code.Unknown;
+  }
 }

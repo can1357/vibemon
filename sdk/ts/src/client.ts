@@ -1,4 +1,5 @@
-import { type Driver, type DriverOptions, type DriverRequestOptions, MeshDriver } from "./driver";
+import type { Driver, DriverOptions, DriverRequestOptions } from "./driver";
+import { MeshDriver } from "./driver";
 import { apiError, ProtocolError, TransportError } from "./errors";
 import {
   PoolService,
@@ -28,8 +29,10 @@ import type {
   RemoteFunctionSourceSpec,
 } from "./remote";
 import { remoteFunction, remoteFunctionFromSource } from "./remote";
-import { Sandbox, type SandboxListOptions } from "./sandbox";
-import { type SecretInput, secretWires, Volume } from "./values";
+import type { SandboxListOptions } from "./sandbox";
+import { Sandbox } from "./sandbox";
+import type { SecretInput } from "./values";
+import { secretWires, Volume } from "./values";
 
 /** Options accepted by the synchronous connect factory. */
 export interface ConnectOptions extends DriverOptions {}
@@ -155,7 +158,7 @@ export class SandboxAPI {
       const { message, endpoint } = await this.#client.driver.call(SandboxService.method.list, {
         tags,
       });
-      return sandboxRows(message.sandboxesJson.map((row) => JSON.parse(row) as unknown))
+      return sandboxRows(message.sandboxesJson.map(parseJson))
         .filter((row) => !options.node || row.node === options.node)
         .map((row) => new Sandbox(this.#client, row, endpoint));
     }
@@ -167,7 +170,7 @@ export class SandboxAPI {
           { endpoint: entry.url },
         );
         return {
-          rows: sandboxRows(message.sandboxesJson.map((row) => JSON.parse(row) as unknown)),
+          rows: sandboxRows(message.sandboxesJson.map(parseJson)),
           endpoint,
         };
       }),
@@ -294,7 +297,10 @@ export class PoolAPI {
       reference: ref,
       bodyJson: JSON.stringify(body),
     });
-    return new Pool(this, ref, count, JSON.parse(message.json) as PoolStats);
+    const stats = parseJson(message.json);
+    if (!isRecord(stats) || Array.isArray(stats))
+      throw new ProtocolError(`pool ${ref} statistics must be an object`);
+    return new Pool(this, ref, count, stats);
   }
   /** Delete a warm pool. */
   async delete(ref: string): Promise<void> {
@@ -336,6 +342,10 @@ function sandboxRows(body: unknown): SandboxInfo[] {
         : [];
   return rows.filter((row): row is SandboxInfo => isRecord(row) && typeof row.id === "string");
 }
+function parseJson(text: string): unknown {
+  return JSON.parse(text);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }

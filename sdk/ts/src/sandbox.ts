@@ -19,8 +19,10 @@ import type {
   SandboxInfo,
   TunnelSet,
 } from "./models";
-import { ConsoleStream, LogStream, Process, type ProcessOptions } from "./process";
-import { mergeSecretEnv, type SecretInput } from "./values";
+import type { ProcessOptions } from "./process";
+import { ConsoleStream, LogStream, Process } from "./process";
+import type { SecretInput } from "./values";
+import { mergeSecretEnv } from "./values";
 
 /** Options for captured command execution. */
 export interface RunOptions extends Omit<ExecRequest, "cmd"> {
@@ -145,13 +147,18 @@ export class Sandbox {
   }
   /** Fetch sandbox metrics. */
   async metrics(): Promise<Record<string, unknown>> {
-    return JSON.parse((await this.call(SandboxService.method.metrics, { id: this.id })).json);
+    const value = parseJson(
+      (await this.call(SandboxService.method.metrics, { id: this.id })).json,
+    );
+    if (!isRecord(value)) throw new ProtocolError("sandbox metrics must be an object");
+    return value;
   }
   /** Gracefully stop the sandbox. */
   async stop(wait = true): Promise<SandboxInfo> {
-    this.#info = JSON.parse(
-      (await this.call(SandboxService.method.stop, { id: this.id })).json,
-    ) as SandboxInfo;
+    this.#info = mergeInfo(
+      this.#info,
+      parseJson((await this.call(SandboxService.method.stop, { id: this.id })).json),
+    );
     if (wait) await this.#waitForState(new Set(["stopped", "exited"]));
     return this.#info;
   }
@@ -166,12 +173,18 @@ export class Sandbox {
   }
   /** Pause sandbox execution. */
   async pause(): Promise<SandboxInfo> {
-    this.#info = JSON.parse((await this.call(SandboxService.method.pause, { id: this.id })).json);
+    this.#info = mergeInfo(
+      this.#info,
+      parseJson((await this.call(SandboxService.method.pause, { id: this.id })).json),
+    );
     return this.#info;
   }
   /** Resume sandbox execution. */
   async resume(): Promise<SandboxInfo> {
-    this.#info = JSON.parse((await this.call(SandboxService.method.resume, { id: this.id })).json);
+    this.#info = mergeInfo(
+      this.#info,
+      parseJson((await this.call(SandboxService.method.resume, { id: this.id })).json),
+    );
     return this.#info;
   }
   /** Extend the sandbox lease. */
@@ -180,13 +193,13 @@ export class Sandbox {
       id: this.id,
       secs: BigInt(secs),
     });
-    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
+    this.#info = mergeInfo(this.#info, parseJson(view.json));
     return this.#info;
   }
   /** Migrate and re-pin the sandbox. */
   async migrate(target: string): Promise<SandboxInfo> {
     const view = await this.call(SandboxService.method.migrate, { id: this.id, target });
-    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
+    this.#info = mergeInfo(this.#info, parseJson(view.json));
     this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
     return this.#info;
   }
@@ -197,7 +210,7 @@ export class Sandbox {
       name: name ?? undefined,
       stop,
     });
-    return responseField(JSON.parse(view.json), "snapshot");
+    return responseField(parseJson(view.json), "snapshot");
   }
   /** Create a filesystem snapshot. */
   async snapshotFilesystem(name?: string): Promise<string> {
@@ -205,11 +218,13 @@ export class Sandbox {
       id: this.id,
       name: name ?? undefined,
     });
-    return responseField(JSON.parse(view.json), "image");
+    return responseField(parseJson(view.json), "image");
   }
   /** Fetch the network policy. */
   async network(): Promise<NetworkPolicy> {
-    return JSON.parse((await this.call(SandboxService.method.networkGet, { id: this.id })).json);
+    return networkPolicy(
+      parseJson((await this.call(SandboxService.method.networkGet, { id: this.id })).json),
+    );
   }
   /** Replace the network policy. */
   async setNetwork(policy: NetworkPolicy): Promise<NetworkPolicy> {
@@ -219,12 +234,13 @@ export class Sandbox {
       cidrAllow: policy.cidr_allow != null ? { values: policy.cidr_allow } : undefined,
       domainAllow: policy.domain_allow != null ? { values: policy.domain_allow } : undefined,
     });
-    return JSON.parse(view.json);
+    return networkPolicy(parseJson(view.json));
   }
   /** Fetch tunnels and cache the proxy token. */
   async tunnels(): Promise<TunnelSet> {
     const view = await this.call(SandboxService.method.tunnels, { id: this.id });
-    const value = JSON.parse(view.json) as TunnelSet;
+    const value = parseJson(view.json);
+    if (!isTunnelSet(value)) throw new ProtocolError("tunnel response must be an object");
     if (typeof value.connect_token === "string") this.#connectToken = value.connect_token;
     return value;
   }
@@ -431,10 +447,12 @@ export class Files {
       id: this.#sandbox.id,
       path,
     });
-    const body: unknown = JSON.parse(view.json);
+    const body = parseJson(view.json);
     if (!isRecord(body) || !Array.isArray(body.entries))
       throw new ProtocolError("file list response did not include entries");
-    return body.entries.filter(isFileInfo);
+    if (!body.entries.every(isFileInfo))
+      throw new ProtocolError("file list response included invalid metadata");
+    return body.entries;
   }
   /** Stat a guest filesystem path. */
   async stat(path: string): Promise<FileInfo> {
@@ -442,7 +460,9 @@ export class Files {
       id: this.#sandbox.id,
       path,
     });
-    return JSON.parse(view.json);
+    const value = parseJson(view.json);
+    if (!isFileInfo(value)) throw new ProtocolError("file stat response was invalid");
+    return value;
   }
   /** Delete a guest path, optionally recursively. */
   async delete(path: string, recursive = false): Promise<void> {
@@ -552,8 +572,55 @@ function mergeInfo(current: SandboxInfo, value: unknown): SandboxInfo {
   if (!isRecord(value)) throw new ProtocolError("sandbox response must be an object");
   return { ...current, ...value };
 }
+function networkPolicy(value: unknown): NetworkPolicy {
+  if (!isNetworkPolicy(value)) throw new ProtocolError("network response must be an object");
+  return value;
+}
+function isNetworkPolicy(value: unknown): value is NetworkPolicy {
+  return (
+    isRecord(value) &&
+    (value.block_network === undefined || typeof value.block_network === "boolean") &&
+    (value.cidr_allow === undefined ||
+      (Array.isArray(value.cidr_allow) &&
+        value.cidr_allow.every((entry) => typeof entry === "string"))) &&
+    (value.domain_allow === undefined ||
+      (Array.isArray(value.domain_allow) &&
+        value.domain_allow.every((entry) => typeof entry === "string")))
+  );
+}
+function isTunnelSet(value: unknown): value is TunnelSet {
+  if (
+    !isRecord(value) ||
+    (value.connect_token !== undefined && typeof value.connect_token !== "string")
+  )
+    return false;
+  if (value.tunnels === undefined) return true;
+  if (!isRecord(value.tunnels) || Array.isArray(value.tunnels)) return false;
+  for (const port in value.tunnels) {
+    const target = value.tunnels[port];
+    if (
+      !isRecord(target) ||
+      typeof target.host !== "string" ||
+      typeof target.port !== "number" ||
+      !Number.isInteger(target.port)
+    )
+      return false;
+  }
+  return true;
+}
 function isFileInfo(value: unknown): value is FileInfo {
-  return isRecord(value);
+  return (
+    isRecord(value) &&
+    (value.ok === undefined || typeof value.ok === "boolean") &&
+    (value.name === undefined || typeof value.name === "string") &&
+    (value.type === undefined || typeof value.type === "string") &&
+    (value.size === undefined || typeof value.size === "number") &&
+    (value.mode === undefined || typeof value.mode === "number") &&
+    (value.mtime === undefined || typeof value.mtime === "number")
+  );
+}
+function parseJson(text: string): unknown {
+  return JSON.parse(text);
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

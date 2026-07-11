@@ -1,4 +1,5 @@
-import { Code, type ConnectError } from "@connectrpc/connect";
+import type { ConnectError } from "@connectrpc/connect";
+import { Code } from "@connectrpc/connect";
 
 /** Structured server error fields. */
 export interface APIErrorShape {

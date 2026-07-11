@@ -1,7 +1,8 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { AsyncQueue, deferred } from "./async-queue";
 import { ProtocolError } from "./errors";
-import { type ExecInputSchema, type ExecOutput, Stream } from "./gen/vmon/v1/api_pb";
+import type { ExecInputSchema, ExecOutput } from "./gen/vmon/v1/api_pb";
+import { Stream } from "./gen/vmon/v1/api_pb";
 import type { EventRecord, ExecExit } from "./models";
 
 /** One decoded process output event. */
@@ -21,6 +22,7 @@ export type ExecInputInit = MessageInitShape<typeof ExecInputSchema>;
 /** Cancelable server-streaming RPC handle consumed by the stream wrappers. */
 export interface StreamHandle<T> {
   stream: AsyncIterable<T>;
+  /** Cancel the underlying RPC stream. */
   cancel(): void;
 }
 

@@ -58,6 +58,7 @@ export class Retries {
   /** Retry delay ceiling in seconds. */
   readonly maxDelay: number;
 
+  /** Validate and store an exponential-backoff policy. */
   constructor(options: RetriesOptions) {
     const { maxRetries, backoffCoefficient = 2.0, initialDelay = 1.0, maxDelay = 60.0 } = options;
     if (!Number.isInteger(maxRetries) || maxRetries < 0) {
@@ -152,10 +153,10 @@ interface SpawnState {
   session: WorkerSession | null;
 }
 
-interface MapCompletion<Result> {
+interface MapCompletion {
   index: number;
   ok: boolean;
-  value: Result | undefined;
+  value: JsonValue | undefined;
   error: unknown;
   output: OutputChunk[];
 }
@@ -381,7 +382,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
    * Run the handler on the warm cached session, streaming remote stdout and
    * stderr live. Dead sandboxes and sessions are recreated transparently.
    */
-  async remote(...args: Arguments): Promise<Result> {
+  remote(...args: Arguments): Promise<Result>;
+  async remote(...args: Arguments): Promise<unknown> {
     if (this.#generatorKind === "generator") {
       throw new TypeError("a generator function cannot be called with .remote(); use .remoteGen()");
     }
@@ -401,7 +403,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
    * the loop (or calling `return()`) kills that session; the next call
    * starts a fresh one.
    */
-  async *remoteGen(...args: Arguments): AsyncGenerator<RemoteYield<Result>, void, undefined> {
+  remoteGen(...args: Arguments): AsyncGenerator<RemoteYield<Result>, void, undefined>;
+  async *remoteGen(...args: Arguments): AsyncGenerator<unknown, void, undefined> {
     if (this.#generatorKind === "value") {
       throw new TypeError(
         "a non-generator function cannot be called with .remoteGen(); use .remote()",
@@ -424,7 +427,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
         });
         for await (const item of stream) {
           yielded = true;
-          yield item as RemoteYield<Result>;
+          yield item;
         }
         return;
       } catch (error) {
@@ -454,7 +457,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
    * handle immediately. Remote output is buffered and replayed by
    * {@link FunctionCall.get}.
    */
-  async spawn(...args: Arguments): Promise<FunctionCall<Result>> {
+  spawn(...args: Arguments): Promise<FunctionCall<Result>>;
+  async spawn(...args: Arguments): Promise<FunctionCall<unknown>> {
     if (this.#generatorKind === "generator") {
       throw new TypeError("cannot spawn a generator function; use .remoteGen()");
     }
@@ -501,7 +505,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
         }
       }
     })();
-    return new FunctionCall<Result>(outcome, state, output, (chunks) =>
+    return new FunctionCall(outcome, state, output, (chunks) =>
       this.#forwardOutput(chunks),
     );
   }
@@ -514,8 +518,12 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
    */
   map(
     inputs: Iterable<Arguments[0]> | AsyncIterable<Arguments[0]>,
+    options?: RemoteMapOptions,
+  ): AsyncGenerator<Result, void, undefined>;
+  map(
+    inputs: Iterable<Arguments[0]> | AsyncIterable<Arguments[0]>,
     options: RemoteMapOptions = {},
-  ): AsyncGenerator<Result, void, undefined> {
+  ): AsyncGenerator<unknown, void, undefined> {
     if (this.#generatorKind === "generator") {
       throw new TypeError("a generator function cannot be mapped; use .remoteGen() per input");
     }
@@ -528,8 +536,12 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
   /** {@link map} over argument tuples, spread into the handler. */
   starmap(
     inputs: Iterable<Arguments> | AsyncIterable<Arguments>,
+    options?: RemoteMapOptions,
+  ): AsyncGenerator<Result, void, undefined>;
+  starmap(
+    inputs: Iterable<Arguments> | AsyncIterable<Arguments>,
     options: RemoteMapOptions = {},
-  ): AsyncGenerator<Result, void, undefined> {
+  ): AsyncGenerator<unknown, void, undefined> {
     if (this.#generatorKind === "generator") {
       throw new TypeError("a generator function cannot be mapped; use .remoteGen() per input");
     }
@@ -573,14 +585,14 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     args: JsonValue[],
     timeout: number | null,
     output: SessionOutputSink,
-  ): Promise<Result> {
+  ): Promise<JsonValue> {
     let infraFailures = 0;
     let retriesUsed = 0;
     while (true) {
       try {
         const session = await target.acquire();
         const value = await session.callValue({ spec, args, timeout, output });
-        return value as Result;
+        return value;
       } catch (error) {
         const kind = classifyFailure(error);
         if (kind === "infra" && infraFailures < MAX_INFRA_FAILURES) {
@@ -605,7 +617,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
   async *#mapEngine(
     items: AsyncIterator<JsonValue[]>,
     options: RemoteMapOptions,
-  ): AsyncGenerator<Result, void, undefined> {
+  ): AsyncGenerator<unknown, void, undefined> {
     const cap = options.concurrency ?? DEFAULT_MAP_CONCURRENCY;
     if (!Number.isInteger(cap) || cap < 1) {
       throw new RangeError("concurrency must be an integer >= 1");
@@ -615,7 +627,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     const timeout = options.timeout ?? this.#timeout;
     const spec = await this.#wireSpec();
 
-    const completions = new AsyncChannel<MapCompletion<Result>>();
+    const completions = new AsyncChannel<MapCompletion>();
     const liveSessions = new Set<WorkerSession>();
     const workers: Promise<void>[] = [];
     let nextIndex = 0;
@@ -718,12 +730,12 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
       task.catch(() => undefined);
     };
 
-    const heldBack = new Map<number, MapCompletion<Result>>();
+    const heldBack = new Map<number, MapCompletion>();
     let emitIndex = 0;
-    const deliver = (completion: MapCompletion<Result>): Result => {
+    const deliver = (completion: MapCompletion): unknown => {
       this.#forwardOutput(completion.output);
       if (!completion.ok && !returnExceptions) throw completion.error;
-      return (completion.ok ? completion.value : completion.error) as Result;
+      return completion.ok ? completion.value : completion.error;
     };
     try {
       startWorker();
@@ -734,7 +746,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
         }
         heldBack.set(completion.index, completion);
         while (heldBack.has(emitIndex)) {
-          const next = heldBack.get(emitIndex) as MapCompletion<Result>;
+          const next = heldBack.get(emitIndex);
+          if (next === undefined) break;
           heldBack.delete(emitIndex);
           emitIndex += 1;
           yield deliver(next);
@@ -755,8 +768,8 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
     wrap: (item: Item) => unknown[],
   ): AsyncIterator<JsonValue[]> {
     async function* encode(): AsyncGenerator<JsonValue[], void, undefined> {
-      for await (const item of inputs as AsyncIterable<Item>) {
-        yield checkedJsonValue(wrap(item), "remote function arguments", new Set()) as JsonValue[];
+      for await (const item of inputs) {
+        yield checkedJsonArray(wrap(item), "remote function arguments");
       }
     }
     return encode()[Symbol.asyncIterator]();
@@ -880,7 +893,7 @@ export class RemoteFunction<Arguments extends unknown[] = JsonValue[], Result = 
   }
 
   #encodeArgs(args: unknown[]): JsonValue[] {
-    return checkedJsonValue(args, "remote function arguments", new Set()) as JsonValue[];
+    return checkedJsonArray(args, "remote function arguments");
   }
 
   #liveSink(): SessionOutputSink {
@@ -968,6 +981,29 @@ function checkedSourceSpec(spec: RemoteFunctionSourceSpec): RemoteFunctionSource
   return { source: spec.source, exportName: spec.exportName };
 }
 
+function checkedJsonArray(value: unknown[], path: string): JsonValue[] {
+  return checkedJsonArrayValue(value, path, new Set());
+}
+
+function checkedJsonArrayValue(
+  value: unknown[],
+  path: string,
+  active: Set<object>,
+): JsonValue[] {
+  if (active.has(value)) throw new TypeError(`${path} contains a cycle`);
+  active.add(value);
+  try {
+    const result: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!(index in value)) throw new TypeError(`${path} contains a sparse array`);
+      result.push(checkedJsonValue(value[index], `${path}[${index}]`, active));
+    }
+    return result;
+  } finally {
+    active.delete(value);
+  }
+}
+
 function checkedJsonValue(value: unknown, path: string, active: Set<object>): JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return value;
@@ -978,6 +1014,7 @@ function checkedJsonValue(value: unknown, path: string, active: Set<object>): Js
     }
     return value;
   }
+  if (Array.isArray(value)) return checkedJsonArrayValue(value, path, active);
   if (typeof value !== "object") {
     throw new TypeError(`${path} contains a non-JSON value`);
   }
@@ -986,16 +1023,6 @@ function checkedJsonValue(value: unknown, path: string, active: Set<object>): Js
   }
   active.add(value);
   try {
-    if (Array.isArray(value)) {
-      const result: JsonValue[] = [];
-      for (let index = 0; index < value.length; index += 1) {
-        if (!(index in value)) {
-          throw new TypeError(`${path} contains a sparse array`);
-        }
-        result.push(checkedJsonValue(value[index], `${path}[${index}]`, active));
-      }
-      return result;
-    }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
       throw new TypeError(`${path} contains a non-plain object`);

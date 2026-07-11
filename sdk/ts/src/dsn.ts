@@ -29,7 +29,7 @@ export function parseDsn(input?: string | null, options: ParseDsnOptions = {}): 
   if (!dsn) {
     dsn = env.VMON_DSN?.trim();
     if (!dsn && env.VMON_CONTEXT) dsn = `vmon+context://${env.VMON_CONTEXT}`;
-    if (!dsn) dsn = `vmon+unix://${vmonHome()}/vmond.sock`;
+    if (!dsn) dsn = browserOrigin() ?? `vmon+unix://${vmonHome()}/vmond.sock`;
   }
   const queryAt = dsn.indexOf("?");
   const rawBase = queryAt < 0 ? dsn : dsn.slice(0, queryAt);
@@ -98,4 +98,13 @@ function normalizeHttpUrl(value: string): string {
 function hasPort(host: string): boolean {
   if (host.startsWith("[")) return /^\[[^\]]+\]:\d+$/.test(host);
   return /:\d+$/.test(host);
+}
+
+function browserOrigin(): string | undefined {
+  if (
+    typeof location === "undefined" ||
+    (location.protocol !== "http:" && location.protocol !== "https:")
+  )
+    return undefined;
+  return location.origin;
 }

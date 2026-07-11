@@ -46,6 +46,22 @@ test("resolves context DSNs and context token", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+test("defaults browser clients to the page origin", () => {
+  delete process.env.VMON_DSN;
+  delete process.env.VMON_CONTEXT;
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: new URL("https://console.example/sandboxes"),
+  });
+  try {
+    expect(parseDsn().endpoints).toEqual([{ url: "https://console.example" }]);
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "location", descriptor);
+    else Reflect.deleteProperty(globalThis, "location");
+  }
+});
+
 test("rejects malformed and unsupported DSNs", () => {
   for (const value of [
     "vmon://a?wat=1",
