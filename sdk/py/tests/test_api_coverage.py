@@ -7,7 +7,7 @@ import pytest
 from v1_stub import V1StubServer, configure_context
 
 import vmon
-from vmon import APIError, connect
+from vmon import APIError, ProtocolError, connect
 
 
 def test_client_root_operations_stream_events_and_send_bearer_auth(monkeypatch, mvm_home) -> None:
@@ -16,12 +16,14 @@ def test_client_root_operations_stream_events_and_send_bearer_auth(monkeypatch, 
         configure_context(monkeypatch, mvm_home, server)
 
         with connect() as client:
-            assert client.health() == {"ok": True}
+            assert client.health().ok is True
             assert client.info().version == "test"
             assert "vmon_test_total 1" in client.metrics()
             assert client.snapshots.list() == []
             with client.events() as stream:
-                assert list(stream) == [{"type": "ready", "sequence": 1}]
+                events = list(stream)
+                assert events[0]["type"] == "ready"
+                assert events[0]["sequence"] == 1
 
         http_paths = {"/healthz", "/metrics"}
         checked = [request for request in server.requests if request.path in http_paths]
@@ -29,6 +31,36 @@ def test_client_root_operations_stream_events_and_send_bearer_auth(monkeypatch, 
         assert all(request.headers["authorization"] == "Bearer test-token" for request in checked)
         for method in ("SystemService/Info", "SystemService/Events", "SnapshotService/List"):
             assert server.last_rpc(method).headers["authorization"] == "Bearer test-token"
+
+
+def test_typed_responses_reject_malformed_payloads(monkeypatch, mvm_home) -> None:
+    with V1StubServer() as server:
+        configure_context(monkeypatch, mvm_home, server)
+        with connect() as client:
+            for response in ({}, [], None):
+                server.health_response = response
+                with pytest.raises(ProtocolError):
+                    client.health()
+
+            sandbox = client.sandboxes.create(name="malformed")
+            for response in ([], None):
+                server.sandbox_metrics_response = response
+                with pytest.raises(ProtocolError):
+                    sandbox.metrics()
+
+            server.events = [[]]
+            with client.events() as stream, pytest.raises(ProtocolError):
+                list(stream)
+
+            server.sandboxes["malformed"]["network"] = {"block_network": "false"}
+            with pytest.raises(ProtocolError):
+                sandbox.network()
+
+            server.sandboxes["malformed"]["tunnels"] = {
+                "8080": {"host": "127.0.0.1", "port": "bad"}
+            }
+            with pytest.raises(ProtocolError):
+                sandbox.tunnels()
 
 
 def test_pool_namespace_escapes_references_and_owns_resources(monkeypatch, mvm_home) -> None:
@@ -65,27 +97,25 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             assert create_request.json["context"] == "."
             assert create_request.json["name"] == "box/name"
 
-            assert sandbox.network() == {
-                "block_network": False,
-                "cidr_allow": [],
-                "domain_allow": [],
-            }
-            assert sandbox.set_network(
+            policy = sandbox.network()
+            assert policy.block_network is False
+            assert policy.cidr_allow == ()
+            assert policy.domain_allow == ()
+            updated_policy = sandbox.set_network(
                 {
                     "block_network": True,
                     "cidr_allow": ["10.0.0.0/8"],
                     "domain_allow": ["example.com"],
                 }
-            ) == {
-                "block_network": True,
-                "cidr_allow": ["10.0.0.0/8"],
-                "domain_allow": ["example.com"],
-            }
+            )
+            assert updated_policy.block_network is True
+            assert updated_policy.cidr_allow == ("10.0.0.0/8",)
+            assert updated_policy.domain_allow == ("example.com",)
             assert sandbox.migrate("node-b").node == "node-b"
             assert sandbox.pause().status == "paused"
             assert sandbox.resume().status == "running"
             assert sandbox.extend(15).raw["deadline_unix"] == 1_800_000_000
-            assert sandbox.metrics() == {"vcpu_exits": 7}
+            assert sandbox.metrics()["vcpu_exits"] == 7
 
             assert sandbox.snapshot("base/snapshot") == "base/snapshot"
             assert client.snapshots.list() == ["base/snapshot"]
@@ -143,7 +173,10 @@ def test_exec_files_attach_logs_tunnels_and_port_proxies(monkeypatch, mvm_home) 
                 assert list(logs) == ["created\n"]
             assert sandbox.logs() == "created\n"
 
-            assert sandbox.tunnels() == {8080: ("127.0.0.1", 48080)}
+            tunnels = sandbox.tunnels()
+            assert tunnels.connect_token == "token-streams"
+            assert tunnels[8080].host == "127.0.0.1"
+            assert tunnels[8080].port == 48080
             methods = ["GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH"]
             for method in methods:
                 response = sandbox.ports.http(

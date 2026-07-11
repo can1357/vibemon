@@ -356,8 +356,6 @@ export class MeshDriver implements Driver {
   #transportFor(entry: RosterEntry): Transport {
     const cached = this.#transports.get(entry.url);
     if (cached) return cached;
-    if (entry.unix && !this.#transportFactory)
-      throw new TransportError("gRPC bridge over UDS is not supported");
     const transport = this.#transportFactory
       ? this.#transportFactory(entry.url)
       : createWsBridgeTransport({
@@ -397,19 +395,13 @@ export class MeshDriver implements Driver {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.#timeout);
     try {
-      const init: RequestInit & { unix?: string } = {
+      return await this.#fetch(url, {
         method,
         headers,
         body,
         signal: controller.signal,
-      };
-      if (entry.unix) {
-        if (typeof Bun === "undefined") throw new Error("UDS endpoints require Bun");
-        init.unix = entry.unix;
-      }
-      return await this.#fetch(url, init);
+      });
     } catch (error) {
-      if (entry.unix && typeof Bun === "undefined") throw error;
       throw new TransportError(`request to ${entry.url} failed`, { cause: error });
     } finally {
       clearTimeout(timer);
@@ -425,12 +417,6 @@ export class MeshDriver implements Driver {
     const candidates = this.#candidates(options.endpoint);
     for (const entry of candidates) {
       if (entry.failedUntil > this.#now() && candidates.length > 1) continue;
-      if (entry.unix) {
-        last = new TransportError(
-          "WebSocket over UDS is not supported by the global WebSocket implementation",
-        );
-        continue;
-      }
       const url = new URL(path.startsWith("/") ? `${entry.url}${path}` : `${entry.url}/${path}`);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       if (options.query instanceof URLSearchParams) {

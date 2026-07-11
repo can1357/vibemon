@@ -9,10 +9,11 @@ import json
 import os
 import sys
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import ModuleType
-from typing import Callable, Literal
+from typing import Literal
 
 MANIFEST_PATH = "vmon-package.json"
 PYTHON_ABI = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"

@@ -11,26 +11,35 @@ import {
 
 interface RecordedRpc {
   method: string;
-  input: Record<string, unknown>;
+  input: object;
+}
+
+interface FakeState {
+  view: unknown;
+  rows: unknown[];
+  snapshots: string[];
+  volumes: string[];
+  logs: string[];
+  events: unknown[];
 }
 
 /** In-memory vmon gRPC surface with canned per-call responses. */
 function fakeVmon() {
   const rpcs: RecordedRpc[] = [];
-  const state = {
-    view: {} as unknown,
-    rows: [] as unknown[],
-    snapshots: [] as string[],
-    volumes: [] as string[],
-    logs: [] as string[],
-    events: [] as unknown[],
+  const state: FakeState = {
+    view: {},
+    rows: [],
+    snapshots: [],
+    volumes: [],
+    logs: [],
+    events: [],
   };
   const view = (method: string, input: object) => {
-    rpcs.push({ method, input: input as Record<string, unknown> });
+    rpcs.push({ method, input });
     return { json: JSON.stringify(state.view) };
   };
   const record = (method: string, input: object) => {
-    rpcs.push({ method, input: input as Record<string, unknown> });
+    rpcs.push({ method, input });
     return {};
   };
   const router = createRouterTransport(({ service }) => {
@@ -38,7 +47,7 @@ function fakeVmon() {
       create: (req) => view("Create", req),
       get: (req) => view("Get", req),
       list: (req) => {
-        rpcs.push({ method: "List", input: req as unknown as Record<string, unknown> });
+        rpcs.push({ method: "List", input: req });
         return { sandboxesJson: state.rows.map((row) => JSON.stringify(row)) };
       },
       stop: (req) => view("Stop", req),
@@ -49,15 +58,15 @@ function fakeVmon() {
       extend: (req) => view("Extend", req),
       metrics: (req) => view("Metrics", req),
       execCapture: (req) => {
-        rpcs.push({ method: "ExecCapture", input: req as unknown as Record<string, unknown> });
+        rpcs.push({ method: "ExecCapture", input: req });
         return { code: 0n, stdout: new Uint8Array(), stderr: new Uint8Array() };
       },
       async *logs(req) {
-        rpcs.push({ method: "Logs", input: req as unknown as Record<string, unknown> });
+        rpcs.push({ method: "Logs", input: req });
         for (const line of state.logs) yield { data: new TextEncoder().encode(line) };
       },
       fileRead: (req) => {
-        rpcs.push({ method: "FileRead", input: req as unknown as Record<string, unknown> });
+        rpcs.push({ method: "FileRead", input: req });
         return { data: new TextEncoder().encode("data") };
       },
       fileWrite: (req) => record("FileWrite", req),
@@ -97,6 +106,10 @@ function fakeVmon() {
   return { rpcs, state, transport: () => router };
 }
 
+function inputField(call: RecordedRpc | undefined, name: string): unknown {
+  return call === undefined ? undefined : Reflect.get(call.input, name);
+}
+
 test("resource hierarchy maps RPCs and views", async () => {
   const { rpcs, state, transport } = fakeVmon();
   const httpCalls: URL[] = [];
@@ -117,7 +130,7 @@ test("resource hierarchy maps RPCs and views", async () => {
   expect(sandbox.id).toBe("s1");
   const created = rpcs.at(-1);
   expect(created?.method).toBe("Create");
-  expect(JSON.parse(String(created?.input.specJson))).toEqual({ image: "alpine" });
+  expect(JSON.parse(String(inputField(created, "specJson")))).toEqual({ image: "alpine" });
 
   await sandbox.run(["echo", "ok"]);
   expect(rpcs.at(-1)).toMatchObject({ method: "ExecCapture", input: { id: "s1" } });
@@ -160,8 +173,8 @@ test("resource hierarchy maps RPCs and views", async () => {
   await client.snapshots.restore("snap", { name: "copy" });
   const restored = rpcs.at(-1);
   expect(restored?.method).toBe("Restore");
-  expect(restored?.input.name).toBe("snap");
-  expect(JSON.parse(String(restored?.input.bodyJson))).toEqual({ name: "copy" });
+  expect(inputField(restored, "name")).toBe("snap");
+  expect(JSON.parse(String(inputField(restored, "bodyJson")))).toEqual({ name: "copy" });
   state.view = { clones: [{ id: "clone-1" }] };
   expect((await client.snapshots.fork("snap", { count: 1 })).map((clone) => clone.id)).toEqual([
     "clone-1",
@@ -181,8 +194,11 @@ test("resource hierarchy maps RPCs and views", async () => {
   await client.pools.set("image", 2, { image: "alpine" });
   const poolSet = rpcs.at(-1);
   expect(poolSet?.method).toBe("PoolSet");
-  expect(poolSet?.input.reference).toBe("image");
-  expect(JSON.parse(String(poolSet?.input.bodyJson))).toEqual({ image: "alpine", size: 2 });
+  expect(inputField(poolSet, "reference")).toBe("image");
+  expect(JSON.parse(String(inputField(poolSet, "bodyJson")))).toEqual({
+    image: "alpine",
+    size: 2,
+  });
   state.view = { image: { size: 2 }, other: { size: 1 } };
   expect((await client.pools.list()).map((pool) => pool.ref)).toEqual(["image", "other"]);
   const beforeClear = rpcs.length;
@@ -191,7 +207,7 @@ test("resource hierarchy maps RPCs and views", async () => {
     rpcs
       .slice(beforeClear)
       .filter((call) => call.method === "PoolDelete")
-      .map((call) => call.input.reference),
+      .map((call) => inputField(call, "reference")),
   ).toEqual(["image", "other"]);
 
   state.view = { self: { node_id: "a" }, peers: [{ node_id: "b" }], replicas_held: 0 };
@@ -205,6 +221,50 @@ test("pool list rejects malformed server data", async () => {
     state.view = response;
     await expect(client.pools.list()).rejects.toBeInstanceOf(ProtocolError);
   }
+});
+
+test("typed response models reject malformed payloads", async () => {
+  const { state, transport } = fakeVmon();
+  let health: unknown = {};
+  const client = new Client(
+    new MeshDriver("http://node-a", {
+      discover: false,
+      transport,
+      fetch: () =>
+        Promise.resolve(
+          new Response(JSON.stringify(health), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+    }),
+  );
+
+  for (const response of [{}, [], null]) {
+    health = response;
+    await expect(client.health()).rejects.toBeInstanceOf(ProtocolError);
+  }
+
+  state.view = {};
+  await expect(client.info()).rejects.toBeInstanceOf(ProtocolError);
+  await expect(client.sandboxes.create({ image: "alpine" })).rejects.toBeInstanceOf(
+    ProtocolError,
+  );
+  state.rows = [null];
+  await expect(client.sandboxes.list()).rejects.toBeInstanceOf(ProtocolError);
+  await expect(client.mesh.status()).rejects.toBeInstanceOf(ProtocolError);
+
+  const sandbox = client.sandboxes.ref("box");
+  state.view = [];
+  await expect(sandbox.metrics()).rejects.toBeInstanceOf(ProtocolError);
+  state.view = { block_network: "false" };
+  await expect(sandbox.network()).rejects.toBeInstanceOf(ProtocolError);
+  state.view = { tunnels: { "8080": { host: "127.0.0.1", port: "bad" } } };
+  await expect(sandbox.tunnels()).rejects.toBeInstanceOf(ProtocolError);
+
+  state.events = [[]];
+  const events = await client.events();
+  await expect(events[Symbol.asyncIterator]().next()).rejects.toBeInstanceOf(ProtocolError);
 });
 
 test("RPC failures map to APIError via the vmon-code trailer with gRPC-code fallback", async () => {

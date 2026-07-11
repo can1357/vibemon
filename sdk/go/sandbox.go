@@ -225,14 +225,14 @@ func (sandbox *Sandbox) FollowLogs(ctx context.Context) (*LogStream, error) {
 }
 
 // Metrics retrieves resource utilization metrics for the sandbox.
-func (sandbox *Sandbox) Metrics(ctx context.Context) (map[string]any, error) {
+func (sandbox *Sandbox) Metrics(ctx context.Context) (SandboxMetrics, error) {
 	body, err := sandbox.view(ctx, "get metrics", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Metrics(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
 	})
 	if err != nil {
-		return nil, err
+		return SandboxMetrics{}, err
 	}
-	var out map[string]any
+	var out SandboxMetrics
 	err = decodeJSONView(body, "get metrics", &out)
 	return out, err
 }

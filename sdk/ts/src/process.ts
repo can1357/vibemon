@@ -1,6 +1,6 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { AsyncQueue, deferred } from "./async-queue";
-import { ProtocolError } from "./errors";
+import { parseResponseJson, ProtocolError } from "./errors";
 import type { ExecInputSchema, ExecOutput } from "./gen/vmon/v1/api_pb";
 import { Stream } from "./gen/vmon/v1/api_pb";
 import type { EventRecord, ExecExit } from "./models";
@@ -188,8 +188,9 @@ export class EventStream implements AsyncIterable<EventRecord> {
   /** Iterate decoded daemon events. */
   async *[Symbol.asyncIterator](): AsyncIterator<EventRecord> {
     for await (const view of this.#handle.stream) {
-      const parsed: unknown = JSON.parse(view.json);
-      if (!isRecord(parsed)) throw new ProtocolError("event document must be an object");
+      const parsed = parseResponseJson(view.json);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new ProtocolError("event document must be an object");
       yield parsed;
     }
   }
@@ -227,7 +228,4 @@ function streamName(stream: Stream): "stdout" | "stderr" | "console" {
     default:
       throw new ProtocolError("unknown output stream");
   }
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

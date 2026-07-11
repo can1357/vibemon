@@ -6,6 +6,7 @@ All notable changes to this project are recorded here.
 
 ### Breaking Changes
 
+- Removed support for `vmon+unix://` DSN transport in the TypeScript SDK
 - Replaced `value` fields in `CreateCallRequest` with structured `payload` unions
 - Removed raw TCP transport; HTTP gateway is the only supported remote protocol
 - Removed `mesh.json` client configuration; named contexts are now required
@@ -157,6 +158,9 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated SDK health, info, and event response handling to enforce strict object validation
+- Upgraded `Sandbox.network` and `Sandbox.set_network` in SDKs to use typed `SandboxNetworkPolicy`
+- Changed SDK `Sandbox.tunnels` to return a `TunnelSet` object containing host/port targets
 - Updated `App.function` decorators to accept and propagate network policy configurations
 - Standardized local actor method invocation and lifecycle hook ordering
 - Updated internal runner protocols to strictly validate I-JSON numeric types and object keys
@@ -220,6 +224,9 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed SDK JSON decoding to enforce strict object structures and reject malformed payloads
+- Fixed SDK `Sandbox.metrics` and `Sandbox.tunnels` to return typed objects instead of generic maps
+- Fixed `vmon+unix` DSN support removal in TS SDK, defaulting to `http://127.0.0.1:8000`
 - Fixed `BatchCall` to prevent silent discard of terminal cancellation events
 - Fixed durability of asynchronous task cancellation for remote function calls
 - Fixed application schedule registration to correctly pin function revisions

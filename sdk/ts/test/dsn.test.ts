@@ -19,9 +19,6 @@ test("parses all DSN schemes and precedence", () => {
   });
   expect(parseDsn("vmons://a").endpoints[0]?.url).toBe("https://a:8000");
   expect(parseDsn("http://a:12/root/").endpoints).toEqual([{ url: "http://a:12/root" }]);
-  expect(parseDsn("vmon+unix:///tmp/vmond.sock").endpoints).toEqual([
-    { url: "http://localhost", unix: "/tmp/vmond.sock" },
-  ]);
   process.env.VMON_API_TOKEN = "env";
   expect(parseDsn("https://a", { token: "explicit" }).token).toBe("explicit");
 });
@@ -44,6 +41,16 @@ test("resolves context DSNs and context token", () => {
     context: "dev",
   });
   rmSync(home, { recursive: true, force: true });
+});
+
+test("defaults non-browser clients to the local TCP endpoint", () => {
+  delete process.env.VMON_DSN;
+  delete process.env.VMON_CONTEXT;
+  expect(parseDsn()).toMatchObject({
+    endpoints: [{ url: "http://127.0.0.1:8000" }],
+    discover: true,
+    timeout: 60,
+  });
 });
 
 test("defaults browser clients to the page origin", () => {
@@ -69,7 +76,7 @@ test("rejects malformed and unsupported DSNs", () => {
     "vmon://a?timeout=no",
     "http://u:p@a",
     "ftp://a",
-    "vmon+unix://relative.sock",
+    "vmon+unix:///tmp/vmond.sock",
   ])
     expect(() => parseDsn(value)).toThrow();
   expect(() => parseDsn("vmon://a?wat=1")).toThrow("invalid DSN parameter wat");

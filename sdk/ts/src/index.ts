@@ -46,6 +46,7 @@ export type {
   RestoreRequest,
   SandboxCreateRequest,
   SandboxInfo,
+  SandboxMetrics,
   ServerInfo,
   SnapshotFilesystemRequest,
   SnapshotRequest,
@@ -84,6 +85,7 @@ export {
   encodeValue,
   type PortableValue,
   type ValueArtifactStore,
+  parseJsonValue,
   type ValueCompressionName,
   type ValueSerializerName,
 } from "./function-values";

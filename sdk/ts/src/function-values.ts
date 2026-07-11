@@ -9,6 +9,11 @@ export type PortableValue =
   | string
   | PortableValue[]
   | { [key: string]: PortableValue };
+
+/** Parse one strict JSON value without widening it to `any`. */
+export function parseJsonValue(text: string): PortableValue {
+  return new JsonReader(text).parse();
+}
 /** Portable serializers supported by this SDK. */
 export type ValueSerializerName = "json" | "cbor";
 /** Compression supported by the portable value codec. */

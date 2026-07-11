@@ -1,7 +1,4 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Code, ConnectError, createRouterTransport, type Transport } from "@connectrpc/connect";
 import { APIError, Client, MeshDriver, Sandbox, TransportError } from "../src";
 import { SandboxService, SystemService } from "../src/gen/vmon/v1/api_pb";
@@ -165,21 +162,3 @@ test("sandbox transparently relocates once after pinned not_found", async () => 
   await expect(absent.refresh()).rejects.toBeInstanceOf(APIError);
 });
 
-test("uses Bun's unix fetch transport for vmon+unix DSNs", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "vmon-ts-uds-"));
-  const socket = join(directory, "vmond.sock");
-  const server = Bun.serve({
-    unix: socket,
-    fetch: () => json({ transport: "unix" }),
-  });
-  servers.push(server);
-  try {
-    const driver = new MeshDriver(`vmon+unix://${socket}?discover=off`);
-    expect(await (await driver.request("GET", "/healthz")).json()).toEqual({ transport: "unix" });
-  } finally {
-    server.stop(true);
-    const index = servers.indexOf(server);
-    if (index >= 0) servers.splice(index, 1);
-    rmSync(directory, { recursive: true, force: true });
-  }
-});

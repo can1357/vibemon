@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from .errors import ProtocolError
 
 
 def _raw(data: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -234,3 +236,158 @@ class ServerInfo:
             capabilities=capabilities,
             raw=_raw(data),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Health:
+    """Daemon health state with the original response retained."""
+
+    ok: bool
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Health:
+        """Parse a health response, requiring its boolean status."""
+        ok = data.get("ok")
+        if not isinstance(ok, bool):
+            raise ProtocolError("health response did not include a boolean ok field")
+        return cls(ok=ok, raw=_raw(data))
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SandboxMetrics(Mapping[str, Any]):
+    """Open sandbox runtime metrics exposed as a read-only mapping."""
+
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SandboxMetrics:
+        """Preserve every runtime metric supplied by the daemon."""
+        return cls(raw=_raw(data))
+
+    def __getitem__(self, key: str) -> Any:
+        return self.raw[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.raw)
+
+    def __len__(self) -> int:
+        return len(self.raw)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxNetworkPolicy:
+    """A sandbox's egress policy and allowlists."""
+
+    block_network: bool | None = None
+    cidr_allow: tuple[str, ...] = ()
+    domain_allow: tuple[str, ...] = ()
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SandboxNetworkPolicy:
+        """Parse network-policy fields and reject malformed allowlists."""
+        block_network = data.get("block_network")
+        if block_network is not None and not isinstance(block_network, bool):
+            raise ProtocolError("network policy block_network field must be boolean")
+        return cls(
+            block_network=block_network,
+            cidr_allow=_string_tuple(data.get("cidr_allow"), "cidr_allow"),
+            domain_allow=_string_tuple(data.get("domain_allow"), "domain_allow"),
+            raw=_raw(data),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the request body for replacing this network policy."""
+        value: dict[str, object] = {
+            "cidr_allow": list(self.cidr_allow),
+            "domain_allow": list(self.domain_allow),
+        }
+        if self.block_network is not None:
+            value["block_network"] = self.block_network
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class TunnelTarget:
+    """One daemon-side TCP target for an exposed guest port."""
+
+    host: str
+    port: int
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class TunnelSet(Mapping[int, TunnelTarget]):
+    """Sandbox tunnels plus the short-lived port-proxy token."""
+
+    tunnels: dict[int, TunnelTarget] = field(default_factory=dict)
+    connect_token: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TunnelSet:
+        """Parse every advertised tunnel and reject incomplete targets."""
+        token = data.get("connect_token")
+        if token is not None and not isinstance(token, str):
+            raise ProtocolError("tunnel response connect_token field must be a string")
+        raw_tunnels = data.get("tunnels", {})
+        if not isinstance(raw_tunnels, Mapping):
+            raise ProtocolError("tunnel response tunnels field must be an object")
+        tunnels: dict[int, TunnelTarget] = {}
+        for raw_guest_port, raw_target in raw_tunnels.items():
+            if isinstance(raw_guest_port, bool) or not isinstance(raw_guest_port, int | str):
+                raise ProtocolError("tunnel response included an invalid guest port")
+            if not isinstance(raw_target, Mapping):
+                raise ProtocolError("tunnel response included an invalid target")
+            host = raw_target.get("host")
+            raw_host_port = raw_target.get("port")
+            if (
+                not isinstance(host, str)
+                or isinstance(raw_host_port, bool)
+                or not isinstance(raw_host_port, int)
+            ):
+                raise ProtocolError("tunnel response included an invalid target")
+            try:
+                guest_port = int(raw_guest_port)
+            except ValueError as exc:
+                raise ProtocolError("tunnel response included an invalid guest port") from exc
+            tunnels[guest_port] = TunnelTarget(host=host, port=raw_host_port)
+        return cls(tunnels=tunnels, connect_token=token, raw=_raw(data))
+
+    def __getitem__(self, port: int) -> TunnelTarget:
+        return self.tunnels[port]
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.tunnels)
+
+    def __len__(self) -> int:
+        return len(self.tunnels)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class EventRecord(Mapping[str, Any]):
+    """One open-ended daemon lifecycle event."""
+
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EventRecord:
+        """Preserve an event document for forward-compatible consumers."""
+        return cls(raw=_raw(data))
+
+    def __getitem__(self, key: str) -> Any:
+        return self.raw[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.raw)
+
+    def __len__(self) -> int:
+        return len(self.raw)
+
+
+def _string_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ProtocolError(f"network policy {field_name} field must be a string array")
+    return tuple(value)

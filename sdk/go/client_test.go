@@ -114,11 +114,50 @@ func TestClientServicesAndBoundSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metrics["cpu"] != float64(1) || metricsID != "box" {
-		t.Fatalf("metrics=%v id=%q", metrics, metricsID)
+	cpu, ok := metrics.Float64("cpu")
+	if !ok || cpu != 1 || metricsID != "box" {
+		t.Fatalf("metrics=%v id=%q", metrics.Values, metricsID)
 	}
 	if sandbox.endpoint != "http://127.0.0.1:1" {
 		t.Fatalf("sandbox affinity=%q", sandbox.endpoint)
+	}
+}
+
+func TestTypedResponsesRejectMalformedPayloads(t *testing.T) {
+	for _, body := range []string{"{}", "[]", "null", "not-json"} {
+		t.Run("health "+body, func(t *testing.T) {
+			driver := &stubDriver{do: func(context.Context, DriverRequest) (*http.Response, string, error) {
+				return jsonResponse(http.StatusOK, body), "http://node", nil
+			}}
+			_, err := NewClient(driver).Health(context.Background())
+			var protocolErr *ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+		})
+	}
+
+	if _, err := decodeEvent([]byte("[]")); err == nil {
+		t.Fatal("event array was accepted")
+	}
+
+	stub := &sandboxServiceStub{
+		create: func(context.Context, *pb.CreateSandboxRequest) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+		},
+		metrics: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+			return &pb.JsonView{Json: "null"}, nil
+		},
+	}
+	client := bufconnClient(t, startSandboxServiceStub(t, stub))
+	sandbox, err := client.Sandboxes.Create(context.Background(), SandboxCreateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = sandbox.Metrics(context.Background())
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("error=%T %v", err, err)
 	}
 }
 

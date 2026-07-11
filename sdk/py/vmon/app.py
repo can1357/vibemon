@@ -21,8 +21,8 @@ from .options import (
     RetryPolicy,
     SerializerPolicy,
 )
-from .values import ValueCodec
 from .v1 import api_pb2
+from .values import ValueCodec
 
 if TYPE_CHECKING:
     from .remote import RemoteFunction
@@ -146,7 +146,7 @@ class App:
         return definition
 
     @overload
-    def function(self, fn: Callable[P, R], /) -> "RemoteFunction[P, R]": ...
+    def function(self, fn: Callable[P, R], /) -> RemoteFunction[P, R]: ...
 
     @overload
     def function(
@@ -186,7 +186,7 @@ class App:
         include: Iterable[str] = (),
         exclude: Iterable[str] = (),
         local_packages: Iterable[str] = (),
-    ) -> Callable[[Callable[P, R]], "RemoteFunction[P, R]"]: ...
+    ) -> Callable[[Callable[P, R]], RemoteFunction[P, R]]: ...
 
     def function(
         self,
@@ -225,12 +225,12 @@ class App:
         include: Iterable[str] = (),
         exclude: Iterable[str] = (),
         local_packages: Iterable[str] = (),
-    ) -> "RemoteFunction[P, R] | Callable[[Callable[P, R]], RemoteFunction[P, R]]":
+    ) -> RemoteFunction[P, R] | Callable[[Callable[P, R]], RemoteFunction[P, R]]:
         """Decorate and add a function using the standard typed option surface."""
 
         from .remote import function
 
-        def decorate(inner: Callable[P, R]) -> "RemoteFunction[P, R]":
+        def decorate(inner: Callable[P, R]) -> RemoteFunction[P, R]:
             configured = function(
                 client=self.client,
                 namespace=self.namespace,
@@ -491,7 +491,7 @@ class App:
         )
 
     @classmethod
-    def from_name(cls, name: str, *, namespace: str = "default", client: Any = None) -> "App":
+    def from_name(cls, name: str, *, namespace: str = "default", client: Any = None) -> App:
         """Create a current-revision application lookup handle."""
 
         return cls(name, namespace=namespace, client=client)

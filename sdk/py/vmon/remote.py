@@ -12,13 +12,13 @@ import functools
 import hashlib
 import inspect
 import os
-import queue
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
-from typing import Any, Generic, ParamSpec, TypeVar, cast, overload
+from typing import Any, TypeVar, cast, overload
+
 import grpc
 
 from ._function_proto import (
@@ -29,26 +29,21 @@ from ._function_proto import (
     value_from_proto,
     value_to_proto,
 )
+from .errors import APIError, RemoteFunctionError, TransportError
+from .image import Image
 from .options import (
     CpuArchitecture,
     FunctionOptions,
     FunctionVolumeMount,
     HighAvailabilityPolicy,
     NetworkPolicy,
-    ResourcePolicy,
     RetryPolicy,
     SerializerPolicy,
-    TimeoutPolicy,
-    WorkerPolicy,
 )
-from .image import Image
 from .package import PackageArtifact, SerializedCallable, package_callable
-from .errors import APIError, RemoteFunctionError, TransportError
-from .values import ValueCodec, ValueCompression, decode_value, encode_value
 from .v1 import api_pb2 as pb
+from .values import ValueCodec, ValueCompression, decode_value, encode_value
 
-P = ParamSpec("P")
-R = TypeVar("R")
 Y = TypeVar("Y")
 _UNSET = object()
 _TERMINAL = {pb.CALL_STATUS_SUCCEEDED, pb.CALL_STATUS_FAILED, pb.CALL_STATUS_CANCELLED}
@@ -83,6 +78,18 @@ def _call_owner(
 ) -> tuple[Any, str | None]:
     value = client.driver.call(operation, endpoint=endpoint)
     return value if isinstance(value, tuple) and len(value) == 2 else (value, endpoint)
+
+
+def _watch_call(stubs: Any, *, request: pb.WatchCallRequest) -> Any:
+    return stubs.calls.Watch(request)
+
+
+def _get_call_result(stubs: Any, *, request: pb.GetCallResultRequest) -> Any:
+    return stubs.calls.GetResult(request)
+
+
+def _list_call_results(stubs: Any, *, request: pb.ListCallResultsRequest) -> Any:
+    return stubs.calls.ListResults(request)
 
 
 def _compose_function_options(
@@ -236,7 +243,7 @@ def _compose_function_options(
     )
 
 
-async def _run_blocking(function: Callable[..., R], *args: Any, **kwargs: Any) -> R:
+async def _run_blocking[R](function: Callable[..., R], *args: Any, **kwargs: Any) -> R:
     """Compatibility bridge for injected synchronous drivers."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
@@ -451,7 +458,7 @@ async def _async_arguments(
     return message
 
 
-class FunctionCall(Generic[R]):
+class FunctionCall[R]:
     """A durable unary or generator call handle."""
 
     def __init__(
@@ -477,7 +484,7 @@ class FunctionCall(Generic[R]):
     @classmethod
     def from_id(
         cls, call_id: str, *, client: Any | None = None, trusted: bool = False
-    ) -> "FunctionCall[Any]":
+    ) -> FunctionCall[Any]:
         if not call_id:
             raise ValueError("call_id must be non-empty")
         bound_client = _client(client)
@@ -490,7 +497,7 @@ class FunctionCall(Generic[R]):
         return cls(call_id, bound_client, trusted=trusted, endpoint=endpoint)
 
     @property
-    def aio(self) -> "_AsyncCall[R]":
+    def aio(self) -> _AsyncCall[R]:
         """Return the native asynchronous facade for this durable call."""
         return _AsyncCall(self)
 
@@ -532,17 +539,16 @@ class FunctionCall(Generic[R]):
         failures = 0
         while True:
             try:
+                request = pb.WatchCallRequest(
+                    cursor=pb.EventCursor(
+                        call=pb.CallRef(call_id=self.call_id),
+                        after_sequence=cursor,
+                    ),
+                    follow=follow,
+                )
                 stream = _call(
                     self._client,
-                    lambda stubs: stubs.calls.Watch(
-                        pb.WatchCallRequest(
-                            cursor=pb.EventCursor(
-                                call=pb.CallRef(call_id=self.call_id),
-                                after_sequence=cursor,
-                            ),
-                            follow=follow,
-                        )
-                    ),
+                    functools.partial(_watch_call, request=request),
                     stream=True,
                     endpoint=self._endpoint,
                 )
@@ -585,11 +591,10 @@ class FunctionCall(Generic[R]):
                         f"remote call ended with status {record.status}",
                         code="cancelled",
                     )
+                request = pb.GetCallResultRequest(call=record.ref, index=0)
                 item = _call(
                     self._client,
-                    lambda stubs: stubs.calls.GetResult(
-                        pb.GetCallResultRequest(call=record.ref, index=0)
-                    ),
+                    functools.partial(_get_call_result, request=request),
                 )
                 return cast(R, _result_value(self._client, item, trusted=self._trusted))
             if deadline is not None and time.monotonic() >= deadline:
@@ -598,7 +603,7 @@ class FunctionCall(Generic[R]):
             time.sleep(min(0.05, remaining) if remaining is not None else 0.05)
 
     @staticmethod
-    def gather(*calls: "FunctionCall[Any]", return_exceptions: bool = False) -> list[Any]:
+    def gather(*calls: FunctionCall[Any], return_exceptions: bool = False) -> list[Any]:
         values = []
         for call in calls:
             try:
@@ -610,7 +615,7 @@ class FunctionCall(Generic[R]):
         return values
 
 
-class BatchCall(Generic[R]):
+class BatchCall[R]:
     """Detached durable batch handle whose results are fetched lazily."""
 
     def __init__(
@@ -629,7 +634,7 @@ class BatchCall(Generic[R]):
     @classmethod
     def from_id(
         cls, call_id: str, *, client: Any | None = None, trusted: bool = False
-    ) -> "BatchCall[Any]":
+    ) -> BatchCall[Any]:
         """Reconstruct a detached durable batch handle."""
         return cls(FunctionCall.from_id(call_id, client=client, trusted=trusted))
 
@@ -649,7 +654,7 @@ class BatchCall(Generic[R]):
         return self._call.cancel(reason)
 
     @property
-    def aio(self) -> "_AsyncCall[Any]":
+    def aio(self) -> _AsyncCall[Any]:
         """Return the native asynchronous facade for this durable batch."""
         return _AsyncCall(self._call)
 
@@ -664,17 +669,16 @@ class BatchCall(Generic[R]):
         after_sequence = 0
         try:
             while True:
+                request = pb.ListCallResultsRequest(
+                    cursor=pb.ResultCursor(
+                        call=pb.CallRef(call_id=self.id),
+                        after_sequence=after_sequence,
+                    ),
+                    page_size=128,
+                )
                 page = _call(
                     self._call._client,
-                    lambda stubs: stubs.calls.ListResults(
-                        pb.ListCallResultsRequest(
-                            cursor=pb.ResultCursor(
-                                call=pb.CallRef(call_id=self.id),
-                                after_sequence=after_sequence,
-                            ),
-                            page_size=128,
-                        )
-                    ),
+                    functools.partial(_list_call_results, request=request),
                     endpoint=self._call._endpoint,
                 )
                 for item in page.results:
@@ -727,7 +731,7 @@ class BatchCall(Generic[R]):
         return self.results(**kwargs)
 
 
-class _AsyncCall(Generic[R]):
+class _AsyncCall[R]:
     def __init__(self, call: FunctionCall[R]) -> None:
         self._call = call
 
@@ -822,8 +826,8 @@ class _AsyncCall(Generic[R]):
             raise
 
 
-class _AsyncRemoteFunction(Generic[P, R]):
-    def __init__(self, function: "RemoteFunction[P, R]") -> None:
+class _AsyncRemoteFunction[**P, R]:
+    def __init__(self, function: RemoteFunction[P, R]) -> None:
         self._function = function
 
     async def spawn(self, *args: P.args, **kwargs: P.kwargs) -> _AsyncCall[R]:
@@ -874,7 +878,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
 
     @overload
     def remote_gen(
-        self: "_AsyncRemoteFunction[P, Iterator[Y]]",
+        self: _AsyncRemoteFunction[P, Iterator[Y]],
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> AsyncIterator[Y]: ...
@@ -1067,8 +1071,11 @@ class _AsyncRemoteFunction(Generic[P, R]):
             raise
 
 
-class RemoteFunction(Generic[P, R]):
+class RemoteFunction[**P, R]:
     """Immutable typed reference to a zero-deploy or registered function."""
+
+    __vmon_class_lifecycle__: str
+    __vmon_lifecycle_metadata__: Any
 
     def __init__(
         self,
@@ -1137,7 +1144,7 @@ class RemoteFunction(Generic[P, R]):
         client: Any | None = None,
         options: FunctionOptions | None = None,
         generator: bool = False,
-    ) -> "RemoteFunction[..., Any]":
+    ) -> RemoteFunction[..., Any]:
         return cls(
             None,
             name=name,
@@ -1150,7 +1157,7 @@ class RemoteFunction(Generic[P, R]):
 
     def with_options(
         self, options: FunctionOptions | None = None, **changes: Any
-    ) -> "RemoteFunction[P, R]":
+    ) -> RemoteFunction[P, R]:
         updated = options or replace(self.options, **changes)
         return type(self)(
             self._function,
@@ -1475,7 +1482,7 @@ class RemoteFunction(Generic[P, R]):
 
     @overload
     def remote_gen(
-        self: "RemoteFunction[P, Iterator[Y]]",
+        self: RemoteFunction[P, Iterator[Y]],
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> Iterator[Y]: ...
@@ -1595,7 +1602,7 @@ class RemoteFunction(Generic[P, R]):
     def map(self, *iterables: Iterable[Any], **kwargs: Any) -> Iterator[R]:
         if not iterables:
             raise ValueError("map requires at least one iterable")
-        items = iterables[0] if len(iterables) == 1 else zip(*iterables)
+        items = iterables[0] if len(iterables) == 1 else zip(*iterables, strict=False)
         return self.spawn_map(
             items, kwargs=kwargs.pop("kwargs", None), starmap=len(iterables) > 1
         ).results(
@@ -1613,9 +1620,9 @@ class RemoteFunction(Generic[P, R]):
 
 
 @overload
-def function(function: Callable[P, R], /) -> RemoteFunction[P, R]: ...
+def function[**P, R](function: Callable[P, R], /) -> RemoteFunction[P, R]: ...
 @overload
-def function(
+def function[**P, R](
     function: None = None,
     /,
     *,
@@ -1654,7 +1661,7 @@ def function(
     exclude: Iterable[str] = (),
     local_packages: Iterable[str] = (),
 ) -> Callable[[Callable[P, R]], RemoteFunction[P, R]]: ...
-def function(
+def function[**P, R](
     function: Callable[P, R] | None = None,
     /,
     *,

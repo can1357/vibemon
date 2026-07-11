@@ -13,6 +13,7 @@ import grpc
 
 from ._endpoint import translate_rpc_error
 from .errors import ProtocolError, TransportError
+from .models import EventRecord
 from .v1 import api_pb2
 
 if TYPE_CHECKING:
@@ -417,15 +418,15 @@ class ConsoleStream(Iterable[bytes]):
         self.close()
 
 
-class EventStream(Iterable[dict[str, Any]]):
-    """A closeable iterator over engine event documents from the Events RPC."""
+class EventStream(Iterable[EventRecord]):
+    """A closeable iterator over typed engine events from the Events RPC."""
 
     def __init__(self, responses: Any, endpoint: str | None = None) -> None:
         self._responses = responses
         self._endpoint = endpoint
         self._closed = False
 
-    def __iter__(self) -> Iterator[dict[str, Any]]:
+    def __iter__(self) -> Iterator[EventRecord]:
         try:
             for view in self._responses:
                 yield self._decode(view.json)
@@ -438,14 +439,14 @@ class EventStream(Iterable[dict[str, Any]]):
             self.close()
 
     @staticmethod
-    def _decode(payload: str) -> dict[str, Any]:
+    def _decode(payload: str) -> EventRecord:
         try:
             value = json.loads(payload)
         except json.JSONDecodeError as exc:
             raise ProtocolError("vmon event stream returned invalid JSON") from exc
         if not isinstance(value, dict):
             raise ProtocolError("vmon event stream returned a non-object event")
-        return value
+        return EventRecord.from_dict(value)
 
     def close(self) -> None:
         """Cancel the streaming call idempotently."""

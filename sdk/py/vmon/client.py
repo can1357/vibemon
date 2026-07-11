@@ -15,6 +15,7 @@ from .driver import (
     parse_dsn,
 )
 from .errors import ProtocolError, TransportError
+from .options import FunctionOptions
 from .sandbox import (
     Sandbox,
     _clone_create_extra,
@@ -24,12 +25,11 @@ from .sandbox import (
     _volume_wire,
 )
 from .secret import Secret
-from .options import FunctionOptions
 from .v1 import api_pb2
 from .volume import Volume
 
 if TYPE_CHECKING:
-    from .models import MeshNode, MeshStatus, PoolStats, ServerInfo
+    from .models import Health, MeshNode, MeshStatus, PoolStats, ServerInfo
     from .process import EventStream, Process
     from .remote import RemoteFunction
 
@@ -46,16 +46,18 @@ class Client:
         self.mesh = MeshAPI(self)
         self._closed = False
 
-    def health(self) -> dict[str, Any]:
-        """Return the selected daemon's health document."""
+    def health(self) -> Health:
+        """Return the selected daemon's typed health state."""
+        from .models import Health
+
         response = self.driver.request("GET", "/healthz")
         try:
             value = response.json()
         except ValueError as exc:
-            raise ProtocolError("health check returned a malformed response") from exc
-        if not isinstance(value, Mapping) or not isinstance(value.get("ok"), bool):
-            raise ProtocolError("health check returned a malformed response")
-        return dict(value)
+            raise ProtocolError("health check returned malformed JSON") from exc
+        if not isinstance(value, Mapping):
+            raise ProtocolError("health check returned a non-object response")
+        return Health.from_dict(value)
 
     def info(self) -> ServerInfo:
         """Return typed server version and capability information."""

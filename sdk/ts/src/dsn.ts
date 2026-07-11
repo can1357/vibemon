@@ -1,9 +1,8 @@
-import { resolveContext, vmonHome } from "./context";
+import { resolveContext } from "./context";
 
-/** A normalized HTTP or Unix-domain-socket endpoint. */
+/** A normalized HTTP(S) endpoint. */
 export interface DsnEndpoint {
   url: string;
-  unix?: string;
 }
 
 /** Parsed connection settings used by the mesh driver. */
@@ -29,7 +28,7 @@ export function parseDsn(input?: string | null, options: ParseDsnOptions = {}): 
   if (!dsn) {
     dsn = env.VMON_DSN?.trim();
     if (!dsn && env.VMON_CONTEXT) dsn = `vmon+context://${env.VMON_CONTEXT}`;
-    if (!dsn) dsn = browserOrigin() ?? `vmon+unix://${vmonHome()}/vmond.sock`;
+    if (!dsn) dsn = browserOrigin() ?? "http://127.0.0.1:8000";
   }
   const queryAt = dsn.indexOf("?");
   const rawBase = queryAt < 0 ? dsn : dsn.slice(0, queryAt);
@@ -49,11 +48,7 @@ export function parseDsn(input?: string | null, options: ParseDsnOptions = {}): 
   let endpoints: DsnEndpoint[];
   let context: string | undefined;
   let contextToken: string | undefined;
-  if (rawBase.startsWith("vmon+unix://")) {
-    const socket = decodeURIComponent(rawBase.slice("vmon+unix://".length));
-    if (!socket.startsWith("/")) throw new Error("vmon+unix DSN requires an absolute path");
-    endpoints = [{ url: "http://localhost", unix: socket }];
-  } else if (rawBase.startsWith("vmon+context://")) {
+  if (rawBase.startsWith("vmon+context://")) {
     context = decodeURIComponent(rawBase.slice("vmon+context://".length).replace(/^\/+/, ""));
     const resolved = resolveContext(context);
     endpoints = resolved.context.endpoints.map((url) => ({ url: normalizeHttpUrl(url) }));

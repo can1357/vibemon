@@ -374,7 +374,7 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     second = scalable(4)
     different = scalable(5)
     with pytest.raises(TypeError):
-        first.id
+        _ = first.id
     assert first.add(1) == 5
     assert first._local_instance.hooks == ["snapshot", "initialize"]
     assert first.add.remote(6) == 11

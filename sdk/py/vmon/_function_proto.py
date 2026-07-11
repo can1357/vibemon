@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import platform
-import sys
 from typing import Any
 
 from .options import FunctionOptions
 from .package import PackageArtifact, SerializedCallable
-from .values import ArtifactPayload, ValueCodec, ValueCompression, ValueEnvelope
 from .v1 import api_pb2 as pb
+from .values import ArtifactPayload, ValueCodec, ValueCompression, ValueEnvelope
 
 _DIGEST_ALGO = pb.DIGEST_ALGORITHM_SHA256
 _CODECS = {
@@ -159,7 +157,8 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
         image.registry.CopyFrom(pb.RegistryImageSource(reference=src.value))
     elif src.kind == "template":
         image.template.CopyFrom(pb.TemplateImageSource(name=src.value))
-    # Local Docker contexts and local-file image steps require separate artifact uploads and are rejected here rather than persisted as paths.
+    # Local Docker contexts and file steps require separate artifact uploads;
+    # reject them here rather than persisting caller-local paths.
     else:
         raise ValueError("Dockerfile image contexts must be uploaded before function registration")
     for step in options.image.steps:
@@ -172,7 +171,7 @@ def options_to_proto(options: FunctionOptions) -> dict[str, Any]:
                 name, sep, version = item.partition("==")
                 image.uv_packages.append(pb.UvPackage(name=name, version=version if sep else ""))
         elif step.kind == "env":
-            image.environment.update(dict(zip(step.values[::2], step.values[1::2])))
+            image.environment.update(dict(zip(step.values[::2], step.values[1::2], strict=True)))
         elif step.kind == "run_commands":
             for command in step.values:
                 image.commands.append(pb.ImageBuildCommand(argv=["/bin/sh", "-c", command]))

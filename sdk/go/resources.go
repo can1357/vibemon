@@ -90,7 +90,7 @@ func (client *Client) Events(ctx context.Context) (*EventStream, error) {
 // Next block-reads and decodes the next event from the stream.
 func (stream *EventStream) Next(ctx context.Context) (Event, error) {
 	if stream == nil || stream.stream == nil {
-		return nil, errors.New("vmon: event stream is not open")
+		return Event{}, errors.New("vmon: event stream is not open")
 	}
 	stream.readMu.Lock()
 	defer stream.readMu.Unlock()
@@ -99,12 +99,12 @@ func (stream *EventStream) Next(ctx context.Context) (Event, error) {
 	view, err := stream.stream.Recv()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return Event{}, ctxErr
 		}
 		if errors.Is(err, io.EOF) {
-			return nil, io.EOF
+			return Event{}, io.EOF
 		}
-		return nil, apiErrorFromStatus(err, "read events", stream.stream.Trailer())
+		return Event{}, apiErrorFromStatus(err, "read events", stream.stream.Trailer())
 	}
 	return decodeEvent([]byte(view.GetJson()))
 }
@@ -124,10 +124,7 @@ func (stream *EventStream) Close() error {
 func decodeEvent(data []byte) (Event, error) {
 	var event Event
 	if err := json.Unmarshal(data, &event); err != nil {
-		return nil, &ProtocolError{Operation: "read events", Message: "invalid event JSON", Err: err}
-	}
-	if event == nil {
-		return nil, &ProtocolError{Operation: "read events", Message: "event is not an object"}
+		return Event{}, &ProtocolError{Operation: "read events", Message: "invalid event JSON", Err: err}
 	}
 	return event, nil
 }

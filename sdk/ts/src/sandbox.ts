@@ -9,7 +9,7 @@ import type {
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import type { Client } from "./client";
 import type { DriverRequestOptions, DriverResponse, RpcStream } from "./driver";
-import { APIError, apiError, ProtocolError } from "./errors";
+import { APIError, apiError, parseResponseJson, ProtocolError } from "./errors";
 import { SandboxService } from "./gen/vmon/v1/api_pb";
 import type {
   ExecRequest,
@@ -17,6 +17,7 @@ import type {
   FileInfo,
   NetworkPolicy,
   SandboxInfo,
+  SandboxMetrics,
   TunnelSet,
 } from "./models";
 import type { ProcessOptions } from "./process";
@@ -82,7 +83,7 @@ export class Sandbox {
   /** Refresh and merge the sandbox view. */
   async refresh(): Promise<SandboxInfo> {
     const view = await this.call(SandboxService.method.get, { id: this.id });
-    this.#info = mergeInfo(this.#info, JSON.parse(view.json));
+    this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;
   }
   /** Run a command and capture its output. */
@@ -146,16 +147,17 @@ export class Sandbox {
     );
   }
   /** Fetch sandbox metrics. */
-  async metrics(): Promise<Record<string, unknown>> {
-    const value = parseJson((await this.call(SandboxService.method.metrics, { id: this.id })).json);
-    if (!isRecord(value)) throw new ProtocolError("sandbox metrics must be an object");
+  async metrics(): Promise<SandboxMetrics> {
+    const value = parseResponseJson((await this.call(SandboxService.method.metrics, { id: this.id })).json);
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new ProtocolError("sandbox metrics must be an object");
     return value;
   }
   /** Gracefully stop the sandbox. */
   async stop(wait = true): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseJson((await this.call(SandboxService.method.stop, { id: this.id })).json),
+      parseResponseJson((await this.call(SandboxService.method.stop, { id: this.id })).json),
     );
     if (wait) await this.#waitForState(new Set(["stopped", "exited"]));
     return this.#info;
@@ -173,7 +175,7 @@ export class Sandbox {
   async pause(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseJson((await this.call(SandboxService.method.pause, { id: this.id })).json),
+      parseResponseJson((await this.call(SandboxService.method.pause, { id: this.id })).json),
     );
     return this.#info;
   }
@@ -181,7 +183,7 @@ export class Sandbox {
   async resume(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
-      parseJson((await this.call(SandboxService.method.resume, { id: this.id })).json),
+      parseResponseJson((await this.call(SandboxService.method.resume, { id: this.id })).json),
     );
     return this.#info;
   }
@@ -191,13 +193,13 @@ export class Sandbox {
       id: this.id,
       secs: BigInt(secs),
     });
-    this.#info = mergeInfo(this.#info, parseJson(view.json));
+    this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;
   }
   /** Migrate and re-pin the sandbox. */
   async migrate(target: string): Promise<SandboxInfo> {
     const view = await this.call(SandboxService.method.migrate, { id: this.id, target });
-    this.#info = mergeInfo(this.#info, parseJson(view.json));
+    this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     this.#endpoint = await this.#client.driver.resolveSandbox(this.id, this.#endpoint);
     return this.#info;
   }
@@ -208,7 +210,7 @@ export class Sandbox {
       name: name ?? undefined,
       stop,
     });
-    return responseField(parseJson(view.json), "snapshot");
+    return responseField(parseResponseJson(view.json), "snapshot");
   }
   /** Create a filesystem snapshot. */
   async snapshotFilesystem(name?: string): Promise<string> {
@@ -216,12 +218,12 @@ export class Sandbox {
       id: this.id,
       name: name ?? undefined,
     });
-    return responseField(parseJson(view.json), "image");
+    return responseField(parseResponseJson(view.json), "image");
   }
   /** Fetch the network policy. */
   async network(): Promise<NetworkPolicy> {
     return networkPolicy(
-      parseJson((await this.call(SandboxService.method.networkGet, { id: this.id })).json),
+      parseResponseJson((await this.call(SandboxService.method.networkGet, { id: this.id })).json),
     );
   }
   /** Replace the network policy. */
@@ -232,12 +234,12 @@ export class Sandbox {
       cidrAllow: policy.cidr_allow != null ? { values: policy.cidr_allow } : undefined,
       domainAllow: policy.domain_allow != null ? { values: policy.domain_allow } : undefined,
     });
-    return networkPolicy(parseJson(view.json));
+    return networkPolicy(parseResponseJson(view.json));
   }
   /** Fetch tunnels and cache the proxy token. */
   async tunnels(): Promise<TunnelSet> {
     const view = await this.call(SandboxService.method.tunnels, { id: this.id });
-    const value = parseJson(view.json);
+    const value = parseResponseJson(view.json);
     if (!isTunnelSet(value)) throw new ProtocolError("tunnel response must be an object");
     if (typeof value.connect_token === "string") this.#connectToken = value.connect_token;
     return value;
@@ -445,12 +447,16 @@ export class Files {
       id: this.#sandbox.id,
       path,
     });
-    const body = parseJson(view.json);
+    const body = parseResponseJson(view.json);
     if (!isRecord(body) || !Array.isArray(body.entries))
       throw new ProtocolError("file list response did not include entries");
-    if (!body.entries.every(isFileInfo))
-      throw new ProtocolError("file list response included invalid metadata");
-    return body.entries;
+    const entries: FileInfo[] = [];
+    for (const entry of body.entries) {
+      if (!isFileInfo(entry))
+        throw new ProtocolError("file list response included invalid metadata");
+      entries.push(entry);
+    }
+    return entries;
   }
   /** Stat a guest filesystem path. */
   async stat(path: string): Promise<FileInfo> {
@@ -458,7 +464,7 @@ export class Files {
       id: this.#sandbox.id,
       path,
     });
-    const value = parseJson(view.json);
+    const value = parseResponseJson(view.json);
     if (!isFileInfo(value)) throw new ProtocolError("file stat response was invalid");
     return value;
   }
@@ -616,9 +622,6 @@ function isFileInfo(value: unknown): value is FileInfo {
     (value.mode === undefined || typeof value.mode === "number") &&
     (value.mtime === undefined || typeof value.mtime === "number")
   );
-}
-function parseJson(text: string): unknown {
-  return JSON.parse(text);
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

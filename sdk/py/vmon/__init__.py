@@ -21,9 +21,23 @@ from .cls import (
 from .context import Context, ContextStore
 from .decorators import CurrentCall, batched, concurrent, current_call
 from .driver import Driver, MeshDriver, parse_dsn
-from .errors import APIError, ActorLostError, ProtocolError, RemoteFunctionError, TransportError
+from .errors import ActorLostError, APIError, ProtocolError, RemoteFunctionError, TransportError
 from .image import Image, ImageError, ImageSource, ImageStep
-from .models import ExecExit, MeshNode, MeshStatus, SandboxInfo
+from .models import (
+    EventRecord,
+    ExecExit,
+    FileInfo,
+    Health,
+    MeshNode,
+    MeshStatus,
+    PoolStats,
+    SandboxInfo,
+    SandboxMetrics,
+    SandboxNetworkPolicy,
+    ServerInfo,
+    TunnelSet,
+    TunnelTarget,
+)
 from .options import (
     BatchingPolicy,
     ConcurrencyPolicy,
@@ -100,15 +114,21 @@ __all__ = [
     "CurrentCall",
     "Driver",
     "EnvelopeIntegrityError",
+    "EventRecord",
+    "ExecExit",
+    "ExecResult",
+    "FileInfo",
     "Files",
     "FunctionCall",
     "FunctionOptions",
     "FunctionVolumeMount",
     "HighAvailabilityPolicy",
+    "Health",
     "Image",
     "ImageError",
     "ImageSource",
     "ImageStep",
+    "EventStream",
     "LifecycleMetadata",
     "LogStream",
     "ManifestFile",
@@ -122,6 +142,7 @@ __all__ = [
     "PackageManifest",
     "Period",
     "Pool",
+    "PoolStats",
     "Process",
     "ProtocolError",
     "RemoteClass",
@@ -132,12 +153,17 @@ __all__ = [
     "RetryPolicy",
     "Sandbox",
     "SandboxInfo",
+    "SandboxMetrics",
+    "SandboxNetworkPolicy",
     "Schedule",
     "Secret",
     "SerializedCallable",
     "SerializerPolicy",
+    "ServerInfo",
     "TimeoutPolicy",
     "TransportError",
+    "TunnelSet",
+    "TunnelTarget",
     "ValueCodec",
     "ValueEnvelope",
     "Volume",

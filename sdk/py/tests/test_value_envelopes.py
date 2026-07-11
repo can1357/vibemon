@@ -1,17 +1,17 @@
 from __future__ import annotations
+
 import gzip
 import hashlib
-
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from vmon.values import (
     ABIMismatchError,
+    ArtifactPayload,
     CodecMismatchError,
     EnvelopeIntegrityError,
-    ArtifactPayload,
     JSONProfileError,
     ValueCodec,
     ValueCompression,
@@ -35,7 +35,7 @@ def test_auto_is_json_first_and_preserves_json_values():
 
 
 def test_explicit_cbor_round_trips_portable_non_json_value():
-    value = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+    value = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
     envelope = encode_value(value, codec="cbor", compress=True)
     assert envelope.codec is ValueCodec.CBOR
     assert decode_value(envelope) == value

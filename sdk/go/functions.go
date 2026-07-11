@@ -177,10 +177,56 @@ const (
 
 func publicCallStatus(status pb.CallStatus) CallStatus { return CallStatus(status) }
 
+// AttemptStatus identifies one durable execution-attempt transition.
+type AttemptStatus uint8
+
+const (
+	// AttemptStatusUnspecified means the attempt state is unavailable.
+	AttemptStatusUnspecified AttemptStatus = iota
+	// AttemptStatusStarted means a worker accepted the attempt.
+	AttemptStatusStarted
+	// AttemptStatusSucceeded means the attempt committed its result.
+	AttemptStatusSucceeded
+	// AttemptStatusFailed means the attempt ended with an error.
+	AttemptStatusFailed
+	// AttemptStatusCancelled means the attempt stopped due to cancellation.
+	AttemptStatusCancelled
+)
+
+// StartupKind identifies how the worker for an attempt was prepared.
+type StartupKind uint8
+
+const (
+	// StartupUnspecified means startup information is unavailable.
+	StartupUnspecified StartupKind = iota
+	// StartupCold means a new worker was created and booted.
+	StartupCold
+	// StartupWarm means an initialized worker was reused.
+	StartupWarm
+	// StartupSnapshot means a worker was restored from a snapshot.
+	StartupSnapshot
+)
+
+// AttemptFailureKind classifies why an execution attempt ended.
+type AttemptFailureKind uint8
+
+const (
+	// AttemptFailureUnspecified means the attempt did not fail or the class is unavailable.
+	AttemptFailureUnspecified AttemptFailureKind = iota
+	// AttemptFailureUser identifies a policy-visible user-code failure.
+	AttemptFailureUser
+	// AttemptFailureInfrastructure identifies a transparent platform failure.
+	AttemptFailureInfrastructure
+	// AttemptFailureCancelled identifies cooperative or forced cancellation.
+	AttemptFailureCancelled
+)
+
 // AttemptStats contains durable per-attempt timing and resource usage.
 type AttemptStats struct {
 	AttemptID                                                                string
 	UserAttempt, InfraAttempt                                                uint32
+	Startup                                                                  StartupKind
+	FailureKind                                                              AttemptFailureKind
 	QueuedMillis, StartupMillis, ExecutionMillis, CPUMillis, PeakMemoryBytes uint64
 }
 
@@ -290,7 +336,7 @@ func (call *FunctionCall[T]) Stats(ctx context.Context) (*CallStats, error) {
 	source := record.Stats
 	result := &CallStats{QueueMillis: source.QueueMillis, StartupMillis: source.StartupMillis, ExecutionMillis: source.ExecutionMillis, WallMillis: source.WallMillis, CPUMillis: source.CpuMillis, PeakMemoryBytes: source.PeakMemoryBytes}
 	for _, attempt := range source.Attempts {
-		result.Attempts = append(result.Attempts, AttemptStats{AttemptID: attempt.AttemptId, UserAttempt: attempt.UserAttempt, InfraAttempt: attempt.InfraAttempt, QueuedMillis: attempt.QueuedMillis, StartupMillis: attempt.StartupMillis, ExecutionMillis: attempt.ExecutionMillis, CPUMillis: attempt.CpuMillis, PeakMemoryBytes: attempt.PeakMemoryBytes})
+		result.Attempts = append(result.Attempts, AttemptStats{AttemptID: attempt.AttemptId, UserAttempt: attempt.UserAttempt, InfraAttempt: attempt.InfraAttempt, Startup: StartupKind(attempt.Startup), FailureKind: AttemptFailureKind(attempt.FailureKind), QueuedMillis: attempt.QueuedMillis, StartupMillis: attempt.StartupMillis, ExecutionMillis: attempt.ExecutionMillis, CPUMillis: attempt.CpuMillis, PeakMemoryBytes: attempt.PeakMemoryBytes})
 	}
 	return result, nil
 }
@@ -373,11 +419,13 @@ type CallLogStream uint8
 
 // AttemptEvent describes one execution attempt transition.
 type AttemptEvent struct {
-	AttemptID                    string
-	UserAttempt, InfraAttempt    uint32
-	Status, Startup, FailureKind uint8
-	WorkerID                     string
-	Error                        *RemoteCallError
+	AttemptID                 string
+	UserAttempt, InfraAttempt uint32
+	Status                    AttemptStatus
+	Startup                   StartupKind
+	FailureKind               AttemptFailureKind
+	WorkerID                  string
+	Error                     *RemoteCallError
 }
 
 // ResultEvent identifies one committed result without decoding its payload.
@@ -461,13 +509,27 @@ func (call *FunctionCall[T]) watch(ctx context.Context, afterSequence uint64, fo
 					select {
 					case events <- item:
 					case <-ctx.Done():
-						boundedCancel(call, ctx.Err().Error())
 						failures <- ctx.Err()
 						return
 					}
 					if item.Status == CallStatusSucceeded || item.Status == CallStatusFailed || item.Status == CallStatusCancelled {
 						return
 					}
+				}
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				mapped := apiErrorFromStatus(err, "watch call")
+				var transportErr *TransportError
+				if !errors.As(mapped, &transportErr) {
+					failures <- mapped
+					return
+				}
+				if health, ok := call.client.driver.(interface{ markFailed(string) }); ok {
+					health.markFailed(endpoint)
+				}
+			} else if err == nil {
+				if health, ok := call.client.driver.(interface{ markSuccess(string) }); ok {
+					health.markSuccess(endpoint)
 				}
 			}
 			if !follow && err == io.EOF {
@@ -514,7 +576,7 @@ func projectCallEvent(event *pb.CallEvent) CallEvent {
 		item.Error = callError(failure).(*RemoteCallError)
 	}
 	if attempt := event.GetAttemptEvent(); attempt != nil {
-		info := &AttemptEvent{AttemptID: attempt.AttemptId, UserAttempt: attempt.UserAttempt, InfraAttempt: attempt.InfraAttempt, Status: uint8(attempt.Status), Startup: uint8(attempt.Startup), FailureKind: uint8(attempt.FailureKind), WorkerID: attempt.WorkerId}
+		info := &AttemptEvent{AttemptID: attempt.AttemptId, UserAttempt: attempt.UserAttempt, InfraAttempt: attempt.InfraAttempt, Status: AttemptStatus(attempt.Status), Startup: StartupKind(attempt.Startup), FailureKind: AttemptFailureKind(attempt.FailureKind), WorkerID: attempt.WorkerId}
 		if attempt.GetError() != nil {
 			info.Error = callError(attempt.GetError()).(*RemoteCallError)
 		}

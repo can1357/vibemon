@@ -8,22 +8,19 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Generic, TypeVar, overload
-
+from typing import Any, overload
 
 from .errors import ActorLostError
 from .options import ConcurrencyPolicy, FunctionOptions
 from .remote import FunctionCall, RemoteFunction, _arguments
-from .values import encode_value
 from .v1 import api_pb2
+from .values import encode_value
 
-R = TypeVar("R")
 
-
-def method(fn: Callable[..., R]) -> Callable[..., R]:
+def method[R](fn: Callable[..., R]) -> Callable[..., R]:
     """Export one class method for remote actor or service dispatch."""
 
-    setattr(fn, "__vmon_method__", True)
+    fn.__vmon_method__ = True  # type: ignore[attr-defined]
     return fn
 
 
@@ -35,8 +32,8 @@ def enter(fn: Callable[..., Any] | None = None, /, *, snapshot: bool = False) ->
     """
 
     def decorate(inner: Callable[..., Any]) -> Callable[..., Any]:
-        setattr(inner, "__vmon_enter__", True)
-        setattr(inner, "__vmon_snapshot_enter__", bool(snapshot))
+        inner.__vmon_enter__ = True  # type: ignore[attr-defined]
+        inner.__vmon_snapshot_enter__ = bool(snapshot)  # type: ignore[attr-defined]
         return inner
 
     return decorate(fn) if fn is not None else decorate
@@ -45,14 +42,14 @@ def enter(fn: Callable[..., Any] | None = None, /, *, snapshot: bool = False) ->
 def exit(fn: Callable[..., Any]) -> Callable[..., Any]:  # noqa: A001
     """Declare an ordered graceful shutdown hook."""
 
-    setattr(fn, "__vmon_exit__", True)
+    fn.__vmon_exit__ = True  # type: ignore[attr-defined]
     return fn
 
 
 def on_restore(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Declare an ordered post-snapshot-restore hook."""
 
-    setattr(fn, "__vmon_restore__", True)
+    fn.__vmon_restore__ = True  # type: ignore[attr-defined]
     return fn
 
 
@@ -158,13 +155,13 @@ class RemoteClass:
             options=configured,
             include=include,
         )
-        setattr(self._function, "__vmon_class_lifecycle__", self.lifecycle)
-        setattr(self._function, "__vmon_lifecycle_metadata__", self.metadata)
+        self._function.__vmon_class_lifecycle__ = self.lifecycle
+        self._function.__vmon_lifecycle_metadata__ = self.metadata
         functools.update_wrapper(self, user_cls, updated=())
 
     def __call__(
         self, *args: Any, labels: Mapping[str, str] | None = None, **kwargs: Any
-    ) -> "RemoteObject":
+    ) -> RemoteObject:
         if self.lifecycle == "service":
             return RemoteObject(self, None, local_init=(args, kwargs), service=True)
         client = self._bound_client()
@@ -188,7 +185,7 @@ class RemoteClass:
         record, _ = client.driver.call(lambda stubs: stubs.actors.Create(request))
         return RemoteObject(self, record.ref.actor_id, record=record, local_init=(args, kwargs))
 
-    def from_id(self, actor_id: str) -> "RemoteObject":
+    def from_id(self, actor_id: str) -> RemoteObject:
         """Reconnect to an existing durable actor without replaying construction."""
 
         if self.lifecycle != "actor":
@@ -199,7 +196,7 @@ class RemoteClass:
         obj._record()
         return obj
 
-    def with_options(self, options: FunctionOptions) -> "RemoteClass":
+    def with_options(self, options: FunctionOptions) -> RemoteClass:
         """Return an immutable definition variant with validated options."""
 
         return type(self)(
@@ -269,7 +266,7 @@ class RemoteObject:
             raise TypeError("service instances do not have durable IDs")
         return self._actor_id
 
-    def __getattr__(self, name: str) -> "_BoundRemoteMethod[Any]":
+    def __getattr__(self, name: str) -> _BoundRemoteMethod[Any]:
         if name in self._remote_cls.metadata.methods:
             return _BoundRemoteMethod(self, name)
         raise AttributeError(f"{name!r} is not decorated with @vmon.method")
@@ -329,7 +326,7 @@ class RemoteObject:
         *,
         labels: Mapping[str, str] | None = None,
         request_id: str | None = None,
-    ) -> "RemoteObject":
+    ) -> RemoteObject:
         """Create an independent actor identity from an immutable checkpoint."""
 
         if checkpoint is None:
@@ -375,7 +372,7 @@ class RemoteObject:
             raise ActorLostError(self.id, status)
 
 
-class _BoundRemoteMethod(Generic[R]):
+class _BoundRemoteMethod[R]:
     """One exported method bound to a durable actor or scalable service."""
 
     def __init__(self, obj: RemoteObject, name: str) -> None:

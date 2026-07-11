@@ -1,4 +1,5 @@
 import type { components } from "./schema";
+import type { PortableValue } from "./function-values";
 
 /** Daemon health response. */
 export type Health = components["schemas"]["HealthBody"];
@@ -74,6 +75,11 @@ export interface PoolStats {
   [key: string]: unknown;
 }
 
+/** Open sandbox runtime metrics keyed by subsystem or counter name. */
+export interface SandboxMetrics {
+  [key: string]: PortableValue;
+}
+
 /** Daemon build, host, and capability information. */
 export interface ServerInfo {
   version?: string;
@@ -100,5 +106,5 @@ export interface TunnelSet {
 
 /** One daemon event payload. */
 export interface EventRecord {
-  [key: string]: unknown;
+  [key: string]: PortableValue;
 }

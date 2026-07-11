@@ -1,6 +1,6 @@
 import type { Driver, DriverOptions, DriverRequestOptions } from "./driver";
 import { MeshDriver } from "./driver";
-import { apiError, ProtocolError, TransportError } from "./errors";
+import { apiError, parseResponseJson, ProtocolError, TransportError } from "./errors";
 import type { FunctionLookupOptions, FunctionValueAdapter } from "./functions";
 import { App, RemoteFunction } from "./functions";
 import {
@@ -57,13 +57,17 @@ export class Client {
     this.apps = new AppAPI(this);
   }
   /** Check daemon health. */
-  health(): Promise<Health> {
-    return this.json("GET", "/healthz");
+  async health(): Promise<Health> {
+    const value = parseResponseJson(await (await this.response("GET", "/healthz")).text());
+    if (!isHealth(value)) throw new ProtocolError("health response must include a boolean ok");
+    return value;
   }
   /** Fetch daemon and node information. */
   async info(): Promise<ServerInfo> {
     const { message } = await this.driver.call(SystemService.method.info, {});
-    return JSON.parse(message.json);
+    const value = parseResponseJson(message.json);
+    if (!isServerInfo(value)) throw new ProtocolError("server info response is malformed");
+    return value;
   }
   /** Fetch Prometheus metrics text. */
   async metrics(): Promise<string> {
@@ -91,10 +95,6 @@ export class Client {
     const response = await this.driver.request(method, path, options);
     if (!response.ok) throw await apiError(response);
     return response;
-  }
-  /** Perform a request and decode its JSON response. */
-  async json<T>(method: string, path: string, options: DriverRequestOptions = {}): Promise<T> {
-    return (await this.response(method, path, options)).json();
   }
 }
 
@@ -172,14 +172,14 @@ export class SandboxAPI {
     const { message, endpoint } = await this.#client.driver.call(SandboxService.method.create, {
       specJson: JSON.stringify(body),
     });
-    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
+    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
   }
   /** Fetch a sandbox and pin its serving endpoint. */
   async get(id: string): Promise<Sandbox> {
     const { message, endpoint } = await this.#client.driver.call(SandboxService.method.get, {
       id,
     });
-    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
+    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
   }
   /** Create an unfetched bound sandbox reference. */
   ref(id: string): Sandbox {
@@ -194,7 +194,7 @@ export class SandboxAPI {
       const { message, endpoint } = await this.#client.driver.call(SandboxService.method.list, {
         tags,
       });
-      return sandboxRows(message.sandboxesJson.map(parseJson))
+      return sandboxRows(message.sandboxesJson.map(parseResponseJson))
         .filter((row) => !options.node || row.node === options.node)
         .map((row) => new Sandbox(this.#client, row, endpoint));
     }
@@ -206,7 +206,7 @@ export class SandboxAPI {
           { endpoint: entry.url },
         );
         return {
-          rows: sandboxRows(message.sandboxesJson.map(parseJson)),
+          rows: sandboxRows(message.sandboxesJson.map(parseResponseJson)),
           endpoint,
         };
       }),
@@ -245,7 +245,7 @@ export class SnapshotAPI {
       name,
       bodyJson: JSON.stringify(request),
     });
-    return new Sandbox(this.#client, JSON.parse(message.json), endpoint);
+    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
   }
   /** Fork one snapshot into multiple sandboxes. */
   async fork(name: string, request: ForkRequest): Promise<Sandbox[]> {
@@ -253,8 +253,8 @@ export class SnapshotAPI {
       name,
       bodyJson: JSON.stringify(request),
     });
-    const body: unknown = JSON.parse(message.json);
-    return sandboxRows(isRecord(body) ? body.clones : undefined).map(
+    const body = parseResponseJson(message.json);
+    return sandboxRows(isRecord(body) ? body.clones : null).map(
       (row) => new Sandbox(this.#client, row, endpoint),
     );
   }
@@ -310,7 +310,7 @@ export class PoolAPI {
   }
   /** List warm pools. */
   async list(): Promise<Pool[]> {
-    const body: unknown = JSON.parse(
+    const body = parseResponseJson(
       (await this.#client.driver.call(PoolService.method.list, {})).message.json,
     );
     if (!isRecord(body) || Array.isArray(body))
@@ -333,7 +333,7 @@ export class PoolAPI {
       reference: ref,
       bodyJson: JSON.stringify(body),
     });
-    const stats = parseJson(message.json);
+    const stats = parseResponseJson(message.json);
     if (!isRecord(stats) || Array.isArray(stats))
       throw new ProtocolError(`pool ${ref} statistics must be an object`);
     return new Pool(this, ref, count, stats);
@@ -359,7 +359,9 @@ export class MeshAPI {
   /** Fetch typed mesh status. */
   async status(): Promise<MeshStatus> {
     const { message } = await this.#client.driver.call(SystemService.method.meshStatus, {});
-    return JSON.parse(message.json);
+    const value = parseResponseJson(message.json);
+    if (!isMeshStatus(value)) throw new ProtocolError("mesh status response is malformed");
+    return value;
   }
   /** Return the local and peer mesh nodes. */
   async nodes(): Promise<MeshNode[]> {
@@ -371,15 +373,65 @@ export class MeshAPI {
 function sandboxRows(body: unknown): SandboxInfo[] {
   const rows = Array.isArray(body)
     ? body
-    : body && typeof body === "object" && "sandboxes" in body && Array.isArray(body.sandboxes)
+    : isRecord(body) && Array.isArray(body.sandboxes)
       ? body.sandboxes
-      : body && typeof body === "object" && "items" in body && Array.isArray(body.items)
+      : isRecord(body) && Array.isArray(body.items)
         ? body.items
-        : [];
-  return rows.filter((row): row is SandboxInfo => isRecord(row) && typeof row.id === "string");
+        : null;
+  if (rows === null || !rows.every(isSandboxInfo))
+    throw new ProtocolError("sandbox list response is malformed");
+  return rows;
 }
-function parseJson(text: string): unknown {
-  return JSON.parse(text);
+
+function sandboxInfo(value: unknown): SandboxInfo {
+  if (!isSandboxInfo(value)) throw new ProtocolError("sandbox response has no id");
+  return value;
+}
+
+function isSandboxInfo(value: unknown): value is SandboxInfo {
+  return isRecord(value) && typeof value.id === "string" && value.id.length > 0;
+}
+
+function isHealth(value: unknown): value is Health {
+  return isRecord(value) && typeof value.ok === "boolean";
+}
+
+function isServerInfo(value: unknown): value is ServerInfo {
+  if (
+    !isRecord(value) ||
+    typeof value.version !== "string" ||
+    (value.platform !== undefined && typeof value.platform !== "string") ||
+    (value.arch !== undefined && typeof value.arch !== "string") ||
+    (value.backend !== undefined && typeof value.backend !== "string")
+  )
+    return false;
+  if (value.capabilities === undefined) return true;
+  if (!isRecord(value.capabilities) || Array.isArray(value.capabilities)) return false;
+  for (const name in value.capabilities)
+    if (typeof value.capabilities[name] !== "boolean") return false;
+  return true;
+}
+
+function isMeshStatus(value: unknown): value is MeshStatus {
+  return (
+    isRecord(value) &&
+    isMeshNode(value.self) &&
+    Array.isArray(value.peers) &&
+    value.peers.every(isMeshNode) &&
+    typeof value.replicas_held === "number" &&
+    Number.isFinite(value.replicas_held)
+  );
+}
+
+function isMeshNode(value: unknown): value is MeshNode {
+  return (
+    isRecord(value) &&
+    typeof value.node_id === "string" &&
+    (value.advertise === undefined ||
+      value.advertise === null ||
+      typeof value.advertise === "string") &&
+    (value.region === undefined || value.region === null || typeof value.region === "string")
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

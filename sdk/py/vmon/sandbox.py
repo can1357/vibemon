@@ -30,7 +30,13 @@ from .volume import Volume
 
 if TYPE_CHECKING:
     from .client import Client
-    from .models import FileInfo, SandboxInfo
+    from .models import (
+        FileInfo,
+        SandboxInfo,
+        SandboxMetrics,
+        SandboxNetworkPolicy,
+        TunnelSet,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,12 +676,15 @@ class Sandbox:
             ) from exc
         return data.decode("utf-8", errors="replace")
 
-    def metrics(self) -> dict[str, Any]:
-        """Return this sandbox's runtime metrics."""
-        return self._view_rpc(
+    def metrics(self) -> SandboxMetrics:
+        """Return this sandbox's typed runtime metrics."""
+        from .models import SandboxMetrics
+
+        value = self._view_rpc(
             lambda stubs: stubs.sandbox.Metrics(api_pb2.SandboxRef(id=self.id)),
             error="sandbox metrics returned a non-object response",
         )
+        return SandboxMetrics.from_dict(value)
 
     def stop(self, wait: bool = True) -> None:
         """Stop the sandbox while retaining its server record."""
@@ -796,59 +805,55 @@ class Sandbox:
             raise ProtocolError("filesystem snapshot returned a malformed response")
         return image
 
-    def network(self) -> dict[str, Any]:
+    def network(self) -> SandboxNetworkPolicy:
         """Return the current sandbox network policy."""
-        return self._view_rpc(
+        from .models import SandboxNetworkPolicy
+
+        value = self._view_rpc(
             lambda stubs: stubs.sandbox.NetworkGet(api_pb2.SandboxRef(id=self.id)),
             error="network policy returned a non-object response",
         )
+        return SandboxNetworkPolicy.from_dict(value)
 
-    def set_network(self, policy: Mapping[str, Any]) -> dict[str, Any]:
+    def set_network(
+        self, policy: SandboxNetworkPolicy | Mapping[str, Any]
+    ) -> SandboxNetworkPolicy:
         """Replace supplied fields in the sandbox network policy."""
+        from .models import SandboxNetworkPolicy
+
+        body = policy.to_dict() if isinstance(policy, SandboxNetworkPolicy) else policy
         request = api_pb2.NetworkSetRequest(id=self.id)
-        if policy.get("block_network") is not None:
-            request.block_network = bool(policy["block_network"])
-        if policy.get("cidr_allow") is not None:
+        if body.get("block_network") is not None:
+            request.block_network = bool(body["block_network"])
+        cidr_allow = body.get("cidr_allow")
+        if cidr_allow is not None:
+            if isinstance(cidr_allow, str) or not isinstance(cidr_allow, Iterable):
+                raise TypeError("cidr_allow must be an iterable of strings")
             request.cidr_allow.SetInParent()
-            request.cidr_allow.values.extend(str(item) for item in policy["cidr_allow"])
-        if policy.get("domain_allow") is not None:
+            request.cidr_allow.values.extend(str(item) for item in cidr_allow)
+        domain_allow = body.get("domain_allow")
+        if domain_allow is not None:
+            if isinstance(domain_allow, str) or not isinstance(domain_allow, Iterable):
+                raise TypeError("domain_allow must be an iterable of strings")
             request.domain_allow.SetInParent()
-            request.domain_allow.values.extend(str(item) for item in policy["domain_allow"])
-        return self._view_rpc(
+            request.domain_allow.values.extend(str(item) for item in domain_allow)
+        value = self._view_rpc(
             lambda stubs: stubs.sandbox.NetworkSet(request),
             error="network update returned a non-object response",
         )
+        return SandboxNetworkPolicy.from_dict(value)
 
-    def tunnels(self) -> dict[int, tuple[str, int]]:
-        """Return exposed guest ports mapped to local tunnel addresses."""
+    def tunnels(self) -> TunnelSet:
+        """Return typed exposed-port targets and their proxy token."""
+        from .models import TunnelSet
+
         value = self._view_rpc(
             lambda stubs: stubs.sandbox.Tunnels(api_pb2.SandboxRef(id=self.id)),
             error="tunnels returned a malformed response",
         )
-        raw = None
-        if isinstance(value, Mapping):
-            token = value.get("connect_token")
-            if isinstance(token, str) and token:
-                self._connect_token = token
-            raw = value.get("tunnels")
-        tunnels: dict[int, tuple[str, int]] = {}
-        if isinstance(raw, Mapping):
-            for port, target in raw.items():
-                if not isinstance(target, Mapping):
-                    continue
-                host = str(target.get("host") or "127.0.0.1")
-                raw_port = target.get("port")
-                if (
-                    isinstance(port, bool)
-                    or not isinstance(port, int | str)
-                    or isinstance(raw_port, bool)
-                    or not isinstance(raw_port, int | str)
-                ):
-                    continue
-                try:
-                    tunnels[int(port)] = (host, int(raw_port))
-                except ValueError:
-                    continue
+        tunnels = TunnelSet.from_dict(value)
+        if tunnels.connect_token:
+            self._connect_token = tunnels.connect_token
         return tunnels
 
     def wait_ready(self, probe: Any = None, timeout: float = 300) -> None:
@@ -873,7 +878,9 @@ class Sandbox:
                 if port is not None:
                     target = self.tunnels().get(port)
                     if target is not None:
-                        with socket.create_connection(target, timeout=min(1.0, timeout)):
+                        with socket.create_connection(
+                            (target.host, target.port), timeout=min(1.0, timeout)
+                        ):
                             return
                 else:
                     result = self.run(
@@ -994,7 +1001,7 @@ class _AsyncSandbox:
             return await asyncio.to_thread(self._sandbox.logs, True)
         return await asyncio.to_thread(self._sandbox.logs, False)
 
-    async def metrics(self) -> dict[str, Any]:
+    async def metrics(self) -> SandboxMetrics:
         return await asyncio.to_thread(self._sandbox.metrics)
 
     async def stop(self, wait: bool = True) -> None:
@@ -1024,13 +1031,15 @@ class _AsyncSandbox:
     async def snapshot_filesystem(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self._sandbox.snapshot_filesystem, *args, **kwargs)
 
-    async def network(self) -> dict[str, Any]:
+    async def network(self) -> SandboxNetworkPolicy:
         return await asyncio.to_thread(self._sandbox.network)
 
-    async def set_network(self, policy: Mapping[str, Any]) -> dict[str, Any]:
+    async def set_network(
+        self, policy: SandboxNetworkPolicy | Mapping[str, Any]
+    ) -> SandboxNetworkPolicy:
         return await asyncio.to_thread(self._sandbox.set_network, policy)
 
-    async def tunnels(self) -> dict[int, tuple[str, int]]:
+    async def tunnels(self) -> TunnelSet:
         return await asyncio.to_thread(self._sandbox.tunnels)
 
     async def wait_ready(self, *args: Any, **kwargs: Any) -> None:

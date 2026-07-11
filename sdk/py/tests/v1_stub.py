@@ -71,7 +71,7 @@ def _start_doc(start: api_pb2.ExecStart) -> dict[str, Any]:
     return doc
 
 
-def _view_json(view: dict[str, Any]) -> api_pb2.JsonView:
+def _view_json(view: object) -> api_pb2.JsonView:
     return api_pb2.JsonView(json=json.dumps(view, separators=(",", ":")))
 
 
@@ -182,7 +182,9 @@ class V1StubServer:
         self.volumes: set[str] = set()
         self.pools: dict[str, dict[str, Any]] = {}
         self.snapshots: set[str] = set()
-        self.events: list[dict[str, Any]] = [{"type": "ready", "sequence": 1}]
+        self.events: list[object] = [{"type": "ready", "sequence": 1}]
+        self.health_response: object = {"ok": True}
+        self.sandbox_metrics_response: object = {"vcpu_exits": 7}
         self.required_token: str | None = None
         self.drop_requests = False
         self.node_id = node_id
@@ -420,7 +422,7 @@ class V1StubServer:
     def _dispatch(self, request: RecordedRequest) -> tuple[int, Any, dict[str, str], bytes]:
         self._require_auth(request.headers)
         if request.path == "/healthz" and request.method == "GET":
-            return self._json_response(200, {"ok": True})
+            return self._json_response(200, self.health_response)
         if request.path == "/metrics" and request.method == "GET":
             return self._bytes_response(
                 200,
@@ -654,7 +656,7 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
     def Metrics(self, request: api_pb2.SandboxRef, context: Any) -> api_pb2.JsonView:
         self._enter(context, "Metrics", {"id": request.id})
         self._sandbox(context, request.id)
-        return _view_json({"vcpu_exits": 7})
+        return _view_json(self._stub.sandbox_metrics_response)
 
     def Logs(self, request: api_pb2.LogsRequest, context: Any) -> Any:
         self._enter(context, "Logs", {"id": request.id, "follow": bool(request.follow)})

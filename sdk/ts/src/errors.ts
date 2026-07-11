@@ -1,5 +1,7 @@
 import type { ConnectError } from "@connectrpc/connect";
 import { Code } from "@connectrpc/connect";
+import type { PortableValue } from "./function-values";
+import { parseJsonValue } from "./function-values";
 
 /** Structured server error fields. */
 export interface APIErrorShape {
@@ -30,6 +32,15 @@ export class TransportError extends Error {
 /** A malformed wire frame or response payload. */
 export class ProtocolError extends Error {
   override readonly name = "ProtocolError";
+}
+
+/** Parse a strict JSON response and normalize decoder failures. */
+export function parseResponseJson(text: string): PortableValue {
+  try {
+    return parseJsonValue(text);
+  } catch (error) {
+    throw new ProtocolError("vmon API returned malformed JSON", { cause: error });
+  }
 }
 
 /** Decode a non-success HTTP response into an APIError. */

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Sequence
-from typing import Any, Generic, TypeVar
-
-R = TypeVar("R")
+from typing import Any
 
 
-class CallGroup(Generic[R]):
+class CallGroup[R]:
     """A durable collection of calls with structured cancellation.
 
     The group never owns call results.  It stores only durable handles and
@@ -79,7 +77,7 @@ class CallGroup(Generic[R]):
     @classmethod
     def from_ids(
         cls, call_ids: Sequence[str], *, client: Any = None, call_type: type | None = None
-    ) -> "CallGroup[Any]":
+    ) -> CallGroup[Any]:
         """Reconnect a group from durable IDs in another process."""
 
         if call_type is None:
@@ -100,7 +98,7 @@ class CallGroup(Generic[R]):
     def __iter__(self) -> Iterator[Any]:
         return iter(self._calls)
 
-    def __enter__(self) -> "CallGroup[R]":
+    def __enter__(self) -> CallGroup[R]:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -111,7 +109,7 @@ class CallGroup(Generic[R]):
                 if exc_type is None:
                     raise
 
-    async def __aenter__(self) -> "CallGroup[R]":
+    async def __aenter__(self) -> CallGroup[R]:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:

@@ -71,14 +71,14 @@ def _definition_options(target: Any) -> FunctionOptions:
     return value
 
 
-def _set_definition_options(target: F, options: FunctionOptions) -> F:
+def _set_definition_options[F](target: F, options: FunctionOptions) -> F:
     with_options = getattr(target, "with_options", None)
     if callable(with_options):
         try:
             return with_options(options=options)
         except TypeError:
             return with_options(options)
-    setattr(target, "__vmon_options__", options)
+    target.__vmon_options__ = options  # type: ignore[attr-defined]
     return target
 
 

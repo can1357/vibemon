@@ -11,6 +11,21 @@ type Health struct {
 	OK bool `json:"ok"`
 }
 
+// UnmarshalJSON requires the daemon's boolean health field.
+func (health *Health) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		OK *bool `json:"ok"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.OK == nil {
+		return fmt.Errorf("health response has no boolean ok field")
+	}
+	health.OK = *wire.OK
+	return nil
+}
+
 // ServerInfo describes the daemon build and host capabilities.
 type ServerInfo struct {
 	// Version is the daemon version.
@@ -23,6 +38,52 @@ type ServerInfo struct {
 	Backend string `json:"backend"`
 	// Capabilities reports feature support by capability name.
 	Capabilities map[string]bool `json:"capabilities"`
+}
+
+// UnmarshalJSON requires the daemon version and validates typed capability values.
+func (info *ServerInfo) UnmarshalJSON(data []byte) error {
+	type serverInfoWire ServerInfo
+	var decoded serverInfoWire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Version == "" {
+		return fmt.Errorf("server info response has no version")
+	}
+	*info = ServerInfo(decoded)
+	return nil
+}
+
+// SandboxMetrics contains open runtime counters as lossless JSON values.
+type SandboxMetrics struct {
+	// Values contains each metric keyed by its daemon-defined name.
+	Values map[string]json.RawMessage
+}
+
+// UnmarshalJSON requires an object while retaining arbitrary nested metrics.
+func (metrics *SandboxMetrics) UnmarshalJSON(data []byte) error {
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	if values == nil {
+		return fmt.Errorf("sandbox metrics response is not an object")
+	}
+	metrics.Values = values
+	return nil
+}
+
+// Float64 decodes one numeric metric.
+func (metrics SandboxMetrics) Float64(name string) (float64, bool) {
+	raw, found := metrics.Values[name]
+	if !found {
+		return 0, false
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 // Sandbox is a typed view of a daemon-owned sandbox.
@@ -181,13 +242,18 @@ type MigrationTiming struct {
 	TotalMS uint64 `json:"total_ms"`
 }
 
-// MigrateResult is the outcome of one live migration.
-type MigrateResult struct {
-	// Sandbox is the restored sandbox's view as reported by the target node;
-	// follow-up calls should use a client for that node.
-	Sandbox Sandbox
-	// Migration reports the migration's phase latencies.
-	Migration MigrationTiming
+// MigrationTiming returns the phase latencies attached to the sandbox view
+// returned by [Sandbox.Migrate]; ok is false when the view carries none.
+func (sandbox *Sandbox) MigrationTiming() (MigrationTiming, bool) {
+	raw, found := sandbox.Details["migration"]
+	if !found {
+		return MigrationTiming{}, false
+	}
+	var timing MigrationTiming
+	if err := json.Unmarshal(raw, &timing); err != nil {
+		return MigrationTiming{}, false
+	}
+	return timing, true
 }
 
 // MeshNode is one member of a mesh.
@@ -467,8 +533,30 @@ type ShellRequest struct {
 	Timeout *float64 `json:"timeout,omitempty"`
 }
 
-// Event is one dynamic lifecycle event from the server-sent event stream.
-type Event map[string]any
+// Event is one open-ended lifecycle event from the daemon.
+type Event struct {
+	// Fields retains each event field as lossless JSON.
+	Fields map[string]json.RawMessage
+}
+
+// UnmarshalJSON requires an event object.
+func (event *Event) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return fmt.Errorf("event is not an object")
+	}
+	event.Fields = fields
+	return nil
+}
+
+// Value returns one raw event field.
+func (event Event) Value(name string) (json.RawMessage, bool) {
+	value, found := event.Fields[name]
+	return value, found
+}
 
 func marshalWithExtras(known map[string]any, extras map[string]any) ([]byte, error) {
 	for key, value := range extras {

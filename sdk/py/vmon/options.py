@@ -6,10 +6,10 @@ import json
 import math
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Mapping
 
 from .image import Image
 from .package import PackageArtifact, SerializedCallable
