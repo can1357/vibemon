@@ -550,6 +550,25 @@ impl Engine {
 		}
 		Ok((spec, Some(proxy)))
 	}
+
+	/// Mount each remote virtio-fs device into its guest target.
+	fn mount_s3_in_guest(agent: &AgentConn, mounts: &[ResolvedS3Mount]) -> Result<()> {
+		for mount in mounts {
+			let mountpoint = Path::new(&mount.mountpoint);
+			if mount.read_only {
+				agent.mount(
+					&mount.tag,
+					mountpoint,
+					true,
+					"virtiofs",
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			} else {
+				agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
+			}
+		}
+		Ok(())
+	}
 	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(MicroVm, RuntimeState)> {
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
@@ -591,20 +610,7 @@ impl Engine {
 				AGENT_REQUEST_TIMEOUT,
 			)?;
 		}
-		for mount in &plan.s3_specs {
-			let mountpoint = Path::new(&mount.mountpoint);
-			if mount.read_only {
-				agent.mount(
-					&mount.tag,
-					mountpoint,
-					true,
-					"virtiofs",
-					AGENT_REQUEST_TIMEOUT,
-				)?;
-			} else {
-				agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
-			}
-		}
+		Self::mount_s3_in_guest(&agent, &plan.s3_specs)?;
 		if let Some(network) = &runtime.network {
 			let gc = &network.guest_config;
 			agent.net_config(
@@ -2536,20 +2542,7 @@ impl EngineApi for Engine {
 		if body.agent.unwrap_or(false) {
 			let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
 			agent.ping(AGENT_CONNECT_TIMEOUT)?;
-			for mount in &s3_mounts {
-				let mountpoint = Path::new(&mount.mountpoint);
-				if mount.read_only {
-					agent.mount(
-						&mount.tag,
-						mountpoint,
-						true,
-						"virtiofs",
-						AGENT_REQUEST_TIMEOUT,
-					)?;
-				} else {
-					agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
-				}
-			}
+			Self::mount_s3_in_guest(&agent, &s3_mounts)?;
 			agent.close();
 		}
 		let mut detail = vm.meta()?;
@@ -2592,6 +2585,7 @@ impl EngineApi for Engine {
 		let mut clones = Vec::new();
 		let snapshot_dir = self.snapshot_dir(snapshot);
 		let base_disk = snapshot_dir.join("rootfs.img");
+		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir)?;
 		for _ in 0..count {
 			let name = format!("fork-{}", random_hex(12));
 			let vm = MicroVm::new(&name);
@@ -2605,8 +2599,27 @@ impl EngineApi for Engine {
 			if base_disk.is_file() {
 				spec = spec.with_disk_overlay(&base_disk, vm.dir().join("rootfs.img"));
 			}
+			let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &s3_mounts)?;
 			vm.launch(&spec)?;
-			let meta = vm.meta()?;
+			if !s3_mounts.is_empty() {
+				let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
+				agent.ping(AGENT_CONNECT_TIMEOUT)?;
+				Self::mount_s3_in_guest(&agent, &s3_mounts)?;
+				agent.close();
+			}
+			let mut meta = vm.meta()?;
+			if !s3_mounts.is_empty() {
+				meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
+			}
+			if let Some(s3_proxy) = s3_proxy {
+				self.inner.runtimes.lock().insert(
+					name.clone(),
+					RuntimeState {
+						s3_proxy: Some(s3_proxy),
+						..RuntimeState::default()
+					},
+				);
+			}
 			let record = VmRecord {
 				id:            name.clone(),
 				name:          name.clone(),
