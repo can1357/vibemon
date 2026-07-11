@@ -229,7 +229,8 @@ impl ProtocolSession {
 			},
 		};
 		encoded.push(b'\n');
-		if let Err(error) = self.inner.control.lock().write_stdin(&encoded) {
+		let write = self.inner.control.lock().write_stdin(&encoded);
+		if let Err(error) = write {
 			self.inner.pending.lock().remove(&request_id);
 			return Err(ProtocolError::Disconnected(error.to_string()));
 		}
@@ -290,7 +291,8 @@ fn dispatch(inner: &Arc<Inner>, bytes: &[u8]) -> Result<(), ProtocolError> {
 	}
 	let frame = Frame(value);
 	if frame.event() == Some("hello") {
-		if let Some(sender) = inner.hello.lock().take() {
+		let hello = inner.hello.lock().take();
+		if let Some(sender) = hello {
 			let _ = sender.send(Ok(frame));
 		}
 		return Ok(());
@@ -318,7 +320,8 @@ fn fail_all(inner: &Arc<Inner>, error: ProtocolError) {
 	if inner.closed.swap(true, Ordering::AcqRel) {
 		return;
 	}
-	if let Some(sender) = inner.hello.lock().take() {
+	let hello = inner.hello.lock().take();
+	if let Some(sender) = hello {
 		let _ = sender.send(Err(error.clone()));
 	}
 	for (_, pending) in inner.pending.lock().drain() {

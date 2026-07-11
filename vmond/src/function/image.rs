@@ -159,7 +159,7 @@ fn realize_with(
 		)));
 	}
 
-	normalized.platform = source.platform.clone();
+	normalized.platform.clone_from(&source.platform);
 	normalized.resolved_oci_digest = Some(pb::Digest {
 		algorithm: pb::DigestAlgorithm::Sha256 as i32,
 		value:     hex::decode(&source.digest)
@@ -168,7 +168,7 @@ fn realize_with(
 	let provenance_digest = manifest_digest(&normalized, &source)?;
 	if matches!(
 		normalized.source.as_ref(),
-		Some(pb::image_spec::Source::Python(_)) | Some(pb::image_spec::Source::Registry(_))
+		Some(pb::image_spec::Source::Python(_) | pb::image_spec::Source::Registry(_))
 	) && let Launch::Image(reference) = &source.launch
 	{
 		normalized.source = Some(pb::image_spec::Source::Registry(pb::RegistryImageSource {
@@ -323,6 +323,7 @@ impl CacheLock {
 			.read(true)
 			.write(true)
 			.create(true)
+			.truncate(false)
 			.mode(0o600)
 			.open(path)?;
 		// SAFETY: `file` owns this valid descriptor for the lifetime of the lock.
@@ -1054,7 +1055,7 @@ fn architecture_name(architecture: pb::CpuArchitecture) -> Result<&'static str> 
 	}
 }
 
-fn has_layers(spec: &pb::ImageSpec) -> bool {
+const fn has_layers(spec: &pb::ImageSpec) -> bool {
 	!spec.apt_packages.is_empty()
 		|| !spec.uv_packages.is_empty()
 		|| !spec.commands.is_empty()
@@ -1227,7 +1228,7 @@ mod tests {
 		let spec = registry();
 		let one = realize_with(&first, &home, &spec, pb::CpuArchitecture::Amd64).unwrap();
 		assert!(one.image.unwrap().contains("@sha256:"));
-		let mut claimed = spec.clone();
+		let mut claimed = spec;
 		claimed.resolved_oci_digest = Some(digest(1));
 		let moved = FakeBackend::new(2);
 		assert!(
@@ -1330,7 +1331,7 @@ mod tests {
 			h[156] = *kind;
 			h[257..263].copy_from_slice(b"ustar\0");
 			let sum: u64 = h.iter().map(|b| u64::from(*b)).sum();
-			let checksum = format!("{:06o}\0 ", sum);
+			let checksum = format!("{sum:06o}\0 ");
 			h[148..156].copy_from_slice(checksum.as_bytes());
 			out.extend(h);
 			out.extend(*data);
@@ -1362,7 +1363,7 @@ mod tests {
 		assert!(realize_with(&FakeBackend::new(4), &home, &spec, pb::CpuArchitecture::Amd64).is_ok());
 		let bad = tar(&[("../escape", b'0', b"x")]);
 		let bad = store.put(&bad).unwrap();
-		let mut traversal = spec.clone();
+		let mut traversal = spec;
 		if let Some(pb::image_spec::Source::Dockerfile(source)) = &mut traversal.source {
 			source.context = Some(pb::ArtifactRef {
 				digest: Some(pb::Digest {

@@ -17,11 +17,10 @@ use tonic::{
 	transport::{Channel, Endpoint as GrpcEndpoint, Uri},
 };
 use vmon_proto::v1::{
-	actor_service_client::ActorServiceClient, artifact_service_client::ArtifactServiceClient,
-	call_service_client::CallServiceClient, function_service_client::FunctionServiceClient,
-	pool_service_client::PoolServiceClient, sandbox_service_client::SandboxServiceClient,
-	snapshot_service_client::SnapshotServiceClient, system_service_client::SystemServiceClient,
-	volume_service_client::VolumeServiceClient,
+	artifact_service_client::ArtifactServiceClient, call_service_client::CallServiceClient,
+	function_service_client::FunctionServiceClient, pool_service_client::PoolServiceClient,
+	sandbox_service_client::SandboxServiceClient, snapshot_service_client::SnapshotServiceClient,
+	system_service_client::SystemServiceClient, volume_service_client::VolumeServiceClient,
 };
 
 use crate::error::{CliError, Result, err};
@@ -36,8 +35,6 @@ pub type ArtifactClient = ArtifactServiceClient<InterceptedService<Channel, Auth
 pub type FunctionClient = FunctionServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 /// Authenticated typed client for durable calls.
 pub type CallClient = CallServiceClient<InterceptedService<Channel, AuthInterceptor>>;
-/// Authenticated typed client for durable actors.
-pub type ActorClient = ActorServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type SandboxClient = SandboxServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type SnapshotClient = SnapshotServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 pub type VolumeClient = VolumeServiceClient<InterceptedService<Channel, AuthInterceptor>>;
@@ -101,11 +98,6 @@ impl Grpc {
 		self.client(CallServiceClient::with_interceptor)
 	}
 
-	/// Creates an actor service client with the CLI message limits.
-	pub fn actors(&self) -> ActorClient {
-		self.client(ActorServiceClient::with_interceptor)
-	}
-
 	pub fn sandboxes(&self) -> SandboxClient {
 		self.client(SandboxServiceClient::with_interceptor)
 	}
@@ -160,7 +152,6 @@ impl_message_limits!(
 	ArtifactClient,
 	FunctionClient,
 	CallClient,
-	ActorClient,
 );
 
 /// Rebuilds a `CliError` from a gRPC status: the stable vmond code travels in

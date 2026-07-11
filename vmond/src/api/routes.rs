@@ -173,14 +173,17 @@ async fn template_page(
 }
 
 async fn template_archive_response(archive: transfer::TemplateArchive) -> ApiResult<Response> {
-	let bytes = tokio::fs::read(&archive.path)
+	// Open, then unlink: the fd keeps the archive readable while it streams,
+	// so multi-GiB checkpoints never sit in server memory or leak temp files.
+	let file = tokio::fs::File::open(&archive.path)
 		.await
 		.map_err(EngineError::from)?;
 	let _ = tokio::fs::remove_file(&archive.path).await;
+	let stream = tokio_util::io::ReaderStream::with_capacity(file, 1 << 20);
 	Response::builder()
 		.header(header::CONTENT_TYPE, archive.media_type)
 		.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", archive.filename))
-		.body(Body::from(bytes))
+		.body(Body::from_stream(stream))
 		.map_err(|err| {
 			ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", err.to_string())
 		})

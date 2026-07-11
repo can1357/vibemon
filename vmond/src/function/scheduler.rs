@@ -49,7 +49,7 @@ impl Default for PoolPolicy {
 			buffer_workers:  0,
 			capacity:        1,
 			max_outstanding: 1,
-			idle_timeout:    Duration::from_secs(60),
+			idle_timeout:    Duration::from_mins(1),
 			max_calls:       0,
 			max_batch_size:  1,
 			batch_wait:      Duration::ZERO,
@@ -193,12 +193,12 @@ impl FairQueue {
 	}
 
 	/// Number of ephemeral advertisements currently admitted.
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		self.queued
 	}
 
 	/// Whether no inputs are currently advertised.
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.queued == 0
 	}
 }
@@ -227,7 +227,7 @@ impl WorkerPool {
 
 	/// Number of tracked live workers, including workers draining for
 	/// retirement.
-	pub fn worker_count(&self) -> usize {
+	pub const fn worker_count(&self) -> usize {
 		self.workers.len()
 	}
 
@@ -359,7 +359,7 @@ pub fn execution_interruptibility(worker: &dyn Worker) -> Interruptibility {
 ///
 /// A durable batch call is a map of independent inputs. It uses unary mode
 /// unless the scheduler explicitly forms a grouped dynamic batch.
-pub fn input_execution_mode(call_type: vmon_proto::v1::CallType) -> ExecutionMode {
+pub const fn input_execution_mode(call_type: vmon_proto::v1::CallType) -> ExecutionMode {
 	match call_type {
 		vmon_proto::v1::CallType::Generator => ExecutionMode::Generator,
 		_ => ExecutionMode::Unary,
@@ -425,7 +425,7 @@ pub async fn background_loop(
 	loop {
 		tokio::select! {
 			_ = shutdown.recv() => break,
-			_ = control.notify.notified() => tick(),
+			() = control.notify.notified() => tick(),
 			_ = maintenance.tick() => tick(),
 		}
 	}
@@ -507,7 +507,7 @@ mod tests {
 	fn backoff_is_separate_attempt_based_and_bounded() {
 		assert_eq!(retry_backoff(100, 1_000, 2.0, 1), Duration::from_millis(100));
 		assert_eq!(retry_backoff(100, 1_000, 2.0, 3), Duration::from_millis(400));
-		assert_eq!(retry_backoff(100, 1_000, 2.0, 8), Duration::from_millis(1_000));
+		assert_eq!(retry_backoff(100, 1_000, 2.0, 8), Duration::from_secs(1));
 	}
 
 	#[test]
@@ -543,11 +543,11 @@ mod tests {
 	struct InterruptibilityWorker(Interruptibility);
 
 	impl Worker for InterruptibilityWorker {
-		fn id(&self) -> &str {
+		fn id(&self) -> &'static str {
 			"test-worker"
 		}
 
-		fn revision_id(&self) -> &str {
+		fn revision_id(&self) -> &'static str {
 			"test-revision"
 		}
 

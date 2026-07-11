@@ -715,6 +715,7 @@ fn upload_artifact(grpc: &Grpc, data: &[u8]) -> Result<pb::ArtifactRef> {
 		media_type_presence: Some(pb::put_artifact_header::MediaTypePresence::MediaType(
 			"application/vnd.vmon.python-package".to_owned(),
 		)),
+		ttl_millis_presence: None,
 	};
 	let mut frames = Vec::with_capacity(data.len() / ARTIFACT_CHUNK_SIZE + 2);
 	frames.push(pb::PutArtifactRequest {
@@ -812,8 +813,7 @@ fn deploy_target_mode(
 	let revision = activated
 		.r#ref
 		.as_ref()
-		.map(|value| value.revision_id.as_str())
-		.unwrap_or("-");
+		.map_or("-", |value| value.revision_id.as_str());
 	println!("deployed {} functions  app-revision={revision}", activated.functions.len());
 	Ok(activated
 		.functions
@@ -1011,11 +1011,10 @@ fn envelope_json(grpc: &Grpc, envelope: &pb::ValueEnvelope) -> Result<Value> {
 	if data.len() as u64 != envelope.uncompressed_size_bytes {
 		return err("call result size does not match its envelope");
 	}
-	if let Some(checksum) = &envelope.checksum {
-		if checksum.value != Sha256::digest(&data).as_slice() {
+	if let Some(checksum) = &envelope.checksum
+		&& checksum.value != Sha256::digest(&data).as_slice() {
 			return err("call result checksum mismatch");
 		}
-	}
 	serde_json::from_slice(&data).map_err(Into::into)
 }
 
@@ -1533,8 +1532,7 @@ fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
 			let call_id = record
 				.r#ref
 				.as_ref()
-				.map(|value| value.call_id.as_str())
-				.unwrap_or("-");
+				.map_or("-", |value| value.call_id.as_str());
 			println!(
 				"{}",
 				serde_json::to_string_pretty(&json!({
@@ -2509,7 +2507,7 @@ fn changed_function_bindings(
 	changed
 }
 
-fn accept_event_sequence(after_sequence: &mut u64, sequence: u64) -> bool {
+const fn accept_event_sequence(after_sequence: &mut u64, sequence: u64) -> bool {
 	if sequence <= *after_sequence {
 		return false;
 	}

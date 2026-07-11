@@ -122,8 +122,8 @@ async fn invoke(
 				return result_json(&domain, result).await.map(Json);
 			},
 			pb::CallStatus::Failed | pb::CallStatus::Cancelled => {
-				let error = current.error_presence.and_then(|presence| match presence {
-					pb::call_record::ErrorPresence::Error(error) => Some(error),
+				let error = current.error_presence.map(|presence| match presence {
+					pb::call_record::ErrorPresence::Error(error) => error,
 				});
 				return Err(error.map_or_else(
 					|| ApiError::function("cancelled", "call was cancelled"),
@@ -375,9 +375,9 @@ mod tests {
 	#[test]
 	fn ijson_rejects_unsafe_integers_and_duplicate_keys() {
 		for invalid in [
-			br#"9007199254740992"#.as_slice(),
-			br#"-9007199254740992"#.as_slice(),
-			br#"1e100"#.as_slice(),
+			br"9007199254740992".as_slice(),
+			br"-9007199254740992".as_slice(),
+			br"1e100".as_slice(),
 			br#"{"same":1,"same":2}"#.as_slice(),
 		] {
 			assert!(parse_ijson(invalid).is_err(), "{}", String::from_utf8_lossy(invalid));

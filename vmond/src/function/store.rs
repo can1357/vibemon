@@ -1,4 +1,4 @@
-//! Transactional SQLite store for the durable function runtime.
+//! Transactional `SQLite` store for the durable function runtime.
 
 use std::{collections::HashSet, fs, str::FromStr, sync::Mutex};
 
@@ -19,6 +19,9 @@ const INPUT_RUNNING: i32 = 3;
 const INPUT_SUCCEEDED: i32 = 4;
 const INPUT_FAILED: i32 = 5;
 const INPUT_CANCELLED: i32 = 6;
+
+type ArtifactMetadata = (u64, Option<String>, u64, Option<u64>, String);
+type CallRow = (i32, bool, Vec<u8>, u64, u64, Option<Vec<u8>>, u64, u64);
 
 /// Exclusive ownership proof for one input attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,7 +76,7 @@ pub struct Page<T> {
 	pub next_page_token: String,
 }
 
-/// Durable SQLite metadata store. All methods serialize through one connection;
+/// Durable `SQLite` metadata store. All methods serialize through one connection;
 /// `BEGIN IMMEDIATE` protects competing lease and transition writers.
 pub struct Store {
 	connection: Mutex<Connection>,
@@ -460,7 +463,7 @@ impl Store {
 				value:     digest.to_vec(),
 			}),
 			created_at_unix_millis: now_ms,
-			previous_presence:      current.clone().map(|revision_id| {
+			previous_presence:      current.map(|revision_id| {
 				app_revision::PreviousPresence::Previous(AppRevisionRef {
 					app: Some(app.clone()),
 					revision_id,
@@ -617,11 +620,9 @@ impl Store {
 		let execution_ms = timeouts.map_or(0, |t| t.execution_millis);
 		let ttl = request
 			.result_ttl_millis_presence
-			.as_ref()
-			.map(|v| match v {
+			.as_ref().map_or_else(|| timeouts.map_or(0, |t| t.result_ttl_millis), |v| match v {
 				create_call_request::ResultTtlMillisPresence::ResultTtlMillis(v) => *v,
-			})
-			.unwrap_or_else(|| timeouts.map_or(0, |t| t.result_ttl_millis));
+			});
 		let id = Uuid::new_v4().to_string();
 		let persisted = request.clone();
 		let mut persisted_ids = HashSet::new();
@@ -850,10 +851,9 @@ impl Store {
 		let created_after = request
 			.created_after_presence
 			.as_ref()
-			.map(|v| match v {
+			.map_or(0, |v| match v {
 				list_calls_request::CreatedAfterPresence::CreatedAfterUnixMillis(ms) => *ms,
-			})
-			.unwrap_or(0);
+			});
 		let (token_ms, token_id) = decode_page_token(&request.page_token)?;
 		let limit = normalized_page_size(request.page_size);
 		let connection = self.connection.lock().map_err(lock_error)?;
@@ -899,7 +899,7 @@ impl Store {
 		};
 		let mut items = Vec::with_capacity(rows.len());
 		for (id, _) in rows {
-			items.push(call_record(&connection, id)?)
+			items.push(call_record(&connection, id)?);
 		}
 		Ok(Page { items, next_page_token })
 	}
@@ -1783,7 +1783,7 @@ impl Store {
 		let mut completed = Vec::new();
 		for id in ids {
 			if complete_call_tx(&tx, &id, now_ms)? {
-				completed.push(id)
+				completed.push(id);
 			}
 		}
 		tx.commit().map_err(sql_error)?;
@@ -1915,11 +1915,9 @@ impl Store {
 		validate_schedule(spec)?;
 		let id = request
 			.schedule_id_presence
-			.as_ref()
-			.map(|v| match v {
+			.as_ref().map_or_else(|| Uuid::new_v4().to_string(), |v| match v {
 				create_schedule_request::ScheduleIdPresence::ScheduleId(id) => id.clone(),
-			})
-			.unwrap_or_else(|| Uuid::new_v4().to_string());
+			});
 		validate_id(&id, "schedule id")?;
 		let fingerprint = canonical_schedule_fingerprint(request);
 		let mut c = self.connection.lock().map_err(lock_error)?;
@@ -2042,7 +2040,7 @@ impl Store {
 			match decode_message(&bytes) {
 				Ok(record) => schedules.push(record),
 				Err(error) => {
-					tracing::warn!(schedule_id=%id,%error,"skipping corrupt durable schedule")
+					tracing::warn!(schedule_id=%id,%error,"skipping corrupt durable schedule");
 				},
 			}
 		}
@@ -2134,9 +2132,10 @@ impl Store {
 				.ok_or_else(|| EngineError::engine("schedule missing ref"))?
 				.schedule_id
 				.clone();
-			let expected = match record.next_run_presence {
-				Some(schedule_record::NextRunPresence::NextRunUnixMillis(value)) => value,
-				None => continue,
+			let Some(schedule_record::NextRunPresence::NextRunUnixMillis(expected)) =
+				record.next_run_presence
+			else {
+				continue;
 			};
 			let spec = record
 				.spec
@@ -2312,11 +2311,9 @@ impl Store {
 		}
 		if let Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(previous)) =
 			&actor_record.latest_checkpoint_presence
-		{
-			if checkpoint_by_id(&tx, &previous.checkpoint_id)?.sequence >= checkpoint.sequence {
+			&& checkpoint_by_id(&tx, &previous.checkpoint_id)?.sequence >= checkpoint.sequence {
 				return Err(EngineError::invalid("checkpoint sequence must increase"));
 			}
-		}
 		let id = Uuid::new_v4().to_string();
 		let mut value = checkpoint.clone();
 		value.r#ref = Some(ActorCheckpointRef { checkpoint_id: id.clone() });
@@ -2630,13 +2627,12 @@ impl Store {
 			})
 			.optional()
 			.map_err(sql_error)?;
-		if let Some((stored_size, stored_path, stored_media)) = existing {
-			if stored_size != size || stored_path != path || stored_media.as_deref() != media_type {
+		if let Some((stored_size, stored_path, stored_media)) = existing
+			&& (stored_size != size || stored_path != path || stored_media.as_deref() != media_type) {
 				return Err(EngineError::invalid(
 					"artifact digest already has conflicting immutable metadata",
 				));
 			}
-		}
 		tx.execute(
 			"INSERT INTO artifacts(digest,size,media_type,created_ms,expires_ms,path) \
 			 VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING",
@@ -2658,7 +2654,7 @@ impl Store {
 	pub fn stat_artifact(
 		&self,
 		digest: &str,
-	) -> Result<(u64, Option<String>, u64, Option<u64>, String)> {
+	) -> Result<ArtifactMetadata> {
 		validate_digest_hex(digest)?;
 		let connection = self.connection.lock().map_err(lock_error)?;
 		connection
@@ -2978,7 +2974,7 @@ fn decode_rows<M: Message + Default>(
 ) -> Result<Vec<M>> {
 	let mut out = Vec::new();
 	for row in rows {
-		out.push(decode_message(&row.map_err(sql_error)?)?)
+		out.push(decode_message(&row.map_err(sql_error)?)?);
 	}
 	Ok(out)
 }
@@ -3112,16 +3108,14 @@ fn resolve_function_defaults(spec: &FunctionSpec) -> FunctionSpec {
 			workers.max_outstanding_inputs = 1;
 		}
 	}
-	if let Some(concurrency) = &mut resolved.concurrency {
-		if concurrency.max_concurrent_calls == 0 {
+	if let Some(concurrency) = &mut resolved.concurrency
+		&& concurrency.max_concurrent_calls == 0 {
 			concurrency.max_concurrent_calls = 1;
 		}
-	}
-	if let Some(batching) = &mut resolved.batching {
-		if batching.enabled && batching.max_batch_size == 0 {
+	if let Some(batching) = &mut resolved.batching
+		&& batching.enabled && batching.max_batch_size == 0 {
 			batching.max_batch_size = 1;
 		}
-	}
 	resolved
 }
 fn validate_function_spec(s: &FunctionSpec) -> Result<()> {
@@ -3210,12 +3204,10 @@ fn canonical_call_fingerprint(request: &CreateCallRequest) -> [u8; 32] {
 	}
 	if let Some(CallTarget { receiver: Some(call_target::Receiver::Service(service)), .. }) =
 		&mut base.target
-	{
-		if let Some(arguments) = &mut service.constructor {
+		&& let Some(arguments) = &mut service.constructor {
 			maps.push(("service.constructor.named".into(), sorted_envelope_map(&arguments.named)));
 			arguments.named.clear();
 		}
-	}
 	hash_domain_maps(base.encode_to_vec(), maps)
 }
 fn canonical_schedule_fingerprint(request: &CreateScheduleRequest) -> [u8; 32] {
@@ -3251,25 +3243,23 @@ fn digest_bindings(bindings: &[AppFunctionBinding]) -> [u8; 32] {
 		h.update((b.name.len() as u64).to_be_bytes());
 		h.update(b.name.as_bytes());
 		if let Some(r) = &b.revision {
-			h.update(r.encode_to_vec())
+			h.update(r.encode_to_vec());
 		}
 	}
 	h.finalize().into()
 }
 fn check_expected_revision(current: Option<&str>, expected: Option<&RevisionRef>) -> Result<()> {
-	if let Some(e) = expected {
-		if current != Some(e.revision_id.as_str()) {
+	if let Some(e) = expected
+		&& current != Some(e.revision_id.as_str()) {
 			return Err(EngineError::busy("active function revision changed"));
 		}
-	}
 	Ok(())
 }
 fn check_expected_app(current: Option<&str>, expected: Option<&AppRevisionRef>) -> Result<()> {
-	if let Some(e) = expected {
-		if current != Some(e.revision_id.as_str()) {
+	if let Some(e) = expected
+		&& current != Some(e.revision_id.as_str()) {
 			return Err(EngineError::busy("active app revision changed"));
 		}
-	}
 	Ok(())
 }
 fn validate_call_error(error: &CallError, depth: usize) -> Result<()> {
@@ -3333,17 +3323,15 @@ fn validate_call_request(r: &CreateCallRequest) -> Result<()> {
 			"unary, generator, and actor calls require exactly one closed index-0 input",
 		));
 	}
-	let mut expected = 0;
 	let mut ids = HashSet::new();
-	for input in &r.inputs {
-		if input.index != expected {
+	for (expected, input) in r.inputs.iter().enumerate() {
+		if input.index != expected as u64 {
 			return Err(EngineError::invalid("initial input indexes must be contiguous"));
 		}
 		if input.input_id.is_empty() || !ids.insert(&input.input_id) {
 			return Err(EngineError::invalid("client input ids must be nonempty and unique"));
 		}
 		validate_call_input(input)?;
-		expected += 1;
 	}
 	Ok(())
 }
@@ -3415,7 +3403,7 @@ fn insert_input(c: &Connection, call: &str, input: &CallInput, now: u64) -> Resu
 	Ok(())
 }
 fn call_record(c: &Connection, id: &str) -> Result<CallRecord> {
-	let row: (i32, bool, Vec<u8>, u64, u64, Option<Vec<u8>>, u64, u64) = c
+	let row: CallRow = c
 		.query_row(
 			"SELECT status,input_closed,request,created_ms,updated_ms,error,(SELECT COUNT(*) FROM \
 			 inputs WHERE call_id=calls.id),result_seq FROM calls WHERE id=?",
@@ -3482,7 +3470,7 @@ fn call_stats(c: &Connection, id: &str) -> Result<CallStats> {
 		.query_map([id], |r| r.get::<_, Vec<u8>>(0))
 		.map_err(sql_error)?
 	{
-		attempts.push(decode_message(&row.map_err(sql_error)?)?)
+		attempts.push(decode_message(&row.map_err(sql_error)?)?);
 	}
 	let queue = started
 		.unwrap_or(updated)
@@ -3605,7 +3593,7 @@ fn call_kind(c: &Connection, id: &str) -> Result<CallType> {
 		.map_err(sql_error)?;
 	CallType::try_from(raw).map_err(|_| EngineError::engine("corrupt call type"))
 }
-fn terminal_call(s: CallStatus) -> bool {
+const fn terminal_call(s: CallStatus) -> bool {
 	matches!(s, CallStatus::Succeeded | CallStatus::Failed | CallStatus::Cancelled)
 }
 fn append_attempt_transition(
@@ -3966,11 +3954,10 @@ fn validate_schedule(s: &ScheduleSpec) -> Result<()> {
 	{
 		return Err(EngineError::invalid("schedule is incomplete"));
 	}
-	if let Some(schedule_spec::Timing::Period(p)) = &s.timing {
-		if p.period_millis == 0 {
+	if let Some(schedule_spec::Timing::Period(p)) = &s.timing
+		&& p.period_millis == 0 {
 			return Err(EngineError::invalid("schedule period must be positive"));
 		}
-	}
 	if ScheduleStatus::try_from(s.status).unwrap_or(ScheduleStatus::Unspecified)
 		== ScheduleStatus::Unspecified
 	{
@@ -4001,7 +3988,7 @@ where
 {
 	let mut values = Vec::new();
 	for row in rows {
-		values.push(row.map_err(sql_error)?)
+		values.push(row.map_err(sql_error)?);
 	}
 	let more = values.len() > limit as usize;
 	if more {
@@ -4017,7 +4004,7 @@ where
 	};
 	let mut items = Vec::new();
 	for (b, ..) in values {
-		items.push(decode(&b)?)
+		items.push(decode(&b)?);
 	}
 	Ok(Page { items, next_page_token: token })
 }
@@ -4059,7 +4046,7 @@ fn actor_initial_artifacts(request: &CreateActorRequest) -> Vec<String> {
 	let mut out = Vec::new();
 	match &request.initial_payload {
 		Some(create_actor_request::InitialPayload::InitialValue(value)) => {
-			out.extend(envelope_artifacts(Some(value)))
+			out.extend(envelope_artifacts(Some(value)));
 		},
 		Some(create_actor_request::InitialPayload::InitialArguments(arguments)) => {
 			for value in &arguments.positional {
@@ -4091,11 +4078,10 @@ fn call_input_artifacts(input: &CallInput) -> Vec<String> {
 }
 fn envelope_artifacts(e: Option<&ValueEnvelope>) -> Vec<String> {
 	let mut v = Vec::new();
-	if let Some(ValueEnvelope { storage: Some(value_envelope::Storage::Artifact(a)), .. }) = e {
-		if let Some(d) = artifact_ref_digest(Some(a)) {
-			v.push(d)
+	if let Some(ValueEnvelope { storage: Some(value_envelope::Storage::Artifact(a)), .. }) = e
+		&& let Some(d) = artifact_ref_digest(Some(a)) {
+			v.push(d);
 		}
-	}
 	v
 }
 fn result_artifacts(r: &CallResult) -> Vec<String> {
@@ -4110,18 +4096,16 @@ fn function_spec_artifacts(s: &FunctionSpec) -> HashSet<String> {
 		if let Some(d) = artifact_ref_digest(p.source.as_ref()) {
 			out.insert(d);
 		}
-		if let Some(package_spec::LockfilePresence::Lockfile(a)) = &p.lockfile_presence {
-			if let Some(d) = artifact_ref_digest(Some(a)) {
+		if let Some(package_spec::LockfilePresence::Lockfile(a)) = &p.lockfile_presence
+			&& let Some(d) = artifact_ref_digest(Some(a)) {
 				out.insert(d);
 			}
-		}
 	}
 	if let Some(i) = &s.image {
-		if let Some(image_spec::Source::Dockerfile(d)) = &i.source {
-			if let Some(v) = artifact_ref_digest(d.context.as_ref()) {
+		if let Some(image_spec::Source::Dockerfile(d)) = &i.source
+			&& let Some(v) = artifact_ref_digest(d.context.as_ref()) {
 				out.insert(v);
 			}
-		}
 		for mount in &i.local_artifact_mounts {
 			if let Some(v) = artifact_ref_digest(mount.artifact.as_ref()) {
 				out.insert(v);
@@ -4302,8 +4286,7 @@ mod tests {
 		barrier.wait();
 		let leases: Vec<_> = threads
 			.into_iter()
-			.map(|t| t.join().unwrap())
-			.flatten()
+			.filter_map(|t| t.join().unwrap())
 			.collect();
 		assert_eq!(leases.len(), 1);
 		let store = Store::open(&home).unwrap();
@@ -4384,7 +4367,7 @@ mod tests {
 			.unwrap()
 			.call_id;
 		let revision_id = revision_ref(&revision).revision_id;
-		let mut later = request.clone();
+		let mut later = request;
 		later.request_id = "later-batch".into();
 		later.inputs = vec![CallInput {
 			index:    0,
@@ -4671,7 +4654,7 @@ mod tests {
 					target:                    first.r#ref.clone(),
 					expected_current_presence: Some(
 						rollback_app_request::ExpectedCurrentPresence::ExpectedCurrent(
-							second.r#ref.clone().unwrap(),
+							second.r#ref.unwrap(),
 						),
 					),
 					request_id:                "rollback".into(),
@@ -4706,7 +4689,7 @@ mod tests {
 				20,
 			)
 			.unwrap();
-		let actor_ref = actor.r#ref.clone().unwrap();
+		let actor_ref = actor.r#ref.unwrap();
 		let checkpoint = store
 			.put_checkpoint(
 				&ActorCheckpoint {
@@ -4742,7 +4725,7 @@ mod tests {
 		let forked = store
 			.fork_actor_from_checkpoint(
 				&ForkActorRequest {
-					checkpoint: checkpoint.r#ref.clone(),
+					checkpoint: checkpoint.r#ref,
 					request_id: "fork".into(),
 					labels:     Default::default(),
 				},
@@ -4774,7 +4757,7 @@ mod tests {
 					)),
 					spec:                 Some(ScheduleSpec {
 						name:   "daily".into(),
-						app:    app_revision.r#ref.clone(),
+						app:    app_revision.r#ref,
 						target: Some(ScheduleTarget {
 							function: Some(revision_ref(&revision)),
 							input:    Some(envelope(b"scheduled")),
@@ -4802,7 +4785,7 @@ mod tests {
 			schedule_id_presence: Some(create_schedule_request::ScheduleIdPresence::ScheduleId(
 				"invalid-target".into(),
 			)),
-			spec:                 schedule.spec.clone(),
+			spec:                 schedule.spec,
 			request_id:           "invalid-target".into(),
 		};
 		invalid
@@ -4841,13 +4824,12 @@ mod tests {
 			ActorStatus::Stopped as i32
 		);
 		assert_eq!(reopened.get_actor(&lost_id).unwrap().status, ActorStatus::Failed as i32);
-		assert_eq!(
+		assert!(
 			reopened
 				.get_actor(&actor_ref.actor_id)
 				.unwrap()
 				.latest_checkpoint_presence
-				.is_some(),
-			true
+				.is_some()
 		);
 		assert_eq!(
 			reopened
@@ -4975,8 +4957,8 @@ mod tests {
 			.unwrap();
 		let mut call = call_request(&registered, "bad");
 		if let Some(call_input::Payload::Value(value)) = call.inputs[0].payload.as_mut() {
-			value.uncompressed_size_bytes = 99
-		};
+			value.uncompressed_size_bytes = 99;
+		}
 		assert!(store.create_call(&call, 3).is_err());
 		drop(store);
 		for path in [

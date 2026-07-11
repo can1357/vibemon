@@ -625,13 +625,10 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 			.message()
 			.await?
 			.ok_or_else(|| status_from(&ApiError::invalid("artifact upload requires a header")))?;
-		let header = match first.frame {
-			Some(pb::put_artifact_request::Frame::Header(header)) => header,
-			_ => {
-				return Err(status_from(&ApiError::invalid(
-					"artifact upload first frame must be a header",
-				)));
-			},
+		let Some(pb::put_artifact_request::Frame::Header(header)) = first.frame else {
+			return Err(status_from(&ApiError::invalid(
+				"artifact upload first frame must be a header",
+			)));
 		};
 		let digest = header
 			.expected_digest
@@ -725,20 +722,17 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 					return Err(error);
 				},
 			};
-			match frame.frame {
-				Some(pb::put_artifact_request::Frame::Data(data)) => {
-					tx.send(ArtifactUploadFrame::Chunk(data))
-						.await
-						.map_err(|_| Status::cancelled("artifact writer stopped"))?;
-				},
-				_ => {
-					let _ = tx.send(ArtifactUploadFrame::Abort).await;
-					let _ = commit.await;
-					return Err(status_from(&ApiError::invalid(
-						"artifact upload frames after the header must contain data",
-					)));
-				},
-			}
+			if let Some(pb::put_artifact_request::Frame::Data(data)) = frame.frame {
+   					tx.send(ArtifactUploadFrame::Chunk(data))
+   						.await
+   						.map_err(|_| Status::cancelled("artifact writer stopped"))?;
+   				} else {
+   					let _ = tx.send(ArtifactUploadFrame::Abort).await;
+   					let _ = commit.await;
+   					return Err(status_from(&ApiError::invalid(
+   						"artifact upload frames after the header must contain data",
+   					)));
+   				}
 		}
 		let record = commit
 			.await
@@ -1129,16 +1123,13 @@ impl pb::call_service_server::CallService for GrpcApi {
 						break;
 					},
 				};
-				let input = match frame.frame {
-					Some(pb::stream_call_inputs_request::Frame::Input(input)) => input,
-					_ => {
-						let _ = tx
-							.send(Err(status_from(&ApiError::invalid(
-								"input frames after the opener must contain an input",
-							))))
-							.await;
-						break;
-					},
+				let Some(pb::stream_call_inputs_request::Frame::Input(input)) = frame.frame else {
+					let _ = tx
+						.send(Err(status_from(&ApiError::invalid(
+							"input frames after the opener must contain an input",
+						))))
+						.await;
+					break;
 				};
 				let input_ref =
 					pb::InputRef { input_id: input.input_id.clone(), input_index: input.index };

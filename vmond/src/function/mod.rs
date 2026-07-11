@@ -138,12 +138,12 @@ impl FunctionDomain {
 	}
 
 	/// Immutable content-addressed payload store.
-	pub fn artifacts(&self) -> &ArtifactStore {
+	pub const fn artifacts(&self) -> &ArtifactStore {
 		&self.artifacts
 	}
 
 	/// Process-local actor worker pins.
-	pub fn actors(&self) -> &ActorManager {
+	pub const fn actors(&self) -> &ActorManager {
 		&self.actors
 	}
 
@@ -185,7 +185,8 @@ impl FunctionDomain {
 	) {
 		let revision_id = revision_id.into();
 		let key = (revision_id.clone(), secret.name.clone(), secret_version(secret));
-		if let Some(mut old) = self.secrets.write().insert(key, value) {
+		let replaced = self.secrets.write().insert(key, value);
+		if let Some(mut old) = replaced {
 			old.fill(0);
 		}
 		if let Err(error) = self.refresh_revision_availability(&revision_id) {
@@ -313,9 +314,10 @@ impl FunctionDomain {
 		loop {
 			let page = self.store.list_revisions(None, 1_000, &page_token)?;
 			for revision in page.items {
-				let record = match revision.snapshot_presence.as_ref() {
-					Some(pb::function_revision::SnapshotPresence::Snapshot(record)) => record,
-					None => continue,
+				let Some(pb::function_revision::SnapshotPresence::Snapshot(record)) =
+					revision.snapshot_presence.as_ref()
+				else {
+					continue;
 				};
 				let expected = SnapshotProvenance::for_revision(&revision)
 					.map_err(|error| EngineError::engine(error.to_string()))?;
@@ -517,8 +519,8 @@ impl FunctionDomain {
 							checkpoint.checkpoint_id.clone()
 						},
 					});
-			if matches!(status, pb::ActorStatus::Ready | pb::ActorStatus::Stopped) {
-				if let Some(checkpoint_id) = checkpoint_id {
+			if matches!(status, pb::ActorStatus::Ready | pb::ActorStatus::Stopped)
+				&& let Some(checkpoint_id) = checkpoint_id {
 					return self
 						.restore_actor_checkpoint(
 							&actor_id,
@@ -527,7 +529,6 @@ impl FunctionDomain {
 						)
 						.await;
 				}
-			}
 			let _ =
 				self
 					.store
@@ -766,7 +767,10 @@ impl FunctionDomain {
 				request_id: request_id.to_owned(),
 				call_id:    None,
 				actor_id:   actor_id.to_owned(),
-				operation:  ActorOperation::Restore { checkpoint_id: checkpoint_id.to_owned(), state },
+				operation:  ActorOperation::Restore {
+					checkpoint_id: checkpoint_id.to_owned(),
+					state: Box::new(state),
+				},
 				input:      None,
 				deadline:   None,
 			})
@@ -821,11 +825,8 @@ impl FunctionDomain {
 			executions
 				.iter()
 				.filter(|((active_call_id, _), _)| active_call_id == call_id)
-				.filter_map(|(_, execution)| {
-					seen
-						.insert(execution.request_id.clone())
-						.then(|| (Arc::clone(&execution.worker), execution.request_id.clone()))
-				})
+				.filter(|&(_, execution)| seen
+						.insert(execution.request_id.clone())).map(|(_, execution)| (Arc::clone(&execution.worker), execution.request_id.clone()))
 				.collect::<Vec<_>>()
 		};
 		for (worker, execution_request_id) in active {
@@ -857,7 +858,7 @@ impl FunctionDomain {
 			loop {
 				tokio::select! {
 					_ = shutdown.recv() => break,
-					_ = domain.control.notify.notified() => domain.scheduler_tick().await,
+					() = domain.control.notify.notified() => domain.scheduler_tick().await,
 					_ = interval.tick() => domain.scheduler_tick().await,
 				}
 			}
@@ -958,11 +959,10 @@ impl FunctionDomain {
 							self
 								.metrics
 								.worker_started(started.elapsed().as_millis() as u64);
-							if let Some(snapshot) = worker.initial_snapshot() {
-								if let Err(error) = self.persist_snapshot(snapshot, &revision) {
+							if let Some(snapshot) = worker.initial_snapshot()
+								&& let Err(error) = self.persist_snapshot(snapshot, &revision) {
 									tracing::warn!(%error, revision_id = %queued.revision_id, "initial function snapshot persistence failed");
 								}
-							}
 							let id = worker.id().to_owned();
 							self.workers.lock().insert(id.clone(), worker);
 							self
@@ -1150,7 +1150,7 @@ impl FunctionDomain {
 		let deadline = leased
 			.execution_deadline_ms
 			.map(|millis| UNIX_EPOCH + Duration::from_millis(millis));
-		let mut _actor_permit = None;
+		let mut actor_permit = None;
 		let mut actor_operation: Option<(String, u64)> = None;
 		let execution_result = if call_type == pb::CallType::Actor {
 			let actor_target = leased
@@ -1158,11 +1158,10 @@ impl FunctionDomain {
 				.target
 				.as_ref()
 				.and_then(|target| target.receiver.as_ref())
-				.map(|receiver| match receiver {
+				.and_then(|receiver| match receiver {
 					pb::call_target::Receiver::Actor(actor) => Some(actor),
 					pb::call_target::Receiver::Service(_) => None,
-				})
-				.flatten();
+				});
 			let actor_id = actor_target
 				.and_then(|target| target.actor.as_ref())
 				.map(|actor| actor.actor_id.clone());
@@ -1175,64 +1174,61 @@ impl FunctionDomain {
 				self.finish_worker_slot(&leased, worker.id());
 				return;
 			};
-			let permit = match self.actors.acquire(&actor_id).await {
-				Ok(permit) => permit,
-				Err(_) => {
-					let record = self.store.get_actor(&actor_id);
-					let checkpoint_id = record.ok().and_then(|record| {
-						record
-							.latest_checkpoint_presence
-							.map(|presence| match presence {
-								pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(
-									checkpoint,
-								) => checkpoint.checkpoint_id,
-							})
-					});
-					if let Some(checkpoint_id) = checkpoint_id {
-						if self
-							.restore_actor_checkpoint(
-								&actor_id,
-								&checkpoint_id,
-								&format!("recover:{request_id}"),
-							)
-							.await
-							.is_ok()
-						{
-							match self.actors.acquire(&actor_id).await {
-								Ok(permit) => permit,
-								Err(error) => {
-									self.commit_worker_error(
-										&leased,
-										&WorkerError::actor_lost(error.to_string()),
-									);
-									self.finish_worker_slot(&leased, worker.id());
-									return;
-								},
-							}
-						} else {
-							self.commit_worker_error(
-								&leased,
-								&WorkerError::actor_lost("actor checkpoint restore failed"),
-							);
-							self.finish_worker_slot(&leased, worker.id());
-							return;
-						}
-					} else {
-						let _ = self.store.set_actor_status(
-							&actor_id,
-							pb::ActorStatus::Failed,
-							None,
-							unix_millis(),
-						);
-						self.commit_worker_error(
-							&leased,
-							&WorkerError::actor_lost("actor worker was lost without a checkpoint"),
-						);
-						self.finish_worker_slot(&leased, worker.id());
-						return;
-					}
-				},
-			};
+			let permit = if let Ok(permit) = self.actors.acquire(&actor_id).await { permit } else {
+   					let record = self.store.get_actor(&actor_id);
+   					let checkpoint_id = record.ok().and_then(|record| {
+   						record
+   							.latest_checkpoint_presence
+   							.map(|presence| match presence {
+   								pb::actor_record::LatestCheckpointPresence::LatestCheckpoint(
+   									checkpoint,
+   								) => checkpoint.checkpoint_id,
+   							})
+   					});
+   					if let Some(checkpoint_id) = checkpoint_id {
+   						if self
+   							.restore_actor_checkpoint(
+   								&actor_id,
+   								&checkpoint_id,
+   								&format!("recover:{request_id}"),
+   							)
+   							.await
+   							.is_ok()
+   						{
+   							match self.actors.acquire(&actor_id).await {
+   								Ok(permit) => permit,
+   								Err(error) => {
+   									self.commit_worker_error(
+   										&leased,
+   										&WorkerError::actor_lost(error.to_string()),
+   									);
+   									self.finish_worker_slot(&leased, worker.id());
+   									return;
+   								},
+   							}
+   						} else {
+   							self.commit_worker_error(
+   								&leased,
+   								&WorkerError::actor_lost("actor checkpoint restore failed"),
+   							);
+   							self.finish_worker_slot(&leased, worker.id());
+   							return;
+   						}
+   					} else {
+   						let _ = self.store.set_actor_status(
+   							&actor_id,
+   							pb::ActorStatus::Failed,
+   							None,
+   							unix_millis(),
+   						);
+   						self.commit_worker_error(
+   							&leased,
+   							&WorkerError::actor_lost("actor worker was lost without a checkpoint"),
+   						);
+   						self.finish_worker_slot(&leased, worker.id());
+   						return;
+   					}
+   				};
 			let sequence = match self
 				.store
 				.allocate_actor_operation(&actor_id, unix_millis())
@@ -1266,7 +1262,7 @@ impl FunctionDomain {
 					deadline,
 				})
 				.await;
-			_actor_permit = Some(permit);
+			actor_permit = Some(permit);
 			result
 		} else {
 			worker
@@ -1314,7 +1310,7 @@ impl FunctionDomain {
 					}
 					break outcome;
 				}
-				_ = tokio::time::sleep(Duration::from_millis(5)) => {
+				() = tokio::time::sleep(Duration::from_millis(5)) => {
 					for event in events.try_iter() {
 						self.commit_worker_event(&leased, event);
 					}
@@ -1390,6 +1386,7 @@ impl FunctionDomain {
 				}
 			},
 		}
+		drop(actor_permit);
 		self.finish_worker_slot(&leased, worker.id());
 		self.notify_work();
 	}
@@ -1497,7 +1494,7 @@ impl FunctionDomain {
 					}
 					break outcome;
 				}
-				_ = tokio::time::sleep(Duration::from_millis(5)) => {
+				() = tokio::time::sleep(Duration::from_millis(5)) => {
 					for event in events.try_iter() {
 						self.commit_batch_worker_event(&leased, event);
 					}
@@ -1670,11 +1667,9 @@ impl FunctionDomain {
 			.r#ref
 			.as_ref()
 			.map(|reference| reference.revision_id.as_str())
-		{
-			if let Some(pool) = self.pools.lock().get_mut(revision_id) {
+			&& let Some(pool) = self.pools.lock().get_mut(revision_id) {
 				pool.complete(worker_id, unix_millis());
 			}
-		}
 	}
 
 	fn retire_idle(&self, now: u64) {
@@ -1683,7 +1678,8 @@ impl FunctionDomain {
 			retire.extend(pool.retire_ready(now));
 		}
 		for worker_id in retire {
-			if let Some(worker) = self.workers.lock().remove(&worker_id) {
+			let worker = self.workers.lock().remove(&worker_id);
+			if let Some(worker) = worker {
 				for pool in self.pools.lock().values_mut() {
 					pool.remove_worker(&worker_id);
 				}
@@ -1696,7 +1692,7 @@ impl FunctionDomain {
 	}
 
 	/// Vibemon home that owns this domain.
-	pub fn home(&self) -> &Home {
+	pub const fn home(&self) -> &Home {
 		&self.home
 	}
 }

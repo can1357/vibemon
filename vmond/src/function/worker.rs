@@ -37,8 +37,8 @@ const RUNNER: &[u8] = include_bytes!("runner.py");
 const RUNNER_PATH: &str = "/opt/vmon/runner.py";
 const PACKAGE_PATH: &str = "/opt/vmon/functions/package.zip";
 const SOCKET_PATH: &str = "/run/vmon/function-v2.sock";
-const DEFAULT_STARTUP: Duration = Duration::from_secs(60);
-const DEFAULT_EXECUTION: Duration = Duration::from_secs(300);
+const DEFAULT_STARTUP: Duration = Duration::from_mins(1);
+const DEFAULT_EXECUTION: Duration = Duration::from_mins(5);
 const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
 
 /// A boxed asynchronous operation used by object-safe executor traits.
@@ -62,20 +62,6 @@ impl SecretValues {
 		}
 	}
 
-	/// Construct secret material from name/value pairs.
-	pub fn from_iter<I, K, V>(items: I) -> Self
-	where
-		I: IntoIterator<Item = (K, V)>,
-		K: Into<String>,
-		V: Into<Vec<u8>>,
-	{
-		Self(
-			items
-				.into_iter()
-				.map(|(k, v)| (k.into(), v.into()))
-				.collect(),
-		)
-	}
 
 	/// Borrow one secret value without copying it.
 	pub fn get(&self, name: &str) -> Option<&[u8]> {
@@ -135,11 +121,10 @@ impl SecretValues {
 
 	fn redact_error(&self, mut error: WorkerError) -> WorkerError {
 		for bytes in self.0.values() {
-			if let Ok(secret) = std::str::from_utf8(bytes) {
-				if !secret.is_empty() {
+			if let Ok(secret) = std::str::from_utf8(bytes)
+				&& !secret.is_empty() {
 					error.message = error.message.replace(secret, "[REDACTED]");
 				}
-			}
 		}
 		error
 	}
@@ -180,9 +165,9 @@ pub struct WorkerError {
 	/// Structured frames supplied by the guest.
 	pub frames:     Vec<pb::ErrorFrame>,
 	/// One bounded structured cause.
-	pub cause:      Option<Box<WorkerError>>,
+	pub cause:      Option<Box<Self>>,
 	/// Non-secret diagnostic attributes.
-	pub details:    HashMap<String, String>,
+	pub details:    Box<HashMap<String, String>>,
 }
 
 impl WorkerError {
@@ -236,7 +221,7 @@ impl WorkerError {
 			error_type: String::new(),
 			frames: Vec::new(),
 			cause: None,
-			details: HashMap::new(),
+			details: Box::default(),
 		}
 	}
 }
@@ -269,7 +254,7 @@ pub enum ExecutionMode {
 	Batch,
 }
 impl ExecutionMode {
-	fn wire(self) -> &'static str {
+	const fn wire(self) -> &'static str {
 		match self {
 			Self::Unary => "unary",
 			Self::Generator => "generator",
@@ -319,7 +304,7 @@ pub enum ActorOperation {
 	Create,
 	Method { name: String },
 	Checkpoint { checkpoint_id: String },
-	Restore { checkpoint_id: String, state: pb::ValueEnvelope },
+	Restore { checkpoint_id: String, state: Box<pb::ValueEnvelope> },
 	Fork { child_actor_id: String },
 	Shutdown,
 }
@@ -455,12 +440,7 @@ impl SnapshotProvenance {
 			spec
 				.lifecycle_hooks
 				.as_ref()
-				.and_then(|hooks| match &hooks.initialize_presence {
-					Some(pb::lifecycle_hooks::InitializePresence::Initialize(hook)) => {
-						Some((hook.module.clone(), hook.qualname.clone()))
-					},
-					None => None,
-				});
+				.and_then(|hooks| hooks.initialize_presence.as_ref().map(|pb::lifecycle_hooks::InitializePresence::Initialize(hook)| (hook.module.clone(), hook.qualname.clone())));
 		let spec_digest = revision
 			.spec_digest
 			.as_ref()
@@ -550,12 +530,7 @@ impl WorkerSnapshot {
 		let runner = record.runner_digest.as_ref().map(|d| d.value.as_slice());
 		let image = record.image_digest.as_ref().map(|d| d.value.as_slice());
 		let package = record.package_digest.as_ref().map(|d| d.value.as_slice());
-		let hook = match &record.initialize_hook_presence {
-			Some(pb::function_snapshot_record::InitializeHookPresence::InitializeHook(hook)) => {
-				Some((hook.module.clone(), hook.qualname.clone()))
-			},
-			None => None,
-		};
+		let hook = record.initialize_hook_presence.as_ref().map(|pb::function_snapshot_record::InitializeHookPresence::InitializeHook(hook)| (hook.module.clone(), hook.qualname.clone()));
 		if revision_id != Some(expected.revision_id.as_str())
 			|| record.protocol_version as u64 != expected.runner_protocol
 			|| runner != Some(expected.runner_digest.as_slice())
@@ -1062,12 +1037,7 @@ impl EngineWorker {
 					"cloudpickle input rejected by revision serializer policy",
 				));
 			}
-			let supplied = match &envelope.python_presence {
-				Some(pb::value_envelope::PythonPresence::Python(python)) => {
-					Some(python.cloudpickle_version.as_str())
-				},
-				None => None,
-			};
+			let supplied = envelope.python_presence.as_ref().map(|pb::value_envelope::PythonPresence::Python(python)| python.cloudpickle_version.as_str());
 			if supplied != self.cloudpickle_version.as_deref() {
 				return Err(WorkerError::platform(
 					"cloudpickle_version_mismatch",
@@ -1179,8 +1149,8 @@ impl EngineWorker {
 			.name(format!("vmon-events-{request_id}"))
 			.spawn(move || {
 				while let Ok(mut frame) = raw_events.recv() {
-					if frame.event() == Some("yield") {
-						if let Err(error) = materialize_output(
+					if frame.event() == Some("yield")
+						&& let Err(error) = materialize_output(
 							event_engine.as_ref(),
 							&event_worker_id,
 							&event_artifact_root,
@@ -1189,16 +1159,14 @@ impl EngineWorker {
 							*event_failure.lock() = Some(error);
 							break;
 						}
-					}
-					if let Some(event) = typed_event(&frame) {
-						if events_tx.try_send(event).is_err() {
+					if let Some(event) = typed_event(&frame)
+						&& events_tx.try_send(event).is_err() {
 							*event_failure.lock() = Some(WorkerError::infrastructure(
 								"event_backpressure",
 								"worker event consumer did not keep up",
 							));
 							break;
 						}
-					}
 				}
 			}) {
 			Ok(worker) => worker,
@@ -1243,10 +1211,11 @@ impl EngineWorker {
 			let cleanup_engine = Arc::clone(&engine);
 			let cleanup_id = id.clone();
 			let _ = tokio::task::spawn_blocking(move || {
-				cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths)
+				cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths);
 			})
 			.await;
-			if let Some(error) = event_error.lock().take() {
+			let event_failure = event_error.lock().take();
+			if let Some(error) = event_failure {
 				result = Err(ProtocolError::Disconnected(error.to_string()));
 			}
 			if let Ok(mut frame) = result {
@@ -1298,8 +1267,8 @@ impl EngineWorker {
 				snapshot_restore: restored,
 				..AttemptStats::default()
 			};
-			if let Ok(metrics) = tokio::task::spawn_blocking(move || engine.metrics(&id)).await {
-				if let Ok(metrics) = metrics {
+			if let Ok(metrics) = tokio::task::spawn_blocking(move || engine.metrics(&id)).await
+				&& let Ok(metrics) = metrics {
 					stats.cpu_millis = metrics
 						.get("cpu_millis")
 						.and_then(Value::as_u64)
@@ -1310,7 +1279,6 @@ impl EngineWorker {
 						.and_then(Value::as_u64)
 						.unwrap_or(0);
 				}
-			}
 			match result {
 				Ok(frame) => Ok(outcome(frame, stats)),
 				Err(error) => {
@@ -1472,7 +1440,7 @@ impl Worker for EngineWorker {
 				let cleanup_engine = Arc::clone(&engine);
 				let cleanup_id = worker_id.clone();
 				let _ = tokio::task::spawn_blocking(move || {
-					cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths)
+					cleanup_guest_paths(cleanup_engine.as_ref(), &cleanup_id, &cleanup_paths);
 				})
 				.await;
 				let stats = AttemptStats {
@@ -1714,10 +1682,9 @@ fn sandbox_create(
 	let architecture = spec
 		.resources
 		.as_ref()
-		.map(|r| {
+		.map_or(pb::CpuArchitecture::Unspecified, |r| {
 			pb::CpuArchitecture::try_from(r.architecture).unwrap_or(pb::CpuArchitecture::Unspecified)
-		})
-		.unwrap_or(pb::CpuArchitecture::Unspecified);
+		});
 	let image = image::realize(home, image_spec, architecture).map_err(engine_error)?;
 	let mut create = SandboxCreate {
 		name: Some(name.to_owned()),
@@ -1760,7 +1727,7 @@ fn sandbox_create(
 	create.timeout_secs = spec
 		.timeouts
 		.as_ref()
-		.map(|t| ((t.execution_millis + t.startup_millis + 999) / 1000).max(1));
+		.map(|t| (t.execution_millis + t.startup_millis).div_ceil(1000).max(1));
 	Ok(create)
 }
 
@@ -1817,7 +1784,7 @@ async fn connect_existing(
 			Err(ProtocolError::Disconnected(_) | ProtocolError::Timeout)
 				if Instant::now() < deadline =>
 			{
-				tokio::time::sleep(Duration::from_millis(25)).await
+				tokio::time::sleep(Duration::from_millis(25)).await;
 			},
 			Err(e) => return Err(e.into()),
 		}
@@ -1914,12 +1881,9 @@ fn execution_policy(
 		.package
 		.as_ref()
 		.and_then(|package| package.python.as_ref())
-		.and_then(|python| match &python.cloudpickle_version_presence {
-			Some(pb::python_code_metadata::CloudpickleVersionPresence::CloudpickleVersion(
+		.and_then(|python| python.cloudpickle_version_presence.as_ref().map(|pb::python_code_metadata::CloudpickleVersionPresence::CloudpickleVersion(
 				version,
-			)) => Some(version.clone()),
-			None => None,
-		});
+			)| version.clone()));
 	if (output == "cloudpickle" || serializer.allow_trusted_python) && cloudpickle.is_none() {
 		return Err(WorkerError::platform(
 			"cloudpickle_version_missing",
@@ -2078,7 +2042,7 @@ pub fn envelope_to_wire(
 	let mut wire = json!({"version":envelope.schema_version,"format":format,"compression":compression,"sha256":format!("sha256:{}",hex::encode(&checksum.value)),"uncompressed_size":envelope.uncompressed_size_bytes});
 	match &envelope.storage {
 		Some(pb::value_envelope::Storage::InlineData(bytes)) => {
-			wire["inline_data"] = json!(BASE64.encode(bytes))
+			wire["inline_data"] = json!(BASE64.encode(bytes));
 		},
 		Some(pb::value_envelope::Storage::Artifact(_)) => {
 			let path = artifact_path.ok_or_else(|| {
@@ -2368,11 +2332,10 @@ fn runner_failure(error: &Value, kind: WorkerErrorKind, depth: usize) -> WorkerE
 			})
 			.collect();
 	}
-	if depth < 4 {
-		if let Some(cause) = error.get("cause").filter(|cause| cause.is_object()) {
+	if depth < 4
+		&& let Some(cause) = error.get("cause").filter(|cause| cause.is_object()) {
 			failure.cause = Some(Box::new(runner_failure(cause, kind, depth + 1)));
 		}
-	}
 	failure
 }
 
@@ -2432,7 +2395,7 @@ fn worker_capacity(spec: &pb::FunctionSpec) -> usize {
 		.map_or(concurrency, |w| w.max_outstanding_inputs.max(concurrency));
 	outstanding.min(concurrency) as usize
 }
-fn duration_ms(value: u64, default: Duration) -> Duration {
+const fn duration_ms(value: u64, default: Duration) -> Duration {
 	if value == 0 {
 		default
 	} else {
@@ -2471,34 +2434,22 @@ fn initialize_hook(spec: &pb::FunctionSpec) -> Option<&pb::LifecycleHookRef> {
 	spec
 		.lifecycle_hooks
 		.as_ref()
-		.and_then(|h| match &h.initialize_presence {
-			Some(pb::lifecycle_hooks::InitializePresence::Initialize(h)) => Some(h),
-			None => None,
-		})
+		.and_then(|h| h.initialize_presence.as_ref().map(|pb::lifecycle_hooks::InitializePresence::Initialize(h)| h))
 }
 fn shutdown_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
 	spec
 		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| match &h.shutdown_presence {
-			Some(pb::lifecycle_hooks::ShutdownPresence::Shutdown(h)) => Some(h),
-			None => None,
-		})
+		.and_then(|h| h.shutdown_presence.as_ref().map(|pb::lifecycle_hooks::ShutdownPresence::Shutdown(h)| h))
 }
 fn restore_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
 	spec
 		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| match &h.restore_presence {
-			Some(pb::lifecycle_hooks::RestorePresence::Restore(h)) => Some(h),
-			None => None,
-		})
+		.and_then(|h| h.restore_presence.as_ref().map(|pb::lifecycle_hooks::RestorePresence::Restore(h)| h))
 }
 fn snapshot_hook(spec: Option<&pb::FunctionSpec>) -> Option<&pb::LifecycleHookRef> {
 	spec
 		.and_then(|s| s.lifecycle_hooks.as_ref())
-		.and_then(|h| match &h.snapshot_presence {
-			Some(pb::lifecycle_hooks::SnapshotPresence::Snapshot(h)) => Some(h),
-			None => None,
-		})
+		.and_then(|h| h.snapshot_presence.as_ref().map(|pb::lifecycle_hooks::SnapshotPresence::Snapshot(h)| h))
 }
 fn worker_hook_allowed(
 	spec: Option<&pb::FunctionSpec>,
@@ -2514,11 +2465,10 @@ fn worker_hook_allowed(
 		return Ok(true);
 	}
 	let lifecycle = spec
-		.map(|spec| {
+		.map_or(pb::FunctionLifecycle::Unspecified, |spec| {
 			pb::FunctionLifecycle::try_from(spec.lifecycle)
 				.unwrap_or(pb::FunctionLifecycle::Unspecified)
-		})
-		.unwrap_or(pb::FunctionLifecycle::Unspecified);
+		});
 	if matches!(lifecycle, pb::FunctionLifecycle::Actor | pb::FunctionLifecycle::Instance) {
 		Ok(false)
 	} else {
@@ -2573,7 +2523,7 @@ fn validate_absolute(path: &str) -> Result<(), WorkerError> {
 	if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
 		return Err(WorkerError::platform(
 			"invalid_path",
-			format!("guest mount path {path:?} must be absolute and normalized"),
+			format!("guest mount path {} must be absolute and normalized", path.display()),
 		));
 	}
 	Ok(())
@@ -2658,7 +2608,7 @@ mod tests {
 		let original = revision();
 		let provenance = SnapshotProvenance::for_revision(&original).unwrap();
 		assert!(provenance.matches(&original));
-		let mut changed = original.clone();
+		let mut changed = original;
 		changed
 			.spec
 			.as_mut()
@@ -2715,7 +2665,7 @@ mod tests {
 
 	#[test]
 	fn concurrent_artifact_inputs_get_unique_confined_paths() {
-		let paths: (std::collections::HashSet<_>) = (0..32).map(|_| guest_value_path()).collect();
+		let paths: std::collections::HashSet<_> = (0..32).map(|_| guest_value_path()).collect();
 		assert_eq!(paths.len(), 32);
 		assert!(
 			paths

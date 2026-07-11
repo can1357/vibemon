@@ -204,11 +204,10 @@ impl ArtifactStore {
 			}
 		})?;
 		let metadata = file.metadata()?;
-		if let Some(size) = expected_size {
-			if metadata.len() != size {
+		if let Some(size) = expected_size
+			&& metadata.len() != size {
 				return Err(EngineError::engine(format!("artifact {digest} has corrupt size")));
 			}
-		}
 		let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
 		file.read_to_end(&mut bytes)?;
 		let actual = hex::encode(Sha256::digest(&bytes));
@@ -263,7 +262,7 @@ fn verify_file(path: &Path, digest: &str, expected_size: u64) -> Result<()> {
 		return Err(EngineError::engine(format!("artifact {digest} has corrupt size")));
 	}
 	let mut hasher = Sha256::new();
-	let mut buffer = [0u8; 64 * 1024];
+	let mut buffer = vec![0u8; 64 * 1024];
 	loop {
 		let read = file.read(&mut buffer)?;
 		if read == 0 {
