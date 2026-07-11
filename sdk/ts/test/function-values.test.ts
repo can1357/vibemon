@@ -10,7 +10,10 @@ class MemoryArtifacts implements ValueArtifactStore {
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(data)));
     const key = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
     this.values.set(key, data.slice());
-    return { $typeName: "vmon.v1.ArtifactRef", digest: { $typeName: "vmon.v1.Digest", algorithm: 1, value: digest } };
+    return {
+      $typeName: "vmon.v1.ArtifactRef",
+      digest: { $typeName: "vmon.v1.Digest", algorithm: 1, value: digest },
+    };
   }
   async get(ref: ArtifactRef): Promise<Uint8Array> {
     if (!ref.digest) throw new Error("missing digest");
@@ -43,7 +46,11 @@ test("JSON and CBOR envelopes round-trip with checksum and gzip", async () => {
 
 test("large values use immutable artifact references", async () => {
   const artifacts = new MemoryArtifacts();
-  const envelope = await encodeValue(sample, { serializer: "cbor", inlineLimit: 0, artifactStore: artifacts });
+  const envelope = await encodeValue(sample, {
+    serializer: "cbor",
+    inlineLimit: 0,
+    artifactStore: artifacts,
+  });
   expect(envelope.storage.case).toBe("artifact");
   expect(artifacts.values.size).toBe(1);
   expect(await decodeValue(envelope, { artifactStore: artifacts })).toEqual(sample);
@@ -62,4 +69,16 @@ test("checksum corruption and cloudpickle are rejected", async () => {
 
 test("non-portable values fail before encoding", async () => {
   await expect(encodeValue(Number.NaN)).rejects.toThrow("finite number");
+});
+
+test("I-JSON enforces safe integer boundaries while CBOR preserves larger exact doubles", async () => {
+  for (const value of [Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER]) {
+    expect(await decodeValue(await encodeValue(value, { serializer: "json" }))).toBe(value);
+  }
+  for (const value of [2 ** 53, -(2 ** 53)]) {
+    await expect(encodeValue(value, { serializer: "json" })).rejects.toThrow(
+      "I-JSON safe integer range",
+    );
+    expect(await decodeValue(await encodeValue(value, { serializer: "cbor" }))).toBe(value);
+  }
 });

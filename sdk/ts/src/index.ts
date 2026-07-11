@@ -68,6 +68,7 @@ export {
   type EventCursor as FunctionEventCursor,
   Function,
   FunctionCall,
+  type FunctionArguments,
   type FunctionCallOptions,
   FunctionExecutionError,
   type FunctionLog,

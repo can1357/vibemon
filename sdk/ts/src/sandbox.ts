@@ -147,9 +147,7 @@ export class Sandbox {
   }
   /** Fetch sandbox metrics. */
   async metrics(): Promise<Record<string, unknown>> {
-    const value = parseJson(
-      (await this.call(SandboxService.method.metrics, { id: this.id })).json,
-    );
+    const value = parseJson((await this.call(SandboxService.method.metrics, { id: this.id })).json);
     if (!isRecord(value)) throw new ProtocolError("sandbox metrics must be an object");
     return value;
   }

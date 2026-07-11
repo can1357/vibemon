@@ -13,7 +13,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import type { DsnConfig, DsnEndpoint, ParseDsnOptions } from "./dsn";
 import { parseDsn } from "./dsn";
 import { APIError, rpcError, TransportError } from "./errors";
-import { SandboxService, SystemService } from "./gen/vmon/v1/api_pb";
+import { CallService, SandboxService, SystemService } from "./gen/vmon/v1/api_pb";
 import { createWsBridgeTransport } from "./grpc-ws";
 
 /** Mesh roster refresh interval in milliseconds. */
@@ -97,6 +97,8 @@ export interface Driver {
   ): Promise<[WebSocket, string]>;
   /** Locate the endpoint currently serving a sandbox. */
   resolveSandbox(id: string, hint?: string): Promise<string>;
+  /** Locate the endpoint currently owning a durable call. */
+  resolveCall?(id: string, hint?: string): Promise<string>;
   /** Snapshot the current endpoint roster. */
   endpoints(): EndpointInfo[];
   /** Refresh mesh discovery. */
@@ -282,7 +284,8 @@ export class MeshDriver implements Driver {
       }
       message = item;
     }
-    if (message === undefined) throw new TransportError("client-streaming RPC returned no response");
+    if (message === undefined)
+      throw new TransportError("client-streaming RPC returned no response");
     return { message, endpoint: handle.endpoint };
   }
 
@@ -495,6 +498,30 @@ export class MeshDriver implements Driver {
     throw (
       original ??
       new APIError({ status: 404, code: "not_found", message: `sandbox ${id} not found` })
+    );
+  }
+
+  /** Locate a durable call by probing the endpoint roster. */
+  async resolveCall(id: string, hint?: string): Promise<string> {
+    let original: APIError | undefined;
+    for (const entry of this.#candidates(hint)) {
+      try {
+        const result = await this.#call(
+          CallService.method.get,
+          { callId: id },
+          { endpoint: entry.url },
+          false,
+        );
+        return result.endpoint;
+      } catch (error) {
+        if (error instanceof TransportError) continue;
+        if (!(error instanceof APIError)) throw error;
+        if (!original) original = error;
+        if (error.code !== "not_found" && error.status !== 404) throw error;
+      }
+    }
+    throw (
+      original ?? new APIError({ status: 404, code: "not_found", message: `call ${id} not found` })
     );
   }
 

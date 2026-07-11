@@ -11,9 +11,9 @@ import (
 	"math"
 	"time"
 
+	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
-	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 )
 
 // ValueCodec is a portable value serialization format.
@@ -55,17 +55,23 @@ func EncodeValue(value any, codec ValueCodec, compression ValueCompression) (*Va
 	switch codec {
 	case ValueJSON:
 		raw, err = json.Marshal(value)
-		if err == nil { err = validateIJSON(raw) }
+		if err == nil {
+			err = validateIJSON(raw)
+		}
 		serializer = pb.ValueSerializer_VALUE_SERIALIZER_JSON
 	case ValueCBOR:
 		mode, modeErr := cbor.CanonicalEncOptions().EncMode()
-		if modeErr != nil { return nil, modeErr }
+		if modeErr != nil {
+			return nil, modeErr
+		}
 		raw, err = mode.Marshal(value)
 		serializer = pb.ValueSerializer_VALUE_SERIALIZER_CBOR
 	default:
 		return nil, fmt.Errorf("vmon: unsupported value codec %d", codec)
 	}
-	if err != nil { return nil, fmt.Errorf("vmon: encode value: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("vmon: encode value: %w", err)
+	}
 	stored := raw
 	wireCompression := pb.ValueCompression_VALUE_COMPRESSION_NONE
 	switch compression {
@@ -74,13 +80,19 @@ func EncodeValue(value any, codec ValueCodec, compression ValueCompression) (*Va
 		var buffer bytes.Buffer
 		writer, _ := gzip.NewWriterLevel(&buffer, gzip.BestSpeed)
 		writer.Header.ModTime = zeroTime
-		if _, err = writer.Write(raw); err == nil { err = writer.Close() }
-		if err != nil { return nil, fmt.Errorf("vmon: compress value: %w", err) }
+		if _, err = writer.Write(raw); err == nil {
+			err = writer.Close()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("vmon: compress value: %w", err)
+		}
 		stored = buffer.Bytes()
 		wireCompression = pb.ValueCompression_VALUE_COMPRESSION_GZIP
 	case CompressionZSTD:
 		writer, createErr := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
-		if createErr != nil { return nil, fmt.Errorf("vmon: create zstd encoder: %w", createErr) }
+		if createErr != nil {
+			return nil, fmt.Errorf("vmon: create zstd encoder: %w", createErr)
+		}
 		stored = writer.EncodeAll(raw, nil)
 		writer.Close()
 		wireCompression = pb.ValueCompression_VALUE_COMPRESSION_ZSTD
@@ -95,17 +107,27 @@ var zeroTime = func() (t time.Time) { return }()
 
 // Decode decodes and validates the envelope into destination. Cloudpickle is always rejected.
 func (value *ValueEnvelope) Decode(destination any, loader ArtifactValueLoader) error {
-	if value == nil || value.wire == nil { return errors.New("vmon: nil value envelope") }
+	if value == nil || value.wire == nil {
+		return errors.New("vmon: nil value envelope")
+	}
 	wire := value.wire
-	if wire.Serializer == pb.ValueSerializer_VALUE_SERIALIZER_CLOUDPICKLE { return errors.New("vmon: cloudpickle values are trusted Python-only and unsupported by Go") }
+	if wire.Serializer == pb.ValueSerializer_VALUE_SERIALIZER_CLOUDPICKLE {
+		return errors.New("vmon: cloudpickle values are trusted Python-only and unsupported by Go")
+	}
 	stored := wire.GetInlineData()
 	if stored == nil {
 		ref := wire.GetArtifact()
-		if ref == nil || ref.Digest == nil { return errors.New("vmon: value envelope has no storage") }
-		if loader == nil { return errors.New("vmon: artifact-backed value requires a loader") }
+		if ref == nil || ref.Digest == nil {
+			return errors.New("vmon: value envelope has no storage")
+		}
+		if loader == nil {
+			return errors.New("vmon: artifact-backed value requires a loader")
+		}
 		var err error
 		stored, err = loader(&ArtifactReference{Digest: append([]byte(nil), ref.Digest.Value...)})
-		if err != nil { return fmt.Errorf("vmon: load value artifact: %w", err) }
+		if err != nil {
+			return fmt.Errorf("vmon: load value artifact: %w", err)
+		}
 		artifactDigest := sha256.Sum256(stored)
 		if ref.Digest.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(artifactDigest[:], ref.Digest.Value) {
 			return errors.New("vmon: artifact digest mismatch")
@@ -115,24 +137,43 @@ func (value *ValueEnvelope) Decode(destination any, loader ArtifactValueLoader) 
 	switch wire.Compression {
 	case pb.ValueCompression_VALUE_COMPRESSION_NONE:
 	case pb.ValueCompression_VALUE_COMPRESSION_GZIP:
-		reader, err := gzip.NewReader(bytes.NewReader(stored)); if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
-		raw, err = io.ReadAll(reader); closeErr := reader.Close(); if err == nil { err = closeErr }
-		if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
+		reader, err := gzip.NewReader(bytes.NewReader(stored))
+		if err != nil {
+			return fmt.Errorf("vmon: decompress value: %w", err)
+		}
+		raw, err = io.ReadAll(reader)
+		closeErr := reader.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return fmt.Errorf("vmon: decompress value: %w", err)
+		}
 	case pb.ValueCompression_VALUE_COMPRESSION_ZSTD:
 		reader, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-		if err != nil { return fmt.Errorf("vmon: create zstd decoder: %w", err) }
+		if err != nil {
+			return fmt.Errorf("vmon: create zstd decoder: %w", err)
+		}
 		raw, err = reader.DecodeAll(stored, nil)
 		reader.Close()
-		if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
+		if err != nil {
+			return fmt.Errorf("vmon: decompress value: %w", err)
+		}
 	default:
 		return errors.New("vmon: unsupported value compression")
 	}
-	if uint64(len(raw)) != wire.UncompressedSizeBytes { return errors.New("vmon: value size mismatch") }
+	if uint64(len(raw)) != wire.UncompressedSizeBytes {
+		return errors.New("vmon: value size mismatch")
+	}
 	digest := sha256.Sum256(raw)
-	if wire.Checksum == nil || wire.Checksum.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(digest[:], wire.Checksum.Value) { return errors.New("vmon: value checksum mismatch") }
+	if wire.Checksum == nil || wire.Checksum.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(digest[:], wire.Checksum.Value) {
+		return errors.New("vmon: value checksum mismatch")
+	}
 	switch wire.Serializer {
 	case pb.ValueSerializer_VALUE_SERIALIZER_JSON:
-		if err := validateIJSON(raw); err != nil { return err }
+		if err := validateIJSON(raw); err != nil {
+			return err
+		}
 		return json.Unmarshal(raw, destination)
 	case pb.ValueSerializer_VALUE_SERIALIZER_CBOR:
 		return cbor.Unmarshal(raw, destination)
@@ -145,18 +186,32 @@ func validateIJSON(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value any
-	if err := decoder.Decode(&value); err != nil { return fmt.Errorf("vmon: invalid JSON value: %w", err) }
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("vmon: invalid JSON value: %w", err)
+	}
 	var visit func(any) error
 	visit = func(current any) error {
 		switch typed := current.(type) {
 		case json.Number:
 			number, err := typed.Float64()
-			if err != nil || math.IsInf(number, 0) || math.IsNaN(number) { return fmt.Errorf("vmon: JSON number %q is outside IEEE-754", typed) }
-			if math.Trunc(number) == number && math.Abs(number) > 9007199254740991 { return fmt.Errorf("vmon: JSON integer %q exceeds the I-JSON safe range; use CBOR", typed) }
+			if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
+				return fmt.Errorf("vmon: JSON number %q is outside IEEE-754", typed)
+			}
+			if math.Trunc(number) == number && math.Abs(number) > 9007199254740991 {
+				return fmt.Errorf("vmon: JSON integer %q exceeds the I-JSON safe range; use CBOR", typed)
+			}
 		case []any:
-			for _, item := range typed { if err := visit(item); err != nil { return err } }
+			for _, item := range typed {
+				if err := visit(item); err != nil {
+					return err
+				}
+			}
 		case map[string]any:
-			for _, item := range typed { if err := visit(item); err != nil { return err } }
+			for _, item := range typed {
+				if err := visit(item); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}

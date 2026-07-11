@@ -4,6 +4,7 @@ Calls are persisted before execution and are therefore at-least-once: an
 attempt may run again after a worker failure.  Call IDs are stable and may be
 reconstructed in another process with :meth:`FunctionCall.from_id`.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +21,14 @@ from dataclasses import replace
 from typing import Any, Generic, ParamSpec, TypeVar, cast, overload
 import grpc
 
-from ._function_proto import artifact_ref, digest, options_to_proto, package_to_proto, value_from_proto, value_to_proto
+from ._function_proto import (
+    artifact_ref,
+    digest,
+    options_to_proto,
+    package_to_proto,
+    value_from_proto,
+    value_to_proto,
+)
 from .options import (
     CpuArchitecture,
     FunctionOptions,
@@ -36,7 +44,7 @@ from .options import (
 from .image import Image
 from .package import PackageArtifact, SerializedCallable, package_callable
 from .errors import APIError, RemoteFunctionError, TransportError
-from .values import ValueCodec, decode_value, encode_value
+from .values import ValueCodec, ValueCompression, decode_value, encode_value
 from .v1 import api_pb2 as pb
 
 P = ParamSpec("P")
@@ -52,8 +60,10 @@ def is_remote() -> bool:
 
 
 def _client(client: Any | None) -> Any:
-    if client is not None: return client
+    if client is not None:
+        return client
     from .client import connect
+
     return connect()
 
 
@@ -73,6 +83,8 @@ def _call_owner(
 ) -> tuple[Any, str | None]:
     value = client.driver.call(operation, endpoint=endpoint)
     return value if isinstance(value, tuple) and len(value) == 2 else (value, endpoint)
+
+
 def _compose_function_options(
     options: FunctionOptions | None = None,
     *,
@@ -85,6 +97,10 @@ def _compose_function_options(
     volumes: tuple[FunctionVolumeMount, ...] | None = None,
     egress: Iterable[str] | None = None,
     network: NetworkPolicy | None = None,
+    block_network: bool | None = None,
+    egress_cidrs: Iterable[str] | None = None,
+    egress_domains: Iterable[str] | None = None,
+    inbound_cidrs: Iterable[str] | None = None,
     retries: RetryPolicy | int | None = None,
     startup_timeout: float | None = None,
     execution_timeout: float | None = None,
@@ -99,13 +115,37 @@ def _compose_function_options(
     serializer: SerializerPolicy | ValueCodec | str | None = None,
 ) -> FunctionOptions:
     supplied = (
-        image, cpus, memory, disk, architecture, ha, volumes, network, egress,
-        retries, startup_timeout, execution_timeout, queue_timeout,
-        idle_timeout, result_ttl, min_workers, max_workers, buffer_workers,
-        scale_down_after, max_outstanding_inputs, serializer,
+        image,
+        cpus,
+        memory,
+        disk,
+        architecture,
+        ha,
+        volumes,
+        network,
+        egress,
+        block_network,
+        egress_cidrs,
+        egress_domains,
+        inbound_cidrs,
+        retries,
+        startup_timeout,
+        execution_timeout,
+        queue_timeout,
+        idle_timeout,
+        result_ttl,
+        min_workers,
+        max_workers,
+        buffer_workers,
+        scale_down_after,
+        max_outstanding_inputs,
+        serializer,
     )
-    if network is not None and egress is not None:
-        raise TypeError("network and egress cannot be combined")
+    network_parts = (egress, block_network, egress_cidrs, egress_domains, inbound_cidrs)
+    if network is not None and any(value is not None for value in network_parts):
+        raise TypeError("network cannot be combined with network shorthand settings")
+    if egress is not None and any(value is not None for value in (egress_cidrs, egress_domains)):
+        raise TypeError("egress cannot be combined with egress_cidrs/egress_domains")
     if options is not None and any(value is not None for value in supplied):
         raise TypeError("options cannot be combined with explicit function settings")
     if options is not None:
@@ -116,16 +156,28 @@ def _compose_function_options(
         cpu_millis=base.resources.cpu_millis if cpus is None else int(cpus * 1000),
         memory_bytes=base.resources.memory_bytes if memory is None else memory,
         ephemeral_disk_bytes=base.resources.ephemeral_disk_bytes if disk is None else disk,
-        architecture=base.resources.architecture if architecture is None else CpuArchitecture(architecture),
-        high_availability=base.resources.high_availability if ha is None else HighAvailabilityPolicy(ha),
+        architecture=base.resources.architecture
+        if architecture is None
+        else CpuArchitecture(architecture),
+        high_availability=base.resources.high_availability
+        if ha is None
+        else HighAvailabilityPolicy(ha),
         network=(
-            base.resources.network
-            if network is None and egress is None
-            else network
+            network
             if network is not None
             else NetworkPolicy(
-                egress_cidrs=tuple(value for value in egress or () if "/" in value),
-                egress_domains=tuple(value for value in egress or () if "/" not in value),
+                block_network=bool(block_network),
+                egress_cidrs=(
+                    tuple(egress_cidrs)
+                    if egress_cidrs is not None
+                    else tuple(value for value in egress or () if "/" in value)
+                ),
+                egress_domains=(
+                    tuple(egress_domains)
+                    if egress_domains is not None
+                    else tuple(value for value in egress or () if "/" not in value)
+                ),
+                inbound_cidrs=tuple(inbound_cidrs or ()),
             )
         ),
         volume_mounts=base.resources.volume_mounts if volumes is None else volumes,
@@ -144,24 +196,34 @@ def _compose_function_options(
         min_workers=base.workers.min_workers if min_workers is None else min_workers,
         max_workers=base.workers.max_workers if max_workers is None else max_workers,
         buffer_workers=base.workers.buffer_workers if buffer_workers is None else buffer_workers,
-        max_outstanding_inputs=base.workers.max_outstanding_inputs if max_outstanding_inputs is None else max_outstanding_inputs,
+        max_outstanding_inputs=base.workers.max_outstanding_inputs
+        if max_outstanding_inputs is None
+        else max_outstanding_inputs,
     )
     retry = (
-        base.retry if retries is None else
-        RetryPolicy(max_attempts=retries + 1) if isinstance(retries, int) else retries
+        base.retry
+        if retries is None
+        else RetryPolicy(max_attempts=retries + 1)
+        if isinstance(retries, int)
+        else retries
     )
     serialization = (
-        base.serializer if serializer is None else serializer
-        if isinstance(serializer, SerializerPolicy) else
-        SerializerPolicy(
+        base.serializer
+        if serializer is None
+        else serializer
+        if isinstance(serializer, SerializerPolicy)
+        else SerializerPolicy(
             input_serializer=ValueCodec(serializer),
             result_serializer=ValueCodec(serializer),
             allow_trusted_python=ValueCodec(serializer) is ValueCodec.CLOUDPICKLE,
         )
     )
     resolved_image = (
-        base.image if image is None else image
-        if isinstance(image, Image) else Image.from_registry(image)
+        base.image
+        if image is None
+        else image
+        if isinstance(image, Image)
+        else Image.from_registry(image)
     )
     return replace(
         base,
@@ -175,18 +237,19 @@ def _compose_function_options(
 
 
 async def _run_blocking(function: Callable[..., R], *args: Any, **kwargs: Any) -> R:
-    """Compatibility bridge for custom synchronous Driver implementations."""
+    """Compatibility bridge for injected synchronous drivers."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, functools.partial(function, *args, **kwargs)
-    )
+    return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
 
 
-def _aio_endpoint(client: Any) -> tuple[Any, Any, float] | None:
+def _aio_endpoint(client: Any, endpoint: str | None = None) -> tuple[Any, Any, float] | None:
     provider = getattr(client.driver, "aio_endpoint", None)
     if provider is None:
         return None
-    return provider()
+    try:
+        return provider(endpoint)
+    except TypeError:
+        return provider()
 
 
 def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
@@ -196,12 +259,15 @@ def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
         return False, None
 
 
-
-
 def _raise(error: pb.CallError) -> None:
-    exc = RemoteFunctionError(error.message or "remote function failed", code=error.code, remote_type=error.type)
+    exc = RemoteFunctionError(
+        error.message or "remote function failed", code=error.code, remote_type=error.type
+    )
     if error.frames:
-        exc.add_note("Remote traceback:\n" + "\n".join(f'  File "{f.file}", line {f.line}, in {f.function}' for f in error.frames))
+        exc.add_note(
+            "Remote traceback:\n"
+            + "\n".join(f'  File "{f.file}", line {f.line}, in {f.function}' for f in error.frames)
+        )
     raise exc
 
 
@@ -215,11 +281,16 @@ def _invocation(args: Iterable[Any], kwargs: Mapping[str, Any]) -> dict[str, Any
 
 
 def _result_value(client: Any, result: pb.CallResult, *, trusted: bool) -> Any:
-    if result.WhichOneof("outcome") == "error": _raise(result.error)
+    if result.WhichOneof("outcome") == "error":
+        _raise(result.error)
     envelope = result.value
     data = None
     if envelope.WhichOneof("storage") == "artifact":
-        chunks = _call(client, lambda s: s.artifacts.Get(pb.GetArtifactRequest(artifact=envelope.artifact)), stream=True)
+        chunks = _call(
+            client,
+            lambda s: s.artifacts.Get(pb.GetArtifactRequest(artifact=envelope.artifact)),
+            stream=True,
+        )
         data = b"".join(chunk.data for chunk in chunks)
     return decode_value(value_from_proto(envelope, data), trusted=trusted)
 
@@ -242,6 +313,7 @@ def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.Artifa
     except APIError as exc:
         if exc.code != "not_found" and exc.status != 404:
             raise
+
     def frames() -> Iterator[pb.PutArtifactRequest]:
         yield pb.PutArtifactRequest(
             header=pb.PutArtifactHeader(
@@ -252,6 +324,7 @@ def _upload(client: Any, data: bytes, sha256: str, media_type: str) -> pb.Artifa
         )
         for offset in range(0, len(data), 256 * 1024):
             yield pb.PutArtifactRequest(data=data[offset : offset + 256 * 1024])
+
     record = _call(client, lambda stubs: stubs.artifacts.Put(frames()))
     return record.ref
 
@@ -267,23 +340,23 @@ def _arguments(
 ) -> pb.InvocationArguments:
     message = pb.InvocationArguments()
     for value in args:
-        envelope, artifact = _encode_input(
-            value, codec, trusted=trusted, compression=compression
-        )
+        envelope, artifact = _encode_input(value, codec, trusted=trusted, compression=compression)
         if artifact is not None:
             ref = _upload(
-                client, artifact, envelope.artifact.digest.value.hex(),
+                client,
+                artifact,
+                envelope.artifact.digest.value.hex(),
                 "application/vnd.vmon.value",
             )
             envelope.artifact.CopyFrom(ref)
         message.positional.append(envelope)
     for name, value in kwargs.items():
-        envelope, artifact = _encode_input(
-            value, codec, trusted=trusted, compression=compression
-        )
+        envelope, artifact = _encode_input(value, codec, trusted=trusted, compression=compression)
         if artifact is not None:
             ref = _upload(
-                client, artifact, envelope.artifact.digest.value.hex(),
+                client,
+                artifact,
+                envelope.artifact.digest.value.hex(),
                 "application/vnd.vmon.value",
             )
             envelope.artifact.CopyFrom(ref)
@@ -311,6 +384,8 @@ async def _async_result_value(
             chunks.append(chunk.data)
         data = b"".join(chunks)
     return decode_value(value_from_proto(envelope, data), trusted=trusted)
+
+
 async def _async_upload(
     stubs: Any,
     metadata: Any,
@@ -338,10 +413,10 @@ async def _async_upload(
         for offset in range(0, len(data), 256 * 1024):
             yield pb.PutArtifactRequest(data=data[offset : offset + 256 * 1024])
 
-    record = await stubs.artifacts.Put(
-        frames(), metadata=metadata, timeout=deadline
-    )
+    record = await stubs.artifacts.Put(frames(), metadata=metadata, timeout=deadline)
     return record.ref
+
+
 async def _async_arguments(
     stubs: Any,
     metadata: Any,
@@ -358,12 +433,13 @@ async def _async_arguments(
         *((None, value) for value in args),
         *((key, value) for key, value in kwargs.items()),
     ]:
-        envelope, artifact = _encode_input(
-            value, codec, trusted=trusted, compression=compression
-        )
+        envelope, artifact = _encode_input(value, codec, trusted=trusted, compression=compression)
         if artifact is not None:
             ref = await _async_upload(
-                stubs, metadata, deadline, artifact,
+                stubs,
+                metadata,
+                deadline,
+                artifact,
                 envelope.artifact.digest.value.hex(),
                 "application/vnd.vmon.value",
             )
@@ -375,12 +451,9 @@ async def _async_arguments(
     return message
 
 
-
-
-
-
 class FunctionCall(Generic[R]):
     """A durable unary or generator call handle."""
+
     def __init__(
         self,
         call_id: str,
@@ -395,33 +468,51 @@ class FunctionCall(Generic[R]):
         self._trusted = trusted
         self._generator = generator
         self._endpoint = endpoint
+
+    @property
+    def id(self) -> str:
+        """Return the stable durable call identifier."""
+        return self.call_id
+
     @classmethod
-    def from_id(cls, call_id: str, *, client: Any | None = None, trusted: bool = False) -> "FunctionCall[Any]":
+    def from_id(
+        cls, call_id: str, *, client: Any | None = None, trusted: bool = False
+    ) -> "FunctionCall[Any]":
         if not call_id:
             raise ValueError("call_id must be non-empty")
         bound_client = _client(client)
+        if not hasattr(bound_client, "driver"):
+            return cls(call_id, bound_client, trusted=trusted)
         record, endpoint = _call_owner(
             bound_client,
             lambda stubs: stubs.calls.Get(pb.CallRef(call_id=call_id)),
         )
         return cls(call_id, bound_client, trusted=trusted, endpoint=endpoint)
+
     @property
     def aio(self) -> "_AsyncCall[R]":
         """Return the native asynchronous facade for this durable call."""
         return _AsyncCall(self)
 
-    def status(self) -> int: return self.get_record().status
+    def status(self) -> int:
+        return self.get_record().status
+
     def done(self) -> bool:
         """Return whether the durable call has reached a terminal state."""
         return self.status() in _TERMINAL
+
     def get_record(self) -> pb.CallRecord:
         return _call(
             self._client,
             lambda stubs: stubs.calls.Get(pb.CallRef(call_id=self.call_id)),
             endpoint=self._endpoint,
         )
-    def stats(self) -> pb.CallStats: return self.get_record().stats
-    def graph(self) -> pb.CallGraph: return self.get_record().graph
+
+    def stats(self) -> pb.CallStats:
+        return self.get_record().stats
+
+    def graph(self) -> pb.CallGraph:
+        return self.get_record().graph
 
     def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
         return _call(
@@ -471,12 +562,15 @@ class FunctionCall(Generic[R]):
 
     def logs(self, *, after_sequence: int = 0, follow: bool = True) -> Iterator[bytes]:
         for event in self.events(after_sequence=after_sequence, follow=follow):
-            if event.WhichOneof("payload") == "log": yield event.log.data
+            if event.WhichOneof("payload") == "log":
+                yield event.log.data
 
     def iter_yields(self, *, after_sequence: int = 0) -> Iterator[R]:
         for event in self.events(after_sequence=after_sequence):
             if event.WhichOneof("payload") == "yield_result":
-                yield cast(R, _result_value(self._client, event.yield_result, trusted=self._trusted))
+                yield cast(
+                    R, _result_value(self._client, event.yield_result, trusted=self._trusted)
+                )
 
     def get(self, timeout: float | None = None) -> R:
         """Wait locally up to ``timeout`` without changing server execution."""
@@ -497,13 +591,9 @@ class FunctionCall(Generic[R]):
                         pb.GetCallResultRequest(call=record.ref, index=0)
                     ),
                 )
-                return cast(
-                    R, _result_value(self._client, item, trusted=self._trusted)
-                )
+                return cast(R, _result_value(self._client, item, trusted=self._trusted))
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"call {self.call_id} did not complete within {timeout} seconds"
-                )
+                raise TimeoutError(f"call {self.call_id} did not complete within {timeout} seconds")
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             time.sleep(min(0.05, remaining) if remaining is not None else 0.05)
 
@@ -511,15 +601,18 @@ class FunctionCall(Generic[R]):
     def gather(*calls: "FunctionCall[Any]", return_exceptions: bool = False) -> list[Any]:
         values = []
         for call in calls:
-            try: values.append(call.get())
+            try:
+                values.append(call.get())
             except Exception as exc:
-                if not return_exceptions: raise
+                if not return_exceptions:
+                    raise
                 values.append(exc)
         return values
 
 
 class BatchCall(Generic[R]):
     """Detached durable batch handle whose results are fetched lazily."""
+
     def __init__(
         self,
         call: FunctionCall[Any],
@@ -532,6 +625,7 @@ class BatchCall(Generic[R]):
         self.input_count = input_count
         self._feeder_stop = feeder_stop
         self._feeder_errors = feeder_errors if feeder_errors is not None else []
+
     @classmethod
     def from_id(
         cls, call_id: str, *, client: Any | None = None, trusted: bool = False
@@ -540,9 +634,15 @@ class BatchCall(Generic[R]):
         return cls(FunctionCall.from_id(call_id, client=client, trusted=trusted))
 
     @property
-    def id(self) -> str: return self._call.id
-    def status(self) -> int: return self._call.status()
-    def done(self) -> bool: return self._call.done()
+    def id(self) -> str:
+        return self._call.id
+
+    def status(self) -> int:
+        return self._call.status()
+
+    def done(self) -> bool:
+        return self._call.done()
+
     def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
         if self._feeder_stop is not None:
             self._feeder_stop.set()
@@ -552,6 +652,7 @@ class BatchCall(Generic[R]):
     def aio(self) -> "_AsyncCall[Any]":
         """Return the native asynchronous facade for this durable batch."""
         return _AsyncCall(self._call)
+
     def results(
         self,
         *,
@@ -574,13 +675,12 @@ class BatchCall(Generic[R]):
                             page_size=128,
                         )
                     ),
+                    endpoint=self._call._endpoint,
                 )
                 for item in page.results:
                     after_sequence = max(after_sequence, item.sequence)
                     try:
-                        value = _result_value(
-                            self._call._client, item, trusted=self._call._trusted
-                        )
+                        value = _result_value(self._call._client, item, trusted=self._call._trusted)
                     except Exception as exc:
                         if not return_exceptions:
                             raise
@@ -595,12 +695,36 @@ class BatchCall(Generic[R]):
                 if self._feeder_errors:
                     raise self._feeder_errors[0]
                 if page.end and self.done():
+                    record = self._call.get_record()
+                    failure: BaseException | None = None
+                    if record.HasField("error"):
+                        failure = RemoteFunctionError(
+                            record.error.message or "remote batch failed",
+                            code=record.error.code,
+                            remote_type=record.error.type,
+                        )
+                    elif record.status == pb.CALL_STATUS_CANCELLED:
+                        failure = RemoteFunctionError(
+                            "remote batch was cancelled", code="cancelled"
+                        )
+                    elif record.status != pb.CALL_STATUS_SUCCEEDED:
+                        failure = RemoteFunctionError(
+                            f"remote batch ended with status {record.status}",
+                            code="remote_error",
+                        )
+                    if failure is not None:
+                        if return_exceptions:
+                            yield cast(R, failure)
+                            return
+                        raise failure
                     return
                 time.sleep(0.02)
         except GeneratorExit:
             self.cancel("batch result consumer closed")
             raise
-    def get(self, **kwargs: Any) -> Iterator[R]: return self.results(**kwargs)
+
+    def get(self, **kwargs: Any) -> Iterator[R]:
+        return self.results(**kwargs)
 
 
 class _AsyncCall(Generic[R]):
@@ -608,7 +732,7 @@ class _AsyncCall(Generic[R]):
         self._call = call
 
     async def cancel(self, reason: str = "cancelled by client") -> pb.CallRecord:
-        endpoint = _aio_endpoint(self._call._client)
+        endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
         if endpoint is None:
             return await _run_blocking(self._call.cancel, reason)
         stubs, metadata, deadline = endpoint
@@ -623,7 +747,7 @@ class _AsyncCall(Generic[R]):
         )
 
     async def get(self, timeout: float | None = None) -> R:
-        endpoint = _aio_endpoint(self._call._client)
+        endpoint = _aio_endpoint(self._call._client, self._call._endpoint)
         if endpoint is None:
             task = asyncio.create_task(_run_blocking(self._call.get, timeout))
             try:
@@ -699,14 +823,16 @@ class _AsyncCall(Generic[R]):
 
 
 class _AsyncRemoteFunction(Generic[P, R]):
-    def __init__(self, function: "RemoteFunction[P, R]") -> None: self._function = function
+    def __init__(self, function: "RemoteFunction[P, R]") -> None:
+        self._function = function
+
     async def spawn(self, *args: P.args, **kwargs: P.kwargs) -> _AsyncCall[R]:
         function = self._function
         if function._signature:
             function._signature.bind(*args, **kwargs)
         client = _client(function._client)
         function._client = client
-        endpoint = _aio_endpoint(client)
+        endpoint = _aio_endpoint(client, function._endpoint)
         if endpoint is None:
             return _AsyncCall(await _run_blocking(function.spawn, *args, **kwargs))
         stubs, metadata, deadline = endpoint
@@ -724,9 +850,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
         )
         record = await stubs.calls.Create(
             pb.CreateCallRequest(
-                type=pb.CALL_TYPE_GENERATOR
-                if function._is_generator
-                else pb.CALL_TYPE_UNARY,
+                type=pb.CALL_TYPE_GENERATOR if function._is_generator else pb.CALL_TYPE_UNARY,
                 target=pb.CallTarget(function=revision.ref),
                 inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
                 inputs_closed=True,
@@ -743,9 +867,11 @@ class _AsyncRemoteFunction(Generic[P, R]):
                 generator=function._is_generator,
             )
         )
+
     async def remote(self, *args: P.args, **kwargs: P.kwargs) -> R:
         call = await self.spawn(*args, **kwargs)
         return await call.get()
+
     @overload
     def remote_gen(
         self: "_AsyncRemoteFunction[P, Iterator[Y]]",
@@ -754,14 +880,12 @@ class _AsyncRemoteFunction(Generic[P, R]):
     ) -> AsyncIterator[Y]: ...
 
     @overload
-    def remote_gen(
-        self, *args: P.args, **kwargs: P.kwargs
-    ) -> AsyncIterator[Any]: ...
+    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[Any]: ...
 
     async def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[Any]:
         async_call = await self.spawn(*args, **kwargs)
         call = async_call._call
-        endpoint = _aio_endpoint(call._client)
+        endpoint = _aio_endpoint(call._client, call._endpoint)
         if endpoint is None:
             iterator = call.iter_yields()
             while True:
@@ -801,13 +925,14 @@ class _AsyncRemoteFunction(Generic[P, R]):
         except asyncio.CancelledError:
             await asyncio.shield(async_call.cancel("async generator cancelled"))
             raise
+
     async def map(
         self, iterable: Iterable[Any] | AsyncIterable[Any], **kwargs: Any
     ) -> AsyncIterator[R]:
         function = self._function
         client = _client(function._client)
         function._client = client
-        endpoint = _aio_endpoint(client)
+        endpoint = _aio_endpoint(client, function._endpoint)
         if endpoint is None:
             batch = await _run_blocking(function.spawn_map, iterable, **kwargs)
             iterator = batch.results(
@@ -848,9 +973,11 @@ class _AsyncRemoteFunction(Generic[P, R]):
                 source = cast(AsyncIterable[Any], iterable)
             else:
                 assert isinstance(iterable, Iterable)
+
                 async def sync_source() -> AsyncIterator[Any]:
                     for value in iterable:
                         yield value
+
                 source = sync_source()
             async for item in source:
                 args = (item,)
@@ -876,17 +1003,19 @@ class _AsyncRemoteFunction(Generic[P, R]):
                 count += 1
 
         async def feed() -> None:
-            async for _ in stubs.calls.StreamInputs(
-                inputs(), metadata=metadata, timeout=deadline
-            ):
-                pass
-            await stubs.calls.CloseInputs(
-                pb.CloseCallInputsRequest(
-                    call=record.ref, expected_input_count=count
-                ),
-                metadata=metadata,
-                timeout=deadline,
-            )
+            try:
+                async for _ in stubs.calls.StreamInputs(
+                    inputs(), metadata=metadata, timeout=deadline
+                ):
+                    pass
+                await stubs.calls.CloseInputs(
+                    pb.CloseCallInputsRequest(call=record.ref, expected_input_count=count),
+                    metadata=metadata,
+                    timeout=deadline,
+                )
+            except BaseException:
+                await asyncio.shield(call.cancel("async batch input feeder failed"))
+                raise
 
         feeder = asyncio.create_task(feed())
         cursor = 0
@@ -898,9 +1027,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
             while True:
                 stream = stubs.calls.Watch(
                     pb.WatchCallRequest(
-                        cursor=pb.EventCursor(
-                            call=record.ref, after_sequence=cursor
-                        ),
+                        cursor=pb.EventCursor(call=record.ref, after_sequence=cursor),
                         follow=True,
                     ),
                     metadata=metadata,
@@ -924,11 +1051,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
                         if not ordered:
                             yield value
                         else:
-                            index = (
-                                result.input_index
-                                if result.input_id
-                                else result.index
-                            )
+                            index = result.input_index if result.input_id else result.index
                             pending[index] = value
                             while next_index in pending:
                                 yield pending.pop(next_index)
@@ -938,7 +1061,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
                     elif kind == "status" and event.status.status in _TERMINAL:
                         await feeder
                         return
-        except (asyncio.CancelledError, GeneratorExit):
+        except asyncio.CancelledError, GeneratorExit:
             feeder.cancel()
             await asyncio.shield(call.cancel("async map consumer closed"))
             raise
@@ -946,6 +1069,7 @@ class _AsyncRemoteFunction(Generic[P, R]):
 
 class RemoteFunction(Generic[P, R]):
     """Immutable typed reference to a zero-deploy or registered function."""
+
     def __init__(
         self,
         function: Callable[P, R] | None = None,
@@ -955,6 +1079,7 @@ class RemoteFunction(Generic[P, R]):
         name: str | None = None,
         revision: str | None = None,
         options: FunctionOptions | None = None,
+        generator: bool = False,
         package_mode: str = "package",
         package_root: str | None = None,
         include: Iterable[str] = (),
@@ -973,28 +1098,110 @@ class RemoteFunction(Generic[P, R]):
         self.options = options or attached_options or FunctionOptions()
         if not isinstance(self.options, FunctionOptions):
             raise TypeError("__vmon_options__ must be FunctionOptions")
+        if package_mode == "cloudpickle":
+            if options is not None and not self.options.serializer.allow_trusted_python:
+                raise ValueError(
+                    "cloudpickle package mode conflicts with allow_trusted_python=False"
+                )
+            self.options = replace(
+                self.options,
+                serializer=replace(self.options.serializer, allow_trusted_python=True),
+            )
+        if not isinstance(self.options, FunctionOptions):
+            raise TypeError("__vmon_options__ must be FunctionOptions")
         self.package_mode, self.package_root = package_mode, package_root
-        self.include, self.exclude, self.local_packages = tuple(include), tuple(exclude), tuple(local_packages)
+        self.include, self.exclude, self.local_packages = (
+            tuple(include),
+            tuple(exclude),
+            tuple(local_packages),
+        )
         self._registered: pb.FunctionRevision | None = None
+        self._endpoint: str | None = None
         self._lock = threading.Lock()
         self._signature = inspect.signature(function) if function else None
-        self._is_generator = bool(function and (inspect.isgeneratorfunction(function) or inspect.isasyncgenfunction(function)))
-        if function: functools.update_wrapper(self, function)
+        self._is_generator = bool(
+            generator
+            or function
+            and (inspect.isgeneratorfunction(function) or inspect.isasyncgenfunction(function))
+        )
+        if function:
+            functools.update_wrapper(self, function)
 
     @classmethod
-    def from_name(cls, name: str, *, namespace: str = "default", revision: str | None = None, client: Any | None = None, options: FunctionOptions | None = None) -> "RemoteFunction[..., Any]":
-        return cls(None, name=name, namespace=namespace, revision=revision, client=client, options=options)
+    def from_name(
+        cls,
+        name: str,
+        *,
+        namespace: str = "default",
+        revision: str | None = None,
+        client: Any | None = None,
+        options: FunctionOptions | None = None,
+        generator: bool = False,
+    ) -> "RemoteFunction[..., Any]":
+        return cls(
+            None,
+            name=name,
+            namespace=namespace,
+            revision=revision,
+            client=client,
+            options=options,
+            generator=generator,
+        )
 
-    def with_options(self, options: FunctionOptions | None = None, **changes: Any) -> "RemoteFunction[P, R]":
+    def with_options(
+        self, options: FunctionOptions | None = None, **changes: Any
+    ) -> "RemoteFunction[P, R]":
         updated = options or replace(self.options, **changes)
-        return type(self)(self._function, client=self._client, namespace=self.namespace, name=self.name, revision=self.revision, options=updated, package_mode=self.package_mode, package_root=self.package_root, include=self.include, exclude=self.exclude, local_packages=self.local_packages)
+        return type(self)(
+            self._function,
+            client=self._client,
+            namespace=self.namespace,
+            name=self.name,
+            revision=self.revision,
+            options=updated,
+            generator=self._is_generator,
+            package_mode=self.package_mode,
+            package_root=self.package_root,
+            include=self.include,
+            exclude=self.exclude,
+            local_packages=self.local_packages,
+        )
+
+    def _adopt_revision_options(self, revision: pb.FunctionRevision) -> None:
+        if self._function is not None:
+            return
+        spec = revision.spec.serializer
+        codecs = {
+            pb.VALUE_SERIALIZER_JSON: ValueCodec.JSON,
+            pb.VALUE_SERIALIZER_CBOR: ValueCodec.CBOR,
+            pb.VALUE_SERIALIZER_CLOUDPICKLE: ValueCodec.CLOUDPICKLE,
+        }
+        compressions = {
+            pb.VALUE_COMPRESSION_NONE: ValueCompression.NONE,
+            pb.VALUE_COMPRESSION_GZIP: ValueCompression.GZIP,
+            pb.VALUE_COMPRESSION_ZSTD: ValueCompression.ZSTD,
+        }
+        self.options = replace(
+            self.options,
+            serializer=SerializerPolicy(
+                input_serializer=codecs[spec.input_serializer],
+                result_serializer=codecs[spec.result_serializer],
+                compression=compressions[spec.compression],
+                allow_trusted_python=spec.allow_trusted_python,
+            ),
+        )
 
     @property
-    def aio(self) -> _AsyncRemoteFunction[P, R]: return _AsyncRemoteFunction(self)
+    def aio(self) -> _AsyncRemoteFunction[P, R]:
+        return _AsyncRemoteFunction(self)
+
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        if self._function is None: raise TypeError("deployed function references cannot run locally")
+        if self._function is None:
+            raise TypeError("deployed function references cannot run locally")
         return self._function(*args, **kwargs)
-    def local(self, *args: P.args, **kwargs: P.kwargs) -> R: return self(*args, **kwargs)
+
+    def local(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        return self(*args, **kwargs)
 
     def _make_spec(
         self, package: PackageArtifact | SerializedCallable, source: pb.ArtifactRef
@@ -1010,14 +1217,14 @@ class RemoteFunction(Generic[P, R]):
             else pb.FUNCTION_LIFECYCLE_STATELESS
         )
         hooks = pb.LifecycleHooks()
-        if metadata is not None and lifecycle_name != "service":
+        if metadata is not None and lifecycle_name is None:
             assert self._function is not None
             module = self._function.__module__
             owner = self._function.__qualname__
+
             def hook(method_name: str) -> pb.LifecycleHookRef:
-                return pb.LifecycleHookRef(
-                    module=module, qualname=f"{owner}.{method_name}"
-                )
+                return pb.LifecycleHookRef(module=module, qualname=f"{owner}.{method_name}")
+
             initialize = (*metadata.snapshot_enter, *metadata.enter)
             if initialize:
                 hooks.initialize.CopyFrom(hook(initialize[0]))
@@ -1046,17 +1253,13 @@ class RemoteFunction(Generic[P, R]):
             selector = (
                 pb.FunctionSelector(
                     pinned=pb.RevisionRef(
-                        function=pb.FunctionRef(
-                            namespace=self.namespace, name=self.name
-                        ),
+                        function=pb.FunctionRef(namespace=self.namespace, name=self.name),
                         revision_id=self.revision,
                     )
                 )
                 if self.revision
                 else pb.FunctionSelector(
-                    current=pb.FunctionRef(
-                        namespace=self.namespace, name=self.name
-                    )
+                    current=pb.FunctionRef(namespace=self.namespace, name=self.name)
                 )
             )
             self._registered = await stubs.functions.Get(
@@ -1064,6 +1267,7 @@ class RemoteFunction(Generic[P, R]):
                 metadata=metadata,
                 timeout=deadline,
             )
+            self._adopt_revision_options(self._registered)
             return self._registered
         package = package_callable(
             self._function,
@@ -1082,9 +1286,7 @@ class RemoteFunction(Generic[P, R]):
             "application/vnd.vmon.python-package",
         )
         spec = self._make_spec(package, source)
-        request_id = hashlib.sha256(
-            spec.SerializeToString(deterministic=True)
-        ).hexdigest()
+        request_id = hashlib.sha256(spec.SerializeToString(deterministic=True)).hexdigest()
         self._registered = await stubs.functions.Register(
             pb.RegisterFunctionRequest(spec=spec, request_id=request_id),
             metadata=metadata,
@@ -1093,29 +1295,78 @@ class RemoteFunction(Generic[P, R]):
         return self._registered
 
     def _resolve(self) -> pb.FunctionRevision:
-        if self._registered is not None: return self._registered
-        client = _client(self._client); self._client = client
+        if self._registered is not None:
+            return self._registered
+        client = _client(self._client)
+        self._client = client
         if self._function is None:
-            selector = pb.FunctionSelector(pinned=pb.RevisionRef(function=pb.FunctionRef(namespace=self.namespace, name=self.name), revision_id=self.revision)) if self.revision else pb.FunctionSelector(current=pb.FunctionRef(namespace=self.namespace, name=self.name))
-            self._registered = _call(client, lambda s: s.functions.Get(pb.GetFunctionRequest(function=selector))); return self._registered
+            selector = (
+                pb.FunctionSelector(
+                    pinned=pb.RevisionRef(
+                        function=pb.FunctionRef(namespace=self.namespace, name=self.name),
+                        revision_id=self.revision,
+                    )
+                )
+                if self.revision
+                else pb.FunctionSelector(
+                    current=pb.FunctionRef(namespace=self.namespace, name=self.name)
+                )
+            )
+            self._registered, self._endpoint = _call_owner(
+                client,
+                lambda stubs: stubs.functions.Get(pb.GetFunctionRequest(function=selector)),
+            )
+            self._adopt_revision_options(self._registered)
+            return self._registered
         with self._lock:
-            if self._registered is not None: return self._registered
-            package = package_callable(self._function, mode=cast(Any, self.package_mode), root=self.package_root, include=self.include, exclude=self.exclude, local_packages=self.local_packages)
-            source = _upload(client, package.data, package.sha256, "application/vnd.vmon.python-package")
+            if self._registered is not None:
+                return self._registered
+            package = package_callable(
+                self._function,
+                mode=cast(Any, self.package_mode),
+                root=self.package_root,
+                include=self.include,
+                exclude=self.exclude,
+                local_packages=self.local_packages,
+            )
+            source = _upload(
+                client, package.data, package.sha256, "application/vnd.vmon.python-package"
+            )
             spec = self._make_spec(package, source)
-            request_id = hashlib.sha256(
-                spec.SerializeToString(deterministic=True)
-            ).hexdigest()
-            self._registered = _call(client, lambda s: s.functions.Register(pb.RegisterFunctionRequest(spec=spec, request_id=request_id)))
+            request_id = hashlib.sha256(spec.SerializeToString(deterministic=True)).hexdigest()
+            self._registered, self._endpoint = _call_owner(
+                client,
+                lambda stubs: stubs.functions.Register(
+                    pb.RegisterFunctionRequest(spec=spec, request_id=request_id)
+                ),
+            )
             return self._registered
 
+    def activate(self) -> pb.FunctionRecord:
+        """Atomically make this immutable revision current."""
+        revision = self._resolve()
+        client = _client(self._client)
+        return _call(
+            client,
+            lambda stubs: stubs.functions.Activate(
+                pb.ActivateFunctionRequest(revision=revision.ref)
+            ),
+            endpoint=self._endpoint,
+        )
+
     def spawn(self, *args: P.args, **kwargs: P.kwargs) -> FunctionCall[R]:
-        if self._signature: self._signature.bind(*args, **kwargs)
-        revision = self._resolve(); client = _client(self._client)
+        if self._signature:
+            self._signature.bind(*args, **kwargs)
+        revision = self._resolve()
+        client = _client(self._client)
         codec = self.options.serializer.input_serializer
         trusted = self.options.serializer.allow_trusted_python
         arguments = _arguments(
-            client, args, kwargs, codec=codec, trusted=trusted,
+            client,
+            args,
+            kwargs,
+            codec=codec,
+            trusted=trusted,
             compression=self.options.serializer.compression,
         )
         call_type = pb.CALL_TYPE_GENERATOR if self._is_generator else pb.CALL_TYPE_UNARY
@@ -1126,8 +1377,16 @@ class RemoteFunction(Generic[P, R]):
             inputs_closed=True,
             request_id=str(uuid.uuid4()),
         )
-        record = _call(client, lambda s: s.calls.Create(request))
-        return FunctionCall(record.ref.call_id, client, trusted=trusted, generator=self._is_generator)
+        record, endpoint = _call_owner(
+            client, lambda stubs: stubs.calls.Create(request), endpoint=self._endpoint
+        )
+        return FunctionCall(
+            record.ref.call_id,
+            client,
+            trusted=trusted,
+            generator=self._is_generator,
+            endpoint=endpoint,
+        )
 
     def _spawn_actor(
         self, actor_id: str, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -1138,7 +1397,9 @@ class RemoteFunction(Generic[P, R]):
         client = _client(self._client)
         trusted = self.options.serializer.allow_trusted_python
         arguments = _arguments(
-            client, args, kwargs,
+            client,
+            args,
+            kwargs,
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
@@ -1147,16 +1408,17 @@ class RemoteFunction(Generic[P, R]):
             type=pb.CALL_TYPE_ACTOR,
             target=pb.CallTarget(
                 function=revision.ref,
-                actor=pb.ActorTarget(
-                    actor=pb.ActorRef(actor_id=actor_id), method=method
-                ),
+                actor=pb.ActorTarget(actor=pb.ActorRef(actor_id=actor_id), method=method),
             ),
             inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
             inputs_closed=True,
             request_id=str(uuid.uuid4()),
         )
-        record = _call(client, lambda stubs: stubs.calls.Create(request))
-        return FunctionCall(record.ref.call_id, client, trusted=trusted)
+        record, endpoint = _call_owner(
+            client, lambda stubs: stubs.calls.Create(request), endpoint=self._endpoint
+        )
+        return FunctionCall(record.ref.call_id, client, trusted=trusted, endpoint=endpoint)
+
     def _spawn_service(
         self,
         service_key: str,
@@ -1172,44 +1434,41 @@ class RemoteFunction(Generic[P, R]):
         client = _client(self._client)
         trusted = self.options.serializer.allow_trusted_python
         constructor = _arguments(
-            client, constructor_args, constructor_kwargs,
+            client,
+            constructor_args,
+            constructor_kwargs,
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
         )
         arguments = _arguments(
-            client, args, kwargs,
+            client,
+            args,
+            kwargs,
             codec=self.options.serializer.input_serializer,
             trusted=trusted,
             compression=self.options.serializer.compression,
         )
-        record = _call(
-            client,
-            lambda stubs: stubs.calls.Create(
-                pb.CreateCallRequest(
-                    type=pb.CALL_TYPE_UNARY,
-                    target=pb.CallTarget(
-                        function=revision.ref,
-                        service=pb.ServiceTarget(
-                            service_key=service_key,
-                            method=method,
-                            constructor=constructor,
-                        ),
-                    ),
-                    inputs=[pb.CallInput(
-                        index=0, input_id=str(uuid.uuid4()), arguments=arguments
-                    )],
-                    inputs_closed=True,
-                    request_id=str(uuid.uuid4()),
-                )
+        request = pb.CreateCallRequest(
+            type=pb.CALL_TYPE_UNARY,
+            target=pb.CallTarget(
+                function=revision.ref,
+                service=pb.ServiceTarget(
+                    service_key=service_key,
+                    method=method,
+                    constructor=constructor,
+                ),
             ),
+            inputs=[pb.CallInput(index=0, input_id=str(uuid.uuid4()), arguments=arguments)],
+            inputs_closed=True,
+            request_id=str(uuid.uuid4()),
         )
-        return FunctionCall(record.ref.call_id, client, trusted=trusted)
+        record, endpoint = _call_owner(
+            client, lambda stubs: stubs.calls.Create(request), endpoint=self._endpoint
+        )
+        return FunctionCall(record.ref.call_id, client, trusted=trusted, endpoint=endpoint)
 
-
-    def remote(
-        self, *args: Any, timeout: float | None = None, **kwargs: Any
-    ) -> R:
+    def remote(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> R:
         if self._is_generator:
             raise ValueError("generator functions must use remote_gen()")
         return self.spawn(*args, **kwargs).get(timeout)
@@ -1222,12 +1481,11 @@ class RemoteFunction(Generic[P, R]):
     ) -> Iterator[Y]: ...
 
     @overload
-    def remote_gen(
-        self, *args: P.args, **kwargs: P.kwargs
-    ) -> Iterator[Any]: ...
+    def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[Any]: ...
 
     def remote_gen(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[Any]:
-        if not self._is_generator: raise ValueError("non-generator functions must use remote()")
+        if not self._is_generator:
+            raise ValueError("non-generator functions must use remote()")
         return self.spawn(*args, **kwargs).iter_yields()
 
     def spawn_map(
@@ -1243,21 +1501,19 @@ class RemoteFunction(Generic[P, R]):
         revision = self._resolve()
         client = _client(self._client)
         trusted = self.options.serializer.allow_trusted_python
-        record = _call(
-            client,
-            lambda stubs: stubs.calls.Create(
-                pb.CreateCallRequest(
-                    type=pb.CALL_TYPE_BATCH,
-                    target=pb.CallTarget(function=revision.ref),
-                    inputs_closed=False,
-                    request_id=str(uuid.uuid4()),
-                )
-            ),
+        request = pb.CreateCallRequest(
+            type=pb.CALL_TYPE_BATCH,
+            target=pb.CallTarget(function=revision.ref),
+            inputs_closed=False,
+            request_id=str(uuid.uuid4()),
+        )
+        record, endpoint = _call_owner(
+            client, lambda stubs: stubs.calls.Create(request), endpoint=self._endpoint
         )
         stop = threading.Event()
         errors: list[BaseException] = []
         batch: BatchCall[R] = BatchCall(
-            FunctionCall(record.ref.call_id, client, trusted=trusted),
+            FunctionCall(record.ref.call_id, client, trusted=trusted, endpoint=endpoint),
             feeder_stop=stop,
             feeder_errors=errors,
         )
@@ -1265,6 +1521,7 @@ class RemoteFunction(Generic[P, R]):
         def feed() -> None:
             count = 0
             try:
+
                 def frames() -> Iterator[pb.StreamCallInputsRequest]:
                     nonlocal count
                     yield pb.StreamCallInputsRequest(call=record.ref)
@@ -1276,7 +1533,9 @@ class RemoteFunction(Generic[P, R]):
                         if self._signature:
                             self._signature.bind(*args, **call_kwargs)
                         arguments = _arguments(
-                            client, args, call_kwargs,
+                            client,
+                            args,
+                            call_kwargs,
                             codec=self.options.serializer.input_serializer,
                             trusted=trusted,
                             compression=self.options.serializer.compression,
@@ -1289,10 +1548,12 @@ class RemoteFunction(Generic[P, R]):
                             )
                         )
                         count += 1
+
                 responses = _call(
                     client,
                     lambda stubs: stubs.calls.StreamInputs(frames()),
                     stream=True,
+                    endpoint=endpoint,
                 )
                 for _ in responses:
                     if stop.is_set():
@@ -1301,15 +1562,28 @@ class RemoteFunction(Generic[P, R]):
                     _call(
                         client,
                         lambda stubs: stubs.calls.CloseInputs(
-                            pb.CloseCallInputsRequest(
-                                call=record.ref, expected_input_count=count
-                            )
+                            pb.CloseCallInputsRequest(call=record.ref, expected_input_count=count)
                         ),
+                        endpoint=endpoint,
                     )
                     batch.input_count = count
             except BaseException as exc:
                 errors.append(exc)
                 stop.set()
+                try:
+                    _call(
+                        client,
+                        lambda stubs: stubs.calls.Cancel(
+                            pb.CancelCallRequest(
+                                call=record.ref,
+                                reason="batch input feeder failed",
+                                request_id=str(uuid.uuid4()),
+                            )
+                        ),
+                        endpoint=endpoint,
+                    )
+                except BaseException:
+                    pass
 
         threading.Thread(
             target=feed,
@@ -1319,13 +1593,23 @@ class RemoteFunction(Generic[P, R]):
         return batch
 
     def map(self, *iterables: Iterable[Any], **kwargs: Any) -> Iterator[R]:
-        if not iterables: raise ValueError("map requires at least one iterable")
+        if not iterables:
+            raise ValueError("map requires at least one iterable")
         items = iterables[0] if len(iterables) == 1 else zip(*iterables)
-        return self.spawn_map(items, kwargs=kwargs.pop("kwargs", None), starmap=len(iterables) > 1).results(**{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}})
+        return self.spawn_map(
+            items, kwargs=kwargs.pop("kwargs", None), starmap=len(iterables) > 1
+        ).results(
+            **{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}}
+        )
+
     def starmap(self, iterable: Iterable[Iterable[Any]], **kwargs: Any) -> Iterator[R]:
-        return self.spawn_map(iterable, kwargs=kwargs.pop("kwargs", None), starmap=True).results(**{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}})
+        return self.spawn_map(iterable, kwargs=kwargs.pop("kwargs", None), starmap=True).results(
+            **{k: v for k, v in kwargs.items() if k in {"order_outputs", "return_exceptions"}}
+        )
+
     def for_each(self, *iterables: Iterable[Any], **kwargs: Any) -> None:
-        for _ in self.map(*iterables, **kwargs): pass
+        for _ in self.map(*iterables, **kwargs):
+            pass
 
 
 @overload
@@ -1348,6 +1632,10 @@ def function(
     volumes: tuple[FunctionVolumeMount, ...] | None = None,
     network: NetworkPolicy | None = None,
     egress: Iterable[str] | None = None,
+    block_network: bool | None = None,
+    egress_cidrs: Iterable[str] | None = None,
+    egress_domains: Iterable[str] | None = None,
+    inbound_cidrs: Iterable[str] | None = None,
     retries: RetryPolicy | int | None = None,
     startup_timeout: float | None = None,
     execution_timeout: float | None = None,
@@ -1383,6 +1671,10 @@ def function(
     volumes: tuple[FunctionVolumeMount, ...] | None = None,
     network: NetworkPolicy | None = None,
     egress: Iterable[str] | None = None,
+    block_network: bool | None = None,
+    egress_cidrs: Iterable[str] | None = None,
+    egress_domains: Iterable[str] | None = None,
+    inbound_cidrs: Iterable[str] | None = None,
     retries: RetryPolicy | int | None = None,
     startup_timeout: float | None = None,
     execution_timeout: float | None = None,
@@ -1405,29 +1697,74 @@ def function(
     has_explicit_options = options is not None or any(
         value is not None
         for value in (
-            image, cpus, memory, disk, architecture, ha, volumes, network, egress,
-            retries, startup_timeout, execution_timeout, queue_timeout,
-            idle_timeout, result_ttl, min_workers, max_workers, buffer_workers,
-            scale_down_after, max_outstanding_inputs, serializer,
+            image,
+            cpus,
+            memory,
+            disk,
+            architecture,
+            ha,
+            volumes,
+            network,
+            egress,
+            block_network,
+            egress_cidrs,
+            egress_domains,
+            inbound_cidrs,
+            retries,
+            startup_timeout,
+            execution_timeout,
+            queue_timeout,
+            idle_timeout,
+            result_ttl,
+            min_workers,
+            max_workers,
+            buffer_workers,
+            scale_down_after,
+            max_outstanding_inputs,
+            serializer,
         )
     )
     configured = _compose_function_options(
-        options, image=image, cpus=cpus, memory=memory, disk=disk,
-        architecture=architecture, ha=ha, volumes=volumes, network=network,
+        options,
+        image=image,
+        cpus=cpus,
+        memory=memory,
+        disk=disk,
+        architecture=architecture,
+        ha=ha,
+        volumes=volumes,
+        network=network,
         egress=egress,
-        retries=retries, startup_timeout=startup_timeout,
-        execution_timeout=execution_timeout, queue_timeout=queue_timeout,
-        idle_timeout=idle_timeout, result_ttl=result_ttl,
-        min_workers=min_workers, max_workers=max_workers,
-        buffer_workers=buffer_workers, scale_down_after=scale_down_after,
-        max_outstanding_inputs=max_outstanding_inputs, serializer=serializer,
+        block_network=block_network,
+        egress_cidrs=egress_cidrs,
+        egress_domains=egress_domains,
+        inbound_cidrs=inbound_cidrs,
+        retries=retries,
+        startup_timeout=startup_timeout,
+        execution_timeout=execution_timeout,
+        queue_timeout=queue_timeout,
+        idle_timeout=idle_timeout,
+        result_ttl=result_ttl,
+        min_workers=min_workers,
+        max_workers=max_workers,
+        buffer_workers=buffer_workers,
+        scale_down_after=scale_down_after,
+        max_outstanding_inputs=max_outstanding_inputs,
+        serializer=serializer,
     )
+
     def decorate(inner: Callable[P, R]) -> RemoteFunction[P, R]:
         return RemoteFunction(
-            inner, client=client, namespace=namespace, name=name,
+            inner,
+            client=client,
+            namespace=namespace,
+            name=name,
             options=configured if has_explicit_options else None,
             package_mode=package_mode,
-            package_root=package_root, include=include, exclude=exclude,
+            package_root=package_root,
+            include=include,
+            exclude=exclude,
             local_packages=local_packages,
         )
+
     return decorate(function) if function is not None else decorate

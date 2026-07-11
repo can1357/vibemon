@@ -135,14 +135,21 @@ class SerializerPolicy:
     allow_trusted_python: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "input_serializer", _codec(self.input_serializer, "input_serializer"))
-        object.__setattr__(self, "result_serializer", _codec(self.result_serializer, "result_serializer"))
+        object.__setattr__(
+            self, "input_serializer", _codec(self.input_serializer, "input_serializer")
+        )
+        object.__setattr__(
+            self, "result_serializer", _codec(self.result_serializer, "result_serializer")
+        )
         try:
             object.__setattr__(self, "compression", ValueCompression(self.compression))
         except ValueError as exc:
             raise OptionsError(f"invalid compression: {self.compression!r}") from exc
         _boolean("allow_trusted_python", self.allow_trusted_python)
-        if ValueCodec.CLOUDPICKLE in (self.input_serializer, self.result_serializer) and not self.allow_trusted_python:
+        if (
+            ValueCodec.CLOUDPICKLE in (self.input_serializer, self.result_serializer)
+            and not self.allow_trusted_python
+        ):
             raise OptionsError("cloudpickle serializers require allow_trusted_python=True")
 
 
@@ -289,12 +296,22 @@ def _integer(name: str, value: object, *, minimum: int) -> None:
 
 
 def _positive(name: str, value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise OptionsError(f"{name} must be a positive finite number")
 
 
 def _nonnegative(name: str, value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         raise OptionsError(f"{name} must be a non-negative finite number")
 
 
@@ -316,7 +333,9 @@ def _absolute_path(name: str, value: object) -> None:
 
 
 def _unique_strings(name: str, values: object) -> None:
-    if not isinstance(values, tuple) or not all(isinstance(value, str) and value for value in values):
+    if not isinstance(values, tuple) or not all(
+        isinstance(value, str) and value for value in values
+    ):
         raise OptionsError(f"{name} must be a tuple of non-empty strings")
     if len(set(values)) != len(values):
         raise OptionsError(f"{name} must not contain duplicates")

@@ -2,6 +2,7 @@ package vmon
 
 import (
 	"context"
+	"io"
 	"sync"
 	"testing"
 
@@ -9,7 +10,9 @@ import (
 	"google.golang.org/grpc"
 )
 
-type functionStub struct{ pb.UnimplementedFunctionServiceServer }
+type functionStub struct {
+	pb.UnimplementedFunctionServiceServer
+}
 
 func (stub *functionStub) Get(context.Context, *pb.GetFunctionRequest) (*pb.FunctionRevision, error) {
 	return &pb.FunctionRevision{Ref: &pb.RevisionRef{Function: &pb.FunctionRef{Namespace: "ns", Name: "double"}, RevisionId: "rev-1"}}, nil
@@ -17,15 +20,23 @@ func (stub *functionStub) Get(context.Context, *pb.GetFunctionRequest) (*pb.Func
 
 type functionCallStub struct {
 	pb.UnimplementedCallServiceServer
-	mu sync.Mutex
-	created *pb.CreateCallRequest
-	watched *pb.WatchCallRequest
-	cancelled bool
+	mu            sync.Mutex
+	created       *pb.CreateCallRequest
+	watched       *pb.WatchCallRequest
+	streamed      []*pb.CallInput
+	cancelRequest *pb.CancelCallRequest
+	cancelled     bool
 }
 
 func (stub *functionCallStub) Create(_ context.Context, request *pb.CreateCallRequest) (*pb.CallRecord, error) {
-	stub.mu.Lock(); stub.created = request; stub.mu.Unlock()
+	stub.mu.Lock()
+	stub.created = request
+	stub.mu.Unlock()
 	return &pb.CallRecord{Ref: &pb.CallRef{CallId: "call-stable"}, Status: pb.CallStatus_CALL_STATUS_PENDING}, nil
+}
+
+func (stub *functionCallStub) Get(_ context.Context, ref *pb.CallRef) (*pb.CallRecord, error) {
+	return &pb.CallRecord{Ref: ref, Type: pb.CallType_CALL_TYPE_UNARY, InputCount: 1, InputsClosed: true, Status: pb.CallStatus_CALL_STATUS_SUCCEEDED}, nil
 }
 
 func (stub *functionCallStub) GetResult(context.Context, *pb.GetCallResultRequest) (*pb.CallResult, error) {
@@ -34,13 +45,44 @@ func (stub *functionCallStub) GetResult(context.Context, *pb.GetCallResultReques
 }
 
 func (stub *functionCallStub) Watch(request *pb.WatchCallRequest, stream grpc.ServerStreamingServer[pb.CallEvent]) error {
-	stub.mu.Lock(); stub.watched = request; stub.mu.Unlock()
+	stub.mu.Lock()
+	stub.watched = request
+	stub.mu.Unlock()
 	return stream.Send(&pb.CallEvent{Call: request.Cursor.Call, Sequence: request.Cursor.AfterSequence + 1, Payload: &pb.CallEvent_Status{Status: &pb.StatusEvent{Status: pb.CallStatus_CALL_STATUS_SUCCEEDED}}})
 }
 
-func (stub *functionCallStub) Cancel(context.Context, *pb.CancelCallRequest) (*pb.CallRecord, error) {
-	stub.mu.Lock(); stub.cancelled = true; stub.mu.Unlock()
+func (stub *functionCallStub) Cancel(_ context.Context, request *pb.CancelCallRequest) (*pb.CallRecord, error) {
+	stub.mu.Lock()
+	stub.cancelled = true
+	stub.cancelRequest = request
+	stub.mu.Unlock()
 	return &pb.CallRecord{Ref: &pb.CallRef{CallId: "call-stable"}, Status: pb.CallStatus_CALL_STATUS_CANCELLING}, nil
+}
+
+func (stub *functionCallStub) StreamInputs(stream grpc.BidiStreamingServer[pb.StreamCallInputsRequest, pb.StreamCallInputsResponse]) error {
+	var count uint64
+	for {
+		frame, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if input := frame.GetInput(); input != nil {
+			stub.mu.Lock()
+			stub.streamed = append(stub.streamed, input)
+			stub.mu.Unlock()
+			count++
+		}
+		if err := stream.Send(&pb.StreamCallInputsResponse{Call: &pb.CallRef{CallId: "call-stable"}, CommittedInputCount: count}); err != nil {
+			return err
+		}
+	}
+}
+
+func (stub *functionCallStub) CloseInputs(_ context.Context, request *pb.CloseCallInputsRequest) (*pb.CallRecord, error) {
+	return &pb.CallRecord{Ref: &pb.CallRef{CallId: "call-stable"}, InputCount: request.ExpectedInputCount, InputsClosed: true}, nil
 }
 
 func TestDeployedFunctionLookupInvokeAndReconstruct(t *testing.T) {
@@ -51,19 +93,64 @@ func TestDeployedFunctionLookupInvokeAndReconstruct(t *testing.T) {
 	})
 	client := bufconnClient(t, listener)
 	function, err := LookupFunction[int](context.Background(), client, "ns", "double")
-	if err != nil { t.Fatal(err) }
-	if function.RevisionID() != "rev-1" { t.Fatalf("revision = %q", function.RevisionID()) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if function.RevisionID() != "rev-1" {
+		t.Fatalf("revision = %q", function.RevisionID())
+	}
 	call, err := function.Spawn(context.Background(), 21)
-	if err != nil { t.Fatal(err) }
-	if call.ID() != "call-stable" { t.Fatalf("id = %q", call.ID()) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.ID() != "call-stable" {
+		t.Fatalf("id = %q", call.ID())
+	}
 	rebuilt, err := FunctionCallFromID[int](client, call.ID())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := rebuilt.Get(context.Background())
-	if err != nil || result != 42 { t.Fatalf("result = %d, %v", result, err) }
-	stub.mu.Lock(); created := stub.created; stub.mu.Unlock()
-	if created == nil || created.Target.Function.RevisionId != "rev-1" || len(created.Inputs) != 1 { t.Fatalf("create = %#v", created) }
+	if err != nil || result != 42 {
+		t.Fatalf("result = %d, %v", result, err)
+	}
+	stub.mu.Lock()
+	created := stub.created
+	stub.mu.Unlock()
+	if created == nil || created.Target.Function.RevisionId != "rev-1" || len(created.Inputs) != 1 {
+		t.Fatalf("create = %#v", created)
+	}
 }
 
+func TestMapUsesAcknowledgedBidiInputs(t *testing.T) {
+	stub := &functionCallStub{}
+	listener := startGRPCServices(t, func(server *grpc.Server) {
+		pb.RegisterFunctionServiceServer(server, &functionStub{})
+		pb.RegisterCallServiceServer(server, stub)
+	})
+	client := bufconnClient(t, listener)
+	function, err := LookupFunction[int](context.Background(), client, "ns", "double")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := make(chan any, 2)
+	inputs <- 1
+	inputs <- 2
+	close(inputs)
+	batch, err := function.Map(context.Background(), inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.count != 2 {
+		t.Fatalf("batch count = %d", batch.count)
+	}
+	stub.mu.Lock()
+	streamed := append([]*pb.CallInput(nil), stub.streamed...)
+	stub.mu.Unlock()
+	if len(streamed) != 2 || streamed[0].InputId == "" || streamed[1].GetValue() == nil {
+		t.Fatalf("streamed inputs = %#v", streamed)
+	}
+}
 
 func TestWatchCursorAndCancel(t *testing.T) {
 	stub := &functionCallStub{}
@@ -72,9 +159,22 @@ func TestWatchCursorAndCancel(t *testing.T) {
 	call, _ := FunctionCallFromID[int](client, "call-stable")
 	events, failures := call.Watch(context.Background(), 41, false)
 	event := <-events
-	if event.Sequence != 42 { t.Fatalf("sequence = %d", event.Sequence) }
-	if err := <-failures; err != nil { t.Fatal(err) }
-	if err := call.Cancel(context.Background(), "test"); err != nil { t.Fatal(err) }
-	stub.mu.Lock(); cancelled := stub.cancelled; stub.mu.Unlock()
-	if !cancelled { t.Fatal("cancel RPC not observed") }
+	if event.Sequence != 42 {
+		t.Fatalf("sequence = %d", event.Sequence)
+	}
+	if err := <-failures; err != nil {
+		t.Fatal(err)
+	}
+	if err := call.Cancel(context.Background(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	stub.mu.Lock()
+	cancelled, request := stub.cancelled, stub.cancelRequest
+	stub.mu.Unlock()
+	if !cancelled {
+		t.Fatal("cancel RPC not observed")
+	}
+	if request == nil || request.RequestId == "" {
+		t.Fatal("cancel request omitted idempotency request_id")
+	}
 }

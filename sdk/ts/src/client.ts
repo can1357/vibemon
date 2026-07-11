@@ -101,13 +101,28 @@ export class Client {
 /** Deployed function lookup operations. */
 export class FunctionAPI {
   readonly #client: Client;
-  constructor(client: Client) { this.#client = client; }
+  constructor(client: Client) {
+    this.#client = client;
+  }
   /** Resolve and pin the active deployed function revision. */
-  fromName<Input, Result>(name: string, options: FunctionLookupOptions<Input, Result> & { input: FunctionValueAdapter<Input>; result: FunctionValueAdapter<Result> }): Promise<RemoteFunction<Input, Result>>;
+  fromName<Input, Result>(
+    name: string,
+    options: FunctionLookupOptions<Input, Result> & {
+      input: FunctionValueAdapter<Input>;
+      result: FunctionValueAdapter<Result>;
+    },
+  ): Promise<RemoteFunction<Input, Result>>;
   fromName(name: string, options?: FunctionLookupOptions): Promise<RemoteFunction>;
-  fromName<Input, Result>(name: string, options: FunctionLookupOptions<Input, Result> = {}): Promise<RemoteFunction<Input, Result> | RemoteFunction> {
+  fromName<Input, Result>(
+    name: string,
+    options: FunctionLookupOptions<Input, Result> = {},
+  ): Promise<RemoteFunction<Input, Result> | RemoteFunction> {
     if (options.input && options.result) {
-      return RemoteFunction.fromName(this.#client, name, { ...options, input: options.input, result: options.result });
+      return RemoteFunction.fromName(this.#client, name, {
+        ...options,
+        input: options.input,
+        result: options.result,
+      });
     }
     return RemoteFunction.fromName(this.#client, name, {
       namespace: options.namespace,
@@ -126,7 +141,9 @@ export class FunctionAPI {
 /** Deployed application lookup operations. */
 export class AppAPI {
   readonly #client: Client;
-  constructor(client: Client) { this.#client = client; }
+  constructor(client: Client) {
+    this.#client = client;
+  }
   /** Resolve and pin the current deployed application revision. */
   fromName(name: string, options: { namespace?: string; revisionId?: string } = {}): Promise<App> {
     return App.fromName(this.#client, name, options);
