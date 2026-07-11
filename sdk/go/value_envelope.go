@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/klauspost/compress/zstd"
 	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 )
 
@@ -31,6 +33,8 @@ const (
 	CompressionNone ValueCompression = iota
 	// CompressionGZIP stores a deterministic gzip stream.
 	CompressionGZIP
+	// CompressionZSTD stores a deterministic Zstandard frame.
+	CompressionZSTD
 )
 
 // ArtifactValueLoader retrieves compressed bytes for an artifact-backed envelope.
@@ -62,7 +66,9 @@ func EncodeValue(value any, codec ValueCodec, compression ValueCompression) (*Va
 	if err != nil { return nil, fmt.Errorf("vmon: encode value: %w", err) }
 	stored := raw
 	wireCompression := pb.ValueCompression_VALUE_COMPRESSION_NONE
-	if compression == CompressionGZIP {
+	switch compression {
+	case CompressionNone:
+	case CompressionGZIP:
 		var buffer bytes.Buffer
 		writer, _ := gzip.NewWriterLevel(&buffer, gzip.BestSpeed)
 		writer.Header.ModTime = zeroTime
@@ -70,7 +76,13 @@ func EncodeValue(value any, codec ValueCodec, compression ValueCompression) (*Va
 		if err != nil { return nil, fmt.Errorf("vmon: compress value: %w", err) }
 		stored = buffer.Bytes()
 		wireCompression = pb.ValueCompression_VALUE_COMPRESSION_GZIP
-	} else if compression != CompressionNone {
+	case CompressionZSTD:
+		writer, createErr := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		if createErr != nil { return nil, fmt.Errorf("vmon: create zstd encoder: %w", createErr) }
+		stored = writer.EncodeAll(raw, nil)
+		writer.Close()
+		wireCompression = pb.ValueCompression_VALUE_COMPRESSION_ZSTD
+	default:
 		return nil, fmt.Errorf("vmon: unsupported value compression %d", compression)
 	}
 	digest := sha256.Sum256(raw)
@@ -92,13 +104,27 @@ func (value *ValueEnvelope) Decode(destination any, loader ArtifactValueLoader) 
 		var err error
 		stored, err = loader(&ArtifactReference{Digest: append([]byte(nil), ref.Digest.Value...)})
 		if err != nil { return fmt.Errorf("vmon: load value artifact: %w", err) }
+		artifactDigest := sha256.Sum256(stored)
+		if ref.Digest.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(artifactDigest[:], ref.Digest.Value) {
+			return errors.New("vmon: artifact digest mismatch")
+		}
 	}
 	raw := stored
-	if wire.Compression == pb.ValueCompression_VALUE_COMPRESSION_GZIP {
+	switch wire.Compression {
+	case pb.ValueCompression_VALUE_COMPRESSION_NONE:
+	case pb.ValueCompression_VALUE_COMPRESSION_GZIP:
 		reader, err := gzip.NewReader(bytes.NewReader(stored)); if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
 		raw, err = io.ReadAll(reader); closeErr := reader.Close(); if err == nil { err = closeErr }
 		if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
-	} else if wire.Compression != pb.ValueCompression_VALUE_COMPRESSION_NONE { return errors.New("vmon: unsupported value compression") }
+	case pb.ValueCompression_VALUE_COMPRESSION_ZSTD:
+		reader, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		if err != nil { return fmt.Errorf("vmon: create zstd decoder: %w", err) }
+		raw, err = reader.DecodeAll(stored, nil)
+		reader.Close()
+		if err != nil { return fmt.Errorf("vmon: decompress value: %w", err) }
+	default:
+		return errors.New("vmon: unsupported value compression")
+	}
 	if uint64(len(raw)) != wire.UncompressedSizeBytes { return errors.New("vmon: value size mismatch") }
 	digest := sha256.Sum256(raw)
 	if wire.Checksum == nil || wire.Checksum.Algorithm != pb.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 || !bytes.Equal(digest[:], wire.Checksum.Value) { return errors.New("vmon: value checksum mismatch") }

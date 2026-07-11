@@ -27,6 +27,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Zstandard (ZSTD) compression support to SDK `ValueEnvelope` serialization
+- Added comprehensive `Function` and `BatchCall` primitives for durable remote function execution
+- Added `LookupFunction` and `LookupFunctionRevision` for resolving deployed function revisions
+- Added `Spawn`, `Remote`, `Map`, and `Results` APIs for managing function call lifecycles
+- Added `FunctionCallFromID` to support reconstructing durable call handles across process boundaries
 - Added `FunctionService` for remote function registration, management, and scheduling
 - Added `ArtifactService` for immutable content-addressed function payload storage
 - Added protocol-v2 guest runner for high-performance function execution

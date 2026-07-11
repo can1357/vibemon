@@ -5,27 +5,20 @@
 // connection failures. NewClient binds the same object model to an injected Driver.
 // Sandbox operations live on values returned by Client.Sandboxes.
 //
-// # Remote functions
+// # Deployed functions
 //
-// Two remote-function paths run code inside sandboxes. NewRemoteFunction executes a
-// self-contained JavaScript module export on a Node.js image. Register plus Takeover
-// re-execute this very Go binary inside the guest ("takeover"): register functions in
-// main, call vmon.Takeover() right after, and invoke them through NewFunction handles
-// with Remote, Spawn, and Map over a persistent in-guest worker session. Worker
-// sandboxes default to a plain glibc image (DefaultTakeoverImage); a CGO_ENABLED=0
-// static build runs on any Linux image. Non-linux hosts must point
-// FunctionOptions.WorkerBinary at a GOOS=linux build of the same program, and
-// FunctionOptions.Pool keeps a server-side warm pool for fast sandbox acquisition.
+// LookupFunction resolves a server-registered function and pins its immutable
+// revision. Remote creates a durable call and waits for its result; Spawn returns
+// a FunctionCall whose stable ID can be reconstructed in another process with
+// FunctionCallFromID. SpawnMap creates a durable batch and Results applies bounded
+// consumer backpressure. Execution and retries are owned entirely by the server.
 //
-//	func main() {
-//		vmon.Register("add", func(a, b int) int { return a + b })
-//		vmon.Takeover() // no-op unless re-executed as a worker
+// Inputs and results use portable JSON or CBOR ValueEnvelope values. Calls provide
+// at-least-once execution: an attempt may run more than once, while indexed results
+// and events are committed durably and can be resumed from their sequence cursors.
 //
-//		client, _ := vmon.Connect("vmon+context://prod")
-//		add, _ := vmon.NewFunction[int](client, "add")
-//		sum, _ := add.Remote(ctx, 2, 3)
-//		_ = sum
-//	}
+//	add, _ := vmon.LookupFunction[int](ctx, client, "production", "add")
+//	sum, _ := add.Remote(ctx, []int{2, 3})
 //
 // # Example
 //
