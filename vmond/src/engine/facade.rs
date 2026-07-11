@@ -26,6 +26,7 @@ use crate::{
 		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, ShellSession,
 		agent::{AgentConn, ExecHandle},
 		control::ControlClient,
+		diskdelta,
 		spawn::{LaunchSpec, MicroVm, VolumeMount},
 	},
 	error::{EngineError, Result},
@@ -587,6 +588,15 @@ impl Engine {
 			.with_agent_sock(vm.dir().join("agent.sock"))
 			.with_mem_mib(u64::from(plan.params.memory))
 			.with_cpus(u64::from(plan.params.cpus));
+		// The restored VM must own its disk: overlay the template's image so
+		// guest writes land in a per-VM file (checkpointable, migratable)
+		// instead of the shared absolute path recorded in the snapshot's
+		// block-device hint — a path that does not even exist on a peer node
+		// restoring a pulled checkpoint.
+		let base_disk = plan.template_dir.join("rootfs.img");
+		if base_disk.is_file() {
+			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
+		}
 		if let Some(secs) = plan.timeout_secs {
 			spec = spec.with_timeout_secs(secs);
 		}
@@ -1227,20 +1237,13 @@ impl Engine {
 		<Self as EngineApi>::create(self, request)
 	}
 
-	/// Build a peer-pullable checkpoint + restore params for migrate/replicate.
+	/// Eligibility checks + restore params shared by every peer checkpoint.
 	///
-	/// `stop` quiesces the source (migration); `!stop` keeps it running
-	/// (replication). Restore params carry the *live* runtime state (env,
-	/// secrets, network spec) on top of the persisted detail; volume data is
-	/// captured into the checkpoint before the content digest so it travels
-	/// with the bundle. Raises `Unsupported` for sandboxes that cannot move
-	/// `hosts` (`fs_dir` shares, rehydrated records, missing network state).
-	fn mesh_checkpoint_for(
-		&self,
-		sid: &str,
-		kind: &str,
-		stop: bool,
-	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+	/// Merges the persisted record detail with the *live* runtime state (env,
+	/// secrets, network spec) a peer needs to re-create the sandbox. Raises
+	/// `Unsupported` for sandboxes that cannot move hosts (`fs_dir` shares,
+	/// rehydrated records, missing network state).
+	fn mesh_checkpoint_params(&self, sid: &str) -> Result<(VmRecord, Map<String, Value>)> {
 		let record = self.get_record(sid, true)?;
 		let detail = record.detail.as_object().cloned().unwrap_or_default();
 		if detail
@@ -1316,17 +1319,24 @@ impl Engine {
 		] {
 			params.remove(key);
 		}
+		Ok((record, params))
+	}
+
+	/// Build a peer-pullable checkpoint + restore params for replication and
+	/// migration pre-copy. The source VM keeps running (it pauses only for
+	/// the dump); volume data is captured into the checkpoint before the
+	/// content digest so it travels with the bundle.
+	fn mesh_checkpoint_for(
+		&self,
+		sid: &str,
+		kind: &str,
+	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
 		let vm = MicroVm::new(sid);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
 		let snapshot_dir =
-			Self::snapshot_machine(&vm, &snapshot, !stop, disk.as_deref(), &self.snapshot_root())?;
-		if stop {
-			// Route the stop through engine teardown so TAP/lease and volume
-			// locks are released, not just the VMM process.
-			let rc = self.teardown(&record);
-			self.persist_status(sid, "stopped", rc, None)?;
-		}
+			Self::snapshot_machine(&vm, &snapshot, true, disk.as_deref(), &self.snapshot_root())?;
 		stamp_checkpoint_rootfs(self.home(), &snapshot_dir, record.detail.as_object())?;
 		stamp_checkpoint_marker(&snapshot_dir, record.detail.as_object())?;
 		capture_checkpoint_volumes(self.home(), &snapshot_dir, record.detail.get("volumes"))?;
@@ -1345,7 +1355,7 @@ impl Engine {
 		&self,
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
-		let prep = self.mesh_checkpoint_for(sid, "replica", false)?;
+		let prep = self.mesh_checkpoint_for(sid, "replica")?;
 		self.mesh_update_detail_fields(
 			sid,
 			Map::from_iter([("checkpoint_ts".to_owned(), json!(unix_time()))]),
@@ -1353,53 +1363,147 @@ impl Engine {
 		Ok(prep)
 	}
 
-	/// Quiesce a live sandbox into a transient cross-node checkpoint: the
-	/// source VM is *stopped* exactly at the snapshot. Follow with
-	/// [`Self::mesh_migrate_commit`] once a target confirms, or
-	/// [`Self::mesh_migrate_abort`] to restore the source locally.
-	pub(crate) fn mesh_migrate_prepare(
+	/// Live-migration phase 1 (pre-copy): checkpoint the running sandbox for
+	/// a peer pull; the source keeps running. Follow with
+	/// [`Self::mesh_migrate_finalize`] once the target holds the bulk image.
+	pub(crate) fn mesh_migrate_precopy(
 		&self,
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
-		self.mesh_checkpoint_for(sid, "migrate", true)
+		self.mesh_checkpoint_for(sid, "migrate")
 	}
 
-	/// Finalize a successful migration: drop the stopped source and its
-	/// checkpoint. The local record MUST go — the mesh router treats any local
-	/// record as owned-here and would refuse to proxy to the new owner — so the
+	/// Live-migration phase 2: pause the source and capture a delta
+	/// checkpoint against the pre-copy `base_dir` — changed RAM pages (the
+	/// VMM's delta snapshot), changed disk blocks (`rootfs-delta.bin`), and
+	/// fresh volume trees — then stop the source exactly at the captured
+	/// state.
+	///
+	/// Any capture failure resumes the source and removes the partial delta;
+	/// once every artifact is durable the source is stopped and the returned
+	/// checkpoint is the sole authority. Follow with
+	/// [`Self::mesh_migrate_commit`] once the target confirms, or
+	/// [`Self::mesh_migrate_abort`] to restore the source locally.
+	pub(crate) fn mesh_migrate_finalize(
+		&self,
+		sid: &str,
+		base_dir: &Path,
+	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+		let (record, params) = self.mesh_checkpoint_params(sid)?;
+		let base_name = base_dir
+			.file_name()
+			.and_then(|name| name.to_str())
+			.ok_or_else(|| {
+				EngineError::engine(format!(
+					"pre-copy checkpoint {} has no usable directory name",
+					base_dir.display()
+				))
+			})?;
+		let snapshot = format!("migrate-{sid}-{}", unix_millis());
+		let dir = self.snapshot_dir(&snapshot);
+		let vm = MicroVm::new(sid);
+		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
+		let mut control = control_for_vm(&vm)?;
+		control.pause()?;
+		let captured = (|| {
+			control.snapshot(&snapshot, Some(base_name))?;
+			if let Some(disk) = disk.as_deref() {
+				let base_rootfs = base_dir.join("rootfs.img");
+				if base_rootfs.is_file() {
+					diskdelta::write_disk_delta(
+						&base_rootfs,
+						disk,
+						&dir.join(diskdelta::DISK_DELTA_FILE),
+					)?;
+				}
+			}
+			capture_checkpoint_volumes(self.home(), &dir, record.detail.get("volumes"))?;
+			stamp_checkpoint_marker(&dir, record.detail.as_object())?;
+			image::cas::index_template(&dir, None)
+		})();
+		let digest = match captured {
+			Ok(digest) => digest,
+			Err(err) => {
+				// The source must keep running when finalize fails; a partial
+				// delta is useless without the stop that never came.
+				let _ = control.resume();
+				let _ = fs::remove_dir_all(&dir);
+				return Err(err);
+			},
+		};
+		drop(control);
+		// Point of no return: the delta checkpoint is durable, so stop the
+		// source exactly at it. Route the stop through engine teardown so
+		// TAP/lease and volume locks are released, not just the VMM process.
+		let rc = self.teardown(&record);
+		self.persist_status(sid, "stopped", rc, None)?;
+		Ok(crate::mesh::reconciler::ReplicatePreparation {
+			digest,
+			snapshot_dir: dir,
+			params: Value::Object(params),
+		})
+	}
+
+	/// Finalize a successful migration: drop the stopped source, its local
+	/// record, and both transient checkpoints (pre-copy base + final delta).
+	/// The local record MUST go — the mesh router treats any local record as
+	/// owned-here and would refuse to proxy to the new owner — so the
 	/// registry entry is force-dropped even if teardown was partial.
 	pub(crate) fn mesh_migrate_commit(
 		&self,
 		sid: &str,
-		snapshot_dir: &Path,
-		digest: &str,
+		base_dir: &Path,
+		base_digest: &str,
+		delta_dir: &Path,
+		delta_digest: &str,
 	) -> Result<()> {
 		if <Self as EngineApi>::remove(self, sid).is_err() {
 			self.inner.registry.remove(sid);
 		}
-		self.mesh_drop_checkpoint(digest, snapshot_dir, true)
+		self.mesh_drop_checkpoint(delta_digest, delta_dir, true)?;
+		self.mesh_drop_checkpoint(base_digest, base_dir, true)
 	}
 
-	/// Roll back a failed migration by restoring the source locally. The
-	/// source was stopped exactly at the checkpoint, so re-creating it from the
-	/// same checkpoint resumes the VM with no lost work. The checkpoint
-	/// directory is kept (the restored VM may page from it); only its
-	/// peer-pullable CAS pointer is dropped.
+	/// Roll back a failed live migration by restoring the source locally.
+	/// The source was stopped exactly at the delta checkpoint, so re-creating
+	/// it from that checkpoint resumes the VM with no lost work. The VM's
+	/// final disk image still exists locally and is adopted as the
+	/// checkpoint's `rootfs.img` (cheaper than replaying the block delta).
+	/// Both checkpoint directories are kept — the delta's memory chain
+	/// resolves through the pre-copy base as a sibling — and only their
+	/// peer-pullable CAS pointers are dropped.
 	pub(crate) fn mesh_migrate_abort(
 		&self,
 		sid: &str,
-		snapshot_dir: &Path,
-		digest: &str,
+		base_digest: &str,
+		delta_dir: &Path,
+		delta_digest: &str,
 		mut params: Map<String, Value>,
 	) -> Result<Value> {
+		let rootfs = delta_dir.join("rootfs.img");
+		if !rootfs.is_file() {
+			let live = MicroVm::new(sid)
+				.rootfs_img()
+				.ok()
+				.filter(|path| path.is_file());
+			let Some(live) = live else {
+				return Err(EngineError::engine(format!(
+					"cannot restore {sid}: its disk image is gone and the delta checkpoint {} carries \
+					 no rootfs.img",
+					delta_dir.display()
+				)));
+			};
+			fs::copy(live, &rootfs)?;
+		}
 		if <Self as EngineApi>::remove(self, sid).is_err() {
 			// The re-create below must not self-conflict with a half-removed
 			// record of the same sid.
 			self.inner.registry.remove(sid);
 		}
-		params.insert("template".to_owned(), json!(snapshot_dir.to_string_lossy()));
+		params.insert("template".to_owned(), json!(delta_dir.to_string_lossy()));
 		let view = self.mesh_create_from_params(params)?;
-		self.mesh_drop_checkpoint(digest, snapshot_dir, false)?;
+		image::cas::drop_pointer(delta_digest)?;
+		image::cas::drop_pointer(base_digest)?;
 		Ok(view)
 	}
 
@@ -2206,6 +2310,13 @@ impl EngineApi for Engine {
 		let vm = MicroVm::new(&name);
 		let mut spec = LaunchSpec::restore(vm.api_sock(), &snapshot_dir)
 			.with_agent_sock(vm.dir().join("agent.sock"));
+		// Same-disk rule as `launch_restore_vm`: the restore owns a fresh
+		// overlay of the snapshot's disk instead of reopening (and mutating)
+		// the source VM's image.
+		let base_disk = snapshot_dir.join("rootfs.img");
+		if base_disk.is_file() {
+			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
+		}
 		if body.agent.unwrap_or(false) {
 			spec = spec.with_console_agent();
 		}
@@ -2242,15 +2353,22 @@ impl EngineApi for Engine {
 	fn fork(&self, snapshot: &str, body: ForkBody) -> Result<Value> {
 		let count = body.count.max(1);
 		let mut clones = Vec::new();
+		let snapshot_dir = self.snapshot_dir(snapshot);
+		let base_disk = snapshot_dir.join("rootfs.img");
 		for _ in 0..count {
 			let name = format!("fork-{}", random_hex(12));
 			let vm = MicroVm::new(&name);
 			// Clones need their own agent channel: the template snapshot carries
 			// a console-agent device, and exec/files re-attach through it.
-			vm.launch(
-				&LaunchSpec::fork_from(vm.api_sock(), self.snapshot_dir(snapshot))
-					.with_agent_sock(vm.dir().join("agent.sock")),
-			)?;
+			let mut spec = LaunchSpec::fork_from(vm.api_sock(), &snapshot_dir)
+				.with_agent_sock(vm.dir().join("agent.sock"));
+			// Same-disk rule as restore: every clone owns a CoW overlay of the
+			// snapshot's disk (the in-process fanout parent does the same for
+			// its children) instead of all clones sharing one writable image.
+			if base_disk.is_file() {
+				spec = spec.with_disk_overlay(&base_disk, vm.dir().join("rootfs.img"));
+			}
+			vm.launch(&spec)?;
 			let meta = vm.meta()?;
 			let record = VmRecord {
 				id:            name.clone(),
@@ -3353,24 +3471,28 @@ mod tests {
 	}
 
 	#[test]
-	fn mesh_migrate_commit_unknown_sid_still_drops_checkpoint() {
+	fn mesh_migrate_commit_unknown_sid_still_drops_both_checkpoints() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _home) = Engine::new_test(config_for(&temp));
-		let (snapshot_dir, digest) = indexed_checkpoint(&temp, "commit-checkpoint");
+		let (base_dir, base_digest) = indexed_checkpoint(&temp, "commit-base-checkpoint");
+		let (delta_dir, delta_digest) = indexed_checkpoint(&temp, "commit-delta-checkpoint");
 
 		engine
-			.mesh_migrate_commit("missing-source", &snapshot_dir, &digest)
+			.mesh_migrate_commit("missing-source", &base_dir, &base_digest, &delta_dir, &delta_digest)
 			.expect("unknown source must not block checkpoint cleanup");
 
-		assert_eq!(cas::lookup(&digest).expect("lookup after commit"), None);
-		assert!(!snapshot_dir.exists(), "migration commit must delete the checkpoint");
+		assert_eq!(cas::lookup(&base_digest).expect("base lookup after commit"), None);
+		assert_eq!(cas::lookup(&delta_digest).expect("delta lookup after commit"), None);
+		assert!(!base_dir.exists(), "migration commit must delete the pre-copy checkpoint");
+		assert!(!delta_dir.exists(), "migration commit must delete the delta checkpoint");
 	}
 
 	#[test]
-	fn mesh_migrate_abort_drops_pointer_but_keeps_checkpoint_dir_after_create_success() {
+	fn mesh_migrate_abort_drops_pointers_but_keeps_checkpoint_dirs_after_create_success() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _home) = Engine::new_test(config_for(&temp));
-		let (snapshot_dir, digest) = indexed_checkpoint(&temp, "abort-success-checkpoint");
+		let (base_dir, base_digest) = indexed_checkpoint(&temp, "abort-base-checkpoint");
+		let (delta_dir, delta_digest) = indexed_checkpoint(&temp, "abort-success-checkpoint");
 		let mut record = VmRecord::new("restored", "restored", "running");
 		record.detail = json!({ "idempotency_key": "abort-replay" });
 		engine.insert_test_record(record);
@@ -3382,31 +3504,39 @@ mod tests {
 		params.insert("idempotency_key".to_owned(), json!("abort-replay"));
 
 		let view = engine
-			.mesh_migrate_abort("missing-source", &snapshot_dir, &digest, params)
+			.mesh_migrate_abort("missing-source", &base_digest, &delta_dir, &delta_digest, params)
 			.expect("abort cleanup succeeds after create returns");
 
 		assert_eq!(view["name"], "restored");
-		assert_eq!(cas::lookup(&digest).expect("lookup after abort"), None);
-		assert!(snapshot_dir.is_dir(), "migration abort must keep the checkpoint");
+		assert_eq!(cas::lookup(&base_digest).expect("base lookup after abort"), None);
+		assert_eq!(cas::lookup(&delta_digest).expect("delta lookup after abort"), None);
+		assert!(base_dir.is_dir(), "migration abort must keep the pre-copy checkpoint");
+		assert!(delta_dir.is_dir(), "migration abort must keep the delta checkpoint");
 	}
 
 	#[test]
-	fn mesh_migrate_abort_create_error_propagates_and_keeps_checkpoint_dir() {
+	fn mesh_migrate_abort_create_error_propagates_and_keeps_checkpoint_dirs() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _home) = Engine::new_test(config_for(&temp));
-		let (snapshot_dir, digest) = indexed_checkpoint(&temp, "abort-error-checkpoint");
+		let (base_dir, base_digest) = indexed_checkpoint(&temp, "abort-error-base-checkpoint");
+		let (delta_dir, delta_digest) = indexed_checkpoint(&temp, "abort-error-checkpoint");
 		let mut params = Map::new();
 		params.insert("cpus".to_owned(), json!(0));
 
 		let err = engine
-			.mesh_migrate_abort("missing-source", &snapshot_dir, &digest, params)
+			.mesh_migrate_abort("missing-source", &base_digest, &delta_dir, &delta_digest, params)
 			.expect_err("invalid create params must propagate");
 
 		assert_eq!(err.message, "cpus must be positive");
 		assert_eq!(
-			cas::lookup(&digest).expect("lookup after failed abort"),
-			Some(snapshot_dir.clone())
+			cas::lookup(&base_digest).expect("base lookup after failed abort"),
+			Some(base_dir.clone())
 		);
-		assert!(snapshot_dir.is_dir(), "failed migration abort must keep the checkpoint");
+		assert_eq!(
+			cas::lookup(&delta_digest).expect("delta lookup after failed abort"),
+			Some(delta_dir.clone())
+		);
+		assert!(base_dir.is_dir(), "failed migration abort must keep the pre-copy checkpoint");
+		assert!(delta_dir.is_dir(), "failed migration abort must keep the delta checkpoint");
 	}
 }

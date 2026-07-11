@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 use crate::error::{EngineError, Result};
 
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// RAM dumps scale with guest size; match the VMM's control reply window
+/// (`vmm::control::CONTROL_REPLY_TIMEOUT`) instead of the per-line default.
+const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 const READY_SLEEP: Duration = Duration::from_millis(5);
 const MIN_CONNECT_SLICE: Duration = Duration::from_millis(1);
 
@@ -152,13 +155,25 @@ impl ControlClient {
 	}
 
 	/// Snapshot guest state into `name`, optionally as a delta against `base`.
+	///
+	/// The read timeout is raised to the server's reply window for this
+	/// request only: the VMM writes the reply after dumping guest RAM.
 	pub fn snapshot(&mut self, name: &str, base: Option<&str>) -> Result<Value> {
 		let mut params = serde_json::Map::new();
 		params.insert("name".to_owned(), json!(name));
 		if let Some(base) = base {
 			params.insert("base".to_owned(), json!(base));
 		}
-		self.request("snapshot", Value::Object(params))
+		self
+			.reader
+			.get_mut()
+			.set_read_timeout(Some(SNAPSHOT_REPLY_TIMEOUT))?;
+		let result = self.request("snapshot", Value::Object(params));
+		self
+			.reader
+			.get_mut()
+			.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+		result
 	}
 
 	/// Re-arm the VMM wall-clock deadline and return its Unix timestamp.
