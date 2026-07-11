@@ -13,12 +13,11 @@
 use std::{
 	fs::{self, File},
 	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-	num::NonZeroUsize,
 	os::unix::io::AsRawFd,
 	path::{Path, PathBuf},
-	thread,
 };
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use virtio_queue::QueueState;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion, bitmap::Bitmap};
@@ -43,11 +42,9 @@ pub const SNAPSHOT_VERSION: u32 = 3;
 const DELTA_PAGE_SIZE: u64 = 4096;
 const DELTA_PAGE_USIZE: usize = DELTA_PAGE_SIZE as usize;
 const MAX_DELTA_CHAIN_DEPTH: usize = 64;
-/// Give each diff worker at least this many pages (64 MiB) so tiny guests
-/// stay single-threaded.
+/// Pages per parallel scan/diff task (64 MiB of RAM); rayon work-steals the
+/// remainder.
 const DIFF_PAGES_PER_WORKER: u64 = 16 * 1024;
-/// Upper bound on diff worker threads.
-const DIFF_MAX_WORKERS: u64 = 16;
 
 const CURRENT_GENERATION_FILE: &str = "current-generation";
 const MANIFEST_TMP_FILE: &str = "current-generation.tmp";
@@ -1149,44 +1146,33 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
 }
 
 /// LSB-first bitmap of pages in `slice` containing any nonzero byte, scanned
-/// across worker threads.
+/// across the rayon pool. Each output byte is accumulated in a register and
+/// stored once; pages derive from the byte index.
 fn scan_nonzero_pages(slice: &[u8]) -> Vec<u8> {
 	let pages =
 		slice.len() / DELTA_PAGE_USIZE + usize::from(!slice.len().is_multiple_of(DELTA_PAGE_USIZE));
 	let mut bitmap = vec![0u8; pages.div_ceil(8)];
-	let hardware = thread::available_parallelism().map_or(1, NonZeroUsize::get) as u64;
-	let workers = hardware
-		.min(DIFF_MAX_WORKERS)
-		.min((pages as u64).div_ceil(DIFF_PAGES_PER_WORKER))
-		.max(1);
-	let chunk_pages = (pages as u64).div_ceil(workers).div_ceil(8) * 8;
-	let base = slice.as_ptr() as usize;
-	thread::scope(|scope| {
-		let mut rest: &mut [u8] = &mut bitmap;
-		let mut start = 0u64;
-		while start < pages as u64 {
-			let end = (start + chunk_pages).min(pages as u64);
-			let byte_len = ((end - start).div_ceil(8)) as usize;
-			let (chunk_bits, tail) = rest.split_at_mut(byte_len);
-			rest = tail;
-			let total = slice.len();
-			scope.spawn(move || {
-				for page in start..end {
-					let from = page as usize * DELTA_PAGE_USIZE;
-					let to = total.min(from + DELTA_PAGE_USIZE);
-					// SAFETY: `page` lies inside the scanned slice; the source
-					// mapping is quiesced (VM paused) for the dump.
-					let bytes =
-						unsafe { std::slice::from_raw_parts((base + from) as *const u8, to - from) };
-					if !memory::is_zero(bytes) {
-						let rel = page - start;
-						chunk_bits[(rel / 8) as usize] |= 1 << (rel % 8);
+	bitmap
+		.par_chunks_mut((DIFF_PAGES_PER_WORKER / 8) as usize)
+		.enumerate()
+		.for_each(|(chunk_index, bits)| {
+			let first_page = chunk_index * (DIFF_PAGES_PER_WORKER as usize);
+			for (byte_index, out) in bits.iter_mut().enumerate() {
+				let page0 = first_page + byte_index * 8;
+				let mut value = 0u8;
+				for bit in 0..8u32 {
+					let from = (page0 + bit as usize) * DELTA_PAGE_USIZE;
+					if from >= slice.len() {
+						break;
+					}
+					let to = slice.len().min(from + DELTA_PAGE_USIZE);
+					if !memory::is_zero(&slice[from..to]) {
+						value |= 1 << bit;
 					}
 				}
-			});
-			start = end;
-		}
-	});
+				*out = value;
+			}
+		});
 	bitmap
 }
 
@@ -1393,50 +1379,50 @@ fn page_index_to_gpa(page: u64, regions: &[MemRegion]) -> Result<u64> {
 	Err(err(format!("delta page index {page} is outside region table")))
 }
 
-/// Compare live RAM against the base view across worker threads, then stream
+/// Compare live RAM against the base view across the rayon pool, then stream
 /// every changed live page to `out` in ascending page order. Returns the
 /// LSB-first changed-page bitmap.
 fn diff_pages_parallel(specs: &[RegionDiff], out: &mut File) -> Result<Vec<u8>> {
 	let total_pages: u64 = specs.iter().map(|spec| spec.pages).sum();
 	let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
-	let hardware = thread::available_parallelism().map_or(1, NonZeroUsize::get) as u64;
-	let workers = hardware
-		.min(DIFF_MAX_WORKERS)
-		.min(total_pages.div_ceil(DIFF_PAGES_PER_WORKER))
-		.max(1);
-	// Chunks are multiples of 8 pages so each worker owns whole bitmap bytes.
-	let chunk_pages = total_pages.div_ceil(workers).div_ceil(8) * 8;
-	thread::scope(|scope| {
-		let mut rest: &mut [u8] = &mut bitmap;
-		let mut start = 0u64;
-		while start < total_pages {
-			let end = (start + chunk_pages).min(total_pages);
-			let byte_len = ((end - start).div_ceil(8)) as usize;
-			let (chunk_bits, tail) = rest.split_at_mut(byte_len);
-			rest = tail;
-			scope.spawn(move || diff_page_range(specs, start, end, chunk_bits));
-			start = end;
-		}
-	});
+	// One task per DIFF_PAGES_PER_WORKER pages; rayon work-steals the rest.
+	bitmap
+		.par_chunks_mut((DIFF_PAGES_PER_WORKER / 8) as usize)
+		.enumerate()
+		.for_each(|(chunk_index, bits)| {
+			let first_page = chunk_index as u64 * DIFF_PAGES_PER_WORKER;
+			diff_bitmap_chunk(specs, first_page, total_pages, bits);
+		});
 	write_changed_pages(specs, &bitmap, out)?;
 	Ok(bitmap)
 }
 
-/// Fill `bits` (whose bit 0 is global page `start`) with the changed pages in
-/// `[start, end)`. Infallible: all pointers were validated by
+/// Fill `bits` (whose bit 0 is global page `first_page`) with the changed
+/// pages it covers. Each output byte is accumulated in a register and stored
+/// once — pages derive from the byte index, so there is no per-page bitmap
+/// indexing. Infallible: all pointers were validated by
 /// [`region_diff_specs`] and the VM is paused.
-fn diff_page_range(specs: &[RegionDiff], start: u64, end: u64, bits: &mut [u8]) {
-	for spec in specs {
-		let spec_end = spec.first_page + spec.pages;
-		if spec_end <= start {
-			continue;
-		}
-		if spec.first_page >= end {
-			break;
-		}
-		for global in start.max(spec.first_page)..end.min(spec_end) {
-			let offset = ((global - spec.first_page) * DELTA_PAGE_SIZE) as usize;
-			// SAFETY: `global` lies inside this region's page window, so both
+fn diff_bitmap_chunk(specs: &[RegionDiff], first_page: u64, total_pages: u64, bits: &mut [u8]) {
+	// Pages ascend, so the owning spec advances monotonically.
+	let mut spec_index = specs.partition_point(|spec| spec.first_page + spec.pages <= first_page);
+	for (byte_index, out) in bits.iter_mut().enumerate() {
+		let page0 = first_page + byte_index as u64 * 8;
+		let mut value = 0u8;
+		for bit in 0..8u32 {
+			let page = page0 + u64::from(bit);
+			if page >= total_pages {
+				break;
+			}
+			while spec_index < specs.len()
+				&& specs[spec_index].first_page + specs[spec_index].pages <= page
+			{
+				spec_index += 1;
+			}
+			let Some(spec) = specs.get(spec_index) else {
+				break;
+			};
+			let offset = ((page - spec.first_page) * DELTA_PAGE_SIZE) as usize;
+			// SAFETY: `page` lies inside this region's page window, so both
 			// pointers address one full mapped page; base is an immutable
 			// mapping and live RAM is quiesced (VM paused) for the dump.
 			let (base_page, live_page) = unsafe {
@@ -1446,10 +1432,10 @@ fn diff_page_range(specs: &[RegionDiff], start: u64, end: u64, bits: &mut [u8]) 
 				)
 			};
 			if base_page != live_page {
-				let rel = global - start;
-				bits[(rel / 8) as usize] |= 1 << (rel % 8);
+				value |= 1 << bit;
 			}
 		}
+		*out = value;
 	}
 }
 

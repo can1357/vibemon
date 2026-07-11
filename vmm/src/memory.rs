@@ -53,13 +53,15 @@ pub fn mark_dirty(mem: &GuestMemoryMmap, gpa: GuestAddress, len: usize) {
 
 /// True when `bytes` is all zero.
 ///
-/// Compares 64 KiB chunks against a static zero block (compiles to memcmp),
-/// so scans run at memory bandwidth even in unoptimized dev builds.
+/// After checking the first byte, compares each byte to its predecessor. Byte
+/// slice equality lowers to `memcmp`, and overlapping reads keep both inputs in
+/// the same cache lines.
 pub fn is_zero(bytes: &[u8]) -> bool {
-	static ZEROES: [u8; 65536] = [0; 65536];
-	bytes
-		.chunks(ZEROES.len())
-		.all(|chunk| chunk == &ZEROES[..chunk.len()])
+	match bytes {
+		[] => true,
+		[0, rest @ ..] => rest == &bytes[..bytes.len() - 1],
+		_ => false,
+	}
 }
 
 /// Clear every region's host-write bitmap (arming a fresh tracking window).
@@ -338,6 +340,21 @@ mod tests {
 		match result {
 			Ok(_) => panic!("operation unexpectedly succeeded"),
 			Err(e) => e.to_string(),
+		}
+	}
+
+	#[test]
+	fn is_zero_handles_empty_and_nonzero_positions() {
+		assert!(is_zero(&[]));
+		assert!(is_zero(&[0]));
+		assert!(!is_zero(&[1]));
+
+		let mut bytes = vec![0; 64 * 1024 + 1];
+		assert!(is_zero(&bytes));
+		for index in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+			bytes[index] = 1;
+			assert!(!is_zero(&bytes), "missed nonzero byte at {index}");
+			bytes[index] = 0;
 		}
 	}
 
