@@ -28,6 +28,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added application rollback support via `App.rollback` to revert to previous revisions
+- Added `egress` network policy options to `App.function` for granular outbound traffic control
+- Added `block_network` option to `App.function` to restrict sandbox network access
+- Added `local()` invocation support for stateful actor methods to execute on the host
+- Added `aclose()` methods to `Client`, `MeshDriver`, and `EndpointTransport` for cleanup
 - Added deterministic function image resolution and validation for `Registry`, `Dockerfile`, `Python`, and `Template` sources
 - Added build-time security validation for Dockerfiles, including forbidden directives and secret-masking
 - Added pinned artifact mounting for functions, ensuring reproducible build environments
@@ -152,6 +157,10 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated `App.function` decorators to accept and propagate network policy configurations
+- Standardized local actor method invocation and lifecycle hook ordering
+- Updated internal runner protocols to strictly validate I-JSON numeric types and object keys
+- Refined `RemoteObject` initialization to explicitly distinguish between local and service actors
 - Upgraded `StreamInputs` from client-streaming to bidirectional streaming
 - Updated durable function HTTP gateway to require `application/json` content type
 - Refactored `stream_inputs` to support bidirectional streaming and progress acknowledgments
@@ -211,6 +220,10 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed `BatchCall` to prevent silent discard of terminal cancellation events
+- Fixed durability of asynchronous task cancellation for remote function calls
+- Fixed application schedule registration to correctly pin function revisions
+- Fixed `MeshDriver` to correctly re-pin call owners when preferred endpoints change during execution
 - Resolved JSON decoding issues by rejecting non-finite numbers and duplicate object keys
 - Fixed race conditions in `vmon exec` stdin/stdout forwarding on TTY streams
 - Corrected `CreateCallRequest` payload handling for structured function arguments

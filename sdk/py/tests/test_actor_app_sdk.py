@@ -23,6 +23,7 @@ class FunctionStub:
         self.activate = None
         self.created_schedule = None
         self.deleted_schedule = None
+        self.rollback = None
 
     def ActivateApp(self, request):
         self.activate = request
@@ -37,6 +38,13 @@ class FunctionStub:
         revision = request.app.pinned.revision_id if request.app.HasField("pinned") else "current-r"
         return pb.AppRevision(ref=pb.AppRevisionRef(app=app, revision_id=revision))
 
+    def RollbackApp(self, request):
+        self.rollback = request
+        return pb.AppRevision(
+            ref=pb.AppRevisionRef(app=request.target.app, revision_id=request.target.revision_id),
+            previous=request.expected_current,
+        )
+
     def CreateSchedule(self, request):
         self.created_schedule = request
         return pb.ScheduleRecord(
@@ -49,14 +57,24 @@ class FunctionStub:
 
     def ListSchedules(self, request):
         return pb.ListSchedulesResponse(
-            schedules=[self.CreateSchedule(pb.CreateScheduleRequest(spec=pb.ScheduleSpec(
-                name="tick",
-                app=pb.AppRevisionRef(app=request.app, revision_id="app-r1"),
-                target=pb.ScheduleTarget(function=pb.RevisionRef(
-                    function=pb.FunctionRef(namespace="ns", name="worker"), revision_id="fn-r1"
-                ), input=pb.ValueEnvelope(inline_data=b"null")),
-                cron=pb.CronSchedule(expression="* * * * *", time_zone="UTC"),
-            )))],
+            schedules=[
+                self.CreateSchedule(
+                    pb.CreateScheduleRequest(
+                        spec=pb.ScheduleSpec(
+                            name="tick",
+                            app=pb.AppRevisionRef(app=request.app, revision_id="app-r1"),
+                            target=pb.ScheduleTarget(
+                                function=pb.RevisionRef(
+                                    function=pb.FunctionRef(namespace="ns", name="worker"),
+                                    revision_id="fn-r1",
+                                ),
+                                input=pb.ValueEnvelope(inline_data=b"null"),
+                            ),
+                            cron=pb.CronSchedule(expression="* * * * *", time_zone="UTC"),
+                        )
+                    )
+                )
+            ],
             next_page_token="next",
         )
 
@@ -70,9 +88,12 @@ class Definition:
         self.name = name
 
     def _resolve(self):
-        return pb.FunctionRevision(ref=pb.RevisionRef(
-            function=pb.FunctionRef(namespace="ns", name=self.name), revision_id=f"{self.name}-r1"
-        ))
+        return pb.FunctionRevision(
+            ref=pb.RevisionRef(
+                function=pb.FunctionRef(namespace="ns", name=self.name),
+                revision_id=f"{self.name}-r1",
+            )
+        )
 
 
 def test_app_free_definition_is_lazy_zero_deploy():
@@ -97,6 +118,7 @@ def test_app_function_delegates_the_typed_option_surface():
         scale_down_after=10,
         retries=3,
         execution_timeout=30,
+        egress=("10.0.0.0/8", "api.example.com"),
     )
     def work(value):
         return value
@@ -108,6 +130,14 @@ def test_app_function_delegates_the_typed_option_surface():
     assert work.options.workers.max_workers == 4
     assert work.options.retry.max_attempts == 4
     assert work.options.timeouts.execution == 30
+    assert work.options.resources.network.egress_cidrs == ("10.0.0.0/8",)
+    assert work.options.resources.network.egress_domains == ("api.example.com",)
+
+    @app.function(name="blocked", block_network=True)
+    def blocked(value):
+        return value
+
+    assert blocked.options.resources.network.block_network is True
 
 
 def test_app_activation_is_complete_atomic_and_lookup_can_be_pinned():
@@ -123,6 +153,10 @@ def test_app_activation_is_complete_atomic_and_lookup_can_be_pinned():
     assert [item.name for item in functions.activate.functions] == ["one", "two"]
     assert all(item.revision.revision_id.endswith("-r1") for item in functions.activate.functions)
     assert app.get("old-r").revision_id == "old-r"
+    rolled_back = app.rollback("old-r", expected_current=revision, request_id="rollback-1")
+    assert rolled_back.revision_id == "old-r"
+    assert functions.rollback.target.revision_id == "old-r"
+    assert functions.rollback.expected_current.revision_id == "app-r1"
 
 
 def test_app_schedule_uses_pinned_revisions_and_server_owned_rpc():
@@ -133,8 +167,13 @@ def test_app_schedule_uses_pinned_revisions_and_server_owned_rpc():
     revision = vmon.AppRevision(manifest, "app-r1")
 
     schedule = app.create_schedule(
-        "tick", "job", vmon.Cron("*/5 * * * *"), input={"x": 1}, app_revision=revision,
-        schedule_id="stable", request_id="request",
+        "tick",
+        "job",
+        vmon.Cron("*/5 * * * *"),
+        input={"x": 1},
+        app_revision=revision,
+        schedule_id="stable",
+        request_id="request",
     )
 
     request = functions.created_schedule
@@ -156,6 +195,7 @@ def test_definition_decorators_validate_compose_and_context_is_scoped():
 
     assert work.__vmon_options__.concurrency.max_concurrent_calls == 4
     assert work.__vmon_options__.batching.max_batch_size == 8
+
     @vmon.function
     @vmon.concurrent(3)
     def deployed(value):
@@ -206,7 +246,9 @@ class ActorsStub:
     def _record(self, actor_id, status=pb.ACTOR_STATUS_READY):
         return pb.ActorRecord(
             ref=pb.ActorRef(actor_id=actor_id),
-            function=pb.RevisionRef(function=pb.FunctionRef(namespace="ns", name="Counter"), revision_id="r1"),
+            function=pb.RevisionRef(
+                function=pb.FunctionRef(namespace="ns", name="Counter"), revision_id="r1"
+            ),
             status=status,
         )
 
@@ -221,8 +263,10 @@ class ActorsStub:
     def Checkpoint(self, request):
         self.calls.append(("checkpoint", request))
         return pb.ActorCheckpoint(
-            ref=pb.ActorCheckpointRef(checkpoint_id="checkpoint-1"), actor=request.actor,
-            sequence=4, created_at_unix_millis=5,
+            ref=pb.ActorCheckpointRef(checkpoint_id="checkpoint-1"),
+            actor=request.actor,
+            sequence=4,
+            created_at_unix_millis=5,
         )
 
     def Restore(self, request):
@@ -241,9 +285,11 @@ class FakeFunction:
         self.services = []
 
     def _resolve(self):
-        return pb.FunctionRevision(ref=pb.RevisionRef(
-            function=pb.FunctionRef(namespace="ns", name="Counter"), revision_id="r1"
-        ))
+        return pb.FunctionRevision(
+            ref=pb.RevisionRef(
+                function=pb.FunctionRef(namespace="ns", name="Counter"), revision_id="r1"
+            )
+        )
 
     def _spawn_actor(self, actor_id, method, args, kwargs):
         self.targets.append((actor_id, method, args, kwargs))
@@ -267,21 +313,26 @@ def _dummy(self):
 
 
 class Counter:
+    def __init__(self, start=0):
+        self.value = start
+        self.hooks = []
+
     @vmon.enter(snapshot=True)
     def before_snapshot(self):
-        pass
+        self.hooks.append("snapshot")
 
     @vmon.enter
     def initialize(self):
-        pass
+        self.hooks.append("initialize")
 
     @vmon.on_restore
     def restored(self):
-        pass
+        self.hooks.append("restore")
 
     @vmon.method
     def add(self, value):
-        return value
+        self.value += value
+        return self.value
 
 
 def test_actor_recovery_targets_lifecycle_and_service_distinction():
@@ -293,9 +344,7 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     assert actor.id == "actor-1"
     create_request = actors.calls[0][1]
     assert create_request.WhichOneof("initial_payload") == "initial_arguments"
-    assert vmon.decode_value(
-        value_from_proto(create_request.initial_arguments.positional[0])
-    ) == 1
+    assert vmon.decode_value(value_from_proto(create_request.initial_arguments.positional[0])) == 1
     assert definition.metadata.snapshot_enter == ("before_snapshot",)
     assert definition.metadata.enter == ("initialize",)
     assert definition.metadata.enter_order == (
@@ -305,8 +354,13 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     assert definition.metadata.restore == ("restored",)
     assert actor.add.remote(3) == 9
     assert function.targets == [("actor-1", "add", (3,), {})]
+    assert actor.add(3) == 4
+    assert actor.add.local(1) == 5
+    assert actor._local_instance.hooks == ["snapshot", "initialize"]
 
     recovered = definition.from_id("actor-1")
+    with pytest.raises(RuntimeError, match="constructor is intentionally not replayed"):
+        recovered.add.local(1)
     checkpoint = recovered.checkpoint()
     recovered.restore(checkpoint)
     fork = recovered.fork(checkpoint)
@@ -321,6 +375,8 @@ def test_actor_recovery_targets_lifecycle_and_service_distinction():
     different = scalable(5)
     with pytest.raises(TypeError):
         first.id
+    assert first.add(1) == 5
+    assert first._local_instance.hooks == ["snapshot", "initialize"]
     assert first.add.remote(6) == 11
     assert second.add.remote(7) == 11
     assert different.add.remote(8) == 11
@@ -349,9 +405,7 @@ def test_service_spawn_uses_native_typed_target_and_arguments():
         )
     )
 
-    handle = function._spawn_service(
-        "stable-key", (4,), {"start": True}, "add", (6,), {"step": 2}
-    )
+    handle = function._spawn_service("stable-key", (4,), {"start": True}, "add", (6,), {"step": 2})
 
     request = calls.request
     assert handle.id == "service-call"
@@ -359,18 +413,15 @@ def test_service_spawn_uses_native_typed_target_and_arguments():
     assert request.target.WhichOneof("receiver") == "service"
     assert request.target.service.service_key == "stable-key"
     assert request.target.service.method == "add"
-    assert vmon.decode_value(
-        value_from_proto(request.target.service.constructor.positional[0])
-    ) == 4
-    assert vmon.decode_value(
-        value_from_proto(request.target.service.constructor.named["start"])
-    ) is True
-    assert vmon.decode_value(
-        value_from_proto(request.inputs[0].arguments.positional[0])
-    ) == 6
-    assert vmon.decode_value(
-        value_from_proto(request.inputs[0].arguments.named["step"])
-    ) == 2
+    assert (
+        vmon.decode_value(value_from_proto(request.target.service.constructor.positional[0])) == 4
+    )
+    assert (
+        vmon.decode_value(value_from_proto(request.target.service.constructor.named["start"]))
+        is True
+    )
+    assert vmon.decode_value(value_from_proto(request.inputs[0].arguments.positional[0])) == 6
+    assert vmon.decode_value(value_from_proto(request.inputs[0].arguments.named["step"])) == 2
 
     function._spawn_actor("actor-7", "add", (9,), {"step": 3})
     actor_request = calls.request
@@ -378,9 +429,18 @@ def test_service_spawn_uses_native_typed_target_and_arguments():
     assert actor_request.target.WhichOneof("receiver") == "actor"
     assert actor_request.target.actor.actor.actor_id == "actor-7"
     assert actor_request.target.actor.method == "add"
-    assert vmon.decode_value(
-        value_from_proto(actor_request.inputs[0].arguments.positional[0])
-    ) == 9
+    assert vmon.decode_value(value_from_proto(actor_request.inputs[0].arguments.positional[0])) == 9
+
+
+def test_stopped_actor_remains_recoverable():
+    actors = ActorsStub()
+    actors.Get = lambda request: actors._record(request.actor_id, pb.ACTOR_STATUS_STOPPED)
+    client = SimpleNamespace(driver=Driver(SimpleNamespace(actors=actors)))
+    definition = vmon.RemoteClass(Counter, client=client, _function=FakeFunction(client))
+
+    stopped = definition.from_id("sleeping")
+
+    assert stopped.id == "sleeping"
 
 
 def test_actor_lost_is_explicit_not_constructor_replay():

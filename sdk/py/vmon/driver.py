@@ -322,11 +322,13 @@ class MeshDriver:
     ) -> tuple[T, str]:
         """Invoke one gRPC call, retrying only failures that did not reach a daemon."""
         return self._call(fn, endpoint=endpoint, stream=stream, trigger_refresh=True)
-    def aio_endpoint(self) -> tuple[Any, tuple[tuple[str, str], ...], float]:
-        """Return native async stubs, auth metadata, and the default deadline."""
-        transport = self._transport(self._preferred)
-        return transport.aio_stubs, transport.aio_metadata, self.timeout
 
+    def aio_endpoint(
+        self, endpoint: str | None = None
+    ) -> tuple[Any, tuple[tuple[str, str], ...], float]:
+        """Return native async stubs, auth metadata, and the default deadline."""
+        transport = self._transport(endpoint or self._preferred)
+        return transport.aio_stubs, transport.aio_metadata, self.timeout
 
     def _call[T](
         self,
@@ -533,6 +535,17 @@ class MeshDriver:
             self._transports.clear()
         for transport in transports:
             transport.close()
+
+    async def aclose(self) -> None:
+        """Close every transport and await native async channel shutdown."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            transports = list(self._transports.values())
+            self._transports.clear()
+        for transport in transports:
+            await transport.aclose()
 
     def _refresh_after_request(self, failed_over: bool) -> None:
         with self._lock:

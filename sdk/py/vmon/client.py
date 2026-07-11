@@ -161,6 +161,17 @@ class Client:
             self._closed = True
             self.driver.close()
 
+    async def aclose(self) -> None:
+        """Await native async transport shutdown idempotently."""
+        if self._closed:
+            return
+        self._closed = True
+        closer = getattr(self.driver, "aclose", None)
+        if closer is None:
+            self.driver.close()
+        else:
+            await closer()
+
     def __enter__(self) -> Client:
         return self
 

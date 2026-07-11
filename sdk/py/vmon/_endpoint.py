@@ -286,6 +286,9 @@ class GrpcStubs:
         self.artifacts = api_pb2_grpc.ArtifactServiceStub(channel)
         self.functions = api_pb2_grpc.FunctionServiceStub(channel)
         self.calls = api_pb2_grpc.CallServiceStub(channel)
+        self.actors = api_pb2_grpc.ActorServiceStub(channel)
+
+
 class GrpcAioStubs:
     """Native asynchronous service stubs sharing one grpc.aio channel."""
 
@@ -293,8 +296,7 @@ class GrpcAioStubs:
         self.artifacts = api_pb2_grpc.ArtifactServiceStub(channel)
         self.functions = api_pb2_grpc.FunctionServiceStub(channel)
         self.calls = api_pb2_grpc.CallServiceStub(channel)
-
-
+        self.actors = api_pb2_grpc.ActorServiceStub(channel)
 
 
 class EndpointTransport:
@@ -349,6 +351,15 @@ class EndpointTransport:
         if channel is not None:
             channel.close()
 
+    async def aclose(self) -> None:
+        """Close synchronous resources and await grpc.aio channel shutdown."""
+        channel = self._aio_channel
+        self._aio_channel = None
+        self._aio_stubs = None
+        self.close()
+        if channel is not None:
+            await channel.close()
+
     def __enter__(self) -> EndpointTransport:
         return self
 
@@ -389,6 +400,7 @@ class EndpointTransport:
                     grpc.intercept_channel(channel, _AuthInterceptor(self.token, self.timeout))
                 )
             return self._grpc_stubs
+
     @property
     def aio_stubs(self) -> GrpcAioStubs:
         """Return lazily-created native grpc.aio function-service stubs."""
@@ -414,7 +426,6 @@ class EndpointTransport:
     def aio_metadata(self) -> tuple[tuple[str, str], ...]:
         """Return authentication metadata for native asynchronous RPCs."""
         return (("authorization", f"Bearer {self.token}"),) if self.token else ()
-
 
     def request(
         self,

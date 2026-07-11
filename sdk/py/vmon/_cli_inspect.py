@@ -50,7 +50,9 @@ def _load(path: Path) -> ModuleType:
     return module
 
 
-def _definitions(module: ModuleType, selected: str | None) -> tuple[str, str, list[tuple[str, Any]]]:
+def _definitions(
+    module: ModuleType, selected: str | None
+) -> tuple[str, str, list[tuple[str, Any]]]:
     apps = [value for value in vars(module).values() if isinstance(value, App)]
     if selected:
         value: Any = module
@@ -84,7 +86,11 @@ def _inspect(definition: Any, root: Path) -> tuple[bytes, bytes]:
         namespace, name, options = definition.namespace, definition.name, definition.options
         mode = cast(Literal["package", "cloudpickle"], definition.package_mode)
         package_root = definition.package_root
-        include, exclude, local_packages = definition.include, definition.exclude, definition.local_packages
+        include, exclude, local_packages = (
+            definition.include,
+            definition.exclude,
+            definition.local_packages,
+        )
     else:
         function = definition
         namespace, name = "default", definition.__name__

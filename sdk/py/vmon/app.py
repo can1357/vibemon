@@ -92,7 +92,9 @@ class Period:
     anchor_unix_millis: int = 0
 
     def __post_init__(self) -> None:
-        seconds = self.seconds.total_seconds() if isinstance(self.seconds, timedelta) else self.seconds
+        seconds = (
+            self.seconds.total_seconds() if isinstance(self.seconds, timedelta) else self.seconds
+        )
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
             raise ValueError("period must be a positive number of seconds")
         if isinstance(self.anchor_unix_millis, bool) or self.anchor_unix_millis < 0:
@@ -162,6 +164,11 @@ class App:
         ha: HighAvailabilityPolicy | str | None = None,
         volumes: tuple[FunctionVolumeMount, ...] | None = None,
         network: NetworkPolicy | None = None,
+        egress: Iterable[str] | None = None,
+        block_network: bool | None = None,
+        egress_cidrs: Iterable[str] | None = None,
+        egress_domains: Iterable[str] | None = None,
+        inbound_cidrs: Iterable[str] | None = None,
         retries: RetryPolicy | int | None = None,
         startup_timeout: float | None = None,
         execution_timeout: float | None = None,
@@ -196,6 +203,11 @@ class App:
         ha: HighAvailabilityPolicy | str | None = None,
         volumes: tuple[FunctionVolumeMount, ...] | None = None,
         network: NetworkPolicy | None = None,
+        egress: Iterable[str] | None = None,
+        block_network: bool | None = None,
+        egress_cidrs: Iterable[str] | None = None,
+        egress_domains: Iterable[str] | None = None,
+        inbound_cidrs: Iterable[str] | None = None,
         retries: RetryPolicy | int | None = None,
         startup_timeout: float | None = None,
         execution_timeout: float | None = None,
@@ -232,6 +244,11 @@ class App:
                 ha=ha,
                 volumes=volumes,
                 network=network,
+                egress=egress,
+                block_network=block_network,
+                egress_cidrs=egress_cidrs,
+                egress_domains=egress_domains,
+                inbound_cidrs=inbound_cidrs,
                 retries=retries,
                 startup_timeout=startup_timeout,
                 execution_timeout=execution_timeout,
@@ -301,7 +318,11 @@ class App:
             ],
             request_id=request_id or str(uuid.uuid4()),
         )
-        expected = expected_current.revision_id if isinstance(expected_current, AppRevision) else expected_current
+        expected = (
+            expected_current.revision_id
+            if isinstance(expected_current, AppRevision)
+            else expected_current
+        )
         if expected:
             request.expected_current.CopyFrom(
                 api_pb2.AppRevisionRef(app=request.app, revision_id=expected)
@@ -324,6 +345,39 @@ class App:
         response, _ = selected.driver.call(
             lambda stubs: stubs.functions.GetApp(api_pb2.GetAppRequest(app=selector))
         )
+        return _app_revision(response)
+
+    def rollback(
+        self,
+        target: str | AppRevision,
+        *,
+        expected_current: str | AppRevision | None = None,
+        client: Any = None,
+        request_id: str | None = None,
+    ) -> AppRevision:
+        """Atomically restore a prior immutable application revision."""
+
+        selected = client or self.client
+        if selected is None:
+            raise ValueError("app rollback requires a client")
+        app_ref = api_pb2.AppRef(namespace=self.namespace, name=self.name)
+        target_id = target.revision_id if isinstance(target, AppRevision) else target
+        if not target_id:
+            raise ValueError("rollback target revision must be non-empty")
+        request = api_pb2.RollbackAppRequest(
+            target=api_pb2.AppRevisionRef(app=app_ref, revision_id=target_id),
+            request_id=request_id or str(uuid.uuid4()),
+        )
+        expected_id = (
+            expected_current.revision_id
+            if isinstance(expected_current, AppRevision)
+            else expected_current
+        )
+        if expected_id:
+            request.expected_current.CopyFrom(
+                api_pb2.AppRevisionRef(app=app_ref, revision_id=expected_id)
+            )
+        response, _ = selected.driver.call(lambda stubs: stubs.functions.RollbackApp(request))
         return _app_revision(response)
 
     def create_schedule(
@@ -491,7 +545,12 @@ def _binding(name: str, revision: Any) -> AppBinding:
 
 def _app_revision(value: Any) -> AppRevision:
     bindings = tuple(
-        AppBinding(item.name, item.revision.function.namespace, item.revision.function.name, item.revision.revision_id)
+        AppBinding(
+            item.name,
+            item.revision.function.namespace,
+            item.revision.function.name,
+            item.revision.revision_id,
+        )
         for item in value.functions
     )
     manifest = AppManifest(value.ref.app.namespace, value.ref.app.name, bindings)

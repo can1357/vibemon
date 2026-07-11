@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -26,9 +27,7 @@ def method(fn: Callable[..., R]) -> Callable[..., R]:
     return fn
 
 
-def enter(
-    fn: Callable[..., Any] | None = None, /, *, snapshot: bool = False
-) -> Callable[..., Any]:
+def enter(fn: Callable[..., Any] | None = None, /, *, snapshot: bool = False) -> Callable[..., Any]:
     """Declare an ordered initialization hook.
 
     ``snapshot=True`` marks the hook as running before a reusable worker
@@ -108,7 +107,9 @@ class RemoteClass:
         self.lifecycle = "service" if service else "actor"
         members = tuple(vars(user_cls).items())
         self.metadata = LifecycleMetadata(
-            methods=tuple(name for name, value in members if getattr(value, "__vmon_method__", False)),
+            methods=tuple(
+                name for name, value in members if getattr(value, "__vmon_method__", False)
+            ),
             enter_order=tuple(
                 (name, bool(getattr(value, "__vmon_snapshot_enter__", False)))
                 for name, value in members
@@ -126,7 +127,9 @@ class RemoteClass:
                 if getattr(value, "__vmon_enter__", False)
                 and getattr(value, "__vmon_snapshot_enter__", False)
             ),
-            restore=tuple(name for name, value in members if getattr(value, "__vmon_restore__", False)),
+            restore=tuple(
+                name for name, value in members if getattr(value, "__vmon_restore__", False)
+            ),
             exit=tuple(name for name, value in members if getattr(value, "__vmon_exit__", False)),
             snapshot_after_initialize=bool(snapshot_after_initialize),
             snapshot_on_worker_retire=bool(snapshot_on_worker_retire),
@@ -163,7 +166,7 @@ class RemoteClass:
         self, *args: Any, labels: Mapping[str, str] | None = None, **kwargs: Any
     ) -> "RemoteObject":
         if self.lifecycle == "service":
-            return RemoteObject(self, None, service_init=(args, kwargs))
+            return RemoteObject(self, None, local_init=(args, kwargs), service=True)
         client = self._bound_client()
         revision = self._function._resolve().ref
         request = api_pb2.CreateActorRequest(
@@ -183,7 +186,7 @@ class RemoteClass:
                 )
             )
         record, _ = client.driver.call(lambda stubs: stubs.actors.Create(request))
-        return RemoteObject(self, record.ref.actor_id, record=record)
+        return RemoteObject(self, record.ref.actor_id, record=record, local_init=(args, kwargs))
 
     def from_id(self, actor_id: str) -> "RemoteObject":
         """Reconnect to an existing durable actor without replaying construction."""
@@ -238,19 +241,23 @@ class RemoteObject:
         actor_id: str | None,
         *,
         record: Any = None,
-        service_init: tuple[tuple[Any, ...], Mapping[str, Any]] | None = None,
+        local_init: tuple[tuple[Any, ...], Mapping[str, Any]] | None = None,
+        service: bool = False,
     ) -> None:
         self._remote_cls = remote_cls
         self._actor_id = actor_id
         self._cached_record = record
-        self._service_init = service_init
+        self._local_init = local_init
+        self._local_instance: Any = None
+        self._local_lock = threading.Lock()
+        self._service_init = local_init if service else None
         self._service_key = (
             encode_value(
-                {"args": service_init[0], "kwargs": dict(service_init[1])},
+                {"args": local_init[0], "kwargs": dict(local_init[1])},
                 codec=remote_cls.options.serializer.input_serializer,
                 compression="none",
             ).sha256
-            if service_init is not None
+            if service and local_init is not None
             else None
         )
 
@@ -266,6 +273,21 @@ class RemoteObject:
         if name in self._remote_cls.metadata.methods:
             return _BoundRemoteMethod(self, name)
         raise AttributeError(f"{name!r} is not decorated with @vmon.method")
+
+    def _local_target(self, name: str) -> Callable[..., Any]:
+        if self._local_init is None:
+            raise RuntimeError(
+                "local execution is unavailable for a recovered actor because "
+                "its constructor is intentionally not replayed"
+            )
+        with self._local_lock:
+            if self._local_instance is None:
+                args, kwargs = self._local_init
+                instance = self._remote_cls._cls(*args, **dict(kwargs))
+                for hook_name, _snapshot in self._remote_cls.metadata.enter_order:
+                    getattr(instance, hook_name)()
+                self._local_instance = instance
+        return getattr(self._local_instance, name)
 
     def checkpoint(self, *, request_id: str | None = None) -> ActorCheckpoint:
         """Capture and return an immutable actor recovery point."""
@@ -345,7 +367,6 @@ class RemoteObject:
 
     def _ensure_alive(self, record: Any) -> None:
         statuses = {
-            api_pb2.ACTOR_STATUS_STOPPED: "stopped",
             api_pb2.ACTOR_STATUS_FAILED: "failed",
             api_pb2.ACTOR_STATUS_DELETED: "deleted",
         }
@@ -360,6 +381,11 @@ class _BoundRemoteMethod(Generic[R]):
     def __init__(self, obj: RemoteObject, name: str) -> None:
         self._obj = obj
         self._name = name
+
+    def local(self, *args: Any, **kwargs: Any) -> R:
+        """Invoke this method on the lazily constructed local instance."""
+
+        return self._obj._local_target(self._name)(*args, **kwargs)
 
     def spawn(self, *args: Any, **kwargs: Any) -> FunctionCall[R]:
         """Create a durable serialized method call."""
@@ -392,7 +418,9 @@ class _BoundRemoteMethod(Generic[R]):
         return self.spawn(*args, **kwargs).get()
 
     def __call__(self, *args: Any, **kwargs: Any) -> R:
-        return self.remote(*args, **kwargs)
+        """Invoke locally; use :meth:`remote` for durable server execution."""
+
+        return self.local(*args, **kwargs)
 
 
 @overload
@@ -427,5 +455,3 @@ def service(cls_: type | None = None, /, **kwargs: Any) -> Any:
         return RemoteClass(inner, service=True, **kwargs)
 
     return decorate(cls_) if cls_ is not None else decorate
-
-

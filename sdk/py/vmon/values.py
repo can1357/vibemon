@@ -16,6 +16,7 @@ JSON_SAFE_INTEGER_MAX = 2**53 - 1
 class ValueErrorBase(ValueError):
     pass
 
+
 class JSONProfileError(ValueErrorBase):
     pass
 
@@ -110,7 +111,7 @@ def encode_value(
     if codec == "auto":
         try:
             raw = _encode_json(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             chosen = ValueCodec.CBOR
             raw = _encode_cbor(value)
         else:

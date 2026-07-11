@@ -150,8 +150,12 @@ def test_canonical_definition_digest_covers_code_lock_image_and_every_policy():
         replace(options, image=options.image.apt_install("git")).canonical_digest(b"code-v1"),
         replace(options, retry=RetryPolicy(max_attempts=2)).canonical_digest(b"code-v1"),
         replace(options, timeouts=TimeoutPolicy(graceful_shutdown=31)).canonical_digest(b"code-v1"),
-        replace(options, workers=WorkerPolicy(max_workers=2, buffer_workers=1)).canonical_digest(b"code-v1"),
-        replace(options, concurrency=ConcurrencyPolicy(max_concurrent_calls=2)).canonical_digest(b"code-v1"),
+        replace(options, workers=WorkerPolicy(max_workers=2, buffer_workers=1)).canonical_digest(
+            b"code-v1"
+        ),
+        replace(options, concurrency=ConcurrencyPolicy(max_concurrent_calls=2)).canonical_digest(
+            b"code-v1"
+        ),
         replace(
             options,
             batching=BatchingPolicy(enabled=True, max_batch_size=2, max_wait=0.1),
@@ -168,8 +172,6 @@ def test_canonical_definition_digest_covers_code_lock_image_and_every_policy():
             ),
         ).canonical_digest(b"code-v1"),
     ]
-    assert baseline == options.canonical_digest(
-        b"code-v1", lockfiles={"uv.lock": b"lock-v1"}
-    )
+    assert baseline == options.canonical_digest(b"code-v1", lockfiles={"uv.lock": b"lock-v1"})
     assert len(set(variants)) == len(variants)
     assert baseline not in variants

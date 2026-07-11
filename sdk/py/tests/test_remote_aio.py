@@ -38,14 +38,16 @@ class _Driver:
         return self.stubs, (), 1.0
 
 
-@pytest.mark.asyncio
-async def test_native_aio_task_cancellation_is_durably_forwarded() -> None:
-    calls = _Calls()
-    client = SimpleNamespace(driver=_Driver(calls))
-    handle = _AsyncCall(FunctionCall("call-aio", client))
-    task = asyncio.create_task(handle.get())
-    await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert calls.cancelled.is_set()
+def test_native_aio_task_cancellation_is_durably_forwarded() -> None:
+    async def scenario() -> None:
+        calls = _Calls()
+        client = SimpleNamespace(driver=_Driver(calls))
+        handle = _AsyncCall(FunctionCall("call-aio", client))
+        task = asyncio.create_task(handle.get())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls.cancelled.is_set()
+
+    asyncio.run(scenario())

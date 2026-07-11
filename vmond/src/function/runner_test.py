@@ -1,5 +1,7 @@
 """Focused subprocess smoke test for the protocol-v2 guest runner."""
 import base64
+import cbor2
+import cloudpickle
 import hashlib
 import io
 import json
@@ -8,11 +10,13 @@ import selectors
 import subprocess
 import sys
 import socket
+import pickle
 import tempfile
 import textwrap
 import time
 import unittest
 import zipfile
+import zstandard
 from pathlib import Path
 
 RUNNER = Path(__file__).with_name("runner.py")
@@ -28,6 +32,38 @@ def envelope(value):
         "sha256": hashlib.sha256(raw).hexdigest(),
         "inline_data": base64.b64encode(raw).decode(),
     }
+def raw_json_envelope(raw):
+    if isinstance(raw, str):
+        raw = raw.encode()
+    return {
+        "format": "json", "version": 1, "compression": "none",
+        "uncompressed_size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        "inline_data": base64.b64encode(raw).decode(),
+    }
+
+
+def binary_envelope(data, value_format, **metadata):
+    result = {
+        "format": value_format, "version": 1, "compression": "none",
+        "uncompressed_size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+        "inline_data": base64.b64encode(data).decode(),
+    }
+    result.update(metadata)
+    return result
+
+
+class CloudValue:
+    def __init__(self, value):
+        self.value = value
+
+
+class EvilReducer:
+    marker = ""
+
+    def __reduce__(self):
+        return os.system, ("touch %s" % self.marker,)
+
+
 
 
 class Client:
@@ -78,7 +114,7 @@ class RunnerSmokeTest(unittest.TestCase):
             @vmon.function()
             def unary(value):
                 assert vmon.is_remote()
-                assert vmon.current_call()["call_id"] == "call-unary"
+                assert vmon.current_call().call_id == "call-unary"
                 print("user-log")
                 return value + 1
 
@@ -93,7 +129,11 @@ class RunnerSmokeTest(unittest.TestCase):
 
             async def context_call(delay):
                 await asyncio.sleep(delay)
-                return vmon.current_call()
+                call = vmon.current_call()
+                return {
+                    "call_id": call.call_id, "function_id": call.function_id,
+                    "input_id": call.input_id, "input_index": call.input_index,
+                }
 
             def generate(value):
                 for index in range(value):
@@ -105,9 +145,27 @@ class RunnerSmokeTest(unittest.TestCase):
             def big_generate():
                 yield "y" * 600000
 
+
+            def batch_values(values):
+                return [value * 2 for value in values]
+
+            def bad_batch(values):
+                return values[:-1]
             def fail(message):
                 raise ValueError(message)
 
+
+            async def suppress_cancel():
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    return "ignored cancellation"
+
+            def sync_wait():
+                time.sleep(0.2)
+                return "late success"
+            def capture(*args, **kwargs):
+                return {"args": list(args), "kwargs": kwargs}
             async def wait():
                 await asyncio.sleep(30)
 
@@ -116,35 +174,92 @@ class RunnerSmokeTest(unittest.TestCase):
                 def __init__(self, value=0):
                     self.value = value
                     self.restores = 0
+                    self.secret = None
 
-                @vmon.enter()
+                @vmon.enter
                 def entered(self):
                     self.enters = getattr(self, "enters", 0) + 1
 
+                @vmon.method
                 def lifecycle_counts(self):
                     return [self.enters, self.restores]
 
-                def add(self, amount):
-                    self.value += amount
+                @vmon.method
+                def add(self, amount=0, *, bonus=0):
+                    self.value += amount + bonus
                     return self.value
 
+                @vmon.method
                 def get(self):
                     return self.value
 
+                @vmon.method
                 def fill(self):
                     self.blob = "z" * 600000
-                    self.secret = "actor-secret"
                     return len(self.blob)
-                @vmon.before_snapshot()
+
+                @vmon.method
+                def set_secret(self):
+                    self.secret = "actor-secret"
+                    return True
+
+                @vmon.method
+                def clear_secret(self):
+                    self.secret = None
+                    return self.value
+
+                @vmon.method
+                def has_secret(self):
+                    return self.secret == "actor-secret"
+
+                @vmon.method
+                def unavailable(self):
+                    raise RuntimeError("database unavailable")
+
+                @vmon.enter(snapshot=True)
                 def prepare(self):
                     self.prepared = True
 
-                @vmon.after_restore()
+                @vmon.on_restore
                 def restored(self):
                     self.restores += 1
+                    self.secret = None
+
+            @vmon.service()
+            class StatefulService:
+                def __init__(self, base=0, *, exit_path=""):
+                    self.value = base
+                    self.exit_path = exit_path
+
+                @vmon.enter
+                def start(self):
+                    self.value += 1
+
+                @vmon.method
+                def add(self, amount=0, *, bonus=0):
+                    self.value += amount + bonus
+                    return self.value
+
+                @vmon.method
+                async def async_add(self, amount):
+                    await asyncio.sleep(0)
+                    self.value += amount
+                    return self.value
+
+                @vmon.method
+                def fail(self):
+                    raise RuntimeError("service failure")
+
+                @vmon.exit
+                def stop(self):
+                    if self.exit_path:
+                        with open(self.exit_path, "a", encoding="utf-8") as output:
+                            output.write("exit\\n")
         """), encoding="utf-8")
         environment = os.environ.copy()
         environment["VMON_RUNNER_SPILL_ROOT"] = str(root / "spills")
+        environment["VMON_RUNNER_MAX_VALUE_BYTES"] = str(2 * 1024 * 1024)
+        environment["VMON_RUNNER_MAX_PENDING_TASKS"] = "9"
         self.function_root = root / "function-root"
         self.function_root.mkdir()
         self.function_root = self.function_root.resolve()
@@ -188,14 +303,19 @@ class RunnerSmokeTest(unittest.TestCase):
     def test_protocol_functions_and_durable_actors(self):
         expected_kinds = {
             "unary": "sync", "native": "sync", "async": "async", "context": "async",
-            "gen": "generator", "big": "sync", "biggen": "generator",
-            "wait": "async", "counter": "sync",
+            "capture": "sync", "batch": "sync", "bad-batch": "sync",
+            "suppress": "async", "sync-wait": "sync", "gen": "generator",
+            "big": "sync", "biggen": "generator", "wait": "async",
+            "counter": "sync", "service": "sync",
         }
         for name, target in (("unary", "unary"), ("native", "native_log"),
                              ("async", "async_call"), ("context", "context_call"),
-                             ("gen", "generate"), ("big", "big"),
-                             ("biggen", "big_generate"), ("wait", "wait"),
-                             ("counter", "Counter")):
+                             ("capture", "capture"), ("batch", "batch_values"),
+                             ("bad-batch", "bad_batch"), ("suppress", "suppress_cancel"),
+                             ("sync-wait", "sync_wait"), ("gen", "generate"),
+                             ("big", "big"), ("biggen", "big_generate"),
+                             ("wait", "wait"), ("counter", "Counter"),
+                             ("service", "StatefulService")):
             status = self.define(name, target,
                                  {"ACTOR_SECRET": "actor-secret"} if name == "counter" else None)
             self.assertEqual(status["callable_kind"], expected_kinds[name])
@@ -246,7 +366,6 @@ class RunnerSmokeTest(unittest.TestCase):
             "target": "archived:call"}})
         linked = self.client.until("define-symlink")[-1]
         self.assertEqual(linked["type"], "error")
-
         unary = self.call("unary", "unary", [4])
         self.assertTrue(any(item.get("type") == "log" and item.get("message") == "user-log"
                             for item in unary))
@@ -255,10 +374,61 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertEqual(unary[-1]["parent_call_id"], "parent")
         self.assertEqual(unary[-1]["value"]["format"], "json")
         native = self.call("native", "native")
-        self.assertTrue(any(item.get("type") == "log" and item.get("message") == "native-log"
-                            for item in native))
+        native_log = next(item for item in native
+                          if item.get("type") == "log" and item.get("message") == "native-log")
+        self.assertEqual(native_log["request_id"], "native")
+        self.assertEqual(native_log["call_id"], "call-native")
+
+        def invoke_capture(request_id, **payload):
+            frame = {"type": "call", "request_id": request_id,
+                     "call_id": "call-" + request_id, "definition_id": "capture"}
+            frame.update(payload)
+            self.client.send(frame)
+            response = self.client.until(request_id)[-1]
+            self.assertEqual(response["type"], "result", response)
+            return json.loads(base64.b64decode(response["value"]["inline_data"]))
+
+        self.assertEqual(invoke_capture(
+            "tag-zero", input=envelope(
+                {"__vmon_python_call__": 1, "args": [], "kwargs": {}})),
+            {"args": [], "kwargs": {}})
+        self.assertEqual(invoke_capture(
+            "tag-mixed", input=envelope(
+                {"__vmon_python_call__": 1, "args": [1, 2], "kwargs": {"named": 3}})),
+            {"args": [1, 2], "kwargs": {"named": 3}})
+        collision = {"args": [1], "kwargs": {"x": 2}}
+        self.assertEqual(invoke_capture("untagged-dict", input=envelope(collision)),
+                         {"args": [collision], "kwargs": {}})
+        self.assertEqual(invoke_capture(
+            "native-arguments", positional=[envelope(4), envelope({"map": True})],
+            named={"flag": envelope("yes")}),
+            {"args": [4, {"map": True}], "kwargs": {"flag": "yes"}})
 
         self.assertEqual(self.call("async", "async", [3])[-1]["type"], "result")
+
+        safe_integer = (1 << 53) - 1
+        self.assertEqual(
+            invoke_capture("ijson-safe", input=envelope(safe_integer))["args"],
+            [safe_integer])
+        self.client.send({"type": "call", "request_id": "ijson-unsafe",
+                          "call_id": "ijson-unsafe", "definition_id": "capture",
+                          "input": envelope(1 << 53)})
+        unsafe_result = self.client.until("ijson-unsafe")[-1]
+        self.assertEqual(unsafe_result["error"]["code"], "serialization_error")
+        for request_id, raw in (
+                ("ijson-duplicate", '{"x":1,"x":2}'),
+                ("ijson-nonfinite", '{"x":NaN}')):
+            self.client.send({"type": "call", "request_id": request_id,
+                              "call_id": request_id, "definition_id": "capture",
+                              "input": raw_json_envelope(raw)})
+            invalid = self.client.until(request_id)[-1]
+            self.assertEqual(invalid["error"]["code"], "serialization_error")
+        self.client.send({"type": "call", "request_id": "ijson-output",
+                          "call_id": "call-unary", "definition_id": "unary",
+                          "args": envelope([safe_integer])})
+        unsafe_output = self.client.until("ijson-output")[-1]
+        self.assertEqual(unsafe_output["type"], "error", unsafe_output)
+        self.assertEqual(unsafe_output["error"]["code"], "serialization_error")
 
         concurrent_frames = (
             {"type": "call", "request_id": "context-1", "call_id": "call-one",
@@ -292,6 +462,29 @@ class RunnerSmokeTest(unittest.TestCase):
                              ("one" if index == 1 else "two"))
         generated = self.call("gen", "gen", [3], execution_mode="generator")
         self.assertEqual([item["index"] for item in generated if item["type"] == "yield"], [0, 1, 2])
+
+        batch_inputs = [
+            {"request_id": "batch-item-%d" % index, "function_id": "batch",
+             "call_id": "batch-call-%d" % index, "input_id": "batch-input-%d" % index,
+             "input_index": index, "attempt": 1, "input": envelope(index)}
+            for index in range(3)
+        ]
+        self.client.send({"type": "batch", "request_id": "batch-request",
+                          "definition_id": "batch", "revision": "r1",
+                          "inputs": batch_inputs})
+        batch_result = self.client.until(
+            "batch-request", terminal=("batch_result", "error"))[-1]
+        self.assertEqual(batch_result["type"], "batch_result")
+        self.assertEqual([item["input_index"] for item in batch_result["results"]], [0, 1, 2])
+        self.assertEqual([
+            json.loads(base64.b64decode(item["value"]["inline_data"]))
+            for item in batch_result["results"]], [0, 2, 4])
+        self.client.send({"type": "batch", "request_id": "bad-batch-request",
+                          "definition_id": "bad-batch", "revision": "r1",
+                          "inputs": batch_inputs})
+        bad_batch = self.client.until("bad-batch-request")[-1]
+        self.assertEqual(bad_batch["type"], "error")
+        self.assertIn("cardinality", bad_batch["error"]["message"])
 
         def consume_spill(value, expected_character):
             self.assertNotIn("inline_data", value)
@@ -329,11 +522,29 @@ class RunnerSmokeTest(unittest.TestCase):
         self.client.send({"type": "cancel", "request_id": "cancel-command",
                           "target_request_id": "cancel"})
         self.assertEqual(self.client.until("cancel")[-1]["type"], "cancelled")
+        self.client.send({"type": "call", "request_id": "suppress",
+                          "call_id": "call-suppress", "definition_id": "suppress",
+                          "args": envelope([])})
+        self.client.send({"type": "cancel", "request_id": "cancel-suppress",
+                          "target_request_id": "suppress"})
+        suppressed = self.client.until("suppress")[-1]
+        self.assertEqual(suppressed["type"], "cancelled")
+        self.assertFalse(suppressed["worker_kill_required"])
+        sync_deadline = self.call(
+            "sync-deadline", "sync-wait",
+            deadline_unix_ms=int(time.time() * 1000) + 20)[-1]
+        self.assertEqual(sync_deadline["type"], "cancelled")
+        self.assertTrue(sync_deadline["worker_kill_required"])
         queued_ids = ["queued-%d" % index for index in range(9)]
         for queued_id in queued_ids:
             self.client.send({"type": "call", "request_id": queued_id,
                               "call_id": "call-" + queued_id, "input_id": queued_id,
                               "definition_id": "wait", "args": envelope([])})
+        self.client.send({"type": "call", "request_id": "overflow",
+                          "call_id": "call-overflow", "input_id": "overflow",
+                          "definition_id": "wait", "args": envelope([])})
+        overflow = self.client.until("overflow")[-1]
+        self.assertEqual(overflow["error"]["code"], "runner_overloaded")
         self.client.send({"type": "cancel", "request_id": "cancel-queued",
                           "target_request_id": queued_ids[-1]})
         queued_cancel = self.client.until(queued_ids[-1])[-1]
@@ -355,10 +566,20 @@ class RunnerSmokeTest(unittest.TestCase):
             return self.client.until(request)[-1]
         created_counts = actor("created-counts", "actor_call",
                                method="lifecycle_counts", args=envelope([]))
+        self.assertIn("value", created_counts, created_counts)
         self.assertEqual(json.loads(base64.b64decode(
             created_counts["value"]["inline_data"])), [1, 0])
 
-        actor("add5", "actor_call", method="add", args=envelope([5]))
+        actor("add5", "actor_call", method="add",
+              positional=[envelope(2)], named={"bonus": envelope(3)})
+        unavailable = actor("unavailable", "actor_call", method="unavailable",
+                            positional=[], named={})
+        self.assertEqual(unavailable["error"]["type"], "RuntimeError")
+        self.assertNotEqual(unavailable["error"].get("code"), "actor_lost")
+        still_alive = actor("still-alive", "actor_call", method="get",
+                            positional=[], named={})
+        self.assertEqual(json.loads(base64.b64decode(
+            still_alive["value"]["inline_data"])), 6)
         checkpoint = actor("checkpoint", "actor_checkpoint", checkpoint_id="cp")
         self.assertEqual(checkpoint["value"]["format"], "cloudpickle")
         actor("fill", "actor_call", method="fill", args=envelope([]))
@@ -372,6 +593,16 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertNotIn(b"actor-secret", checkpoint_bytes)
         os.remove(checkpoint_path)
         actor("big-restore", "actor_restore", checkpoint_id="big-cp")
+        actor("set-secret", "actor_call", method="set_secret", positional=[], named={})
+        secret_checkpoint = actor(
+            "secret-checkpoint", "actor_checkpoint", checkpoint_id="secret-cp")
+        self.assertEqual(secret_checkpoint["error"]["code"], "checkpoint_contains_secret")
+        self.assertNotIn("actor-secret", json.dumps(secret_checkpoint))
+        has_secret = actor("has-secret", "actor_call", method="has_secret",
+                           positional=[], named={})
+        self.assertTrue(json.loads(base64.b64decode(
+            has_secret["value"]["inline_data"])))
+        actor("clear-secret", "actor_call", method="clear_secret", positional=[], named={})
         actor("add2", "actor_call", method="add", args=envelope([2]))
         actor("restore", "actor_restore", checkpoint_id="cp")
         actor("fork", "actor_fork", child_actor_id="b")
@@ -388,6 +619,58 @@ class RunnerSmokeTest(unittest.TestCase):
         self.assertEqual(json.loads(base64.b64decode(
             child_counts["value"]["inline_data"])), [1, 2])
 
+        exit_path = str(Path(self.root) / "service-exits.txt")
+
+        def service(request, key, method, constructor=None, positional=None, named=None):
+            frame = {
+                "type": "service_call", "request_id": request,
+                "call_id": "service-" + request, "definition_id": "service",
+                "revision": "r1", "service_key": key, "method": method,
+                "constructor": constructor or {}, "positional": positional or [],
+                "named": named or {},
+            }
+            self.client.send(frame)
+            return self.client.until(request)[-1]
+
+        constructor = {
+            "positional": [envelope(10)],
+            "named": {"exit_path": envelope(exit_path)},
+        }
+        first_service = service(
+            "service-first", "key-one", "add", constructor,
+            [envelope(2)], {"bonus": envelope(3)})
+        self.assertEqual(json.loads(base64.b64decode(
+            first_service["value"]["inline_data"])), 16)
+        second_service = service(
+            "service-async", "key-one", "async_add", constructor,
+            [envelope(4)], {})
+        self.assertEqual(json.loads(base64.b64decode(
+            second_service["value"]["inline_data"])), 20)
+        independent = service(
+            "service-independent", "key-two", "add",
+            {"positional": [envelope(0)], "named": {"exit_path": envelope(exit_path)}},
+            [envelope(1)], {})
+        self.assertEqual(json.loads(base64.b64decode(
+            independent["value"]["inline_data"])), 2)
+        failed_service = service(
+            "service-fail", "key-one", "fail", constructor, [], {})
+        self.assertEqual(failed_service["error"]["type"], "RuntimeError")
+        recreated = service(
+            "service-recreated", "key-one", "add", constructor, [envelope(1)], {})
+        self.assertEqual(json.loads(base64.b64decode(
+            recreated["value"]["inline_data"])), 12)
+
+
+        self.client.send({"type": "before_snapshot", "request_id": "secret-snapshot",
+                          "call_id": "secret-snapshot", "input_id": "lifecycle",
+                          "attempt": 1, "parent_call_id": None})
+        secret_snapshot = self.client.until(
+            "secret-snapshot", terminal=("status", "error"))[-1]
+        self.assertEqual(secret_snapshot["error"]["code"],
+                         "snapshot_with_secrets_unsupported")
+        self.define("counter", "Counter", {})
+        self.define("fail", "fail", {})
+
         self.client.send({"type": "before_snapshot", "request_id": "before",
                           "call_id": "lifecycle-before", "input_id": "lifecycle",
                           "attempt": 1, "parent_call_id": None})
@@ -403,6 +686,8 @@ class RunnerSmokeTest(unittest.TestCase):
         self.process.stdin.close()
         self.process.wait(timeout=5)
         self.assertEqual(self.process.returncode, 0, self.process.stderr.read())
+        exits = Path(exit_path).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(exits, ["exit", "exit", "exit"])
 
 
 class SocketReconnectTest(unittest.TestCase):
@@ -410,12 +695,15 @@ class SocketReconnectTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "actor_module.py").write_text(textwrap.dedent("""
+                import vmon
                 class Counter:
                     def __init__(self):
                         self.value = 0
+                    @vmon.method
                     def add(self, amount):
                         self.value += amount
                         return self.value
+                    @vmon.method
                     def get(self):
                         return self.value
             """), encoding="utf-8")

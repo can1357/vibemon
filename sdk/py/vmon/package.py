@@ -95,7 +95,9 @@ class PackageArtifact:
     codec: Literal["zip"] = "zip"
 
     def resolve(self) -> object:
-        return resolve_qualname(importlib.import_module(self.manifest.module), self.manifest.qualname)
+        return resolve_qualname(
+            importlib.import_module(self.manifest.module), self.manifest.qualname
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +141,9 @@ def resolve_qualname(module: ModuleType, qualname: str) -> object:
     return value
 
 
-def inspect_manifest(archive: bytes | bytearray | memoryview | str | os.PathLike[str]) -> PackageManifest:
+def inspect_manifest(
+    archive: bytes | bytearray | memoryview | str | os.PathLike[str],
+) -> PackageManifest:
     """Read and validate the embedded manifest from package ZIP bytes or a path."""
     if isinstance(archive, (bytes, bytearray, memoryview)):
         source: io.BytesIO | str | os.PathLike[str] = io.BytesIO(bytes(archive))
@@ -225,7 +229,9 @@ def package_callable(
     module_file = getattr(module, "__file__", None)
     if module_file is None:
         raise PackageError(f"module {module_name!r} has no filesystem source")
-    package_root = Path(root).resolve() if root is not None else _module_root(Path(module_file), module_name)
+    package_root = (
+        Path(root).resolve() if root is not None else _module_root(Path(module_file), module_name)
+    )
     return build_package(
         package_root,
         module=module_name,

@@ -81,7 +81,11 @@ class Image:
         project: str | os.PathLike[str] = ".",
         groups: tuple[str, ...] = (),
     ) -> Self:
-        values = (os.fspath(project), "frozen" if frozen else "unlocked", *_strings(groups, "group"))
+        values = (
+            os.fspath(project),
+            "frozen" if frozen else "unlocked",
+            *_strings(groups, "group"),
+        )
         return self._step("uv_sync", values)
 
     def uv_install(self, *packages: str) -> Self:
@@ -135,16 +139,12 @@ class Image:
                 "kind": self.source.kind,
                 "value": self.source.value,
             },
-            "steps": [
-                {"kind": step.kind, "values": list(step.values)} for step in self.steps
-            ],
+            "steps": [{"kind": step.kind, "values": list(step.values)} for step in self.steps],
         }
 
     @property
     def digest(self) -> str:
-        encoded = json.dumps(
-            self.canonical_dict(), sort_keys=True, separators=(",", ":")
-        ).encode()
+        encoded = json.dumps(self.canonical_dict(), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
 
     def _step(self, kind: ImageStepKind, values: tuple[str, ...]) -> Self:
