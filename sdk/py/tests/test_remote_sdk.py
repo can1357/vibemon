@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 import vmon.remote as remote_module
-from vmon.errors import APIError, RemoteFunctionError
 from vmon._function_proto import artifact_ref, package_to_proto, value_from_proto, value_to_proto
+from vmon.errors import APIError, RemoteFunctionError
 from vmon.package import package_callable
 from vmon.remote import BatchCall, FunctionCall, RemoteFunction, _invocation, function
 from vmon.v1 import api_pb2
@@ -336,3 +336,89 @@ def test_ordered_batch_return_exceptions_is_per_item_and_then_exhausts() -> None
     assert isinstance(values[0], RemoteFunctionError)
     assert values[0].code == "invalid"
     assert values[1] == 7
+
+
+def test_unordered_batch_keeps_durable_completion_sequence() -> None:
+    class Calls:
+        def GetResult(self, request):
+            raise AssertionError("unordered iteration must not poll by input index")
+
+        def ListResults(self, request):
+            results = []
+            for sequence, input_index in ((1, 2), (2, 0)):
+                envelope = encode_value(input_index, codec=ValueCodec.JSON, compress=False)
+                results.append(
+                    api_pb2.CallResult(
+                        call=request.cursor.call,
+                        sequence=sequence,
+                        input_id=f"input-{input_index}",
+                        input_index=input_index,
+                        value=value_to_proto(envelope),
+                    )
+                )
+            return api_pb2.ListCallResultsResponse(
+                results=results,
+                next_cursor=api_pb2.ResultCursor(
+                    call=request.cursor.call,
+                    after_sequence=2,
+                ),
+                end=True,
+            )
+
+        def Get(self, request):
+            return api_pb2.CallRecord(
+                ref=request,
+                status=api_pb2.CALL_STATUS_SUCCEEDED,
+            )
+
+    calls = Calls()
+
+    class Driver:
+        def call(self, operation, *, endpoint=None, stream=False):
+            return operation(SimpleNamespace(calls=calls)), "owner"
+
+    batch = BatchCall.from_id("unordered", client=SimpleNamespace(driver=Driver()))
+    assert list(batch.results(order_outputs=False)) == [2, 0]
+
+
+def test_ordered_batch_surfaces_terminal_failure_after_committed_prefix() -> None:
+    class Calls:
+        def GetResult(self, request):
+            if request.index == 0:
+                envelope = encode_value(3, codec=ValueCodec.JSON, compress=False)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-0",
+                    input_index=0,
+                    value=value_to_proto(envelope),
+                )
+            raise APIError("no later result", code="not_found", status=404)
+
+        def Get(self, request):
+            return api_pb2.CallRecord(
+                ref=request,
+                status=api_pb2.CALL_STATUS_FAILED,
+                error=api_pb2.CallError(
+                    code="worker_lost",
+                    message="batch failed",
+                    type="WorkerLost",
+                ),
+            )
+
+    calls = Calls()
+
+    class Driver:
+        def call(self, operation, *, endpoint=None, stream=False):
+            return operation(SimpleNamespace(calls=calls)), "owner"
+
+    batch = BatchCall.from_id("failed-prefix", client=SimpleNamespace(driver=Driver()))
+    iterator = batch.results()
+    assert next(iterator) == 3
+    with pytest.raises(RemoteFunctionError) as raised:
+        next(iterator)
+    assert raised.value.code == "worker_lost"
+
+    values = list(batch.results(return_exceptions=True))
+    assert values[0] == 3
+    assert isinstance(values[1], RemoteFunctionError)
+    assert values[1].code == "worker_lost"

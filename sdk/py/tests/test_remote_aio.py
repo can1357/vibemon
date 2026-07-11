@@ -7,8 +7,8 @@ import grpc
 import pytest
 
 import vmon.remote as remote_module
-from vmon.errors import RemoteFunctionError
 from vmon._function_proto import value_to_proto
+from vmon.errors import RemoteFunctionError
 from vmon.remote import BatchCall, FunctionCall, RemoteFunction, _AsyncCall
 from vmon.v1 import api_pb2
 from vmon.values import ValueCodec, ValueCompression, encode_value
@@ -397,5 +397,114 @@ def test_native_aio_ordered_batch_preserves_item_errors_before_terminal_cancel()
         assert values[1] == 9
         assert isinstance(values[2], RemoteFunctionError)
         assert values[2].code == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_native_aio_ordered_batch_reconnects_get_result_transport() -> None:
+    async def scenario() -> None:
+        requests: list[tuple[str, int]] = []
+
+        class Calls:
+            def __init__(self, owner: str) -> None:
+                self.owner = owner
+
+            async def GetResult(self, request, **kwargs):
+                requests.append((self.owner, request.index))
+                if self.owner == "owner-1":
+                    raise _Unavailable()
+                envelope = encode_value(
+                    5,
+                    codec=ValueCodec.JSON,
+                    compression=ValueCompression.NONE,
+                )
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-0",
+                    input_index=0,
+                    value=value_to_proto(envelope),
+                )
+
+            async def Cancel(self, request, **kwargs):
+                return api_pb2.CallRecord(
+                    ref=request.call,
+                    status=api_pb2.CALL_STATUS_CANCELLED,
+                )
+
+        class Driver:
+            def __init__(self) -> None:
+                self.calls = {
+                    "owner-1": Calls("owner-1"),
+                    "owner-2": Calls("owner-2"),
+                }
+                self.resolved: list[tuple[str, str | None]] = []
+
+            def aio_endpoint(self, endpoint=None):
+                selected = endpoint or "owner-1"
+                return (
+                    SimpleNamespace(calls=self.calls[selected]),
+                    (),
+                    1.0,
+                    selected,
+                )
+
+            def resolve_call(self, call_id, endpoint=None):
+                self.resolved.append((call_id, endpoint))
+                return "owner-2"
+
+        driver = Driver()
+        iterator = BatchCall(
+            FunctionCall("reconnect-batch-aio", SimpleNamespace(driver=driver))
+        ).aio.results()
+        assert await anext(iterator) == 5
+        assert requests == [("owner-1", 0), ("owner-2", 0)]
+        assert driver.resolved == [("reconnect-batch-aio", "owner-1")]
+        await iterator.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_native_aio_unordered_batch_keeps_completion_sequence() -> None:
+    async def scenario() -> None:
+        class Calls:
+            def Watch(self, request, **kwargs):
+                async def events():
+                    for sequence, input_index in ((1, 2), (2, 0)):
+                        envelope = encode_value(
+                            input_index,
+                            codec=ValueCodec.JSON,
+                            compression=ValueCompression.NONE,
+                        )
+                        yield api_pb2.CallEvent(
+                            call=request.cursor.call,
+                            sequence=sequence,
+                            result=api_pb2.CallResult(
+                                call=request.cursor.call,
+                                sequence=sequence,
+                                input_id=f"input-{input_index}",
+                                input_index=input_index,
+                                value=value_to_proto(envelope),
+                            ),
+                        )
+                    yield api_pb2.CallEvent(
+                        call=request.cursor.call,
+                        sequence=3,
+                        status=api_pb2.StatusEvent(status=api_pb2.CALL_STATUS_SUCCEEDED),
+                    )
+
+                return events()
+
+            async def GetResult(self, request, **kwargs):
+                raise AssertionError("unordered iteration must not poll by input index")
+
+        calls = Calls()
+        client = SimpleNamespace(driver=_Driver(calls))
+        values = [
+            value
+            async for value in BatchCall(FunctionCall("unordered-aio", client)).aio.results(
+                order_outputs=False
+            )
+        ]
+        assert values == [2, 0]
 
     asyncio.run(scenario())
