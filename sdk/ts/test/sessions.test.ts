@@ -18,11 +18,11 @@ afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
 });
 
-interface BridgeConn {
+export interface BridgeConn {
   sendMessage(payload: Uint8Array): void;
   end(status?: number, message?: string, trailers?: Record<string, string>): void;
 }
-interface RpcStub {
+export interface RpcStub {
   onCall?(conn: BridgeConn, metadata: Record<string, string>): void;
   onMessage?(conn: BridgeConn, payload: Uint8Array): void;
   onHalfClose?(conn: BridgeConn): void;
@@ -36,7 +36,7 @@ function bridgeFrame(frame: MessageInitShape<typeof BridgeFrameSchema>["frame"])
 }
 
 /** A Bun WS server speaking the /grpc BridgeFrame protocol. */
-function bridgeServer(routes: Record<string, RpcStub>): Bun.Server<BridgeSocketState> {
+export function bridgeServer(routes: Record<string, RpcStub>): Bun.Server<BridgeSocketState> {
   const server = Bun.serve<BridgeSocketState>({
     port: 0,
     fetch(request, server) {
@@ -88,7 +88,7 @@ function bridgeServer(routes: Record<string, RpcStub>): Bun.Server<BridgeSocketS
   return server;
 }
 
-function clientFor(server: Bun.Server<BridgeSocketState>): Client {
+export function clientFor(server: Bun.Server<BridgeSocketState>): Client {
   return new Client(new MeshDriver(`http://127.0.0.1:${server.port}`, { discover: false }));
 }
 

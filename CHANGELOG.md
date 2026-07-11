@@ -27,6 +27,8 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `Function` and `App` primitives for remote function and application lookup in TS SDK
+- Added portable `ValueEnvelope` serialization (JSON/CBOR) with artifact storage support for TS SDK
 - Added durable server-native function calls with at-least-once execution and retry support
 - Added structured lifetime management for groups of durable calls via `CallGroup`
 - Added `App` and `Schedule` primitives for atomic grouping and automated task execution

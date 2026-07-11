@@ -1,6 +1,7 @@
 import type {
   DescMessage,
   DescMethodBiDiStreaming,
+  DescMethodClientStreaming,
   DescMethodServerStreaming,
   DescMethodStreaming,
   DescMethodUnary,
@@ -69,6 +70,12 @@ export interface Driver {
   call<I extends DescMessage, O extends DescMessage>(
     method: DescMethodUnary<I, O>,
     input: MessageInitShape<I>,
+    options?: RpcCallOptions,
+  ): Promise<RpcResult<MessageShape<O>>>;
+  /** Send one affinity-aware client-streaming RPC. */
+  clientStream?<I extends DescMessage, O extends DescMessage>(
+    method: DescMethodClientStreaming<I, O>,
+    input: AsyncIterable<MessageInitShape<I>>,
     options?: RpcCallOptions,
   ): Promise<RpcResult<MessageShape<O>>>;
   /** Open one affinity-aware server-streaming RPC. */
@@ -258,6 +265,25 @@ export class MeshDriver implements Driver {
       }
     }
     throw last ?? new TransportError("no usable endpoints");
+  }
+
+  /** Send one client-streaming RPC with transport-only failover on connect. */
+  async clientStream<I extends DescMessage, O extends DescMessage>(
+    method: DescMethodClientStreaming<I, O>,
+    input: AsyncIterable<MessageInitShape<I>>,
+    options: RpcCallOptions = {},
+  ): Promise<RpcResult<MessageShape<O>>> {
+    const handle = await this.#openStream(method, input, options);
+    let message: MessageShape<O> | undefined;
+    for await (const item of handle.stream) {
+      if (message !== undefined) {
+        handle.cancel();
+        throw new TransportError("client-streaming RPC returned more than one response");
+      }
+      message = item;
+    }
+    if (message === undefined) throw new TransportError("client-streaming RPC returned no response");
+    return { message, endpoint: handle.endpoint };
   }
 
   /** Open one server-streaming RPC with transport-only failover on connect. */

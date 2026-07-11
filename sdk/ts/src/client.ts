@@ -1,6 +1,8 @@
 import type { Driver, DriverOptions, DriverRequestOptions } from "./driver";
 import { MeshDriver } from "./driver";
 import { apiError, ProtocolError, TransportError } from "./errors";
+import type { FunctionLookupOptions, FunctionValueAdapter } from "./functions";
+import { App, RemoteFunction } from "./functions";
 import {
   PoolService,
   SandboxService,
@@ -21,14 +23,6 @@ import type {
   ServerInfo,
 } from "./models";
 import { EventStream, Process } from "./process";
-import type {
-  JsonValue,
-  RemoteCallable,
-  RemoteFunction,
-  RemoteFunctionOptions,
-  RemoteFunctionSourceSpec,
-} from "./remote";
-import { remoteFunction, remoteFunctionFromSource } from "./remote";
 import type { SandboxListOptions } from "./sandbox";
 import { Sandbox } from "./sandbox";
 import type { SecretInput } from "./values";
@@ -49,6 +43,8 @@ export class Client {
   readonly volumes: VolumeAPI;
   readonly pools: PoolAPI;
   readonly mesh: MeshAPI;
+  readonly functions: FunctionAPI;
+  readonly apps: AppAPI;
   /** Bind the client to a driver implementation. */
   constructor(driver: Driver) {
     this.driver = driver;
@@ -57,6 +53,8 @@ export class Client {
     this.volumes = new VolumeAPI(this);
     this.pools = new PoolAPI(this);
     this.mesh = new MeshAPI(this);
+    this.functions = new FunctionAPI(this);
+    this.apps = new AppAPI(this);
   }
   /** Check daemon health. */
   health(): Promise<Health> {
@@ -84,20 +82,6 @@ export class Client {
     await process.ready();
     return process;
   }
-  /** Package a source-serializable function for remote execution. */
-  remoteFunction<Arguments extends unknown[], Result>(
-    fn: RemoteCallable<Arguments, Result>,
-    options: RemoteFunctionOptions = {},
-  ): RemoteFunction<Arguments, Result> {
-    return remoteFunction(this, fn, options);
-  }
-  /** Create a remote function from JavaScript module source. */
-  remoteFunctionFromSource<Arguments extends unknown[] = JsonValue[], Result = JsonValue>(
-    spec: RemoteFunctionSourceSpec,
-    options: RemoteFunctionOptions = {},
-  ): RemoteFunction<Arguments, Result> {
-    return remoteFunctionFromSource<Arguments, Result>(this, spec, options);
-  }
   /** Close the underlying driver. */
   close(): void | Promise<void> {
     return this.driver.close();
@@ -111,6 +95,43 @@ export class Client {
   /** Perform a request and decode its JSON response. */
   async json<T>(method: string, path: string, options: DriverRequestOptions = {}): Promise<T> {
     return (await this.response(method, path, options)).json();
+  }
+}
+
+/** Deployed function lookup operations. */
+export class FunctionAPI {
+  readonly #client: Client;
+  constructor(client: Client) { this.#client = client; }
+  /** Resolve and pin the active deployed function revision. */
+  fromName<Input, Result>(name: string, options: FunctionLookupOptions<Input, Result> & { input: FunctionValueAdapter<Input>; result: FunctionValueAdapter<Result> }): Promise<RemoteFunction<Input, Result>>;
+  fromName(name: string, options?: FunctionLookupOptions): Promise<RemoteFunction>;
+  fromName<Input, Result>(name: string, options: FunctionLookupOptions<Input, Result> = {}): Promise<RemoteFunction<Input, Result> | RemoteFunction> {
+    if (options.input && options.result) {
+      return RemoteFunction.fromName(this.#client, name, { ...options, input: options.input, result: options.result });
+    }
+    return RemoteFunction.fromName(this.#client, name, {
+      namespace: options.namespace,
+      revisionId: options.revisionId,
+      serializer: options.serializer,
+      compression: options.compression,
+      inlineLimit: options.inlineLimit,
+      typeName: options.typeName,
+      labels: options.labels,
+      resultTtlMillis: options.resultTtlMillis,
+      cancelOnDisconnect: options.cancelOnDisconnect,
+      clientSessionId: options.clientSessionId,
+      signal: options.signal,
+    });
+  }
+}
+
+/** Deployed application lookup operations. */
+export class AppAPI {
+  readonly #client: Client;
+  constructor(client: Client) { this.#client = client; }
+  /** Resolve and pin the current deployed application revision. */
+  fromName(name: string, options: { namespace?: string; revisionId?: string } = {}): Promise<App> {
+    return App.fromName(this.#client, name, options);
   }
 }
 
