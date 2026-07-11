@@ -22,6 +22,7 @@ pub mod models;
 pub mod net;
 pub mod pools;
 pub mod registry;
+pub mod s3;
 pub mod volumes;
 
 pub use error::{EngineError, ErrorCode, Result};

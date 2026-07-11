@@ -221,6 +221,15 @@ impl AgentConn {
 		)
 	}
 
+	/// Mount a read-only virtio-fs lower layer beneath a volatile guest overlay.
+	pub fn mount_overlay(&self, tag: &str, path: &Path, timeout: Duration) -> Result<Value> {
+		self.request(
+			"mount_overlay",
+			json!({ "tag": tag, "path": path_to_str(path)? }),
+			timeout,
+		)
+	}
+
 	/// Probe guest TCP connectivity.
 	pub fn tcp_probe(&self, port: u16, host: &str, timeout: Duration) -> Result<bool> {
 		let resp = self.request("tcp_probe", json!({ "port": port, "host": host }), timeout)?;

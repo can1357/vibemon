@@ -93,6 +93,15 @@ impl VolumeMount {
 	}
 }
 
+/// One read-only `--remote-fs tag:socket` object-proxy mount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteFsShare {
+	/// Guest-visible virtio-fs tag.
+	pub tag:  String,
+	/// Absolute Unix socket path for the per-VM proxy.
+	pub sock: PathBuf,
+}
+
 /// Builder-style launch specification consumed by [`build_launch_args`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSpec {
@@ -126,6 +135,8 @@ pub struct LaunchSpec {
 	pub fs_share:           Option<FsShare>,
 	/// Repeatable virtio-fs volume mounts.
 	pub volumes:            Vec<VolumeMount>,
+	/// Repeatable object-proxy virtio-fs mounts.
+	pub remote_fs:          Vec<RemoteFsShare>,
 	/// Optional wall-clock timeout in seconds.
 	pub timeout_secs:       Option<u64>,
 	/// Snapshot root passed to the VMM.
@@ -165,6 +176,7 @@ impl LaunchSpec {
 			rng:                false,
 			fs_share:           None,
 			volumes:            Vec::new(),
+			remote_fs:          Vec::new(),
 			timeout_secs:       None,
 			snapshot_root:      None,
 			remote_page_url:    None,
@@ -202,6 +214,7 @@ impl LaunchSpec {
 			rng: false,
 			fs_share: None,
 			volumes: Vec::new(),
+			remote_fs: Vec::new(),
 			timeout_secs: None,
 			snapshot_root: None,
 			remote_page_url: None,
@@ -286,6 +299,12 @@ impl LaunchSpec {
 		self
 	}
 
+	/// Add one object-proxy virtio-fs mount.
+	pub fn with_remote_fs(mut self, mount: RemoteFsShare) -> Self {
+		self.remote_fs.push(mount);
+		self
+	}
+
 	/// Set wall-clock timeout seconds.
 	pub const fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
 		self.timeout_secs = Some(timeout_secs);
@@ -342,6 +361,9 @@ impl LaunchSpec {
 		}
 		for volume in &self.volumes {
 			validate_volume_mount(volume)?;
+		}
+		for mount in &self.remote_fs {
+			validate_remote_fs_share(mount)?;
 		}
 		Ok(())
 	}
@@ -467,6 +489,7 @@ fn append_after_disk_args(args: &mut Vec<String>, spec: &LaunchSpec, flags: Afte
 		push_arg(args, "--fs-dir", &share.dir);
 	}
 	args.extend(volume_args(&spec.volumes));
+	args.extend(remote_fs_args(&spec.remote_fs));
 	if let Some(timeout_secs) = spec.timeout_secs {
 		push_arg(args, "--timeout-secs", timeout_secs.to_string());
 	}
@@ -537,6 +560,16 @@ pub fn volume_args(volumes: &[VolumeMount]) -> Vec<String> {
 			spec.push_str(":ro");
 		}
 		args.push(spec);
+	}
+	args
+}
+
+/// Format repeatable `--remote-fs` flags for object-proxy virtio-fs mounts.
+fn remote_fs_args(mounts: &[RemoteFsShare]) -> Vec<String> {
+	let mut args = Vec::with_capacity(mounts.len() * 2);
+	for mount in mounts {
+		args.push("--remote-fs".to_owned());
+		args.push(format!("{}:{}", mount.tag, path_string(&mount.sock)));
 	}
 	args
 }
@@ -915,6 +948,7 @@ fn launch_metadata(
 			meta.insert("tap".to_owned(), nullable_string(tap_name(spec).as_deref()));
 			meta.insert("user_net".to_owned(), json!(matches!(spec.network, Some(NetworkMode::User))));
 			meta.insert("volumes".to_owned(), volumes_json(&spec.volumes));
+			meta.insert("remote_fs".to_owned(), remote_fs_json(&spec.remote_fs));
 		},
 		LaunchMode::Restore { snapshot } => {
 			meta.insert("restored_from".to_owned(), json!(path_string(snapshot)));
@@ -924,6 +958,7 @@ fn launch_metadata(
 			meta.insert("user_net".to_owned(), json!(matches!(spec.network, Some(NetworkMode::User))));
 			meta.insert("rootfs".to_owned(), path_json(spec.rootfs.as_deref()));
 			meta.insert("volumes".to_owned(), volumes_json(&spec.volumes));
+			meta.insert("remote_fs".to_owned(), remote_fs_json(&spec.remote_fs));
 			meta
 				.insert("remote_page_url".to_owned(), nullable_string(spec.remote_page_url.as_deref()));
 			meta.insert(
@@ -944,6 +979,7 @@ fn launch_metadata(
 			meta.insert("forked_from".to_owned(), json!(path_string(snapshot)));
 			meta.insert("rootfs".to_owned(), path_json(spec.rootfs.as_deref()));
 			meta.insert("volumes".to_owned(), volumes_json(&spec.volumes));
+			meta.insert("remote_fs".to_owned(), remote_fs_json(&spec.remote_fs));
 		},
 	}
 	meta
@@ -960,6 +996,15 @@ fn volumes_json(volumes: &[VolumeMount]) -> Value {
 					"ro": volume.read_only,
 				})
 			})
+			.collect(),
+	)
+}
+
+fn remote_fs_json(mounts: &[RemoteFsShare]) -> Value {
+	Value::Array(
+		mounts
+			.iter()
+			.map(|mount| json!({ "tag": mount.tag, "sock": path_string(&mount.sock) }))
 			.collect(),
 	)
 }
@@ -1124,6 +1169,26 @@ fn validate_volume_mount(volume: &VolumeMount) -> Result<()> {
 	}
 	if !volume.read_only && host.ends_with(":ro") {
 		return Err(EngineError::invalid("read-write volume host directory must not end with ':ro'"));
+	}
+	Ok(())
+}
+
+fn validate_remote_fs_share(mount: &RemoteFsShare) -> Result<()> {
+	if !valid_volume_tag(&mount.tag) {
+		return Err(EngineError::invalid(format!(
+			"remote filesystem tag {:?} must match [a-z0-9_]{{1,32}}",
+			mount.tag
+		)));
+	}
+	if !mount.sock.is_absolute() {
+		return Err(EngineError::invalid(format!(
+			"remote filesystem socket must be absolute: {}",
+			mount.sock.display()
+		)));
+	}
+	let sock = path_string(&mount.sock);
+	if sock.contains('\0') {
+		return Err(EngineError::invalid("remote filesystem socket must not contain NUL bytes"));
 	}
 	Ok(())
 }

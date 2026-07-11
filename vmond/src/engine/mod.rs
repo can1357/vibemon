@@ -10,6 +10,7 @@ pub mod agent;
 pub mod control;
 pub(crate) mod diskdelta;
 mod facade;
+pub mod s3proxy;
 pub mod spawn;
 
 use std::collections::HashMap;

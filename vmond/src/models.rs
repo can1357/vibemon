@@ -36,6 +36,8 @@ pub struct SandboxCreate {
 	pub secrets:                Option<Vec<Value>>,
 	/// Mountpoint -> volume name or `{name, read_only}`.
 	pub volumes:                Option<HashMap<String, Value>>,
+	/// Mountpoint -> lazy S3 mount specification.
+	pub s3_mounts:                Option<HashMap<String, S3MountSpec>>,
 	pub tags:                   Option<HashMap<String, String>>,
 	pub fs_dir:                 Option<String>,
 	#[serde(default)]
@@ -56,6 +58,95 @@ pub struct SandboxCreate {
 	pub idempotency_key:        Option<String>,
 	/// Foreground entrypoint override (`command?: [str]`, new in v1).
 	pub command:                Option<Vec<String>>,
+	/// Mesh-only tag preservation for restored remote virtio-fs snapshots.
+	#[serde(skip)]
+	pub(crate) s3_restore_tags: Option<HashMap<String, String>>,
+}
+
+/// Create-time settings for one lazy S3 mount.
+#[derive(Clone, Serialize)]
+pub struct S3MountSpec {
+	/// `s3://bucket[/prefix]` source URI.
+	pub uri:           String,
+	/// Optional S3-compatible path-style endpoint.
+	pub endpoint:      Option<String>,
+	/// Optional SigV4 region override.
+	pub region:        Option<String>,
+	/// Mount without a guest-side volatile overlay.
+	#[serde(default)]
+	pub read_only:     bool,
+	/// Inline access key; never serialized beyond the request boundary.
+	#[serde(skip_serializing)]
+	pub access_key:    Option<String>,
+	/// Inline secret key; never serialized beyond the request boundary.
+	#[serde(skip_serializing)]
+	pub secret_key:    Option<String>,
+	/// Inline session token; never serialized beyond the request boundary.
+	#[serde(skip_serializing)]
+	pub session_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3MountFields {
+	uri:           String,
+	endpoint:      Option<String>,
+	region:        Option<String>,
+	#[serde(default)]
+	read_only:     bool,
+	access_key:    Option<String>,
+	secret_key:    Option<String>,
+	session_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum S3MountWire {
+	Uri(String),
+	Fields(S3MountFields),
+}
+
+impl<'de> Deserialize<'de> for S3MountSpec {
+	fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		match S3MountWire::deserialize(deserializer)? {
+			S3MountWire::Uri(uri) => Ok(Self {
+				uri,
+				endpoint: None,
+				region: None,
+				read_only: false,
+				access_key: None,
+				secret_key: None,
+				session_token: None,
+			}),
+			S3MountWire::Fields(fields) => Ok(Self {
+				uri: fields.uri,
+				endpoint: fields.endpoint,
+				region: fields.region,
+				read_only: fields.read_only,
+				access_key: fields.access_key,
+				secret_key: fields.secret_key,
+				session_token: fields.session_token,
+			}),
+		}
+	}
+}
+
+impl std::fmt::Debug for S3MountSpec {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("S3MountSpec")
+			.field("uri", &self.uri)
+			.field("endpoint", &self.endpoint)
+			.field("region", &self.region)
+			.field("read_only", &self.read_only)
+			.field("access_key", &self.access_key.as_ref().map(|_| "<redacted>"))
+			.field("secret_key", &self.secret_key.as_ref().map(|_| "<redacted>"))
+			.field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+			.finish()
+	}
 }
 
 fn default_context() -> String {
@@ -156,4 +247,37 @@ pub struct PoolPutBody {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MigrateBody {
 	pub target: String,
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::SandboxCreate;
+
+	#[test]
+	fn s3_mounts_accept_uri_shorthand_and_never_serialize_credentials() {
+		let request: SandboxCreate = serde_json::from_value(json!({
+			"s3_mounts": {
+				"/mnt/public": "s3://public/prefix",
+				"/mnt/private": {
+					"uri": "s3://private",
+					"access_key": "access",
+					"secret_key": "secret",
+					"session_token": "session"
+				}
+			}
+		}))
+		.expect("S3 mount request parses");
+		let mounts = request.s3_mounts.as_ref().expect("mounts");
+		assert_eq!(mounts["/mnt/public"].uri, "s3://public/prefix");
+		assert!(!mounts["/mnt/public"].read_only);
+		assert_eq!(mounts["/mnt/private"].access_key.as_deref(), Some("access"));
+
+		let wire = serde_json::to_value(request).expect("request serializes");
+		let private = &wire["s3_mounts"]["/mnt/private"];
+		assert!(private.get("access_key").is_none());
+		assert!(private.get("secret_key").is_none());
+		assert!(private.get("session_token").is_none());
+	}
 }

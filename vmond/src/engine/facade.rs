@@ -1,7 +1,7 @@
 //! The real [`Engine`]: method-for-method port of `python/vmon/core.py`.
 
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, HashMap, HashSet},
 	fmt::Write as _,
 	fs,
 	io::{self, Seek, SeekFrom, Write as _},
@@ -27,16 +27,18 @@ use crate::{
 		agent::{AgentConn, ExecHandle},
 		control::ControlClient,
 		diskdelta,
-		spawn::{LaunchSpec, MicroVm, VolumeMount},
+		spawn::{LaunchSpec, MicroVm, RemoteFsShare, VolumeMount},
+		s3proxy::S3Proxy,
 	},
 	error::{EngineError, Result},
 	home::Home,
 	image::{self, CachedTemplate, TemplateBooter, TemplateRequest, TemplateSpec},
-	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
+	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, S3MountSpec, SandboxCreate},
 	net::{self, SandboxNetwork},
 	pools::{PoolRegistry, WarmPool, template_key},
 	registry::{Registry, VmRecord},
 	volumes::{self, Secret, Volume, VolumeLock},
+	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
 };
 
 const DEFAULT_SHELL_IMAGE: &str = "debian:stable-slim";
@@ -50,6 +52,8 @@ const LOG_FOLLOW_POLL: Duration = Duration::from_millis(100);
 const EXEC_CAPTURE_CAP: Duration = Duration::from_mins(1);
 const WARM_VOLUME_SLOTS: u64 = 8;
 const ALLOWED_HA: [&str; 4] = ["async", "async+rerun", "off", "rerun"];
+const S3_MOUNTS_FILE: &str = "s3-mounts.json";
+const MAX_S3_MOUNTS: usize = 8;
 
 /// Single owner of the microVM registry and all VM lifecycle logic.
 #[derive(Clone)]
@@ -81,6 +85,7 @@ struct RuntimeState {
 	network_policy: NetworkPolicy,
 	network_spec:   Option<Value>,
 	timeout_stop:   Option<Sender<()>>,
+	s3_proxy:      Option<S3Proxy>,
 }
 
 #[derive(Default, Clone)]
@@ -124,6 +129,7 @@ struct CreatePlan {
 	secret_env:           BTreeMap<String, String>,
 	timeout_secs:         Option<u64>,
 	volume_specs:         Vec<ResolvedVolume>,
+	s3_specs:            Vec<ResolvedS3Mount>,
 	template_dir:         PathBuf,
 	image_spec:           Option<image::ImageConfig>,
 	image_ref:            Option<String>,
@@ -141,6 +147,14 @@ struct ResolvedVolume {
 	host_dir:   PathBuf,
 	read_only:  bool,
 	lock:       Option<VolumeLock>,
+}
+
+struct ResolvedS3Mount {
+	mountpoint: String,
+	tag:        String,
+	read_only:  bool,
+	client:     Arc<S3Client>,
+	meta:       Value,
 }
 
 impl Engine {
@@ -279,20 +293,28 @@ impl Engine {
 		let secrets = parse_secrets(params.secrets.take())?;
 		let secret_env = merge_secret_env(&secrets);
 		let timeout_secs = effective_timeout_secs(params.timeout_secs, params.timeout)?;
-		let mut volume_specs = self.resolve_volumes(params.volumes.take())?;
+		let mut used_tags = HashSet::new();
+		let mut volume_specs = self.resolve_volumes(params.volumes.take(), &mut used_tags)?;
+		let mut s3_specs = self.resolve_s3_mounts(params.s3_mounts.take(), &mut used_tags)?;
+		if let Some(tags) = params.s3_restore_tags.take() {
+			apply_restored_s3_tags(&mut s3_specs, &volume_specs, &tags)?;
+		}
 		let n_vols = u64::try_from(volume_specs.len()).unwrap_or(WARM_VOLUME_SLOTS + 1);
 		let warm_volumes = params.block_network
 			&& params.fs_dir.is_none()
 			&& params.template.is_none()
+			&& s3_specs.is_empty()
 			&& (1..=WARM_VOLUME_SLOTS).contains(&n_vols);
 		let host_slot = params.block_network
 			&& params.fs_dir.is_some()
 			&& params.template.is_none()
+			&& s3_specs.is_empty()
 			&& volume_specs.is_empty();
 		let networked_warm = !params.block_network
 			&& cfg!(target_os = "macos")
 			&& params.template.is_none()
 			&& params.fs_dir.is_none()
+			&& s3_specs.is_empty()
 			&& volume_specs.is_empty()
 			&& params.ports.as_ref().is_none_or(Vec::is_empty)
 			&& params.egress_allow.as_ref().is_none_or(Vec::is_empty)
@@ -308,6 +330,7 @@ impl Engine {
 			&& !cfg!(target_os = "macos")
 			&& params.template.is_none()
 			&& params.fs_dir.is_none()
+			&& s3_specs.is_empty()
 			&& volume_specs.is_empty();
 		let fs_slots = if warm_volumes { n_vols } else { 0 };
 		let (template_dir, image_spec, image_ref, cached_key) = self.resolve_template(
@@ -340,6 +363,7 @@ impl Engine {
 			host_slot,
 			networked_warm,
 			networked_warm_linux,
+			s3_specs,
 		})
 	}
 
@@ -381,8 +405,8 @@ impl Engine {
 	fn resolve_volumes(
 		&self,
 		volumes: Option<HashMap<String, Value>>,
+		used_tags: &mut HashSet<String>,
 	) -> Result<Vec<ResolvedVolume>> {
-		let mut used_tags = std::collections::HashSet::new();
 		let mut out = Vec::new();
 		for (mountpoint, value) in volumes.unwrap_or_default() {
 			let (name, read_only) = parse_volume_spec(&value)?;
@@ -392,7 +416,7 @@ impl Engine {
 			} else {
 				Some(volume.acquire_write_lock()?)
 			};
-			let tag = unique_volume_tag(&name, &mut used_tags);
+			let tag = unique_volume_tag(&name, used_tags);
 			out.push(ResolvedVolume {
 				mountpoint,
 				name,
@@ -405,6 +429,127 @@ impl Engine {
 		Ok(out)
 	}
 
+	fn resolve_s3_mounts(
+		&self,
+		mounts: Option<HashMap<String, S3MountSpec>>,
+		used_tags: &mut HashSet<String>,
+	) -> Result<Vec<ResolvedS3Mount>> {
+		let mounts = mounts.unwrap_or_default();
+		if mounts.len() > MAX_S3_MOUNTS {
+			return Err(EngineError::invalid(format!(
+				"at most {MAX_S3_MOUNTS} S3 mounts are supported"
+			)));
+		}
+		let mut mounts = mounts.into_iter().collect::<Vec<_>>();
+		mounts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+		let mut out = Vec::with_capacity(mounts.len());
+		for (mountpoint, spec) in mounts {
+			if !Path::new(&mountpoint).is_absolute() {
+				return Err(EngineError::invalid(format!(
+					"s3 mountpoint must be absolute: {mountpoint}"
+				)));
+			}
+			let (bucket, prefix) = parse_s3_uri(&spec.uri)?;
+			let region = spec
+				.region
+				.clone()
+				.filter(|region| !region.is_empty())
+				.unwrap_or_else(|| {
+					std::env::var("AWS_REGION")
+						.ok()
+						.filter(|region| !region.is_empty())
+						.unwrap_or_else(|| "us-east-1".to_owned())
+				});
+			let (creds, auth) = s3_credentials(&mountpoint, &spec)?;
+			let client = Arc::new(
+				S3Client::new(S3MountConfig {
+					bucket: bucket.clone(),
+					prefix: prefix.clone(),
+					region: region.clone(),
+					endpoint: spec.endpoint.clone(),
+					read_only: spec.read_only,
+					creds,
+					auth,
+				})
+				.map_err(|error| EngineError::invalid(format!("s3 mount '{mountpoint}': {error}")))?,
+			);
+			self
+				.inner
+				.net_runtime
+				.block_on(client.probe())
+				.map_err(|error| EngineError::invalid(format!("s3 mount '{mountpoint}': {error}")))?;
+			let tag = unique_volume_tag(&bucket, used_tags);
+			out.push(ResolvedS3Mount {
+				mountpoint,
+				tag: tag.clone(),
+				read_only: spec.read_only,
+				client,
+				meta: json!({
+					"uri": spec.uri,
+					"endpoint": spec.endpoint,
+					"region": region,
+					"read_only": spec.read_only,
+					"tag": tag,
+					"auth": auth.as_str(),
+				}),
+			});
+		}
+		Ok(out)
+	}
+
+	/// Rebuild remote filesystem clients from a snapshot's credential-free mount metadata.
+	fn snapshot_s3_mounts(&self, snapshot_dir: &Path) -> Result<Vec<ResolvedS3Mount>> {
+		let path = snapshot_dir.join(S3_MOUNTS_FILE);
+		if !path.is_file() {
+			return Ok(Vec::new());
+		}
+		let source = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+		if source.as_object().is_some_and(Map::is_empty) {
+			return Ok(Vec::new());
+		}
+		let mut params = Map::from_iter([("s3_mounts".to_owned(), source)]);
+		let tags = restore_s3_mount_params(&mut params)?.ok_or_else(|| {
+			EngineError::invalid(format!(
+				"snapshot {} has invalid S3 mount metadata",
+				snapshot_dir.display()
+			))
+		})?;
+		let mounts = serde_json::from_value(
+			params
+				.remove("s3_mounts")
+				.expect("restored S3 mount parameters remain present"),
+		)?;
+		let mut used_tags = HashSet::new();
+		let mut mounts = self.resolve_s3_mounts(Some(mounts), &mut used_tags)?;
+		apply_restored_s3_tags(&mut mounts, &[], &tags)?;
+		Ok(mounts)
+	}
+
+
+	/// Start a per-VM proxy before its remote virtio-fs devices connect.
+	fn with_s3_proxy(
+		&self,
+		vm: &MicroVm,
+		mut spec: LaunchSpec,
+		mounts: &[ResolvedS3Mount],
+	) -> Result<(LaunchSpec, Option<S3Proxy>)> {
+		if mounts.is_empty() {
+			return Ok((spec, None));
+		}
+		let sock = vm.dir().join("s3.sock");
+		let routes = mounts
+			.iter()
+			.map(|mount| (mount.tag.clone(), Arc::clone(&mount.client)))
+			.collect();
+		let proxy = S3Proxy::start(&self.inner.net_runtime, &sock, routes)?;
+		for mount in mounts {
+			spec = spec.with_remote_fs(RemoteFsShare {
+				tag:  mount.tag.clone(),
+				sock: sock.clone(),
+			});
+		}
+		Ok((spec, Some(proxy)))
+	}
 	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(MicroVm, RuntimeState)> {
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
@@ -445,6 +590,20 @@ impl Engine {
 				"virtiofs",
 				AGENT_REQUEST_TIMEOUT,
 			)?;
+		}
+		for mount in &plan.s3_specs {
+			let mountpoint = Path::new(&mount.mountpoint);
+			if mount.read_only {
+				agent.mount(
+					&mount.tag,
+					mountpoint,
+					true,
+					"virtiofs",
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			} else {
+				agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
+			}
 		}
 		if let Some(network) = &runtime.network {
 			let gc = &network.guest_config;
@@ -512,6 +671,7 @@ impl Engine {
 		);
 		meta.insert("tags".to_owned(), json!(plan.tags));
 		meta.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
+		meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
 		meta.insert("block_network".to_owned(), json!(plan.params.block_network));
 		meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
 		meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
@@ -522,6 +682,7 @@ impl Engine {
 	fn claim_or_launch_vm(&self, plan: &CreatePlan, runtime: &mut RuntimeState) -> Result<MicroVm> {
 		if (plan.params.block_network || plan.networked_warm)
 			&& plan.volume_specs.is_empty()
+			&& plan.s3_specs.is_empty()
 			&& plan.params.fs_dir.is_none()
 		{
 			if plan.params.pool_size > 0 {
@@ -553,32 +714,40 @@ impl Engine {
 				return Ok(vm);
 			}
 		}
-		if plan.params.block_network && plan.params.fs_dir.is_none() && plan.volume_specs.is_empty() {
-			return Self::launch_restore_vm(plan, None, runtime);
+		if plan.params.block_network
+			&& plan.params.fs_dir.is_none()
+			&& plan.volume_specs.is_empty()
+			&& plan.s3_specs.is_empty()
+		{
+			return self.launch_restore_vm(plan, None, runtime);
 		}
 		if plan.warm_volumes || plan.host_slot || plan.networked_warm {
-			return Self::launch_restore_vm(plan, None, runtime);
+			return self.launch_restore_vm(plan, None, runtime);
 		}
 		if (plan.networked_warm_linux
-			|| (!plan.params.block_network && snapshot_state_present(&plan.template_dir)))
+			|| (!plan.params.block_network
+				&& plan.s3_specs.is_empty()
+				&& snapshot_state_present(&plan.template_dir)))
 			&& !cfg!(target_os = "macos")
 		{
 			let network = self.setup_network(&plan.sid, &plan.params)?;
 			let tap = network.guest_config.tap.clone();
 			runtime.network = Some(network);
-			return Self::launch_restore_vm(plan, Some(tap), runtime);
+			return self.launch_restore_vm(plan, Some(tap), runtime);
 		}
 		if !plan.params.block_network
+			&& plan.s3_specs.is_empty()
 			&& cfg!(target_os = "macos")
 			&& snapshot_state_present(&plan.template_dir)
 		{
 			reject_macos_host_network_features(&plan.params)?;
-			return Self::launch_restore_vm(plan, None, runtime);
+			return self.launch_restore_vm(plan, None, runtime);
 		}
 		self.launch_cold_vm(plan, runtime)
 	}
 
 	fn launch_restore_vm(
+		&self,
 		plan: &CreatePlan,
 		tap: Option<String>,
 		runtime: &mut RuntimeState,
@@ -622,7 +791,9 @@ impl Engine {
 				plan.params.remote_page_digest.clone(),
 			);
 		}
+		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		vm.launch(&spec)?;
+		runtime.s3_proxy = s3_proxy;
 		if !plan.params.block_network && runtime.network.is_none() {
 			runtime.network_spec = Some(json!({
 				"flavor": "user",
@@ -676,7 +847,9 @@ impl Engine {
 				volume.read_only,
 			)?);
 		}
+		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		vm.launch(&spec)?;
+		runtime.s3_proxy = s3_proxy;
 		Ok(vm)
 	}
 
@@ -906,6 +1079,7 @@ impl Engine {
 			if let Some(agent) = state.agent.take() {
 				agent.close();
 			}
+			drop(state.s3_proxy.take());
 			if let Some(network) = state.network.take() {
 				let _ = network.teardown();
 			} else {
@@ -1233,8 +1407,10 @@ impl Engine {
 		)
 	}
 
-	pub(crate) fn mesh_create_from_params(&self, params: Map<String, Value>) -> Result<Value> {
-		let request = crate::mesh::runtime::sandbox_create_from_mesh_params(params)?;
+	pub(crate) fn mesh_create_from_params(&self, mut params: Map<String, Value>) -> Result<Value> {
+		let s3_restore_tags = restore_s3_mount_params(&mut params)?;
+		let mut request = crate::mesh::runtime::sandbox_create_from_mesh_params(params)?;
+		request.s3_restore_tags = s3_restore_tags;
 		<Self as EngineApi>::create(self, request)
 	}
 
@@ -1734,6 +1910,7 @@ impl EngineApi for Engine {
 			detail.insert("fs_dir".to_owned(), json!(fs_dir));
 		}
 		detail.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
+		detail.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
 		detail.insert(
 			"create_latency_ms".to_owned(),
 			json!(request_time.elapsed().as_secs_f64() * 1000.0),
@@ -2283,6 +2460,13 @@ impl EngineApi for Engine {
 			&self.snapshot_root(),
 			false,
 		)?;
+		if let Some(s3_mounts) = record
+			.detail
+			.get("s3_mounts")
+			.filter(|mounts| mounts.as_object().is_some_and(|mounts| !mounts.is_empty()))
+		{
+			fs::write(dir.join(S3_MOUNTS_FILE), serde_json::to_vec(s3_mounts)?)?;
+		}
 		if stop {
 			let rc = self.teardown(&record);
 			self.persist_status(id, "stopped", rc, None)?;
@@ -2333,6 +2517,7 @@ impl EngineApi for Engine {
 			.name
 			.unwrap_or_else(|| format!("restore-{}", random_hex(12)));
 		let snapshot_dir = self.snapshot_dir(snapshot);
+		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir)?;
 		let vm = MicroVm::new(&name);
 		let mut spec = LaunchSpec::restore(vm.api_sock(), &snapshot_dir)
 			.with_agent_sock(vm.dir().join("agent.sock"));
@@ -2346,26 +2531,52 @@ impl EngineApi for Engine {
 		if body.agent.unwrap_or(false) {
 			spec = spec.with_console_agent();
 		}
+		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &s3_mounts)?;
 		vm.launch(&spec)?;
 		if body.agent.unwrap_or(false) {
 			let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
-			let readiness = agent.ping(AGENT_CONNECT_TIMEOUT);
+			agent.ping(AGENT_CONNECT_TIMEOUT)?;
+			for mount in &s3_mounts {
+				let mountpoint = Path::new(&mount.mountpoint);
+				if mount.read_only {
+					agent.mount(
+						&mount.tag,
+						mountpoint,
+						true,
+						"virtiofs",
+						AGENT_REQUEST_TIMEOUT,
+					)?;
+				} else {
+					agent.mount_overlay(&mount.tag, mountpoint, AGENT_REQUEST_TIMEOUT)?;
+				}
+			}
 			agent.close();
-			readiness?;
 		}
-		let meta = vm.meta()?;
+		let mut detail = vm.meta()?;
+		if !s3_mounts.is_empty() {
+			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
+		}
+		if let Some(s3_proxy) = s3_proxy {
+			self.inner.runtimes.lock().insert(
+				name.clone(),
+				RuntimeState {
+					s3_proxy: Some(s3_proxy),
+					..RuntimeState::default()
+				},
+			);
+		}
 		let record = VmRecord {
 			id: name.clone(),
 			name,
 			status: "running".to_owned(),
-			pid: meta
+			pid: detail
 				.get("pid")
 				.and_then(Value::as_i64)
 				.and_then(|pid| i32::try_from(pid).ok()),
 			source: Some(format!("restore:{snapshot}")),
 			created_at: unix_time(),
 			timeout: None,
-			detail: Value::Object(meta),
+			detail: Value::Object(detail),
 			tags: HashMap::new(),
 			last_active: unix_time(),
 			terminated_at: None,
@@ -2694,6 +2905,195 @@ fn parse_volume_spec(value: &Value) -> Result<(String, bool)> {
 			.and_then(Value::as_bool)
 			.unwrap_or(false),
 	))
+}
+
+fn s3_credentials(
+	mountpoint: &str,
+	spec: &S3MountSpec,
+) -> Result<(Option<S3Credentials>, S3Auth)> {
+	let inline_requested =
+		spec.access_key.is_some() || spec.secret_key.is_some() || spec.session_token.is_some();
+	let access_key = spec.access_key.as_deref().filter(|value| !value.is_empty());
+	let secret_key = spec.secret_key.as_deref().filter(|value| !value.is_empty());
+	if let (Some(access_key), Some(secret_key)) = (access_key, secret_key) {
+		return Ok((
+			Some(S3Credentials {
+				access_key:    access_key.to_owned(),
+				secret_key:    secret_key.to_owned(),
+				session_token: spec.session_token.clone().filter(|value| !value.is_empty()),
+			}),
+			S3Auth::Inline,
+		));
+	}
+	if inline_requested {
+		return Err(EngineError::invalid(format!(
+			"S3 mount {mountpoint} requires both access_key and secret_key"
+		)));
+	}
+	if let Some(creds) = environment_s3_credentials() {
+		return Ok((Some(creds), S3Auth::Env));
+	}
+	Ok((None, S3Auth::Anonymous))
+}
+
+fn environment_s3_credentials() -> Option<S3Credentials> {
+	let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+		.ok()
+		.filter(|value| !value.is_empty())?;
+	let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+		.ok()
+		.filter(|value| !value.is_empty())?;
+	Some(S3Credentials {
+		access_key,
+		secret_key,
+		session_token: std::env::var("AWS_SESSION_TOKEN")
+			.ok()
+			.filter(|value| !value.is_empty()),
+	})
+}
+
+fn apply_restored_s3_tags(
+	mounts: &mut [ResolvedS3Mount],
+	volumes: &[ResolvedVolume],
+	tags: &HashMap<String, String>,
+) -> Result<()> {
+	if mounts.len() != tags.len() {
+		return Err(EngineError::invalid(
+			"restored S3 mount metadata does not match the requested mounts",
+		));
+	}
+	let mut used = volumes
+		.iter()
+		.map(|volume| volume.tag.clone())
+		.collect::<HashSet<_>>();
+	for mount in mounts {
+		let tag = tags.get(&mount.mountpoint).ok_or_else(|| {
+			EngineError::invalid(format!(
+				"restored S3 mount metadata is missing tag for {}",
+				mount.mountpoint
+			))
+		})?;
+		if !valid_virtiofs_tag(tag) {
+			return Err(EngineError::invalid(format!(
+				"restored S3 mount has invalid virtio-fs tag {tag:?}"
+			)));
+		}
+		if !used.insert(tag.clone()) {
+			return Err(EngineError::invalid(format!(
+				"restored S3 mount tag {tag:?} collides with another filesystem mount"
+			)));
+		}
+		mount.tag.clone_from(tag);
+		mount
+			.meta
+			.as_object_mut()
+			.expect("S3 mount metadata is always an object")
+			.insert("tag".to_owned(), json!(tag));
+	}
+	Ok(())
+}
+
+fn valid_virtiofs_tag(tag: &str) -> bool {
+	!tag.is_empty()
+		&& tag.len() <= 32
+		&& tag
+			.bytes()
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn restore_s3_mount_params(params: &mut Map<String, Value>) -> Result<Option<HashMap<String, String>>> {
+	let Some(source) = params.get("s3_mounts").cloned() else {
+		return Ok(None);
+	};
+	let mounts = source
+		.as_object()
+		.ok_or_else(|| EngineError::invalid("restored S3 mounts must be an object"))?;
+	let has_metadata = mounts
+		.values()
+		.any(|mount| mount.get("auth").is_some());
+	if !has_metadata {
+		return Ok(None);
+	}
+	let mut restored = Map::new();
+	let mut tags = HashMap::with_capacity(mounts.len());
+	for (mountpoint, mount) in mounts {
+		let object = mount.as_object().ok_or_else(|| {
+			EngineError::invalid(format!("restored S3 mount {mountpoint} must be an object"))
+		})?;
+		let uri = object
+			.get("uri")
+			.and_then(Value::as_str)
+			.filter(|uri| !uri.is_empty())
+			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing uri")))?;
+		let tag = object
+			.get("tag")
+			.and_then(Value::as_str)
+			.filter(|tag| !tag.is_empty())
+			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing tag")))?;
+		let auth = object
+			.get("auth")
+			.and_then(Value::as_str)
+			.ok_or_else(|| EngineError::invalid(format!("restored S3 mount {mountpoint} is missing auth")))?;
+		match auth {
+			"inline" => {
+				if environment_s3_credentials().is_none() {
+					return Err(EngineError::invalid(format!(
+						"S3 mount {mountpoint} was created with inline credentials; \
+						 set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to restore"
+					)));
+				}
+			},
+			"env" => {
+				if environment_s3_credentials().is_none() {
+					return Err(EngineError::invalid(format!(
+						"S3 mount {mountpoint} requires AWS_ACCESS_KEY_ID and \
+						 AWS_SECRET_ACCESS_KEY to restore"
+					)));
+				}
+			},
+			"anonymous" => {},
+			_ => {
+				return Err(EngineError::invalid(format!(
+					"restored S3 mount {mountpoint} has unknown auth mode {auth:?}"
+				)));
+			},
+		}
+		let spec = Map::from_iter([
+			("uri".to_owned(), json!(uri)),
+			(
+				"endpoint".to_owned(),
+				object.get("endpoint").cloned().unwrap_or(Value::Null),
+			),
+			(
+				"region".to_owned(),
+				object.get("region").cloned().unwrap_or(Value::Null),
+			),
+			(
+				"read_only".to_owned(),
+				json!(object.get("read_only").and_then(Value::as_bool).unwrap_or(false)),
+			),
+		]);
+		if let Some(endpoint) = spec.get("endpoint")
+			&& !endpoint.is_null()
+			&& !endpoint.is_string()
+		{
+			return Err(EngineError::invalid(format!(
+				"restored S3 mount {mountpoint} has invalid endpoint"
+			)));
+		}
+		if let Some(region) = spec.get("region")
+			&& !region.is_null()
+			&& !region.is_string()
+		{
+			return Err(EngineError::invalid(format!(
+				"restored S3 mount {mountpoint} has invalid region"
+			)));
+		}
+		restored.insert(mountpoint.clone(), Value::Object(spec));
+		tags.insert(mountpoint.clone(), tag.to_owned());
+	}
+	params.insert("s3_mounts".to_owned(), Value::Object(restored));
+	Ok(Some(tags))
 }
 
 fn unique_volume_tag(base: &str, used: &mut std::collections::HashSet<String>) -> String {
@@ -3038,6 +3438,15 @@ fn volumes_meta(volumes: &[ResolvedVolume]) -> Value {
 				)
 			})
 			.collect::<Map<_, _>>(),
+	)
+}
+
+fn s3_mounts_meta(mounts: &[ResolvedS3Mount]) -> Value {
+	Value::Object(
+		mounts
+			.iter()
+			.map(|mount| (mount.mountpoint.clone(), mount.meta.clone()))
+			.collect(),
 	)
 }
 
@@ -3564,5 +3973,31 @@ mod tests {
 		);
 		assert!(base_dir.is_dir(), "failed migration abort must keep the pre-copy checkpoint");
 		assert!(delta_dir.is_dir(), "failed migration abort must keep the delta checkpoint");
+	}
+
+	#[test]
+	fn restored_s3_metadata_preserves_tags_without_persisting_credentials() {
+		let mut params = Map::from_iter([(
+			"s3_mounts".to_owned(),
+			json!({
+				"/mnt/data": {
+					"uri": "s3://bucket/prefix",
+					"endpoint": "http://127.0.0.1:9000",
+					"region": "us-east-1",
+					"read_only": false,
+					"tag": "bucket",
+					"auth": "anonymous"
+				}
+			}),
+		)]);
+
+		let tags = restore_s3_mount_params(&mut params)
+			.expect("metadata parses")
+			.expect("metadata carries tags");
+		assert_eq!(tags.get("/mnt/data").map(String::as_str), Some("bucket"));
+		assert_eq!(params["s3_mounts"]["/mnt/data"]["uri"], "s3://bucket/prefix");
+		assert!(params["s3_mounts"]["/mnt/data"].get("tag").is_none());
+		assert!(params["s3_mounts"]["/mnt/data"].get("auth").is_none());
+		assert!(params["s3_mounts"]["/mnt/data"].get("access_key").is_none());
 	}
 }
