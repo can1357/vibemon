@@ -333,8 +333,7 @@ async def _zip_async(
 
 def _raise(error: pb.CallError) -> None:
     traceback_text = "\n".join(
-        f'  File "{frame.file}", line {frame.line}, in {frame.function}'
-        for frame in error.frames
+        f'  File "{frame.file}", line {frame.line}, in {frame.function}' for frame in error.frames
     )
     exc = RemoteFunctionError(
         error.message or "remote function failed",

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import type { ArtifactRef, ValueEnvelope } from "../src/gen/vmon/v1/api_pb";
-import { ValueSerializer } from "../src/gen/vmon/v1/api_pb";
 import type { PortableValue, ValueArtifactStore, ValueSerializerName } from "../src";
 import { decodeValue, encodeValue } from "../src";
+import type { ArtifactRef, ValueEnvelope } from "../src/gen/vmon/v1/api_pb";
+import { ValueSerializer } from "../src/gen/vmon/v1/api_pb";
 
 class MemoryArtifacts implements ValueArtifactStore {
   readonly values = new Map<string, Uint8Array>();

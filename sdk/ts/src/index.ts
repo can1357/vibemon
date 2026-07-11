@@ -1,10 +1,10 @@
 export {
-  Client,
   AppAPI,
+  Client,
   type ConnectOptions,
   connect,
-  MeshAPI,
   FunctionAPI,
+  MeshAPI,
   Pool,
   PoolAPI,
   SandboxAPI,
@@ -29,6 +29,33 @@ export {
 } from "./driver";
 export { type DsnConfig, type DsnEndpoint, type ParseDsnOptions, parseDsn } from "./dsn";
 export { APIError, type APIErrorShape, ProtocolError, TransportError } from "./errors";
+export {
+  type DecodeValueOptions,
+  decodeValue,
+  type EncodeValueOptions,
+  encodeValue,
+  type JsonValue,
+  type PortableValue,
+  parseJsonValue,
+  type ValueArtifactStore,
+  type ValueCompressionName,
+  type ValueSerializerName,
+} from "./function-values";
+export {
+  App,
+  BatchCall,
+  type EventCursor as FunctionEventCursor,
+  Function,
+  type FunctionArguments,
+  FunctionCall,
+  type FunctionCallOptions,
+  FunctionExecutionError,
+  type FunctionLog,
+  type FunctionLookupOptions,
+  type FunctionResult,
+  type FunctionValueAdapter,
+  RemoteFunction,
+} from "./functions";
 export type {
   EventRecord,
   ExecExit,
@@ -62,33 +89,6 @@ export {
   type ProcessOptions,
   type StreamHandle,
 } from "./process";
-export {
-  App,
-  BatchCall,
-  type EventCursor as FunctionEventCursor,
-  Function,
-  FunctionCall,
-  type FunctionArguments,
-  type FunctionCallOptions,
-  FunctionExecutionError,
-  type FunctionLog,
-  type FunctionLookupOptions,
-  type FunctionResult,
-  type FunctionValueAdapter,
-  RemoteFunction,
-} from "./functions";
-export {
-  type DecodeValueOptions,
-  decodeValue,
-  type EncodeValueOptions,
-  encodeValue,
-  type JsonValue,
-  type PortableValue,
-  type ValueArtifactStore,
-  parseJsonValue,
-  type ValueCompressionName,
-  type ValueSerializerName,
-} from "./function-values";
 export {
   type ExecOptions,
   Files,

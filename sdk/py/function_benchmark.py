@@ -130,12 +130,15 @@ def run(iterations: int, output: Path) -> None:
         managed_log = server.log_path
         server_log = str(output.parent / "server.log")
 
-    image = vmon.Image.from_registry(os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim"))
+    image = vmon.Image.from_registry(
+        os.environ.get("VMON_E2E_PYTHON_IMAGE", "python:3.14-slim")
+    ).uv_install("cloudpickle==3.1.2")
     network = vmon.NetworkPolicy(block_network=True)
     ordinary_options = vmon.FunctionOptions(
         image=image,
         resources=vmon.ResourcePolicy(network=network),
         workers=vmon.WorkerPolicy(max_workers=1, max_calls_per_worker=2),
+        serializer=vmon.SerializerPolicy(allow_trusted_python=True),
     )
 
     @vmon.service(
@@ -143,10 +146,12 @@ def run(iterations: int, output: Path) -> None:
         name="benchmark-snapshot-service",
         snapshot_after_initialize=True,
         snapshot_on_worker_retire=True,
+        package_mode="cloudpickle",
         options=vmon.FunctionOptions(
             image=image,
             resources=vmon.ResourcePolicy(network=network),
             workers=vmon.WorkerPolicy(max_workers=1, max_calls_per_worker=1),
+            serializer=vmon.SerializerPolicy(allow_trusted_python=True),
         ),
     )
     class SnapshotService:
@@ -170,7 +175,11 @@ def run(iterations: int, output: Path) -> None:
             return value + 1
 
     ordinary = vmon.function(
-        _ordinary, client=client, name="benchmark-ordinary", options=ordinary_options
+        _ordinary,
+        client=client,
+        name="benchmark-ordinary",
+        options=ordinary_options,
+        package_mode="cloudpickle",
     )
     service = SnapshotService()
     try:

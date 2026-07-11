@@ -9,7 +9,7 @@ import type {
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import type { Client } from "./client";
 import type { DriverRequestOptions, DriverResponse, RpcStream } from "./driver";
-import { APIError, apiError, parseResponseJson, ProtocolError } from "./errors";
+import { APIError, apiError, ProtocolError, parseResponseJson } from "./errors";
 import { SandboxService } from "./gen/vmon/v1/api_pb";
 import type {
   ExecRequest,

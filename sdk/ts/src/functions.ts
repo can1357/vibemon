@@ -1,8 +1,11 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
-import type { Client } from "./client";
 import { AsyncQueue } from "./async-queue";
+import type { Client } from "./client";
+import type { EncodeValueOptions, PortableValue, ValueArtifactStore } from "./function-values";
+import { decodeValue, encodeValue } from "./function-values";
 import type {
   AppRevision,
+  AppSelectorSchema,
   ArtifactRef,
   CallError,
   CallEvent,
@@ -10,11 +13,10 @@ import type {
   CallRecord,
   CallResult,
   CallStats,
-  RevisionRef,
   CreateCallRequestSchema,
   FunctionSelectorSchema,
-  AppSelectorSchema,
   PutArtifactRequestSchema,
+  RevisionRef,
   StreamCallInputsRequestSchema,
   ValueEnvelope,
 } from "./gen/vmon/v1/api_pb";
@@ -26,8 +28,6 @@ import {
   FunctionService,
   LogStream,
 } from "./gen/vmon/v1/api_pb";
-import type { EncodeValueOptions, PortableValue, ValueArtifactStore } from "./function-values";
-import { decodeValue, encodeValue } from "./function-values";
 
 /** Converts application values to and from the portable JSON/CBOR data model. */
 export interface FunctionValueAdapter<Value> {
@@ -967,8 +967,10 @@ function rejectCloudpickle(envelope: ValueEnvelope): void {
   if (envelope.serializer === 3)
     throw new Error("cloudpickle values are Python-only and cannot be sent by TypeScript");
 }
+
 /** Alias matching the deployed-function lookup spelling (`Function.fromName`). */
 export { RemoteFunction as Function };
+
 function bindAbort<Result>(call: FunctionCall<Result>, signal: AbortSignal | undefined): void {
   if (!signal) return;
   if (signal.aborted) {

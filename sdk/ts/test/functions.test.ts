@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
-import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import { createRouterTransport } from "@connectrpc/connect";
 import type { FunctionValueAdapter, PortableValue, ValueArtifactStore } from "../src";
 import {
   Client,
+  decodeValue,
+  encodeValue,
   FunctionCall,
   FunctionExecutionError,
   MeshDriver,
-  decodeValue,
-  encodeValue,
 } from "../src";
 import type {
   ArtifactRef,
@@ -18,16 +18,16 @@ import type {
 } from "../src/gen/vmon/v1/api_pb";
 import {
   ArtifactService,
+  CallEventSchema,
+  CallRecordSchema,
   CallService,
   CallStatus,
   CallType,
-  FunctionService,
-  LogStream,
-  CallEventSchema,
-  CallRecordSchema,
   CreateCallRequestSchema,
   FunctionRevisionSchema,
+  FunctionService,
   GetFunctionRequestSchema,
+  LogStream,
   WatchCallRequestSchema,
 } from "../src/gen/vmon/v1/api_pb";
 import { bridgeServer, clientFor } from "./sessions.test";

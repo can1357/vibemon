@@ -1029,8 +1029,14 @@ def _function_options(
     min_workers: int = 0,
 ) -> vmon.FunctionOptions:
     selected_serializer = serializer or SerializerPolicy()
+    image = _py_image()
+    if ValueCodec.CLOUDPICKLE in (
+        selected_serializer.input_serializer,
+        selected_serializer.result_serializer,
+    ):
+        image = image.uv_install("cloudpickle==3.1.2")
     return vmon.FunctionOptions(
-        image=_py_image(),
+        image=image,
         timeouts=vmon.TimeoutPolicy(execution=120),
         workers=vmon.WorkerPolicy(min_workers=min_workers),
         serializer=selected_serializer,
@@ -1072,10 +1078,6 @@ def t_remote_function_warm(_):
 def t_remote_function_rich_args(_):
     """Explicit trusted-Python serialization preserves rich Python values."""
     import datetime
-    import cloudpickle
-
-    assert cloudpickle.__file__ is not None
-    cloudpickle_root = Path(cloudpickle.__file__).resolve().parent
 
     remote = sdk().function(
         remote_shift,
@@ -1086,7 +1088,6 @@ def t_remote_function_rich_args(_):
                 allow_trusted_python=True,
             )
         ),
-        local_packages=(str(cloudpickle_root),),
     )
     stamp = datetime.datetime(2026, 7, 11, 8, 30, 0)
     shifted, swapped = remote.remote(stamp, (1, 2))

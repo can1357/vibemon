@@ -1,6 +1,6 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { AsyncQueue, deferred } from "./async-queue";
-import { parseResponseJson, ProtocolError } from "./errors";
+import { ProtocolError, parseResponseJson } from "./errors";
 import type { ExecInputSchema, ExecOutput } from "./gen/vmon/v1/api_pb";
 import { Stream } from "./gen/vmon/v1/api_pb";
 import type { EventRecord, ExecExit } from "./models";

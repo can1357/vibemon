@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 
-import { type Client, FunctionCall, connect } from "../src";
+import { type Client, connect, FunctionCall } from "../src";
 
 const wantsSmoke = process.env.VMON_TS_SMOKE === "1";
 const wantsRemoteSmoke = process.env.VMON_TS_REMOTE_SMOKE === "1";

@@ -1,6 +1,6 @@
 import type { Driver, DriverOptions, DriverRequestOptions } from "./driver";
 import { MeshDriver } from "./driver";
-import { apiError, parseResponseJson, ProtocolError, TransportError } from "./errors";
+import { apiError, ProtocolError, parseResponseJson, TransportError } from "./errors";
 import type { FunctionLookupOptions, FunctionValueAdapter } from "./functions";
 import { App, RemoteFunction } from "./functions";
 import {
