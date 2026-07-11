@@ -1830,6 +1830,8 @@ message CallInput {
   uint64 index = 1;
   // Value is the typed input envelope.
   ValueEnvelope value = 2;
+  // InputId is a stable identifier; the server assigns one when the client leaves it empty.
+  string input_id = 3;
 }
 
 // CallGraph records durable parent relationships between calls.
@@ -1841,6 +1843,8 @@ message CallGraph {
     // RootCallId identifies the graph root.
     string root_call_id = 2;
   }
+  // ParentInputIds aligns with ParentCallIds and identifies the parent input that created each edge.
+  repeated string parent_input_ids = 3;
 }
 
 // CreateCallRequest describes a call that must be persisted before execution.
@@ -1865,6 +1869,11 @@ message CreateCallRequest {
   oneof result_ttl_millis_presence {
     // ResultTtlMillis is the per-call durable result retention duration.
     uint64 result_ttl_millis = 9;
+  }
+  // ClientSessionId is required and nonempty when ClientCancellation is CANCEL.
+  oneof client_session_id_presence {
+    // ClientSessionId is the creator capability persisted for authenticated watch-drop cancellation.
+    string client_session_id = 10;
   }
 }
 
@@ -1991,6 +2000,15 @@ message CallResult {
   uint64 created_at_unix_millis = 5;
   // Sequence is strictly increasing across all committed results and yields in the call.
   uint64 sequence = 6;
+  // InputId identifies the stable owning input.
+  string input_id = 7;
+  // InputIndex is the owning input's index, including for generator yields.
+  uint64 input_index = 8;
+  // YieldIndex is present only for an indexed generator output.
+  oneof yield_index_presence {
+    // YieldIndex is the generator-local output index.
+    uint64 yield_index = 9;
+  }
 }
 
 // ResultCursor identifies a durable position in one call result sequence.
@@ -2015,6 +2033,11 @@ message WatchCallRequest {
   EventCursor cursor = 1;
   // Follow waits for new events after replaying committed history.
   bool follow = 2;
+  // ClientSessionId is omitted by observers and reattached consumers.
+  oneof client_session_id_presence {
+    // ClientSessionId may trigger drop cancellation only for a follow watch when it exactly matches the creator session.
+    string client_session_id = 3;
+  }
 }
 
 // StatusEvent records a durable lifecycle transition.
@@ -2069,13 +2092,28 @@ message CallEvent {
     // Result records an indexed final result.
     CallResult result = 8;
     // Attempt records an attempt transition.
-    AttemptEvent attempt = 9;
+    AttemptEvent attempt_event = 9;
     // Error records a structured execution error.
     CallError error = 10;
     // InputClosed records the final committed input count.
     StreamCallInputsResponse input_closed = 11;
     // CancelRequested records the durable cancellation request.
     CancelCallRequest cancel_requested = 12;
+  }
+  // InputId is present when the event is attributable to one stable input.
+  oneof input_id_presence {
+    // InputId identifies the stable input.
+    string input_id = 13;
+  }
+  // InputIndex is present when the event is attributable to one indexed input.
+  oneof input_index_presence {
+    // InputIndex is the owning input's index.
+    uint64 input_index = 14;
+  }
+  // Attempt is present when the event is attributable to one execution attempt.
+  oneof attempt_presence {
+    // Attempt is the one-based execution attempt number.
+    uint32 attempt = 15;
   }
 }
 

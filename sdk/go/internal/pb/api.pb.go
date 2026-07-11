@@ -8861,7 +8861,9 @@ type CallInput struct {
 	// Index is zero for unary calls and monotonically increasing for batch inputs.
 	Index uint64 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
 	// Value is the typed input envelope.
-	Value         *ValueEnvelope `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Value *ValueEnvelope `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// InputId is a stable identifier; the server assigns one when the client leaves it empty.
+	InputId       string `protobuf:"bytes,3,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8910,6 +8912,13 @@ func (x *CallInput) GetValue() *ValueEnvelope {
 	return nil
 }
 
+func (x *CallInput) GetInputId() string {
+	if x != nil {
+		return x.InputId
+	}
+	return ""
+}
+
 // CallGraph records durable parent relationships between calls.
 type CallGraph struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -8921,8 +8930,10 @@ type CallGraph struct {
 	//
 	//	*CallGraph_RootCallId
 	RootCallIdPresence isCallGraph_RootCallIdPresence `protobuf_oneof:"root_call_id_presence"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// ParentInputIds aligns with ParentCallIds and identifies the parent input that created each edge.
+	ParentInputIds []string `protobuf:"bytes,3,rep,name=parent_input_ids,json=parentInputIds,proto3" json:"parent_input_ids,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CallGraph) Reset() {
@@ -8978,6 +8989,13 @@ func (x *CallGraph) GetRootCallId() string {
 	return ""
 }
 
+func (x *CallGraph) GetParentInputIds() []string {
+	if x != nil {
+		return x.ParentInputIds
+	}
+	return nil
+}
+
 type isCallGraph_RootCallIdPresence interface {
 	isCallGraph_RootCallIdPresence()
 }
@@ -9014,6 +9032,12 @@ type CreateCallRequest struct {
 	//
 	//	*CreateCallRequest_ResultTtlMillis
 	ResultTtlMillisPresence isCreateCallRequest_ResultTtlMillisPresence `protobuf_oneof:"result_ttl_millis_presence"`
+	// ClientSessionId is required and nonempty when ClientCancellation is CANCEL.
+	//
+	// Types that are valid to be assigned to ClientSessionIdPresence:
+	//
+	//	*CreateCallRequest_ClientSessionId
+	ClientSessionIdPresence isCreateCallRequest_ClientSessionIdPresence `protobuf_oneof:"client_session_id_presence"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -9120,6 +9144,22 @@ func (x *CreateCallRequest) GetResultTtlMillis() uint64 {
 	return 0
 }
 
+func (x *CreateCallRequest) GetClientSessionIdPresence() isCreateCallRequest_ClientSessionIdPresence {
+	if x != nil {
+		return x.ClientSessionIdPresence
+	}
+	return nil
+}
+
+func (x *CreateCallRequest) GetClientSessionId() string {
+	if x != nil {
+		if x, ok := x.ClientSessionIdPresence.(*CreateCallRequest_ClientSessionId); ok {
+			return x.ClientSessionId
+		}
+	}
+	return ""
+}
+
 type isCreateCallRequest_ResultTtlMillisPresence interface {
 	isCreateCallRequest_ResultTtlMillisPresence()
 }
@@ -9130,6 +9170,17 @@ type CreateCallRequest_ResultTtlMillis struct {
 }
 
 func (*CreateCallRequest_ResultTtlMillis) isCreateCallRequest_ResultTtlMillisPresence() {}
+
+type isCreateCallRequest_ClientSessionIdPresence interface {
+	isCreateCallRequest_ClientSessionIdPresence()
+}
+
+type CreateCallRequest_ClientSessionId struct {
+	// ClientSessionId is the creator capability persisted for authenticated watch-drop cancellation.
+	ClientSessionId string `protobuf:"bytes,10,opt,name=client_session_id,json=clientSessionId,proto3,oneof"`
+}
+
+func (*CreateCallRequest_ClientSessionId) isCreateCallRequest_ClientSessionIdPresence() {}
 
 // CallRecord is the latest durable state of a call.
 type CallRecord struct {
@@ -9829,9 +9880,19 @@ type CallResult struct {
 	// CreatedAtUnixMillis is the result commit time.
 	CreatedAtUnixMillis uint64 `protobuf:"varint,5,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
 	// Sequence is strictly increasing across all committed results and yields in the call.
-	Sequence      uint64 `protobuf:"varint,6,opt,name=sequence,proto3" json:"sequence,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Sequence uint64 `protobuf:"varint,6,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// InputId identifies the stable owning input.
+	InputId string `protobuf:"bytes,7,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
+	// InputIndex is the owning input's index, including for generator yields.
+	InputIndex uint64 `protobuf:"varint,8,opt,name=input_index,json=inputIndex,proto3" json:"input_index,omitempty"`
+	// YieldIndex is present only for an indexed generator output.
+	//
+	// Types that are valid to be assigned to YieldIndexPresence:
+	//
+	//	*CallResult_YieldIndex
+	YieldIndexPresence isCallResult_YieldIndexPresence `protobuf_oneof:"yield_index_presence"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *CallResult) Reset() {
@@ -9917,6 +9978,36 @@ func (x *CallResult) GetSequence() uint64 {
 	return 0
 }
 
+func (x *CallResult) GetInputId() string {
+	if x != nil {
+		return x.InputId
+	}
+	return ""
+}
+
+func (x *CallResult) GetInputIndex() uint64 {
+	if x != nil {
+		return x.InputIndex
+	}
+	return 0
+}
+
+func (x *CallResult) GetYieldIndexPresence() isCallResult_YieldIndexPresence {
+	if x != nil {
+		return x.YieldIndexPresence
+	}
+	return nil
+}
+
+func (x *CallResult) GetYieldIndex() uint64 {
+	if x != nil {
+		if x, ok := x.YieldIndexPresence.(*CallResult_YieldIndex); ok {
+			return x.YieldIndex
+		}
+	}
+	return 0
+}
+
 type isCallResult_Outcome interface {
 	isCallResult_Outcome()
 }
@@ -9934,6 +10025,17 @@ type CallResult_Error struct {
 func (*CallResult_Value) isCallResult_Outcome() {}
 
 func (*CallResult_Error) isCallResult_Outcome() {}
+
+type isCallResult_YieldIndexPresence interface {
+	isCallResult_YieldIndexPresence()
+}
+
+type CallResult_YieldIndex struct {
+	// YieldIndex is the generator-local output index.
+	YieldIndex uint64 `protobuf:"varint,9,opt,name=yield_index,json=yieldIndex,proto3,oneof"`
+}
+
+func (*CallResult_YieldIndex) isCallResult_YieldIndexPresence() {}
 
 // ResultCursor identifies a durable position in one call result sequence.
 type ResultCursor struct {
@@ -10051,9 +10153,15 @@ type WatchCallRequest struct {
 	// Cursor identifies the call and last processed sequence.
 	Cursor *EventCursor `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	// Follow waits for new events after replaying committed history.
-	Follow        bool `protobuf:"varint,2,opt,name=follow,proto3" json:"follow,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Follow bool `protobuf:"varint,2,opt,name=follow,proto3" json:"follow,omitempty"`
+	// ClientSessionId is omitted by observers and reattached consumers.
+	//
+	// Types that are valid to be assigned to ClientSessionIdPresence:
+	//
+	//	*WatchCallRequest_ClientSessionId
+	ClientSessionIdPresence isWatchCallRequest_ClientSessionIdPresence `protobuf_oneof:"client_session_id_presence"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *WatchCallRequest) Reset() {
@@ -10099,6 +10207,33 @@ func (x *WatchCallRequest) GetFollow() bool {
 	}
 	return false
 }
+
+func (x *WatchCallRequest) GetClientSessionIdPresence() isWatchCallRequest_ClientSessionIdPresence {
+	if x != nil {
+		return x.ClientSessionIdPresence
+	}
+	return nil
+}
+
+func (x *WatchCallRequest) GetClientSessionId() string {
+	if x != nil {
+		if x, ok := x.ClientSessionIdPresence.(*WatchCallRequest_ClientSessionId); ok {
+			return x.ClientSessionId
+		}
+	}
+	return ""
+}
+
+type isWatchCallRequest_ClientSessionIdPresence interface {
+	isWatchCallRequest_ClientSessionIdPresence()
+}
+
+type WatchCallRequest_ClientSessionId struct {
+	// ClientSessionId may trigger drop cancellation only for a follow watch when it exactly matches the creator session.
+	ClientSessionId string `protobuf:"bytes,3,opt,name=client_session_id,json=clientSessionId,proto3,oneof"`
+}
+
+func (*WatchCallRequest_ClientSessionId) isWatchCallRequest_ClientSessionIdPresence() {}
 
 // StatusEvent records a durable lifecycle transition.
 type StatusEvent struct {
@@ -10326,13 +10461,31 @@ type CallEvent struct {
 	//	*CallEvent_Log
 	//	*CallEvent_Yield
 	//	*CallEvent_Result
-	//	*CallEvent_Attempt
+	//	*CallEvent_AttemptEvent
 	//	*CallEvent_Error
 	//	*CallEvent_InputClosed
 	//	*CallEvent_CancelRequested
-	Payload       isCallEvent_Payload `protobuf_oneof:"payload"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Payload isCallEvent_Payload `protobuf_oneof:"payload"`
+	// InputId is present when the event is attributable to one stable input.
+	//
+	// Types that are valid to be assigned to InputIdPresence:
+	//
+	//	*CallEvent_InputId
+	InputIdPresence isCallEvent_InputIdPresence `protobuf_oneof:"input_id_presence"`
+	// InputIndex is present when the event is attributable to one indexed input.
+	//
+	// Types that are valid to be assigned to InputIndexPresence:
+	//
+	//	*CallEvent_InputIndex
+	InputIndexPresence isCallEvent_InputIndexPresence `protobuf_oneof:"input_index_presence"`
+	// Attempt is present when the event is attributable to one execution attempt.
+	//
+	// Types that are valid to be assigned to AttemptPresence:
+	//
+	//	*CallEvent_Attempt
+	AttemptPresence isCallEvent_AttemptPresence `protobuf_oneof:"attempt_presence"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CallEvent) Reset() {
@@ -10436,10 +10589,10 @@ func (x *CallEvent) GetResult() *CallResult {
 	return nil
 }
 
-func (x *CallEvent) GetAttempt() *AttemptEvent {
+func (x *CallEvent) GetAttemptEvent() *AttemptEvent {
 	if x != nil {
-		if x, ok := x.Payload.(*CallEvent_Attempt); ok {
-			return x.Attempt
+		if x, ok := x.Payload.(*CallEvent_AttemptEvent); ok {
+			return x.AttemptEvent
 		}
 	}
 	return nil
@@ -10472,6 +10625,54 @@ func (x *CallEvent) GetCancelRequested() *CancelCallRequest {
 	return nil
 }
 
+func (x *CallEvent) GetInputIdPresence() isCallEvent_InputIdPresence {
+	if x != nil {
+		return x.InputIdPresence
+	}
+	return nil
+}
+
+func (x *CallEvent) GetInputId() string {
+	if x != nil {
+		if x, ok := x.InputIdPresence.(*CallEvent_InputId); ok {
+			return x.InputId
+		}
+	}
+	return ""
+}
+
+func (x *CallEvent) GetInputIndexPresence() isCallEvent_InputIndexPresence {
+	if x != nil {
+		return x.InputIndexPresence
+	}
+	return nil
+}
+
+func (x *CallEvent) GetInputIndex() uint64 {
+	if x != nil {
+		if x, ok := x.InputIndexPresence.(*CallEvent_InputIndex); ok {
+			return x.InputIndex
+		}
+	}
+	return 0
+}
+
+func (x *CallEvent) GetAttemptPresence() isCallEvent_AttemptPresence {
+	if x != nil {
+		return x.AttemptPresence
+	}
+	return nil
+}
+
+func (x *CallEvent) GetAttempt() uint32 {
+	if x != nil {
+		if x, ok := x.AttemptPresence.(*CallEvent_Attempt); ok {
+			return x.Attempt
+		}
+	}
+	return 0
+}
+
 type isCallEvent_Payload interface {
 	isCallEvent_Payload()
 }
@@ -10496,9 +10697,9 @@ type CallEvent_Result struct {
 	Result *CallResult `protobuf:"bytes,8,opt,name=result,proto3,oneof"`
 }
 
-type CallEvent_Attempt struct {
+type CallEvent_AttemptEvent struct {
 	// Attempt records an attempt transition.
-	Attempt *AttemptEvent `protobuf:"bytes,9,opt,name=attempt,proto3,oneof"`
+	AttemptEvent *AttemptEvent `protobuf:"bytes,9,opt,name=attempt_event,json=attemptEvent,proto3,oneof"`
 }
 
 type CallEvent_Error struct {
@@ -10524,13 +10725,46 @@ func (*CallEvent_Yield) isCallEvent_Payload() {}
 
 func (*CallEvent_Result) isCallEvent_Payload() {}
 
-func (*CallEvent_Attempt) isCallEvent_Payload() {}
+func (*CallEvent_AttemptEvent) isCallEvent_Payload() {}
 
 func (*CallEvent_Error) isCallEvent_Payload() {}
 
 func (*CallEvent_InputClosed) isCallEvent_Payload() {}
 
 func (*CallEvent_CancelRequested) isCallEvent_Payload() {}
+
+type isCallEvent_InputIdPresence interface {
+	isCallEvent_InputIdPresence()
+}
+
+type CallEvent_InputId struct {
+	// InputId identifies the stable input.
+	InputId string `protobuf:"bytes,13,opt,name=input_id,json=inputId,proto3,oneof"`
+}
+
+func (*CallEvent_InputId) isCallEvent_InputIdPresence() {}
+
+type isCallEvent_InputIndexPresence interface {
+	isCallEvent_InputIndexPresence()
+}
+
+type CallEvent_InputIndex struct {
+	// InputIndex is the owning input's index.
+	InputIndex uint64 `protobuf:"varint,14,opt,name=input_index,json=inputIndex,proto3,oneof"`
+}
+
+func (*CallEvent_InputIndex) isCallEvent_InputIndexPresence() {}
+
+type isCallEvent_AttemptPresence interface {
+	isCallEvent_AttemptPresence()
+}
+
+type CallEvent_Attempt struct {
+	// Attempt is the one-based execution attempt number.
+	Attempt uint32 `protobuf:"varint,15,opt,name=attempt,proto3,oneof"`
+}
+
+func (*CallEvent_Attempt) isCallEvent_AttemptPresence() {}
 
 // ErrorFrame is one structured stack frame.
 type ErrorFrame struct {
@@ -12084,15 +12318,17 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x05actor\x18\x02 \x01(\v2\x11.vmon.v1.ActorRefH\x00R\x05actor\x12#\n" +
 	"\factor_method\x18\x03 \x01(\tH\x01R\vactorMethodB\x10\n" +
 	"\x0eactor_presenceB\x17\n" +
-	"\x15actor_method_presence\"O\n" +
+	"\x15actor_method_presence\"j\n" +
 	"\tCallInput\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12,\n" +
-	"\x05value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeR\x05value\"p\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.vmon.v1.ValueEnvelopeR\x05value\x12\x19\n" +
+	"\binput_id\x18\x03 \x01(\tR\ainputId\"\x9a\x01\n" +
 	"\tCallGraph\x12&\n" +
 	"\x0fparent_call_ids\x18\x01 \x03(\tR\rparentCallIds\x12\"\n" +
 	"\froot_call_id\x18\x02 \x01(\tH\x00R\n" +
-	"rootCallIdB\x17\n" +
-	"\x15root_call_id_presence\"\x9c\x04\n" +
+	"rootCallId\x12(\n" +
+	"\x10parent_input_ids\x18\x03 \x03(\tR\x0eparentInputIdsB\x17\n" +
+	"\x15root_call_id_presence\"\xe8\x04\n" +
 	"\x11CreateCallRequest\x12%\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x11.vmon.v1.CallTypeR\x04type\x12+\n" +
 	"\x06target\x18\x02 \x01(\v2\x13.vmon.v1.CallTargetR\x06target\x12*\n" +
@@ -12103,11 +12339,14 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"request_id\x18\x06 \x01(\tR\trequestId\x12>\n" +
 	"\x06labels\x18\a \x03(\v2&.vmon.v1.CreateCallRequest.LabelsEntryR\x06labels\x12R\n" +
 	"\x13client_cancellation\x18\b \x01(\x0e2!.vmon.v1.ClientCancellationPolicyR\x12clientCancellation\x12,\n" +
-	"\x11result_ttl_millis\x18\t \x01(\x04H\x00R\x0fresultTtlMillis\x1a9\n" +
+	"\x11result_ttl_millis\x18\t \x01(\x04H\x00R\x0fresultTtlMillis\x12,\n" +
+	"\x11client_session_id\x18\n" +
+	" \x01(\tH\x01R\x0fclientSessionId\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x1c\n" +
-	"\x1aresult_ttl_millis_presence\"\xc6\x05\n" +
+	"\x1aresult_ttl_millis_presenceB\x1c\n" +
+	"\x1aclient_session_id_presence\"\xc6\x05\n" +
 	"\n" +
 	"CallRecord\x12\"\n" +
 	"\x03ref\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x03ref\x12%\n" +
@@ -12157,7 +12396,7 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"R\n" +
 	"\x14GetCallResultRequest\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12\x14\n" +
-	"\x05index\x18\x02 \x01(\x04R\x05index\"\x80\x02\n" +
+	"\x05index\x18\x02 \x01(\x04R\x05index\"\xf7\x02\n" +
 	"\n" +
 	"CallResult\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12\x14\n" +
@@ -12165,17 +12404,25 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x05value\x18\x03 \x01(\v2\x16.vmon.v1.ValueEnvelopeH\x00R\x05value\x12*\n" +
 	"\x05error\x18\x04 \x01(\v2\x12.vmon.v1.CallErrorH\x00R\x05error\x123\n" +
 	"\x16created_at_unix_millis\x18\x05 \x01(\x04R\x13createdAtUnixMillis\x12\x1a\n" +
-	"\bsequence\x18\x06 \x01(\x04R\bsequenceB\t\n" +
-	"\aoutcome\"[\n" +
+	"\bsequence\x18\x06 \x01(\x04R\bsequence\x12\x19\n" +
+	"\binput_id\x18\a \x01(\tR\ainputId\x12\x1f\n" +
+	"\vinput_index\x18\b \x01(\x04R\n" +
+	"inputIndex\x12!\n" +
+	"\vyield_index\x18\t \x01(\x04H\x01R\n" +
+	"yieldIndexB\t\n" +
+	"\aoutcomeB\x16\n" +
+	"\x14yield_index_presence\"[\n" +
 	"\fResultCursor\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12%\n" +
 	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"Z\n" +
 	"\vEventCursor\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12%\n" +
-	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"X\n" +
+	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"\xa4\x01\n" +
 	"\x10WatchCallRequest\x12,\n" +
 	"\x06cursor\x18\x01 \x01(\v2\x14.vmon.v1.EventCursorR\x06cursor\x12\x16\n" +
-	"\x06follow\x18\x02 \x01(\bR\x06follow\":\n" +
+	"\x06follow\x18\x02 \x01(\bR\x06follow\x12,\n" +
+	"\x11client_session_id\x18\x03 \x01(\tH\x00R\x0fclientSessionIdB\x1c\n" +
+	"\x1aclient_session_id_presence\":\n" +
 	"\vStatusEvent\x12+\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x13.vmon.v1.CallStatusR\x06status\"J\n" +
 	"\bLogEvent\x12*\n" +
@@ -12187,7 +12434,7 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\astartup\x18\x03 \x01(\x0e2\x14.vmon.v1.StartupKindR\astartup\x12\x1b\n" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12*\n" +
 	"\x05error\x18\x05 \x01(\v2\x12.vmon.v1.CallErrorH\x00R\x05errorB\x10\n" +
-	"\x0eerror_presence\"\xdc\x04\n" +
+	"\x0eerror_presence\"\x84\x06\n" +
 	"\tCallEvent\x12$\n" +
 	"\x04call\x18\x01 \x01(\v2\x10.vmon.v1.CallRefR\x04call\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x123\n" +
@@ -12196,13 +12443,20 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x06status\x18\x05 \x01(\v2\x14.vmon.v1.StatusEventH\x00R\x06status\x12%\n" +
 	"\x03log\x18\x06 \x01(\v2\x11.vmon.v1.LogEventH\x00R\x03log\x12+\n" +
 	"\x05yield\x18\a \x01(\v2\x13.vmon.v1.CallResultH\x00R\x05yield\x12-\n" +
-	"\x06result\x18\b \x01(\v2\x13.vmon.v1.CallResultH\x00R\x06result\x121\n" +
-	"\aattempt\x18\t \x01(\v2\x15.vmon.v1.AttemptEventH\x00R\aattempt\x12*\n" +
+	"\x06result\x18\b \x01(\v2\x13.vmon.v1.CallResultH\x00R\x06result\x12<\n" +
+	"\rattempt_event\x18\t \x01(\v2\x15.vmon.v1.AttemptEventH\x00R\fattemptEvent\x12*\n" +
 	"\x05error\x18\n" +
 	" \x01(\v2\x12.vmon.v1.CallErrorH\x00R\x05error\x12F\n" +
 	"\finput_closed\x18\v \x01(\v2!.vmon.v1.StreamCallInputsResponseH\x00R\vinputClosed\x12G\n" +
-	"\x10cancel_requested\x18\f \x01(\v2\x1a.vmon.v1.CancelCallRequestH\x00R\x0fcancelRequestedB\t\n" +
-	"\apayload\"w\n" +
+	"\x10cancel_requested\x18\f \x01(\v2\x1a.vmon.v1.CancelCallRequestH\x00R\x0fcancelRequested\x12\x1b\n" +
+	"\binput_id\x18\r \x01(\tH\x01R\ainputId\x12!\n" +
+	"\vinput_index\x18\x0e \x01(\x04H\x02R\n" +
+	"inputIndex\x12\x1a\n" +
+	"\aattempt\x18\x0f \x01(\rH\x03R\aattemptB\t\n" +
+	"\apayloadB\x13\n" +
+	"\x11input_id_presenceB\x16\n" +
+	"\x14input_index_presenceB\x12\n" +
+	"\x10attempt_presence\"w\n" +
 	"\n" +
 	"ErrorFrame\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\tR\x04file\x12\x12\n" +
@@ -12831,7 +13085,7 @@ var file_vmon_v1_api_proto_depIdxs = []int32{
 	143, // 162: vmon.v1.CallEvent.log:type_name -> vmon.v1.LogEvent
 	138, // 163: vmon.v1.CallEvent.yield:type_name -> vmon.v1.CallResult
 	138, // 164: vmon.v1.CallEvent.result:type_name -> vmon.v1.CallResult
-	144, // 165: vmon.v1.CallEvent.attempt:type_name -> vmon.v1.AttemptEvent
+	144, // 165: vmon.v1.CallEvent.attempt_event:type_name -> vmon.v1.AttemptEvent
 	147, // 166: vmon.v1.CallEvent.error:type_name -> vmon.v1.CallError
 	133, // 167: vmon.v1.CallEvent.input_closed:type_name -> vmon.v1.StreamCallInputsResponse
 	150, // 168: vmon.v1.CallEvent.cancel_requested:type_name -> vmon.v1.CancelCallRequest
@@ -13120,6 +13374,7 @@ func file_vmon_v1_api_proto_init() {
 	}
 	file_vmon_v1_api_proto_msgTypes[112].OneofWrappers = []any{
 		(*CreateCallRequest_ResultTtlMillis)(nil),
+		(*CreateCallRequest_ClientSessionId)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[113].OneofWrappers = []any{
 		(*CallRecord_Error)(nil),
@@ -13137,6 +13392,10 @@ func file_vmon_v1_api_proto_init() {
 	file_vmon_v1_api_proto_msgTypes[120].OneofWrappers = []any{
 		(*CallResult_Value)(nil),
 		(*CallResult_Error)(nil),
+		(*CallResult_YieldIndex)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[123].OneofWrappers = []any{
+		(*WatchCallRequest_ClientSessionId)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[126].OneofWrappers = []any{
 		(*AttemptEvent_Error)(nil),
@@ -13146,10 +13405,13 @@ func file_vmon_v1_api_proto_init() {
 		(*CallEvent_Log)(nil),
 		(*CallEvent_Yield)(nil),
 		(*CallEvent_Result)(nil),
-		(*CallEvent_Attempt)(nil),
+		(*CallEvent_AttemptEvent)(nil),
 		(*CallEvent_Error)(nil),
 		(*CallEvent_InputClosed)(nil),
 		(*CallEvent_CancelRequested)(nil),
+		(*CallEvent_InputId)(nil),
+		(*CallEvent_InputIndex)(nil),
+		(*CallEvent_Attempt)(nil),
 	}
 	file_vmon_v1_api_proto_msgTypes[128].OneofWrappers = []any{
 		(*ErrorFrame_Code)(nil),
