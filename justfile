@@ -160,16 +160,16 @@ seccomp-audit:
 # TypeScript SDK recipes live under `sdk-ts` and `sdk-ts-smoke`.
 
 # Format every language in place.
-format: fmt-rust fmt-py fmt-ui
+format: fmt-rust fmt-py fmt-ui fmt-ts fmt-go
 
 # Verify formatting across every language without writing (CI gate).
-fmt-check: fmt-check-rust fmt-check-py fmt-check-ui
+fmt-check: fmt-check-rust fmt-check-py fmt-check-ui fmt-check-ts fmt-check-go
 
-# Lint every language (biome | ruff | clippy).
-lint: lint-rust lint-py lint-ui
+# Lint every language (biome | ruff | clippy | go vet).
+lint: lint-rust lint-py lint-ui lint-ts lint-go
 
-# Static/type-check every language (tsc | mypy | cargo check).
-check: check-rust check-py check-ui
+# Static/type-check every language (tsc | mypy | cargo check | go build).
+check: check-rust check-py check-ui check-ts check-go
 
 # -- Rust --
 fmt-rust:
@@ -226,6 +226,18 @@ check-ui:
     cd ui && bun run typecheck
 
 # -- TypeScript SDK (sdk/ts) --
+fmt-ts:
+    cd sdk/ts && bun run format
+
+fmt-check-ts:
+    cd sdk/ts && bun run format:check
+
+lint-ts:
+    cd sdk/ts && bun run lint
+
+check-ts:
+    cd sdk/ts && bun run typecheck
+
 sdk-ts:
     cd sdk/ts && bun install && bun run typecheck
 
@@ -233,6 +245,18 @@ sdk-ts-smoke:
     cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
 
 # -- Go SDK (sdk/go) --
+fmt-go:
+    gofmt -s -w sdk/go
+
+fmt-check-go:
+    @test -z "$(gofmt -l sdk/go)" || { echo "Go files need formatting. Run 'just format' to fix."; gofmt -d sdk/go; exit 1; }
+
+lint-go:
+    cd sdk/go && go vet ./...
+
+check-go:
+    cd sdk/go && go build ./...
+
 sdk-go:
     cd sdk/go && go test ./...
 
