@@ -140,6 +140,8 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated durable function calls to support structured invocation arguments
+- Enhanced durable function call results to support paginated output and streaming retrieval
 - Updated `ResourceSpec` to define CPU requirements in absolute vCPUs (`cpus`) instead of `cpu_millis`
 - Updated I-JSON serialization to enforce strict IEEE-754 range and object key constraints
 - Migrated `StreamInputs` from unary to bidirectional streaming for improved result synchronization

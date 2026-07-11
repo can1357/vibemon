@@ -1081,6 +1081,21 @@ fn wait_call(grpc: &Grpc, call_id: &str) -> Result<i32> {
 	}
 }
 
+fn invocation_input(values: &[Value], input_id: String) -> Result<pb::CallInput> {
+	if input_id.is_empty() {
+		return err("call input ID must not be empty");
+	}
+	let positional = values.iter().map(json_envelope).collect::<Result<Vec<_>>>()?;
+	Ok(pb::CallInput {
+		index: 0,
+		payload: Some(pb::call_input::Payload::Arguments(pb::InvocationArguments {
+			positional,
+			named: HashMap::new(),
+		})),
+		input_id,
+	})
+}
+
 fn cmd_run_function(
 	target: String,
 	raw_args: Vec<String>,
@@ -1099,7 +1114,17 @@ fn cmd_run_function(
 		.next()
 		.ok_or_else(|| CliError::new("target inspection returned no function"))?;
 	let grpc = client(options, true)?.grpc()?;
-	let input = json_envelope(&json!({"args": values, "kwargs": {}}))?;
+	let call_request_id = request_id(
+		"cli-call",
+		format!(
+			"{target}:{}",
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map_err(|error| CliError::new(error.to_string()))?
+				.as_nanos()
+		)
+		.as_bytes(),
+	);
 	let mut calls = grpc.calls();
 	install_call_interrupt();
 	let call = grpc
@@ -1107,31 +1132,14 @@ fn cmd_run_function(
 			r#type: pb::CallType::Unary as i32,
 			target: Some(pb::CallTarget {
 				function: Some(revision),
-				actor_presence: None,
-				actor_method_presence: None,
+				receiver: None,
 			}),
-			inputs: vec![pb::CallInput {
-				index: 0,
-				value: Some(input),
-				input_id: String::new(),
-			}],
+			inputs: vec![invocation_input(&values, format!("{call_request_id}:0"))?],
 			inputs_closed: true,
 			graph: Some(pb::CallGraph::default()),
-			request_id: request_id(
-				"cli-call",
-				format!(
-					"{target}:{}",
-					SystemTime::now()
-						.duration_since(UNIX_EPOCH)
-						.map_err(|error| CliError::new(error.to_string()))?
-						.as_nanos()
-				)
-				.as_bytes(),
-			),
+			request_id: call_request_id,
 			labels: HashMap::new(),
-			client_cancellation: pb::ClientCancellationPolicy::Detach as i32,
 			result_ttl_millis_presence: None,
-			client_session_id_presence: None,
 		}))
 		.map_err(status_error)?
 		.into_inner();
@@ -1450,6 +1458,48 @@ fn call_status_name(status: i32) -> &'static str {
 	pb::CallStatus::try_from(status).map_or("CALL_STATUS_UNKNOWN", |status| status.as_str_name())
 }
 
+fn print_call_results(grpc: &Grpc, call: pb::CallRef) -> Result<i32> {
+	let mut calls = grpc.calls();
+	let mut after_sequence = 0;
+	let mut exit_code = 0;
+	loop {
+		let requested_after = after_sequence;
+		let page = grpc
+			.block_on(calls.list_results(pb::ListCallResultsRequest {
+				cursor: Some(pb::ResultCursor {
+					call: Some(call.clone()),
+					after_sequence,
+				}),
+				page_size: 200,
+			}))
+			.map_err(status_error)?
+			.into_inner();
+		for result in page.results {
+			after_sequence = after_sequence.max(result.sequence);
+			let outcome =
+				result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
+			exit_code = exit_code.max(outcome_exit_code(&outcome));
+			match outcome {
+				pb::call_result::Outcome::Value(value) => {
+					println!("{}", serde_json::to_string_pretty(&envelope_json(grpc, &value)?)?);
+				},
+				pb::call_result::Outcome::Error(error) => print_call_error(&error),
+			}
+		}
+		if page.end {
+			return Ok(exit_code);
+		}
+		let next = page
+			.next_cursor
+			.ok_or_else(|| CliError::new("call result page omitted continuation cursor"))?
+			.after_sequence;
+		if next <= requested_after {
+			return err("call result cursor did not advance");
+		}
+		after_sequence = next;
+	}
+}
+
 fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
 	let grpc = client(options, true)?.grpc()?;
 	match command {
@@ -1472,24 +1522,10 @@ fn cmd_call(command: CallCommands, options: &TransportOptions) -> Result<i32> {
 					"updated_at_unix_millis": record.updated_at_unix_millis,
 				}))?
 			);
-			if record.status == pb::CallStatus::Succeeded as i32 && record.result_count > 0 {
-				let result = grpc
-					.block_on(calls.get_result(pb::GetCallResultRequest {
-						call: record.r#ref,
-						index: 0,
-					}))
-					.map_err(status_error)?
-					.into_inner();
-				let outcome =
-					result.outcome.ok_or_else(|| CliError::new("call result omitted outcome"))?;
-				let exit_code = outcome_exit_code(&outcome);
-				match outcome {
-					pb::call_result::Outcome::Value(value) => {
-						println!("{}", serde_json::to_string_pretty(&envelope_json(&grpc, &value)?)?);
-					},
-					pb::call_result::Outcome::Error(error) => print_call_error(&error),
-				}
-				Ok(exit_code)
+			if record.result_count > 0 {
+				let call =
+					record.r#ref.ok_or_else(|| CliError::new("call record omitted its ID"))?;
+				print_call_results(&grpc, call)
 			} else if let Some(pb::call_record::ErrorPresence::Error(error)) =
 				record.error_presence
 			{
@@ -1513,7 +1549,6 @@ fn follow_call_logs(grpc: &Grpc, call_id: &str, follow: bool) -> Result<i32> {
 				after_sequence,
 			}),
 			follow,
-			client_session_id_presence: None,
 		}));
 		let mut stream = match response {
 			Ok(response) => response.into_inner(),
@@ -2575,6 +2610,15 @@ mod durable_cli_tests {
 		let error = pb::call_result::Outcome::Error(pb::CallError::default());
 		assert_eq!(outcome_exit_code(&value), 0);
 		assert_eq!(outcome_exit_code(&error), 1);
+		let input =
+			invocation_input(&[json!(1), json!({"key": "value"})], "request-1:0".to_owned())
+				.unwrap();
+		assert!(!input.input_id.is_empty());
+		let Some(pb::call_input::Payload::Arguments(arguments)) = input.payload else {
+			panic!("expected structured invocation arguments");
+		};
+		assert_eq!(arguments.positional.len(), 2);
+		assert!(arguments.named.is_empty());
 	}
 
 	#[test]
