@@ -458,6 +458,7 @@ fn networking_supported() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_net_admin() -> bool {
+	// SAFETY: `geteuid` reads the effective user ID without dereferencing pointers.
 	if unsafe { libc::geteuid() } == 0 {
 		return true;
 	}

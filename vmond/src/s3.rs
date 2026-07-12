@@ -802,10 +802,15 @@ mod sigv4 {
 			.map(|(name, _)| name.as_str())
 			.collect::<Vec<_>>()
 			.join(";");
-		let canonical_request = format!(
-			"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\\
-			 n{payload_hash}"
-		);
+		let canonical_request = [
+			method,
+			canonical_uri,
+			canonical_query,
+			&canonical_headers,
+			&signed_headers,
+			payload_hash,
+		]
+		.join("\n");
 		let date = timestamp.format("%Y%m%d").to_string();
 		let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
 		let scope = format!("{date}/{region}/s3/aws4_request");
