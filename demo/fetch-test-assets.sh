@@ -493,7 +493,7 @@ case "$mode" in
     fi
     share=$(cat /mnt/SHARE.txt 2>/dev/null) || fail "read /mnt/SHARE.txt"
     [ "$share" = "vmon share fixture" ] || fail "unexpected SHARE.txt: $share"
-    if echo deny > /mnt/DENY.txt 2>/dev/null; then
+    if (echo deny > /mnt/DENY.txt) 2>/dev/null; then
       fail "write to read-only virtiofs share unexpectedly succeeded"
     fi
     echo "FSSHARE_OK"
