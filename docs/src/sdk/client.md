@@ -260,7 +260,7 @@ console.log(sandbox.id, snapshotNames, deployed);
 </div>
 </div>
 
-See [Sandboxes](sandboxes.md), [Snapshots](snapshots.md), [Volumes and Secrets](volumes-and-secrets.md), [Processes](processes.md), [Files and Ports](files-and-ports.md), and [Durable Functions](functions.md) for operation-specific APIs. [Shared Concepts](../shared-concepts.md) describes the common resource and endpoint-affinity model.
+See [Sandboxes](sandboxes.md), [Snapshots](snapshots.md), [Volumes and Secrets](volumes-and-secrets.md), [Processes](processes.md), [Files and Ports](files-and-ports.md), and [Durable Functions](functions.md) for operation-specific APIs. [Shared Concepts](shared-concepts.md) describes the common resource and endpoint-affinity model.
 
 ## Direct driver construction and lifecycle
 
@@ -296,4 +296,4 @@ Closing the client marks a `MeshDriver` closed, so later operations fail instead
 </div>
 </div>
 
-The client does not promise application-level retries. See [Shared Concepts](../shared-concepts.md) for transport failover and affinity, [Errors](errors.md) for SDK failure types, and [Mesh and High Availability](../../platform/mesh.md) for server topology.
+The client does not promise application-level retries. See [Shared Concepts](shared-concepts.md) for transport failover and affinity, [Errors](errors.md) for SDK failure types, and [Mesh and High Availability](../platform/mesh.md) for server topology.

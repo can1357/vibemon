@@ -7,7 +7,7 @@ Vibemon exposes two different capture operations:
 - A **full VM snapshot** captures resumable machine state and is used with the snapshot collection's restore and fork operations.
 - A **filesystem snapshot** produces an image/template reference for later sandbox creation. It does not contain CPU, memory, or device state.
 
-The two result names are not interchangeable. See [Snapshots, Restore, and Fork](../../platform/snapshots.md) for the authoritative capture contents, external-resource behavior, compatibility rules, and copy-on-write implementation.
+The two result names are not interchangeable. See [Snapshots, Restore, and Fork](../platform/snapshots.md) for the authoritative capture contents, external-resource behavior, compatibility rules, and copy-on-write implementation.
 
 ## Capture a sandbox
 
@@ -175,7 +175,7 @@ The optional body is `RestoreRequest`: every `SandboxCreateRequest` field is opt
 
 ### External resources and S3 mounts
 
-A full VM snapshot does not copy arbitrary host resources. Named volumes, ordinary host shares, network backends, and managed S3 storage remain external dependencies. The restoring or forking host must satisfy the requirements documented in the [platform snapshot guide](../../platform/snapshots.md).
+A full VM snapshot does not copy arbitrary host resources. Named volumes, ordinary host shares, network backends, and managed S3 storage remain external dependencies. The restoring or forking host must satisfy the requirements documented in the [platform snapshot guide](../platform/snapshots.md).
 
 For a sandbox created with managed S3 mounts, the daemon records credential-free mount metadata beside the snapshot. Restore and fork reconstruct those recorded mounts using credentials available to the destination daemon. The snapshot never contains access keys, secret keys, session tokens, or the remote S3 objects themselves. A mount that originally used inline credentials or daemon environment credentials therefore requires suitable `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values at the destination, plus `AWS_SESSION_TOKEN` when applicable; anonymous mounts require no credentials.
 
@@ -243,7 +243,7 @@ for (const clone of clones) {
 </div>
 </div>
 
-Create-style fields express a request, not a scheduling or placement promise. Fetch a sandbox again when current owner, placement, or status matters. Mesh eligibility and affinity are described in [Mesh and High Availability](../../platform/mesh.md).
+Create-style fields express a request, not a scheduling or placement promise. Fetch a sandbox again when current owner, placement, or status matters. Mesh eligibility and affinity are described in [Mesh and High Availability](../platform/mesh.md).
 
 ## Manage warm pools
 
@@ -305,4 +305,4 @@ await pool.delete();
 </div>
 </div>
 
-Read the pool inventory when observed capacity matters, and use daemon scheduling telemetry to diagnose misses. Warm-pool scoring never overrides architecture, snapshot compatibility, agent, kernel, or other placement eligibility checks described in [Mesh and High Availability](../../platform/mesh.md).
+Read the pool inventory when observed capacity matters, and use daemon scheduling telemetry to diagnose misses. Warm-pool scoring never overrides architecture, snapshot compatibility, agent, kernel, or other placement eligibility checks described in [Mesh and High Availability](../platform/mesh.md).

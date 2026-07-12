@@ -3,7 +3,7 @@
 `@vmon.cls` defines a Python durable actor: a server-backed class definition
 whose actor instances have durable IDs and exported method calls. This is a
 Python source-packaged feature, not a portable class interface. Read
-[Durable Functions](functions.md) for Python packaging and trusted
+[Durable Functions](../functions.md) for Python packaging and trusted
 serialization, and [Shared Concepts](../shared-concepts.md) for daemon-owned
 durability and execution semantics.
 
