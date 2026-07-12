@@ -1,4 +1,4 @@
-//! virtio-rng (entropy source) backed by the host CSPRNG (`/dev/urandom`).
+//! virtio-rng entropy device backed by the host CSPRNG.
 //!
 //! A single requestq (index 0) carries guest-posted write-only buffers; on each
 //! queue notification the worker fills as many as it can with fresh host
@@ -11,13 +11,13 @@
 //! SSH/key generation, `systemd`, language runtimes) does not block waiting for
 //! the pool to initialize on a freshly booted microVM.
 //!
-//! `/dev/urandom` is opened once at construction — before the seccomp/Landlock
-//! sandbox is installed and inside the jail's bind-mounted `/dev` — and the
-//! worker only ever `read`s the held fd, so it keeps working under the sandbox
-//! without a `getrandom(2)` allowlist entry. This mirrors QEMU's `rng-random`
-//! backend.
+//! The host entropy source is opened once at construction. Unix holds
+//! `/dev/urandom`; Windows uses the process CSPRNG through a temporary source
+//! file so the queue path remains ordinary `Read` I/O.
 
-use std::{fs::File, io::Read, sync::Arc};
+#[cfg(not(target_os = "windows"))]
+use std::io::Read;
+use std::{fs::File, sync::Arc};
 
 use virtio_bindings::{bindings::virtio_config::VIRTIO_F_VERSION_1, virtio_ids::VIRTIO_ID_RNG};
 use virtio_queue::{Queue, QueueT};
@@ -34,8 +34,7 @@ const NUM_QUEUES: usize = 1;
 /// Per-`read` chunk pulled from the entropy source, bounding the host buffer
 /// while one (possibly large) guest descriptor is filled across reads.
 const ENTROPY_CHUNK: u32 = 4096;
-/// Host entropy source. `/dev/urandom` never blocks and is bind-mounted into
-/// the jail's `/dev` (`jail.rs`).
+#[cfg(not(target_os = "windows"))]
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
 /// virtio-rng entropy device. See the module docs.
@@ -43,8 +42,8 @@ pub struct Rng {
 	features:       u64,
 	acked_features: u64,
 	queue_sizes:    Vec<u16>,
-	/// Open handle to the host CSPRNG, read by the worker under the sandbox.
-	source:         File,
+	/// Open Unix entropy handle; Windows uses `ProcessPrng` directly.
+	source:         Option<File>,
 	mem:            Option<GuestMemoryMmap>,
 	interrupt:      Option<Arc<Interrupt>>,
 	queue:          Option<Queue>,
@@ -58,8 +57,13 @@ impl Rng {
 	/// the sandbox filters are installed; the worker only reads the held fd
 	/// afterwards, so a sandboxed worker never needs to open it.
 	pub fn new() -> Result<Self> {
+		#[cfg(not(target_os = "windows"))]
 		let source = File::open(ENTROPY_SOURCE)
 			.map_err(|e| err(format!("opening entropy source {ENTROPY_SOURCE}: {e}")))?;
+		#[cfg(target_os = "windows")]
+		let source = None;
+		#[cfg(not(target_os = "windows"))]
+		let source = Some(source);
 		Ok(Self {
 			features: 1u64 << VIRTIO_F_VERSION_1,
 			acked_features: 0,
@@ -69,6 +73,30 @@ impl Rng {
 			interrupt: None,
 			queue: None,
 		})
+	}
+
+	fn fill_entropy(_source: &mut Option<File>, buffer: &mut [u8]) -> Result<usize> {
+		#[cfg(target_os = "windows")]
+		{
+			let ok = unsafe {
+				windows_sys::Win32::Security::Cryptography::ProcessPrng(
+					buffer.as_mut_ptr(),
+					buffer.len(),
+				)
+			};
+			if ok == 0 {
+				return Err(std::io::Error::last_os_error().into());
+			}
+			Ok(buffer.len())
+		}
+		#[cfg(not(target_os = "windows"))]
+		{
+			_source
+				.as_mut()
+				.expect("Unix entropy source")
+				.read(buffer)
+				.map_err(Into::into)
+		}
 	}
 
 	/// Raise the used-buffer interrupt if the device is activated.
@@ -106,7 +134,7 @@ impl Rng {
 					let take_usize = take as usize;
 					// A source/guest fault leaves the bytes already written valid;
 					// stop this descriptor and complete the chain with that count.
-					if self.source.read_exact(&mut buf[..take_usize]).is_err()
+					if Self::fill_entropy(&mut self.source, &mut buf[..take_usize]).is_err()
 						|| mem.write_slice(&buf[..take_usize], addr).is_err()
 					{
 						break;

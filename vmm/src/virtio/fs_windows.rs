@@ -328,6 +328,9 @@ impl Fs {
 		let mut by_path = HashMap::from([(root.clone(), FUSE_ROOT_ID)]);
 		let mut greatest_id = FUSE_ROOT_ID;
 		for (id, relative) in &state.inodes {
+			if *id == FUSE_ROOT_ID && relative == "." {
+				continue;
+			}
 			let relative = Path::new(relative);
 			if *id <= FUSE_ROOT_ID || !safe_relative(relative) {
 				return Err(err(format!(

@@ -431,6 +431,7 @@ mod tests {
 		assert!(err.contains("page-aligned"), "unexpected error: {err}");
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn create_guest_memory_private_rejects_trailing_file_bytes() {
 		let path = std::env::temp_dir().join(format!(

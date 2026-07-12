@@ -41,7 +41,7 @@ seccompiler = "0.5"
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 libwhp = { git = "https://github.com/insula-rs/libwhp", rev = "3ee2119fa8a889cccbc223b0858bd1cdb1635975" }
 libslirp = { version = "4.3.2", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"

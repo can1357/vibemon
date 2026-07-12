@@ -2124,6 +2124,7 @@ mod tests {
 		assert_eq!(decoded.devices[0].user_net_state.as_deref(), Some(state.as_slice()));
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn fs_state_survives_serde_round_trip_and_restore_drops_stale() {
 		let root = temp_root_dir("vmon-snap-fs");

@@ -1019,6 +1019,7 @@ mod tests {
 		assert!(!cfg.no_sandbox);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_platform_registry_flags() {
 		let cfg = parse_config(&[
@@ -1255,6 +1256,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn netns_requires_jail_validation() {
 		assert_config_err_contains(

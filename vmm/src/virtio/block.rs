@@ -65,7 +65,13 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		.write(true)
 		.create_new(true)
 		.open(dest)
-		.map_err(|e| err(format!("creating overlay {}: {e}", dest.display())))?;
+		.map_err(|e| {
+			if e.kind() == std::io::ErrorKind::AlreadyExists {
+				err(format!("overlay destination {} already exists", dest.display()))
+			} else {
+				err(format!("creating overlay {}: {e}", dest.display()))
+			}
+		})?;
 	let mut buffer = vec![0u8; 64 * 1024];
 	loop {
 		let count = source.read(&mut buffer)?;
