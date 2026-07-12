@@ -1,6 +1,6 @@
 //! Kernel / initrd / command-line loading and zero-page (`boot_params`) setup.
 
-use std::{cmp::max, io::Read, path::Path};
+use std::{cmp::max, fs::File, io::Read, path::Path};
 
 #[cfg(target_os = "linux")]
 use kvm_bindings::{CpuId, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
