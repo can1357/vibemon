@@ -56,6 +56,7 @@ impl Rng {
 	/// Fails if [`ENTROPY_SOURCE`] cannot be opened. It is opened here, before
 	/// the sandbox filters are installed; the worker only reads the held fd
 	/// afterwards, so a sandboxed worker never needs to open it.
+	#[allow(clippy::unnecessary_wraps, reason = "opening /dev/urandom can fail on Unix")]
 	pub fn new() -> Result<Self> {
 		#[cfg(not(target_os = "windows"))]
 		let source = File::open(ENTROPY_SOURCE)
@@ -75,10 +76,13 @@ impl Rng {
 		})
 	}
 
+	#[allow(clippy::needless_pass_by_ref_mut, reason = "Unix reads mutate the entropy file cursor")]
 	fn fill_entropy(source: &mut Option<File>, buffer: &mut [u8]) -> Result<usize> {
 		#[cfg(target_os = "windows")]
 		{
 			let _ = source;
+			// SAFETY: `buffer` is valid for `buffer.len()` writable bytes for the duration
+			// of the call.
 			let ok = unsafe {
 				windows_sys::Win32::Security::Cryptography::ProcessPrng(
 					buffer.as_mut_ptr(),
