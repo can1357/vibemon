@@ -435,9 +435,7 @@ pub fn setup_tap(
 		))?;
 	}
 
-	if !restricted {
-		iptables_ensure(&unrestricted_egress_rule(IptablesAction::Append, &lease))?;
-	} else {
+	if restricted {
 		for (idx, cidr) in lease.egress_allow.iter().enumerate() {
 			iptables_ensure(&egress_cidr_rule(
 				IptablesAction::Append,
@@ -461,6 +459,8 @@ pub fn setup_tap(
 		if !domains.is_empty() {
 			start_domain_refresher(&lease.name, &lease.guest_cidr(), domains, domain_ips)?;
 		}
+	} else {
+		iptables_ensure(&unrestricted_egress_rule(IptablesAction::Append, &lease))?;
 	}
 
 	Ok(lease)
