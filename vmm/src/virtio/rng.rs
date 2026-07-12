@@ -75,9 +75,10 @@ impl Rng {
 		})
 	}
 
-	fn fill_entropy(_source: &mut Option<File>, buffer: &mut [u8]) -> Result<usize> {
+	fn fill_entropy(source: &mut Option<File>, buffer: &mut [u8]) -> Result<usize> {
 		#[cfg(target_os = "windows")]
 		{
+			let _ = source;
 			let ok = unsafe {
 				windows_sys::Win32::Security::Cryptography::ProcessPrng(
 					buffer.as_mut_ptr(),
@@ -91,7 +92,7 @@ impl Rng {
 		}
 		#[cfg(not(target_os = "windows"))]
 		{
-			_source
+			source
 				.as_mut()
 				.expect("Unix entropy source")
 				.read(buffer)
