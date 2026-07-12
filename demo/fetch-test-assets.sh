@@ -480,6 +480,7 @@ case "$mode" in
     ip link set "$iface" up || fail "bring up $iface"
     mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null) || fail "read $iface MAC"
     echo "MAC=$mac"
+    echo "MAC_OK"
     finish
     ;;
 

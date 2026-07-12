@@ -321,7 +321,7 @@ fn nic_honors_mac_override() {
 	args.push(MAC.into());
 
 	let refs = common::as_refs(&args);
-	let output = common::boot_capture(&refs, "MAC=", Duration::from_secs(90));
+	let output = common::boot_capture(&refs, "MAC_OK", Duration::from_secs(90));
 
 	assert!(
 		output.contains(&format!("MAC={MAC}")),
