@@ -115,6 +115,7 @@ impl Backend {
 		}
 	}
 
+	#[allow(clippy::unnecessary_wraps, reason = "user networking state serialization can fail on macOS and Windows")]
 	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
 		match self {
 			Self::Tap(_) => Ok(None),
