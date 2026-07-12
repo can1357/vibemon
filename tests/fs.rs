@@ -23,7 +23,7 @@ fn virtiofs_host_share_readonly() {
 	args.push(share.display().to_string());
 
 	let refs = common::as_refs(&args);
-	let output = common::boot_capture(&refs, "FSSHARE_", Duration::from_secs(90));
+	let output = common::boot_capture(&refs, "FSSHARE_OK", Duration::from_secs(90));
 	if output.contains("FSSHARE_NODEV") {
 		eprintln!("SKIP virtiofs_host_share_readonly: guest kernel lacks virtio-fs");
 		return;
