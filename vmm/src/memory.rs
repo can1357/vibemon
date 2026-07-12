@@ -1,9 +1,12 @@
 //! Guest RAM allocation.
 
+#[cfg(not(target_os = "windows"))]
 use std::{fs::File, io, os::unix::io::AsRawFd};
 
+#[cfg(not(target_os = "windows"))]
+use vm_memory::FileOffset;
 use vm_memory::{
-	Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap as VmGuestMemoryMmap,
+	Address, GuestAddress, GuestMemory, GuestMemoryMmap as VmGuestMemoryMmap,
 	bitmap::{AtomicBitmap, Bitmap},
 };
 
@@ -112,13 +115,20 @@ pub fn create_guest_memory(size: usize) -> Result<GuestMemoryMmap> {
 		return Err(err(format!("guest memory size {size} is not page-aligned")));
 	}
 	let regions = arrange_memory(size);
-	let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
-		Vec::with_capacity(regions.len());
-	for (addr, len) in regions {
-		let file = create_shared_memory_file(len)?;
-		ranges.push((addr, len, Some(FileOffset::new(file, 0))));
+	#[cfg(target_os = "windows")]
+	{
+		Ok(GuestMemoryMmap::from_ranges(&regions)?)
 	}
-	Ok(GuestMemoryMmap::from_ranges_with_files(ranges)?)
+	#[cfg(not(target_os = "windows"))]
+	{
+		let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
+			Vec::with_capacity(regions.len());
+		for (addr, len) in regions {
+			let file = create_shared_memory_file(len)?;
+			ranges.push((addr, len, Some(FileOffset::new(file, 0))));
+		}
+		Ok(GuestMemoryMmap::from_ranges_with_files(ranges)?)
+	}
 }
 
 /// Create the platform RAM backing file used by the shared guest mappings.
@@ -230,8 +240,11 @@ use linux::{create_shared_memory_file, private_mmap_flags};
 pub use macos::advise_mergeable;
 #[cfg(target_os = "macos")]
 use macos::{create_shared_memory_file, private_mmap_flags};
+#[cfg(target_os = "windows")]
+pub const fn advise_mergeable(_mem: &GuestMemoryMmap) {}
 
 /// Resize a backing file to exactly `len` bytes.
+#[cfg(not(target_os = "windows"))]
 fn size_file(file: &File, len: usize) -> Result<()> {
 	let len =
 		libc::off_t::try_from(len).map_err(|_| err("RAM backing file size overflows off_t"))?;
@@ -247,6 +260,15 @@ fn size_file(file: &File, len: usize) -> Result<()> {
 /// `CoW` fork: clean pages are shared via the host page cache across every
 /// child process, while a write faults a private copy. `regions` is `(gpa, len,
 /// file_offset)` matching the snapshot's contiguous region table.
+#[cfg(target_os = "windows")]
+pub fn create_guest_memory_private(
+	_mem_file: &std::path::Path,
+	_regions: &[(u64, u64, u64)],
+) -> Result<GuestMemoryMmap> {
+	Err(err("private snapshot memory (--fork-from) is not supported on Windows"))
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn create_guest_memory_private(
 	mem_file: &std::path::Path,
 	regions: &[(u64, u64, u64)],

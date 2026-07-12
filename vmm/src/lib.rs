@@ -1,7 +1,7 @@
 //! vmm — the per-VM monitor core: boots a Linux guest with a serial console
 //! and virtio IO. The hypervisor backend is selected at compile time: KVM on
-//! Linux (`x86_64`/aarch64), Apple Hypervisor.framework on macOS (aarch64 /
-//! Apple Silicon).
+//! Linux (`x86_64`/aarch64), Apple Hypervisor.framework on macOS (aarch64), or
+//! Windows Hypervisor Platform on Windows (`x86_64`).
 //!
 //! The `vmon` binary re-execs itself as `vmon vmm …` for each microVM and
 //! hands the remaining flags to [`run_cli`].
@@ -17,18 +17,26 @@ mod layout;
 mod memory;
 mod metrics;
 mod os;
+#[cfg(not(target_os = "windows"))]
 mod pager;
 pub mod result;
 #[cfg(target_os = "linux")]
 mod sandbox;
+#[cfg(not(target_os = "windows"))]
 pub mod snapshot;
 
 /// Remote virtio-fs proxy wire protocol shared with the server-side proxy.
+#[cfg(not(target_os = "windows"))]
 pub mod remotefs {
 	pub use crate::virtio::remotefs::proto;
 }
 mod tap;
 mod virtio;
+#[cfg(not(target_os = "windows"))]
+#[path = "vmm.rs"]
+mod vmm;
+#[cfg(target_os = "windows")]
+#[path = "vmm_windows.rs"]
 mod vmm;
 
 use config::{Config, LogFormat};

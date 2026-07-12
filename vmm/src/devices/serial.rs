@@ -24,22 +24,29 @@ struct ConsoleOut;
 
 impl Write for ConsoleOut {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		loop {
-			// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is a
-			// process-global fd, and `write` does not retain the pointer.
-			let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
-			if n >= 0 {
-				return Ok(n as usize);
+		#[cfg(unix)]
+		{
+			loop {
+				// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is a
+				// process-global fd, and `write` does not retain the pointer.
+				let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
+				if n >= 0 {
+					return Ok(n as usize);
+				}
+				let err = io::Error::last_os_error();
+				if err.kind() != io::ErrorKind::Interrupted {
+					return Err(err);
+				}
 			}
-			let err = io::Error::last_os_error();
-			if err.kind() != io::ErrorKind::Interrupted {
-				return Err(err);
-			}
+		}
+		#[cfg(target_os = "windows")]
+		{
+			std::io::stdout().write(buf)
 		}
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
-		Ok(())
+		std::io::stdout().flush()
 	}
 }
 

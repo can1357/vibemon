@@ -2,7 +2,7 @@
 name = "vmm"
 version = "0.1.0"
 edition = "2024"
-description = "Vibemon per-VM monitor core (KVM/HVF microVM)"
+description = "Vibemon per-VM monitor core (KVM/HVF/WHP microVM)"
 
 [lib]
 
@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 virtio-bindings = "0.2"
 virtio-queue = "0.17"
-vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"] }
+vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap", "backend-bitmap"] }
 vmm-sys-util = { version = "0.15", features = ["with-serde"] }
 linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 vm-superio = "0.8.1"
@@ -36,6 +36,10 @@ kvm-ioctls = "0.25"
 io-uring = "0.7"
 landlock = "0.4"
 seccompiler = "0.5"
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+libwhp = { git = "https://github.com/insula-rs/libwhp", rev = "3ee2119fa8a889cccbc223b0858bd1cdb1635975" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"

@@ -2,17 +2,22 @@
 
 pub mod block;
 pub mod console;
+#[cfg(not(target_os = "windows"))]
 pub mod fs;
 pub mod mmio;
 pub mod net;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 pub mod pci;
+#[cfg(not(target_os = "windows"))]
 pub mod remotefs;
 pub mod rng;
 
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::{
 	io,
-	os::unix::io::{AsRawFd, RawFd},
 	sync::{
 		Arc,
 		atomic::{AtomicU32, Ordering},
@@ -22,6 +27,10 @@ use std::{
 use parking_lot::Mutex;
 use virtio_queue::Queue;
 use vm_memory::{GuestAddress, GuestMemory};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
 use crate::{
 	hv::IrqLine,
@@ -39,6 +48,13 @@ pub fn descriptor_range_valid(mem: &GuestMemoryMmap, addr: GuestAddress, len: u3
 
 #[cfg(target_arch = "x86_64")]
 type InterruptNotifier = Arc<dyn Fn() -> Result<bool> + Send + Sync>;
+
+/// Host wait primitive consumed by a virtio worker.
+#[cfg(unix)]
+pub type WorkerWaitSource = RawFd;
+/// Host wait primitive consumed by a virtio worker.
+#[cfg(target_os = "windows")]
+pub type WorkerWaitSource = RawHandle;
 
 /// Shared interrupt state for one virtio device.
 ///
@@ -151,13 +167,14 @@ pub trait VirtioDevice: Send {
 	fn reset(&mut self) -> Result<()> {
 		Ok(())
 	}
-	/// Extra host fds (besides the queue-notify eventfd) to poll for readiness.
-	fn worker_fds(&self) -> Vec<RawFd> {
+	/// Extra host wait sources besides the queue notification object.
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
 		Vec::new()
 	}
 	fn process_queue_notify(&mut self) -> Result<()>;
-	/// One of [`worker_fds`](VirtioDevice::worker_fds) became readable.
-	fn process_worker_fd(&mut self, _fd: RawFd) -> Result<()> {
+	/// One of [`worker_wait_sources`](VirtioDevice::worker_wait_sources) became
+	/// ready.
+	fn process_worker_source(&mut self, _index: usize) -> Result<()> {
 		Ok(())
 	}
 	/// Live virtqueue state for snapshotting (read AFTER activation, when the
@@ -211,119 +228,138 @@ pub fn run_worker(
 	kill_evt: EventFd,
 	control: WorkerControl,
 ) -> Result<()> {
-	let extra_fds = device.lock().worker_fds();
-
-	let mut poll_fds = Vec::with_capacity(4 + extra_fds.len());
-	let mut tokens = Vec::with_capacity(4 + extra_fds.len());
-	push_poll_fd(&mut poll_fds, &mut tokens, queue_evt.as_raw_fd(), QUEUE_TOKEN);
-	push_poll_fd(&mut poll_fds, &mut tokens, kill_evt.as_raw_fd(), KILL_TOKEN);
-	push_poll_fd(&mut poll_fds, &mut tokens, control.pause_evt.as_raw_fd(), PAUSE_TOKEN);
-	push_poll_fd(&mut poll_fds, &mut tokens, control.resume_evt.as_raw_fd(), RESUME_TOKEN);
-	for (i, fd) in extra_fds.iter().enumerate() {
-		push_poll_fd(&mut poll_fds, &mut tokens, *fd, FD_TOKEN_BASE + i as u64);
+	let extra_sources = device.lock().worker_wait_sources();
+	let mut wait_set = WorkerWaitSet::with_capacity(4 + extra_sources.len());
+	wait_set.push(event_wait_source(&queue_evt), QUEUE_TOKEN);
+	wait_set.push(event_wait_source(&kill_evt), KILL_TOKEN);
+	wait_set.push(event_wait_source(&control.pause_evt), PAUSE_TOKEN);
+	wait_set.push(event_wait_source(&control.resume_evt), RESUME_TOKEN);
+	for (index, source) in extra_sources.iter().enumerate() {
+		wait_set.push(*source, FD_TOKEN_BASE + index as u64);
 	}
 
-	// A second poll set holds only resume/kill while paused so queue_evt and
-	// worker fds are NOT consumed during pause: their pending notifications must
-	// survive to be serviced after resume (the guest is frozen and cannot
-	// re-ring the doorbell).
-	let mut pause_poll_fds = Vec::with_capacity(2);
-	let mut pause_tokens = Vec::with_capacity(2);
-	push_poll_fd(
-		&mut pause_poll_fds,
-		&mut pause_tokens,
-		control.resume_evt.as_raw_fd(),
-		RESUME_TOKEN,
-	);
-	push_poll_fd(&mut pause_poll_fds, &mut pause_tokens, kill_evt.as_raw_fd(), KILL_TOKEN);
+	// While paused, do not consume queue/backend notifications: they must remain
+	// pending until resume because the frozen guest cannot ring them again.
+	let mut pause_wait_set = WorkerWaitSet::with_capacity(2);
+	pause_wait_set.push(event_wait_source(&control.resume_evt), RESUME_TOKEN);
+	pause_wait_set.push(event_wait_source(&kill_evt), KILL_TOKEN);
 
 	loop {
-		wait_poll(&mut poll_fds)?;
-		for idx in 0..poll_fds.len() {
-			if !take_revents(&mut poll_fds[idx])? {
-				continue;
-			}
-			match tokens[idx] {
-				QUEUE_TOKEN => {
+		let (token, _) = wait_set.wait()?;
+		match token {
+			QUEUE_TOKEN => {
+				let _ = queue_evt.read();
+				device.lock().process_queue_notify()?;
+			},
+			KILL_TOKEN => {
+				let _ = kill_evt.read();
+				return Ok(());
+			},
+			PAUSE_TOKEN => {
+				let _ = control.pause_evt.read();
+				{
+					let mut dev = device.lock();
 					let _ = queue_evt.read();
-					device.lock().process_queue_notify()?;
-				},
-				KILL_TOKEN => {
-					let _ = kill_evt.read();
-					return Ok(());
-				},
-				PAUSE_TOKEN => {
-					let _ = control.pause_evt.read();
-					{
-						let mut dev = device.lock();
-						// Service any descriptors the guest made available just
-						// before we paused: the queue-notify eventfd is NOT part
-						// of the snapshot, so an unprocessed kick would be lost
-						// and the guest would hang on restore. Submit them...
-						let _ = queue_evt.read();
-						if let Err(e) = dev.process_queue_notify() {
-							let message = format!("pause queue drain failed: {e}");
-							*control.failure_msg.lock() = Some(message.clone());
-							let _ = control.failure_evt.write(1);
-							return Err(err(message));
-						}
-						// ...then flush all in-flight backend IO so the snapshot
-						// captures a quiescent device (no half-completed requests).
-						if let Err(e) = dev.drain() {
-							let message = format!("pause drain failed: {e}");
-							*control.failure_msg.lock() = Some(message.clone());
-							let _ = control.failure_evt.write(1);
-							return Err(err(message));
-						}
+					if let Err(e) = dev.process_queue_notify() {
+						let message = format!("pause queue drain failed: {e}");
+						*control.failure_msg.lock() = Some(message.clone());
+						let _ = control.failure_evt.write(1);
+						return Err(err(message));
 					}
-					// Confirm to the VMM that this worker is now quiesced.
-					let _ = control.ack_evt.write(1);
-					// Stay quiesced, servicing no queues, until resume (or kill).
-					'paused: loop {
-						wait_poll(&mut pause_poll_fds)?;
-						for pause_idx in 0..pause_poll_fds.len() {
-							if !take_revents(&mut pause_poll_fds[pause_idx])? {
-								continue;
-							}
-							match pause_tokens[pause_idx] {
-								RESUME_TOKEN => {
-									let _ = control.resume_evt.read();
-									break 'paused;
-								},
-								KILL_TOKEN => {
-									let _ = kill_evt.read();
-									return Ok(());
-								},
-								_ => {},
-							}
-						}
+					if let Err(e) = dev.drain() {
+						let message = format!("pause drain failed: {e}");
+						*control.failure_msg.lock() = Some(message.clone());
+						let _ = control.failure_evt.write(1);
+						return Err(err(message));
 					}
-				},
-				RESUME_TOKEN => {
-					// Resume while not paused: harmless, just drain it.
-					let _ = control.resume_evt.read();
-				},
-				token => {
-					let idx = (token - FD_TOKEN_BASE) as usize;
-					if let Some(fd) = extra_fds.get(idx) {
-						device.lock().process_worker_fd(*fd)?;
+				}
+				let _ = control.ack_evt.write(1);
+				'paused: loop {
+					let (pause_token, _) = pause_wait_set.wait()?;
+					match pause_token {
+						RESUME_TOKEN => {
+							let _ = control.resume_evt.read();
+							break 'paused;
+						},
+						KILL_TOKEN => {
+							let _ = kill_evt.read();
+							return Ok(());
+						},
+						_ => {},
 					}
-				},
-			}
+				}
+			},
+			RESUME_TOKEN => {
+				let _ = control.resume_evt.read();
+			},
+			token => {
+				let index = (token - FD_TOKEN_BASE) as usize;
+				device.lock().process_worker_source(index)?;
+			},
 		}
 	}
 }
 
-fn push_poll_fd(poll_fds: &mut Vec<libc::pollfd>, tokens: &mut Vec<u64>, fd: RawFd, token: u64) {
-	poll_fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-	tokens.push(token);
+struct WorkerWaitSet {
+	#[cfg(unix)]
+	poll_fds: Vec<libc::pollfd>,
+	#[cfg(target_os = "windows")]
+	handles:  Vec<RawHandle>,
+	tokens:   Vec<u64>,
 }
 
+impl WorkerWaitSet {
+	fn with_capacity(capacity: usize) -> Self {
+		Self {
+			#[cfg(unix)]
+			poll_fds: Vec::with_capacity(capacity),
+			#[cfg(target_os = "windows")]
+			handles: Vec::with_capacity(capacity),
+			tokens: Vec::with_capacity(capacity),
+		}
+	}
+
+	fn push(&mut self, source: WorkerWaitSource, token: u64) {
+		#[cfg(unix)]
+		self
+			.poll_fds
+			.push(libc::pollfd { fd: source, events: libc::POLLIN, revents: 0 });
+		#[cfg(target_os = "windows")]
+		self.handles.push(source);
+		self.tokens.push(token);
+	}
+
+	#[cfg(unix)]
+	fn wait(&mut self) -> io::Result<(u64, usize)> {
+		wait_poll(&mut self.poll_fds)?;
+		for index in 0..self.poll_fds.len() {
+			if take_revents(&mut self.poll_fds[index])? {
+				return Ok((self.tokens[index], index));
+			}
+		}
+		Err(io::Error::other("poll returned without a readable worker source"))
+	}
+
+	#[cfg(target_os = "windows")]
+	fn wait(&self) -> io::Result<(u64, usize)> {
+		wait_handles(&self.handles).map(|index| (self.tokens[index], index))
+	}
+}
+
+#[cfg(unix)]
+fn event_wait_source(evt: &EventFd) -> WorkerWaitSource {
+	evt.as_raw_fd()
+}
+
+#[cfg(target_os = "windows")]
+fn event_wait_source(evt: &EventFd) -> WorkerWaitSource {
+	evt.as_raw_handle()
+}
+
+#[cfg(unix)]
 fn wait_poll(poll_fds: &mut [libc::pollfd]) -> io::Result<()> {
 	loop {
-		// SAFETY: `poll_fds` is a live mutable slice of `libc::pollfd`; its pointer is
-		// non-null for the duration of the call, and the element count is passed
-		// unchanged as `nfds_t`.
+		// SAFETY: `poll_fds` remains live and its length is passed unchanged.
 		let n = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, -1) };
 		if n >= 0 {
 			return Ok(());
@@ -335,6 +371,7 @@ fn wait_poll(poll_fds: &mut [libc::pollfd]) -> io::Result<()> {
 	}
 }
 
+#[cfg(unix)]
 fn take_revents(poll_fd: &mut libc::pollfd) -> io::Result<bool> {
 	let revents = poll_fd.revents;
 	poll_fd.revents = 0;
@@ -342,4 +379,28 @@ fn take_revents(poll_fd: &mut libc::pollfd) -> io::Result<bool> {
 		return Err(io::Error::from_raw_os_error(libc::EBADF));
 	}
 	Ok(revents != 0)
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_MAXIMUM_WAIT_OBJECTS: usize = 64;
+
+#[cfg(target_os = "windows")]
+fn wait_handles(handles: &[RawHandle]) -> io::Result<usize> {
+	if handles.is_empty() || handles.len() > WINDOWS_MAXIMUM_WAIT_OBJECTS {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!("invalid Windows worker wait set size {}", handles.len()),
+		));
+	}
+	// SAFETY: every entry is a live waitable handle retained by the worker.
+	let result = unsafe {
+		WaitForMultipleObjects(handles.len() as u32, handles.as_ptr().cast::<HANDLE>(), 0, INFINITE)
+	};
+	if result < WAIT_OBJECT_0 + handles.len() as u32 {
+		return Ok((result - WAIT_OBJECT_0) as usize);
+	}
+	if result == WAIT_FAILED {
+		return Err(io::Error::last_os_error());
+	}
+	Err(io::Error::other(format!("unexpected WaitForMultipleObjects result {result:#x}")))
 }

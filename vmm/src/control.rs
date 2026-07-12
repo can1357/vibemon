@@ -14,6 +14,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+#[cfg(unix)]
 use std::{
 	fs,
 	io::{self, BufRead, BufReader, Write},
@@ -22,12 +24,13 @@ use std::{
 		fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
 		net::{UnixListener, UnixStream},
 	},
-	path::{Path, PathBuf},
-	sync::Arc,
-	time::Duration,
+	path::Path,
 };
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use flume::{RecvTimeoutError, Sender};
+#[cfg(unix)]
+use flume::RecvTimeoutError;
+use flume::Sender;
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
@@ -77,15 +80,12 @@ pub mod pause_signal {
 
 #[cfg(not(target_os = "linux"))]
 pub mod pause_signal {
-	use parking_lot::Mutex;
-
 	use crate::result::Result;
+
 	#[allow(clippy::unnecessary_wraps, reason = "uniform API across target operating systems")]
 	pub fn install() -> Result<()> {
 		Ok(())
 	}
-	/// No POSIX-signal kick on non-Linux backends.
-	pub const fn signal_threads(_tids: &Mutex<Vec<Option<libc::pthread_t>>>) {}
 }
 /// Lifecycle state shared by all vCPU threads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,6 +111,7 @@ pub struct PauseGate {
 	cv:     Condvar,
 	parked: Mutex<Vec<bool>>,
 	cpus:   u32,
+	#[cfg(target_os = "linux")]
 	tids:   Mutex<Vec<Option<libc::pthread_t>>>,
 	kicker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -123,6 +124,7 @@ impl PauseGate {
 			cv: Condvar::new(),
 			parked: Mutex::new(vec![false; cpus as usize]),
 			cpus,
+			#[cfg(target_os = "linux")]
 			tids: Mutex::new(vec![None; cpus as usize]),
 			kicker: Mutex::new(None),
 		})
@@ -151,9 +153,19 @@ impl PauseGate {
 
 	/// Called by vCPU thread `vcpu_id` on entry: record its pthread id so the
 	/// gate can later signal exactly the registered threads.
+	#[allow(
+		clippy::missing_const_for_fn,
+		clippy::unused_self,
+		reason = "Linux records pthread IDs; other backends keep the same gate API"
+	)]
 	pub fn register_tid(&self, vcpu_id: usize) {
-		// SAFETY: `pthread_self` is always safe to call.
-		self.tids.lock()[vcpu_id] = Some(unsafe { libc::pthread_self() });
+		#[cfg(target_os = "linux")]
+		{
+			// SAFETY: `pthread_self` is always safe to call.
+			self.tids.lock()[vcpu_id] = Some(unsafe { libc::pthread_self() });
+		}
+		#[cfg(not(target_os = "linux"))]
+		let _ = vcpu_id;
 	}
 
 	/// Mark vCPU `vcpu_id` parked and wake any waiter (e.g. `pause()`).
@@ -202,13 +214,14 @@ impl PauseGate {
 
 	/// Install a backend-specific wakeup for vCPU APIs that are not
 	/// signal-driven.
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	pub fn set_kicker(&self, kicker: Arc<dyn Fn() + Send + Sync>) {
 		*self.kicker.lock() = Some(kicker);
 	}
 
 	/// Kick every registered vCPU out of the hypervisor run call.
 	pub fn signal_all_vcpus(&self) {
+		#[cfg(target_os = "linux")]
 		pause_signal::signal_threads(&self.tids);
 		let kicker = self.kicker.lock().clone();
 		if let Some(kicker) = kicker {
@@ -282,12 +295,14 @@ pub struct SocketOwner {
 	pub gid: u32,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct SocketIdentity {
 	dev: u64,
 	ino: u64,
 }
 
+#[cfg(unix)]
 impl SocketIdentity {
 	fn from_metadata(meta: &fs::Metadata) -> Self {
 		Self { dev: meta.dev(), ino: meta.ino() }
@@ -300,6 +315,7 @@ impl SocketIdentity {
 
 /// Bound control socket listener. Binding can happen before sandbox uid/gid
 /// drops; serving starts later, after the process sandbox is in place.
+#[cfg(unix)]
 pub struct ControlServer {
 	sock_path:  PathBuf,
 	owner_uid:  u32,
@@ -308,12 +324,14 @@ pub struct ControlServer {
 	identity:   SocketIdentity,
 }
 
+#[cfg(unix)]
 pub struct ControlCleanup {
 	sock_path: PathBuf,
 	owner_uid: u32,
 	identity:  SocketIdentity,
 }
 
+#[cfg(unix)]
 impl ControlServer {
 	pub fn cleanup(&self) {
 		cleanup_socket_for_uid(&self.sock_path, self.owner_uid, Some(self.identity));
@@ -344,10 +362,42 @@ impl ControlServer {
 	}
 }
 
+#[cfg(unix)]
 impl ControlCleanup {
 	pub fn cleanup(&self) {
 		cleanup_socket_for_uid(&self.sock_path, self.owner_uid, Some(self.identity));
 	}
+}
+
+#[cfg(not(unix))]
+pub struct ControlServer;
+
+#[cfg(not(unix))]
+pub struct ControlCleanup;
+
+#[cfg(not(unix))]
+impl ControlServer {
+	pub const fn cleanup(&self) {}
+
+	pub const fn cleanup_token(&self) -> ControlCleanup {
+		ControlCleanup
+	}
+
+	pub fn start(self, _tx: Sender<ControlCmd>) {}
+}
+
+#[cfg(not(unix))]
+impl ControlCleanup {
+	pub const fn cleanup(&self) {}
+}
+
+#[cfg(not(unix))]
+pub fn bind(
+	_sock_path: PathBuf,
+	_owner: Option<SocketOwner>,
+	_launch_uid: u32,
+) -> Result<ControlServer> {
+	Err(err("Unix socket control plane is not supported on Windows"))
 }
 
 /// Bind a `UnixListener` at `sock_path` without spawning the server thread.
@@ -360,6 +410,7 @@ impl ControlCleanup {
 /// otherwise unsafe parents are rejected. Stale sockets are unlinked only after
 /// verifying they are inactive sockets owned by the expected uid or allowed
 /// pre-bind uid.
+#[cfg(unix)]
 pub fn bind(
 	sock_path: PathBuf,
 	owner: Option<SocketOwner>,
@@ -388,6 +439,7 @@ pub fn bind(
 	Ok(ControlServer { sock_path, owner_uid, launch_uid, listener, identity })
 }
 
+#[cfg(unix)]
 fn bound_socket_identity(sock_path: &Path, expected_uid: u32) -> Result<SocketIdentity> {
 	let meta = fs::symlink_metadata(sock_path)?;
 	if !meta.file_type().is_socket() {
@@ -403,6 +455,7 @@ fn bound_socket_identity(sock_path: &Path, expected_uid: u32) -> Result<SocketId
 	Ok(SocketIdentity::from_metadata(&meta))
 }
 
+#[cfg(unix)]
 fn cleanup_socket_for_uid(sock_path: &Path, expected_uid: u32, identity: Option<SocketIdentity>) {
 	let Ok(meta) = fs::symlink_metadata(sock_path) else {
 		return;
@@ -418,6 +471,7 @@ fn cleanup_socket_for_uid(sock_path: &Path, expected_uid: u32, identity: Option<
 	let _ = fs::remove_file(sock_path);
 }
 
+#[cfg(unix)]
 fn prepare_socket_path(sock_path: &Path, owner: Option<SocketOwner>) -> Result<()> {
 	if sock_path.as_os_str().is_empty() {
 		return Err(err("control socket path must not be empty"));
@@ -430,6 +484,7 @@ fn prepare_socket_path(sock_path: &Path, owner: Option<SocketOwner>) -> Result<(
 	Ok(())
 }
 
+#[cfg(unix)]
 fn socket_parent(sock_path: &Path) -> &Path {
 	sock_path
 		.parent()
@@ -437,6 +492,7 @@ fn socket_parent(sock_path: &Path) -> &Path {
 		.unwrap_or_else(|| Path::new("."))
 }
 
+#[cfg(unix)]
 fn ensure_private_parent(
 	parent: &Path,
 	sock_path: &Path,
@@ -467,6 +523,7 @@ fn ensure_private_parent(
 	}
 }
 
+#[cfg(unix)]
 fn reown_prebind_parent(
 	parent: &Path,
 	sock_path: &Path,
@@ -489,6 +546,7 @@ fn reown_prebind_parent(
 	verify_private_parent(parent, &meta, expected_uid, None)
 }
 
+#[cfg(unix)]
 fn ensure_parent_can_be_reowned(
 	parent: &Path,
 	sock_path: &Path,
@@ -530,6 +588,7 @@ fn ensure_parent_can_be_reowned(
 	Ok(())
 }
 
+#[cfg(unix)]
 const fn allowed_prebind_parent_uid(
 	owner: Option<SocketOwner>,
 	expected_uid: u32,
@@ -542,18 +601,22 @@ const fn allowed_prebind_parent_uid(
 	}
 }
 
+#[cfg(unix)]
 fn parent_owner_is_allowed(parent_uid: u32, expected_uid: u32, prebind_uid: Option<u32>) -> bool {
 	parent_uid == expected_uid || prebind_uid == Some(parent_uid)
 }
 
+#[cfg(unix)]
 fn socket_owner_is_allowed(socket_uid: u32, expected_uid: u32, prebind_uid: Option<u32>) -> bool {
 	socket_uid == expected_uid || prebind_uid == Some(socket_uid)
 }
 
+#[cfg(unix)]
 const fn private_parent_mode_is_safe(mode: u32) -> bool {
 	mode & 0o077 == 0
 }
 
+#[cfg(unix)]
 fn verify_private_parent(
 	parent: &Path,
 	meta: &fs::Metadata,
@@ -589,6 +652,7 @@ fn verify_private_parent(
 	Ok(())
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(
 	sock_path: &Path,
 	expected_uid: u32,
@@ -636,6 +700,7 @@ fn remove_stale_socket(
 	Ok(())
 }
 
+#[cfg(unix)]
 fn chown_path(path: &Path, owner: SocketOwner) -> Result<()> {
 	let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
 		err(format!("control socket path {} contains an interior NUL byte", path.display()))
@@ -657,6 +722,7 @@ fn chown_path(path: &Path, owner: SocketOwner) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 #[allow(clippy::useless_conversion, reason = "mode_t is u16 on macOS but u32 on Linux")]
 fn chmod_path(path: &Path, mode: libc::mode_t) -> Result<()> {
 	let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
@@ -684,6 +750,7 @@ fn chmod_path(path: &Path, mode: libc::mode_t) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 fn chmod_fallback_allowed(e: &io::Error) -> bool {
 	matches!(
 		 e.raw_os_error(),
@@ -692,11 +759,13 @@ fn chmod_fallback_allowed(e: &io::Error) -> bool {
 	)
 }
 
+#[cfg(unix)]
 fn current_euid() -> u32 {
 	// SAFETY: `geteuid` is thread-safe and has no preconditions.
 	unsafe { libc::geteuid() as u32 }
 }
 
+#[cfg(unix)]
 fn configure_stream(stream: &UnixStream) -> io::Result<()> {
 	stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
 	stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT))?;
@@ -750,7 +819,7 @@ fn verify_peer_credentials(stream: &UnixStream, launch_uid: u32) -> io::Result<(
 	Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn verify_peer_credentials(_: &UnixStream, _: u32) -> io::Result<()> {
 	Ok(())
 }
@@ -780,12 +849,14 @@ struct Response {
 	error:  Option<ApiError>,
 }
 
+#[cfg(unix)]
 enum RequestLine {
 	Text(String),
 	BadRequest { message: &'static str, close: bool },
 }
 
 /// Serve one client connection until EOF or an IO error.
+#[cfg(unix)]
 fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 	// One half for writing replies, the other (buffered) for reading commands.
 	let Ok(mut writer) = stream.try_clone() else {
@@ -847,6 +918,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 	}
 }
 
+#[cfg(unix)]
 fn write_success(writer: &mut UnixStream, id: u64, result: serde_json::Value) -> io::Result<()> {
 	write_json_line(writer, &Response {
 		id:     Some(id),
@@ -856,16 +928,19 @@ fn write_success(writer: &mut UnixStream, id: u64, result: serde_json::Value) ->
 	})
 }
 
+#[cfg(unix)]
 fn write_error(writer: &mut UnixStream, id: Option<u64>, error: ApiError) -> io::Result<()> {
 	write_json_line(writer, &Response { id, ok: false, result: None, error: Some(error) })
 }
 
+#[cfg(unix)]
 fn write_json_line<T: Serialize>(writer: &mut UnixStream, value: &T) -> io::Result<()> {
 	serde_json::to_writer(&mut *writer, value)
 		.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 	writer.write_all(b"\n")
 }
 
+#[cfg(unix)]
 fn read_request_line(
 	reader: &mut BufReader<UnixStream>,
 	line: &mut Vec<u8>,
@@ -961,7 +1036,7 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 	Ok((request.id, kind))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
 

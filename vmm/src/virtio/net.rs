@@ -6,7 +6,9 @@
 //! verbatim to `/dev/net/tun`; macOS vmnet and user-mode networking strip or
 //! synthesize a zero header because they consume plain Ethernet frames.
 
-use std::{io::ErrorKind, os::unix::io::RawFd, sync::Arc};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::{io::ErrorKind, sync::Arc};
 
 use virtio_bindings::{
 	bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_net::VIRTIO_NET_F_MAC},
@@ -19,7 +21,7 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	tap::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, Tap, VNET_HDR_SIZE},
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
 };
 #[cfg(target_os = "macos")]
 mod user;
@@ -94,12 +96,18 @@ impl Backend {
 		}
 	}
 
-	fn worker_fds(&self) -> Vec<RawFd> {
+	#[cfg(unix)]
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
 		match self {
 			Self::Tap(tap) => vec![tap.as_raw_fd()],
 			#[cfg(target_os = "macos")]
 			Self::User(user) => vec![user.as_raw_fd()],
 		}
+	}
+
+	#[cfg(target_os = "windows")]
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
+		Vec::new()
 	}
 
 	#[allow(
@@ -275,8 +283,8 @@ impl VirtioDevice for Net {
 		Ok(())
 	}
 
-	fn worker_fds(&self) -> Vec<RawFd> {
-		self.backend.worker_fds()
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
+		self.backend.worker_wait_sources()
 	}
 
 	fn process_queue_notify(&mut self) -> Result<()> {
@@ -286,7 +294,7 @@ impl VirtioDevice for Net {
 		self.process_tx()
 	}
 
-	fn process_worker_fd(&mut self, _fd: RawFd) -> Result<()> {
+	fn process_worker_source(&mut self, _index: usize) -> Result<()> {
 		self.process_rx()
 	}
 

@@ -9,11 +9,11 @@
 //! features beyond `VIRTIO_F_VERSION_1` are offered, so the config space stays
 //! zero (no `F_SIZE` / `F_MULTIPORT`).
 
-use std::{
-	collections::VecDeque,
-	os::unix::io::{AsRawFd, RawFd},
-	sync::Arc,
-};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+use std::{collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 use virtio_bindings::{bindings::virtio_config::VIRTIO_F_VERSION_1, virtio_ids::VIRTIO_ID_CONSOLE};
@@ -24,7 +24,7 @@ use crate::{
 	memory::GuestMemoryMmap,
 	os::EventFd,
 	result::{Result, err},
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
 };
 
 const QUEUE_SIZE: u16 = 64;
@@ -373,8 +373,8 @@ impl VirtioDevice for Console {
 		Ok(())
 	}
 
-	fn worker_fds(&self) -> Vec<RawFd> {
-		vec![self.input_evt.as_raw_fd(), self.drain_resume_evt.as_raw_fd()]
+	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
+		vec![event_wait_source(&self.input_evt), event_wait_source(&self.drain_resume_evt)]
 	}
 
 	fn process_queue_notify(&mut self) -> Result<()> {
@@ -389,17 +389,13 @@ impl VirtioDevice for Console {
 		Ok(())
 	}
 
-	fn process_worker_fd(&mut self, fd: RawFd) -> Result<()> {
-		if fd == self.input_evt.as_raw_fd() {
-			// The host injected input; clear the level-triggered eventfd, then
-			// push the bytes into whatever RX buffers the guest has posted.
+	fn process_worker_source(&mut self, index: usize) -> Result<()> {
+		if index == 0 {
 			let _ = self.input_evt.read();
 			if self.fill_rx()? {
 				self.signal_used()?;
 			}
-		} else if fd == self.drain_resume_evt.as_raw_fd() {
-			// The host drained guest output below the cap; resume TX draining so
-			// posted guest buffers can be completed and backpressure can clear.
+		} else if index == 1 {
 			let _ = self.drain_resume_evt.read();
 			if self.drain_tx()? {
 				self.signal_used()?;
@@ -430,6 +426,16 @@ impl VirtioDevice for Console {
 		}
 		Ok(())
 	}
+}
+
+#[cfg(unix)]
+fn event_wait_source(evt: &EventFd) -> WorkerWaitSource {
+	evt.as_raw_fd()
+}
+
+#[cfg(target_os = "windows")]
+fn event_wait_source(evt: &EventFd) -> WorkerWaitSource {
+	evt.as_raw_handle()
 }
 
 #[cfg(test)]
@@ -562,8 +568,8 @@ mod tests {
 		console.output.lock().clear();
 		console.drain_resume_evt.write(1).expect("signal resume");
 		console
-			.process_worker_fd(console.drain_resume_evt.as_raw_fd())
-			.expect("process worker fd");
+			.process_worker_source(1)
+			.expect("process worker source");
 
 		assert_eq!(&console.output.lock()[..], b"guest");
 		assert_eq!(used_idx(console.mem.as_ref().expect("mem")), 1);

@@ -1,4 +1,4 @@
-//! Backend-neutral types shared by the KVM and HVF hypervisor backends.
+//! Backend-neutral types shared by the KVM, HVF and WHP hypervisor backends.
 //!
 //! [`Exit`] is the unified vCPU run result: both backends self-complete
 //! MMIO/PIO accesses, so after the run loop fills (read) or consumes (write)
@@ -15,6 +15,8 @@ pub enum Backend {
 	Kvm,
 	/// Apple Hypervisor.framework.
 	Hvf,
+	/// Windows Hypervisor Platform.
+	Whp,
 }
 
 /// The hypervisor backend this binary was compiled against.
@@ -26,6 +28,10 @@ pub const fn current_backend() -> Backend {
 	#[cfg(target_os = "macos")]
 	{
 		Backend::Hvf
+	}
+	#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+	{
+		Backend::Whp
 	}
 }
 
