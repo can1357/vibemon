@@ -3,7 +3,7 @@
 use std::arch::x86_64::__cpuid_count;
 
 /// One CPUID leaf/subleaf result exposed to a WHP vCPU.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CpuIdEntry {
 	/// CPUID leaf in EAX.
 	pub function: u32,
@@ -20,7 +20,7 @@ pub struct CpuIdEntry {
 }
 
 /// Host CPUID leaves patched per vCPU before guest entry.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CpuId {
 	entries: Vec<CpuIdEntry>,
 }

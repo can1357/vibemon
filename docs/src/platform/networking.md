@@ -1,22 +1,17 @@
 # Networking
 
-A guest network device is virtio-net. Vibemon has two host backends with
-different operational and platform requirements. The guest sees Ethernet in
-both cases; the host backend determines how that traffic reaches a network.
+A guest network device is virtio-net. Vibemon supports operator-managed TAP networking and libslirp user-mode networking. The guest sees Ethernet in both cases; the host backend determines how traffic reaches the network.
 
 ## Choose a backend
 
 | Host and backend | Guest connectivity | Host prerequisites and limits |
 | --- | --- | --- |
 | Linux/KVM with `--tap <name>` | The guest NIC sends and receives through the named Linux TAP device. | The TAP device and its host routing, bridge, firewall, and address assignment are operator-managed. Opening/configuring it commonly needs `sudo` or the relevant capabilities. `--netns <path>` enters an operator-supplied network namespace before opening TAP, but only with `--jail --id <name>`: `--netns` requires `--jail`, and `--jail` requires `--id`. |
-| macOS/HVF with `--net user` | libslirp provides userspace outbound NAT, DHCP, and DNS. The guest network is `10.0.2.0/24`, with host `10.0.2.2`, DNS `10.0.2.3`, and DHCP starting at `10.0.2.15`. | This is entitlement-free but needs native `libslirp` and `pkg-config` when building. It does not provide general inbound reachability: inbound access requires explicit forwarding support. |
-| macOS/HVF with `--tap` | Not a supported substitute for user-mode NAT on the normal ad-hoc-signed build. | vmnet-style host networking needs `com.apple.vm.networking`, an entitlement that the documented ad-hoc signing path cannot grant. Vibemon reports this case as an error. |
+| macOS/HVF or Windows/WHP with `--net user` | libslirp provides userspace outbound NAT, DHCP, and DNS. The guest network is `10.0.2.0/24`, with host `10.0.2.2`, DNS `10.0.2.3`, and DHCP starting at `10.0.2.15`. | This mode does not provide general inbound reachability. macOS builds need native `libslirp` and `pkg-config`; Windows builds use the vendored backend. |
+| macOS/HVF with `--tap` | Not a supported substitute for user-mode NAT on the normal ad-hoc-signed build. | vmnet-style host networking needs `com.apple.vm.networking`, which the documented ad-hoc signature cannot grant. |
+| Windows/WHP with `--tap <adapter>` | The guest sends and receives through an operator-supplied TAP-Windows adapter. | Adapter creation, addressing, routing, and firewall policy are operator-managed. Prefer `--net user` when outbound NAT is sufficient. |
 
-On Linux, TAP moves the virtio network header between the guest and
-`/dev/net/tun`. macOS user networking consumes and produces ordinary Ethernet
-frames, so Vibemon removes or synthesizes that header at the backend boundary.
-This implementation detail is why offload behavior is backend-specific:
-user-mode networking advertises no TAP offloads.
+TAP backends move the virtio network header between the guest and host adapter. User networking consumes and produces ordinary Ethernet frames, so Vibemon removes or synthesizes that header at the backend boundary. User-mode networking advertises no TAP offloads.
 
 ### Linux TAP example
 
@@ -47,10 +42,10 @@ To enter an operator-supplied network namespace, use a jail rather than adding
 and `--jail` requires `--id <name>`; the jail setup also determines which host
 paths and sockets are available inside the namespace.
 
-### macOS user-mode NAT example
+### macOS and Windows user-mode NAT example
 
 ```sh
-# macOS 15+ on Apple Silicon/HVF; binary must have the documented HVF entitlement.
+# Apple Silicon macOS/HVF or x86_64 Windows/WHP.
 ./target/release/vmon vmm \
   --kernel <kernel-image> \
   --initrd <initramfs.cpio.gz> \
@@ -58,10 +53,7 @@ paths and sockets are available inside the namespace.
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-Use this mode for guest egress without a vmnet networking entitlement. It is
-not an inbound listener. Do not advertise a service as reachable merely
-because it is listening in the guest; expose it through an explicit
-server-managed port forwarding or tunnel when that feature is configured.
+Use this mode for guest egress without creating a host TAP device. It is not an inbound listener. Expose guest services through explicit server-managed forwarding or tunnels.
 
 ## Control-plane policy and exposure
 
@@ -75,8 +67,8 @@ Conceptually, use the layers as follows:
 
 | Need | Mechanism | Do not assume |
 | --- | --- | --- |
-| Guest outbound access | A host backend (TAP topology or macOS user-mode NAT), then the sandbox network policy. | An allowlist itself creates a route, DNS service, or NAT. |
-| Inspect/update policy | gRPC `NetworkGet` / `NetworkSet`. | The policy RPC changes host bridge or macOS entitlement configuration. |
+| Guest outbound access | A host backend (TAP topology or user-mode NAT), then the sandbox network policy. | An allowlist itself creates a route, DNS service, or NAT. |
+| Inspect/update policy | gRPC `NetworkGet` / `NetworkSet`. | The policy RPC changes host adapter or hypervisor configuration. |
 | Reach a guest service from outside | An explicitly configured port forwarding/tunnel, visible through gRPC `Tunnels`; the server's HTTP port proxy is the infrastructure HTTP surface. | A listening guest socket is automatically published, especially behind `--net user`. |
 
 `NetworkSet` is presence-aware for its CIDR and domain lists: omitting a list
@@ -86,14 +78,6 @@ rejected by the gRPC API. Authentication and server binding are described in
 
 ## Snapshot interaction
 
-A VMM snapshot records virtio-net device state. For macOS user networking, it
-also records libslirp's guest-visible state, including DHCP lease and ARP/NAT
-tables. It cannot carry host-side sockets across restore: in-flight TCP flows
-reset, while new outbound connections can be made after restore. TAP snapshots
-record the TAP backend hint and NIC state; their continued connectivity still
-depends on the referenced host TAP and its live host configuration.
+A VMM snapshot records virtio-net device state. On macOS and Windows user networking, it also records libslirp's guest-visible DHCP and ARP/NAT state. Host-side sockets cannot move across restore: in-flight TCP flows reset, while new outbound connections work after restore. TAP snapshots record the adapter hint and NIC state; continued connectivity depends on the referenced host adapter and its configuration.
 
-Snapshot files are architecture- and hypervisor-backend-specific. In
-particular, do not plan a KVM-to-HVF or HVF-to-KVM network restore. See
-[Snapshots, Restore, and Fork](snapshots.md) for the complete compatibility
-rules.
+Snapshot files are architecture- and hypervisor-specific. Do not plan KVM, HVF, or WHP cross-backend restores. See [Snapshots, Restore, and Fork](snapshots.md) for the compatibility rules.

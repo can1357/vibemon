@@ -53,8 +53,29 @@ use crate::{
 /// and the returned file descriptor is the one handed to the block backend so a
 /// later path swap cannot make the guest open some other host file.
 #[cfg(target_os = "windows")]
-pub fn create_cow_overlay(_base: &Path, _dest: &Path) -> Result<File> {
-	Err(err("copy-on-write block overlays are unsupported on Windows"))
+pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
+	use std::io::{Read, Write};
+	let mut source =
+		File::open(base).map_err(|e| err(format!("opening base disk {}: {e}", base.display())))?;
+	if !source.metadata()?.is_file() {
+		return Err(err(format!("base disk {} must be a regular file", base.display())));
+	}
+	let mut output = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.open(dest)
+		.map_err(|e| err(format!("creating overlay {}: {e}", dest.display())))?;
+	let mut buffer = vec![0u8; 64 * 1024];
+	loop {
+		let count = source.read(&mut buffer)?;
+		if count == 0 {
+			break;
+		}
+		output.write_all(&buffer[..count])?;
+	}
+	output.flush()?;
+	Ok(output)
 }
 
 #[cfg(not(target_os = "windows"))]

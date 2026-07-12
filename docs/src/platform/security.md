@@ -4,9 +4,9 @@ Vibemon is not a production isolation boundary and has not received a security a
 
 ## Threat boundary and trusted inputs
 
-Treat guests, guest-controlled virtqueue data, and restored snapshot files as untrusted. The trusted computing base includes the `vmon` process, KVM or HVF, the host kernel, guest kernel and image inputs, disk images, snapshots, and every host path supplied at launch. Operator-supplied kernels, initrds, rootfs images, firmware, and host paths are trusted configuration, so protect their provenance and write access.
+Treat guests, guest-controlled virtqueue data, and restored snapshot files as untrusted. The trusted computing base includes `vmon`, KVM/HVF/WHP, the host kernel, guest kernel and image inputs, disk images, snapshots, and every host path supplied at launch.
 
-Do not expose control sockets, agent sockets, host filesystem shares, TAP devices, vmnet attachments, or user-mode forwarded ports across trust boundaries. Control and agent sockets are operator-owned, mode `0600`, must have private parent directories, and on Linux accept only root or the launch UID. Apply external host network policy around the gateway and exposed guest ports.
+Do not expose control endpoints, agent endpoints, host filesystem shares, TAP devices, vmnet attachments, or forwarded ports across trust boundaries. Unix control and agent sockets are operator-owned and mode `0600`. Windows named pipes use a local-only owner/SYSTEM ACL and reject remote clients. Apply external host network policy around gateways and exposed guest ports.
 
 ## Gateway authentication and TLS
 

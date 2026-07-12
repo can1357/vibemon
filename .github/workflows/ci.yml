@@ -74,6 +74,25 @@ jobs:
       - name: Compile tests
         run: cargo test --locked --no-run
 
+  windows:
+    name: Windows x86_64 WHP
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Check vmon binary
+        run: cargo check -p vmon --bin vmon --locked
+
+      - name: Lint Windows backend
+        run: cargo clippy -p vmm --tests --locked --no-deps -- -A dead_code -D warnings
+
+      - name: Test Windows backend
+        run: cargo test -p vmm --lib --locked
+
   python:
     name: Python SDK
     runs-on: ubuntu-latest

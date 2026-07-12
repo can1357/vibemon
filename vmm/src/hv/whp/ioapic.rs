@@ -21,6 +21,14 @@ const IOAPIC_REGSEL: u64 = 0x00;
 const IOAPIC_WINDOW: u64 = 0x10;
 const REDIR_MASKED: u64 = 1 << 16;
 
+/// Serializable userspace IOAPIC register state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct IoApicState {
+	pub selector:    u32,
+	pub id:          u8,
+	pub redirection: Vec<u64>,
+}
+
 /// Userspace IOAPIC whose redirection entries inject through
 /// `WHvRequestInterrupt`.
 pub struct IoApic {
@@ -32,7 +40,7 @@ pub struct IoApic {
 
 impl IoApic {
 	/// Create an IOAPIC attached to a WHP partition.
-	pub fn new(partition: Partition) -> Self {
+	pub const fn new(partition: Partition) -> Self {
 		Self {
 			partition,
 			selector: 0,
@@ -86,6 +94,29 @@ impl IoApic {
 		interrupt.Destination = destination;
 		interrupt.Vector = vector;
 		self.partition.request_interrupt(&interrupt)?;
+		Ok(())
+	}
+
+	/// Capture the userspace IOAPIC register file.
+	pub fn save_state(&self) -> IoApicState {
+		IoApicState {
+			selector:    self.selector,
+			id:          self.id,
+			redirection: self.redirection.to_vec(),
+		}
+	}
+
+	/// Restore the userspace IOAPIC register file.
+	pub fn restore_state(&mut self, state: &IoApicState) -> Result<()> {
+		if state.redirection.len() != IOAPIC_REDIRECTION_ENTRIES {
+			return Err(err(format!(
+				"WHP IOAPIC snapshot has {} entries, expected {IOAPIC_REDIRECTION_ENTRIES}",
+				state.redirection.len()
+			)));
+		}
+		self.selector = state.selector;
+		self.id = state.id;
+		self.redirection.copy_from_slice(&state.redirection);
 		Ok(())
 	}
 
@@ -180,7 +211,7 @@ impl vm_superio::Trigger for IrqLine {
 	type E = io::Error;
 
 	fn trigger(&self) -> io::Result<()> {
-		IrqLine::trigger(self).map_err(|e| io::Error::other(e.to_string()))
+		Self::trigger(self).map_err(|e| io::Error::other(e.to_string()))
 	}
 }
 
@@ -192,5 +223,20 @@ fn interrupt_type(delivery_mode: u8) -> Result<WHV_INTERRUPT_TYPE> {
 		5 => Ok(WHV_INTERRUPT_TYPE::WHvX64InterruptTypeInit),
 		6 => Ok(WHV_INTERRUPT_TYPE::WHvX64InterruptTypeSipi),
 		_ => Err(err(format!("WHP IOAPIC delivery mode {delivery_mode} is unsupported"))),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn delivery_modes_map_to_whp_interrupt_types() {
+		assert_eq!(interrupt_type(0).unwrap(), WHV_INTERRUPT_TYPE::WHvX64InterruptTypeFixed);
+		assert_eq!(interrupt_type(1).unwrap(), WHV_INTERRUPT_TYPE::WHvX64InterruptTypeLowestPriority);
+		assert_eq!(interrupt_type(4).unwrap(), WHV_INTERRUPT_TYPE::WHvX64InterruptTypeNmi);
+		assert_eq!(interrupt_type(5).unwrap(), WHV_INTERRUPT_TYPE::WHvX64InterruptTypeInit);
+		assert_eq!(interrupt_type(6).unwrap(), WHV_INTERRUPT_TYPE::WHvX64InterruptTypeSipi);
+		assert!(interrupt_type(3).is_err());
 	}
 }

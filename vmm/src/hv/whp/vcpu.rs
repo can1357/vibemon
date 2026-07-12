@@ -1,4 +1,4 @@
-//! WHP vCPU wrapper, run-loop exits and x86_64 boot register setup.
+//! WHP vCPU wrapper, run-loop exits and `x86_64` boot register setup.
 
 use std::sync::{
 	Arc,
@@ -10,19 +10,19 @@ use libwhp::{
 	WHV_MEMORY_ACCESS_CONTEXT, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
 	WHV_RUN_VP_EXIT_REASON, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT_CODE,
 	WHV_X64_FP_CONTROL_STATUS_REGISTER, WHV_X64_FP_CONTROL_STATUS_REGISTER_anon_struct,
-	WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_SEGMENT_REGISTER, WHV_X64_TABLE_REGISTER,
-	WHV_X64_XMM_CONTROL_STATUS_REGISTER, WHV_X64_XMM_CONTROL_STATUS_REGISTER_anon_struct,
+	WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_PENDING_EVENT_TYPE, WHV_X64_PENDING_EXCEPTION_EVENT,
+	WHV_X64_SEGMENT_REGISTER, WHV_X64_TABLE_REGISTER, WHV_X64_XMM_CONTROL_STATUS_REGISTER,
+	WHV_X64_XMM_CONTROL_STATUS_REGISTER_anon_struct,
 	instruction_emulator::{
 		Emulator, EmulatorCallbacks, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
 		WHV_EMULATOR_STATUS,
 	},
 };
 use parking_lot::Mutex;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
 
 use super::{CpuId, vm::IoEvents};
 use crate::{
-	bail,
 	devices::Bus,
 	hv::Exit,
 	layout::{
@@ -47,6 +47,7 @@ const X86_CR0_NE: u64 = 1 << 5;
 const X86_CR0_WP: u64 = 1 << 16;
 const X86_CR0_AM: u64 = 1 << 18;
 const X86_CR0_PG: u64 = 1 << 31;
+const X86_CR0_RESET: u64 = 0x6000_0010;
 const X86_CR4_PAE: u64 = 1 << 5;
 const X86_CR4_OSFXSR: u64 = 1 << 9;
 const X86_CR4_OSXMMEXCPT: u64 = 1 << 10;
@@ -71,6 +72,7 @@ const APIC_MODE_EXTINT: u32 = 0x7;
 const BOOT_CR0: u64 =
 	X86_CR0_PE | X86_CR0_MP | X86_CR0_ET | X86_CR0_NE | X86_CR0_WP | X86_CR0_AM | X86_CR0_PG;
 const BOOT_CR4: u64 = X86_CR4_PAE | X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT;
+const WHP_DIRTY_PAGE_SIZE: u64 = 4096;
 
 /// Cloneable WHP virtual processor with userspace emulation state.
 pub struct Vcpu {
@@ -100,7 +102,7 @@ impl Clone for Vcpu {
 
 impl Vcpu {
 	/// Wrap a newly-created WHP virtual processor.
-	pub(crate) fn new(inner: VirtualProcessor, ioevents: IoEvents) -> Self {
+	pub(super) fn new(inner: VirtualProcessor, ioevents: IoEvents) -> Self {
 		let inner = Arc::new(inner);
 		let cancel = VcpuCancel { vp: inner.clone() };
 		Self {
@@ -175,12 +177,12 @@ impl Vcpu {
 		}
 	}
 
-	/// Backend-neutral `run` is not used by the WHP backend.
-	pub fn run(&mut self) -> Result<Exit<'static>> {
-		Err(err("WHP vCPUs must be run with run_whp(pio_bus, mmio_bus)"))
-	}
-
-	/// Clone and patch a host CPUID template for this vCPU.
+	/// Store the per-vCPU CPUID overrides applied on top of WHP's filtered
+	/// default results.
+	#[allow(
+		clippy::unnecessary_wraps,
+		reason = "x86 boot setup uses the same fallible CPUID interface on KVM and WHP"
+	)]
 	pub fn set_cpuid_template(&self, base: &CpuId, cpu_id: u8) -> Result<()> {
 		let mut cpuid = base.clone();
 		for entry in cpuid.as_mut_slice() {
@@ -195,6 +197,57 @@ impl Vcpu {
 			}
 		}
 		*self.cpuid.lock() = cpuid;
+		Ok(())
+	}
+
+	/// Clone the CPUID surface currently presented to this vCPU.
+	pub fn cpuid_state(&self) -> CpuId {
+		self.cpuid.lock().clone()
+	}
+
+	/// Replace the CPUID surface presented to this vCPU.
+	pub fn set_cpuid_state(&self, cpuid: &CpuId) {
+		*self.cpuid.lock() = cpuid.clone();
+	}
+
+	/// Return the userspace-emulated `IA32_MISC_ENABLE` value.
+	pub(crate) fn misc_enable_state(&self) -> u64 {
+		self.misc_enable.load(Ordering::SeqCst)
+	}
+
+	/// Restore the userspace-emulated `IA32_MISC_ENABLE` value.
+	pub(crate) fn set_misc_enable_state(&self, value: u64) {
+		self.misc_enable.store(value, Ordering::SeqCst);
+	}
+
+	/// Fetch and clear WHP's guest-write bitmap for every RAM region.
+	pub(crate) fn take_dirty_log(&self, memory: &GuestMemoryMmap) -> Result<Vec<Vec<u64>>> {
+		let mut logs = Vec::new();
+		for region in memory.iter() {
+			let pages = region.len().div_ceil(WHP_DIRTY_PAGE_SIZE);
+			let bytes = u32::try_from(pages.div_ceil(64) * std::mem::size_of::<u64>() as u64)
+				.map_err(|_| err("WHP dirty bitmap size overflows u32"))?;
+			let start = region.start_addr().raw_value();
+			let log = self
+				.inner
+				.query_gpa_range_dirty_bitmap(start, region.len(), bytes)?;
+			self
+				.inner
+				.query_gpa_range_dirty_bitmap(start, region.len(), 0)?;
+			logs.push(log.into_vec());
+		}
+		Ok(logs)
+	}
+
+	/// Clear WHP's guest-write bitmap for every RAM region.
+	pub(crate) fn clear_dirty_log(&self, memory: &GuestMemoryMmap) -> Result<()> {
+		for region in memory.iter() {
+			self.inner.query_gpa_range_dirty_bitmap(
+				region.start_addr().raw_value(),
+				region.len(),
+				0,
+			)?;
+		}
 		Ok(())
 	}
 
@@ -268,6 +321,60 @@ impl Vcpu {
 		Ok(())
 	}
 
+	/// Set the architectural reset-vector general-purpose register state for
+	/// UEFI.
+	pub fn setup_uefi_regs(&self, entry: u64) -> Result<()> {
+		let names = [
+			WHV_REGISTER_NAME::WHvX64RegisterRflags,
+			WHV_REGISTER_NAME::WHvX64RegisterRip,
+			WHV_REGISTER_NAME::WHvX64RegisterRsp,
+			WHV_REGISTER_NAME::WHvX64RegisterRbp,
+			WHV_REGISTER_NAME::WHvX64RegisterRsi,
+		];
+		let values = [reg64(2), reg64(entry & 0xffff), reg64(0), reg64(0), reg64(0)];
+		self.inner.set_registers(&names, &values)?;
+		Ok(())
+	}
+
+	/// Configure real-mode segment and control-register state for a UEFI reset.
+	pub fn setup_uefi_sregs(&self) -> Result<()> {
+		let names = [
+			WHV_REGISTER_NAME::WHvX64RegisterCs,
+			WHV_REGISTER_NAME::WHvX64RegisterDs,
+			WHV_REGISTER_NAME::WHvX64RegisterEs,
+			WHV_REGISTER_NAME::WHvX64RegisterFs,
+			WHV_REGISTER_NAME::WHvX64RegisterGs,
+			WHV_REGISTER_NAME::WHvX64RegisterSs,
+			WHV_REGISTER_NAME::WHvX64RegisterCr0,
+			WHV_REGISTER_NAME::WHvX64RegisterCr3,
+			WHV_REGISTER_NAME::WHvX64RegisterCr4,
+			WHV_REGISTER_NAME::WHvX64RegisterEfer,
+		];
+		let data = reset_segment(0, 0, 3);
+		let values = [
+			segment_reg(reset_segment(0xf000, 0xffff_0000, 0xb)),
+			segment_reg(data),
+			segment_reg(data),
+			segment_reg(data),
+			segment_reg(data),
+			segment_reg(data),
+			reg64(X86_CR0_RESET),
+			reg64(0),
+			reg64(0),
+			reg64(0),
+		];
+		self.inner.set_registers(&names, &values)?;
+		Ok(())
+	}
+
+	/// Hold an application processor until the guest sends its startup IPI.
+	pub fn suspend_for_startup(&self) -> Result<()> {
+		self
+			.inner
+			.set_registers(&[WHV_REGISTER_NAME::WHvRegisterInternalActivityState], &[reg64(1)])?;
+		Ok(())
+	}
+
 	/// Configure segment/control registers and install boot page tables.
 	pub fn setup_sregs(&self, mem: &GuestMemoryMmap) -> Result<()> {
 		write_boot_tables(mem)?;
@@ -306,15 +413,14 @@ impl Vcpu {
 		Ok(())
 	}
 
-	/// Snapshotting WHP vCPU state is not supported in the first Windows
-	/// backend.
-	pub fn save_state(&self, _xsave_size: usize) -> Result<crate::arch::state::VcpuState> {
-		Err(err("WHP snapshots are not supported"))
+	/// Snapshot this WHP vCPU's architectural state.
+	pub fn save_state(&self, xsave_size: usize) -> Result<crate::arch::state::VcpuState> {
+		crate::arch::state::save_vcpu(self, xsave_size)
 	}
 
-	/// Restoring WHP vCPU state is not supported in the first Windows backend.
-	pub fn restore_state(&self, _st: &crate::arch::state::VcpuState) -> Result<()> {
-		Err(err("WHP restore is not supported"))
+	/// Restore this WHP vCPU's architectural state.
+	pub fn restore_state(&self, state: &crate::arch::state::VcpuState) -> Result<()> {
+		crate::arch::state::restore_vcpu(self, state)
 	}
 
 	fn emulate_mmio(
@@ -348,21 +454,15 @@ impl Vcpu {
 	fn handle_cpuid(&self, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<()> {
 		// SAFETY: `CpuidAccess` is valid for this exit reason.
 		let access = unsafe { exit_context.anon_union.CpuidAccess };
-		let result = self
-			.cpuid
-			.lock()
-			.result(access.Rax as u32, access.Rcx as u32);
-		let (eax, ebx, ecx, edx) = result.map_or(
-			(
-				access.DefaultResultRax,
-				access.DefaultResultRbx,
-				access.DefaultResultRcx,
-				access.DefaultResultRdx,
-			),
-			|entry| {
-				(u64::from(entry.eax), u64::from(entry.ebx), u64::from(entry.ecx), u64::from(entry.edx))
-			},
-		);
+		let function = access.Rax as u32;
+		let defaults = [
+			access.DefaultResultRax,
+			access.DefaultResultRbx,
+			access.DefaultResultRcx,
+			access.DefaultResultRdx,
+		];
+		let entry = self.cpuid.lock().result(function, access.Rcx as u32);
+		let [eax, ebx, ecx, edx] = apply_cpuid_override(defaults, function, entry);
 		let names = [
 			WHV_REGISTER_NAME::WHvX64RegisterRip,
 			WHV_REGISTER_NAME::WHvX64RegisterRax,
@@ -378,6 +478,9 @@ impl Vcpu {
 	fn handle_msr(&self, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<()> {
 		// SAFETY: `MsrAccess` is valid for this exit reason.
 		let access = unsafe { exit_context.anon_union.MsrAccess };
+		if !supports_msr(access.MsrNumber) {
+			return self.inject_general_protection();
+		}
 		if access.AccessInfo.IsWrite() == 1 {
 			let value = (access.Rdx << 32) | (access.Rax & 0xffff_ffff);
 			self.set_msr_register(access.MsrNumber, value)?;
@@ -400,14 +503,28 @@ impl Vcpu {
 		Ok(())
 	}
 
+	fn inject_general_protection(&self) -> Result<()> {
+		let mut event = WHV_X64_PENDING_EXCEPTION_EVENT::default();
+		event.set_EventPending(1);
+		event.set_EventType(WHV_X64_PENDING_EVENT_TYPE::WHvX64PendingEventException as u64);
+		event.set_DeliverErrorCode(1);
+		event.set_Vector(13);
+		event.set_ErrorCode(0);
+		let mut value = WHV_REGISTER_VALUE::default();
+		value.ExceptionEvent = event;
+		self
+			.inner
+			.set_registers(&[WHV_REGISTER_NAME::WHvRegisterPendingEvent], &[value])?;
+		Ok(())
+	}
+
 	fn set_msr_register(&self, msr: u32, value: u64) -> Result<()> {
 		if msr == MSR_IA32_MISC_ENABLE {
 			self.misc_enable.store(value, Ordering::SeqCst);
 			return Ok(());
 		}
-		let Some(name) = msr_register_name(msr) else {
-			bail!("WHP unsupported MSR write {msr:#x}");
-		};
+		let name = msr_register_name(msr)
+			.ok_or_else(|| err(format!("no WHP register mapping for MSR {msr:#x}")))?;
 		self.inner.set_registers(&[name], &[reg64(value)])?;
 		Ok(())
 	}
@@ -416,9 +533,8 @@ impl Vcpu {
 		if msr == MSR_IA32_MISC_ENABLE {
 			return Ok(self.misc_enable.load(Ordering::SeqCst));
 		}
-		let Some(name) = msr_register_name(msr) else {
-			bail!("WHP unsupported MSR read {msr:#x}");
-		};
+		let name = msr_register_name(msr)
+			.ok_or_else(|| err(format!("no WHP register mapping for MSR {msr:#x}")))?;
 		let mut value = [WHV_REGISTER_VALUE::default()];
 		self.inner.get_registers(&[name], &mut value)?;
 		// SAFETY: the requested register is a 64-bit register.
@@ -441,7 +557,7 @@ struct RunCallbacks {
 }
 
 impl RunCallbacks {
-	fn new(vp: &VirtualProcessor, pio_bus: &Bus, mmio_bus: &Bus, ioevents: IoEvents) -> Self {
+	const fn new(vp: &VirtualProcessor, pio_bus: &Bus, mmio_bus: &Bus, ioevents: IoEvents) -> Self {
 		Self { vp, pio_bus, mmio_bus, ioevents, error: None }
 	}
 
@@ -450,18 +566,18 @@ impl RunCallbacks {
 		E_FAIL
 	}
 
-	fn vp(&self) -> &VirtualProcessor {
+	const fn vp(&self) -> &VirtualProcessor {
 		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `vp` alive.
 		unsafe { &*self.vp }
 	}
 
-	fn pio_bus(&self) -> &Bus {
+	const fn pio_bus(&self) -> &Bus {
 		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `pio_bus`
 		// alive.
 		unsafe { &*self.pio_bus }
 	}
 
-	fn mmio_bus(&self) -> &Bus {
+	const fn mmio_bus(&self) -> &Bus {
 		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `mmio_bus`
 		// alive.
 		unsafe { &*self.mmio_bus }
@@ -475,7 +591,6 @@ impl EmulatorCallbacks for RunCallbacks {
 		if io_access.Direction == 1 {
 			let bytes = io_access.Data.to_le_bytes();
 			self.pio_bus().write(port, &bytes[..len]);
-			S_OK
 		} else {
 			let mut bytes = [0xffu8; 4];
 			if self.pio_bus().read(port, &mut bytes[..len]) {
@@ -483,8 +598,8 @@ impl EmulatorCallbacks for RunCallbacks {
 			} else {
 				io_access.Data = u32::MAX;
 			}
-			S_OK
 		}
+		S_OK
 	}
 
 	fn memory(&mut self, memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO) -> HRESULT {
@@ -496,7 +611,6 @@ impl EmulatorCallbacks for RunCallbacks {
 				return self.fail(format!("failed to signal WHP ioevent at {addr:#x}"));
 			}
 			self.mmio_bus().write(addr, data);
-			S_OK
 		} else {
 			let mut data = [0xffu8; 8];
 			if self.mmio_bus().read(addr, &mut data[..len]) {
@@ -504,8 +618,8 @@ impl EmulatorCallbacks for RunCallbacks {
 			} else {
 				memory_access.Data[..len].fill(0xff);
 			}
-			S_OK
 		}
+		S_OK
 	}
 
 	fn get_virtual_processor_registers(
@@ -589,6 +703,39 @@ fn set_hypervisor_vendor(entry: &mut super::CpuIdEntry) {
 	entry.edx = u32::from_le_bytes(vendor[8..12].try_into().unwrap());
 }
 
+fn apply_cpuid_override(
+	mut defaults: [u64; 4],
+	function: u32,
+	entry: Option<super::CpuIdEntry>,
+) -> [u64; 4] {
+	let Some(entry) = entry else {
+		return defaults;
+	};
+	match function {
+		LEAF_FEATURE_INFO => {
+			defaults[1] = (defaults[1] & 0x00ff_ffff) | (u64::from(entry.ebx) & 0xff00_0000);
+			defaults[2] |= u64::from(ECX_HYPERVISOR_BIT);
+		},
+		LEAF_EXTENDED_TOPOLOGY | LEAF_V2_EXTENDED_TOPOLOGY => {
+			defaults[3] = u64::from(entry.edx);
+		},
+		0x4000_0000 => {
+			defaults = [
+				u64::from(entry.eax),
+				u64::from(entry.ebx),
+				u64::from(entry.ecx),
+				u64::from(entry.edx),
+			];
+		},
+		_ => {},
+	}
+	defaults
+}
+
+const fn supports_msr(msr: u32) -> bool {
+	msr == MSR_IA32_MISC_ENABLE || msr_register_name(msr).is_some()
+}
+
 fn next_rip(exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> u64 {
 	exit_context.VpContext.Rip + u64::from(exit_context.VpContext.InstructionLength())
 }
@@ -609,6 +756,19 @@ fn table_reg(base: u64, limit: u16) -> WHV_REGISTER_VALUE {
 	let mut reg = WHV_REGISTER_VALUE::default();
 	reg.Table = WHV_X64_TABLE_REGISTER { Pad: [0; 3], Limit: limit, Base: base };
 	reg
+}
+
+fn reset_segment(selector: u16, base: u64, type_: u16) -> WHV_X64_SEGMENT_REGISTER {
+	let mut seg = WHV_X64_SEGMENT_REGISTER {
+		Base:       base,
+		Limit:      0xffff,
+		Selector:   selector,
+		Attributes: 0,
+	};
+	seg.set_SegmentType(type_);
+	seg.set_NonSystemSegment(1);
+	seg.set_Present(1);
+	seg
 }
 
 fn code_segment(index: u16) -> WHV_X64_SEGMENT_REGISTER {
@@ -699,7 +859,7 @@ const fn set_apic_delivery_mode(reg: u32, mode: u32) -> u32 {
 	(reg & !0x700) | (mode << 8)
 }
 
-fn msr_register_name(msr: u32) -> Option<WHV_REGISTER_NAME> {
+const fn msr_register_name(msr: u32) -> Option<WHV_REGISTER_NAME> {
 	Some(match msr {
 		MSR_IA32_SYSENTER_CS => WHV_REGISTER_NAME::WHvX64RegisterSysenterCs,
 		MSR_IA32_SYSENTER_ESP => WHV_REGISTER_NAME::WHvX64RegisterSysenterEsp,
@@ -715,4 +875,44 @@ fn msr_register_name(msr: u32) -> Option<WHV_REGISTER_NAME> {
 		MSR_IA32_TSC_AUX => WHV_REGISTER_NAME::WHvX64RegisterTscAux,
 		_ => return None,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ioevent_matching_uses_address_and_little_endian_datamatch() {
+		assert!(event_matches(0x1000, None, 0x1000, &[]));
+		assert!(event_matches(0x1000, Some(0x1234), 0x1000, &[0x34, 0x12]));
+		assert!(!event_matches(0x1000, Some(0x1234), 0x1000, &[0x12, 0x34]));
+		assert!(!event_matches(0x1000, None, 0x1004, &[]));
+	}
+
+	#[test]
+	fn cpuid_overrides_only_per_vcpu_fields() {
+		let defaults = [1, 0x0055_aa55, 0x10, 4];
+		let entry = super::super::CpuIdEntry {
+			ebx: 0xab00_0000,
+			ecx: ECX_HYPERVISOR_BIT,
+			edx: 7,
+			..Default::default()
+		};
+		let feature = apply_cpuid_override(defaults, LEAF_FEATURE_INFO, Some(entry));
+		assert_eq!(feature[0], defaults[0]);
+		assert_eq!(feature[1], 0xab55_aa55);
+		assert_eq!(feature[2], defaults[2] | u64::from(ECX_HYPERVISOR_BIT));
+		assert_eq!(feature[3], defaults[3]);
+
+		let topology = apply_cpuid_override(defaults, LEAF_EXTENDED_TOPOLOGY, Some(entry));
+		assert_eq!(topology, [defaults[0], defaults[1], defaults[2], 7]);
+		assert_eq!(apply_cpuid_override(defaults, 0x7, Some(entry)), defaults);
+	}
+
+	#[test]
+	fn msr_filter_accepts_only_emulated_or_backed_registers() {
+		assert!(supports_msr(MSR_IA32_MISC_ENABLE));
+		assert!(supports_msr(MSR_IA32_TSC));
+		assert!(!supports_msr(u32::MAX));
+	}
 }

@@ -34,7 +34,7 @@ just release
 just profile=release bin
 ```
 
-The project uses Linux/KVM directly on Linux and HVF natively on macOS. Its `just` recipes select the host implementation automatically. Separate `lima-*` recipes drive the Linux/KVM path through `limactl shell` from macOS; that path uses a checkout inside the Lima guest rather than the macOS checkout.
+The project uses Linux/KVM on Linux, HVF on Apple Silicon macOS, and WHP on x86_64 Windows. The backend is selected at compile time. Separate `lima-*` recipes drive Linux/KVM through `limactl shell` from macOS.
 
 ## macOS signing
 
@@ -54,6 +54,16 @@ codesign --sign - --entitlements hvf.entitlements --force target/release/vmon
 ```
 
 Linux builds do not require codesigning; the Linux `codesign` recipe reports that KVM does not need it.
+
+## Windows build
+
+Build from an x86_64 Windows developer shell with the Rust MSVC toolchain and Windows SDK installed:
+
+```powershell
+cargo build --release
+```
+
+The host must have Windows Hypervisor Platform or Hyper-V enabled to run a guest. The Windows user-network backend is built from the vendored libslirp sources, so it does not require a separately installed libslirp runtime. Control, agent, and remote-filesystem paths are converted into local named-pipe names at runtime.
 
 ## Build the embedded panel
 

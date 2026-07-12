@@ -1,5 +1,5 @@
-//! Control plane: vCPU pause/resume signalling primitives and a Unix-socket
-//! command server.
+//! Control plane: vCPU pause/resume signalling primitives and a local command
+//! server.
 //!
 //! [`PauseGate`] coordinates parking every vCPU thread at a safe point so a
 //! snapshot sees a frozen machine. It uses a real-time signal to kick threads
@@ -7,18 +7,18 @@
 //! `SA_RESTART`, so the interrupted ioctl returns `EINTR` and the vCPU loop can
 //! re-check its run state.
 //!
-//! [`serve`] exposes a newline-delimited JSON lifecycle protocol over a
-//! `UnixListener`. The socket thread never touches the `Vmm` directly; it
-//! forwards parsed requests to the owning thread over a channel and
-//! serializes that thread's JSON response back to the socket.
+//! [`serve`] exposes a newline-delimited JSON lifecycle protocol over a Unix
+//! socket or Windows named pipe. The server thread never touches the `Vmm`
+//! directly; it forwards parsed requests to the owning thread over a channel
+//! and serializes that thread's JSON response back to the connection.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{FromRawHandle, RawHandle};
 #[cfg(unix)]
 use std::{
 	fs,
-	io::{self, BufRead, BufReader, Write},
 	os::unix::{
 		ffi::OsStrExt,
 		fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
@@ -26,18 +26,37 @@ use std::{
 	},
 	path::Path,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+	io::{self, BufRead, BufReader, Read, Write},
+	path::PathBuf,
+	sync::Arc,
+	time::Duration,
+};
 
-#[cfg(unix)]
-use flume::RecvTimeoutError;
-use flume::Sender;
+use flume::{RecvTimeoutError, Sender};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+	Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
+	Security::{
+		Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, PSECURITY_DESCRIPTOR,
+		SECURITY_ATTRIBUTES,
+	},
+	Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
+	System::Pipes::{
+		ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+		PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+	},
+};
 
-use crate::result::{Result, err};
+use crate::result::Result;
+#[cfg(unix)]
+use crate::result::err;
 
 const CONTROL_MAX_REQUEST_LINE: usize = 65_536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 /// Real-time signal used on Linux to kick a vCPU out of `KVM_RUN`.
@@ -368,36 +387,141 @@ impl ControlCleanup {
 		cleanup_socket_for_uid(&self.sock_path, self.owner_uid, Some(self.identity));
 	}
 }
+#[cfg(target_os = "windows")]
+/// Windows named-pipe control server owned by the VMM lifecycle.
+pub struct ControlServer {
+	pipe_name: Vec<u16>,
+	listener:  Mutex<Option<std::fs::File>>,
+}
 
-#[cfg(not(unix))]
-pub struct ControlServer;
-
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+/// No-op cleanup token matching the Unix control-server interface.
 pub struct ControlCleanup;
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
 impl ControlServer {
-	pub const fn cleanup(&self) {}
+	/// Close the outstanding named-pipe listener.
+	pub fn cleanup(&self) {
+		self.listener.lock().take();
+	}
 
+	/// Return the cleanup token used by shared VMM teardown code.
+	#[allow(
+		clippy::unused_self,
+		reason = "the Unix implementation derives cleanup state from the server"
+	)]
 	pub const fn cleanup_token(&self) -> ControlCleanup {
 		ControlCleanup
 	}
 
-	pub fn start(self, _tx: Sender<ControlCmd>) {}
+	/// Serve control requests on named-pipe instances.
+	pub fn start(self, tx: Sender<ControlCmd>) {
+		let pipe_name = self.pipe_name;
+		let first = self.listener.into_inner();
+		std::thread::spawn(move || {
+			let mut listener = first;
+			while let Some(pipe) = listener {
+				if connect_named_pipe(&pipe).is_err() {
+					return;
+				}
+				listener = create_control_pipe(&pipe_name, false).ok();
+				let tx = tx.clone();
+				std::thread::spawn(move || handle_connection(pipe, tx));
+			}
+		});
+	}
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
 impl ControlCleanup {
+	/// Complete platform-neutral teardown; Windows handles close through RAII.
+	#[allow(
+		clippy::unused_self,
+		reason = "shared teardown invokes cleanup through the platform token"
+	)]
 	pub const fn cleanup(&self) {}
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+/// Bind the Windows control plane to a deterministic named-pipe name.
 pub fn bind(
-	_sock_path: PathBuf,
+	sock_path: PathBuf,
 	_owner: Option<SocketOwner>,
 	_launch_uid: u32,
 ) -> Result<ControlServer> {
-	Err(err("Unix socket control plane is not supported on Windows"))
+	let pipe_name = crate::windows_pipe::pipe_name(&sock_path);
+	let listener = create_control_pipe(&pipe_name, true)?;
+	Ok(ControlServer { pipe_name, listener: Mutex::new(Some(listener)) })
+}
+
+#[cfg(target_os = "windows")]
+fn create_control_pipe(pipe_name: &[u16], first: bool) -> Result<std::fs::File> {
+	const SDDL_REVISION_1: u32 = 1;
+	let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;GA;;;OW)"
+		.encode_utf16()
+		.chain(Some(0))
+		.collect();
+	let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+	// SAFETY: SDDL is NUL-terminated and descriptor points to writable storage.
+	if unsafe {
+		ConvertStringSecurityDescriptorToSecurityDescriptorW(
+			sddl.as_ptr(),
+			SDDL_REVISION_1,
+			&mut descriptor,
+			std::ptr::null_mut(),
+		)
+	} == 0
+	{
+		return Err(io::Error::last_os_error().into());
+	}
+	let attributes = SECURITY_ATTRIBUTES {
+		nLength:              std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+		lpSecurityDescriptor: descriptor,
+		bInheritHandle:       0,
+	};
+	let open_mode = PIPE_ACCESS_DUPLEX
+		| if first {
+			FILE_FLAG_FIRST_PIPE_INSTANCE
+		} else {
+			0
+		};
+	// SAFETY: pipe_name and the security descriptor remain valid for the call.
+	let handle = unsafe {
+		CreateNamedPipeW(
+			pipe_name.as_ptr(),
+			open_mode,
+			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+			PIPE_UNLIMITED_INSTANCES,
+			64 * 1024,
+			64 * 1024,
+			CONTROL_READ_TIMEOUT.as_millis() as u32,
+			&attributes,
+		)
+	};
+	// SAFETY: ConvertStringSecurityDescriptor allocated descriptor with LocalAlloc.
+	unsafe { LocalFree(descriptor.cast()) };
+	if handle == INVALID_HANDLE_VALUE {
+		return Err(io::Error::last_os_error().into());
+	}
+	// SAFETY: CreateNamedPipeW returned a fresh owned handle.
+	Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+}
+
+#[cfg(target_os = "windows")]
+fn connect_named_pipe(pipe: &std::fs::File) -> io::Result<()> {
+	use std::os::windows::io::AsRawHandle;
+	let handle = pipe.as_raw_handle() as HANDLE;
+	// SAFETY: handle is a live named-pipe server handle and synchronous operation
+	// requires no OVERLAPPED storage.
+	if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
+		return Ok(());
+	}
+	let error = io::Error::last_os_error();
+	if error.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
+		Ok(())
+	} else {
+		Err(error)
+	}
 }
 
 /// Bind a `UnixListener` at `sock_path` without spawning the server thread.
@@ -849,17 +973,32 @@ struct Response {
 	error:  Option<ApiError>,
 }
 
-#[cfg(unix)]
 enum RequestLine {
 	Text(String),
 	BadRequest { message: &'static str, close: bool },
 }
 
-/// Serve one client connection until EOF or an IO error.
+trait ControlStream: Read + Write + Send + Sized + 'static {
+	fn duplicate(&self) -> io::Result<Self>;
+}
+
 #[cfg(unix)]
-fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
-	// One half for writing replies, the other (buffered) for reading commands.
-	let Ok(mut writer) = stream.try_clone() else {
+impl ControlStream for UnixStream {
+	fn duplicate(&self) -> io::Result<Self> {
+		self.try_clone()
+	}
+}
+
+#[cfg(target_os = "windows")]
+impl ControlStream for std::fs::File {
+	fn duplicate(&self) -> io::Result<Self> {
+		self.try_clone()
+	}
+}
+
+/// Serve one client connection until EOF or an IO error.
+fn handle_connection<S: ControlStream>(stream: S, tx: Sender<ControlCmd>) {
+	let Ok(mut writer) = stream.duplicate() else {
 		return;
 	};
 	if write_json_line(&mut writer, &Banner { vmm: env!("CARGO_PKG_VERSION"), api: 1 }).is_err() {
@@ -896,17 +1035,16 @@ fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 
 		crate::metrics::record_control_request();
 
-		// Hand the command to the owning thread and wait for its JSON reply.
 		let (rtx, rrx) = flume::bounded::<ControlReply>(1);
 		if tx.send(ControlCmd { kind, reply: rtx }).is_err() {
-			return; // VMM gone: nothing more to serve.
+			return;
 		}
 		let reply = match rrx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
 			Ok(reply) => reply,
 			Err(RecvTimeoutError::Timeout) => Err(ApiError::internal(format!(
 				"control reply timed out after {CONTROL_REPLY_TIMEOUT:?}"
 			))),
-			Err(RecvTimeoutError::Disconnected) => return, // Reply dropped without a response.
+			Err(RecvTimeoutError::Disconnected) => return,
 		};
 		let write_result = match reply {
 			Ok(result) => write_success(&mut writer, id, result),
@@ -918,8 +1056,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<ControlCmd>) {
 	}
 }
 
-#[cfg(unix)]
-fn write_success(writer: &mut UnixStream, id: u64, result: serde_json::Value) -> io::Result<()> {
+fn write_success<W: Write>(writer: &mut W, id: u64, result: serde_json::Value) -> io::Result<()> {
 	write_json_line(writer, &Response {
 		id:     Some(id),
 		ok:     true,
@@ -928,21 +1065,18 @@ fn write_success(writer: &mut UnixStream, id: u64, result: serde_json::Value) ->
 	})
 }
 
-#[cfg(unix)]
-fn write_error(writer: &mut UnixStream, id: Option<u64>, error: ApiError) -> io::Result<()> {
+fn write_error<W: Write>(writer: &mut W, id: Option<u64>, error: ApiError) -> io::Result<()> {
 	write_json_line(writer, &Response { id, ok: false, result: None, error: Some(error) })
 }
 
-#[cfg(unix)]
-fn write_json_line<T: Serialize>(writer: &mut UnixStream, value: &T) -> io::Result<()> {
+fn write_json_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
 	serde_json::to_writer(&mut *writer, value)
 		.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 	writer.write_all(b"\n")
 }
 
-#[cfg(unix)]
-fn read_request_line(
-	reader: &mut BufReader<UnixStream>,
+fn read_request_line<R: BufRead>(
+	reader: &mut R,
 	line: &mut Vec<u8>,
 ) -> io::Result<Option<RequestLine>> {
 	line.clear();

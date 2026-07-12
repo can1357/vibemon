@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/hero.png" alt="Vibemon — KVM/HVF microVM monitor" width="100%" />
+  <img src="assets/hero.png" alt="Vibemon — KVM, HVF, and WHP microVM monitor" width="100%" />
 </p>
 
 # Vibemon
 
-`vmon` is a small KVM/HVF-based virtual machine monitor for Linux guests. It boots containers as hardware-isolated microVMs, snapshots them to disk, and forks copy-on-write clones in milliseconds — now owned end-to-end by a single Rust binary: the user CLI, `vmon serve` server, and low-level `vmon vmm` monitor.
+`vmon` is a small KVM, HVF, and WHP virtual machine monitor for Linux guests. One Rust binary owns the user CLI, `vmon serve` server, and low-level `vmon vmm` monitor. It boots containers as hardware-isolated microVMs, snapshots them to disk, and forks copy-on-write clones.
 
 <p align="center">
   <img src="assets/lifecycle.png" alt="Snapshot, restore, and fork lifecycle" width="100%" />
@@ -16,7 +16,7 @@
 # Build the single Rust binary
 just release                      # target/release/vmon
 
-# Run a container as a microVM (Linux/KVM, or Apple-silicon macOS/HVF)
+# Run a container as a microVM (Linux/KVM or Apple Silicon macOS/HVF)
 ./target/release/vmon run alpine -- sh -c 'echo hello from a microVM; uname -a'
 
 # Snapshot, warm-boot, and fork
@@ -25,7 +25,7 @@ just release                      # target/release/vmon
 ./target/release/vmon fork tpl --count 5           # ~3 ms per CoW clone
 ```
 
-The commands above also run natively on Apple-silicon macOS via HVF (`just release` codesigns the binary). To launch the embedded web panel and gRPC/HTTP API (any platform):
+The commands above run on Linux/KVM and Apple Silicon macOS/HVF. The Windows build currently exposes the low-level `vmon vmm` WHP monitor; the user CLI and `vmon serve` have not been ported to Windows. `just release` codesigns the macOS binary. To launch the embedded web panel and gRPC/HTTP API:
 
 ```sh
 cd ui && bun install && bun run build   # writes vmond/web/
@@ -53,23 +53,23 @@ vmon vmm (Rust VMM crate)
 vmon-agent (guest agent, Linux guest only)
 ```
 
-**Rust boot path:** `Config::from_args()` → `vmm::run()` → `Vmm::build()` (boot or restore/fork) → allocate guest memory, instantiate virtio device backends, register on the device `Bus` → `Vmm::start()` spawns one thread per vCPU and one worker thread per device. vCPU threads run the hypervisor loop (`KVM_RUN` / HVF), trap MMIO/PortIO to the `Bus`, and notify virtio queues; device workers `poll()` queue/backend/control eventfds and signal completion interrupts.
+**Rust boot path:** `Config::from_args()` → `vmm::run()` → `Vmm::build()` (boot or restore/fork) → allocate guest memory, instantiate virtio device backends, register on the device `Bus` → `Vmm::start()` spawns one thread per vCPU and one worker thread per device. vCPU threads run the hypervisor loop (`KVM_RUN`, HVF, or WHP), trap MMIO/PortIO to the `Bus`, and notify virtio queues; device workers wait for queue, backend, and control events before signaling completion interrupts.
 
-**Control plane:** Unix-socket JSON protocol (`ping`, `info`, `pause`, `resume`, `snapshot`, `quit`, `metrics`, `extend`). The socket thread never touches the `Vmm` directly — requests cross a `flume` channel to the owner thread. `PauseGate` quiesces vCPUs via an RT signal without `SA_RESTART` on Linux and via a backend kicker callback on HVF.
+**Control plane:** JSON lifecycle protocol (`ping`, `info`, `pause`, `resume`, `snapshot`, `quit`, `metrics`, `extend`) over Unix sockets on Linux/macOS and local named pipes on Windows. Requests cross a `flume` channel to the owner thread; the transport thread never touches the `Vmm` directly. `PauseGate` quiesces vCPUs with an RT signal on Linux and backend exit kickers on HVF and WHP.
 
 ## Support matrix
 
 | Area | Supported | Notes |
 | --- | --- | --- |
-| Host OS | Linux with `/dev/kvm`; macOS 15+ on Apple Silicon with Hypervisor.framework | Linux builds use KVM. macOS builds use HVF and require a codesigned binary with `com.apple.security.hypervisor`. |
-| Host CPU architecture | `x86_64`, `aarch64` | Linux guests follow the host hypervisor architecture. macOS/HVF supports `aarch64` Linux guests only. |
+| Host OS | Linux with `/dev/kvm`; macOS 15+ on Apple Silicon with Hypervisor.framework; x86_64 Windows with Windows Hypervisor Platform | The backend is selected at compile time: KVM, HVF, or WHP. macOS requires a codesigned binary with `com.apple.security.hypervisor`; Windows requires the Hyper-V/Windows Hypervisor Platform feature and currently supports the low-level `vmon vmm` monitor only. |
+| Host CPU architecture | `x86_64`, `aarch64` | Linux guests follow the host hypervisor architecture. macOS/HVF supports `aarch64` guests only; Windows/WHP supports `x86_64` guests only. |
 | Guest OS | Linux | Direct-kernel boot and operator-supplied UEFI firmware are supported; non-Linux guests are not a target. |
-| x86_64 direct kernel format | uncompressed ELF `vmlinux` or `bzImage` | Loaded directly by vmon. |
+| x86_64 direct kernel format | uncompressed ELF `vmlinux` or `bzImage` | Loaded directly by vmon on KVM or WHP. |
 | aarch64 direct kernel format | uncompressed `Image` | The demo can extract an `Image` from a host `vmlinuz` on arm64 Linux. |
-| UEFI firmware | QEMU/EDK2 firmware supplied by the operator | Pass `--boot-mode uefi --firmware <path>`; vmon does not vendor firmware blobs. |
-| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, virtio-rng, writable or read-only virtio-fs | Linux networking uses TAP. macOS/HVF supports entitlement-free `--net user` virtio-net via libslirp; `--tap` still errors on the ad-hoc-signed binary because vmnet-style host networking needs unavailable entitlements. The default aarch64 kernel includes virtio-fs; x86_64/firecracker and custom non-virtiofs kernels lack it. Snapshot/restore covers MMIO/PCI virtio state, virtio-fs inode/mode state, and macOS user-net libslirp state; host-side TCP flows reset after user-net restore. Named volumes are re-attached by host path locally and are lease-protected on mesh writable mounts. |
+| UEFI firmware | QEMU/EDK2 firmware supplied by the operator | Pass `--boot-mode uefi --firmware <path>`; vmon maps OVMF firmware on x86_64 WHP and does not vendor firmware blobs. |
+| Devices | serial console, virtio-blk, virtio-net, virtio-console agent, virtio-rng, writable/read-only virtio-fs, remote virtio-fs | Linux networking uses TAP. macOS/HVF and Windows/WHP support `--net user` through libslirp. Windows control, agent, and remote-filesystem endpoints use local named pipes. Snapshot/restore covers device state and user-net state; host-side TCP flows reset after user-net restore. |
 
-Fast CI runs Rust formatting, check, clippy, tests, aarch64 check/clippy, and `cargo audit` on Ubuntu stable Rust, plus macOS arm64 build and no-run test coverage with HVF codesigning. It also checks the thin Python SDK, the web UI, and the TypeScript SDK. KVM and HVF guest-boot coverage live in the integration workflow, and `mesh-soak.yml` loops the Rust cluster e2e suite under host-level netem.
+Fast CI runs Rust formatting, checks, clippy, tests, aarch64 checks, and `cargo audit` on Ubuntu, plus macOS arm64 build and no-run test coverage with HVF codesigning. A native Windows job checks the x86_64 `vmon` binary and runs WHP clippy and unit tests. Real guest-boot coverage currently runs on KVM and HVF hosts.
 
 ## Build
 
@@ -202,7 +202,7 @@ sudo ./target/release/vmon vmm \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-Snapshots record the virtio-fs mode in the v2 snapshot format and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Snapshot restores are backend- and architecture-specific: a KVM snapshot restores only on a KVM build, a macOS/HVF snapshot restores only on a macOS/HVF build, and arm64 images restore only on arm64 (cross-hypervisor/cross-architecture migration is out of scope). Delta snapshots follow the same rule.
+Snapshots record the virtio-fs mode and are tagged with the capturing backend. Named volume data is not copied into snapshots; the SDK re-attaches volumes by name on restore or fork. Restores are backend- and architecture-specific: KVM snapshots restore on KVM, HVF snapshots on HVF, and WHP snapshots on WHP. Cross-hypervisor and cross-architecture migration is out of scope.
 
 ### Production platform flags
 
@@ -442,9 +442,9 @@ vmon's wedge is local ownership of the sandbox stack. It can create from memory 
 
 The platform includes writable named volumes, secrets, pty exec, egress controls, authenticated port tunnels, tags, snapshot-to-image flows, and VMM-enforced timeouts. GPU passthrough is a non-goal for this project.
 
-## Testing across the three environments
+## Host integration testing
 
-The same Rust integration suite under `tests/` runs end-to-end against each supported hypervisor. Each test declares the capabilities it needs and skips where they are unavailable, so one suite covers all three environments:
+The Rust integration suite under `tests/` runs end-to-end on KVM and HVF. The WHP backend currently has native Windows unit, lint, and binary-build coverage but no automated real-guest CI runner.
 
 | Environment | Backend / arch | Run it with | Networking exercised |
 | --- | --- | --- | --- |
@@ -452,17 +452,17 @@ The same Rust integration suite under `tests/` runs end-to-end against each supp
 | macOS host | HVF, aarch64 (Apple Silicon) | `just integration` | user-mode NAT (`--net user`) |
 | Lima on macOS | KVM, aarch64 (nested) | `just lima-integration` | TAP (`--tap`) |
 
-Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The recipes set it for you, fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `vmlinux` or aarch64 `Image` for the host), and on macOS route each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmon` with the hypervisor entitlement immediately before it runs (Cargo re-copies the unsigned binary on every invocation, so signing earlier is lost). Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
+Set `VMON_E2E=1` to opt in to booting guests; without it the boot tests early-return so a plain `cargo test` stays hermetic. The Linux and macOS recipes fetch the pinned per-architecture guest assets (`demo/fetch-test-assets.sh` selects the x86_64 `bzImage` or aarch64 `Image` for the host). A Windows run needs the same x86_64 assets under `target/test-assets/`. On macOS, the recipe routes each test binary through `demo/hvf-test-runner.sh`, which ad-hoc codesigns the spawned `vmon` with the hypervisor entitlement immediately before it runs. Building the macOS assets needs `brew install libslirp pkg-config e2fsprogs cpio`.
 
 What each environment exercises:
 
-- **Boot, virtio-blk, virtio-fs, JSON control (pause/snapshot/resume/quit), metrics, timeout, snapshot/restore/fork** run on every backend.
+- **Boot, virtio-blk, virtio-fs, JSON control (pause/snapshot/resume/quit), metrics, timeout, snapshot/restore/fork** run in the KVM/HVF integration jobs; the corresponding WHP paths have compile and unit coverage.
 - **TAP networking and throughput** require a host TAP and run on Linux/KVM only; export `VMON_TAP=<iface>` (and optionally `VMON_HOST_IP`).
-- **User-mode NAT** (DHCP lease + outbound TCP through the slirp gateway) runs on macOS/HVF only.
+- **User-mode NAT** (DHCP lease + outbound TCP through the slirp gateway) runs on macOS/HVF and Windows/WHP; the current real-guest CI case runs on macOS.
 - **userfaultfd paging, jail, and the seccomp audit** are Linux-only.
-- **The CLI capability matrix** (`tests/cli_matrix.rs`) needs no hypervisor and runs everywhere under a plain `cargo test`, asserting that unsupported flag combinations are rejected per host (PCI off aarch64, `--net user` off macOS, `--net user` with `--tap`, UEFI without firmware).
+- **The CLI capability matrix** (`tests/cli_matrix.rs`) needs no hypervisor and checks platform flag combinations, including PCI on unsupported architectures, `--net user` outside macOS/Windows, TAP conflicts, UEFI firmware requirements, and remote-filesystem validation.
 
-The delta snapshot test runs on every hypervisor backend, including macOS/HVF.
+The delta snapshot code path supports KVM, HVF, and WHP; automated real-guest coverage currently runs on KVM and HVF.
 
 ## Demo commands
 
@@ -486,15 +486,15 @@ demo/run-uefi-ubuntu.sh
 ## Current limitations
 
 - This is not a production isolation boundary. It has not had a security audit.
-- The trusted computing base includes the vmon process, KVM or HVF, the host kernel, guest kernel/image inputs, disk images, snapshots, and host paths passed on the command line.
+- The trusted computing base includes the vmon process, KVM, HVF, or WHP, the host kernel, guest kernel/image inputs, disk images, snapshots, and host paths passed on the command line.
 - Snapshot restore requires a matching build architecture, hypervisor backend, and supported snapshot version (currently version 3).
-- Bare VMM networking uses host TAP devices on Linux. On macOS/HVF, `--net user` provides entitlement-free user-mode NAT via libslirp, while `--tap` still requires vmnet-style host networking support that is not available to the ad-hoc-signed binary. User-mode NAT currently provides outbound/DHCP/DNS guest connectivity, not same-LAN bridging or inbound host port forwarding.
+- Bare VMM networking uses host TAP devices on Linux. On macOS/HVF and Windows/WHP, `--net user` provides user-mode NAT through libslirp. macOS `--tap` still requires vmnet-style host networking support that is unavailable to the ad-hoc-signed binary. User-mode NAT currently provides outbound/DHCP/DNS guest connectivity, not same-LAN bridging or inbound host port forwarding.
 - Host paths exposed through virtio-fs should be dedicated directories. `--fs-dir` is read-only; named `--volume` mounts are writable unless `:ro` is set.
-- Stage-B process filters (seccomp syscall filtering, Landlock path policy, `no_new_privs`, and resource-limit tightening) are applied by default; pass `--no-sandbox` to disable them for local development. `--jail` is the full production isolation path, adding cgroup v2, namespaces, pivot-root, and uid/gid drop on top of the always-on filters.
+- Linux applies Stage-B process filters (seccomp syscall filtering, Landlock path policy, `no_new_privs`, and resource-limit tightening) by default; pass `--no-sandbox` to disable them for local development. `--jail` adds cgroup v2, namespaces, pivot-root, and uid/gid drop. Windows and macOS currently run without this host-process sandbox.
 - Launch-time caps are enforced for accidental fanout: up to 64 vCPUs, 64 GiB RAM, and 32 fork children.
 
 ## Security model status
 
-Treat guests, guest-controlled virtqueue data, and restored snapshot files as untrusted. Treat kernel/initrd/rootfs images and host paths supplied by an operator as trusted configuration. The Stage-B syscall and path filters are on by default (opt out with `--no-sandbox`); production launches should additionally use `--jail` for namespace, cgroup, pivot-root, and uid/gid isolation. Control and agent sockets are operator-owned, mode `0600`, require private parent directories, and on Linux accept only root or the launch uid.
+Treat guests, guest-controlled virtqueue data, and restored snapshot files as untrusted. Treat kernel/initrd/rootfs images and host paths supplied by an operator as trusted configuration. On Linux, keep the default Stage-B filters enabled and use `--jail` for production namespace, cgroup, pivot-root, and uid/gid isolation. Unix control and agent sockets are operator-owned, mode `0600`, live in private parent directories, and on Linux accept only root or the launch uid. Windows uses local named pipes with remote-client rejection.
 
 Do not expose vmon control sockets, host filesystem shares, TAP devices, vmnet attachments, or user-mode forwarded ports across trust boundaries without the jail and external host network policy. See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting policy.

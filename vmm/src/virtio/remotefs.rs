@@ -158,15 +158,302 @@ pub mod proto {
 	}
 }
 
-use std::{
-	collections::HashMap, os::unix::net::UnixStream, path::PathBuf, sync::Arc, time::Duration,
-};
+#[cfg(not(target_os = "windows"))]
+use std::os::unix::net::UnixStream as ProxyStream;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+#[cfg(target_os = "windows")]
+use std::{fs::OpenOptions, thread};
+#[cfg(target_os = "windows")]
+type ProxyStream = std::fs::File;
 
+#[cfg(target_os = "windows")]
+use remote_fuse as fs;
 use virtio_bindings::{bindings::virtio_config::VIRTIO_F_VERSION_1, virtio_ids::VIRTIO_ID_FS};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestAddress;
 
-use super::{Interrupt, VirtioDevice, fs};
+#[cfg(not(target_os = "windows"))]
+use super::fs;
+use super::{Interrupt, VirtioDevice};
+
+#[cfg(target_os = "windows")]
+mod remote_fuse {
+	use virtio_queue::DescriptorChain;
+	use vm_memory::{Bytes, GuestAddress};
+
+	use crate::{memory::GuestMemoryMmap, virtio::descriptor_range_valid};
+
+	pub(super) const QUEUE_SIZE: u16 = 64;
+	pub(super) const NUM_QUEUES: usize = 2;
+	pub(super) const HIPRIO_QUEUE: usize = 0;
+	pub(super) const REQUEST_QUEUE: usize = 1;
+	pub(super) const TAG_LEN: usize = 36;
+	pub(super) const CONFIG_SPACE_SIZE: usize = TAG_LEN + 4;
+	pub(super) const NUM_REQUEST_QUEUES: u32 = 1;
+	pub(super) const FUSE_ROOT_ID: u64 = 1;
+	pub(super) const FUSE_PROTO_MINOR: u32 = 44;
+	pub(super) const MAX_WRITE: u32 = 1 << 20;
+	pub(super) const FUSE_LOOKUP: u32 = 1;
+	pub(super) const FUSE_FORGET: u32 = 2;
+	pub(super) const FUSE_GETATTR: u32 = 3;
+	pub(super) const FUSE_SETATTR: u32 = 4;
+	pub(super) const FUSE_READLINK: u32 = 5;
+	pub(super) const FUSE_SYMLINK: u32 = 6;
+	pub(super) const FUSE_MKNOD: u32 = 8;
+	pub(super) const FUSE_MKDIR: u32 = 9;
+	pub(super) const FUSE_UNLINK: u32 = 10;
+	pub(super) const FUSE_RMDIR: u32 = 11;
+	pub(super) const FUSE_RENAME: u32 = 12;
+	pub(super) const FUSE_LINK: u32 = 13;
+	pub(super) const FUSE_OPEN: u32 = 14;
+	pub(super) const FUSE_READ: u32 = 15;
+	pub(super) const FUSE_WRITE: u32 = 16;
+	pub(super) const FUSE_STATFS: u32 = 17;
+	pub(super) const FUSE_RELEASE: u32 = 18;
+	pub(super) const FUSE_FSYNC: u32 = 20;
+	pub(super) const FUSE_FLUSH: u32 = 25;
+	pub(super) const FUSE_INIT: u32 = 26;
+	pub(super) const FUSE_OPENDIR: u32 = 27;
+	pub(super) const FUSE_READDIR: u32 = 28;
+	pub(super) const FUSE_RELEASEDIR: u32 = 29;
+	pub(super) const FUSE_FSYNCDIR: u32 = 30;
+	pub(super) const FUSE_ACCESS: u32 = 34;
+	pub(super) const FUSE_CREATE: u32 = 35;
+	pub(super) const FUSE_INTERRUPT: u32 = 36;
+	pub(super) const FUSE_BATCH_FORGET: u32 = 42;
+	pub(super) const FUSE_FALLOCATE: u32 = 43;
+	pub(super) const FUSE_READDIRPLUS: u32 = 44;
+	pub(super) const FUSE_RENAME2: u32 = 45;
+
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseInHeader {
+		pub(super) len:          u32,
+		pub(super) opcode:       u32,
+		pub(super) unique:       u64,
+		pub(super) nodeid:       u64,
+		pub(super) uid:          u32,
+		pub(super) gid:          u32,
+		pub(super) pid:          u32,
+		pub(super) total_extlen: u16,
+		pub(super) padding:      u16,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseOutHeader {
+		pub(super) len:    u32,
+		pub(super) error:  i32,
+		pub(super) unique: u64,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseAttr {
+		pub(super) ino:       u64,
+		pub(super) size:      u64,
+		pub(super) blocks:    u64,
+		pub(super) atime:     u64,
+		pub(super) mtime:     u64,
+		pub(super) ctime:     u64,
+		pub(super) atimensec: u32,
+		pub(super) mtimensec: u32,
+		pub(super) ctimensec: u32,
+		pub(super) mode:      u32,
+		pub(super) nlink:     u32,
+		pub(super) uid:       u32,
+		pub(super) gid:       u32,
+		pub(super) rdev:      u32,
+		pub(super) blksize:   u32,
+		pub(super) flags:     u32,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseAttrOut {
+		pub(super) attr_valid:      u64,
+		pub(super) attr_valid_nsec: u32,
+		pub(super) dummy:           u32,
+		pub(super) attr:            FuseAttr,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseEntryOut {
+		pub(super) nodeid:           u64,
+		pub(super) generation:       u64,
+		pub(super) entry_valid:      u64,
+		pub(super) attr_valid:       u64,
+		pub(super) entry_valid_nsec: u32,
+		pub(super) attr_valid_nsec:  u32,
+		pub(super) attr:             FuseAttr,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseInitOut {
+		pub(super) major:                u32,
+		pub(super) minor:                u32,
+		pub(super) max_readahead:        u32,
+		pub(super) flags:                u32,
+		pub(super) max_background:       u16,
+		pub(super) congestion_threshold: u16,
+		pub(super) max_write:            u32,
+		pub(super) time_gran:            u32,
+		pub(super) max_pages:            u16,
+		pub(super) map_alignment:        u16,
+		pub(super) flags2:               u32,
+		pub(super) unused:               [u32; 7],
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseOpenOut {
+		pub(super) fh:         u64,
+		pub(super) open_flags: u32,
+		pub(super) backing_id: i32,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseReadIn {
+		pub(super) fh:         u64,
+		pub(super) offset:     u64,
+		pub(super) size:       u32,
+		pub(super) read_flags: u32,
+		pub(super) lock_owner: u64,
+		pub(super) flags:      u32,
+		pub(super) padding:    u32,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseDirent {
+		pub(super) ino:     u64,
+		pub(super) off:     u64,
+		pub(super) namelen: u32,
+		pub(super) type_:   u32,
+	}
+	#[repr(C)]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct FuseKstatfs {
+		pub(super) blocks:  u64,
+		pub(super) bfree:   u64,
+		pub(super) bavail:  u64,
+		pub(super) files:   u64,
+		pub(super) ffree:   u64,
+		pub(super) bsize:   u32,
+		pub(super) namelen: u32,
+		pub(super) frsize:  u32,
+		pub(super) padding: u32,
+		pub(super) spare:   [u32; 6],
+	}
+
+	pub(super) const IN_HEADER_SIZE: usize = std::mem::size_of::<FuseInHeader>();
+	pub(super) const OUT_HEADER_SIZE: usize = std::mem::size_of::<FuseOutHeader>();
+	pub(super) const DIRENT_HEADER: usize = std::mem::size_of::<FuseDirent>();
+	const MAX_REQUEST_SIZE: usize = IN_HEADER_SIZE + 40 + MAX_WRITE as usize;
+	pub(super) type SplitChain = (Vec<u8>, Vec<(GuestAddress, u32)>);
+
+	pub(super) fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
+		let end = off.checked_add(std::mem::size_of::<T>())?;
+		if end > buf.len() {
+			return None;
+		}
+		// SAFETY: the bounds check proves the full value lies in `buf`; unaligned
+		// access is required because FUSE structures are byte-packed on the wire.
+		Some(unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) })
+	}
+	pub(super) const fn struct_bytes<T: Copy>(value: &T) -> &[u8] {
+		// SAFETY: callers pass fully initialized, plain-data FUSE wire structures.
+		unsafe { std::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>()) }
+	}
+	pub(super) const fn align8(value: usize) -> usize {
+		(value + 7) & !7
+	}
+	pub(super) fn write_reply(
+		mem: &GuestMemoryMmap,
+		writable: &[(GuestAddress, u32)],
+		unique: u64,
+		error: i32,
+		body: &[u8],
+	) -> u32 {
+		let Some(capacity) = writable
+			.iter()
+			.try_fold(0usize, |total, &(_, len)| total.checked_add(len as usize))
+		else {
+			return 0;
+		};
+		if capacity < OUT_HEADER_SIZE {
+			return 0;
+		}
+		let body_len = body.len().min(capacity - OUT_HEADER_SIZE);
+		let total = OUT_HEADER_SIZE + body_len;
+		let header = FuseOutHeader { len: total as u32, error, unique };
+		let mut reply = Vec::with_capacity(total);
+		reply.extend_from_slice(struct_bytes(&header));
+		reply.extend_from_slice(&body[..body_len]);
+		let mut offset = 0;
+		for &(address, len) in writable {
+			if offset == reply.len() {
+				break;
+			}
+			let count = (len as usize).min(reply.len() - offset);
+			if mem
+				.write_slice(&reply[offset..offset + count], address)
+				.is_err()
+			{
+				return 0;
+			}
+			offset += count;
+		}
+		if offset == reply.len() {
+			total as u32
+		} else {
+			0
+		}
+	}
+	pub(super) fn split_chain(
+		mem: &GuestMemoryMmap,
+		chain: DescriptorChain<&GuestMemoryMmap>,
+	) -> Option<SplitChain> {
+		let mut request = Vec::new();
+		let mut writable = Vec::new();
+		let mut seen_writable = false;
+		for descriptor in chain {
+			if !descriptor_range_valid(mem, descriptor.addr(), descriptor.len()) {
+				return None;
+			}
+			if descriptor.is_write_only() {
+				seen_writable = true;
+				writable.push((descriptor.addr(), descriptor.len()));
+			} else {
+				if seen_writable {
+					return None;
+				}
+				let end = request.len().checked_add(descriptor.len() as usize)?;
+				if end > MAX_REQUEST_SIZE {
+					return None;
+				}
+				let start = request.len();
+				request.resize(end, 0);
+				mem.read_slice(&mut request[start..], descriptor.addr())
+					.ok()?;
+			}
+		}
+		Some((request, writable))
+	}
+}
+
+#[cfg(target_os = "windows")]
+mod libc {
+	pub const EACCES: i32 = 13;
+	pub const EINVAL: i32 = 22;
+	pub const EIO: i32 = 5;
+	pub const ENOENT: i32 = 2;
+	pub const ENOSYS: i32 = 38;
+	pub const EROFS: i32 = 30;
+	pub const W_OK: i32 = 2;
+	pub const DT_DIR: u8 = 4;
+	pub const DT_REG: u8 = 8;
+	pub const O_ACCMODE: i32 = 3;
+	pub const O_WRONLY: i32 = 1;
+	pub const O_RDWR: i32 = 2;
+	pub const O_CREAT: i32 = 0o100;
+	pub const O_TRUNC: i32 = 0o1000;
+}
 use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
@@ -184,12 +471,12 @@ enum ProxyReply {
 
 /// In-memory state for a remote read-only virtio-fs mount.
 ///
-/// Object paths are relative to the mount root. The lazy Unix-socket connection
-/// is intentionally excluded from snapshots; it reconnects when the guest next
-/// asks the device to serve a request.
+/// Object paths are relative to the mount root. The lazy platform transport
+/// connection is intentionally excluded from snapshots; it reconnects when
+/// the guest next asks the device to serve a request.
 struct RemoteFsState {
 	sock:    PathBuf,
-	conn:    Option<UnixStream>,
+	conn:    Option<ProxyStream>,
 	inodes:  HashMap<u64, String>,
 	by_path: HashMap<String, u64>,
 	next:    u64,
@@ -255,11 +542,7 @@ impl RemoteFsState {
 
 		for _ in 0..2 {
 			if self.conn.is_none() {
-				let conn = UnixStream::connect(&self.sock).and_then(|conn| {
-					conn.set_read_timeout(Some(PROXY_TIMEOUT))?;
-					conn.set_write_timeout(Some(PROXY_TIMEOUT))?;
-					Ok(conn)
-				});
+				let conn = Self::connect_proxy(&self.sock);
 				match conn {
 					Ok(conn) => self.conn = Some(conn),
 					Err(_) => continue,
@@ -294,6 +577,33 @@ impl RemoteFsState {
 		}
 
 		Err(-libc::EIO)
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	fn connect_proxy(path: &std::path::Path) -> std::io::Result<ProxyStream> {
+		let conn = ProxyStream::connect(path)?;
+		conn.set_read_timeout(Some(PROXY_TIMEOUT))?;
+		conn.set_write_timeout(Some(PROXY_TIMEOUT))?;
+		Ok(conn)
+	}
+
+	#[cfg(target_os = "windows")]
+	fn connect_proxy(path: &std::path::Path) -> std::io::Result<ProxyStream> {
+		let deadline = std::time::Instant::now() + PROXY_TIMEOUT;
+		loop {
+			match OpenOptions::new().read(true).write(true).open(path) {
+				Ok(pipe) => return Ok(pipe),
+				Err(error)
+					if matches!(
+						error.raw_os_error(),
+						Some(2 | 231) // ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY
+					) && std::time::Instant::now() < deadline =>
+				{
+					thread::sleep(Duration::from_millis(10));
+				},
+				Err(error) => return Err(error),
+			}
+		}
 	}
 
 	fn stat(&mut self, path: &str) -> std::result::Result<proto::StatReply, i32> {
@@ -886,7 +1196,7 @@ impl VirtioDevice for RemoteFs {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use std::{
 		fs as stdfs,

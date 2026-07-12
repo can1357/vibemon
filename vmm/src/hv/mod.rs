@@ -3,8 +3,9 @@
 //! The VMM is written against one concrete `Vm` / `Vcpu` / `IrqLine` / `Gic`
 //! type whose implementation is selected at compile time: KVM on Linux,
 //! Apple Hypervisor.framework (HVF) on macOS, or Windows Hypervisor Platform
-//! (WHP) on x86_64 Windows. Backends expose identical inherent method surfaces,
-//! so call sites stay monomorphic — no trait objects in the vCPU run loop.
+//! (WHP) on `x86_64` Windows. Backends expose identical inherent method
+//! surfaces, so call sites stay monomorphic — no trait objects in the vCPU run
+//! loop.
 
 mod neutral;
 pub use neutral::*;
@@ -22,7 +23,7 @@ compile_error!("the Windows Hypervisor Platform backend supports only x86_64 Win
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod whp;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use whp::{CpuId, IrqLine, Vcpu, Vm};
+pub use whp::{CpuId, IoApicState, IrqLine, Vcpu, Vm};
 
 #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 compile_error!("the macOS Hypervisor.framework backend supports only Apple Silicon (aarch64)");

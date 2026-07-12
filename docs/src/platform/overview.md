@@ -35,9 +35,9 @@ The server owns the sandbox registry and launches a monitor child for each micro
 
 The low-level boot path is `Config::from_args()`, then `vmm::run()`, `Vmm::build()`, and `Vmm::start()`. Building a VMM allocates guest memory, instantiates virtio backends, and registers them on the device bus. Starting it creates one hypervisor loop thread for each vCPU and one worker thread for each device.
 
-The vCPU loop runs KVM on Linux or Hypervisor.framework (HVF) on macOS. It handles MMIO and Port I/O traps through the device bus and signals virtio queues. Device workers poll queue, backend, and control eventfds before raising completion interrupts.
+The vCPU loop runs KVM on Linux, Hypervisor.framework (HVF) on Apple Silicon macOS, or Windows Hypervisor Platform (WHP) on x86_64 Windows. It handles MMIO and Port I/O traps through the device bus and signals virtio queues. Device workers wait for queue, backend, and control events before raising completion interrupts.
 
-The monitor's host control plane is a Unix-socket JSON protocol with `ping`, `info`, `pause`, `resume`, `snapshot`, `quit`, `metrics`, and `extend` operations. Socket handling sends requests through a channel to the owning VMM thread rather than accessing the VMM directly. Pause quiesces vCPUs with a real-time signal on Linux and a backend kicker callback on HVF.
+The monitor's lifecycle protocol uses Unix sockets on Linux/macOS and local named pipes on Windows. It supports `ping`, `info`, `pause`, `resume`, `snapshot`, `quit`, `metrics`, and `extend`. Requests cross a channel to the owning VMM thread. Pause uses a real-time signal on Linux and backend exit kickers on HVF and WHP.
 
 ## Host boundary
 

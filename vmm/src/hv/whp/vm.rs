@@ -10,7 +10,7 @@ use libwhp::{
 use parking_lot::Mutex;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
-use super::{CpuId, IoApic, IrqLine, Vcpu};
+use super::{CpuId, IoApic, IoApicState, IrqLine, Vcpu};
 use crate::{
 	devices::Bus,
 	layout::IO_APIC_DEFAULT_PHYS_BASE,
@@ -23,25 +23,26 @@ const WHP_PROCESSOR_COUNT: u32 = 64;
 const CPUID_EXIT_LEAVES: &[u32] = &[0x1, 0xb, 0x1f, 0x4000_0000];
 
 /// A userspace ioeventfd registration handled by the WHP run loop.
-pub(crate) struct IoEvent {
+pub(super) struct IoEvent {
 	pub addr:      u64,
 	pub datamatch: Option<u64>,
 	pub evt:       EventFd,
 }
 
 /// Shared ioevent table consulted by every WHP vCPU.
-pub(crate) type IoEvents = Arc<Mutex<Vec<IoEvent>>>;
+pub(super) type IoEvents = Arc<Mutex<Vec<IoEvent>>>;
 
 /// Owns the WHP partition, guest RAM and shared userspace interrupt/ioevent
 /// state.
 pub struct Vm {
 	#[allow(dead_code, reason = "dropping the mapping unmaps guest RAM from WHP")]
-	mappings:        Vec<GPARangeMapping>,
+	mappings:        Mutex<Vec<GPARangeMapping>>,
 	partition:       Partition,
 	ioapic:          Arc<Mutex<IoApic>>,
 	ioevents:        IoEvents,
 	memory:          GuestMemoryMmap,
 	supported_cpuid: CpuId,
+	dirty_tracking:  bool,
 }
 
 impl Vm {
@@ -54,6 +55,8 @@ impl Vm {
 	pub fn with_memory(memory: GuestMemoryMmap) -> Result<Self> {
 		ensure_hypervisor_present()?;
 		ensure_local_apic_available()?;
+		ensure_extended_exits_available()?;
+		let dirty_tracking = dirty_tracking_available()?;
 
 		let partition = Partition::new()?;
 		set_processor_count(&partition, WHP_PROCESSOR_COUNT)?;
@@ -62,21 +65,43 @@ impl Vm {
 		set_local_apic(&partition)?;
 		partition.setup()?;
 
-		let mappings = register_memory(&partition, &memory)?;
+		let mappings = register_memory(&partition, &memory, dirty_tracking)?;
 		let ioapic = Arc::new(Mutex::new(IoApic::new(partition.clone())));
 		Ok(Self {
-			mappings,
+			mappings: Mutex::new(mappings),
 			partition,
 			ioapic,
 			ioevents: Arc::new(Mutex::new(Vec::new())),
 			memory,
 			supported_cpuid: CpuId::host_supported(),
+			dirty_tracking,
 		})
 	}
 
 	/// Return the guest memory owned by this VM.
 	pub const fn memory(&self) -> &GuestMemoryMmap {
 		&self.memory
+	}
+
+	/// Map writable UEFI flash at its guest physical address.
+	///
+	/// The returned WHP mapping is retained by the VM until partition teardown;
+	/// the caller must retain the backing `GuestMemoryMmap` for the same
+	/// lifetime.
+	pub fn map_firmware(&self, memory: &GuestMemoryMmap) -> Result<()> {
+		for region in memory.iter() {
+			let host = HostMem { ptr: region.as_ptr(), len: region.len() as usize };
+			let mapping = self.partition.map_gpa_range(
+				&host,
+				region.start_addr().raw_value(),
+				region.len(),
+				WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
+					| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
+					| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagExecute,
+			)?;
+			self.mappings.lock().push(mapping);
+		}
+		Ok(())
 	}
 
 	/// Return the host-supported CPUID template for x86 vCPU setup.
@@ -90,9 +115,23 @@ impl Vm {
 	}
 
 	/// Register the userspace IOAPIC on the guest MMIO bus.
+	#[allow(
+		clippy::unnecessary_wraps,
+		reason = "device registration shares a fallible cross-hypervisor callsite"
+	)]
 	pub fn register_ioapic(&self, bus: &mut Bus) -> Result<()> {
 		bus.register(u64::from(IO_APIC_DEFAULT_PHYS_BASE), 0x20, self.ioapic());
 		Ok(())
+	}
+
+	/// Capture VM-global userspace interrupt-controller state.
+	pub fn save_machine_state(&self) -> IoApicState {
+		self.ioapic.lock().save_state()
+	}
+
+	/// Restore VM-global userspace interrupt-controller state.
+	pub fn restore_machine_state(&self, state: &IoApicState) -> Result<()> {
+		self.ioapic.lock().restore_state(state)
 	}
 
 	/// Create a backend-owned vCPU with the given index.
@@ -125,22 +164,33 @@ impl Vm {
 			.push(IoEvent { addr, datamatch, evt: evt.try_clone()? });
 		Ok(())
 	}
+
+	/// Return whether guest writes are recorded by WHP for incremental
+	/// snapshots.
+	pub const fn dirty_tracking_available(&self) -> bool {
+		self.dirty_tracking
+	}
 }
 
 fn register_memory(
 	partition: &Partition,
 	memory: &GuestMemoryMmap,
+	dirty_tracking: bool,
 ) -> Result<Vec<GPARangeMapping>> {
 	let mut mappings = Vec::new();
 	for region in memory.iter() {
 		let host = HostMem { ptr: region.as_ptr(), len: region.len() as usize };
+		let mut flags = WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
+			| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
+			| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagExecute;
+		if dirty_tracking {
+			flags |= WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagTrackDirtyPages;
+		}
 		mappings.push(partition.map_gpa_range(
 			&host,
 			region.start_addr().raw_value(),
-			region.len() as u64,
-			WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
-				| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagWrite
-				| WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagExecute,
+			region.len(),
+			flags,
 		)?);
 	}
 	Ok(mappings)
@@ -193,6 +243,23 @@ fn ensure_local_apic_available() -> Result<()> {
 	Ok(())
 }
 
+fn dirty_tracking_available() -> Result<bool> {
+	let capability: WHV_CAPABILITY = get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeFeatures)?;
+	// SAFETY: the union field matches the requested capability code.
+	Ok(unsafe { capability.Features }.DirtyPageTracking() != 0)
+}
+
+fn ensure_extended_exits_available() -> Result<()> {
+	let capability: WHV_CAPABILITY =
+		get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeExtendedVmExits)?;
+	// SAFETY: the union field matches the requested capability code.
+	let exits = unsafe { capability.ExtendedVmExits };
+	if exits.X64CpuidExit() == 0 || exits.X64MsrExit() == 0 {
+		return Err(err("WHP CPUID and MSR exits are required but unavailable"));
+	}
+	Ok(())
+}
+
 fn set_processor_count(partition: &Partition, count: u32) -> Result<()> {
 	let mut property = WHV_PARTITION_PROPERTY::default();
 	property.ProcessorCount = count;
@@ -210,7 +277,6 @@ fn set_extended_exits(partition: &Partition) -> Result<()> {
 	unsafe {
 		property.ExtendedVmExits.set_X64CpuidExit(1);
 		property.ExtendedVmExits.set_X64MsrExit(1);
-		property.ExtendedVmExits.set_ExceptionExit(1);
 	}
 	partition.set_property(
 		WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeExtendedVmExits,

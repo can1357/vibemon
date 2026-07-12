@@ -10,10 +10,11 @@
 //! `crate::arch::state` (selected at compile time) and are referenced here only
 //! by type name, so this module compiles identically on `x86_64` and aarch64.
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::{
 	fs::{self, File},
 	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-	os::unix::io::AsRawFd,
 	path::{Path, PathBuf},
 };
 
@@ -1101,6 +1102,26 @@ fn regions_total_len(regions: &[MemRegion]) -> Result<u64> {
 	Ok(total)
 }
 
+#[cfg(target_os = "windows")]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+	use std::os::windows::fs::FileExt;
+	let mut written = 0;
+	while written < buf.len() {
+		let n = file.seek_write(&buf[written..], offset + written as u64)?;
+		if n == 0 {
+			return Err(std::io::ErrorKind::WriteZero.into());
+		}
+		written += n;
+	}
+	Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+	use std::os::unix::fs::FileExt;
+	file.write_all_at(buf, offset)
+}
+
 /// Dump every guest-RAM region into `path` (slot order) and return the region
 /// table.
 ///
@@ -1110,8 +1131,6 @@ fn regions_total_len(regions: &[MemRegion]) -> Result<u64> {
 /// across worker threads (this executes while the VM is paused), and data
 /// runs are written with positioned writes, one syscall per run.
 fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>> {
-	use std::os::unix::fs::FileExt;
-
 	let file = File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
 	let regions = memory_region_table(mem)?;
 	let mut logical = 0u64;
@@ -1139,8 +1158,7 @@ fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>
 			}
 			let byte_start = start * DELTA_PAGE_USIZE;
 			let byte_end = len.min(page * DELTA_PAGE_USIZE);
-			file
-				.write_all_at(&slice[byte_start..byte_end], logical + byte_start as u64)
+			write_all_at(&file, &slice[byte_start..byte_end], logical + byte_start as u64)
 				.map_err(|e| err(format!("writing region {gpa:#x}: {e}", gpa = region.gpa)))?;
 		}
 		logical += len as u64;
@@ -1186,19 +1204,10 @@ fn scan_nonzero_pages(slice: &[u8]) -> Vec<u8> {
 	bitmap
 }
 
-/// Read-only mmap of a whole file: lets a delta dump diff live RAM against a
-/// full base snapshot straight out of the page cache instead of copying the
-/// base into guest-sized scratch memory.
+/// Read-only mmap of a whole base snapshot memory file.
 struct FileMap {
-	ptr: *const u8,
-	len: usize,
+	map: memmap2::Mmap,
 }
-
-// SAFETY: the mapping is immutable and privately owned; raw pointers derived
-// from it are only read by diff workers that are joined before the map drops.
-unsafe impl Send for FileMap {}
-// SAFETY: as above — concurrent readers of an immutable mapping are safe.
-unsafe impl Sync for FileMap {}
 
 impl FileMap {
 	/// Map `path` read-only, requiring it to be exactly `expected_len` bytes.
@@ -1214,35 +1223,14 @@ impl FileMap {
 				path.display()
 			)));
 		}
-		let len = usize::try_from(len)
-			.map_err(|_| err(format!("base memory file {} exceeds usize", path.display())))?;
 		if len == 0 {
 			return Err(err(format!("base memory file {} is empty", path.display())));
 		}
-		// SAFETY: mapping `len` readable bytes of a file we just opened; the
-		// result is checked against MAP_FAILED before use.
-		let ptr = unsafe {
-			libc::mmap(
-				std::ptr::null_mut(),
-				len,
-				libc::PROT_READ,
-				libc::MAP_PRIVATE,
-				file.as_raw_fd(),
-				0,
-			)
-		};
-		if ptr == libc::MAP_FAILED {
-			return Err(err(format!("mmap {}: {}", path.display(), std::io::Error::last_os_error())));
-		}
-		Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
-	}
-}
-
-impl Drop for FileMap {
-	fn drop(&mut self) {
-		// SAFETY: ptr/len came from the successful mmap in `open`, owned
-		// exclusively by this value.
-		unsafe { libc::munmap(self.ptr.cast_mut().cast::<libc::c_void>(), self.len) };
+		// SAFETY: the file remains unchanged for the lifetime of this private,
+		// read-only mapping; snapshot generations are immutable after publication.
+		let map = unsafe { memmap2::MmapOptions::new().map(&file) }
+			.map_err(|e| err(format!("mapping {}: {e}", path.display())))?;
+		Ok(Self { map })
 	}
 }
 
@@ -1280,7 +1268,7 @@ fn region_diff_specs(
 			BaseView::Mapped(map) => {
 				let offset = usize::try_from(region.file_offset)
 					.map_err(|_| err("region file offset exceeds usize"))?;
-				map.ptr as usize + offset
+				map.map.as_ptr() as usize + offset
 			},
 			BaseView::Scratch(mem) => mem
 				.get_host_address(GuestAddress(region.gpa))
@@ -1475,6 +1463,26 @@ fn write_changed_pages(specs: &[RegionDiff], bitmap: &[u8], out: &mut File) -> R
 	Ok(())
 }
 
+#[cfg(unix)]
+fn host_page_size() -> Result<u64> {
+	// SAFETY: sysconf(_SC_PAGESIZE) has no memory-safety preconditions.
+	u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+		.map_err(|_| err("host page size is not positive"))
+}
+
+#[cfg(target_os = "windows")]
+#[allow(
+	clippy::unnecessary_wraps,
+	reason = "the shared snapshot callsite also handles Unix page-size failures"
+)]
+fn host_page_size() -> Result<u64> {
+	use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+	let mut info = SYSTEM_INFO::default();
+	// SAFETY: `info` points to writable storage for the duration of the call.
+	unsafe { GetSystemInfo(&mut info) };
+	Ok(u64::from(info.dwPageSize))
+}
+
 /// Write only pages flagged dirty since the base was captured: the union of
 /// the hypervisor's guest-write log and the host-write bitmap that raw DMA
 /// paths mark. Every candidate is verified against the base so rewrites of
@@ -1493,11 +1501,7 @@ fn diff_dirty_pages(
 			specs.len()
 		)));
 	}
-	// The hypervisor log and host-write bitmap both work at host page
-	// granularity, which may be coarser than the 4 KiB delta page.
-	// SAFETY: sysconf(_SC_PAGESIZE) has no memory-safety preconditions.
-	let host_page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-		.map_err(|_| err("host page size is not positive"))?;
+	let host_page = host_page_size()?;
 	if host_page < DELTA_PAGE_SIZE || !host_page.is_multiple_of(DELTA_PAGE_SIZE) {
 		return Err(err(format!("host page size {host_page} incompatible with delta pages")));
 	}
@@ -1806,11 +1810,22 @@ mod tests {
 		}
 	}
 
-	#[cfg(target_arch = "x86_64")]
+	#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 	fn machine_state() -> MachineState {
 		// SAFETY: zero is a valid inert value for these KVM state blobs in
 		// migration-only unit tests; no ioctl consumes this synthetic state.
 		unsafe { std::mem::zeroed() }
+	}
+
+	#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+	fn machine_state() -> MachineState {
+		MachineState {
+			ioapic: crate::hv::IoApicState {
+				selector:    0,
+				id:          0,
+				redirection: vec![1 << 16; 24],
+			},
+		}
 	}
 
 	#[cfg(target_arch = "aarch64")]
@@ -2354,8 +2369,7 @@ mod tests {
 		let live_slice = unsafe { std::slice::from_raw_parts_mut(live_ptr, sz) };
 		live_slice.copy_from_slice(base_slice);
 
-		// SAFETY: sysconf has no preconditions.
-		let host_page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+		let host_page = host_page_size().unwrap();
 		let group = (host_page / DELTA_PAGE_SIZE).max(1) as usize;
 		// Three delta pages in three distinct host pages: `changed_host`
 		// (changed + host-flagged), `changed_guest` (changed + guest-flagged),

@@ -1,0 +1,13 @@
+image: "rust:latest"
+
+before_script:
+- apt-get update -yqq
+- apt-get install -yqq --no-install-recommends build-essential git meson dbus libdbus-1-dev python3-scapy python3-pydbus iproute2
+- git clone https://gitlab.freedesktop.org/slirp/libslirp.git libslirp
+- (cd libslirp && meson --prefix=/usr build && ninja -C build install)
+
+test:cargo:
+  script:
+  - rustc --version && cargo --version
+  - cargo test --all --verbose
+  - make test

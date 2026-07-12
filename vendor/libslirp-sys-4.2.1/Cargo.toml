@@ -1,0 +1,13 @@
+[package]
+name = "libslirp-sys"
+version = "4.2.1"
+edition = "2018"
+license-file = "LICENSE"
+links = "slirp"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+pkg-config = "0.3"

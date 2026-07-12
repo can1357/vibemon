@@ -29,6 +29,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Windows (WHP) support for sandbox snapshots, restores, and live-migration
+- Added Windows support for virtual networking via TAP-Windows adapters
+- Added Windows support for virtio-fs read-only volume mounts
 - Added language switcher component to SDK documentation for easier navigation between SDKs
 - Added Getting Started, Connect, Client, Sandboxes, Processes, Files and Ports, Volumes and Secrets, Snapshots, Durable Functions, and Errors reference guides to SDK documentation
 - Added support for S3-backed guest mounts (`s3_mounts`) via SDK and CLI

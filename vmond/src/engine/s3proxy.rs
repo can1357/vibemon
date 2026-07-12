@@ -1,4 +1,4 @@
-//! Per-VM Unix-socket proxy between remote virtio-fs devices and S3.
+//! Per-VM local-transport proxy between remote virtio-fs devices and S3.
 //!
 //! The proxy owns no S3 credentials itself. It routes one framed request at a
 //! time to the mount-specific [`S3Client`] selected during sandbox creation.
@@ -11,9 +11,12 @@ use std::{
 };
 
 use serde::Serialize;
+#[cfg(not(target_os = "windows"))]
+use tokio::net::UnixListener;
+#[cfg(target_os = "windows")]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::{
-	io::{AsyncReadExt, AsyncWriteExt},
-	net::{UnixListener, UnixStream},
+	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 	runtime::Runtime,
 	sync::oneshot,
 	task::{JoinHandle, JoinSet},
@@ -50,34 +53,17 @@ impl S3Proxy {
 				sock.display()
 			)));
 		}
-		let parent = sock
-			.parent()
-			.filter(|parent| !parent.as_os_str().is_empty())
-			.ok_or_else(|| {
-				EngineError::invalid(format!("S3 proxy socket has no parent: {}", sock.display()))
-			})?;
-		fs::create_dir_all(parent)
-			.map_err(|error| EngineError::engine(format!("creating S3 proxy directory: {error}")))?;
-		match fs::remove_file(sock) {
-			Ok(()) => {},
-			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-			Err(error) => {
-				return Err(EngineError::engine(format!(
-					"removing stale S3 proxy socket {}: {error}",
-					sock.display()
-				)));
-			},
-		}
+		prepare_endpoint(sock)?;
 
 		let sock = sock.to_path_buf();
 		let listener_sock = sock.clone();
 		let mounts = Arc::new(mounts);
 		let (ready_tx, ready_rx) = oneshot::channel::<std::result::Result<(), String>>();
 		let accept_task = runtime.spawn(async move {
-			match UnixListener::bind(&listener_sock) {
+			match bind_listener(&listener_sock) {
 				Ok(listener) => {
 					let _ = ready_tx.send(Ok(()));
-					accept_loop(listener, mounts).await;
+					accept_loop(listener, listener_sock, mounts).await;
 				},
 				Err(error) => {
 					let _ = ready_tx.send(Err(error.to_string()));
@@ -89,12 +75,12 @@ impl S3Proxy {
 			Ok(Ok(())) => Ok(Self { accept_task, sock }),
 			Ok(Err(error)) => {
 				accept_task.abort();
-				let _ = fs::remove_file(&sock);
+				cleanup_endpoint(&sock);
 				Err(EngineError::engine(format!("binding S3 proxy socket {}: {error}", sock.display())))
 			},
 			Err(error) => {
 				accept_task.abort();
-				let _ = fs::remove_file(&sock);
+				cleanup_endpoint(&sock);
 				Err(EngineError::engine(format!(
 					"starting S3 proxy listener {}: {error}",
 					sock.display()
@@ -107,11 +93,67 @@ impl S3Proxy {
 impl Drop for S3Proxy {
 	fn drop(&mut self) {
 		self.accept_task.abort();
-		let _ = fs::remove_file(&self.sock);
+		cleanup_endpoint(&self.sock);
 	}
 }
 
-async fn accept_loop(listener: UnixListener, mounts: Arc<HashMap<String, Arc<S3Client>>>) {
+#[cfg(not(target_os = "windows"))]
+type ProxyListener = UnixListener;
+#[cfg(target_os = "windows")]
+type ProxyListener = NamedPipeServer;
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_endpoint(sock: &Path) -> Result<()> {
+	let parent = sock
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+		.ok_or_else(|| {
+			EngineError::invalid(format!("S3 proxy socket has no parent: {}", sock.display()))
+		})?;
+	fs::create_dir_all(parent)
+		.map_err(|error| EngineError::engine(format!("creating S3 proxy directory: {error}")))?;
+	match fs::remove_file(sock) {
+		Ok(()) => {},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+		Err(error) => {
+			return Err(EngineError::engine(format!(
+				"removing stale S3 proxy socket {}: {error}",
+				sock.display()
+			)));
+		},
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_endpoint(_sock: &Path) -> Result<()> {
+	Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_endpoint(sock: &Path) {
+	let _ = fs::remove_file(sock);
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_endpoint(_sock: &Path) {}
+
+#[cfg(not(target_os = "windows"))]
+fn bind_listener(sock: &Path) -> io::Result<ProxyListener> {
+	UnixListener::bind(sock)
+}
+
+#[cfg(target_os = "windows")]
+fn bind_listener(sock: &Path) -> io::Result<ProxyListener> {
+	ServerOptions::new().first_pipe_instance(true).create(sock)
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn accept_loop(
+	listener: ProxyListener,
+	_endpoint: PathBuf,
+	mounts: Arc<HashMap<String, Arc<S3Client>>>,
+) {
 	let mut connections = JoinSet::new();
 	loop {
 		tokio::select! {
@@ -136,10 +178,45 @@ async fn accept_loop(listener: UnixListener, mounts: Arc<HashMap<String, Arc<S3C
 	}
 }
 
-async fn serve_connection(
-	mut stream: UnixStream,
+#[cfg(target_os = "windows")]
+async fn accept_loop(
+	mut listener: ProxyListener,
+	endpoint: PathBuf,
 	mounts: Arc<HashMap<String, Arc<S3Client>>>,
-) -> io::Result<()> {
+) {
+	let mut connections = JoinSet::new();
+	loop {
+		if let Err(error) = listener.connect().await {
+			warn!(%error, "S3 proxy accept failed");
+			return;
+		}
+		let connected = listener;
+		listener = match ServerOptions::new().create(&endpoint) {
+			Ok(listener) => listener,
+			Err(error) => {
+				warn!(%error, "S3 proxy listener recreation failed");
+				return;
+			},
+		};
+		let mounts = Arc::clone(&mounts);
+		connections.spawn(async move { serve_connection(connected, mounts).await });
+		while let Some(joined) = connections.try_join_next() {
+			match joined {
+				Ok(Err(error)) => warn!(%error, "S3 proxy connection ended with an error"),
+				Err(error) => warn!(%error, "S3 proxy connection task failed"),
+				Ok(Ok(())) => {},
+			}
+		}
+	}
+}
+
+async fn serve_connection<S>(
+	mut stream: S,
+	mounts: Arc<HashMap<String, Arc<S3Client>>>,
+) -> io::Result<()>
+where
+	S: AsyncRead + AsyncWrite + Unpin,
+{
 	loop {
 		let (ty, id, payload) = match read_frame(&mut stream).await {
 			Ok(frame) => frame,
@@ -243,7 +320,7 @@ fn json<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
 	serde_json::to_vec(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-async fn read_frame(stream: &mut UnixStream) -> io::Result<(u8, u32, Vec<u8>)> {
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(u8, u32, Vec<u8>)> {
 	let mut header = [0u8; proto::HEADER_LEN];
 	stream.read_exact(&mut header).await?;
 	let payload_len =
@@ -261,7 +338,12 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<(u8, u32, Vec<u8>)> {
 	Ok((ty, id, payload))
 }
 
-async fn write_frame(stream: &mut UnixStream, ty: u8, id: u32, payload: &[u8]) -> io::Result<()> {
+async fn write_frame<S: AsyncWrite + Unpin>(
+	stream: &mut S,
+	ty: u8,
+	id: u32,
+	payload: &[u8],
+) -> io::Result<()> {
 	if payload.len() > proto::MAX_FRAME {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidInput,

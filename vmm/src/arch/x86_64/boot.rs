@@ -18,6 +18,8 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
 use super::mptable;
 #[cfg(target_os = "linux")]
 use crate::hv::Vcpu;
+#[cfg(target_os = "windows")]
+use crate::hv::{CpuId, Vcpu, Vm};
 use crate::{
 	bail,
 	layout::{
@@ -89,25 +91,31 @@ pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
 /// physical `0xfffffff0`; the whole file is therefore placed at the top of the
 /// 32-bit address space. The mapping is separate from guest RAM so normal RAM
 /// snapshots do not include operator-supplied firmware bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn load_uefi_firmware(
 	path: &Path,
 	ram: &GuestMemoryMmap,
-	vm_fd: &VmFd,
+	#[cfg(target_os = "linux")] vm_fd: &VmFd,
+	#[cfg(target_os = "windows")] vm: &Vm,
 ) -> Result<LoadedKernel> {
+	#[cfg(target_os = "linux")]
+	let firmware_memory = map_uefi_firmware(path, ram, vm_fd)?;
+	#[cfg(target_os = "windows")]
+	let firmware_memory = map_uefi_firmware(path, ram, vm)?;
 	Ok(LoadedKernel {
 		entry:           GuestAddress(UEFI_RESET_VECTOR),
 		setup_header:    None,
-		firmware_memory: Some(map_uefi_firmware(path, ram, vm_fd)?),
+		firmware_memory: Some(firmware_memory),
 	})
 }
 
 /// Register the firmware ROM memslot used for fresh UEFI boots and restores.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn map_uefi_firmware(
 	path: &Path,
 	ram: &GuestMemoryMmap,
-	vm_fd: &VmFd,
+	#[cfg(target_os = "linux")] vm_fd: &VmFd,
+	#[cfg(target_os = "windows")] vm: &Vm,
 ) -> Result<GuestMemoryMmap> {
 	let mut file =
 		File::open(path).map_err(|e| format!("opening firmware {}: {e}", path.display()))?;
@@ -125,25 +133,39 @@ pub fn map_uefi_firmware(
 
 	let size = buf.len();
 	let base = GuestAddress(FIRST_ADDR_PAST_32BITS - size as u64);
+	let minimum_firmware_base = u64::from(APIC_DEFAULT_PHYS_BASE) + GUEST_PAGE_SIZE;
+	if base.raw_value() < minimum_firmware_base {
+		bail!("firmware {} size {} overlaps the local APIC page", path.display(), buf.len());
+	}
 	let firmware = GuestMemoryMmap::from_ranges(&[(base, size)])
 		.map_err(|e| format!("allocating firmware ROM at {:#x}: {e}", base.raw_value()))?;
 	firmware.write_slice(&buf, base)?;
 
-	let region = firmware
-		.find_region(base)
-		.ok_or("firmware ROM region disappeared after allocation")?;
-	let slot = u32::try_from(ram.iter().count()).map_err(|_| "too many RAM slots")?;
-	let kvm_region = kvm_userspace_memory_region {
-		slot,
-		guest_phys_addr: base.raw_value(),
-		memory_size: region.len(),
-		userspace_addr: region.as_ptr() as u64,
-		flags: 0,
-	};
-	// SAFETY: `firmware` owns the mmap backing `userspace_addr` and is retained
-	// by the VMM for at least as long as the VM can run.
-	unsafe { vm_fd.set_user_memory_region(kvm_region)? };
-	Ok(firmware)
+	#[cfg(target_os = "windows")]
+	{
+		let _ = ram;
+		vm.map_firmware(&firmware)?;
+		Ok(firmware)
+	}
+
+	#[cfg(target_os = "linux")]
+	{
+		let region = firmware
+			.find_region(base)
+			.ok_or("firmware ROM region disappeared after allocation")?;
+		let slot = u32::try_from(ram.iter().count()).map_err(|_| "too many RAM slots")?;
+		let kvm_region = kvm_userspace_memory_region {
+			slot,
+			guest_phys_addr: base.raw_value(),
+			memory_size: region.len(),
+			userspace_addr: region.as_ptr() as u64,
+			flags: 0,
+		};
+		// SAFETY: `firmware` owns the mmap backing `userspace_addr` and is retained
+		// by the VMM for at least as long as the VM can run.
+		unsafe { vm_fd.set_user_memory_region(kvm_region)? };
+		Ok(firmware)
+	}
 }
 
 /// Read an initrd/initramfs image into guest RAM above the low boot-data area,
@@ -295,23 +317,40 @@ pub fn configure_uefi_system(
 
 /// Configure one x86 vCPU for a firmware reset-vector entry instead of the
 /// direct Linux 64-bit boot protocol.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn configure_uefi_vcpu(
 	vcpu: &Vcpu,
 	base_cpuid: &CpuId,
 	cpu_id: u8,
 	entry: GuestAddress,
 ) -> Result<()> {
-	super::cpuid::setup_cpuid(vcpu, base_cpuid, cpu_id)?;
-	super::msr::setup_msrs(vcpu)?;
-	super::interrupts::set_lint(vcpu)?;
-
-	if cpu_id == 0 {
-		setup_uefi_reset_sregs(vcpu)?;
-		setup_uefi_reset_regs(vcpu, entry.raw_value())?;
-		super::regs::setup_fpu(vcpu)?;
+	#[cfg(target_os = "windows")]
+	{
+		vcpu.set_cpuid_template(base_cpuid, cpu_id)?;
+		vcpu.setup_msrs()?;
+		vcpu.set_lint()?;
+		if cpu_id == 0 {
+			vcpu.setup_uefi_sregs()?;
+			vcpu.setup_uefi_regs(entry.raw_value())?;
+			vcpu.setup_fpu()?;
+		} else {
+			vcpu.suspend_for_startup()?;
+		}
+		Ok(())
 	}
-	Ok(())
+
+	#[cfg(target_os = "linux")]
+	{
+		super::cpuid::setup_cpuid(vcpu, base_cpuid, cpu_id)?;
+		super::msr::setup_msrs(vcpu)?;
+		super::interrupts::set_lint(vcpu)?;
+		if cpu_id == 0 {
+			setup_uefi_reset_sregs(vcpu)?;
+			setup_uefi_reset_regs(vcpu, entry.raw_value())?;
+			super::regs::setup_fpu(vcpu)?;
+		}
+		Ok(())
+	}
 }
 
 #[cfg(target_os = "linux")]

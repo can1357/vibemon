@@ -22,11 +22,9 @@ mod pager;
 pub mod result;
 #[cfg(target_os = "linux")]
 mod sandbox;
-#[cfg(not(target_os = "windows"))]
 pub mod snapshot;
 
 /// Remote virtio-fs proxy wire protocol shared with the server-side proxy.
-#[cfg(not(target_os = "windows"))]
 pub mod remotefs {
 	pub use crate::virtio::remotefs::proto;
 }
@@ -38,6 +36,8 @@ mod vmm;
 #[cfg(target_os = "windows")]
 #[path = "vmm_windows.rs"]
 mod vmm;
+#[cfg(target_os = "windows")]
+mod windows_pipe;
 
 use config::{Config, LogFormat};
 use tracing_subscriber::EnvFilter;

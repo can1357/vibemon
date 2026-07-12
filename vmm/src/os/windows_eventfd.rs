@@ -136,17 +136,10 @@ fn lock_state(state: &Mutex<CounterState>) -> io::Result<MutexGuard<'_, CounterS
 }
 
 fn wait_event(handle: RawHandle) -> io::Result<()> {
-	loop {
-		// SAFETY: `handle` is a live event handle and the call does not retain it.
-		let ret = unsafe { WaitForSingleObject(handle as HANDLE, INFINITE) };
-		match ret {
-			WAIT_OBJECT_0 => return Ok(()),
-			WAIT_FAILED => return Err(io::Error::last_os_error()),
-			_ => {
-				return Err(io::Error::other(format!(
-					"unexpected WaitForSingleObject result {ret:#x}"
-				)));
-			},
-		}
+	// SAFETY: `handle` is a live event handle and the call does not retain it.
+	match unsafe { WaitForSingleObject(handle as HANDLE, INFINITE) } {
+		WAIT_OBJECT_0 => Ok(()),
+		WAIT_FAILED => Err(io::Error::last_os_error()),
+		result => Err(io::Error::other(format!("unexpected WaitForSingleObject result {result:#x}"))),
 	}
 }

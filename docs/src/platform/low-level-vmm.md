@@ -1,8 +1,8 @@
 # Low-Level VMM
 
-`vmon vmm` starts one bare virtual-machine monitor directly. It is the escape hatch below the managed [`vmon` CLI](cli.md) and [`vmon serve`](server.md): it does not create a server sandbox record and it does not expose the `vmon.v1` gRPC API. The monitor uses KVM on Linux and Apple Hypervisor.framework on Apple-silicon macOS; the backend is selected at build time.
+`vmon vmm` starts one bare virtual-machine monitor directly. It is the escape hatch below the managed [`vmon` CLI](cli.md) and [`vmon serve`](server.md): it does not create a server sandbox record and it does not expose the `vmon.v1` gRPC API. The monitor uses KVM on Linux, Hypervisor.framework on Apple Silicon macOS, and WHP on x86_64 Windows; the backend is selected at build time.
 
-This command needs a compatible host, a kernel and guest image built for the host architecture, and sufficient privilege for the requested host facilities. On Linux, a root launch with the default sandbox must also supply `--sandbox-uid` and `--sandbox-gid` (both greater than zero); the examples use the `nobody` identity `65534:65534`, which must be able to read the supplied files. On macOS, `--net user` is the entitlement-free NAT choice; host TAP/vmnet networking requires the appropriate host support and entitlement. Run [Installation](installation.md) and [Troubleshooting](troubleshooting.md) guidance before using it in production.
+This command needs a compatible host, guest assets for the host architecture, and sufficient privilege for requested host facilities. Linux root launches with the default sandbox must supply `--sandbox-uid` and `--sandbox-gid`. macOS and Windows can use `--net user` for outbound NAT without an operator-created TAP device.
 
 ## Direct boot
 
@@ -46,7 +46,7 @@ sudo vmon vmm \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-On macOS/HVF, use user-mode NAT without the VM-networking entitlement:
+On macOS/HVF or Windows/WHP, use user-mode NAT:
 
 ```sh
 vmon vmm \
@@ -55,16 +55,11 @@ vmon vmm \
   --cmdline "console=ttyS0 reboot=t panic=-1 rdinit=/init"
 ```
 
-`--net` accepts only `user`. Other available direct attachments are `--mac ADDR`, read-only `--fs-tag TAG --fs-dir DIR`, repeatable `--volume TAG:HOST_DIR` (append `:ro` for a read-only volume), `--rng`, and `--console-agent`. `--agent-sock PATH` bridges a host Unix socket to the virtio-console agent; `--agent-exec CMD` runs the command through that agent after boot. A cold boot using `--agent-exec` requires `--agent-sock`.
+`--net` accepts only `user`. Other attachments include `--mac ADDR`, `--fs-tag TAG --fs-dir DIR`, repeatable `--volume TAG:HOST_DIR`, `--rng`, and `--console-agent`. `--agent-sock PATH` bridges the host to the virtio-console agent through a Unix socket on Linux/macOS or a local named pipe on Windows.
 
 ### Proxy-backed remote filesystems
 
-`--remote-fs <tag>:<absolute-socket>` is a repeatable, direct VMM attachment for
-a read-only virtio-fs filesystem served by an operator-managed Unix-socket
-proxy. It is **not** an S3 client and does not create a proxy. The tag is what
-the guest mounts; it must match `[a-z0-9_]{1,32}` and share the same namespace
-as `--volume` tags, so every volume and remote-filesystem tag in one VM must be
-unique. The socket path must be absolute.
+`--remote-fs <tag>:<endpoint>` is a repeatable, direct VMM attachment for a read-only virtio-fs filesystem served by an operator-managed proxy. The endpoint is a Unix socket on Linux/macOS and a local named-pipe-derived path on Windows. The tag must match `[a-z0-9_]{1,32}` and share the same namespace as `--volume` tags. The endpoint path must be absolute.
 
 ```sh
 sudo vmon vmm \

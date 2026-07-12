@@ -28,13 +28,13 @@ The shared suite runs on Linux/KVM, Apple Silicon macOS/HVF, and Linux/KVM in Li
 | --- | --- |
 | Boot, virtio block and filesystem, JSON control (pause/snapshot/resume/quit), metrics, timeout, snapshot/restore/fork, and delta snapshots | Every supported backend |
 | TAP networking and throughput | Linux/KVM only; requires a host TAP via `VMON_TAP=<iface>` and optionally `VMON_HOST_IP` |
-| User-mode NAT, DHCP lease, and outbound TCP through slirp | macOS/HVF only |
+| User-mode NAT, DHCP lease, and outbound TCP through slirp | Implemented on macOS/HVF and Windows/WHP; current real-guest CI coverage runs on macOS/HVF |
 | PCI virtio transport | x86_64 only |
 | userfaultfd paging and seccomp audit | Linux only |
 | Namespace jail | Linux only; requires `VMON_JAIL=1` and effective root, as provided by `just smoke-jail` |
 | CLI capability matrix | No hypervisor; runs under plain `cargo test` and checks unsupported flag combinations, including remote-filesystem validation. |
 
-The CLI matrix is specifically useful for flag validation without guest hardware: it covers PCI on aarch64, `--net user` outside macOS, `--net user` combined with `--tap`, UEFI without firmware, and invalid `--remote-fs` combinations. Remote-filesystem rows reject a tag duplicated by `--volume`, tags outside `[a-z0-9_]{1,32}`, a missing `tag:socket` separator, and a relative socket path. They do not require a running socket or S3 service; those are runtime/proxy concerns.
+The CLI matrix is useful for flag validation without guest hardware: it covers PCI on aarch64, `--net user` outside macOS/Windows, `--net user` combined with `--tap`, UEFI without firmware, and invalid `--remote-fs` combinations. Remote-filesystem rows reject duplicate or malformed tags, a missing `tag:endpoint` separator, and a relative endpoint path. They do not require a running proxy.
 
 ## Focused recipes
 
@@ -73,4 +73,4 @@ A denial indicates that the exercised syscall is outside the current allowlist; 
 
 For manual environments, do not set `VMON_E2E=1` unless guest assets and a usable hypervisor are available. Test helpers require `VMON_E2E=1` and a host backend before booting; otherwise those tests intentionally return early. Jail helpers additionally require `VMON_JAIL=1`, Linux, and effective root, and emit `SKIP jail tests: VMON_JAIL=1 but not running as root` when jail coverage was requested without privilege.
 
-Cluster testing is not a substitute for the hermetic mesh invariant tests. The real-VM `cluster-e2e` recipe exercises the gated hardware path, while failure-mode contracts are also covered without booting guests. Run the narrowest recipe that can observe the behavior being changed, then use a supported KVM/HVF environment for guest and mesh paths.
+Cluster testing is not a substitute for the hermetic mesh invariant tests. The real-VM `cluster-e2e` recipe exercises the gated hardware path, while failure-mode contracts are also covered without booting guests. Run the narrowest recipe that observes the behavior, then use a supported KVM, HVF, or WHP host for guest and mesh paths.

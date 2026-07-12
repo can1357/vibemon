@@ -4,11 +4,13 @@ pub mod block;
 pub mod console;
 #[cfg(not(target_os = "windows"))]
 pub mod fs;
+#[cfg(target_os = "windows")]
+#[path = "fs_windows.rs"]
+pub mod fs;
 pub mod mmio;
 pub mod net;
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 pub mod pci;
-#[cfg(not(target_os = "windows"))]
 pub mod remotefs;
 pub mod rng;
 

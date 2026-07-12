@@ -262,10 +262,49 @@ fn size_file(file: &File, len: usize) -> Result<()> {
 /// file_offset)` matching the snapshot's contiguous region table.
 #[cfg(target_os = "windows")]
 pub fn create_guest_memory_private(
-	_mem_file: &std::path::Path,
-	_regions: &[(u64, u64, u64)],
+	mem_file: &std::path::Path,
+	regions: &[(u64, u64, u64)],
 ) -> Result<GuestMemoryMmap> {
-	Err(err("private snapshot memory (--fork-from) is not supported on Windows"))
+	use std::os::windows::fs::FileExt;
+
+	use vm_memory::{Bytes, mmap::GuestRegionMmap};
+	let file = std::fs::File::open(mem_file)
+		.map_err(|e| err(format!("opening {}: {e}", mem_file.display())))?;
+	let file_len = file.metadata()?.len();
+	if regions.is_empty() {
+		return Err(err("snapshot has no memory regions"));
+	}
+	let mut next_file_offset = 0u64;
+	let mut mapped = Vec::with_capacity(regions.len());
+	for (index, &(gpa, len, file_offset)) in regions.iter().enumerate() {
+		if gpa % PAGE_SIZE as u64 != 0 || len == 0 || len % PAGE_SIZE as u64 != 0 {
+			return Err(err(format!("snapshot memory region {index} is not page-aligned")));
+		}
+		let end = file_offset
+			.checked_add(len)
+			.ok_or_else(|| err(format!("snapshot memory region {index} file extent overflows")))?;
+		if file_offset != next_file_offset || end > file_len {
+			return Err(err(format!("snapshot memory region {index} has invalid file extent")));
+		}
+		next_file_offset = end;
+		let size = usize::try_from(len).map_err(|_| err("snapshot memory region exceeds usize"))?;
+		let region = vm_memory::mmap::MmapRegion::new(size)?;
+		let guest = GuestRegionMmap::new(region, GuestAddress(gpa))
+			.ok_or_else(|| err(format!("snapshot memory region {index} is invalid")))?;
+		let mut offset = 0usize;
+		let mut buffer = vec![0u8; 1 << 20];
+		while offset < size {
+			let count = (size - offset).min(buffer.len());
+			let read = file.seek_read(&mut buffer[..count], file_offset + offset as u64)?;
+			if read == 0 {
+				return Err(err("snapshot memory file ended early"));
+			}
+			guest.write_slice(&buffer[..read], vm_memory::MemoryRegionAddress(offset as u64))?;
+			offset += read;
+		}
+		mapped.push(guest);
+	}
+	GuestMemoryMmap::from_regions(mapped).map_err(Into::into)
 }
 
 #[cfg(not(target_os = "windows"))]

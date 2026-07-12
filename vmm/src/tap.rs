@@ -661,39 +661,306 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-	use std::io;
+	use std::{
+		ffi::c_void,
+		io,
+		os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
+		ptr,
+	};
 
-	use crate::result::{Result, err};
+	use parking_lot::Mutex;
+	use windows_sys::Win32::{
+		Foundation::{
+			ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+			INVALID_HANDLE_VALUE,
+		},
+		Storage::FileSystem::{
+			CreateFileW, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+			FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
+		},
+		System::{
+			IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
+			Threading::{CreateEventW, ResetEvent},
+		},
+	};
 
-	/// Networking boundary for WHP hosts; TAP attachment is not implemented.
+	use crate::{
+		result::{Result, err},
+		tap::VNET_HDR_SIZE,
+	};
+
+	const TAP_IOCTL_SET_MEDIA_STATUS: u32 = 0x0022_000c;
+	const TAP_FRAME_CAPACITY: usize = 65_536;
+
+	struct OverlappedOp {
+		event:      OwnedHandle,
+		overlapped: Box<OVERLAPPED>,
+	}
+
+	#[allow(
+		clippy::non_send_fields_in_send_ty,
+		reason = "OVERLAPPED is pinned in a Box and all access is serialized until completion"
+	)]
+	// SAFETY: the boxed `OVERLAPPED` stays at a stable address, its embedded raw
+	// pointer is always null, and callers serialize every access to an operation.
+	unsafe impl Send for OverlappedOp {}
+
+	impl OverlappedOp {
+		fn new() -> io::Result<Self> {
+			// SAFETY: null security attributes/name create a private,
+			// non-inheritable manual-reset event.
+			let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+			if event.is_null() {
+				return Err(io::Error::last_os_error());
+			}
+			// SAFETY: `CreateEventW` returned a fresh owned handle.
+			let event = unsafe { OwnedHandle::from_raw_handle(event as RawHandle) };
+			let mut op = Self { event, overlapped: Box::new(OVERLAPPED::default()) };
+			op.reset()?;
+			Ok(op)
+		}
+
+		fn reset(&mut self) -> io::Result<()> {
+			// SAFETY: `event` is a live event handle.
+			if unsafe { ResetEvent(self.event.as_raw_handle() as HANDLE) } == 0 {
+				return Err(io::Error::last_os_error());
+			}
+			*self.overlapped = OVERLAPPED::default();
+			self.overlapped.hEvent = self.event.as_raw_handle() as HANDLE;
+			Ok(())
+		}
+
+		fn as_mut_ptr(&mut self) -> *mut OVERLAPPED {
+			std::ptr::from_mut(self.overlapped.as_mut())
+		}
+
+		fn complete(&self, handle: HANDLE, wait: bool) -> io::Result<usize> {
+			let mut transferred = 0u32;
+			// SAFETY: `handle` and the event-backed `OVERLAPPED` remain live until
+			// this operation has completed.
+			let ok = unsafe {
+				GetOverlappedResult(handle, self.overlapped.as_ref(), &mut transferred, i32::from(wait))
+			};
+			if ok == 0 {
+				let error = io::Error::last_os_error();
+				if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE as i32) {
+					return Err(io::Error::from(io::ErrorKind::WouldBlock));
+				}
+				return Err(error);
+			}
+			Ok(transferred as usize)
+		}
+	}
+
+	struct ReadState {
+		op:      OverlappedOp,
+		frame:   Box<[u8]>,
+		pending: bool,
+	}
+
+	impl ReadState {
+		fn new() -> io::Result<Self> {
+			Ok(Self {
+				op:      OverlappedOp::new()?,
+				frame:   vec![0; TAP_FRAME_CAPACITY].into_boxed_slice(),
+				pending: false,
+			})
+		}
+
+		fn arm(&mut self, handle: HANDLE) -> io::Result<()> {
+			self.op.reset()?;
+			let length = u32::try_from(self.frame.len())
+				.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+			// SAFETY: the boxed frame and boxed `OVERLAPPED` remain at stable
+			// addresses until completion; `Tap::drop` drains a pending operation.
+			let started = unsafe {
+				ReadFile(handle, self.frame.as_mut_ptr(), length, ptr::null_mut(), self.op.as_mut_ptr())
+			};
+			accept_overlapped_start(started)?;
+			self.pending = true;
+			Ok(())
+		}
+	}
+
+	/// TAP-Windows adapter with one continuously pending packet read.
 	pub struct Tap {
-		mac: [u8; 6],
+		handle: OwnedHandle,
+		read:   Mutex<ReadState>,
+		write:  Mutex<OverlappedOp>,
+		mac:    [u8; 6],
 	}
 
 	impl Tap {
-		/// Reject TAP creation until a Windows packet backend is configured.
-		pub fn open(name: &str, _mac: [u8; 6]) -> Result<Self> {
-			Err(err(format!("TAP networking is unsupported on Windows (requested {name:?})")))
+		/// Open a TAP-Windows adapter. `name` may be a full device path or an
+		/// adapter GUID, in which case the standard TAP-Windows path is built.
+		pub fn open(name: &str, mac: [u8; 6]) -> Result<Self> {
+			let path = if name.starts_with(r"\\.\Global\") {
+				name.to_owned()
+			} else {
+				format!(r"\\.\Global\{name}.tap")
+			};
+			let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+			// SAFETY: `wide` is NUL-terminated and all optional pointers are null.
+			let handle = unsafe {
+				CreateFileW(
+					wide.as_ptr(),
+					GENERIC_READ | GENERIC_WRITE,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					ptr::null(),
+					OPEN_EXISTING,
+					FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED,
+					ptr::null_mut(),
+				)
+			};
+			if handle == INVALID_HANDLE_VALUE {
+				return Err(err(format!(
+					"opening TAP-Windows adapter {name:?}: {}",
+					io::Error::last_os_error()
+				)));
+			}
+			// SAFETY: `CreateFileW` returned a fresh owned handle.
+			let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+			let mut write = OverlappedOp::new()?;
+			set_media_status(handle.as_raw_handle() as HANDLE, &mut write)?;
+			let mut read = ReadState::new()?;
+			read.arm(handle.as_raw_handle() as HANDLE)?;
+			Ok(Self { handle, read: Mutex::new(read), write: Mutex::new(write), mac })
 		}
 
-		pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
-			Err(io::Error::new(io::ErrorKind::Unsupported, "TAP networking is unsupported on Windows"))
+		/// Receive one Ethernet frame with a synthesized virtio-net header.
+		pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+			if buf.len() < VNET_HDR_SIZE {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"virtio-net receive buffer is smaller than its header",
+				));
+			}
+			let handle = self.handle.as_raw_handle() as HANDLE;
+			let mut read = self.read.lock();
+			if !read.pending {
+				read.arm(handle)?;
+			}
+			let frame_len = read.op.complete(handle, false)?;
+			read.pending = false;
+			let packet_len = VNET_HDR_SIZE
+				.checked_add(frame_len)
+				.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+			let copy_result = if packet_len > buf.len() {
+				Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("TAP-Windows frame of {frame_len} bytes exceeds receive buffer"),
+				))
+			} else {
+				buf[..VNET_HDR_SIZE].fill(0);
+				buf[VNET_HDR_SIZE..packet_len].copy_from_slice(&read.frame[..frame_len]);
+				Ok(packet_len)
+			};
+			read.arm(handle)?;
+			copy_result
 		}
 
-		pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
-			Err(io::Error::new(io::ErrorKind::Unsupported, "TAP networking is unsupported on Windows"))
+		/// Send one Ethernet frame after removing its virtio-net header.
+		pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+			let frame = buf.get(VNET_HDR_SIZE..).ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"virtio-net transmit buffer is smaller than its header",
+				)
+			})?;
+			let length =
+				u32::try_from(frame.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+			let handle = self.handle.as_raw_handle() as HANDLE;
+			let mut op = self.write.lock();
+			op.reset()?;
+			// SAFETY: `frame` and the boxed `OVERLAPPED` remain live until the
+			// synchronous completion wait below returns.
+			let started =
+				unsafe { WriteFile(handle, frame.as_ptr(), length, ptr::null_mut(), op.as_mut_ptr()) };
+			accept_overlapped_start(started)?;
+			let written = op.complete(handle, true)?;
+			Ok(VNET_HDR_SIZE + written)
 		}
 
-		pub fn set_offloads(&self, _offloads: u32) -> Result<()> {
-			Err(err("TAP networking is unsupported on Windows"))
+		/// Configure negotiated offloads; TAP-Windows accepts raw frames only.
+		#[allow(
+			clippy::unused_self,
+			reason = "network backends expose one instance-based offload interface"
+		)]
+		pub fn set_offloads(&self, offloads: u32) -> Result<()> {
+			if offloads == 0 {
+				Ok(())
+			} else {
+				Err(err("TAP-Windows does not expose virtio offload metadata"))
+			}
 		}
 
+		/// Return the TAP offload mask exposed to the virtio guest.
+		#[allow(
+			clippy::unused_self,
+			reason = "network backends expose one instance-based offload interface"
+		)]
 		pub const fn supported_offloads(&self) -> u32 {
 			0
 		}
 
+		/// Return the guest-visible MAC address.
 		pub const fn mac(&self) -> [u8; 6] {
 			self.mac
+		}
+
+		/// Return the event signaled when the pending packet read completes.
+		pub fn as_raw_handle(&self) -> RawHandle {
+			self.read.lock().op.event.as_raw_handle()
+		}
+	}
+
+	impl Drop for Tap {
+		fn drop(&mut self) {
+			let read = self.read.get_mut();
+			if !read.pending {
+				return;
+			}
+			let handle = self.handle.as_raw_handle() as HANDLE;
+			// SAFETY: both handles and the pending `OVERLAPPED` are live. Waiting
+			// after cancellation prevents Windows from retaining the frame buffer.
+			unsafe {
+				CancelIoEx(handle, read.op.overlapped.as_ref());
+			}
+			let _ = read.op.complete(handle, true);
+			read.pending = false;
+		}
+	}
+
+	fn set_media_status(handle: HANDLE, op: &mut OverlappedOp) -> io::Result<()> {
+		let enabled = 1u32;
+		op.reset()?;
+		// SAFETY: the input and boxed `OVERLAPPED` remain live until completion.
+		let started = unsafe {
+			DeviceIoControl(
+				handle,
+				TAP_IOCTL_SET_MEDIA_STATUS,
+				std::ptr::from_ref(&enabled).cast::<c_void>(),
+				std::mem::size_of_val(&enabled) as u32,
+				ptr::null_mut(),
+				0,
+				ptr::null_mut(),
+				op.as_mut_ptr(),
+			)
+		};
+		accept_overlapped_start(started)?;
+		op.complete(handle, true)?;
+		Ok(())
+	}
+
+	fn accept_overlapped_start(started: i32) -> io::Result<()> {
+		if started != 0 {
+			return Ok(());
+		}
+		let error = io::Error::last_os_error();
+		if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+			Ok(())
+		} else {
+			Err(error)
 		}
 	}
 }

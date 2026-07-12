@@ -68,6 +68,12 @@ Use macOS 15 or later on Apple Silicon with Hypervisor.framework available. `vmo
 
 For macOS user-mode guest networking, install native `libslirp` and `pkg-config` locally (for example, `brew install libslirp pkg-config`) and use `--net user`. The ad-hoc-signed binary cannot use `--tap`: vmnet-style networking requires entitlements unavailable to that signing mode. See [Build from Source](build-from-source.md) for the manual signing equivalent.
 
+### x86_64 Windows/WHP
+
+Use x86_64 Windows with hardware virtualization and Windows Hypervisor Platform or Hyper-V enabled. Build with the Rust MSVC toolchain and Windows SDK. Use `--net user` for in-process outbound NAT, or attach an operator-managed TAP-Windows adapter.
+
+Windows control and guest-agent endpoints use local named pipes. Remote virtio-fs uses the same request framing over named pipes. Direct-kernel and UEFI boot are supported; supply x86_64 OVMF/EDK2 firmware with `--boot-mode uefi --firmware <path>`.
+
 ### Image and guest filesystem tools
 
 `vmon doctor` warns when image tools are absent and names `skopeo` and `umoci`; install both before using `vmon run` with image references. It also checks for `mkfs.ext4`. On macOS, its suggested installation is `brew install e2fsprogs`; on other platforms it advises installing `e2fsprogs`.

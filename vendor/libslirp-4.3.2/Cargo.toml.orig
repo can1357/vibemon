@@ -1,0 +1,43 @@
+[package]
+name = "libslirp"
+version = "4.3.2"
+authors = ["Marc-André Lureau <marcandre.lureau@redhat.com>"]
+repository = "https://gitlab.freedesktop.org/slirp/libslirp-rs.git"
+homepage = "https://gitlab.freedesktop.org/slirp/libslirp-rs"
+documentation = "https://docs.rs/libslirp"
+description = "High-level bindings & helper process for libslirp."
+license-file = "LICENSE"
+edition = "2018"
+keywords = ["networking", "tcp", "ip", "qemu", "virtualization"]
+categories = ["api-bindings", "command-line-utilities", "emulators", "network-programming"]
+
+[features]
+default = ["mio", "mio-extras", "ipnetwork", "structopt", "slab"]
+helper = ["libc", "zbus", "nix", "libsystemd", "url", "lazy_static", "zvariant", "enumflags2"]
+
+[dependencies]
+libslirp-sys = { version = "4.2.1" }
+ipnetwork = { version = "0.20", optional = true }
+structopt = { version = "0.3.26", optional = true }
+mio = { version = "0.6.23", optional = true }
+mio-extras = { version = "2.0.6", optional = true }
+slab = { version = "0.4.9", optional = true }
+libc = { version = "0.2", optional = true }
+nix = { version = "0.29", optional = true, features = ["fs", "ioctl", "sched"] }
+libsystemd = { version = "0.7", optional = true }
+url = { version = "2.5", optional = true }
+lazy_static = { version = "1.5", optional = true }
+zbus = { version = "1.9", optional = true }
+zvariant = { version = "2.10", optional = true }
+enumflags2 = { version = "0.6.4", optional = true }
+
+[dev-dependencies]
+etherparse = "0.15.0"
+
+[[bin]]
+name = "libslirp-helper"
+required-features = ["default", "helper"]
+
+[[test]]
+name = "test-ip"
+required-features = ["default"]

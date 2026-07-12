@@ -25,6 +25,10 @@ use crate::{
 };
 #[cfg(target_os = "macos")]
 mod user;
+#[cfg(target_os = "windows")]
+mod user_windows;
+#[cfg(target_os = "windows")]
+use user_windows as user;
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 2;
@@ -59,7 +63,7 @@ pub struct Net {
 
 enum Backend {
 	Tap(Tap),
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	User(user::UserNet),
 }
 
@@ -67,7 +71,7 @@ impl Backend {
 	fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
 		match self {
 			Self::Tap(tap) => tap.read(buf),
-			#[cfg(target_os = "macos")]
+			#[cfg(any(target_os = "macos", target_os = "windows"))]
 			Self::User(user) => user.read(buf),
 		}
 	}
@@ -75,7 +79,7 @@ impl Backend {
 	fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
 		match self {
 			Self::Tap(tap) => tap.write(buf),
-			#[cfg(target_os = "macos")]
+			#[cfg(any(target_os = "macos", target_os = "windows"))]
 			Self::User(user) => user.write(buf),
 		}
 	}
@@ -83,7 +87,7 @@ impl Backend {
 	fn set_offloads(&self, offloads: u32) -> Result<()> {
 		match self {
 			Self::Tap(tap) => tap.set_offloads(offloads),
-			#[cfg(target_os = "macos")]
+			#[cfg(any(target_os = "macos", target_os = "windows"))]
 			Self::User(user) => user.set_offloads(offloads),
 		}
 	}
@@ -91,7 +95,7 @@ impl Backend {
 	const fn supported_offloads(&self) -> u32 {
 		match self {
 			Self::Tap(tap) => tap.supported_offloads(),
-			#[cfg(target_os = "macos")]
+			#[cfg(any(target_os = "macos", target_os = "windows"))]
 			Self::User(user) => user.supported_offloads(),
 		}
 	}
@@ -107,17 +111,16 @@ impl Backend {
 
 	#[cfg(target_os = "windows")]
 	fn worker_wait_sources(&self) -> Vec<WorkerWaitSource> {
-		Vec::new()
+		match self {
+			Self::Tap(tap) => vec![tap.as_raw_handle()],
+			Self::User(user) => vec![user.as_raw_handle()],
+		}
 	}
 
-	#[allow(
-		clippy::unnecessary_wraps,
-		reason = "the macOS user-net arm is fallible; Linux builds only see the Tap arm"
-	)]
 	fn user_net_state(&self) -> Result<Option<Vec<u8>>> {
 		match self {
 			Self::Tap(_) => Ok(None),
-			#[cfg(target_os = "macos")]
+			#[cfg(any(target_os = "macos", target_os = "windows"))]
 			Self::User(user) => Ok(Some(user.save_state()?)),
 		}
 	}
@@ -128,7 +131,7 @@ impl Net {
 		Self::with_backend(Backend::Tap(tap), mac)
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	pub fn new_user_with_state(mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
 		Ok(Self::with_backend(Backend::User(user::UserNet::new_with_state(mac, state)?), mac))
 	}

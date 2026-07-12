@@ -40,5 +40,9 @@ pub fn configure_vcpu(
 		regs::setup_fpu(vcpu)?;
 		regs::setup_sregs(mem, vcpu)?;
 	}
+	#[cfg(target_os = "windows")]
+	if cpu_id != 0 {
+		vcpu.suspend_for_startup()?;
+	}
 	Ok(())
 }

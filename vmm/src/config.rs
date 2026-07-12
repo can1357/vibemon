@@ -553,8 +553,8 @@ impl Config {
 		if user_net && cli.tap.is_some() {
 			bail!("--net user cannot be combined with --tap");
 		}
-		if user_net && !cfg!(target_os = "macos") {
-			bail!("--net user is currently supported only on macOS");
+		if user_net && !cfg!(any(target_os = "macos", target_os = "windows")) {
+			bail!("--net user is currently supported only on macOS and Windows");
 		}
 		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
 			bail!("--transport pci is only supported on x86_64");
@@ -1203,9 +1203,9 @@ mod tests {
 		);
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	#[test]
-	fn accepts_user_net_on_macos() {
+	fn accepts_user_net_on_supported_hosts() {
 		let cfg = parse_config(&["vmon", "--kernel", "k", "--net", "user"])
 			.expect("--net user parses on macOS");
 		assert!(cfg.user_net);
@@ -1232,10 +1232,10 @@ mod tests {
 		);
 	}
 
-	#[cfg(not(target_os = "macos"))]
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	#[test]
-	fn rejects_user_net_off_macos() {
-		assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "user"], "only on macOS");
+	fn rejects_user_net_on_unsupported_hosts() {
+		assert_config_err_contains(&["vmon", "--kernel", "k", "--net", "user"], "macOS and Windows");
 	}
 
 	#[cfg(target_arch = "x86_64")]
