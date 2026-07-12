@@ -768,22 +768,21 @@ class SocketReconnectTest(unittest.TestCase):
                                 response.get("type") in terminal):
                             return response
 
-                connection, stream = connect()
-                response = transact(stream, {
+                first_connection, first_stream = connect()
+                response = transact(first_stream, {
                     "type": "define", "request_id": "define", "definition_id": "counter",
                     "revision": "r1", "definition": {"mode": "package", "root": str(root),
                     "target": "actor_module:Counter"}})
                 self.assertEqual(response["status"], "initialized")
-                transact(stream, {"type": "actor_create", "request_id": "create",
+                transact(first_stream, {"type": "actor_create", "request_id": "create",
                                    "actor_id": "durable", "definition_id": "counter",
                                    "args": envelope([])})
-                transact(stream, {"type": "actor_call", "request_id": "add",
+                transact(first_stream, {"type": "actor_call", "request_id": "add",
                                    "actor_id": "durable", "method": "add",
                                    "args": envelope([9])})
-                stream.close()
-                connection.close()
-
                 connection, stream = connect()
+                first_stream.close()
+                first_connection.close()
                 response = transact(stream, {"type": "actor_call", "request_id": "get",
                                               "actor_id": "durable", "method": "get",
                                               "args": envelope([])})

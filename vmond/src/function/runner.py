@@ -1847,9 +1847,23 @@ async def _run_socket(runner, socket_path):
     except FileNotFoundError:
         pass
     connection_lock = asyncio.Lock()
+    active_writer = None
     stopped = asyncio.Event()
 
     async def serve_connection(reader, writer):
+        nonlocal active_writer
+        previous = active_writer
+        active_writer = writer
+        if previous is not None:
+            previous.close()
+            try:
+                await previous.wait_closed()
+            except (ConnectionError, BrokenPipeError):
+                pass
+        if active_writer is not writer:
+            writer.close()
+            await writer.wait_closed()
+            return
         async with connection_lock:
             transport_socket = writer.get_extra_info("socket")
             _WRITER.replace_fd(transport_socket.fileno())
@@ -1882,6 +1896,8 @@ async def _run_socket(runner, socket_path):
                 if runner.stopping:
                     stopped.set()
             finally:
+                if active_writer is writer:
+                    active_writer = None
                 writer.close()
                 try:
                     await writer.wait_closed()
