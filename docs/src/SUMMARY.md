@@ -27,53 +27,26 @@
 - [Connection Strings and Contexts](sdk/connection-strings.md)
 - [Shared Concepts](sdk/shared-concepts.md)
 
-## Python SDK
+## SDK Guides
 
-- [Overview](sdk/python/index.md)
-- [Install](sdk/python/install.md)
-- [Connect](sdk/python/connect.md)
-- [Client](sdk/python/client.md)
-- [Sandboxes](sdk/python/sandboxes.md)
-- [Processes](sdk/python/processes.md)
-- [Files and Ports](sdk/python/files-and-ports.md)
-- [Volumes and Secrets](sdk/python/volumes-and-secrets.md)
-- [Snapshots](sdk/python/snapshots.md)
-- [Mesh](sdk/python/mesh.md)
-- [Durable Functions](sdk/python/functions.md)
+- [Getting Started](sdk/getting-started.md)
+- [Install](sdk/install.md)
+- [Connect](sdk/connect.md)
+- [Client](sdk/client.md)
+- [Mesh](sdk/mesh.md)
+- [Sandboxes](sdk/sandboxes.md)
+- [Processes](sdk/processes.md)
+- [Files and Ports](sdk/files-and-ports.md)
+- [Volumes and Secrets](sdk/volumes-and-secrets.md)
+- [Snapshots](sdk/snapshots.md)
+- [Durable Functions](sdk/functions.md)
+- [Errors](sdk/errors.md)
+- [Testing](sdk/testing.md)
+
+## Python-only Guides
+
 - [Stateful Actors and Apps](sdk/python/actors.md)
-- [Async API](sdk/python/async.md)
-- [Errors](sdk/python/errors.md)
-- [Testing](sdk/python/testing.md)
 
-## Go SDK
-
-- [Overview](sdk/go/index.md)
-- [Install](sdk/go/install.md)
-- [Connect](sdk/go/connect.md)
-- [Client](sdk/go/client.md)
-- [Sandboxes](sdk/go/sandboxes.md)
-- [Processes](sdk/go/processes.md)
-- [Files and Ports](sdk/go/files-and-ports.md)
-- [Volumes and Secrets](sdk/go/volumes-and-secrets.md)
-- [Snapshots and Pools](sdk/go/snapshots.md)
-- [Durable Functions](sdk/go/functions.md)
-- [Errors](sdk/go/errors.md)
-- [Testing](sdk/go/testing.md)
-
-## TypeScript SDK
-
-- [Overview](sdk/typescript/index.md)
-- [Install](sdk/typescript/install.md)
-- [Connect](sdk/typescript/connect.md)
-- [Client](sdk/typescript/client.md)
-- [Sandboxes](sdk/typescript/sandboxes.md)
-- [Processes](sdk/typescript/processes.md)
-- [Files and Ports](sdk/typescript/files-and-ports.md)
-- [Volumes and Secrets](sdk/typescript/volumes-and-secrets.md)
-- [Snapshots](sdk/typescript/snapshots.md)
-- [Durable Functions](sdk/typescript/functions.md)
-- [Errors](sdk/typescript/errors.md)
-- [Testing](sdk/typescript/testing.md)
 
 # Reference
 

@@ -9,3 +9,7 @@ build-dir = "book"
 [output.html]
 git-repository-url = "https://github.com/can1357/vibemon"
 site-url = "https://can1357.github.io/vibemon/"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["theme/sdk-language.css", "theme/custom.css"]
+additional-js = ["theme/sdk-language.js"]

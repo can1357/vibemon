@@ -64,9 +64,8 @@ handles, not local resources or copies of guest state. A reference made from
 an ID is usable before it is fetched; operations resolve it through the
 daemon.
 
-Language-specific pages show spelling and async conventions:
-[Python connection](python/connect.md), [Go connection](go/connect.md), and
-[TypeScript connection](typescript/connect.md). The shared connection forms
+The merged [Connect](connect.md) guide shows language-specific spelling,
+async conventions, and transport limitations. The shared connection forms
 and defaults are in [Connection Strings and Contexts](connection-strings.md).
 
 ## Typical flow

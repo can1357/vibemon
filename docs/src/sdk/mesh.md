@@ -1,0 +1,179 @@
+# Mesh
+
+A `Client` represents one logical connection to a vmon mesh. It starts from the DSN endpoints and, unless discovery is disabled, discovers mesh-advertised endpoints lazily. The SDKs expose the same status and node roster through `client.mesh` or `client.Mesh`.
+
+For DSN host lists, discovery parameters, contexts, and authentication, see [Connection Strings and Contexts](connection-strings.md). Disabling discovery keeps the configured endpoint roster fixed; it does not turn one endpoint into a mesh router.
+
+## Inspect membership
+
+Mesh status contains the reporting node, its advertised peers, and the number of replicas it currently holds. A node has a stable node identifier plus its advertised API URL and placement region when supplied by the server.
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+```python
+from vmon import connect
+
+with connect("vmon://node-a.example,node-b.example?discover=on") as client:
+    status = client.mesh.status()
+    print(status.self_node.node_id, status.replicas_held)
+    for node in client.mesh.nodes():
+        print(node.node_id, node.advertise, node.region)
+```
+
+`status.self_node` is the reporting node. `client.mesh.nodes()` returns `[status.self_node, *status.peers]`.
+
+</div>
+<div data-sdk-language="go">
+
+```go
+client, err := vmon.Connect("vmon://node-a.example,node-b.example?discover=on")
+if err != nil {
+    return err
+}
+defer client.Close()
+
+status, err := client.Mesh.Status(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status.Self.NodeID, status.ReplicasHeld)
+
+nodes, err := client.Mesh.Nodes(ctx)
+if err != nil {
+    return err
+}
+for _, node := range nodes {
+    fmt.Println(node.NodeID, node.Advertise, node.Region)
+}
+```
+
+`Nodes` returns the reporting node followed by its peers. `MeshStatus` also exposes `ExpectedMembers`, `Quorum`, and the original JSON payload through `Raw`.
+
+</div>
+<div data-sdk-language="typescript">
+
+```ts
+import { connect } from "@vmon/sdk";
+
+const client = connect("vmon://node-a.example,node-b.example?discover=on");
+try {
+  const status = await client.mesh.status();
+  console.log(status.self.node_id, status.replicas_held);
+  for (const node of await client.mesh.nodes()) {
+    console.log(node.node_id, node.advertise, node.region);
+  }
+} finally {
+  await client.close();
+}
+```
+
+`nodes()` returns `[status.self, ...status.peers]`. Mesh response objects retain additional server fields for forward-compatible placement data.
+
+</div>
+</div>
+
+## Driver roster and discovery
+
+The client driver maintains seed and discovered endpoints. Its endpoint snapshot is an advanced diagnostic surface, not an instruction to manually choose a node for ordinary resource calls.
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+```python
+for endpoint in client.driver.endpoints():
+    print(endpoint.url, endpoint.healthy, endpoint.source)
+
+client.driver.refresh(force=True)
+```
+
+</div>
+<div data-sdk-language="go">
+
+```go
+for _, endpoint := range client.Driver().Endpoints() {
+    fmt.Println(endpoint.URL, endpoint.Healthy, endpoint.Source)
+}
+
+if err := client.Driver().Refresh(ctx, true); err != nil {
+    return err
+}
+```
+
+</div>
+<div data-sdk-language="typescript">
+
+```ts
+for (const endpoint of client.driver.endpoints()) {
+  console.log(endpoint.url, endpoint.healthy, endpoint.source);
+}
+
+await client.driver.refresh(true);
+```
+
+</div>
+</div>
+
+Discovery is throttled and lazy. The roster keeps configured seeds and merges healthy advertised peers. Closing the client releases or closes every transport owned by its driver.
+
+## Routing and resource affinity
+
+The mesh driver selects a reachable endpoint for client-wide requests. A sandbox returned by create, lookup, restore, fork, or list is pinned to the endpoint that supplied it. Resource handles are owner-pinned; they are not portable requests that should be manually routed to every member.
+
+When a sandbox-scoped request reports `not_found` and several endpoints exist, each SDK can locate the current owner and re-pin the handle. Migration asks the server to move the sandbox, then refreshes or resolves its current owner.
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+```python
+sandbox = client.sandboxes.create(image="alpine")
+try:
+    print("before:", sandbox.endpoint)
+    sandbox.migrate("node-b")
+    print("after:", sandbox.endpoint)
+finally:
+    sandbox.terminate()
+```
+
+</div>
+<div data-sdk-language="go">
+
+```go
+sandbox, err := client.Sandboxes.Create(ctx, vmon.SandboxCreateRequest{Image: "alpine"})
+if err != nil {
+    return err
+}
+defer sandbox.Terminate(ctx)
+
+if _, err := sandbox.Migrate(ctx, "node-b"); err != nil {
+    return err
+}
+fmt.Println("migrated to", sandbox.Node)
+```
+
+</div>
+<div data-sdk-language="typescript">
+
+```ts
+const sandbox = await client.sandboxes.create({ image: "alpine" });
+try {
+  console.log("before:", sandbox.endpoint);
+  await sandbox.migrate("node-b");
+  console.log("after:", sandbox.endpoint);
+} finally {
+  await sandbox.terminate();
+}
+```
+
+</div>
+</div>
+
+Use a target node identifier accepted by the daemon. Migration is a server operation; the refreshed sandbox view reports the resulting placement.
+
+## Failover boundaries
+
+Drivers fail over only on transport failures that did not successfully complete an API request. They do not retry API errors, validation failures, HTTP status failures, or commands that have already started. Streaming calls can fail over while establishing the stream; failures after establishment belong to that stream.
+
+This policy does not provide at-most-once or exactly-once mutation semantics. Use explicit API controls such as sandbox creation `idempotency_key`, and make durable-function side effects idempotent. See [Shared Concepts](shared-concepts.md), [Errors](errors.md), and [Mesh and High Availability](../platform/mesh.md).
+
+Sandbox list operations query the live roster, merge rows by sandbox ID, and support tag and node filtering. A partial result can remain useful when another endpoint has a transport failure; if every attempted endpoint fails at the transport layer, the operation returns that failure.
