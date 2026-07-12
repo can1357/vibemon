@@ -6,8 +6,6 @@
 //! verbatim to `/dev/net/tun`; macOS vmnet and user-mode networking strip or
 //! synthesize a zero header because they consume plain Ethernet frames.
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::{io::ErrorKind, sync::Arc};
 
 use virtio_bindings::{

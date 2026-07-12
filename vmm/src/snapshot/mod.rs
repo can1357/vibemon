@@ -10,8 +10,6 @@
 //! `crate::arch::state` (selected at compile time) and are referenced here only
 //! by type name, so this module compiles identically on `x86_64` and aarch64.
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::{
 	fs::{self, File},
 	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},

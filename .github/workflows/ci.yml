@@ -84,6 +84,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Install Windows native dependencies
+        shell: pwsh
+        run: |
+          vcpkg install libslirp:x64-windows
+          "VCPKG_DEFAULT_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Check vmon binary
         run: cargo check -p vmon --bin vmon --locked
 

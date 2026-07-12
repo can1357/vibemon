@@ -1,6 +1,6 @@
 //! Kernel / initrd / command-line loading and zero-page (`boot_params`) setup.
 
-use std::{cmp::max, fs::File, io::Read, path::Path};
+use std::{cmp::max, io::Read, path::Path};
 
 #[cfg(target_os = "linux")]
 use kvm_bindings::{CpuId, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
@@ -55,9 +55,6 @@ pub struct LoadedKernel {
 
 /// Load a kernel image (raw ELF `vmlinux` or `bzImage`) into guest memory.
 pub fn load_kernel(path: &Path, mem: &GuestMemoryMmap) -> Result<LoadedKernel> {
-	#[cfg(not(target_os = "windows"))]
-	let mut file = File::open(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
-	#[cfg(target_os = "windows")]
 	let mut file = std::io::Cursor::new(
 		std::fs::read(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?,
 	);
