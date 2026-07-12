@@ -512,7 +512,7 @@ case "$mode" in
     sync || fail "sync volume write"
     echo "VOLUME_OK"
     mount -t virtiofs snap /ro || fail "mount virtiofs snap"
-    if echo deny > /ro/DENY.txt 2>/dev/null; then
+    if (echo deny > /ro/DENY.txt) 2>/dev/null; then
       fail "write to read-only volume unexpectedly succeeded"
     fi
     echo "VOLUME_RO_OK"
