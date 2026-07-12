@@ -88,6 +88,7 @@ jobs:
         shell: pwsh
         run: |
           vcpkg install libslirp:x64-windows
+          "VCPKG_ROOT=C:\\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_DEFAULT_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Check vmon binary
