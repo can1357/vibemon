@@ -223,9 +223,12 @@ impl BuildkitWorker {
 		archive: &Path,
 		arch: Option<&str>,
 	) -> Result<()> {
+		let home = archive
+			.parent()
+			.ok_or_else(|| EngineError::invalid("BuildKit output must have a parent directory"))?;
 		let args =
 			buildkit_build_args(&self.binary, &self.address, context, dockerfile_name, archive, arch);
-		run_worker(&args, BUILD_TIMEOUT)
+		run_worker(&args, BUILD_TIMEOUT, home)
 	}
 }
 
@@ -282,14 +285,14 @@ fn validate_context_tree(path: &Path, total: &mut u64, limit: u64) -> Result<()>
 	Ok(())
 }
 
-fn run_worker(cmd: &[String], timeout: Duration) -> Result<()> {
+fn run_worker(cmd: &[String], timeout: Duration, home: &Path) -> Result<()> {
 	let Some((program, args)) = cmd.split_first() else {
 		return Err(EngineError::engine("empty BuildKit worker command"));
 	};
 	let mut child = Command::new(program)
 		.args(args)
 		.env_clear()
-		.env("HOME", "/nonexistent")
+		.env("HOME", home)
 		.env("PATH", "/usr/bin:/bin")
 		.env("BUILDKIT_PROGRESS", "plain")
 		.stdin(Stdio::null())
@@ -588,13 +591,26 @@ struct TempDir {
 	path: PathBuf,
 }
 
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt;
+
+		fs::DirBuilder::new().mode(0o700).create(path)
+	}
+	#[cfg(not(unix))]
+	{
+		fs::create_dir(path)
+	}
+}
+
 impl TempDir {
 	fn new_in(parent: &Path, prefix: &str) -> Result<Self> {
 		fs::create_dir_all(parent)?;
 		for attempt in 0..100_u32 {
 			let path =
 				parent.join(format!("{prefix}{}-{attempt}-{}", std::process::id(), time_nanos()));
-			match fs::create_dir(&path) {
+			match create_private_dir(&path) {
 				Ok(()) => return Ok(Self { path }),
 				Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
 				Err(e) => return Err(e.into()),
@@ -759,7 +775,12 @@ rm -rf "$tmpdir"
 		// Assert precise environment isolation
 		let lines: Vec<&str> = env_content.lines().collect();
 		assert!(lines.contains(&"BUILDKIT_PROGRESS=plain"));
-		assert!(lines.contains(&"HOME=/nonexistent"));
+		let home = lines
+			.iter()
+			.find_map(|line| line.strip_prefix("HOME="))
+			.expect("isolated HOME");
+		assert!(Path::new(home).starts_with(&builds_root));
+		assert!(!Path::new(home).exists(), "temporary HOME must be removed");
 		assert!(lines.contains(&"PATH=/usr/bin:/bin"));
 		// Assert that ambient cargo/runner environment did not leak
 		assert!(!lines.iter().any(|l| l.starts_with("CARGO")));
