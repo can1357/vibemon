@@ -1,19 +1,18 @@
 //! Shared TLS-capable `PostgreSQL` connection setup.
 
-use native_tls::TlsConnector;
 use postgres::Client;
-use postgres_native_tls::MakeTlsConnector;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{EngineError, Result};
 
 /// Connect to `PostgreSQL` with system-root TLS when requested by the URL.
 pub fn connect(url: &str, context: &str) -> Result<Client> {
-	let tls = TlsConnector::builder()
-		.build()
-		.map(MakeTlsConnector::new)
-		.map_err(|error| {
-			EngineError::engine(format!("{context}: TLS initialization failed: {error}"))
-		})?;
+	let (tls, errors) = MakeRustlsConnect::with_native_certs().map_err(|errors| {
+		EngineError::engine(format!("{context}: no usable system TLS roots: {errors:?}"))
+	})?;
+	if !errors.is_empty() {
+		tracing::warn!(context, ?errors, "some PostgreSQL TLS roots could not be loaded");
+	}
 	blocking(|| Client::connect(url, tls))
 		.map_err(|error| EngineError::engine(format!("{context}: {error}")))
 }

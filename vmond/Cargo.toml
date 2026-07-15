@@ -21,8 +21,7 @@ hex = "0.4"
 hmac = "0.12"
 rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
 postgres = "0.19"
-postgres-native-tls = "0.5"
-native-tls = "0.2"
+tokio-postgres-rustls = { version = "0.14", features = ["native-certs", "ring"] }
 include_dir = "0.7"
 libc = "0.2"
 parking_lot = "0.12.5"
