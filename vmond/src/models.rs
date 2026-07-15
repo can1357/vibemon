@@ -218,18 +218,25 @@ pub struct NetworkBody {
 /// `POST /v1/snapshots/{name}/restore` body.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RestoreBody {
+	/// Optional stable ID for the restored sandbox.
 	pub name:  Option<String>,
 	/// Wait for the guest agent before returning.
 	pub agent: Option<bool>,
-	/// Additional create-style overrides (network, tags, …).
+	/// Runtime-only overrides such as environment, tags, timeout, secrets, and
+	/// command.
 	#[serde(flatten)]
 	pub extra: HashMap<String, Value>,
 }
 
+/// Maximum number of clones accepted by one fork request.
+pub const MAX_FORK_CLONES: u32 = 32;
+
 /// `POST /v1/snapshots/{name}/fork` body.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForkBody {
+	/// Number of clones to create atomically.
 	pub count: u32,
+	/// Runtime-only overrides shared by every clone in the batch.
 	#[serde(flatten)]
 	pub extra: HashMap<String, Value>,
 }

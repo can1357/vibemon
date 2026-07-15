@@ -152,7 +152,7 @@ if err != nil {
 fmt.Println(names, restored.ID)
 ```
 
-`RestoreRequest` has typed `Name` and `Agent` fields plus create-style `Overrides`. Do not put `"name"` or `"agent"` in `Overrides`; the SDK rejects those conflicts.
+`RestoreRequest` has typed `Name` and `Agent` fields. `Overrides` accepts runtime-only fields: `env`, `workdir`, `tags`, `timeout`, `timeout_secs`, `readiness_probe`, `secrets`, `s3_mounts`, and `command`. Do not put `"name"` or `"agent"` in `Overrides`; the SDK rejects those conflicts. CPU, memory, disk, network, volume, host-share, image, and placement fields cannot change the devices already captured in a full VM snapshot and are rejected.
 
 </div>
 <div data-sdk-language="typescript">
@@ -168,7 +168,7 @@ const restored = await client.snapshots.restore("worker-checkpoint", {
 console.log(names, restored.id);
 ```
 
-The optional body is `RestoreRequest`: every `SandboxCreateRequest` field is optional, with an additional optional `agent` field. Validation and the resulting sandbox state remain daemon-owned.
+The optional `RestoreRequest` body accepts `name`, `agent`, and the runtime-only override fields listed above. Device shape and placement remain properties of the captured snapshot.
 
 </div>
 </div>
@@ -177,13 +177,21 @@ The optional body is `RestoreRequest`: every `SandboxCreateRequest` field is opt
 
 A full VM snapshot does not copy arbitrary host resources. Named volumes, ordinary host shares, network backends, and managed S3 storage remain external dependencies. The restoring or forking host must satisfy the requirements documented in the [platform snapshot guide](../platform/snapshots.md).
 
+Sandboxes configured with secrets can be captured, restored, forked, and
+migrated. A full VM snapshot preserves raw guest RAM, including secret bytes
+that remain after a process exits, so protect snapshot and replica artifacts as
+secret-bearing data. Local restore and fork do not infer the host-side secret
+binding from guest memory. Go and TypeScript callers can use the runtime-only
+`secrets` override when future exec calls need that binding; live mesh migration
+carries the source sandbox's active binding to the destination.
+
 For a sandbox created with managed S3 mounts, the daemon records credential-free mount metadata beside the snapshot. Restore and fork reconstruct those recorded mounts using credentials available to the destination daemon. The snapshot never contains access keys, secret keys, session tokens, or the remote S3 objects themselves. A mount that originally used inline credentials or daemon environment credentials therefore requires suitable `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values at the destination, plus `AWS_SESSION_TOKEN` when applicable; anonymous mounts require no credentials.
 
-The SDK request shapes do not change that rule. Python accepts an `s3_mounts` restore/fork argument, and Go and TypeScript can represent create-style fields in their request bodies, but these fields are not a replacement for the snapshot's recorded mount configuration. Do not use them as a general override for inherited mounts or put credentials in application source.
+An `s3_mounts` override supplies replacement connection or credential settings for the mountpoints already recorded in the snapshot; it cannot add or remove remote filesystem devices. The daemon preserves the recorded virtio-fs tags and rejects a mismatched mountpoint set. Do not put credentials in application source.
 
 ## Fork copy-on-write clones
 
-Fork asks the daemon to create a positive number of independent sandboxes from one full snapshot using copy-on-write sharing. Every returned sandbox has its own lifecycle and must be terminated or removed independently. Placement, compatibility, and whether the requested batch can be fulfilled are daemon decisions.
+Fork asks the daemon to create between 1 and 32 independent sandboxes from one full snapshot using copy-on-write sharing. The batch is atomic: if any clone fails, the daemon removes every clone created by that request. Every returned sandbox has its own lifecycle and must be terminated or removed independently.
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -221,7 +229,7 @@ for _, clone := range clones {
 }
 ```
 
-`ForkRequest.Count` is required. `Overrides` carries additional create-style request fields.
+`ForkRequest.Count` is required. `Overrides` accepts the same runtime-only fields as restore; each value applies to every clone.
 
 </div>
 <div data-sdk-language="typescript">
@@ -238,12 +246,12 @@ for (const clone of clones) {
 }
 ```
 
-`ForkRequest` requires `count` and accepts the optional fields from `SandboxCreateRequest`.
+`ForkRequest` requires `count` and accepts the same runtime-only fields as `RestoreRequest`.
 
 </div>
 </div>
 
-Create-style fields express a request, not a scheduling or placement promise. Fetch a sandbox again when current owner, placement, or status matters. Mesh eligibility and affinity are described in [Mesh and High Availability](../platform/mesh.md).
+Runtime-only overrides do not change snapshot compatibility or placement. Fetch a sandbox again when current owner or status matters. Mesh eligibility and affinity are described in [Mesh and High Availability](../platform/mesh.md).
 
 ## Manage warm pools
 

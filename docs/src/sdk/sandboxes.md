@@ -6,7 +6,7 @@ For endpoint selection and client ownership, see [Connect](connect.md). For daem
 
 ## Create a sandbox
 
-Creation sends a request to the daemon and returns a handle associated with the endpoint that created the sandbox. The daemon decides which images, templates, architectures, and resource combinations it accepts. Environment values are for non-secret configuration; use the SDK's secret and volume request values where appropriate. See [Volumes and Secrets](volumes-and-secrets.md).
+Creation sends a request to the daemon and returns a stable-ID handle whose mesh routing remains private to the SDK. The daemon decides which images, templates, architectures, and resource combinations it accepts. Environment values are for non-secret configuration; use the SDK's secret and volume request values where appropriate. See [Volumes and Secrets](volumes-and-secrets.md).
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -93,9 +93,9 @@ console.log(sandbox.id, sandbox.node, sandbox.info);
 
 ## Get, reference, and list
 
-Use a remote lookup when current metadata is required. Use an ID-only reference when the ID is already known and no initial request is needed; it does not verify that the sandbox exists. Listing queries live mesh endpoints, merges successful results, and de-duplicates entries by sandbox ID. Results may be filtered by exact tag pairs or reporting node.
+Listing queries live mesh endpoints, merges successful results, and de-duplicates entries by sandbox ID. Results may be filtered by exact tag pairs.
 
-Handles returned by creation, lookup, and listing retain endpoint affinity. In a mesh, migration can re-resolve and rebind that endpoint. See [Shared Concepts](shared-concepts.md#resource-handles-and-namespaces).
+Handles returned by creation, lookup, and listing retain a private, stable-ID endpoint resolver that handles transparent re-routing in a mesh. See [Shared Concepts](shared-concepts.md#resource-handles-and-namespaces).
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -105,10 +105,9 @@ with vmon.connect() as client:
     current = client.sandboxes.get("sandbox-id")
     deferred = client.sandboxes.ref("sandbox-id")  # no request here
     builds = client.sandboxes.list(tags={"service": "build"})
-    node_a = client.sandboxes.list(node="node-a")
 ```
 
-The latest typed `SandboxInfo` is available as `sandbox.info`. Call `refresh()` to fetch and update it.
+The latest typed `SandboxInfo` is available as `sandbox.info`; `sandbox.node` identifies the reporting mesh node when present. Call `refresh()` to fetch and update it.
 
 </div>
 <div data-sdk-language="go">
@@ -135,14 +134,13 @@ const current = await client.sandboxes.get(sandbox.id);
 const deferred = client.sandboxes.ref("sbx_123"); // no request here
 const previews = await client.sandboxes.list({
   tags: { service: "preview" },
-  node: "node-a",
 });
 
 console.log(current.info.state);
 await deferred.stop();
 ```
 
-`Sandbox.info` is the handle's latest read-only cached view. `id` is stable, `node` is the reporting node or `null`, and `endpoint` is the preferred daemon endpoint when known. `refresh()` fetches a current `SandboxInfo` and merges it into the handle.
+`Sandbox.info` is the handle's latest read-only cached view. `id` is stable, and `node` is the reporting mesh node or `null`. `refresh()` fetches a current `SandboxInfo` and merges it into the handle.
 
 </div>
 </div>
@@ -151,7 +149,7 @@ await deferred.stop();
 
 Lifecycle operations act on the identified server sandbox. Stopping execution, immediately terminating resources, and removing the server record are distinct operations. Use the least destructive action that matches the intent. Named volumes have their own lifecycle and are not removed with the sandbox.
 
-Pause and resume suspend and reactivate execution. Extend increases the sandbox lease by a number of seconds. Migrate relocates the sandbox to a target mesh node, refreshes its view, and re-resolves the serving endpoint. When another actor may have changed state, refresh before relying on cached metadata.
+Pause and resume suspend and reactivate execution. Extend increases the sandbox lease by a number of seconds. Migrate moves a running sandbox to a compatible mesh node, updates its view, and privately re-resolves the serving endpoint. Migration requires an operator token; snapshot backend, architecture, network, storage, and host-resource compatibility still apply. When another actor may have changed state, refresh before relying on cached metadata.
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -172,6 +170,7 @@ The `wait` argument on `stop()` and `terminate()` remains in the Python signatur
 sandbox.stop()
 sandbox.refresh()
 print(sandbox.info.status)
+
 
 updated = sandbox.migrate("node-b")
 print(updated.node)
@@ -200,12 +199,15 @@ if _, err := sandbox.Stop(ctx); err != nil {
 if _, err := sandbox.Extend(ctx, 600); err != nil {
     return err
 }
+if _, err := sandbox.Migrate(ctx, "node-b"); err != nil {
+    return err
+}
 if err := sandbox.Terminate(ctx); err != nil {
     return err
 }
 ```
 
-`Stop`, `Pause`, `Resume`, `Extend`, and `Migrate` replace the receiver's decoded metadata while preserving its client binding.
+`Stop`, `Pause`, `Resume`, `Extend`, and `Migrate` replace the receiver's decoded metadata while preserving its client binding. `MigrationTiming()` exposes the migration response's pre-copy, downtime, and total durations when present.
 
 </div>
 <div data-sdk-language="typescript">

@@ -507,7 +507,11 @@ fn snapshot_restore_preserves_disk_state() {
 		return;
 	}
 	let server = Server::start(&HOME);
-	let view = create_sandbox(&server, json!({}));
+	let secret_value = format!("snapshot-secret-{}", std::process::id());
+	let view = create_sandbox(
+		&server,
+		json!({"secrets": [{"name": "snapshot", "values": {"SNAPSHOT_SECRET": secret_value}}]}),
+	);
 	let id = sandbox_id(&view);
 	let snap = format!("e2esnap-{}", std::process::id());
 
@@ -540,7 +544,16 @@ fn snapshot_restore_preserves_disk_state() {
 		snaps.snapshots
 	);
 
-	let restore = pb::RestoreSnapshotRequest { name: snap, body_json: "{}".to_owned() };
+	let restore = pb::RestoreSnapshotRequest {
+		name:      snap,
+		body_json: json!({
+			"secrets": [{
+				"name": "snapshot",
+				"values": {"SNAPSHOT_SECRET": secret_value}
+			}]
+		})
+		.to_string(),
+	};
 	let restored = grpc
 		.block_on(snapshots.restore(restore))
 		.unwrap_or_else(|status| {
@@ -557,6 +570,11 @@ fn snapshot_restore_preserves_disk_state() {
 	let (exit, stdout, _) = exec(&server, &rid, &["/bin/sh", "-c", "cat /root/marker"]);
 	assert_eq!(exit, 0);
 	assert_eq!(stdout.trim(), "snapshotted", "disk state lost across restore");
+
+	let (exit, stdout, _) =
+		exec(&server, &rid, &["/bin/sh", "-c", "printf %s \"$SNAPSHOT_SECRET\""]);
+	assert_eq!(exit, 0);
+	assert_eq!(stdout, secret_value, "secret binding lost across restore");
 
 	remove_sandbox(&server, &rid);
 }

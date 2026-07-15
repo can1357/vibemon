@@ -460,6 +460,8 @@ enum MeshCommands {
 	Join(MeshJoinArgs),
 	/// Leave the cluster.
 	Leave(MeshLeaveArgs),
+	/// Migrate a running sandbox to another mesh node.
+	Migrate(MeshMigrateArgs),
 	/// Show cluster status.
 	Status,
 }
@@ -483,6 +485,12 @@ struct MeshJoinArgs {
 	advertise: Option<String>,
 	#[arg(long, default_value = "")]
 	region:    String,
+}
+
+#[derive(Args)]
+struct MeshMigrateArgs {
+	name: String,
+	node: String,
 }
 
 #[derive(Args)]
@@ -2187,6 +2195,15 @@ fn cmd_mesh(command: MeshCommands, options: &TransportOptions) -> Result<i32> {
 			let response =
 				client.request_json("POST", "/v1/mesh/leave", Some(json!({"drain": args.drain})))?;
 			print_json(&response)
+		},
+		MeshCommands::Migrate(args) => {
+			let grpc = client.grpc()?;
+			let mut sandboxes = grpc.sandboxes();
+			let view = grpc
+				.block_on(sandboxes.migrate(pb::MigrateRequest { id: args.name, target: args.node }))
+				.map_err(status_error)?
+				.into_inner();
+			print_json(&json_view(view)?)
 		},
 		MeshCommands::Status => {
 			let grpc = client.grpc()?;

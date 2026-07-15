@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+args=()
+for arg in "$@"; do
+  args+=("$arg")
+  if [[ "$arg" == create || "$arg" == run ]]; then
+    args+=(--no-pivot)
+  fi
+done
+exec /usr/bin/runc "${args[@]}"

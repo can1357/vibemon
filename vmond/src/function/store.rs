@@ -1,7 +1,14 @@
-//! Transactional `SQLite` store for the durable function runtime.
+//! Transactional durable store for the function runtime.
 
-use std::{collections::HashSet, fs, str::FromStr, sync::Mutex};
+use std::{
+	collections::HashSet,
+	fs,
+	ops::{Deref, DerefMut},
+	str::FromStr,
+	sync::{Mutex, MutexGuard},
+};
 
+use ::postgres::Client as PgClient;
 use chrono::{TimeZone as _, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
@@ -10,7 +17,12 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use vmon_proto::{prost::Message, v1::*};
 
-use crate::{EngineError, Result, home::Home};
+use crate::{
+	EngineError, Result,
+	config::{ClusterMode, ServeConfig},
+	home::Home,
+	postgres as pg,
+};
 
 const SCHEMA_VERSION: u32 = 5;
 const INPUT_QUEUED: i32 = 1;
@@ -78,32 +90,254 @@ pub struct Page<T> {
 	pub next_page_token: String,
 }
 
-/// Durable `SQLite` metadata store. All methods serialize through one
-/// connection; `BEGIN IMMEDIATE` protects competing lease and transition
-/// writers.
+/// Durable function metadata backed by local `SQLite` or shared `PostgreSQL`.
+///
+/// Production serializes operations through one row containing the
+/// `SQLite`-compatible transactional state, preserving atomic store semantics
+/// without a local source of truth.
 pub struct Store {
-	connection: Mutex<Connection>,
+	connection: StoreConnection,
+}
+
+enum StoreConnection {
+	Sqlite(Mutex<Connection>),
+	Postgres(PgConnection),
+}
+
+struct PgConnection {
+	client: Mutex<Option<PgClient>>,
+}
+
+enum StoreConnectionGuard<'a> {
+	Sqlite(MutexGuard<'a, Connection>),
+	Postgres(PgStoreGuard<'a>),
+}
+
+struct PgStoreGuard<'a> {
+	client:     MutexGuard<'a, Option<PgClient>>,
+	connection: Connection,
+}
+
+impl Deref for StoreConnectionGuard<'_> {
+	type Target = Connection;
+
+	fn deref(&self) -> &Self::Target {
+		match self {
+			Self::Sqlite(connection) => connection,
+			Self::Postgres(guard) => &guard.connection,
+		}
+	}
+}
+
+impl DerefMut for StoreConnectionGuard<'_> {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		match self {
+			Self::Sqlite(connection) => connection,
+			Self::Postgres(guard) => &mut guard.connection,
+		}
+	}
+}
+
+impl Drop for PgStoreGuard<'_> {
+	fn drop(&mut self) {
+		let result = blocking(|| {
+			let client = self
+				.client
+				.as_mut()
+				.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
+			let state = self
+				.connection
+				.serialize(rusqlite::MAIN_DB)
+				.map_err(sql_error)?;
+			let bytes: &[u8] = &state;
+			let updated = client
+				.execute("UPDATE function_store_state SET state = $1 WHERE singleton = TRUE", &[&bytes])
+				.map_err(pg_error)?;
+			if updated != 1 {
+				return Err(EngineError::engine(
+					"function PostgreSQL store lost its singleton state row",
+				));
+			}
+			client.batch_execute("COMMIT").map_err(pg_error)
+		});
+		if let Err(error) = result {
+			if let Some(client) = self.client.as_mut() {
+				let _ = blocking(|| client.batch_execute("ROLLBACK"));
+			}
+			if std::thread::panicking() {
+				tracing::error!(%error, "failed to persist function metadata during unwind");
+			} else {
+				panic!("failed to persist function metadata: {error}");
+			}
+		}
+	}
+}
+
+impl StoreConnection {
+	fn lock(&self) -> Result<StoreConnectionGuard<'_>> {
+		match self {
+			Self::Sqlite(connection) => connection
+				.lock()
+				.map(StoreConnectionGuard::Sqlite)
+				.map_err(lock_error),
+			Self::Postgres(connection) => connection.lock(),
+		}
+	}
+}
+
+impl PgConnection {
+	fn lock(&self) -> Result<StoreConnectionGuard<'_>> {
+		let mut client_guard = self.client.lock().map_err(lock_error)?;
+		blocking(|| {
+			let client = client_guard
+				.as_mut()
+				.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
+			client.batch_execute("BEGIN").map_err(pg_error)?;
+			let bytes = match client.query_opt(
+				"SELECT state FROM function_store_state WHERE singleton = TRUE FOR UPDATE",
+				&[],
+			) {
+				Ok(Some(row)) => row.get::<_, Vec<u8>>(0),
+				Ok(None) => {
+					let _ = client.batch_execute("ROLLBACK");
+					return Err(EngineError::engine("function PostgreSQL store is uninitialized"));
+				},
+				Err(error) => {
+					let _ = client.batch_execute("ROLLBACK");
+					return Err(pg_error(error));
+				},
+			};
+			let connection = match open_serialized_connection(&bytes) {
+				Ok(connection) => connection,
+				Err(error) => {
+					let _ = client.batch_execute("ROLLBACK");
+					return Err(error);
+				},
+			};
+			Ok(StoreConnectionGuard::Postgres(PgStoreGuard { client: client_guard, connection }))
+		})
+	}
+}
+
+impl Drop for PgConnection {
+	fn drop(&mut self) {
+		let client = self
+			.client
+			.get_mut()
+			.unwrap_or_else(|e| e.into_inner())
+			.take();
+		if let Some(client) = client {
+			blocking(move || drop(client));
+		}
+	}
+}
+
+fn blocking<T>(operation: impl FnOnce() -> T) -> T {
+	if tokio::runtime::Handle::try_current()
+		.is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+	{
+		tokio::task::block_in_place(operation)
+	} else {
+		operation()
+	}
+}
+
+fn open_sqlite_connection<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
+	let connection = Connection::open(path).map_err(sql_error)?;
+	connection
+		.pragma_update(None, "journal_mode", "WAL")
+		.map_err(sql_error)?;
+	connection
+		.pragma_update(None, "synchronous", "FULL")
+		.map_err(sql_error)?;
+	connection
+		.pragma_update(None, "foreign_keys", "ON")
+		.map_err(sql_error)?;
+	connection
+		.busy_timeout(std::time::Duration::from_secs(5))
+		.map_err(sql_error)?;
+	migrate(&connection)?;
+	Ok(connection)
+}
+
+fn open_serialized_connection(bytes: &[u8]) -> Result<Connection> {
+	let mut connection = Connection::open_in_memory().map_err(sql_error)?;
+	connection
+		.deserialize_read_exact(rusqlite::MAIN_DB, bytes, bytes.len(), false)
+		.map_err(sql_error)?;
+	connection
+		.pragma_update(None, "foreign_keys", "ON")
+		.map_err(sql_error)?;
+	connection
+		.busy_timeout(std::time::Duration::from_secs(5))
+		.map_err(sql_error)?;
+	migrate(&connection)?;
+	Ok(connection)
+}
+
+fn pg_error(e: ::postgres::Error) -> EngineError {
+	EngineError::engine(format!("function PostgreSQL store: {e}"))
 }
 
 impl Store {
-	/// Open, migrate, and configure the function metadata database.
+	/// Open the function metadata database using local `SQLite`.
 	pub fn open(home: &Home) -> Result<Self> {
+		Self::open_sqlite(home)
+	}
+
+	/// Open explicitly configured durable metadata backend.
+	pub fn open_with_config(home: &Home, config: &ServeConfig) -> Result<Self> {
+		if config.cluster_mode == ClusterMode::Production {
+			let url = config
+				.postgres_url
+				.as_deref()
+				.ok_or_else(|| EngineError::invalid("production mode requires postgres_url"))?;
+			Self::open_postgres(url)
+		} else {
+			Self::open_sqlite(home)
+		}
+	}
+
+	fn open_sqlite(home: &Home) -> Result<Self> {
 		fs::create_dir_all(home.functions_dir())?;
-		let connection = Connection::open(home.functions_db()).map_err(sql_error)?;
-		connection
-			.pragma_update(None, "journal_mode", "WAL")
-			.map_err(sql_error)?;
-		connection
-			.pragma_update(None, "synchronous", "FULL")
-			.map_err(sql_error)?;
-		connection
-			.pragma_update(None, "foreign_keys", "ON")
-			.map_err(sql_error)?;
-		connection
-			.busy_timeout(std::time::Duration::from_secs(5))
-			.map_err(sql_error)?;
-		migrate(&connection)?;
-		Ok(Self { connection: Mutex::new(connection) })
+		let connection = open_sqlite_connection(home.functions_db())?;
+		Ok(Self { connection: StoreConnection::Sqlite(Mutex::new(connection)) })
+	}
+
+	fn open_postgres(url: &str) -> Result<Self> {
+		let mut client = pg::connect(url, "function PostgreSQL store")?;
+		blocking(|| {
+			client
+				.batch_execute(
+					"CREATE TABLE IF NOT EXISTS function_store_state (
+						singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+						state BYTEA NOT NULL
+					)",
+				)
+				.map_err(pg_error)?;
+			let exists = client
+				.query_opt("SELECT singleton FROM function_store_state WHERE singleton = TRUE", &[])
+				.map_err(pg_error)?
+				.is_some();
+			if !exists {
+				let connection = Connection::open_in_memory().map_err(sql_error)?;
+				connection
+					.pragma_update(None, "foreign_keys", "ON")
+					.map_err(sql_error)?;
+				migrate(&connection)?;
+				let state = connection.serialize(rusqlite::MAIN_DB).map_err(sql_error)?;
+				let bytes: &[u8] = &state;
+				client
+					.execute("INSERT INTO function_store_state (singleton, state) VALUES (TRUE, $1)", &[
+						&bytes,
+					])
+					.map_err(pg_error)?;
+			}
+			Ok::<(), EngineError>(())
+		})?;
+		Ok(Self {
+			connection: StoreConnection::Postgres(PgConnection { client: Mutex::new(Some(client)) }),
+		})
 	}
 
 	/// Register an immutable revision, deduplicating by the full canonical spec
@@ -3235,8 +3469,24 @@ fn immediate(c: &mut Connection) -> Result<Transaction<'_>> {
 fn sql_error(e: rusqlite::Error) -> EngineError {
 	EngineError::engine(format!("function store: {e}"))
 }
-fn lock_error<T>(_: std::sync::PoisonError<T>) -> EngineError {
-	EngineError::engine("function store lock poisoned")
+pub trait IntoLockError {
+	fn into_lock_error(self) -> EngineError;
+}
+
+impl<T> IntoLockError for std::sync::PoisonError<T> {
+	fn into_lock_error(self) -> EngineError {
+		EngineError::engine("function store lock poisoned")
+	}
+}
+
+impl IntoLockError for EngineError {
+	fn into_lock_error(self) -> EngineError {
+		self
+	}
+}
+
+fn lock_error<E: IntoLockError>(e: E) -> EngineError {
+	e.into_lock_error()
 }
 fn u64_i64(v: u64) -> Result<i64> {
 	i64::try_from(v).map_err(|_| EngineError::invalid("numeric value exceeds SQLite range"))
@@ -4743,6 +4993,39 @@ mod tests {
 		record_package(&store);
 		let revision = store.register_function(&spec(), "register-1", 10).unwrap();
 		(temp, home, store, revision)
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn production_metadata_is_shared_across_store_instances() {
+		if std::net::TcpStream::connect(("127.0.0.1", 15433)).is_err() {
+			eprintln!("SKIP production function store: PostgreSQL is unavailable on port 15433");
+			return;
+		}
+		tokio::task::yield_now().await;
+		let config = crate::config::resolve_serve_config(&std::collections::HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			(
+				"postgres_url".to_owned(),
+				"postgresql://fastbench:fastbench@127.0.0.1:15433/fastbench".to_owned(),
+			),
+			("s3_endpoint".to_owned(), "http://127.0.0.1:9000".to_owned()),
+			("s3_bucket".to_owned(), "test".to_owned()),
+		]))
+		.unwrap();
+		let first_home = tempfile::tempdir().unwrap();
+		let second_home = tempfile::tempdir().unwrap();
+		let first = Store::open_with_config(&Home::new(first_home.path()), &config).unwrap();
+		let digest = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
+		let path = format!("s3://test/{digest}");
+		first
+			.record_artifact(&digest, 17, Some("application/octet-stream"), &path, 42, None)
+			.unwrap();
+
+		let second = Store::open_with_config(&Home::new(second_home.path()), &config).unwrap();
+		assert_eq!(
+			second.stat_artifact(&digest).unwrap(),
+			(17, Some("application/octet-stream".to_owned()), 42, None, path)
+		);
 	}
 
 	#[test]

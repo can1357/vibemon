@@ -32,7 +32,7 @@ from vmon import (
 BATCH_SIZE = 12
 EXECUTION_TIMEOUT_SECONDS = 45.0
 GET_TIMEOUT_SECONDS = 75.0
-type JsonRecord = dict[str, str | int]
+JsonRecord = dict[str, str | int]
 
 PYTHON_IMAGE = Image.python("3.14", slim=True)
 JSON_SERIALIZER = SerializerPolicy(

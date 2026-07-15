@@ -463,12 +463,12 @@ class SandboxServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Migrate(self, request, context):
-        """Initiates state migration of the sandbox to a target destination or host.
+        """Migrates a running sandbox to another mesh node.
 
-        Replaces: POST /v1/sandboxes/{id}/migrate
         Errors:
         - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-        - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+        - `invalid` (INVALID_ARGUMENT): The target node ID is empty or unknown.
+        - `unsupported` (UNIMPLEMENTED): The server is not part of a mesh.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

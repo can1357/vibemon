@@ -209,9 +209,28 @@ def translate_rpc_error(
     status = exc.code() if isinstance(exc, grpc.Call) else None
     message = (exc.details() or "") if isinstance(exc, grpc.Call) else str(exc)
     trailing = exc.trailing_metadata() if isinstance(exc, grpc.Call) else None
-    code = next((value for key, value in trailing or () if key == "vmon-code"), None)
+    trailing_dict = dict(trailing or ())
+    code = trailing_dict.get("vmon-code")
+    retryable_val = trailing_dict.get("vmon-retryable")
+    action_val = trailing_dict.get("vmon-action")
+
+    actual_code = (
+        str(code)
+        if code
+        else (_GRPC_STATUS_TO_CODE.get(status) if status is not None else fallback_code)
+    )
+
+    if retryable_val is not None:
+        retryable = str(retryable_val).lower() == "true"
+    else:
+        retryable = actual_code in {"busy", "ha_unavailable", "unavailable_secret"}
+
+    action = str(action_val) if action_val else None
+
     if code:
-        return APIError(message or fallback_message, code=str(code))
+        return APIError(
+            message or fallback_message, code=str(code), retryable=retryable, action=action
+        )
     if status == grpc.StatusCode.UNAVAILABLE:
         return TransportError(
             f"cannot reach vmon daemon at {endpoint or 'endpoint'}: {message}",
@@ -222,7 +241,12 @@ def translate_rpc_error(
     if status == grpc.StatusCode.CANCELLED:
         return TransportError("vmon API call was cancelled", endpoint=endpoint)
     mapped = _GRPC_STATUS_TO_CODE.get(status) if status is not None else None
-    return APIError(message or fallback_message, code=mapped or fallback_code)
+    return APIError(
+        message or fallback_message,
+        code=mapped or fallback_code,
+        retryable=retryable,
+        action=action,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,6 +589,8 @@ class EndpointTransport:
     def _error_from_response(response: httpx.Response) -> APIError:
         code = "unauthorized" if response.status_code in {401, 403} else str(response.status_code)
         message = response.text.strip() or f"vmon API HTTP {response.status_code}"
+        retryable = False
+        action = None
         try:
             body = response.json()
         except ValueError:
@@ -586,7 +612,23 @@ class EndpointTransport:
                     code = detail_code
                 if isinstance(detail_message, str) and detail_message:
                     message = detail_message
-        return APIError(message, code=code, status=response.status_code)
+
+            raw_retryable = body.get("retryable")
+            if isinstance(raw_retryable, bool):
+                retryable = raw_retryable
+            elif isinstance(raw_retryable, str):
+                retryable = raw_retryable.lower() == "true"
+            else:
+                retryable = code in {"busy", "ha_unavailable", "unavailable_secret"}
+
+            raw_action = body.get("action")
+            if isinstance(raw_action, str):
+                action = raw_action
+        else:
+            retryable = code in {"busy", "ha_unavailable", "unavailable_secret"}
+        return APIError(
+            message, code=code, status=response.status_code, retryable=retryable, action=action
+        )
 
 
 def path_segment(value: str) -> str:

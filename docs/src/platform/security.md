@@ -63,6 +63,12 @@ non-read-only S3 request adds only a guest-local volatile overlay. Do not infer
 that proxy access, a guest overlay, or a snapshot gives the guest S3
 credentials or permission to write S3 objects.
 
+Machine snapshots capture arbitrary bytes from guest RAM. A sandbox that has
+received secrets can therefore write those values into snapshot and replica
+artifacts; Vibemon does not encrypt those files. Protect them as secret-bearing
+data. Live mesh migration also carries the runtime secret environment over the
+bearer-authenticated cluster channel so the destination retains the binding.
+
 ## Linux jail
 
 `--jail` is the stronger Linux production path. It requires root and an `--id`; it creates a private jail tree, cgroup v2 placement, mount/PID/IPC/UTS namespaces, makes mounts private, pivots into the jail root, pre-binds operator-owned sockets, then applies the same Stage-B filters and drops to the sandbox identity.

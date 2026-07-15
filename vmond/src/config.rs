@@ -43,6 +43,27 @@ pub struct WarmImage {
 	pub count:     usize,
 }
 
+/// Persistence substrate selected for mesh metadata and portable artifacts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClusterMode {
+	/// One process owns all state and may use `SQLite` and the local content
+	/// store.
+	#[default]
+	SingleNode,
+	/// Multiple processes share `PostgreSQL` metadata and S3-compatible objects.
+	Production,
+}
+
+impl ClusterMode {
+	fn parse(value: &str) -> Result<Self> {
+		match value.trim().to_ascii_lowercase().as_str() {
+			"single-node" | "single_node" | "local" => Ok(Self::SingleNode),
+			"production" | "cluster" => Ok(Self::Production),
+			_ => Err(EngineError::invalid("cluster_mode must be single-node or production")),
+		}
+	}
+}
+
 /// Resolved configuration consumed by `vmon serve` and doctor checks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServeConfig {
@@ -94,6 +115,22 @@ pub struct ServeConfig {
 	pub mesh_w_region: f64,
 	/// Placement penalty for inflight creates.
 	pub mesh_w_inflight: f64,
+	/// Cluster substrate mode.
+	pub cluster_mode: ClusterMode,
+	/// `PostgreSQL` connection URL.
+	pub postgres_url: Option<String>,
+	/// S3-compatible storage endpoint URL.
+	pub s3_endpoint: Option<String>,
+	/// S3-compatible storage bucket.
+	pub s3_bucket: Option<String>,
+	/// S3-compatible storage region.
+	pub s3_region: Option<String>,
+	/// S3-compatible storage access key.
+	pub s3_access_key: Option<String>,
+	/// S3-compatible storage secret key.
+	pub s3_secret_key: Option<String>,
+	/// S3-compatible key prefix.
+	pub s3_prefix: Option<String>,
 	sources: HashMap<String, ConfigSource>,
 }
 
@@ -176,6 +213,14 @@ impl Default for ServeConfig {
 			mesh_w_local: 50.0,
 			mesh_w_region: 30.0,
 			mesh_w_inflight: 80.0,
+			cluster_mode: ClusterMode::default(),
+			postgres_url: None,
+			s3_endpoint: None,
+			s3_bucket: None,
+			s3_region: None,
+			s3_access_key: None,
+			s3_secret_key: None,
+			s3_prefix: None,
 			sources,
 		}
 	}
@@ -207,6 +252,14 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"mesh_w_local",
 	"mesh_w_region",
 	"mesh_w_inflight",
+	"cluster_mode",
+	"postgres_url",
+	"s3_endpoint",
+	"s3_bucket",
+	"s3_region",
+	"s3_access_key",
+	"s3_secret_key",
+	"s3_prefix",
 ];
 
 /// Environment variable names for serve config fields.
@@ -235,6 +288,14 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("mesh_w_local", "VMON_MESH_W_LOCAL"),
 	("mesh_w_region", "VMON_MESH_W_REGION"),
 	("mesh_w_inflight", "VMON_MESH_W_INFLIGHT"),
+	("cluster_mode", "VMON_CLUSTER_MODE"),
+	("postgres_url", "VMON_POSTGRES_URL"),
+	("s3_endpoint", "VMON_S3_ENDPOINT"),
+	("s3_bucket", "VMON_S3_BUCKET"),
+	("s3_region", "VMON_S3_REGION"),
+	("s3_access_key", "VMON_S3_ACCESS_KEY"),
+	("s3_secret_key", "VMON_S3_SECRET_KEY"),
+	("s3_prefix", "VMON_S3_PREFIX"),
 ];
 
 /// CLI option spellings for serve config fields.
@@ -263,6 +324,14 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("mesh_w_local", "--mesh-w-local"),
 	("mesh_w_region", "--mesh-w-region"),
 	("mesh_w_inflight", "--mesh-w-inflight"),
+	("cluster_mode", "--cluster-mode"),
+	("postgres_url", "--postgres-url"),
+	("s3_endpoint", "--s3-endpoint"),
+	("s3_bucket", "--s3-bucket"),
+	("s3_region", "--s3-region"),
+	("s3_access_key", "--s3-access-key"),
+	("s3_secret_key", "--s3-secret-key"),
+	("s3_prefix", "--s3-prefix"),
 ];
 
 const CONFIG_PATH_KEYS: &[&str] = &["config", "config_path"];
@@ -286,6 +355,29 @@ pub fn resolve_serve_config(cli_overrides: &HashMap<String, String>) -> Result<S
 	overlay_toml(&mut config, &file_values, ConfigSource::File)?;
 	overlay_strings(&mut config, &env_values, ConfigSource::Env)?;
 	overlay_strings(&mut config, &overrides, ConfigSource::Flag)?;
+	if config.cluster_mode == ClusterMode::Production {
+		if config
+			.postgres_url
+			.as_ref()
+			.is_none_or(|s| s.trim().is_empty())
+		{
+			return Err(EngineError::invalid("production mode requires postgres_url"));
+		}
+		if config
+			.s3_endpoint
+			.as_ref()
+			.is_none_or(|s| s.trim().is_empty())
+		{
+			return Err(EngineError::invalid("production mode requires s3_endpoint"));
+		}
+		if config
+			.s3_bucket
+			.as_ref()
+			.is_none_or(|s| s.trim().is_empty())
+		{
+			return Err(EngineError::invalid("production mode requires s3_bucket"));
+		}
+	}
 	Ok(config)
 }
 
@@ -527,6 +619,30 @@ fn apply_value(
 		"mesh_w_local" => config.mesh_w_local = positive_float(key, value)?,
 		"mesh_w_region" => config.mesh_w_region = positive_float(key, value)?,
 		"mesh_w_inflight" => config.mesh_w_inflight = positive_float(key, value)?,
+		"cluster_mode" => {
+			config.cluster_mode = ClusterMode::parse(&coerce_string(key, value)?)?;
+		},
+		"postgres_url" => {
+			config.postgres_url = empty_string_as_none(key, value)?;
+		},
+		"s3_endpoint" => {
+			config.s3_endpoint = empty_string_as_none(key, value)?;
+		},
+		"s3_bucket" => {
+			config.s3_bucket = empty_string_as_none(key, value)?;
+		},
+		"s3_region" => {
+			config.s3_region = empty_string_as_none(key, value)?;
+		},
+		"s3_access_key" => {
+			config.s3_access_key = empty_string_as_none(key, value)?;
+		},
+		"s3_secret_key" => {
+			config.s3_secret_key = empty_string_as_none(key, value)?;
+		},
+		"s3_prefix" => {
+			config.s3_prefix = empty_string_as_none(key, value)?;
+		},
 		_ => return Err(EngineError::invalid(format!("unsupported serve config key {key:?}"))),
 	}
 	config.set_source(key, source);
@@ -863,5 +979,68 @@ mod tests {
 		let err = resolve_serve_config(&overrides).expect_err("unknown key");
 		assert!(err.message.contains("unknown CLI override"));
 		validate_knob_inventory().expect("metadata covers fields");
+	}
+
+	#[test]
+	fn cluster_mode_validation() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+		// Default single-node should parse without extra fields
+		let config = resolve_serve_config(&HashMap::new()).expect("default");
+		assert_eq!(config.cluster_mode, ClusterMode::SingleNode);
+
+		// Single-node explicitly set
+		let config = resolve_serve_config(&HashMap::from([(
+			"cluster_mode".to_owned(),
+			"single-node".to_owned(),
+		)]))
+		.expect("explicit single-node");
+		assert_eq!(config.cluster_mode, ClusterMode::SingleNode);
+
+		// Production with missing dependencies should fail
+		let err = resolve_serve_config(&HashMap::from([(
+			"cluster_mode".to_owned(),
+			"production".to_owned(),
+		)]))
+		.expect_err("should reject missing postgres");
+		assert!(err.message.contains("postgres_url"));
+
+		// Production with postgres but missing S3 endpoint should fail
+		let err = resolve_serve_config(&HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			("postgres_url".to_owned(), "postgresql://user:pass@host/db".to_owned()),
+		]))
+		.expect_err("should reject missing s3 endpoint");
+		assert!(err.message.contains("s3_endpoint"));
+
+		// Production with postgres and S3 endpoint but missing bucket should fail
+		let err = resolve_serve_config(&HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			("postgres_url".to_owned(), "postgresql://user:pass@host/db".to_owned()),
+			("s3_endpoint".to_owned(), "http://localhost:9000".to_owned()),
+		]))
+		.expect_err("should reject missing s3 bucket");
+		assert!(err.message.contains("s3_bucket"));
+
+		// Production with all required configuration should pass
+		let config = resolve_serve_config(&HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			("postgres_url".to_owned(), "postgresql://user:pass@host/db".to_owned()),
+			("s3_endpoint".to_owned(), "http://localhost:9000".to_owned()),
+			("s3_bucket".to_owned(), "my-bucket".to_owned()),
+			("s3_region".to_owned(), "us-east-1".to_owned()),
+			("s3_access_key".to_owned(), "key".to_owned()),
+			("s3_secret_key".to_owned(), "secret".to_owned()),
+			("s3_prefix".to_owned(), "pre/".to_owned()),
+		]))
+		.expect("valid production configuration");
+		assert_eq!(config.cluster_mode, ClusterMode::Production);
+		assert_eq!(config.postgres_url.as_deref(), Some("postgresql://user:pass@host/db"));
+		assert_eq!(config.s3_endpoint.as_deref(), Some("http://localhost:9000"));
+		assert_eq!(config.s3_bucket.as_deref(), Some("my-bucket"));
+		assert_eq!(config.s3_region.as_deref(), Some("us-east-1"));
+		assert_eq!(config.s3_access_key.as_deref(), Some("key"));
+		assert_eq!(config.s3_secret_key.as_deref(), Some("secret"));
+		assert_eq!(config.s3_prefix.as_deref(), Some("pre/"));
 	}
 }

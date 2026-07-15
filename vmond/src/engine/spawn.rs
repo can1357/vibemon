@@ -8,6 +8,7 @@ use std::{
 	os::unix::{fs::PermissionsExt, process::CommandExt},
 	path::{Path, PathBuf},
 	process::{Child, Command, Stdio},
+	sync::LazyLock,
 	thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +16,7 @@ use std::{
 use serde_json::{Map, Value, json};
 
 use crate::{
+	doctor,
 	engine::control::ControlClient,
 	error::{EngineError, Result},
 	home::state_dir,
@@ -574,9 +576,61 @@ fn remote_fs_args(mounts: &[RemoteFsShare]) -> Vec<String> {
 	args
 }
 
+/// Runtime boundary for sandbox process lifecycle.
+///
+/// Backends share the [`SandboxVm`] on-disk layout and guest-agent/control
+/// protocols while remaining free to launch a different VMM implementation.
+pub trait SandboxRuntime: Send + Sync {
+	/// Stable runtime identifier persisted with sandbox metadata.
+	fn name(&self) -> &'static str;
+
+	/// Address a sandbox by name under the current state directory.
+	fn sandbox(&self, name: &str) -> SandboxVm {
+		SandboxVm::new(name)
+	}
+
+	/// Start a sandbox and wait for its control plane to become ready.
+	fn launch(&self, vm: &SandboxVm, spec: &LaunchSpec) -> Result<()>;
+
+	/// Stop a running sandbox.
+	fn stop(&self, vm: &SandboxVm, wait: bool) -> Result<()>;
+
+	/// Remove a sandbox and its runtime-owned state.
+	fn remove(&self, vm: &SandboxVm) -> Result<()>;
+
+	/// Report whether a sandbox is still running.
+	fn is_running(&self, vm: &SandboxVm) -> Result<bool>;
+}
+
+/// Runtime backed by the built-in `vmon vmm` process.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VmonRuntime;
+
+impl SandboxRuntime for VmonRuntime {
+	fn name(&self) -> &'static str {
+		"vmon"
+	}
+
+	fn launch(&self, vm: &SandboxVm, spec: &LaunchSpec) -> Result<()> {
+		vm.launch(spec)
+	}
+
+	fn stop(&self, vm: &SandboxVm, wait: bool) -> Result<()> {
+		vm.stop(wait)
+	}
+
+	fn remove(&self, vm: &SandboxVm) -> Result<()> {
+		vm.remove()
+	}
+
+	fn is_running(&self, vm: &SandboxVm) -> Result<bool> {
+		vm.is_running()
+	}
+}
+
 /// A microVM instance rooted under `$VMON_HOME/vms/<name>`.
 #[derive(Clone, Debug)]
-pub struct MicroVm {
+pub struct SandboxVm {
 	name:      String,
 	dir:       PathBuf,
 	sock:      PathBuf,
@@ -584,7 +638,7 @@ pub struct MicroVm {
 	meta_path: PathBuf,
 }
 
-impl MicroVm {
+impl SandboxVm {
 	/// Address a VM by name under the current state directory.
 	pub fn new(name: impl Into<String>) -> Self {
 		let name = name.into();
@@ -737,13 +791,22 @@ impl MicroVm {
 			let _ = fs::remove_file(sock);
 		}
 		fs::create_dir_all(&self.dir)?;
+		let mut parents = Vec::new();
 		for sock in [&spec.api_sock, spec.agent_sock.as_ref().unwrap_or(&spec.api_sock)] {
 			if let Some(parent) = sock.parent() {
-				fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+				parents.push(parent);
 			}
 		}
+		parents.sort();
+		parents.dedup();
+		for parent in parents {
+			fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+		}
 
-		let binary = std::env::current_exe()?;
+		static BINARY: LazyLock<Option<PathBuf>> = LazyLock::new(doctor::find_vmon_binary);
+		let binary = BINARY.clone().ok_or_else(|| {
+			EngineError::engine("vmon executable not found; set VMON_BIN or install vmon on PATH")
+		})?;
 		let log_file = OpenOptions::new()
 			.create(true)
 			.append(true)
@@ -1438,7 +1501,7 @@ mod tests {
 		fs::create_dir(tmp.path().join("b")).unwrap();
 		fs::create_dir(tmp.path().join("a")).unwrap();
 		fs::write(tmp.path().join("file"), b"no").unwrap();
-		let names: Vec<String> = MicroVm::list_in(tmp.path())
+		let names: Vec<String> = SandboxVm::list_in(tmp.path())
 			.unwrap()
 			.into_iter()
 			.map(|vm| vm.name().to_owned())
@@ -1449,7 +1512,7 @@ mod tests {
 	#[test]
 	fn spawn_is_running_requires_running_status() {
 		let tmp = tempfile::tempdir().unwrap();
-		let vm = MicroVm::from_dir("vm", tmp.path().join("vm"));
+		let vm = SandboxVm::from_dir("vm", tmp.path().join("vm"));
 		let mut meta = Map::new();
 		meta.insert("pid".to_owned(), json!(std::process::id()));
 		meta.insert("status".to_owned(), json!("stopped"));
@@ -1460,7 +1523,7 @@ mod tests {
 	#[test]
 	fn spawn_socket_paths_honor_jail_root() {
 		let tmp = tempfile::tempdir().unwrap();
-		let vm = MicroVm::from_dir("vm", tmp.path().join("vm"));
+		let vm = SandboxVm::from_dir("vm", tmp.path().join("vm"));
 		let mut meta = Map::new();
 		meta.insert("jail_root".to_owned(), json!("/jail"));
 		vm.save_meta(meta).unwrap();

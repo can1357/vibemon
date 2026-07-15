@@ -109,7 +109,6 @@ with vmon.connect() as client:
 | `Health(ctx)` | `vmon.Health` | Reads daemon health; `Health.OK` is the health flag. |
 | `Info(ctx)` | `vmon.ServerInfo` | Reads version, platform, architecture, backend, and capabilities. |
 | `Metrics(ctx)` | `string` | Reads the Prometheus metrics document. |
-| `OpenAPI(ctx)` | `json.RawMessage` | Reads and validates the daemon OpenAPI document. |
 | `Events(ctx)` | `*vmon.EventStream` | Opens a lifecycle-event stream. |
 | `Driver()` | `vmon.Driver` | Returns the transport backing the client. |
 | `Close()` | `error` | Releases cached connections and the backing driver. |
@@ -178,7 +177,7 @@ try {
 
 ## Resource and service namespaces
 
-Namespaces are created by the root client and retain its connection; do not instantiate namespace or service classes directly. A resource returned by creation or lookup remains associated with that client and, when known, the endpoint that owns it.
+Namespaces retain their root client; do not instantiate namespace or service classes directly. Resources returned by creation or lookup retain that client and manage mesh routing privately by stable ID.
 
 The SDKs share services for sandboxes, snapshots, volumes, pools, and mesh topology. TypeScript additionally exposes deployed durable functions and applications from the root client.
 

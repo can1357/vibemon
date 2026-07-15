@@ -135,15 +135,17 @@ impl Backend for SystemBackend {
 /// attached to the sandbox after this non-secret build plan has completed.
 pub fn realize(
 	home: &Home,
+	artifacts: &ArtifactStore,
 	spec: &pb::ImageSpec,
 	architecture: pb::CpuArchitecture,
 ) -> Result<RealizedImage> {
-	realize_with(&SystemBackend, home, spec, architecture)
+	realize_with_artifacts(&SystemBackend, home, artifacts, spec, architecture)
 }
 
-fn realize_with(
+fn realize_with_artifacts(
 	backend: &impl Backend,
 	home: &Home,
+	artifacts: &ArtifactStore,
 	spec: &pb::ImageSpec,
 	architecture: pb::CpuArchitecture,
 ) -> Result<RealizedImage> {
@@ -151,8 +153,7 @@ fn realize_with(
 	validate_inputs(spec)?;
 	let mut normalized = spec.clone();
 	normalize_spec(&mut normalized);
-	let artifacts = ArtifactStore::open(home.function_artifacts_dir())?;
-	let source = resolve_source(backend, home, &artifacts, &normalized, arch)?;
+	let source = resolve_source(backend, home, artifacts, &normalized, arch)?;
 	verify_caller_digest(normalized.resolved_oci_digest.as_ref(), &source.digest)?;
 	if source.platform != format!("linux/{arch}") {
 		return Err(EngineError::unsupported(format!(
@@ -1179,6 +1180,17 @@ fn tar_octal(field: &[u8]) -> Result<u64> {
 	}
 	u64::from_str_radix(text, 8)
 		.map_err(|_| EngineError::invalid("archive numeric field is invalid"))
+}
+
+#[cfg(test)]
+fn realize_with(
+	backend: &impl Backend,
+	home: &Home,
+	spec: &pb::ImageSpec,
+	architecture: pb::CpuArchitecture,
+) -> Result<RealizedImage> {
+	let artifacts = ArtifactStore::open(home.function_artifacts_dir())?;
+	realize_with_artifacts(backend, home, &artifacts, spec, architecture)
 }
 
 #[cfg(test)]

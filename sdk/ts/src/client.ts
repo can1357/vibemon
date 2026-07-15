@@ -1,6 +1,6 @@
 import type { Driver, DriverOptions, DriverRequestOptions } from "./driver";
 import { MeshDriver } from "./driver";
-import { apiError, ProtocolError, parseResponseJson, TransportError } from "./errors";
+import { APIError, apiError, ProtocolError, parseResponseJson, TransportError } from "./errors";
 import type { FunctionLookupOptions, FunctionValueAdapter } from "./functions";
 import { App, RemoteFunction } from "./functions";
 import {
@@ -24,7 +24,7 @@ import type {
 } from "./models";
 import { EventStream, Process } from "./process";
 import type { SandboxListOptions } from "./sandbox";
-import { Sandbox } from "./sandbox";
+import { Sandbox, sandboxFromRoute } from "./sandbox";
 import type { SecretInput } from "./values";
 import { secretWires, Volume } from "./values";
 
@@ -174,14 +174,33 @@ export class SandboxAPI {
     const { message, endpoint } = await this.#client.driver.call(SandboxService.method.create, {
       specJson: JSON.stringify(body),
     });
-    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
+    return sandboxFromRoute(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
   }
-  /** Fetch a sandbox and pin its serving endpoint. */
+  /** Reconnect to a sandbox by stable ID and pin its current endpoint. */
   async get(id: string): Promise<Sandbox> {
-    const { message, endpoint } = await this.#client.driver.call(SandboxService.method.get, {
-      id,
-    });
-    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
+    const getAt = async (endpoint?: string) => {
+      const result = await this.#client.driver.call(
+        SandboxService.method.get,
+        { id },
+        { endpoint },
+      );
+      return sandboxFromRoute(
+        this.#client,
+        sandboxInfo(parseResponseJson(result.message.json)),
+        result.endpoint,
+      );
+    };
+    try {
+      return await getAt();
+    } catch (error) {
+      if (
+        !(error instanceof APIError) ||
+        (error.code !== "not_found" && error.status !== 404) ||
+        this.#client.driver.endpoints().length <= 1
+      )
+        throw error;
+    }
+    return getAt(await this.#client.driver.resolveSandbox(id));
   }
   /** Create an unfetched bound sandbox reference. */
   ref(id: string): Sandbox {
@@ -196,9 +215,9 @@ export class SandboxAPI {
       const { message, endpoint } = await this.#client.driver.call(SandboxService.method.list, {
         tags,
       });
-      return sandboxRows(message.sandboxesJson.map(parseResponseJson))
-        .filter((row) => !options.node || row.node === options.node)
-        .map((row) => new Sandbox(this.#client, row, endpoint));
+      return sandboxRows(message.sandboxesJson.map(parseResponseJson)).map((row) =>
+        sandboxFromRoute(this.#client, row, endpoint),
+      );
     }
     const attempts = await Promise.allSettled(
       endpoints.map(async (entry) => {
@@ -222,8 +241,8 @@ export class SandboxAPI {
         continue;
       }
       for (const row of attempt.value.rows)
-        if (!merged.has(row.id) && (!options.node || row.node === options.node))
-          merged.set(row.id, new Sandbox(this.#client, row, attempt.value.endpoint));
+        if (!merged.has(row.id))
+          merged.set(row.id, sandboxFromRoute(this.#client, row, attempt.value.endpoint));
     }
     if (attempts.every((attempt) => attempt.status === "rejected")) throw lastTransportError;
     return [...merged.values()];
@@ -247,7 +266,7 @@ export class SnapshotAPI {
       name,
       bodyJson: JSON.stringify(request),
     });
-    return new Sandbox(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
+    return sandboxFromRoute(this.#client, sandboxInfo(parseResponseJson(message.json)), endpoint);
   }
   /** Fork one snapshot into multiple sandboxes. */
   async fork(name: string, request: ForkRequest): Promise<Sandbox[]> {
@@ -256,8 +275,8 @@ export class SnapshotAPI {
       bodyJson: JSON.stringify(request),
     });
     const body = parseResponseJson(message.json);
-    return sandboxRows(isRecord(body) ? body.clones : null).map(
-      (row) => new Sandbox(this.#client, row, endpoint),
+    return sandboxRows(isRecord(body) ? body.clones : null).map((row) =>
+      sandboxFromRoute(this.#client, row, endpoint),
     );
   }
 }

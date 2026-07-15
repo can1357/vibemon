@@ -1479,8 +1479,8 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 	}
 
 	let exe = std::env::current_exe()?;
-	// Base disk to clone per child: an explicit --disk-overlay-of base wins, then
-	// --rootfs, then the disk recorded in the template snapshot.
+	// Never trust a disk path embedded in snapshot state. Fork children receive
+	// only an operator-supplied base from this launch.
 	let snap = snapshot::read_state(dir)?;
 	if snap.delta.is_some() {
 		return Err(err("cannot fork from a delta snapshot; restore it instead"));
@@ -1489,17 +1489,17 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 		.disk_overlay_of
 		.as_ref()
 		.or(config.rootfs.as_ref())
-		.map(|p| p.to_string_lossy().into_owned())
-		.or_else(|| {
-			snap.devices.iter().find_map(|d| match &d.backend {
-				BackendHint::Block { path, .. } => Some(path.clone()),
-				BackendHint::Net { .. } | BackendHint::UserNet { .. } => None,
-				BackendHint::Console => None,
-				BackendHint::Fs { .. } => None,
-				BackendHint::RemoteFs { .. } => None,
-				BackendHint::Rng => None,
-			})
-		});
+		.map(|path| path.to_string_lossy().into_owned());
+	if base_disk.is_none()
+		&& snap
+			.devices
+			.iter()
+			.any(|device| matches!(device.backend, BackendHint::Block { .. }))
+	{
+		return Err(err(
+			"forking a snapshot with a block device requires --disk-overlay-of or --rootfs",
+		));
+	}
 	let snap_has_net = snap
 		.devices
 		.iter()
@@ -2344,7 +2344,7 @@ impl Vmm {
 		let mut console_input = None;
 		let mut console_output = None;
 		for ds in &snap.devices {
-			let backend = resolve_backend(ds, config);
+			let backend = resolve_backend(ds, config)?;
 			let mut fs_handle = None;
 			let device: Arc<Mutex<dyn VirtioDevice>> = match &backend {
 				BackendHint::Block { path, read_only } => {
@@ -3560,28 +3560,35 @@ fn open_user_net_device(
 	Err(err("--net user is currently supported only on macOS"))
 }
 
-/// On restore, CLI flags override the snapshot's recorded backend (so a clone
-/// can point at a different disk/tap/fs share); otherwise the snapshot hint is
-/// used.
-fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
+/// Rebind a restored device only to host resources supplied for this launch.
+///
+/// Snapshot backend paths are untrusted metadata. Reusing them would let a
+/// crafted snapshot open a host disk, TAP, directory, or Unix socket.
+fn resolve_backend(ds: &DeviceState, config: &Config) -> Result<BackendHint> {
 	match &ds.backend {
-		BackendHint::Block { path, read_only } => BackendHint::Block {
-			path:      config
+		BackendHint::Block { read_only, .. } => {
+			let path = config
 				.rootfs
 				.as_ref()
-				.map_or_else(|| path.clone(), |p| p.to_string_lossy().into_owned()),
-			read_only: *read_only,
+				.ok_or_else(|| err("restoring a block device requires an explicit --rootfs binding"))?;
+			Ok(BackendHint::Block {
+				path:      path.to_string_lossy().into_owned(),
+				read_only: *read_only,
+			})
 		},
-		BackendHint::Net { tap, mac } => {
+		BackendHint::Net { mac, .. } => {
 			let mac = if config.mac_specified {
 				config.mac
 			} else {
 				*mac
 			};
 			if config.user_net {
-				BackendHint::UserNet { mac }
+				Ok(BackendHint::UserNet { mac })
 			} else {
-				BackendHint::Net { tap: config.tap.clone().unwrap_or_else(|| tap.clone()), mac }
+				let tap = config.tap.clone().ok_or_else(|| {
+					err("restoring a TAP-backed network device requires --tap or --net user")
+				})?;
+				Ok(BackendHint::Net { tap, mac })
 			}
 		},
 		BackendHint::UserNet { mac } => {
@@ -3591,47 +3598,46 @@ fn resolve_backend(ds: &DeviceState, config: &Config) -> BackendHint {
 				*mac
 			};
 			if let Some(tap) = &config.tap {
-				BackendHint::Net { tap: tap.clone(), mac }
+				Ok(BackendHint::Net { tap: tap.clone(), mac })
 			} else {
-				BackendHint::UserNet { mac }
+				Ok(BackendHint::UserNet { mac })
 			}
 		},
-		BackendHint::Fs { tag, shared_dir, read_only } => {
-			// Re-attach each virtio-fs device by matching its snapshot tag: a
-			// named volume re-binds to that volume's host dir + mode; the single
-			// RO share re-binds to --fs-dir; otherwise the snapshot values stand.
-			let (shared_dir, read_only) =
-				if let Some(m) = config.volumes.iter().find(|m| &m.tag == tag) {
-					(
-						std::fs::canonicalize(&m.dir).map_or_else(
-							|_| m.dir.to_string_lossy().into_owned(),
-							|p| p.to_string_lossy().into_owned(),
-						),
-						m.read_only,
-					)
-				} else if config.fs_tag.as_deref() == Some(tag.as_str()) {
-					(
-						config
-							.fs_dir
-							.as_ref()
-							.map_or_else(|| shared_dir.clone(), |p| p.to_string_lossy().into_owned()),
-						*read_only,
-					)
-				} else {
-					(shared_dir.clone(), *read_only)
-				};
-			BackendHint::Fs { tag: tag.clone(), shared_dir, read_only }
+		BackendHint::Fs { tag, read_only, .. } => {
+			let (shared_dir, read_only) = if let Some(mount) =
+				config.volumes.iter().find(|mount| &mount.tag == tag)
+			{
+				(mount.dir.to_string_lossy().into_owned(), mount.read_only)
+			} else if config.fs_tag.as_deref() == Some(tag.as_str()) {
+				let dir = config.fs_dir.as_ref().ok_or_else(|| {
+					err(format!("restoring virtio-fs tag {tag:?} requires an explicit --fs-dir binding"))
+				})?;
+				(dir.to_string_lossy().into_owned(), *read_only)
+			} else {
+				return Err(err(format!(
+					"restoring virtio-fs tag {tag:?} requires a matching --volume or --fs-tag/--fs-dir \
+					 binding"
+				)));
+			};
+			Ok(BackendHint::Fs { tag: tag.clone(), shared_dir, read_only })
 		},
-		BackendHint::RemoteFs { tag, sock } => {
-			let sock = config
+		BackendHint::RemoteFs { tag, .. } => {
+			let mount = config
 				.remote_fs
 				.iter()
 				.find(|mount| mount.tag == *tag)
-				.map_or_else(|| sock.clone(), |mount| mount.sock.to_string_lossy().into_owned());
-			BackendHint::RemoteFs { tag: tag.clone(), sock }
+				.ok_or_else(|| {
+					err(format!(
+						"restoring remote virtio-fs tag {tag:?} requires a matching --remote-fs binding"
+					))
+				})?;
+			Ok(BackendHint::RemoteFs {
+				tag:  tag.clone(),
+				sock: mount.sock.to_string_lossy().into_owned(),
+			})
 		},
-		BackendHint::Console => BackendHint::Console,
-		BackendHint::Rng => BackendHint::Rng,
+		BackendHint::Console => Ok(BackendHint::Console),
+		BackendHint::Rng => Ok(BackendHint::Rng),
 	}
 }
 
@@ -4188,5 +4194,87 @@ fn restore_terminal() {
 		unsafe {
 			libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, term);
 		}
+	}
+}
+
+#[cfg(test)]
+mod backend_restore_tests {
+	use super::*;
+
+	fn config(extra: &[&str]) -> Config {
+		Config::from_args(
+			["--restore", "/snapshot"]
+				.into_iter()
+				.chain(extra.iter().copied())
+				.map(str::to_owned),
+		)
+		.expect("restore config")
+	}
+
+	fn device(kind: DeviceKind, backend: BackendHint) -> DeviceState {
+		DeviceState {
+			kind,
+			transport: DeviceTransportKind::Mmio,
+			mmio_base: MMIO_MEM_START,
+			gsi: IRQ_BASE,
+			interrupt_status: 0,
+			device_features_select: 0,
+			driver_features_select: 0,
+			acked_features: 0,
+			status: 0,
+			activated: false,
+			queues: Vec::new(),
+			backend,
+			user_net_state: None,
+			transport_pci: None,
+			fs: None,
+		}
+	}
+
+	#[test]
+	fn snapshot_host_paths_require_explicit_rebinding() {
+		let cases = [
+			device(DeviceKind::Block, BackendHint::Block {
+				path:      "/etc/passwd".to_owned(),
+				read_only: false,
+			}),
+			device(DeviceKind::Net, BackendHint::Net {
+				tap: "host-tap".to_owned(),
+				mac: [2, 0, 0, 0, 0, 1],
+			}),
+			device(DeviceKind::Fs, BackendHint::Fs {
+				tag:        "host".to_owned(),
+				shared_dir: "/".to_owned(),
+				read_only:  false,
+			}),
+			device(DeviceKind::RemoteFs, BackendHint::RemoteFs {
+				tag:  "objects".to_owned(),
+				sock: "/private/host.sock".to_owned(),
+			}),
+		];
+		for state in cases {
+			assert!(resolve_backend(&state, &config(&[])).is_err());
+		}
+	}
+
+	#[test]
+	fn explicit_restore_bindings_replace_snapshot_paths() {
+		let state = device(DeviceKind::Block, BackendHint::Block {
+			path:      "/etc/passwd".to_owned(),
+			read_only: false,
+		});
+		let backend =
+			resolve_backend(&state, &config(&["--rootfs", "/safe/rootfs.img"])).expect("binding");
+		assert!(matches!(
+			backend,
+			BackendHint::Block { path, .. } if path == "/safe/rootfs.img"
+		));
+
+		let state = device(DeviceKind::Net, BackendHint::Net {
+			tap: "host-tap".to_owned(),
+			mac: [2, 0, 0, 0, 0, 1],
+		});
+		let backend = resolve_backend(&state, &config(&["--tap", "safe-tap"])).expect("binding");
+		assert!(matches!(backend, BackendHint::Net { tap, .. } if tap == "safe-tap"));
 	}
 }

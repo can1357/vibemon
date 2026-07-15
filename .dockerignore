@@ -1,0 +1,15 @@
+.git
+.venv
+**/.venv
+**/node_modules
+target
+**/target
+dist
+**/__pycache__
+**/.pytest_cache
+**/nonexistent
+*.qcow2
+*.raw
+*.img
+*.cpio
+*.cpio.gz

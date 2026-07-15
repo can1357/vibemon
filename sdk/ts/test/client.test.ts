@@ -186,9 +186,12 @@ test("resource hierarchy maps RPCs and views", async () => {
   state.view = { expires_at: 123 };
   expect((await sandbox.extend(30)).id).toBe("s1");
   expect(rpcs.at(-1)).toMatchObject({ method: "Extend", input: { id: "s1", secs: 30n } });
-  state.view = { target: "node-b" };
-  expect((await sandbox.migrate("node-b")).id).toBe("s1");
-  expect(rpcs.at(-1)).toMatchObject({ method: "Get", input: { id: "s1" } });
+  state.view = { id: "s1", node: "node-b" };
+  expect((await sandbox.migrate("node-b")).node).toBe("node-b");
+  expect(sandbox.node).toBe("node-b");
+  expect(rpcs.find((rpc) => rpc.method === "Migrate")).toMatchObject({
+    input: { id: "s1", target: "node-b" },
+  });
 
   state.view = { size: 2 };
   await client.pools.set("image", 2, { image: "alpine" });

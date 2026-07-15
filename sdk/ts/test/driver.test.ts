@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { Code, ConnectError, createRouterTransport, type Transport } from "@connectrpc/connect";
-import { APIError, Client, MeshDriver, Sandbox, TransportError } from "../src";
+import { APIError, Client, MeshDriver, TransportError } from "../src";
 import { SandboxService, SystemService } from "../src/gen/vmon/v1/api_pb";
+import { channelFor, sandboxFromRoute } from "../src/sandbox";
 
 const A = "http://node-a";
 const B = "http://node-b";
@@ -154,10 +155,35 @@ test("sandbox transparently relocates once after pinned not_found", async () => 
   const driver = new MeshDriver("vmon://node-a,node-b?discover=off", {
     transport: (baseUrl) => (baseUrl === A_8000 ? gone : serving),
   });
-  const sandbox = new Sandbox(new Client(driver), { id }, A_8000);
-  expect((await sandbox.refresh()).node).toBe("b");
-  expect(sandbox.endpoint).toBe(B_8000);
+  const client = new Client(driver);
+  const reconnected = await client.sandboxes.get(id);
+  expect(channelFor(reconnected).endpoint).toBe(B_8000);
 
-  const absent = new Sandbox(new Client(driver), { id: "absent" }, A_8000);
+  const sandbox = sandboxFromRoute(client, { id }, A_8000);
+  await sandbox.refresh();
+  expect(channelFor(sandbox).endpoint).toBe(B_8000);
+
+  const absent = sandboxFromRoute(new Client(driver), { id: "absent" }, A_8000);
   await expect(absent.refresh()).rejects.toBeInstanceOf(APIError);
+});
+
+test("APIError parses retryable and action metadata", () => {
+  const { rpcError } = require("../src/errors");
+  const errWithMeta = rpcError(
+    new ConnectError("busy details", Code.Aborted, {
+      "vmon-code": "busy",
+      "vmon-retryable": "true",
+      "vmon-action": "re-register",
+    }),
+  );
+  expect(errWithMeta.code).toBe("busy");
+  expect(errWithMeta.retryable).toBe(true);
+  expect(errWithMeta.action).toBe("re-register");
+
+  const errFallback = rpcError(
+    new ConnectError("busy details", Code.Aborted, {
+      "vmon-code": "busy",
+    }),
+  );
+  expect(errFallback.retryable).toBe(true);
 });

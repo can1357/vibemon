@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vmon"
 version = "0.3.0"
 description = "Thin Python SDK for the Rust vmon API"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "cbor2>=5.7",
     "cloudpickle>=3.1",
@@ -37,7 +37,7 @@ vmon = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py311"
 extend-exclude = ["vmon/v1"]
 
 [tool.ruff.lint]
@@ -52,7 +52,7 @@ ignore = [
 
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.11"
 files = ["vmon", "tests/typing_remote.py"]
 exclude = ["^e2e\\.py$"]
 ignore_missing_imports = true

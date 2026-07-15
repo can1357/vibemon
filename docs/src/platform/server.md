@@ -48,3 +48,11 @@ The server middleware protects the routes. The normal admin credential is the co
 Use `GET /healthz` for a simple liveness check and scrape `GET /metrics` with a Prometheus-compatible collector. `vmon metrics` retrieves platform metrics through the normal CLI transport. The server also exposes the local Unix-domain-socket endpoint used by the CLI and supported SDK transports; selecting the `local` context directs the Rust CLI there.
 
 For cluster setup, warm pools, storage, and snapshot operations, use the corresponding CLI control-plane commands and their gRPC services rather than sending lifecycle commands to a VMM socket. See [Mesh and High Availability](mesh.md), [Storage and Volumes](storage.md), and [Snapshots, Restore, and Fork](snapshots.md).
+
+## Production cluster storage
+
+`VMON_CLUSTER_MODE=production` requires both PostgreSQL and S3 configuration. The daemon refuses to start when the PostgreSQL URL, S3 endpoint, or bucket is missing.
+
+Set `VMON_POSTGRES_URL` to the PostgreSQL connection string. Configure object storage with `VMON_S3_ENDPOINT`, `VMON_S3_BUCKET`, `VMON_S3_REGION`, `VMON_S3_ACCESS_KEY`, and `VMON_S3_SECRET_KEY`; `VMON_S3_PREFIX` is optional. Custom S3 endpoints use path-style requests.
+
+Dockerfile builds also require `buildctl` on `PATH` and `VMON_BUILDKIT_ADDR` pointing to an isolated BuildKit daemon. There is no fallback to Docker, Buildah, or a host shell.

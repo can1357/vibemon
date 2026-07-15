@@ -27,7 +27,7 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import replace
-from typing import Any, Protocol, Self, TypeVar, cast, overload
+from typing import Any, Generic, ParamSpec, Protocol, Self, TypeVar, cast, overload
 
 import grpc
 
@@ -54,6 +54,10 @@ from .package import PackageArtifact, SerializedCallable, package_callable
 from .v1 import api_pb2 as pb
 from .values import ValueCodec, ValueCompression, decode_value, encode_value
 
+P = ParamSpec("P")
+R = TypeVar("R")
+Q = ParamSpec("Q")
+T = TypeVar("T")
 Y = TypeVar("Y")
 _UNSET = object()
 _TERMINAL = {pb.CALL_STATUS_SUCCEEDED, pb.CALL_STATUS_FAILED, pb.CALL_STATUS_CANCELLED}
@@ -264,7 +268,7 @@ def _compose_function_options(
     )
 
 
-async def _run_blocking[R](function: Callable[..., R], *args: Any, **kwargs: Any) -> R:
+async def _run_blocking(function: Callable[..., R], *args: Any, **kwargs: Any) -> R:
     """Compatibility bridge for injected synchronous drivers."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
@@ -547,7 +551,7 @@ async def _async_arguments(
     return message
 
 
-class FunctionCall[R]:
+class FunctionCall(Generic[R]):
     """A durable unary or generator call handle."""
 
     def __init__(
@@ -751,7 +755,7 @@ class FunctionCall[R]:
         return values
 
 
-class BatchCall[R]:
+class BatchCall(Generic[R]):
     """Detached durable batch handle whose results are fetched lazily."""
 
     def __init__(
@@ -945,7 +949,7 @@ class BatchCall[R]:
         return self.results(**kwargs)
 
 
-class _AsyncCall[R]:
+class _AsyncCall(Generic[R]):
     def __init__(self, call: FunctionCall[R]) -> None:
         self._call = call
 
@@ -1138,7 +1142,7 @@ class _AsyncCall[R]:
             raise
 
 
-class _AsyncBatchCall[R]:
+class _AsyncBatchCall(Generic[R]):
     """Native asynchronous access to a detached durable batch."""
 
     def __init__(
@@ -1379,12 +1383,12 @@ class _AsyncBatchCall[R]:
                         yield cast(R, terminal_error)
                         return
                     raise terminal_error
-        except asyncio.CancelledError, GeneratorExit:
+        except (asyncio.CancelledError, GeneratorExit):
             await asyncio.shield(self.cancel("async batch result consumer closed"))
             raise
 
 
-class _AsyncRemoteFunction[**P, R]:
+class _AsyncRemoteFunction(Generic[P, R]):
     def __init__(self, function: RemoteFunction[P, R]) -> None:
         self._function = function
 
@@ -1668,7 +1672,7 @@ class _AsyncRemoteFunction[**P, R]:
             pass
 
 
-class RemoteFunction[**P, R]:
+class RemoteFunction(Generic[P, R]):
     """Immutable typed reference to a zero-deploy or registered function."""
 
     __vmon_class_lifecycle__: str
@@ -2310,7 +2314,7 @@ class RemoteFunction[**P, R]:
             pass
 
 
-class SyncRemoteFunction[**P, R](RemoteFunction[P, R]):
+class SyncRemoteFunction(RemoteFunction[P, R]):
     """Typed wrapper whose local implementation is a synchronous function."""
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -2320,7 +2324,7 @@ class SyncRemoteFunction[**P, R](RemoteFunction[P, R]):
         return self(*args, **kwargs)
 
 
-class AsyncRemoteFunction[**P, R](RemoteFunction[P, R]):
+class AsyncRemoteFunction(RemoteFunction[P, R]):
     """Typed wrapper whose local implementation is a coroutine function."""
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Coroutine[Any, Any, R]:
@@ -2332,7 +2336,7 @@ class AsyncRemoteFunction[**P, R](RemoteFunction[P, R]):
         return self(*args, **kwargs)
 
 
-class GeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
+class GeneratorRemoteFunction(RemoteFunction[P, R]):
     """Typed wrapper whose local implementation is a synchronous generator."""
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Iterator[R]:
@@ -2344,7 +2348,7 @@ class GeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
         return self(*args, **kwargs)
 
 
-class AsyncGeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
+class AsyncGeneratorRemoteFunction(RemoteFunction[P, R]):
     """Typed wrapper whose local implementation is an asynchronous generator."""
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> AsyncIterator[R]:
@@ -2358,44 +2362,44 @@ class AsyncGeneratorRemoteFunction[**P, R](RemoteFunction[P, R]):
 
 class _FunctionDecorator(Protocol):
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, Iterator[T]], /
     ) -> GeneratorRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, AsyncIterator[T]], /
     ) -> AsyncGeneratorRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, Coroutine[Any, Any, T]], /
     ) -> AsyncRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
+    def __call__(self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
 
 
 @overload
-def function[**P, Y](  # type: ignore[overload-overlap]
+def function(  # type: ignore[overload-overlap]
     function: Callable[P, Iterator[Y]], /
 ) -> GeneratorRemoteFunction[P, Y]: ...
 
 
 @overload
-def function[**P, Y](  # type: ignore[overload-overlap]
+def function(  # type: ignore[overload-overlap]
     function: Callable[P, AsyncIterator[Y]], /
 ) -> AsyncGeneratorRemoteFunction[P, Y]: ...
 
 
 @overload
-def function[**P, Y](  # type: ignore[overload-overlap]
+def function(  # type: ignore[overload-overlap]
     function: Callable[P, Coroutine[Any, Any, Y]], /
 ) -> AsyncRemoteFunction[P, Y]: ...
 
 
 @overload
-def function[**P, R](function: Callable[P, R], /) -> SyncRemoteFunction[P, R]: ...
+def function(function: Callable[P, R], /) -> SyncRemoteFunction[P, R]: ...
 @overload
 def function(
     function: None = None,

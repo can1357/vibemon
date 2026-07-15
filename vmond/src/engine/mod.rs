@@ -140,7 +140,7 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn snapshots(&self) -> Result<Vec<String>>;
 	/// Restore a named snapshot into a fresh sandbox -> view (201).
 	fn restore(&self, snapshot: &str, body: RestoreBody) -> Result<Value>;
-	/// Fork `CoW` clones -> `{"clones": [{name, pid, reconstruct_ms}]}`.
+	/// Fork `CoW` clones -> `{"clones": [<canonical sandbox view>, ...]}`.
 	fn fork(&self, snapshot: &str, body: ForkBody) -> Result<Value>;
 
 	// -- volumes / pools (server-owned) ------------------------------------

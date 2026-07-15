@@ -122,7 +122,7 @@ pub struct OwnerRecord {
 pub trait OwnerRouter: Send + Sync {
 	fn mesh_enabled(&self) -> bool;
 	fn local_node_id(&self) -> &str;
-	fn owner_of(&self, sandbox_id: &str) -> Option<String>;
+	fn owner_of(&self, sandbox_id: &str) -> MeshResult<Option<String>>;
 	fn peer_url(&self, node_id: &str) -> Option<String>;
 	fn peers(&self) -> Vec<MeshPeer>;
 	fn record_owner(&self, sandbox_id: &str, owner: &str, epoch: u64);
@@ -135,7 +135,7 @@ pub trait SandboxPresence: Send + Sync {
 
 /// Optional durable create-record owner fallback.
 pub trait RecordOwnerLookup: Send + Sync {
-	fn owner_record(&self, sandbox_id: &str) -> Option<OwnerRecord>;
+	fn owner_record(&self, sandbox_id: &str) -> MeshResult<Option<OwnerRecord>>;
 }
 
 /// Result of the mesh owner router for an incoming sandbox route.
@@ -253,7 +253,7 @@ pub async fn scatter_locate<M, R>(
 	client: &Client,
 	sandbox_id: &str,
 	outbound_token: &str,
-) -> Option<String>
+) -> MeshResult<Option<String>>
 where
 	M: OwnerRouter,
 	R: RecordOwnerLookup + ?Sized,
@@ -283,15 +283,16 @@ where
 			continue;
 		};
 		mesh.record_owner(sandbox_id, &owner, payload.epoch.unwrap_or(0));
-		return Some(owner);
+		return Ok(Some(owner));
 	}
-	if let Some(record) = record_store.and_then(|store| store.owner_record(sandbox_id))
+	if let Some(store) = record_store
+		&& let Some(record) = store.owner_record(sandbox_id)?
 		&& !record.owner.is_empty()
 	{
 		mesh.record_owner(sandbox_id, &record.owner, record.epoch);
-		return Some(record.owner);
+		return Ok(Some(record.owner));
 	}
-	None
+	Ok(None)
 }
 
 /// Decide whether a sandbox request should be served locally or forwarded to a
@@ -323,9 +324,9 @@ where
 	if presence.has_sandbox(&sandbox_id) {
 		return Ok(OwnerProxyDecision::ServeLocal);
 	}
-	let owner = match mesh.owner_of(&sandbox_id) {
+	let owner = match mesh.owner_of(&sandbox_id)? {
 		Some(owner) => Some(owner),
-		None => scatter_locate(mesh, record_store, client, &sandbox_id, outbound_token).await,
+		None => scatter_locate(mesh, record_store, client, &sandbox_id, outbound_token).await?,
 	};
 	let Some(owner) = owner else {
 		return Ok(OwnerProxyDecision::ServeLocal);
@@ -788,14 +789,23 @@ pub const fn method_proxyable(_method: &Method) -> bool {
 
 /// Return every owner id known locally or through durable fallback.  Useful for
 /// route-level diagnostics without making a peer request.
-pub fn known_owner<M, R>(mesh: &M, record_store: Option<&R>, sandbox_id: &str) -> Option<String>
+pub fn known_owner<M, R>(
+	mesh: &M,
+	record_store: Option<&R>,
+	sandbox_id: &str,
+) -> MeshResult<Option<String>>
 where
 	M: OwnerRouter,
 	R: RecordOwnerLookup + ?Sized,
 {
-	mesh.owner_of(sandbox_id).or_else(|| {
-		record_store.and_then(|store| store.owner_record(sandbox_id).map(|record| record.owner))
-	})
+	if let Some(owner) = mesh.owner_of(sandbox_id)? {
+		return Ok(Some(owner));
+	}
+	Ok(record_store
+		.map(|store| store.owner_record(sandbox_id))
+		.transpose()?
+		.flatten()
+		.map(|record| record.owner))
 }
 
 /// Build the exact peer headers used by both HTTP and WebSocket owner

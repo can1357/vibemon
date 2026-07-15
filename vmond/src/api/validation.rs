@@ -6,7 +6,7 @@ use serde_json::Value;
 use super::error::{ApiError, ApiResult};
 use crate::{
 	engine::ExecRequest,
-	models::{ExecBody, ExtendBody, ForkBody, NetworkBody, SandboxCreate},
+	models::{ExecBody, ExtendBody, ForkBody, MAX_FORK_CLONES, NetworkBody, SandboxCreate},
 };
 
 const ALLOWED_HA: &[&str] = &["async", "async+rerun", "off", "rerun"];
@@ -112,8 +112,8 @@ pub fn validate_network(body: &NetworkBody) -> ApiResult<()> {
 }
 
 pub fn validate_fork(body: &ForkBody) -> ApiResult<()> {
-	if body.count == 0 {
-		return Err(ApiError::invalid("count must be positive"));
+	if !(1..=MAX_FORK_CLONES).contains(&body.count) {
+		return Err(ApiError::invalid(format!("count must be between 1 and {MAX_FORK_CLONES}")));
 	}
 	Ok(())
 }

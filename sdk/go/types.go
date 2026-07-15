@@ -94,8 +94,6 @@ type Sandbox struct {
 	Name string `json:"name"`
 	// Status is the current lifecycle state.
 	Status string `json:"status"`
-	// Node is the mesh node currently hosting the sandbox.
-	Node string `json:"node,omitempty"`
 	// PID is the monitor process identifier when one is available.
 	PID *int32 `json:"pid,omitempty"`
 	// Source is the image, template, fork, or restore source.
@@ -114,6 +112,8 @@ type Sandbox struct {
 	Tags map[string]string `json:"tags"`
 	// ReturnCode is the foreground process exit code when known.
 	ReturnCode *int64 `json:"returncode"`
+	// Node is the mesh node that reported the latest sandbox view.
+	Node string `json:"node,omitempty"`
 	// Details retains non-canonical response fields as raw JSON.
 	Details map[string]json.RawMessage `json:"-"`
 
@@ -136,14 +136,37 @@ func (sandbox *Sandbox) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, key := range []string{
-		"id", "name", "status", "node", "pid", "source", "created_at", "last_active",
-		"expires_at", "terminated_at", "error", "tags", "returncode",
+		"id", "name", "status", "pid", "source", "created_at", "last_active",
+		"expires_at", "terminated_at", "error", "tags", "returncode", "node",
 	} {
 		delete(details, key)
 	}
 	*sandbox = Sandbox(decoded)
 	sandbox.Details = details
 	return nil
+}
+
+// MigrationTiming reports the source-side phases of a completed migration.
+type MigrationTiming struct {
+	// PrecopyMS is time spent copying guest state while the source kept running.
+	PrecopyMS uint64 `json:"precopy_ms"`
+	// DowntimeMS is time from source suspension until the target resumed.
+	DowntimeMS uint64 `json:"downtime_ms"`
+	// TotalMS is the complete migration duration.
+	TotalMS uint64 `json:"total_ms"`
+}
+
+// MigrationTiming returns timing data carried by a migration response.
+func (sandbox *Sandbox) MigrationTiming() (MigrationTiming, bool) {
+	var timing MigrationTiming
+	if sandbox == nil {
+		return timing, false
+	}
+	raw, ok := sandbox.Details["migration"]
+	if !ok || json.Unmarshal(raw, &timing) != nil {
+		return MigrationTiming{}, false
+	}
+	return timing, true
 }
 
 // SandboxCreateRequest is the stable request body for creating a sandbox.
@@ -221,8 +244,6 @@ type S3Mount struct {
 type SandboxListOptions struct {
 	// Tags requires each key/value tag pair to match.
 	Tags map[string]string
-	// Node filters results by hosting mesh node.
-	Node string
 }
 
 // SandboxPoll is one non-blocking sandbox lifecycle observation.
@@ -241,32 +262,6 @@ type SandboxPoll struct {
 type ExtendResult struct {
 	// DeadlineUnix is the updated absolute Unix deadline.
 	DeadlineUnix int64 `json:"deadline_unix"`
-}
-
-// MigrationTiming reports the phase latencies of one live ("teleport")
-// migration as measured by the source node.
-type MigrationTiming struct {
-	// PrecopyMS is the bulk RAM+disk streaming phase; the guest keeps running.
-	PrecopyMS uint64 `json:"precopy_ms"`
-	// DowntimeMS is the guest blackout: suspended on the source until the
-	// target node reports the VM running.
-	DowntimeMS uint64 `json:"downtime_ms"`
-	// TotalMS is the duration of the whole migrate call.
-	TotalMS uint64 `json:"total_ms"`
-}
-
-// MigrationTiming returns the phase latencies attached to the sandbox view
-// returned by [Sandbox.Migrate]; ok is false when the view carries none.
-func (sandbox *Sandbox) MigrationTiming() (MigrationTiming, bool) {
-	raw, found := sandbox.Details["migration"]
-	if !found {
-		return MigrationTiming{}, false
-	}
-	var timing MigrationTiming
-	if err := json.Unmarshal(raw, &timing); err != nil {
-		return MigrationTiming{}, false
-	}
-	return timing, true
 }
 
 // MeshNode is one member of a mesh.
@@ -457,13 +452,13 @@ type FilesystemSnapshotResult struct {
 	Image string `json:"image"`
 }
 
-// RestoreRequest describes a snapshot restore and optional create-style overrides.
+// RestoreRequest describes a snapshot restore and optional runtime overrides.
 type RestoreRequest struct {
 	// Name requests a sandbox name.
 	Name string
 	// Agent controls whether restore waits for the guest agent.
 	Agent *bool
-	// Overrides contains additional create-style fields.
+	// Overrides contains environment, tags, timeout, secrets, S3, readiness, or command fields.
 	Overrides map[string]any
 }
 
@@ -486,13 +481,13 @@ func (request RestoreRequest) MarshalJSON() ([]byte, error) {
 
 // ForkRequest describes an ordered batch of clones from a snapshot.
 type ForkRequest struct {
-	// Count is the positive number of clones to create.
+	// Count is the number of clones to create atomically, from 1 through 32.
 	Count uint32
-	// Overrides contains additional create-style fields.
+	// Overrides contains runtime-only fields shared by every clone.
 	Overrides map[string]any
 }
 
-// MarshalJSON merges the fork count and create-style overrides.
+// MarshalJSON merges the fork count and runtime overrides.
 func (request ForkRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtras(map[string]any{"count": request.Count}, request.Overrides)
 }

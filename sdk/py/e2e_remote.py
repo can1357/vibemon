@@ -5,6 +5,9 @@ from __future__ import annotations
 import datetime
 import time
 from collections.abc import Callable, Iterator
+from typing import Any, TypeVar
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 def remote_double(value: int) -> int:
@@ -31,21 +34,21 @@ def remote_add(a: int, b: int) -> int:
     return a + b
 
 
-def _tag[F: Callable[..., object]](fn: F, **attributes: object) -> F:
+def _tag(fn: F, **attributes: object) -> F:
     for name, value in attributes.items():
         setattr(fn, name, value)
     return fn
 
 
-def _method[F: Callable[..., object]](fn: F) -> F:
+def _method(fn: F) -> F:
     return _tag(fn, __vmon_method__=True)
 
 
-def _enter[F: Callable[..., object]](fn: F) -> F:
+def _enter(fn: F) -> F:
     return _tag(fn, __vmon_enter__=True, __vmon_snapshot_enter__=False)
 
 
-def _exit[F: Callable[..., object]](fn: F) -> F:
+def _exit(fn: F) -> F:
     return _tag(fn, __vmon_exit__=True)
 
 

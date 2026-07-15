@@ -254,9 +254,9 @@ pub trait MeshControl: Send + Sync {
 	fn request_template_key(&self, params: &JsonObject) -> Option<String>;
 	fn has_local_template_key(&self, key: &str) -> bool;
 
-	fn authoritative_owner(&self, sid: &str) -> Option<(String, i64)>;
+	fn authoritative_owner(&self, sid: &str) -> MeshResult<Option<(String, i64)>>;
 	fn local_epoch(&self, sid: &str) -> i64;
-	fn owner_of(&self, sid: &str) -> Option<String>;
+	fn owner_of(&self, sid: &str) -> MeshResult<Option<String>>;
 	fn record_owner(&self, sid: &str, node_id: &str, epoch: i64);
 	fn broadcast_owner(&self, sid: &str, node_id: &str, epoch: i64);
 	fn forget_owner(&self, sid: &str);
@@ -357,7 +357,8 @@ pub trait MeshLeaseManager: Send + Sync {
 pub trait MeshRecordStore: Send + Sync {
 	fn get(&self, sid: &str) -> MeshResult<Option<CreateRecordWire>>;
 	fn put(&self, record: CreateRecordWire) -> MeshResult<()>;
-	fn remove(&self, sid: &str) -> MeshResult<()>;
+	fn remove(&self, sid: &str, owner: &str, epoch: i64) -> MeshResult<()>;
+	fn list(&self) -> MeshResult<Vec<CreateRecordWire>>;
 
 	fn put_if_newer(&self, record: CreateRecordWire) -> MeshResult<bool> {
 		let should_put = match self.get(&record.sid)? {
@@ -390,7 +391,7 @@ pub trait MeshReplicaStore: Send + Sync {
 		source_node: String,
 		snapshot_dir: String,
 		params: JsonObject,
-	) -> MeshResult<()>;
+	) -> BoxFuture<'_, MeshResult<()>>;
 	fn list(&self) -> MeshResult<Vec<String>>;
 	fn remove(&self, sid: &str) -> MeshResult<()>;
 }
@@ -651,13 +652,11 @@ async fn mesh_locate(
 ) -> RouteResult<Json<Value>> {
 	require_mesh_auth(&state, &headers, true)?;
 	if state.engine.has_sandbox(&sandbox_id) {
-		let (owner, epoch) = state
-			.mesh
-			.authoritative_owner(&sandbox_id)
+		let (owner, epoch) = map_mesh(state.mesh.authoritative_owner(&sandbox_id))?
 			.unwrap_or_else(|| (state.mesh.node_id(), state.mesh.local_epoch(&sandbox_id)));
 		return Ok(Json(json!({"owner": owner, "epoch": epoch})));
 	}
-	if let Some((owner, epoch)) = state.mesh.authoritative_owner(&sandbox_id) {
+	if let Some((owner, epoch)) = map_mesh(state.mesh.authoritative_owner(&sandbox_id))? {
 		return Ok(Json(json!({"owner": owner, "epoch": epoch})));
 	}
 	if let Some(record) = map_mesh(state.records.get(&sandbox_id))? {
@@ -764,11 +763,22 @@ async fn mesh_migrate_receive(
 	let digest = take_string(&mut body, "digest");
 	let base_digest = take_string(&mut body, "base_digest");
 	let source_url = take_string(&mut body, "source_url");
+	let record = body
+		.remove("record")
+		.ok_or_else(|| MeshRouteError::invalid("migration record is required"))?;
+	let record = CreateRecordWire::from_value(record).map_err(MeshRouteError::from)?;
 	let params = match body.remove("params") {
 		Some(Value::Object(params)) => params,
 		_ => JsonObject::new(),
 	};
 	let name = string_or(params.get("name"), String::new());
+	let epoch = to_i64(body.remove("epoch")).unwrap_or(0);
+	let owner = state.mesh.node_id();
+	if record.sid != name || record.owner != owner || record.epoch != epoch {
+		return Err(MeshRouteError::invalid(
+			"migration record does not match the target owner and epoch",
+		));
+	}
 	if digest.is_empty() || base_digest.is_empty() || source_url.is_empty() || name.is_empty() {
 		return Err(MeshRouteError::detail(
 			StatusCode::UNPROCESSABLE_ENTITY,
@@ -819,7 +829,6 @@ async fn mesh_migrate_receive(
 	// The installed delta dir gained the materialized rootfs, so its CAS
 	// pointer no longer matches the directory content.
 	let _ = cas::drop_pointer(&digest);
-	let epoch = to_i64(body.remove("epoch")).unwrap_or(0);
 	let lease_records = map_mesh(
 		state
 			.leases
@@ -837,9 +846,13 @@ async fn mesh_migrate_receive(
 			return Err(MeshRouteError::from(err));
 		},
 	};
-	let sid = sid_from_view(&restored).unwrap_or_else(|| name.clone());
+	let sid = record.sid.clone();
 	map_mesh(state.engine.record_volume_leases(&sid, lease_records))?;
-	state.mesh.record_owner(&name, &state.mesh.node_id(), epoch);
+	let restored = apply_view_detail(restored, &record);
+	// Commit local ownership before acknowledging the restore; the source's
+	// follow-up replication is best-effort.
+	map_mesh(state.records.put(record))?;
+	state.mesh.record_owner(&sid, &owner, epoch);
 	Ok(Json(restored))
 }
 
@@ -934,7 +947,8 @@ async fn mesh_replica_receive(
 	map_mesh(
 		state
 			.replicas
-			.put(name, digest, source_node, installed, params),
+			.put(name, digest, source_node, installed, params)
+			.await,
 	)?;
 	Ok(Json(json!({"ok": true})))
 }
@@ -970,12 +984,16 @@ async fn mesh_record_remove(
 ) -> RouteResult<Json<Value>> {
 	let headers = request.headers().clone();
 	require_mesh_auth(&state, &headers, true)?;
-	let body = json_object(request).await?;
-	let sid = string_or(body.get("sid"), String::new());
-	if !sid.is_empty() {
-		map_mesh(state.records.remove(&sid))?;
-		state.mesh.forget_owner(&sid);
+	let mut body = json_object(request).await?;
+	let sid = take_string(&mut body, "sid");
+	let owner = take_string(&mut body, "owner");
+	let epoch = to_i64(body.remove("epoch"))
+		.ok_or_else(|| MeshRouteError::invalid("record removal requires an epoch"))?;
+	if sid.is_empty() || owner.is_empty() {
+		return Err(MeshRouteError::invalid("record removal requires a sandbox id and owner"));
 	}
+	map_mesh(state.records.remove(&sid, &owner, epoch))?;
+	state.mesh.forget_owner(&sid);
 	Ok(Json(json!({"ok": true})))
 }
 
@@ -1273,7 +1291,7 @@ async fn worker_create(
 		let name = string_or(params.get("name"), String::new());
 		if !name.is_empty()
 			&& (state.engine.has_sandbox(&name)
-				|| state.mesh.owner_of(&name).is_some()
+				|| state.mesh.owner_of(&name)?.is_some()
 				|| scatter_locate(state, &name).await?.is_some())
 		{
 			return Err(MeshError::conflict(format!("sandbox {} already exists", py_repr(&name))));
@@ -1451,6 +1469,8 @@ pub(crate) async fn migrate_sandbox_to(
 ) -> RouteResult<Value> {
 	let started = Instant::now();
 	let peer = map_mesh(state.mesh.migration_target(&target))?;
+	let mut record = map_mesh(state.records.get(&sandbox_id))?
+		.ok_or_else(|| MeshRouteError::detail(StatusCode::NOT_FOUND, "unknown sandbox"))?;
 	// Phase 1 (pre-copy): checkpoint the running sandbox and let the target
 	// pull the bulk RAM+disk image; the source resumes right after the dump.
 	let precopy = map_mesh(state.engine.migrate_precopy(sandbox_id.clone()).await)?;
@@ -1500,16 +1520,17 @@ pub(crate) async fn migrate_sandbox_to(
 			return Err(MeshRouteError::from(err));
 		},
 	};
-	let epoch = state
-		.mesh
-		.authoritative_owner(&sandbox_id)
-		.map_or(0, |(_, epoch)| epoch)
-		+ 1;
+	let epoch =
+		map_mesh(state.mesh.authoritative_owner(&sandbox_id))?.map_or(0, |(_, epoch)| epoch) + 1;
+	record.params.clone_from(&fin.params);
+	record.owner.clone_from(&target);
+	record.epoch = epoch;
 	let receive = json!({
 		"digest": fin.digest,
 		"base_digest": precopy.digest,
 		"source_url": state.mesh.advertise(),
 		"params": fin.params.clone(),
+		"record": record.to_value(),
 		"epoch": epoch,
 	});
 	let mut view = match state
@@ -1542,12 +1563,7 @@ pub(crate) async fn migrate_sandbox_to(
 		},
 	};
 	let downtime_ms = blackout.elapsed().as_millis() as u64;
-	state.mesh.broadcast_owner(&sandbox_id, &target, epoch);
-	if let Some(mut record) = map_mesh(state.records.get(&sandbox_id))? {
-		record.owner = target.clone();
-		record.epoch = epoch;
-		map_mesh(replicate_record(state, record, false).await)?;
-	}
+	map_mesh(replicate_record(state, record, false).await)?;
 	map_mesh(
 		state
 			.leases
@@ -1639,7 +1655,8 @@ fn make_create_record(
 	}
 }
 
-fn apply_view_detail(view: Value, record: &CreateRecordWire) -> Value {
+/// Adds authoritative mesh placement fields to an engine-owned sandbox view.
+pub(crate) fn apply_view_detail(view: Value, record: &CreateRecordWire) -> Value {
 	let mut object = match view {
 		Value::Object(object) => object,
 		other => return other,

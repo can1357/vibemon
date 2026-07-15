@@ -347,3 +347,14 @@ lima-seccomp-audit:
 # Open an interactive shell in the Lima guest.
 lima-shell: _lima-check
     @exec limactl shell '{{lima_vm}}'
+
+# Validate systemd, Compose, Helm templates, and Kubernetes schemas.
+validate-deploy:
+    shellcheck deploy/single-node/*.sh
+    VMON_API_TOKEN=validation-token-000000000000 docker compose -f deploy/single-node/docker-compose.yml config --quiet
+    docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 lint /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml
+    docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 template vmon /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml | docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary
+
+# Package the deployment assets into a release tarball
+package-deploy:
+    ./scripts/package-release.sh

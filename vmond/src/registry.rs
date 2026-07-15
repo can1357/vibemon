@@ -85,6 +85,8 @@ impl VmRecord {
 		out.insert("id".to_owned(), json!(self.id));
 		out.insert("name".to_owned(), json!(self.name));
 		out.insert("status".to_owned(), json!(self.status));
+		out.insert("pid".to_owned(), json!(self.pid));
+		out.insert("source".to_owned(), json!(self.source));
 		out.insert("created_at".to_owned(), json!(self.created_at));
 		out.insert("last_active".to_owned(), json!(self.last_active));
 		out.insert("expires_at".to_owned(), json!(self.expires_at()));
@@ -111,9 +113,10 @@ impl Registry {
 
 	/// Rebuild records from `$VMON_HOME/vms/<name>/meta.json`.
 	///
-	/// The returned `(record_name, volume_names)` entries are the volume locks
-	/// the engine must re-acquire for records still backed by a live VMM
-	/// process.
+	/// Canonical identity and lifecycle timestamps are restored from metadata;
+	/// legacy records without them keep their directory name as the stable ID.
+	/// The returned `(record_id, volume_names)` entries are the volume locks the
+	/// engine must re-acquire for records still backed by a live VMM process.
 	pub fn rehydrate(&self, home: &Home) -> Result<VolumeLockRequests> {
 		let vms_dir = home.vms_dir();
 		if !vms_dir.is_dir() {
@@ -156,25 +159,27 @@ impl Registry {
 				"stopped".to_owned()
 			};
 			let now = unix_time();
+			let id = string_field(&meta, "sandbox_id").unwrap_or_else(|| name.clone());
+			let created_at = number_field(&meta, "created_at").unwrap_or(now);
 			let mut record = VmRecord {
-				id: name.clone(),
+				id: id.clone(),
 				name: name.clone(),
 				status: status.clone(),
 				pid,
 				source: source_of(&meta),
-				created_at: now,
+				created_at,
 				timeout: timeout_of(&meta),
 				detail: Value::Object(meta.clone()),
 				tags: tags_of(&meta),
-				last_active: now,
-				terminated_at: None,
-				error: None,
+				last_active: number_field(&meta, "last_active").unwrap_or(created_at),
+				terminated_at: number_field(&meta, "terminated_at"),
+				error: string_field(&meta, "error"),
 			};
 
 			if running {
 				let volume_names = volume_names(&meta);
 				if !volume_names.is_empty() {
-					lock_requests.push((name.clone(), volume_names));
+					lock_requests.push((id.clone(), volume_names));
 				}
 				if meta.get("tap").is_some_and(json_truthy) {
 					detail_object_mut(&mut record.detail)
@@ -188,7 +193,7 @@ impl Registry {
 					// best effort.
 				}
 			}
-			records.insert(name, record);
+			records.insert(id, record);
 		}
 
 		let mut idempotency = HashMap::new();
@@ -209,9 +214,9 @@ impl Registry {
 		Ok(lock_requests)
 	}
 
-	/// Return a cloned record by name.
-	pub fn get(&self, name: &str) -> Option<VmRecord> {
-		self.records.read().get(name).cloned()
+	/// Return a cloned record by stable ID.
+	pub fn get(&self, id: &str) -> Option<VmRecord> {
+		self.records.read().get(id).cloned()
 	}
 
 	/// Return all records sorted by name for deterministic callers.
@@ -226,52 +231,72 @@ impl Registry {
 		self.idempotency.read().get(key).cloned()
 	}
 
-	/// Record an idempotency key mapping for a sandbox name.
-	pub fn record_idempotency(&self, name: &str, key: &str) {
+	/// Record an idempotency key mapping for a stable sandbox ID.
+	pub fn record_idempotency(&self, id: &str, key: &str) {
 		if !key.is_empty() {
 			self
 				.idempotency
 				.write()
-				.insert(key.to_owned(), name.to_owned());
+				.insert(key.to_owned(), id.to_owned());
 		}
 	}
 
-	/// Insert or replace one record.
+	/// Insert or replace one record by stable ID.
 	pub fn insert(&self, record: VmRecord) {
-		self.records.write().insert(record.name.clone(), record);
+		self.records.write().insert(record.id.clone(), record);
 	}
 
-	/// Remove one record and any idempotency entries pointing at it.
-	pub fn remove(&self, name: &str) -> Option<VmRecord> {
-		let removed = self.records.write().remove(name);
+	/// Persist canonical identity fields, then insert the record.
+	pub fn insert_persisted(&self, home: &Home, record: VmRecord) -> Result<()> {
+		let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+		meta.insert("sandbox_id".to_owned(), json!(record.id));
+		meta.insert("created_at".to_owned(), json!(record.created_at));
+		meta.insert("last_active".to_owned(), json!(record.last_active));
+		meta.insert("status".to_owned(), json!(record.status));
+		meta.insert("terminated_at".to_owned(), json!(record.terminated_at));
+		meta.insert("error".to_owned(), json!(record.error));
+		write_meta_map(&home.meta_path(&record.name), &meta)?;
+		self.insert(record);
+		Ok(())
+	}
+
+	/// Remove one record by stable ID and clear its idempotency entries.
+	pub fn remove(&self, id: &str) -> Option<VmRecord> {
+		let removed = self.records.write().remove(id);
 		if removed.is_some() {
-			self.idempotency.write().retain(|_, sid| sid != name);
+			self
+				.idempotency
+				.write()
+				.retain(|_, sandbox_id| sandbox_id != id);
 		}
 		removed
 	}
 
-	/// Mutate one record in place and return a clone of the updated record.
-	pub fn update<F>(&self, name: &str, update: F) -> Option<VmRecord>
+	/// Mutate one record by stable ID and return the updated clone.
+	pub fn update<F>(&self, id: &str, update: F) -> Option<VmRecord>
 	where
 		F: FnOnce(&mut VmRecord),
 	{
 		let mut records = self.records.write();
-		let record = records.get_mut(name)?;
+		let record = records.get_mut(id)?;
 		update(record);
 		Some(record.clone())
 	}
 
-	/// Drop a stale idempotency mapping if it still points at `name`.
-	pub fn remove_idempotency_for(&self, key: &str, name: &str) {
+	/// Drop a stale idempotency mapping if it still points at `id`.
+	pub fn remove_idempotency_for(&self, key: &str, id: &str) {
 		let mut idempotency = self.idempotency.write();
-		if idempotency.get(key).is_some_and(|sid| sid == name) {
+		if idempotency
+			.get(key)
+			.is_some_and(|sandbox_id| sandbox_id == id)
+		{
 			idempotency.remove(key);
 		}
 	}
 
 	/// Replace or add one field in the durable detail object.
-	pub fn set_detail_field(&self, name: &str, key: &str, value: Value) -> Option<VmRecord> {
-		self.update(name, |record| {
+	pub fn set_detail_field(&self, id: &str, key: &str, value: Value) -> Option<VmRecord> {
+		self.update(id, |record| {
 			detail_object_mut(&mut record.detail).insert(key.to_owned(), value);
 		})
 	}
@@ -296,16 +321,17 @@ impl Registry {
 		*self.idempotency.write() = idempotency;
 	}
 
-	/// Update a record and persist terminal status into `meta.json`.
+	/// Update a record by stable ID and persist terminal status into
+	/// `meta.json`.
 	pub fn persist_record_status(
 		&self,
 		home: &Home,
-		name: &str,
+		id: &str,
 		status: &str,
 		returncode: Option<i64>,
 		terminated_at: Option<f64>,
 	) -> Result<()> {
-		if let Some(record) = self.records.write().get_mut(name) {
+		let name = if let Some(record) = self.records.write().get_mut(id) {
 			status.clone_into(&mut record.status);
 			let detail = detail_object_mut(&mut record.detail);
 			detail.insert("status".to_owned(), json!(status));
@@ -316,8 +342,11 @@ impl Registry {
 				record.terminated_at = Some(ts);
 				detail.insert("terminated_at".to_owned(), json!(ts));
 			}
-		}
-		let mut meta = read_meta_map(&home.meta_path(name))?;
+			record.name.clone()
+		} else {
+			id.to_owned()
+		};
+		let mut meta = read_meta_map(&home.meta_path(&name))?;
 		meta.insert("status".to_owned(), json!(status));
 		if let Some(code) = returncode {
 			meta.insert("returncode".to_owned(), json!(code));
@@ -325,7 +354,7 @@ impl Registry {
 		if let Some(ts) = terminated_at {
 			meta.insert("terminated_at".to_owned(), json!(ts));
 		}
-		write_meta_map(&home.meta_path(name), &meta)
+		write_meta_map(&home.meta_path(&name), &meta)
 	}
 
 	fn replace(&self, records: HashMap<String, VmRecord>, idempotency: HashMap<String, String>) {
@@ -364,6 +393,21 @@ fn pid_of(meta: &Map<String, Value>) -> Option<i32> {
 
 fn timeout_of(meta: &Map<String, Value>) -> Option<f64> {
 	meta.get("timeout_secs")?.as_f64()
+}
+
+fn string_field(meta: &Map<String, Value>, key: &str) -> Option<String> {
+	meta
+		.get(key)
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.map(str::to_owned)
+}
+
+fn number_field(meta: &Map<String, Value>, key: &str) -> Option<f64> {
+	meta
+		.get(key)
+		.and_then(Value::as_f64)
+		.filter(|value| value.is_finite())
 }
 
 fn tags_of(meta: &Map<String, Value>) -> HashMap<String, String> {
@@ -560,6 +604,32 @@ mod tests {
 		assert_eq!(live.source.as_deref(), Some("base-snap"));
 		assert_eq!(live.detail["tunnels_lost"], true);
 		assert_eq!(registry.find_by_idempotency_key("idem-live"), Some("live".to_owned()));
+	}
+
+	#[test]
+	fn persisted_identity_survives_registry_rehydrate() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let mut record = VmRecord::new("sb-stable", "sandbox-directory", "stopped");
+		record.created_at = 10.0;
+		record.last_active = 12.0;
+		record.terminated_at = Some(13.0);
+		record.error = Some("guest exited".to_owned());
+
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, record)
+			.expect("persist record");
+		let rehydrated = Registry::new();
+		rehydrated.rehydrate(&home).expect("rehydrate");
+
+		let restored = rehydrated.get("sb-stable").expect("stable id");
+		assert_eq!(restored.name, "sandbox-directory");
+		assert_eq!(restored.created_at, 10.0);
+		assert_eq!(restored.last_active, 12.0);
+		assert_eq!(restored.terminated_at, Some(13.0));
+		assert_eq!(restored.error.as_deref(), Some("guest exited"));
+		assert!(rehydrated.get("sandbox-directory").is_none());
 	}
 
 	fn write_fixture(home: &Home, name: &str, value: Value) {

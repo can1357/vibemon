@@ -34,6 +34,7 @@ where
 		.map_err(EngineError::from)?;
 	let engine = Arc::new(Engine::new(config.clone())?);
 	let mesh = MeshRuntime::new(config.clone(), home.clone(), engine.clone())?;
+	runtime.block_on(mesh.verify_storage())?;
 	let engine_api: Arc<dyn EngineApi> = engine.clone();
 	let result = runtime.block_on(async {
 		prepare_home(&home)?;
@@ -62,7 +63,7 @@ async fn run_listeners(
 	};
 	let server_uid = current_uid();
 	let uds_listener = UdsPeerListener::new(uds, server_uid);
-	let functions = FunctionDomain::open(home.clone(), engine.clone())?;
+	let functions = FunctionDomain::open(home.clone(), engine.clone(), &config)?;
 	let base_state = ApiState::new(engine, functions.clone(), config.clone(), Transport::Unix)
 		.with_mesh(mesh.clone());
 	let uds_router = routes::router(base_state.with_transport(Transport::Unix));

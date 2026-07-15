@@ -36,26 +36,28 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 R = TypeVar("R")
 F = TypeVar("F", bound=Callable[..., Any])
+Q = ParamSpec("Q")
+T = TypeVar("T")
 
 
 class _AppFunctionDecorator(Protocol):
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, Iterator[T]], /
     ) -> GeneratorRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, AsyncIterator[T]], /
     ) -> AsyncGeneratorRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](  # type: ignore[overload-overlap]
+    def __call__(  # type: ignore[overload-overlap]
         self, function: Callable[Q, Coroutine[Any, Any, T]], /
     ) -> AsyncRemoteFunction[Q, T]: ...
 
     @overload
-    def __call__[**Q, T](self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
+    def __call__(self, function: Callable[Q, T], /) -> SyncRemoteFunction[Q, T]: ...
 
 
 @dataclass(frozen=True, slots=True)

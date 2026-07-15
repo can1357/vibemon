@@ -6,9 +6,7 @@
 
 use std::{
 	collections::HashMap,
-	fs::File,
 	future::Future,
-	io::Read,
 	path::{Component, Path},
 	pin::Pin,
 	sync::{
@@ -33,6 +31,7 @@ use super::{
 	store::Store,
 };
 use crate::{
+	config::ServeConfig,
 	engine::{EngineApi, ExecRequest},
 	home::Home,
 	models::{RestoreBody, SandboxCreate},
@@ -631,13 +630,14 @@ pub trait Worker: Send + Sync {
 pub struct EngineExecutor {
 	home:   Home,
 	engine: Arc<dyn EngineApi>,
+	config: ServeConfig,
 	serial: AtomicU64,
 }
 
 impl EngineExecutor {
 	/// Construct a shared executor rooted in one daemon home.
-	pub fn new(home: Home, engine: Arc<dyn EngineApi>) -> Arc<Self> {
-		Arc::new(Self { home, engine, serial: AtomicU64::new(1) })
+	pub fn new(home: Home, engine: Arc<dyn EngineApi>, config: ServeConfig) -> Arc<Self> {
+		Arc::new(Self { home, engine, config, serial: AtomicU64::new(1) })
 	}
 }
 
@@ -649,9 +649,10 @@ impl Executor for EngineExecutor {
 	) -> BoxFuture<Result<Arc<dyn Worker>, WorkerError>> {
 		let engine = Arc::clone(&self.engine);
 		let home = self.home.clone();
+		let config = self.config.clone();
 		let serial = self.serial.fetch_add(1, Ordering::Relaxed);
 		Box::pin(async move {
-			EngineWorker::spawn(home, engine, revision, secrets, serial)
+			EngineWorker::spawn(home, engine, config, revision, secrets, serial)
 				.await
 				.map(|w| w as Arc<dyn Worker>)
 		})
@@ -665,8 +666,9 @@ impl Executor for EngineExecutor {
 	) -> BoxFuture<Result<Arc<dyn Worker>, WorkerError>> {
 		let engine = Arc::clone(&self.engine);
 		let home = self.home.clone();
+		let config = self.config.clone();
 		Box::pin(async move {
-			EngineWorker::restore(home, engine, revision, snapshot, secrets)
+			EngineWorker::restore(home, engine, config, revision, snapshot, secrets)
 				.await
 				.map(|w| w as Arc<dyn Worker>)
 		})
@@ -678,6 +680,7 @@ struct EngineWorker {
 	revision_id:          String,
 	revision:             Arc<pb::FunctionRevision>,
 	home:                 Home,
+	artifacts:            ArtifactStore,
 	engine:               Arc<dyn EngineApi>,
 	session:              ProtocolSession,
 	capacity:             usize,
@@ -695,17 +698,21 @@ struct EngineWorker {
 	cloudpickle_version:  Option<String>,
 	max_batch_size:       usize,
 	initial_snapshot:     RwLock<Option<WorkerSnapshot>>,
+	config:               ServeConfig,
 }
 
 impl EngineWorker {
 	async fn spawn(
 		home: Home,
 		engine: Arc<dyn EngineApi>,
+		config: ServeConfig,
 		revision: Arc<pb::FunctionRevision>,
 		secrets: SecretValues,
 		serial: u64,
 	) -> Result<Arc<Self>, WorkerError> {
 		let started = Instant::now();
+		let artifacts = ArtifactStore::open_with_config(home.function_artifacts_dir(), &config)
+			.map_err(engine_error)?;
 		let expected = SnapshotProvenance::for_revision(&revision)?;
 		let spec = revision
 			.spec
@@ -718,7 +725,7 @@ impl EngineWorker {
 		let protocol_requirements = protocol_requirements(spec)?;
 		let startup_deadline = started + startup;
 		let name = worker_name(&expected.revision_id, serial);
-		let create = sandbox_create(&home, spec, &name, &secrets)?;
+		let create = sandbox_create(&home, &artifacts, spec, &name, &secrets)?;
 		let view = blocking(remaining(startup_deadline)?, {
 			let engine = Arc::clone(&engine);
 			move || engine.create(create)
@@ -734,7 +741,7 @@ impl EngineWorker {
 			let source = package.source.as_ref().ok_or_else(|| {
 				WorkerError::platform("invalid_revision", "package source is required")
 			})?;
-			read_artifact_at(&home, source)?
+			read_artifact_at(&artifacts, source)?
 		};
 		let package_sha256 = hex::encode(Sha256::digest(&artifact));
 		let package_size = artifact.len() as u64;
@@ -792,6 +799,7 @@ impl EngineWorker {
 			revision_id: expected.revision_id.clone(),
 			revision: Arc::clone(&revision),
 			home,
+			artifacts,
 			engine,
 			session,
 			capacity: worker_capacity(spec),
@@ -809,6 +817,7 @@ impl EngineWorker {
 			startup_millis: millis(started.elapsed()),
 			restored: false,
 			initial_snapshot: RwLock::new(None),
+			config,
 		});
 		let initialized = async {
 			worker.define(remaining(startup_deadline)?).await?;
@@ -845,10 +854,13 @@ impl EngineWorker {
 	async fn restore(
 		home: Home,
 		engine: Arc<dyn EngineApi>,
+		config: ServeConfig,
 		revision: Arc<pb::FunctionRevision>,
 		snapshot: WorkerSnapshot,
 		secrets: SecretValues,
 	) -> Result<Arc<Self>, WorkerError> {
+		let artifacts = ArtifactStore::open_with_config(home.function_artifacts_dir(), &config)
+			.map_err(engine_error)?;
 		ensure_snapshot_safe(revision.spec.as_ref())?;
 		if !snapshot.provenance.matches(&revision) {
 			return Err(WorkerError::platform(
@@ -920,6 +932,7 @@ impl EngineWorker {
 			revision_id: snapshot.provenance.revision_id.clone(),
 			revision: Arc::clone(&revision),
 			home,
+			artifacts,
 			engine,
 			session,
 			capacity,
@@ -937,6 +950,7 @@ impl EngineWorker {
 			startup_millis: millis(started.elapsed()),
 			restored: true,
 			initial_snapshot: RwLock::new(Some(snapshot)),
+			config,
 		});
 		let restored = async {
 			worker.define(remaining(startup_deadline)?).await?;
@@ -1104,7 +1118,7 @@ impl EngineWorker {
 		}
 		let guest_path =
 			if let Some(pb::value_envelope::Storage::Artifact(reference)) = &envelope.storage {
-				let bytes = read_artifact_at(&self.home, reference)?;
+				let bytes = read_artifact_at(&self.artifacts, reference)?;
 				let path = guest_value_path();
 				self
 					.engine
@@ -1164,7 +1178,7 @@ impl EngineWorker {
 		let bytes = match envelope.storage.as_ref() {
 			Some(pb::value_envelope::Storage::InlineData(bytes)) => bytes.clone(),
 			Some(pb::value_envelope::Storage::Artifact(reference)) => {
-				read_artifact_at(&self.home, reference)?
+				read_artifact_at(&self.artifacts, reference)?
 			},
 			None => {
 				return Err(WorkerError::platform(
@@ -1285,6 +1299,7 @@ impl EngineWorker {
 		let event_engine = Arc::clone(&self.engine);
 		let event_worker_id = self.id.clone();
 		let event_artifact_root = self.home.root().join("functions/artifacts");
+		let event_config = self.config.clone();
 		let event_worker = match std::thread::Builder::new()
 			.name(format!("vmon-events-{request_id}"))
 			.spawn(move || {
@@ -1294,6 +1309,7 @@ impl EngineWorker {
 							event_engine.as_ref(),
 							&event_worker_id,
 							&event_artifact_root,
+							&event_config,
 							&mut frame,
 						) {
 						*event_failure.lock() = Some(error);
@@ -1326,6 +1342,7 @@ impl EngineWorker {
 		let timeout = execution_timeout(&self.revision);
 		let session = self.session.clone();
 		let closed = Arc::clone(&self.closed);
+		let config_clone = self.config.clone();
 		let artifact_root = self.home.root().join("functions/artifacts");
 		let completion = Box::pin(async move {
 			let started = Instant::now();
@@ -1363,7 +1380,13 @@ impl EngineWorker {
 				let output_engine = Arc::clone(&engine);
 				let output_id = id.clone();
 				result = match tokio::task::spawn_blocking(move || {
-					materialize_output(output_engine.as_ref(), &output_id, &artifact_root, &mut frame)?;
+					materialize_output(
+						output_engine.as_ref(),
+						&output_id,
+						&artifact_root,
+						&config_clone,
+						&mut frame,
+					)?;
 					Ok::<Frame, WorkerError>(frame)
 				})
 				.await
@@ -1570,6 +1593,7 @@ impl Worker for EngineWorker {
 			let timeout = execution_timeout(&self.revision);
 			let startup = self.startup_millis;
 			let restored = self.restored;
+			let config = self.config.clone();
 			let artifact_root = self.home.root().join("functions/artifacts");
 			let session = self.session.clone();
 			let closed = Arc::clone(&self.closed);
@@ -1666,7 +1690,13 @@ impl Worker for EngineWorker {
 					}
 					let mut value_frame =
 						Frame(json!({"value":result.get("value").cloned().unwrap_or(Value::Null)}));
-					materialize_output(engine.as_ref(), &worker_id, &artifact_root, &mut value_frame)?;
+					materialize_output(
+						engine.as_ref(),
+						&worker_id,
+						&artifact_root,
+						&config,
+						&mut value_frame,
+					)?;
 					let value = wire_to_envelope(value_frame.0.get("value").unwrap())?;
 					outcomes.push(BatchItemOutcome {
 						request_id:  input.request_id,
@@ -1864,6 +1894,7 @@ fn apply_sandbox_resources(create: &mut SandboxCreate, resources: &pb::ResourceS
 
 fn sandbox_create(
 	home: &Home,
+	artifacts: &ArtifactStore,
 	spec: &pb::FunctionSpec,
 	name: &str,
 	secrets: &SecretValues,
@@ -1878,7 +1909,7 @@ fn sandbox_create(
 		.map_or(pb::CpuArchitecture::Unspecified, |r| {
 			pb::CpuArchitecture::try_from(r.architecture).unwrap_or(pb::CpuArchitecture::Unspecified)
 		});
-	let image = image::realize(home, image_spec, architecture).map_err(engine_error)?;
+	let image = image::realize(home, artifacts, image_spec, architecture).map_err(engine_error)?;
 	sandbox_create_from_image(spec, name, secrets, image)
 }
 
@@ -2200,6 +2231,7 @@ fn materialize_output(
 	engine: &dyn EngineApi,
 	worker_id: &str,
 	artifact_root: &Path,
+	config: &ServeConfig,
 	frame: &mut Frame,
 ) -> Result<(), WorkerError> {
 	let Some(value) = frame.0.get_mut("value") else {
@@ -2231,7 +2263,7 @@ fn materialize_output(
 		.map_err(engine_error);
 	let bytes = read?;
 	delete?;
-	materialize_output_bytes(artifact_root, value, bytes)?;
+	materialize_output_bytes(artifact_root, config, value, bytes)?;
 	if let Some(object) = value.as_object_mut() {
 		object.remove("path");
 		object.remove("remove_after_read");
@@ -2241,6 +2273,7 @@ fn materialize_output(
 
 fn materialize_output_bytes(
 	artifact_root: &Path,
+	config: &ServeConfig,
 	value: &mut Value,
 	bytes: Vec<u8>,
 ) -> Result<(), WorkerError> {
@@ -2287,7 +2320,8 @@ fn materialize_output_bytes(
 		value["inline_data"] = json!(BASE64.encode(bytes));
 	} else {
 		let stored_digest = Sha256::digest(&bytes);
-		let artifacts = ArtifactStore::open(artifact_root.to_owned()).map_err(engine_error)?;
+		let artifacts =
+			ArtifactStore::open_with_config(artifact_root.to_owned(), config).map_err(engine_error)?;
 		let stored = artifacts
 			.put_verified(&stored_digest, bytes.len() as u64, &bytes)
 			.map_err(engine_error)?;
@@ -2295,7 +2329,7 @@ fn materialize_output_bytes(
 			.parent()
 			.and_then(Path::parent)
 			.ok_or_else(|| WorkerError::infrastructure("artifact_store", "invalid artifact root"))?;
-		let store = Store::open(&Home::new(home_root)).map_err(engine_error)?;
+		let store = Store::open_with_config(&Home::new(home_root), config).map_err(engine_error)?;
 		store
 			.record_artifact(
 				&stored.digest,
@@ -2686,7 +2720,10 @@ fn terminal_error(frame: &Frame) -> Result<(), WorkerError> {
 	};
 	Err(runner_failure(error, kind, 0))
 }
-fn read_artifact_at(home: &Home, reference: &pb::ArtifactRef) -> Result<Vec<u8>, WorkerError> {
+fn read_artifact_at(
+	artifacts: &ArtifactStore,
+	reference: &pb::ArtifactRef,
+) -> Result<Vec<u8>, WorkerError> {
 	let digest = reference
 		.digest
 		.as_ref()
@@ -2695,38 +2732,22 @@ fn read_artifact_at(home: &Home, reference: &pb::ArtifactRef) -> Result<Vec<u8>,
 		return Err(WorkerError::platform("invalid_artifact", "artifact digest must be SHA-256"));
 	}
 	let hex = hex::encode(&digest.value);
-	let path = home
-		.root()
-		.join("functions/artifacts")
-		.join(&hex[..2])
-		.join(&hex[2..]);
-	let bytes = read_bounded_file(&path, 64 * 1024 * 1024).map_err(|error| {
-		if error.kind() == std::io::ErrorKind::InvalidData {
-			WorkerError::platform("artifact_too_large", "artifact exceeds 64 MiB worker limit")
-		} else {
-			WorkerError::platform("artifact_unavailable", format!("artifact {hex} is unavailable"))
-		}
-	})?;
+	let bytes = artifacts
+		.read_bounded(&hex, None, 64 * 1024 * 1024)
+		.map_err(|error| {
+			if error.code == crate::ErrorCode::Invalid
+				&& error.message.contains("in-memory read limit")
+			{
+				WorkerError::platform("artifact_too_large", "artifact exceeds 64 MiB worker limit")
+			} else {
+				WorkerError::platform(
+					"artifact_unavailable",
+					format!("artifact {hex} is unavailable: {}", error.message),
+				)
+			}
+		})?;
 	if Sha256::digest(&bytes).as_slice() != digest.value.as_slice() {
 		return Err(WorkerError::platform("artifact_corrupt", "artifact digest mismatch"));
-	}
-	Ok(bytes)
-}
-fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-	let file = File::open(path)?;
-	if file.metadata()?.len() > limit {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			"file exceeds bounded read limit",
-		));
-	}
-	let mut bytes = Vec::with_capacity(usize::try_from(limit.min(1024 * 1024)).unwrap_or(0));
-	file.take(limit + 1).read_to_end(&mut bytes)?;
-	if bytes.len() as u64 > limit {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			"file grew beyond bounded read limit",
-		));
 	}
 	Ok(bytes)
 }
@@ -3166,7 +3187,8 @@ mod tests {
 			"sha256":format!("sha256:{checksum}"),
 			"uncompressed_size":bytes.len(),
 		});
-		materialize_output_bytes(&artifact_root, &mut value, bytes.clone()).unwrap();
+		materialize_output_bytes(&artifact_root, &ServeConfig::default(), &mut value, bytes.clone())
+			.unwrap();
 		let digest = value["artifact_digest"].as_str().unwrap();
 		let store = Store::open(&home).unwrap();
 		let metadata = store.stat_artifact(digest).unwrap();
@@ -3201,18 +3223,6 @@ mod tests {
 		assert_eq!(frame["definition"], definition);
 		assert_eq!(frame["definition"]["trusted"], true);
 		assert_eq!(frame["definition"]["value"]["cloudpickle_version"], "3.1.1");
-	}
-
-	#[test]
-	fn bounded_artifact_read_rejects_oversized_file_before_allocation() {
-		let temp = tempfile::tempdir().unwrap();
-		let path = temp.path().join("oversized");
-		let file = File::create(&path).unwrap();
-		file.set_len(1025).unwrap();
-		assert_eq!(
-			read_bounded_file(&path, 1024).unwrap_err().kind(),
-			std::io::ErrorKind::InvalidData
-		);
 	}
 
 	#[test]

@@ -38,7 +38,7 @@ use self::{
 		WorkerEvent, WorkerOutcome, WorkerSnapshot,
 	},
 };
-use crate::{EngineError, Result, engine::EngineApi, home::Home};
+use crate::{EngineError, Result, config::ServeConfig, engine::EngineApi, home::Home};
 
 const EVENT_REPLAY_LIMIT: u32 = 10_000;
 const SNAPSHOT_ARTIFACT_LIMIT: u64 = 64 * 1024 * 1024;
@@ -101,14 +101,14 @@ pub struct FunctionDomain {
 impl FunctionDomain {
 	/// Open durable state and start lease-recovery, scheduler, schedule, and GC
 	/// tasks.
-	pub fn open(home: Home, engine: Arc<dyn EngineApi>) -> Result<Arc<Self>> {
+	pub fn open(home: Home, engine: Arc<dyn EngineApi>, config: &ServeConfig) -> Result<Arc<Self>> {
 		let _runtime = tokio::runtime::Handle::try_current()
 			.map_err(|_| EngineError::engine("FunctionDomain::open requires a Tokio runtime"))?;
-		let store = Arc::new(Store::open(&home)?);
+		let store = Arc::new(Store::open_with_config(&home, config)?);
 		let now = unix_millis();
 		store.recover_startup(now)?;
-		let artifacts = ArtifactStore::open(home.function_artifacts_dir())?;
-		let executor: Arc<dyn Executor> = EngineExecutor::new(home.clone(), engine);
+		let artifacts = ArtifactStore::open_with_config(home.function_artifacts_dir(), config)?;
+		let executor: Arc<dyn Executor> = EngineExecutor::new(home.clone(), engine, config.clone());
 		let metrics = Arc::new(FunctionMetrics::default());
 		let control = Arc::new(SchedulerControl::new(Arc::clone(&metrics)));
 		let (shutdown, _) = broadcast::channel(4);
@@ -170,7 +170,7 @@ impl FunctionDomain {
 		spec: &pb::ImageSpec,
 		architecture: pb::CpuArchitecture,
 	) -> Result<pb::ImageSpec> {
-		Ok(image::realize(&self.home, spec, architecture)?.resolved_spec)
+		Ok(image::realize(&self.home, &self.artifacts, spec, architecture)?.resolved_spec)
 	}
 
 	/// Wake the scheduler after a transaction creates or requeues work.

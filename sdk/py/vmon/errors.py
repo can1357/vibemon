@@ -4,11 +4,21 @@
 class APIError(Exception):
     """A structured error response returned by the vmon API."""
 
-    def __init__(self, message: str, *, code: str = "engine", status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "engine",
+        status: int | None = None,
+        retryable: bool = False,
+        action: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.message: str = message
         self.code: str = code
         self.status: int | None = status
+        self.retryable: bool = retryable
+        self.action: str | None = action
 
 
 class TransportError(Exception):

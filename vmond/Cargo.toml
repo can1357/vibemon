@@ -19,7 +19,10 @@ flume = { version = "0.11", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
 hmac = "0.12"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
+postgres = "0.19"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 include_dir = "0.7"
 libc = "0.2"
 parking_lot = "0.12.5"

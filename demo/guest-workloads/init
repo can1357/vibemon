@@ -1,0 +1,33 @@
+#!/bin/busybox sh
+set -eu
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+echo "WORKLOAD_INIT_START"
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs -o mode=1777,size=512m shm /dev/shm
+chmod 1777 /tmp
+
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+if [ -e /sys/fs/cgroup/cgroup.subtree_control ]; then
+  mkdir -p /sys/fs/cgroup/vmon
+  chown vmon:vmon /sys/fs/cgroup/vmon
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -c /dev/hvc0 ] && break
+  sleep 1
+done
+[ -c /dev/hvc0 ] || {
+  echo "VMON_TEST_FAIL: wait for /dev/hvc0" >&2
+  poweroff -f
+}
+
+echo "AGENT_INIT_OK"
+exec /usr/bin/vmon-agent

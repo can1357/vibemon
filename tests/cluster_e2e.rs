@@ -24,6 +24,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use tonic::{Code, Request};
 use vmon_proto::v1 as pb;
 
 const LOOPBACK: &str = "127.0.0.1";
@@ -880,7 +881,7 @@ fn try_list_sandboxes_backend(node: &NodeProc) -> Result<Value, String> {
 
 fn list_sandboxes_via(grpc: common::api::Grpc, mesh_hop: bool) -> Result<Value, String> {
 	let mut sandboxes = grpc.sandboxes();
-	let mut request = tonic::Request::new(pb::ListSandboxesRequest { tags: Vec::new() });
+	let mut request = Request::new(pb::ListSandboxesRequest { tags: Vec::new() });
 	if mesh_hop {
 		request
 			.metadata_mut()
@@ -897,6 +898,21 @@ fn list_sandboxes_via(grpc: common::api::Grpc, mesh_hop: bool) -> Result<Value, 
 		.collect::<Result<Vec<_>, _>>()
 		.map_err(|err| format!("invalid sandbox view JSON: {err}"))?;
 	Ok(json!({ "sandboxes": rows }))
+}
+
+/// Check one node's local engine without following mesh ownership.
+fn local_sandbox_exists(node: &NodeProc, sid: &str) -> Result<bool, String> {
+	let grpc = node.grpc_backend()?;
+	let mut sandboxes = grpc.sandboxes();
+	let mut request = Request::new(pb::SandboxRef { id: sid.to_owned() });
+	request
+		.metadata_mut()
+		.insert("x-vmon-mesh-hop", "1".parse().expect("static metadata value"));
+	match grpc.block_on(sandboxes.get(request)) {
+		Ok(_) => Ok(true),
+		Err(status) if status.code() == Code::NotFound => Ok(false),
+		Err(status) => Err(common::api::status_detail(&status)),
+	}
 }
 
 fn remove_sandbox_best_effort(nodes: &[&NodeProc], sid: &str) {
@@ -1254,6 +1270,7 @@ fn two_node_migrate_moves_running_sandbox() {
 	let sid = unique("mig");
 	let ram_marker = format!("ram-{sid}");
 	let disk_marker = format!("disk-{sid}");
+	let secret_marker = format!("secret-{sid}");
 	let mut gateway_a = start_node(home_a, free_port(), &[], "mig-a", &token, false);
 	let mut gateway_b = start_node(home_b, free_port(), &[], "mig-b", &token, false);
 
@@ -1290,6 +1307,7 @@ fn two_node_migrate_moves_running_sandbox() {
 				"block_network": true,
 				"timeout_secs": 900,
 				"ha": "off",
+				"secrets": [{"name": "migration", "values": {"MIGRATION_SECRET": secret_marker}}],
 				"idempotency_key": format!("{sid}-create"),
 			}),
 		)
@@ -1319,9 +1337,9 @@ fn two_node_migrate_moves_running_sandbox() {
 		assert_eq!(exit, 0, "writing markers failed stdout={stdout:?} stderr={stderr:?}");
 
 		let migrated = {
-			let grpc = source
+			let grpc = target
 				.grpc()
-				.unwrap_or_else(|err| panic!("gRPC connect to {} failed: {err}", source.name));
+				.unwrap_or_else(|err| panic!("gRPC connect to {} failed: {err}", target.name));
 			let mut sandboxes = grpc.sandboxes();
 			let view =
 				grpc
@@ -1332,14 +1350,24 @@ fn two_node_migrate_moves_running_sandbox() {
 					.unwrap_or_else(|status| {
 						panic!(
 							"migrate via {} failed: {}\nlog tail:\n{}",
-							source.name,
+							target.name,
 							common::api::status_detail(&status),
-							source.log_tail()
+							target.log_tail()
 						)
 					})
 					.into_inner();
 			serde_json::from_str::<Value>(&view.json).expect("migrate view JSON")
 		};
+		assert_eq!(
+			migrated.get("node").and_then(Value::as_str),
+			Some(target_node),
+			"migration response reported the wrong owner: {migrated}"
+		);
+		assert_eq!(
+			migrated.get("status").and_then(Value::as_str),
+			Some("running"),
+			"migration response did not report a running sandbox: {migrated}"
+		);
 		let timing = migrated
 			.get("migration")
 			.unwrap_or_else(|| panic!("migrate response missing timing object: {migrated}"));
@@ -1372,10 +1400,17 @@ fn two_node_migrate_moves_running_sandbox() {
 			exec_capture(target, &sid, &["cat", "/root/teleport"], Duration::from_secs(30));
 		assert_eq!(exit, 0, "disk marker read failed stdout={stdout:?} stderr={stderr:?}");
 		assert_eq!(stdout, disk_marker, "disk marker changed across migration");
+		let (exit, stdout, stderr) = exec_capture(
+			target,
+			&sid,
+			&["/bin/sh", "-c", "printf %s \"$MIGRATION_SECRET\""],
+			Duration::from_secs(30),
+		);
+		assert_eq!(exit, 0, "secret read failed stdout={stdout:?} stderr={stderr:?}");
+		assert_eq!(stdout, secret_marker, "secret binding changed across migration");
 
 		eventually("source node to drop migrated sandbox", FAST_TIMEOUT, POLL_INTERVAL, || {
-			let listing = try_list_sandboxes(source).ok()?;
-			sandbox_row(&listing, &sid).is_none().then_some(())
+			matches!(local_sandbox_exists(source, &sid), Ok(false)).then_some(())
 		});
 	}));
 	remove_sandbox_best_effort(&[&gateway_a, &gateway_b], &sid);

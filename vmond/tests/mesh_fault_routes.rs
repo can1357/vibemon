@@ -166,16 +166,16 @@ impl MeshControl for FakeMesh {
 		false
 	}
 
-	fn authoritative_owner(&self, sid: &str) -> Option<(String, i64)> {
-		self.owners.lock().get(sid).cloned()
+	fn authoritative_owner(&self, sid: &str) -> MeshResult<Option<(String, i64)>> {
+		Ok(self.owners.lock().get(sid).cloned())
 	}
 
 	fn local_epoch(&self, _sid: &str) -> i64 {
 		0
 	}
 
-	fn owner_of(&self, sid: &str) -> Option<String> {
-		self.authoritative_owner(sid).map(|(owner, _)| owner)
+	fn owner_of(&self, sid: &str) -> MeshResult<Option<String>> {
+		Ok(self.authoritative_owner(sid)?.map(|(owner, _)| owner))
 	}
 
 	fn record_owner(&self, sid: &str, node_id: &str, epoch: i64) {
@@ -426,7 +426,11 @@ impl MeshRecordStore for FakeRecords {
 		Ok(())
 	}
 
-	fn remove(&self, sid: &str) -> MeshResult<()> {
+	fn list(&self) -> MeshResult<Vec<CreateRecordWire>> {
+		Ok(self.0.lock().values().cloned().collect())
+	}
+
+	fn remove(&self, sid: &str, _owner: &str, _epoch: i64) -> MeshResult<()> {
 		self.0.lock().remove(sid);
 		Ok(())
 	}
@@ -447,8 +451,8 @@ impl MeshReplicaStore for FakeReplicas {
 		_source_node: String,
 		_snapshot_dir: String,
 		_params: JsonObject,
-	) -> MeshResult<()> {
-		Ok(())
+	) -> BoxFuture<'_, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
 	}
 
 	fn list(&self) -> MeshResult<Vec<String>> {

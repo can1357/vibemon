@@ -205,14 +205,13 @@ service SandboxService {
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
   rpc Tunnels(SandboxRef) returns (JsonView);
 
-  // Initiates state migration of the sandbox to a target destination or host.
+  // Migrates a running sandbox to another mesh node.
   //
-  // Replaces: POST /v1/sandboxes/{id}/migrate
   // Errors:
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-  //   - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+  //   - `invalid` (INVALID_ARGUMENT): The target node ID is empty or unknown.
+  //   - `unsupported` (UNIMPLEMENTED): The server is not part of a mesh.
   rpc Migrate(MigrateRequest) returns (JsonView);
-
   // Captures a snapshot of the sandbox's memory, register, and device state.
   //
   // Replaces: POST /v1/sandboxes/{id}/snapshot
@@ -534,15 +533,14 @@ message NetworkSetRequest {
   StringList domain_allow = 4;
 }
 
-// MigrateRequest represents parameters to migrate a sandbox.
+// Identifies a sandbox and its destination mesh node.
 message MigrateRequest {
-  // The unique identifier of the target sandbox to migrate.
+  // The sandbox to migrate.
   string id = 1;
 
-  // The destination address or host URI.
+  // The destination mesh node ID.
   string target = 2;
 }
-
 // SnapshotRequest defines snapshot creation parameters.
 message SnapshotRequest {
   // The unique identifier of the target sandbox.
@@ -840,8 +838,6 @@ enum HighAvailabilityPolicy {
   // HIGH_AVAILABILITY_POLICY_ZONE spreads workers across availability zones.
   HIGH_AVAILABILITY_POLICY_ZONE = 3;
 }
-
-
 
 // CallType identifies the execution and result-indexing model of a call.
 enum CallType {
@@ -1324,7 +1320,6 @@ message FunctionVolumeMount {
   bool read_only = 3;
 }
 
-
 // NetworkPolicy is a default-deny typed outbound policy.
 message NetworkPolicy {
   // BlockNetwork denies all network traffic regardless of allowlists when true.
@@ -1495,7 +1490,7 @@ message FunctionSnapshotRef {
   // SnapshotId is the stable server-assigned snapshot identifier.
   string snapshot_id = 1;
 }
- 
+
 // FunctionSnapshotRecord is a persisted, reloadable worker snapshot with validation provenance.
 message FunctionSnapshotRecord {
   // Ref identifies the persisted function snapshot.

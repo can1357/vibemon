@@ -86,8 +86,9 @@ impl AgentClient {
 		}
 	}
 
-	/// Run `argv` in the guest; returns (exit code, stdout bytes). Frames for
-	/// other request ids (e.g. the boot-exec hand-off) are skipped.
+	/// Run `argv` in the guest; returns the exit code and combined
+	/// stdout/stderr. Frames for other request IDs (for example, boot-exec
+	/// hand-off) are skipped.
 	pub fn exec(&mut self, argv: &[&str], timeout: Duration) -> (i64, Vec<u8>) {
 		let deadline = Instant::now() + timeout;
 		let id = self.send_request(&json!({"op": "exec", "cmd": argv, "tty": false}));
@@ -98,7 +99,7 @@ impl AgentClient {
 				continue;
 			}
 			match frame.ty {
-				proto::FRAME_STDOUT => stdout.extend_from_slice(&frame.payload),
+				proto::FRAME_STDOUT | proto::FRAME_STDERR => stdout.extend_from_slice(&frame.payload),
 				proto::FRAME_EXIT => {
 					let exit: Value = serde_json::from_slice(&frame.payload).expect("exit payload json");
 					let code = exit.get("code").and_then(Value::as_i64).unwrap_or(-1);
@@ -114,6 +115,28 @@ impl AgentClient {
 				},
 				_ => {},
 			}
+		}
+	}
+
+	/// Write `content` to `path` in the guest with the specified file `mode`.
+	pub fn write_file(&mut self, path: &str, content: &[u8], mode: u32, timeout: Duration) {
+		let deadline = Instant::now() + timeout;
+		let id = self.send_request(&json!({
+			"op": "fs_write",
+			"path": path,
+			"mode": mode,
+		}));
+
+		proto::write_frame(&mut self.stream, proto::FRAME_STDIN, id, content)
+			.expect("write file data frame");
+
+		proto::write_frame(&mut self.stream, proto::FRAME_STDIN, id, &[])
+			.expect("write file EOF frame");
+
+		if let Some(resp) = self.wait_resp(id, deadline) {
+			assert_eq!(resp.get("ok").and_then(Value::as_bool), Some(true), "fs_write failed: {resp}");
+		} else {
+			panic!("fs_write timed out");
 		}
 	}
 

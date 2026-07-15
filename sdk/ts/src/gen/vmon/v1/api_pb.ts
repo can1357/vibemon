@@ -664,20 +664,20 @@ export const NetworkSetRequestSchema: GenMessage<NetworkSetRequest> = /*@__PURE_
   messageDesc(file_vmon_v1_api, 20);
 
 /**
- * MigrateRequest represents parameters to migrate a sandbox.
+ * Identifies a sandbox and its destination mesh node.
  *
  * @generated from message vmon.v1.MigrateRequest
  */
 export type MigrateRequest = Message<"vmon.v1.MigrateRequest"> & {
   /**
-   * The unique identifier of the target sandbox to migrate.
+   * The sandbox to migrate.
    *
    * @generated from field: string id = 1;
    */
   id: string;
 
   /**
-   * The destination address or host URI.
+   * The destination mesh node ID.
    *
    * @generated from field: string target = 2;
    */
@@ -7035,12 +7035,12 @@ export const SandboxService: GenService<{
     output: typeof JsonViewSchema;
   },
   /**
-   * Initiates state migration of the sandbox to a target destination or host.
+   * Migrates a running sandbox to another mesh node.
    *
-   * Replaces: POST /v1/sandboxes/{id}/migrate
    * Errors:
    *   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-   *   - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+   *   - `invalid` (INVALID_ARGUMENT): The target node ID is empty or unknown.
+   *   - `unsupported` (UNIMPLEMENTED): The server is not part of a mesh.
    *
    * @generated from rpc vmon.v1.SandboxService.Migrate
    */

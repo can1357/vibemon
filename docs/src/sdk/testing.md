@@ -199,6 +199,16 @@ go run ./examples/durable-functions \
 
 It checks current and pinned revisions, durable call reconstruction, status and events, bounded maps, and optional cancellation. The deployed function must return its input unchanged.
 
+The teleport example exercises a live migration between two nodes that already belong to the same mesh:
+
+```sh
+VMON_API_TOKEN="$VMON_API_TOKEN" go run ./examples/teleport \
+  -source http://127.0.0.1:8081 \
+  -target http://127.0.0.1:8082
+```
+
+It writes markers to guest RAM and the writable root filesystem, starts a live counter, migrates the sandbox once, then checks all three through the destination.
+
 </div>
 <div data-sdk-language="typescript">
 

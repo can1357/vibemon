@@ -11,8 +11,9 @@
 //! by type name, so this module compiles identically on `x86_64` and aarch64.
 
 use std::{
-	fs::{self, File},
+	fs::{self, File, OpenOptions},
 	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
+	os::unix::fs::OpenOptionsExt,
 	path::{Path, PathBuf},
 };
 
@@ -48,6 +49,8 @@ const DIFF_PAGES_PER_WORKER: u64 = 16 * 1024;
 const CURRENT_GENERATION_FILE: &str = "current-generation";
 const MANIFEST_TMP_FILE: &str = "current-generation.tmp";
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_NAME_BYTES: usize = 128;
+const MAX_MANIFEST_BYTES: u64 = 32;
 const SERIAL_FIFO_SIZE: usize = 0x40;
 const VIRTQ_DESC_ELEMENT_SIZE: u64 = 16;
 const VIRTQ_AVAIL_META_SIZE: u64 = 6;
@@ -329,13 +332,15 @@ pub const fn build_arch() -> &'static str {
 	}
 }
 
-/// True if `name` is a non-empty snapshot basename with no path separators,
-/// NUL bytes, leading dots, or parent-directory traversal.
+/// True if `name` is a bounded ASCII snapshot basename safe for paths and logs.
 pub fn is_safe_snapshot_name(name: &str) -> bool {
 	!name.is_empty()
+		&& name.len() <= MAX_SNAPSHOT_NAME_BYTES
 		&& !name.starts_with('.')
 		&& !name.contains("..")
-		&& !name.as_bytes().iter().any(|b| *b == b'/' || *b == b'\0')
+		&& name
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// Transactionally write memory and state as a new generation, then publish it.
@@ -450,13 +455,29 @@ fn next_generation(dir: &Path) -> Result<u64> {
 
 fn current_generation(dir: &Path) -> Result<Option<u64>> {
 	let path = dir.join(CURRENT_GENERATION_FILE);
-	let contents = match fs::read_to_string(&path) {
-		Ok(contents) => contents,
-		Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-		Err(e) => {
-			return Err(err(format!("reading {}: {e}", path.display())));
-		},
+	let file = match OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		.open(&path)
+	{
+		Ok(file) => file,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(err(format!("opening {}: {error}", path.display()))),
 	};
+	if !file
+		.metadata()
+		.map_err(|error| err(format!("stat {}: {error}", path.display())))?
+		.is_file()
+	{
+		return Err(err(format!("{} is not a regular file", path.display())));
+	}
+	let mut contents = String::new();
+	Read::take(file, MAX_MANIFEST_BYTES + 1)
+		.read_to_string(&mut contents)
+		.map_err(|error| err(format!("reading {}: {error}", path.display())))?;
+	if contents.len() as u64 > MAX_MANIFEST_BYTES {
+		return Err(err(format!("{CURRENT_GENERATION_FILE} exceeds {MAX_MANIFEST_BYTES} bytes")));
+	}
 	Ok(Some(parse_generation(&contents)?))
 }
 
@@ -478,8 +499,7 @@ fn publish_generation(dir: &Path, generation: u64) -> Result<()> {
 	let tmp = dir.join(MANIFEST_TMP_FILE);
 	let current = dir.join(CURRENT_GENERATION_FILE);
 	let publish = (|| -> Result<()> {
-		let mut file =
-			File::create(&tmp).map_err(|e| err(format!("creating {}: {e}", tmp.display())))?;
+		let mut file = create_snapshot_file(&tmp)?;
 		writeln!(file, "{generation}").map_err(|e| err(format!("writing {}: {e}", tmp.display())))?;
 		file
 			.sync_all()
@@ -496,9 +516,37 @@ fn publish_generation(dir: &Path, generation: u64) -> Result<()> {
 	sync_dir(dir)
 }
 
+fn open_snapshot_file(path: &Path) -> Result<File> {
+	let file = OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		.open(path)
+		.map_err(|error| err(format!("opening {}: {error}", path.display())))?;
+	if !file
+		.metadata()
+		.map_err(|error| err(format!("stat {}: {error}", path.display())))?
+		.is_file()
+	{
+		return Err(err(format!("{} is not a regular file", path.display())));
+	}
+	Ok(file)
+}
+
+fn create_snapshot_file(path: &Path) -> Result<File> {
+	OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		.open(path)
+		.map_err(|error| err(format!("creating {}: {error}", path.display())))
+}
+
 fn read_state_file(path: &Path) -> Result<Snapshot> {
-	let len = fs::metadata(path)
-		.map_err(|e| err(format!("stat {}: {e}", path.display())))?
+	let file = open_snapshot_file(path)?;
+	let len = file
+		.metadata()
+		.map_err(|error| err(format!("stat {}: {error}", path.display())))?
 		.len();
 	if len > MAX_STATE_BYTES as u64 {
 		return Err(err(format!(
@@ -506,7 +554,16 @@ fn read_state_file(path: &Path) -> Result<Snapshot> {
 			path.display()
 		)));
 	}
-	let bytes = fs::read(path).map_err(|e| err(format!("reading {}: {e}", path.display())))?;
+	let mut bytes = Vec::with_capacity(len as usize);
+	Read::take(file, MAX_STATE_BYTES as u64 + 1)
+		.read_to_end(&mut bytes)
+		.map_err(|error| err(format!("reading {}: {error}", path.display())))?;
+	if bytes.len() > MAX_STATE_BYTES {
+		return Err(err(format!(
+			"snapshot state {} grew over {MAX_STATE_BYTES} byte limit while reading",
+			path.display()
+		)));
+	}
 	let (version, _) = postcard::take_from_bytes::<u32>(&bytes)
 		.map_err(|e| err(format!("decoding snapshot version: {e}")))?;
 	if version > SNAPSHOT_VERSION {
@@ -628,12 +685,10 @@ fn validate_snapshot_metadata_only(image: &SnapshotImage) -> Result<()> {
 }
 
 fn snapshot_memory_len(path: &Path) -> Result<u64> {
-	let metadata = fs::metadata(path)
-		.map_err(|e| err(format!("stat snapshot memory {}: {e}", path.display())))?;
-	if !metadata.is_file() {
-		return Err(err(format!("snapshot memory {} is not a regular file", path.display())));
-	}
-	Ok(metadata.len())
+	Ok(open_snapshot_file(path)?
+		.metadata()
+		.map_err(|error| err(format!("stat snapshot memory {}: {error}", path.display())))?
+		.len())
 }
 
 fn validate_memory_regions(snap: &Snapshot, memory_len: u64) -> Result<()> {
@@ -1045,8 +1100,7 @@ fn write_state_file(path: &Path, snap: &Snapshot) -> Result<()> {
 			bytes.len()
 		)));
 	}
-	let mut file =
-		File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
+	let mut file = create_snapshot_file(path)?;
 	file
 		.write_all(&bytes)
 		.map_err(|e| err(format!("writing {}: {e}", path.display())))?;
@@ -1129,7 +1183,7 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
 /// across worker threads (this executes while the VM is paused), and data
 /// runs are written with positioned writes, one syscall per run.
 fn dump_memory_file(path: &Path, mem: &GuestMemoryMmap) -> Result<Vec<MemRegion>> {
-	let file = File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
+	let file = create_snapshot_file(path)?;
 	let regions = memory_region_table(mem)?;
 	let mut logical = 0u64;
 	for region in &regions {
@@ -1210,7 +1264,7 @@ struct FileMap {
 impl FileMap {
 	/// Map `path` read-only, requiring it to be exactly `expected_len` bytes.
 	fn open(path: &Path, expected_len: u64) -> Result<Self> {
-		let file = File::open(path).map_err(|e| err(format!("opening {}: {e}", path.display())))?;
+		let file = open_snapshot_file(path)?;
 		let len = file
 			.metadata()
 			.map_err(|e| err(format!("stat {}: {e}", path.display())))?
@@ -1313,8 +1367,7 @@ fn dump_delta_memory_file(
 	};
 	let specs = region_diff_specs(&base_view, live, &live_regions)?;
 
-	let mut file =
-		File::create(path).map_err(|e| err(format!("creating {}: {e}", path.display())))?;
+	let mut file = create_snapshot_file(path)?;
 	let changed = match guest_dirty {
 		Some(log) => diff_dirty_pages(&specs, live, log, &mut file)?,
 		None => diff_pages_parallel(&specs, &mut file)?,
@@ -1334,7 +1387,7 @@ fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -
 			"snapshot memory data length {expected_len} != memory file length {memory_len}"
 		)));
 	}
-	let mut file = File::open(path).map_err(|e| err(format!("reading {}: {e}", path.display())))?;
+	let mut file = open_snapshot_file(path)?;
 	for r in regions {
 		file
 			.seek(SeekFrom::Start(r.file_offset))
@@ -1560,8 +1613,7 @@ fn apply_delta_pages(
 	let total_ram = regions_total_len(regions)?;
 	let memory_len = snapshot_memory_len(memory_file)?;
 	validate_delta_memory(d, total_ram, memory_len)?;
-	let mut file = File::open(memory_file)
-		.map_err(|e| err(format!("reading {}: {e}", memory_file.display())))?;
+	let mut file = open_snapshot_file(memory_file)?;
 	let total_pages = total_ram / DELTA_PAGE_SIZE;
 	let mut file_offset = 0u64;
 	for page in 0..total_pages {
@@ -1742,6 +1794,26 @@ fn cleanup_unpublished_generation(dir: &Path, generation: u64) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn snapshot_names_are_bounded_safe_basenames() {
+		for valid in ["checkpoint", "worker-1", "release_2.0"] {
+			assert!(is_safe_snapshot_name(valid), "{valid}");
+		}
+		for invalid in [
+			"",
+			".hidden",
+			"../escape",
+			"nested/snapshot",
+			r"nested\snapshot",
+			"two..dots",
+			"white space",
+			"é",
+		] {
+			assert!(!is_safe_snapshot_name(invalid), "{invalid}");
+		}
+		assert!(!is_safe_snapshot_name(&"x".repeat(MAX_SNAPSHOT_NAME_BYTES + 1)));
+	}
 
 	fn block_device(mmio_base: u64, gsi: u32) -> DeviceState {
 		DeviceState {
@@ -2054,6 +2126,27 @@ mod tests {
 		let _ = fs::remove_file(&path);
 
 		assert!(err.contains("newer than supported"));
+	}
+
+	#[test]
+	fn snapshot_files_reject_symlinks_for_reads_and_writes() {
+		let dir = temp_root_dir("vmon-snapshot-symlink");
+		let outside = unique_temp_path("vmon-snapshot-outside");
+		fs::write(&outside, b"1\n").unwrap();
+		for file in [CURRENT_GENERATION_FILE, "vmstate.1.bin", "memory.1.bin"] {
+			std::os::unix::fs::symlink(&outside, dir.join(file)).unwrap();
+		}
+
+		assert!(current_generation(&dir).is_err());
+		assert!(read_state_file(&dir.join("vmstate.1.bin")).is_err());
+		assert!(snapshot_memory_len(&dir.join("memory.1.bin")).is_err());
+		let write_link = dir.join("vmstate.2.bin.tmp");
+		std::os::unix::fs::symlink(&outside, &write_link).unwrap();
+		assert!(create_snapshot_file(&write_link).is_err());
+		assert_eq!(fs::read(&outside).unwrap(), b"1\n");
+
+		fs::remove_dir_all(dir).unwrap();
+		fs::remove_file(outside).unwrap();
 	}
 
 	#[test]

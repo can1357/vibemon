@@ -238,11 +238,7 @@ impl RecordStore {
 		let (clean, secrets) = split_secrets(&record.params);
 		record.params = clean;
 		let mut inner = self.inner.write();
-		if let Some(secrets) = secrets {
-			inner.secrets.insert(record.sid.clone(), secrets);
-		} else {
-			inner.secrets.remove(&record.sid);
-		}
+		store_secrets(&mut inner, &record.sid, secrets);
 		inner.meta.insert(record.sid.clone(), record.clone());
 		write_record(&self.root, &record.sid, &record.to_wire())
 	}
@@ -267,6 +263,24 @@ impl RecordStore {
 			record.params.insert("secrets".to_owned(), secrets.clone());
 		}
 		Some(record)
+	}
+
+	/// Remember secret material for a durable record without writing it to disk.
+	pub(crate) fn remember_secrets(&self, sid: &str, secrets: Option<JsonValue>) {
+		store_secrets(&mut self.inner.write(), sid, secrets);
+	}
+
+	/// Reattach process-local secret material to a record loaded from durable
+	/// storage.
+	pub(crate) fn attach_secrets(&self, record: &mut CreateRecord) {
+		if let Some(secrets) = self.inner.read().secrets.get(&record.sid) {
+			record.params.insert("secrets".to_owned(), secrets.clone());
+		}
+	}
+
+	/// Forget process-local secret material after its durable record is removed.
+	pub(crate) fn forget_secrets(&self, sid: &str) {
+		self.inner.write().secrets.remove(sid);
 	}
 
 	/// Update a record's authoritative owner and persist the replacement.
@@ -316,6 +330,14 @@ impl RecordStore {
 
 	pub fn contains(&self, sid: &str) -> bool {
 		self.inner.read().meta.contains_key(sid)
+	}
+}
+
+fn store_secrets(inner: &mut RecordInner, sid: &str, secrets: Option<JsonValue>) {
+	if let Some(secrets) = secrets {
+		inner.secrets.insert(sid.to_owned(), secrets);
+	} else {
+		inner.secrets.remove(sid);
 	}
 }
 

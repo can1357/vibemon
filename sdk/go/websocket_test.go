@@ -32,6 +32,7 @@ type sandboxServiceStub struct {
 	extend      func(context.Context, *pb.ExtendSandboxRequest) (*pb.JsonView, error)
 	terminate   func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	tunnels     func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
+	migrate     func(context.Context, *pb.MigrateRequest) (*pb.JsonView, error)
 	execCapture func(context.Context, *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error)
 	fileRead    func(context.Context, *pb.FilePathRequest) (*pb.FileContent, error)
 	fileWrite   func(context.Context, *pb.FileWriteRequest) (*pb.Ok, error)
@@ -83,6 +84,12 @@ func (stub *sandboxServiceStub) Tunnels(ctx context.Context, ref *pb.SandboxRef)
 		return nil, status.Error(codes.Unimplemented, "tunnels not stubbed")
 	}
 	return stub.tunnels(ctx, ref)
+}
+func (stub *sandboxServiceStub) Migrate(ctx context.Context, request *pb.MigrateRequest) (*pb.JsonView, error) {
+	if stub.migrate == nil {
+		return nil, status.Error(codes.Unimplemented, "migrate not stubbed")
+	}
+	return stub.migrate(ctx, request)
 }
 func (stub *sandboxServiceStub) ExecCapture(ctx context.Context, request *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error) {
 	if stub.execCapture == nil {

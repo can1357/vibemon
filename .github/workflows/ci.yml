@@ -12,6 +12,20 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: fastbench
+          POSTGRES_USER: fastbench
+          POSTGRES_PASSWORD: fastbench
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd "pg_isready -U fastbench -d fastbench"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,6 +141,28 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  python-compat:
+    name: Python SDK (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: sdk/py
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Test
+        run: uv run --locked --python ${{ matrix.python-version }} pytest
 
   go:
     name: Go SDK

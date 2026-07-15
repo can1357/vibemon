@@ -158,7 +158,7 @@ Python's remaining language-specific guide is [Stateful Actors and Apps](python/
 </div>
 <div data-sdk-language="go">
 
-`*vmon.Client` exposes `Sandboxes`, `Snapshots`, `Volumes`, `Pools`, and `Mesh`, along with root methods for daemon health, build information, Prometheus metrics, the OpenAPI document, and lifecycle events.
+`*vmon.Client` exposes `Sandboxes`, `Snapshots`, `Volumes`, `Pools`, and `Mesh`, along with root methods for daemon health, build information, Prometheus metrics, and lifecycle events.
 
 Methods return Go values plus an `error`. Structured failures include `APIError`, `ProtocolError`, `TransportError`, and `ResponseTooLargeError`; inspect them with `errors.As` rather than parsing error text.
 

@@ -40,13 +40,12 @@ export interface WaitReadyOptions {
 /** Sandbox list filters. */
 export interface SandboxListOptions {
   tags?: Record<string, string>;
-  node?: string;
 }
 
 const sandboxChannel = Symbol("vmon.sandbox.channel");
 const sandboxToken = Symbol("vmon.sandbox.token");
 
-/** A sandbox bound to its client and serving mesh endpoint. */
+/** A sandbox resource bound to its client; mesh routing remains private. */
 export class Sandbox {
   readonly #client: Client;
   #info: SandboxInfo;
@@ -54,11 +53,11 @@ export class Sandbox {
   [sandboxToken]?: string;
   readonly files: Files;
   readonly ports: Ports;
-  /** Bind a sandbox view or identifier to a client and endpoint. */
-  constructor(client: Client, info: SandboxInfo | string, endpoint?: string) {
+  /** Bind a sandbox view or identifier to a client. */
+  constructor(client: Client, info: SandboxInfo | string) {
     this.#client = client;
     this.#info = typeof info === "string" ? { id: info } : info;
-    this[sandboxChannel] = new SandboxChannel(client, this.id, endpoint);
+    this[sandboxChannel] = new SandboxChannel(client, this.id);
     this.files = new Files(this);
     this.ports = new Ports(this);
   }
@@ -70,13 +69,9 @@ export class Sandbox {
   get info(): Readonly<SandboxInfo> {
     return this.#info;
   }
-  /** Mesh node that reported the sandbox. */
+  /** Mesh node that reported the latest sandbox view. */
   get node(): string | null {
     return typeof this.#info.node === "string" ? this.#info.node : null;
-  }
-  /** Preferred serving endpoint. */
-  get endpoint(): string | undefined {
-    return channelFor(this).endpoint;
   }
   /** Owning root client. */
   get client(): Client {
@@ -212,8 +207,9 @@ export class Sandbox {
     this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;
   }
-  /** Migrate and re-pin the sandbox. */
+  /** Migrate the sandbox to a mesh node and re-pin its serving endpoint. */
   async migrate(target: string): Promise<SandboxInfo> {
+    if (!target) throw new TypeError("target node id is required");
     const view = await channelFor(this).call(SandboxService.method.migrate, {
       id: this.id,
       target,
@@ -309,6 +305,17 @@ export class Sandbox {
   }
 }
 
+/** Build a sandbox carrying an SDK-internal mesh route. */
+export function sandboxFromRoute(
+  client: Client,
+  info: SandboxInfo | string,
+  endpoint?: string,
+): Sandbox {
+  const sandbox = new Sandbox(client, info);
+  sandbox[sandboxChannel].bind(endpoint);
+  return sandbox;
+}
+
 class SandboxChannel {
   readonly #client: Client;
   readonly id: string;
@@ -322,6 +329,10 @@ class SandboxChannel {
 
   get endpoint(): string | undefined {
     return this.#endpoint;
+  }
+
+  bind(endpoint?: string): void {
+    this.#endpoint = endpoint;
   }
 
   async relocate(): Promise<void> {
@@ -438,7 +449,7 @@ class SandboxChannel {
   }
 }
 
-function channelFor(sandbox: Sandbox): SandboxChannel {
+export function channelFor(sandbox: Sandbox): SandboxChannel {
   return sandbox[sandboxChannel];
 }
 

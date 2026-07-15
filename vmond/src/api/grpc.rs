@@ -7,7 +7,7 @@
 //! owned by a mesh peer are re-issued over a tonic channel to the owner.
 
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	io::{Read as _, Seek as _, SeekFrom},
 	pin::Pin,
 	sync::Arc,
@@ -37,7 +37,7 @@ use crate::{
 	image::normalize_oci_arch,
 	mesh::{
 		proxy::{self, MeshError, MeshPeer, OwnerProxyDecision, OwnerRecord},
-		routes::MeshRouteState,
+		routes::{CreateRecordWire, MeshControl, MeshRecordStore, MeshRouteState, apply_view_detail},
 	},
 	models::{ExecBody, ExtendBody, ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
 };
@@ -141,8 +141,8 @@ enum ArtifactUploadFrame {
 	Abort,
 }
 
-/// Map an [`ApiError`] onto the contract's gRPC status table and attach the
-/// stable vmond code as `vmon-code` metadata.
+/// Map an [`ApiError`] onto the contract's gRPC status table with stable code,
+/// retryability, and recovery guidance metadata.
 pub fn status_from(err: &ApiError) -> Status {
 	let code = match err.code() {
 		"not_found" => Code::NotFound,
@@ -161,6 +161,13 @@ pub fn status_from(err: &ApiError) -> Status {
 	let mut status = Status::new(code, err.message().to_owned());
 	if let Ok(value) = MetadataValue::try_from(err.code()) {
 		status.metadata_mut().insert("vmon-code", value);
+	}
+	status.metadata_mut().insert(
+		"vmon-retryable",
+		MetadataValue::from_static(if err.retryable() { "true" } else { "false" }),
+	);
+	if let Ok(value) = MetadataValue::try_from(err.action()) {
+		status.metadata_mut().insert("vmon-action", value);
 	}
 	status
 }
@@ -283,8 +290,12 @@ impl proxy::OwnerRouter for MeshView {
 		&self.node_id
 	}
 
-	fn owner_of(&self, sandbox_id: &str) -> Option<String> {
-		self.state.mesh.owner_of(sandbox_id)
+	fn owner_of(&self, sandbox_id: &str) -> proxy::MeshResult<Option<String>> {
+		self
+			.state
+			.mesh
+			.owner_of(sandbox_id)
+			.map_err(|err| proxy::MeshError::new(err.code, err.message))
 	}
 
 	fn peer_url(&self, node_id: &str) -> Option<String> {
@@ -316,16 +327,17 @@ impl proxy::SandboxPresence for MeshView {
 }
 
 impl proxy::RecordOwnerLookup for MeshView {
-	fn owner_record(&self, sandbox_id: &str) -> Option<OwnerRecord> {
+	fn owner_record(&self, sandbox_id: &str) -> proxy::MeshResult<Option<OwnerRecord>> {
 		self
 			.state
 			.records
 			.get(sandbox_id)
-			.ok()
-			.flatten()
-			.map(|record| OwnerRecord {
-				owner: record.owner,
-				epoch: u64::try_from(record.epoch).unwrap_or(0),
+			.map_err(|error| proxy::MeshError::new("internal", error.to_string()))
+			.map(|record| {
+				record.map(|record| OwnerRecord {
+					owner: record.owner,
+					epoch: u64::try_from(record.epoch).unwrap_or(0),
+				})
 			})
 	}
 }
@@ -544,20 +556,6 @@ fn terminal_call_status(status: i32) -> bool {
 		pb::CallStatus::try_from(status).unwrap_or(pb::CallStatus::Unspecified),
 		pb::CallStatus::Succeeded | pb::CallStatus::Failed | pb::CallStatus::Cancelled
 	)
-}
-
-fn annotate_local_mesh_node(state: &ApiState, view: Value) -> Value {
-	let Some(mesh) = state.mesh.as_ref().filter(|mesh| mesh.mesh_enabled()) else {
-		return view;
-	};
-	let mut object = match view {
-		Value::Object(object) => object,
-		other => return other,
-	};
-	object
-		.entry("node".to_owned())
-		.or_insert_with(|| Value::String(mesh.local_node_id()));
-	Value::Object(object)
 }
 
 fn json_view(value: &Value) -> pb::JsonView {
@@ -1653,6 +1651,28 @@ impl pb::actor_service_server::ActorService for GrpcApi {
 	}
 }
 
+fn gossip_mesh_api_error(err: crate::mesh::gossip::MeshError) -> ApiError {
+	ApiError::new(err.http_status(), err.code, err.message)
+}
+
+fn record_matches_tags(record: &CreateRecordWire, tags: Option<&HashMap<String, String>>) -> bool {
+	let Some(tags) = tags else {
+		return true;
+	};
+	let Some(record_tags) = record.params.get("tags").and_then(|v| v.as_object()) else {
+		return tags.is_empty();
+	};
+	for (k, v) in tags {
+		let Some(record_v) = record_tags.get(k).and_then(|v| v.as_str()) else {
+			return false;
+		};
+		if record_v != v {
+			return false;
+		}
+	}
+	true
+}
+
 #[tonic::async_trait]
 impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	type AttachStream = BoxStream<pb::ExecOutput>;
@@ -1680,7 +1700,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		} else {
 			self.engine_call(move |engine| engine.create(body)).await?
 		};
-		Ok(Response::new(json_view(&annotate_local_mesh_node(&self.state, view))))
+		Ok(Response::new(json_view(&view)))
 	}
 
 	async fn list(
@@ -1689,11 +1709,51 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	) -> Result<Response<pb::ListSandboxesResponse>, Status> {
 		let message = request.into_inner();
 		let tags = validation::parse_tag_filters(&message.tags)?;
-		let rows = self.engine_call(move |engine| engine.list(tags)).await?;
-		let sandboxes_json = rows
-			.into_iter()
-			.map(|row| compact_json(&annotate_local_mesh_node(&self.state, row)))
-			.collect();
+		let rows = if let Some(mesh) = self.state.mesh.clone()
+			&& mesh.mesh_enabled()
+		{
+			let records = MeshRecordStore::list(&*mesh)
+				.map_err(|err| status_from(&gossip_mesh_api_error(err)))?;
+			let mut views = Vec::new();
+			let local_node = MeshControl::node_id(&*mesh);
+			for rec in records {
+				if !record_matches_tags(&rec, tags.as_ref()) {
+					continue;
+				}
+				let sid = rec.sid.clone();
+				if rec.owner == local_node {
+					let engine = self.state.engine.clone();
+					let view_res = tokio::task::spawn_blocking(move || engine.get(&sid)).await;
+					if let Ok(Ok(view)) = view_res {
+						views.push(apply_view_detail(view, &rec));
+					} else {
+						views.push(serde_json::json!({
+							"id": rec.sid,
+							"name": rec.sid,
+							"node": rec.owner,
+							"ha": rec.ha,
+							"restart_policy": rec.restart_policy,
+							"created_at": rec.created_at,
+							"status": "running",
+						}));
+					}
+				} else {
+					views.push(serde_json::json!({
+						"id": rec.sid,
+						"name": rec.sid,
+						"node": rec.owner,
+						"ha": rec.ha,
+						"restart_policy": rec.restart_policy,
+						"created_at": rec.created_at,
+						"status": "running",
+					}));
+				}
+			}
+			views
+		} else {
+			self.engine_call(move |engine| engine.list(tags)).await?
+		};
+		let sandboxes_json = rows.into_iter().map(|row| compact_json(&row)).collect();
 		Ok(Response::new(pb::ListSandboxesResponse { sandboxes_json }))
 	}
 
@@ -1702,7 +1762,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		forward_to_owner!(self, metadata, &message.id, message, get);
 		let id = message.id;
 		let view = self.engine_call(move |engine| engine.get(&id)).await?;
-		Ok(Response::new(json_view(&annotate_local_mesh_node(&self.state, view))))
+		Ok(Response::new(json_view(&view)))
 	}
 
 	async fn stop(
@@ -2035,10 +2095,12 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		&self,
 		request: Request<pb::MigrateRequest>,
 	) -> Result<Response<pb::JsonView>, Status> {
-		let pb::MigrateRequest { id, target } = request.into_inner();
-		if target.is_empty() {
+		let (metadata, _, message) = request.into_parts();
+		if message.target.is_empty() {
 			return Err(ApiError::invalid("target node id is required").into());
 		}
+		forward_to_owner!(self, metadata, &message.id, message, migrate);
+		let pb::MigrateRequest { id, target } = message;
 		let value = if let Some(mesh) = self.state.mesh.clone() {
 			mesh
 				.migrate_sandbox(id, target)
@@ -2249,6 +2311,34 @@ mod tests {
 				.map(str::to_owned);
 			assert_eq!(carried.as_deref(), Some(code.as_str()));
 		}
+	}
+
+	#[test]
+	fn status_metadata_explains_retryability_and_recovery() {
+		let invalid = status_from(&ApiError::invalid("bad request"));
+		assert_eq!(
+			invalid
+				.metadata()
+				.get("vmon-retryable")
+				.and_then(|value| value.to_str().ok()),
+			Some("false")
+		);
+		assert_eq!(
+			invalid
+				.metadata()
+				.get("vmon-action")
+				.and_then(|value| value.to_str().ok()),
+			Some("correct the request parameters")
+		);
+
+		let engine = status_from(&ApiError::from(EngineError::engine("host unavailable")));
+		assert_eq!(
+			engine
+				.metadata()
+				.get("vmon-retryable")
+				.and_then(|value| value.to_str().ok()),
+			Some("true")
+		);
 	}
 
 	#[test]

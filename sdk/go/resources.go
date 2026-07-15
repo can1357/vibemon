@@ -44,22 +44,6 @@ func (client *Client) Metrics(ctx context.Context) (string, error) {
 	return string(body), err
 }
 
-// OpenAPI retrieves the OpenAPI JSON spec from the server.
-func (client *Client) OpenAPI(ctx context.Context) (json.RawMessage, error) {
-	response, _, err := client.request(ctx, DriverRequest{Method: http.MethodGet, Path: "/v1/openapi.json"})
-	if err != nil {
-		return nil, err
-	}
-	body, err := client.readResponse(response)
-	if err != nil {
-		return nil, err
-	}
-	if !json.Valid(body) {
-		return nil, &ProtocolError{Operation: "get OpenAPI", Message: "invalid JSON response"}
-	}
-	return json.RawMessage(body), nil
-}
-
 // EventStream incrementally decodes daemon lifecycle events.
 type EventStream struct {
 	cancel    context.CancelFunc
@@ -151,14 +135,23 @@ func (service *SandboxService) Create(ctx context.Context, request SandboxCreate
 	return service.client.bindSandbox(&sandbox, endpoint, "create sandbox")
 }
 
-// Get retrieves metadata of an existing sandbox by ID.
+// Get reconnects to an existing sandbox by stable ID.
 func (service *SandboxService) Get(ctx context.Context, id string) (*Sandbox, error) {
 	if err := requireIdentifier("sandbox id", id); err != nil {
 		return nil, err
 	}
-	endpoint, view, err := service.client.unaryView(ctx, "", "get sandbox", func(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) (*pb.JsonView, error) {
-		return pb.NewSandboxServiceClient(conn).Get(ctx, &pb.SandboxRef{Id: id}, opts...)
-	})
+	fetch := func(hint string) (string, []byte, error) {
+		return service.client.unaryView(ctx, hint, "get sandbox", func(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) (*pb.JsonView, error) {
+			return pb.NewSandboxServiceClient(conn).Get(ctx, &pb.SandboxRef{Id: id}, opts...)
+		})
+	}
+	endpoint, view, err := fetch("")
+	if err != nil && isNotFoundAPIError(err) && len(service.client.driver.Endpoints()) > 1 {
+		endpoint, err = service.client.resolveSandbox(ctx, id, "")
+		if err == nil {
+			endpoint, view, err = fetch(endpoint)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +231,7 @@ func (service *SandboxService) List(ctx context.Context, options ...SandboxListO
 		}
 		successes++
 		for _, sandbox := range result.rows {
-			if sandbox == nil || seen[sandbox.ID] || filter.Node != "" && sandbox.Node != filter.Node {
+			if sandbox == nil || seen[sandbox.ID] {
 				continue
 			}
 			bound, err := service.client.bindSandbox(sandbox, result.endpoint, "list sandboxes")

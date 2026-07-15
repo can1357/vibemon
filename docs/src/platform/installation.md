@@ -79,3 +79,56 @@ Windows control and guest-agent endpoints use local named pipes. Remote virtio-f
 `vmon doctor` warns when image tools are absent and names `skopeo` and `umoci`; install both before using `vmon run` with image references. It also checks for `mkfs.ext4`. On macOS, its suggested installation is `brew install e2fsprogs`; on other platforms it advises installing `e2fsprogs`.
 
 The diagnostic accepts `VMON_KERNEL` when it points at an existing bootable guest kernel. Otherwise, it reports an available cached kernel or warns that the first macOS boot auto-downloads a pinned kernel; on non-macOS hosts, supply `VMON_KERNEL` as needed. It also checks for the bundled static guest agent and suggests `just agent-musl` when missing.
+
+## Deployment options
+
+Deployment files live under `deploy/`.
+
+### Single node
+
+The systemd installer targets a dedicated Linux host with KVM:
+
+```sh
+sudo ./deploy/single-node/install.sh ./target/release/vmon
+```
+
+It installs the binary and service, creates `/etc/vmon/serve.toml` with a random admin token, and records an unprivileged UID/GID for the VMM sandbox. Re-running it keeps the existing configuration. Remove the service with:
+
+```sh
+sudo ./deploy/single-node/uninstall.sh
+# Also delete /etc/vmon and /var/lib/vmon:
+sudo ./deploy/single-node/uninstall.sh --purge
+```
+
+The Compose deployment includes a separate rootless BuildKit service for Dockerfile builds:
+
+```sh
+export VMON_API_TOKEN="$(openssl rand -hex 32)"
+docker compose -f deploy/single-node/docker-compose.yml up -d
+```
+
+The `vmon` container needs `/dev/kvm`, `/dev/net/tun`, host networking, and elevated network capabilities. It is intended for a dedicated virtualization host, not a shared container cluster. A systemd install can use an operator-managed BuildKit daemon by setting `VMON_BUILDKIT_ADDR` in `/etc/default/vmon`; OCI image pulls do not require BuildKit.
+
+### Kubernetes cluster
+
+The Helm chart runs one stateful `vmon serve` pod per KVM host. Each pod serves the API and launches local VMM children. The chart uses stable pod DNS for mesh membership, PostgreSQL for authoritative cluster records, S3-compatible storage for portable artifacts, and a separate rootless BuildKit pod for Dockerfile builds.
+
+Label the KVM nodes before installation:
+
+```sh
+kubectl label node worker-a worker-b worker-c virtualization=kvm
+```
+
+Then install with non-default credentials:
+
+```sh
+helm install vmon ./deploy/helm/vmon \
+  --set nodes.apiToken="$(openssl rand -hex 32)" \
+  --set postgresql.auth.password="replace-this-password" \
+  --set s3Storage.auth.accessKey="replace-this-access-key" \
+  --set s3Storage.auth.secretKey="replace-this-secret-key"
+```
+
+The bundled PostgreSQL and MinIO workloads are for evaluation. For production, set `postgresql.enabled=false` and `s3Storage.enabled=false`, then fill `externalDatabase` and `externalS3`. Set `buildkit.enabled=false` and `buildkit.address` to use an operator-managed builder.
+
+`just validate-deploy` checks the shell scripts, Compose model, rendered Helm chart, and Kubernetes schemas. The full value contract is in `deploy/helm/vmon/values.schema.json`.

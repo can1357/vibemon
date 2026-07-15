@@ -37,21 +37,13 @@ unpacked image plus the injected agent.
 
 ## Dockerfile builds
 
-A Dockerfile can be built into a local, content-addressed OCI layout before it
-enters the same pipeline. Vibemon prefers `buildah`; if it is unavailable it
-uses Docker Buildx. The image tag must be non-empty. The build timeout in the
-image implementation is 30 minutes.
+Dockerfile builds require `buildctl` and an isolated BuildKit endpoint in `VMON_BUILDKIT_ADDR`. Vibemon does not invoke Docker, Buildah, a shell, or an inherited host environment.
 
-Build inputs are a server-host Dockerfile and build context. Treat both as
-trusted build inputs: this is a host-side image build, not a guest operation.
-After a Dockerfile-derived template is consumed, old local build layouts may
-be pruned on a best-effort basis; do not use the internal build cache as an
-archive.
+The daemon rejects contexts that escape through symlinks or exceed 1 GiB. It sends the context to BuildKit with a cleared environment, accepts at most 4 GiB of OCI output, validates the OCI layout, and only then publishes it under a content-addressed cache key. The build timeout is 30 minutes.
 
-Local `oci:<path>` references are accepted only when the resolved OCI layout is
-under the server's own build cache (`builds/`) or pulled-image cache (`images/`).
-This check keeps local references within server-managed caches; neither cache is
-an archive or a general-purpose path-mounting mechanism.
+BuildKit executes Dockerfile instructions, so run the daemon behind `VMON_BUILDKIT_ADDR` as a disposable, least-privileged service. The bundled Compose and Helm deployments use a separate rootless BuildKit workload.
+
+The build and pulled-image caches are not archives. Local `oci:<path>` references are accepted only when the resolved OCI layout is under the server's `builds/` or `images/` cache.
 
 ## Commands and image defaults
 

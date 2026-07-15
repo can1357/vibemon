@@ -9,7 +9,7 @@ import socket
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import grpc
 import httpx
@@ -27,6 +27,8 @@ from .process import ConsoleStream, LogStream, Process, open_process
 from .secret import Secret, merge_secrets
 from .v1 import api_pb2
 from .volume import S3Mount, Volume
+
+T = TypeVar("T")
 
 if TYPE_CHECKING:
     from .client import Client
@@ -407,22 +409,16 @@ def _validate_port(port: int) -> int:
 
 
 class Sandbox:
-    """A sandbox resource bound to its owning client and current mesh endpoint."""
+    """A sandbox resource bound to its client; mesh routing remains private."""
 
-    def __init__(
-        self,
-        client: Client,
-        info: Mapping[str, Any],
-        *,
-        endpoint: str | None = None,
-    ) -> None:
+    def __init__(self, client: Client, info: Mapping[str, Any]) -> None:
         identifier = info.get("id") or info.get("name")
         if not isinstance(identifier, str) or not identifier:
             raise ValueError("sandbox id is required")
         self._client = client
         self._raw = dict(info)
         self._raw.setdefault("id", identifier)
-        self._endpoint = endpoint
+        self._endpoint: str | None = None
         self._workdir = self._string_detail("workdir")
         raw_env = self._raw.get("env")
         self._env = (
@@ -438,6 +434,17 @@ class Sandbox:
         self.ports = Ports(self)
         self._aio = _AsyncSandbox(self)
 
+    @classmethod
+    def _from_route(
+        cls,
+        client: Client,
+        info: Mapping[str, Any],
+        endpoint: str | None,
+    ) -> Sandbox:
+        sandbox = cls(client, info)
+        sandbox._endpoint = endpoint
+        return sandbox
+
     @property
     def id(self) -> str:
         """Return the stable sandbox identifier."""
@@ -452,14 +459,8 @@ class Sandbox:
 
     @property
     def node(self) -> str | None:
-        """Return the mesh node id annotated by the server, when available."""
-        value = self._raw.get("node")
-        return value if isinstance(value, str) and value else None
-
-    @property
-    def endpoint(self) -> str | None:
-        """Return the base URL currently pinned for sandbox-scoped calls."""
-        return self._endpoint
+        """Return the mesh node that reported the latest sandbox view."""
+        return self._string_detail("node")
 
     @property
     def aio(self) -> _AsyncSandbox:
@@ -471,7 +472,7 @@ class Sandbox:
         return f"/v1/sandboxes/{path_segment(self.id)}"
 
     def __repr__(self) -> str:
-        return f"Sandbox(id={self.id!r}, endpoint={self.endpoint!r})"
+        return f"Sandbox(id={self.id!r})"
 
     def __str__(self) -> str:
         return self.id
@@ -495,7 +496,7 @@ class Sandbox:
         value = self._raw.get(key)
         return value if isinstance(value, str) else None
 
-    def _rpc[T](self, fn: Callable[[GrpcStubs], T], *, stream: bool = False) -> T:
+    def _rpc(self, fn: Callable[[GrpcStubs], T], *, stream: bool = False) -> T:
         """Invoke one sandbox-scoped RPC, re-resolving the endpoint on not_found."""
 
         def send() -> tuple[T, str]:
@@ -778,18 +779,17 @@ class Sandbox:
         return self.info
 
     def migrate(self, target: str) -> SandboxInfo:
-        """Migrate to a mesh node and re-pin this object to the new endpoint."""
-        target = str(target)
+        """Migrate the sandbox to a mesh node and re-pin its serving endpoint."""
         if not target:
-            raise ValueError("migration target must not be empty")
+            raise ValueError("target node id is required")
         self._update(
             self._view_rpc(
                 lambda stubs: stubs.sandbox.Migrate(
                     api_pb2.MigrateRequest(id=self.id, target=target)
                 ),
-                error="migration returned a non-object response",
+                error="migrate returned invalid data",
             ),
-            "migration returned a non-object response",
+            "migrate returned invalid data",
         )
         self._endpoint = self._client.driver.resolve_sandbox(self.id, self._endpoint)
         return self.info

@@ -488,9 +488,15 @@ fn expected_members_from_home(home: &Path) -> usize {
 		.max(1)
 }
 
-fn find_vmon_binary() -> Option<PathBuf> {
+pub(crate) fn find_vmon_binary() -> Option<PathBuf> {
 	if let Some(path) = env::var_os("VMON_BIN").map(PathBuf::from) {
 		return executable_file(&path).then_some(path);
+	}
+	if let Ok(path) = env::current_exe()
+		&& path.parent().is_none_or(|parent| !parent.ends_with("deps"))
+		&& executable_file(&path)
+	{
+		return Some(path);
 	}
 	let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
 		.parent()

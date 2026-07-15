@@ -1,19 +1,19 @@
 //! Host networking: TAP leases, iptables, egress, tunnels. Port of
 //! python/vmon/net.py.
 
+pub mod policy;
+
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::net::ToSocketAddrs;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::LazyLock;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 use std::sync::mpsc;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 use std::thread::{self, JoinHandle};
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 use std::time::Duration;
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -58,6 +58,10 @@ pub const USER_NET_PREFIX: u8 = 24;
 pub const USER_NET_GATEWAY: &str = "10.0.2.2";
 /// DNS servers exposed by libslirp.
 pub const USER_NET_DNS: [&str; 1] = ["10.0.2.3"];
+
+#[cfg(any(test, target_os = "linux"))]
+static START_INSTANT: std::sync::LazyLock<std::time::Instant> =
+	std::sync::LazyLock::new(std::time::Instant::now);
 
 #[cfg(target_os = "linux")]
 static REFRESHERS: LazyLock<Mutex<HashMap<String, DomainRefresher>>> =
@@ -267,6 +271,27 @@ pub async fn setup_sandbox_network(
 	inbound_cidr_allowlist: Option<&[String]>,
 ) -> Result<SandboxNetwork> {
 	let config = allocate_guest_config(name)?;
+	let policy_result = policy::EgressPolicy::new(
+		policy::SystemResolver,
+		egress_allow_domains.unwrap_or(&[]),
+		egress_allow.unwrap_or(&[]),
+	)
+	.and_then(|p| {
+		let dns_ips = config
+			.dns
+			.iter()
+			.map(|s| {
+				s.parse::<IpAddr>()
+					.map_err(|_| EngineError::invalid(format!("invalid DNS address {s}")))
+			})
+			.collect::<Result<Vec<IpAddr>>>()?;
+		p.approved_dns(&dns_ips)?;
+		Ok(())
+	});
+	if let Err(err) = policy_result {
+		let _ = release_guest_config(name);
+		return Err(err);
+	}
 	let tap_result = setup_tap(
 		&config.tap,
 		&config.guest_ip,
@@ -388,6 +413,52 @@ fn require_net_admin() -> Result<()> {
 }
 
 /// Create/configure a TAP interface and its NAT/FORWARD rules.
+#[cfg(any(test, target_os = "linux"))]
+pub const PROTECTED_V4_RANGES: &[&str] = &[
+	"0.0.0.0/8",
+	"127.0.0.0/8",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+	"224.0.0.0/4",
+	"255.255.255.255/32",
+	"100.64.0.0/10",
+	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"192.88.99.0/24",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
+	"240.0.0.0/4",
+];
+
+#[cfg(any(test, target_os = "linux"))]
+fn protected_deny_rule(
+	action: IptablesAction,
+	name: &str,
+	guest_cidr: &str,
+	range: &str,
+	idx: usize,
+) -> Vec<String> {
+	strings([
+		action.flag(),
+		"FORWARD",
+		"-i",
+		name,
+		"-s",
+		guest_cidr,
+		"-d",
+		range,
+		"-m",
+		"comment",
+		"--comment",
+		&comment(name, &format!("deny-range-{idx}")),
+		"-j",
+		"REJECT",
+	])
+}
+
 #[cfg(target_os = "linux")]
 pub fn setup_tap(
 	name: &str,
@@ -425,12 +496,21 @@ pub fn setup_tap(
 	let prior_domain_ips = stop_domain_refresher(name);
 	iptables_delete(&unrestricted_egress_rule(IptablesAction::Delete, &lease))?;
 	iptables_delete(&deny_egress_rule(IptablesAction::Delete, &lease))?;
-	for (idx, ip) in prior_domain_ips.iter().enumerate() {
+	for (ip, idx) in &prior_domain_ips {
 		iptables_delete(&domain_rule(
 			IptablesAction::Delete,
 			&lease.name,
 			&lease.guest_cidr(),
 			ip,
+			*idx,
+		))?;
+	}
+	for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
+		iptables_delete(&protected_deny_rule(
+			IptablesAction::Delete,
+			&lease.name,
+			&lease.guest_cidr(),
+			range,
 			idx,
 		))?;
 	}
@@ -445,21 +525,51 @@ pub fn setup_tap(
 				idx,
 			))?;
 		}
-		let domain_ips = resolve_domain_ips(&domains);
-		for (idx, ip) in domain_ips.iter().enumerate() {
+		let mut policy =
+			policy::EgressPolicy::new(policy::SystemResolver, &domains, &lease.egress_allow)?;
+		let now = START_INSTANT.elapsed();
+		let mut rules = BTreeMap::new();
+		let mut next_idx = 0;
+		for domain in &domains {
+			let ips = policy.resolve_allowed(domain, now)?;
+			for ip in ips {
+				let ip_str = ip.to_string();
+				if !rules.contains_key(&ip_str) {
+					rules.insert(ip_str, next_idx);
+					next_idx += 1;
+				}
+			}
+		}
+		for (ip, idx) in &rules {
 			iptables_ensure(&domain_rule(
 				IptablesAction::Insert,
 				&lease.name,
 				&lease.guest_cidr(),
 				ip,
-				idx,
+				*idx,
 			))?;
 		}
 		iptables_ensure(&deny_egress_rule(IptablesAction::Append, &lease))?;
 		if !domains.is_empty() {
-			start_domain_refresher(&lease.name, &lease.guest_cidr(), domains, domain_ips)?;
+			start_domain_refresher(
+				&lease.name,
+				&lease.guest_cidr(),
+				domains,
+				rules,
+				next_idx,
+				lease.egress_allow.clone(),
+			)?;
 		}
 	} else {
+		for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
+			iptables_ensure(&protected_deny_rule(
+				IptablesAction::Append,
+				&lease.name,
+				&lease.guest_cidr(),
+				range,
+				idx,
+			))?;
+		}
 		iptables_ensure(&unrestricted_egress_rule(IptablesAction::Append, &lease))?;
 	}
 
@@ -489,7 +599,7 @@ pub fn teardown_tap(
 	egress_allow: Option<&[String]>,
 	egress_allow_domains: Option<&[String]>,
 ) -> Result<()> {
-	let seen_domain_ips = stop_domain_refresher(name);
+	let seen_rules = stop_domain_refresher(name);
 	if !has_net_admin() {
 		return Ok(());
 	}
@@ -499,6 +609,15 @@ pub fn teardown_tap(
 		iptables_delete(&masq_rule(IptablesAction::Delete, &lease))?;
 		iptables_delete(&return_rule(IptablesAction::Delete, &lease))?;
 		iptables_delete(&unrestricted_egress_rule(IptablesAction::Delete, &lease))?;
+		for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
+			iptables_delete(&protected_deny_rule(
+				IptablesAction::Delete,
+				&lease.name,
+				&lease.guest_cidr(),
+				range,
+				idx,
+			))?;
+		}
 		for (idx, cidr) in lease.egress_allow.iter().enumerate() {
 			iptables_delete(&egress_cidr_rule(
 				IptablesAction::Delete,
@@ -510,19 +629,31 @@ pub fn teardown_tap(
 		}
 		iptables_delete(&deny_egress_rule(IptablesAction::Delete, &lease))?;
 
-		let mut domain_ips = seen_domain_ips;
-		for ip in resolve_domain_ips(&clean_domains(egress_allow_domains)) {
-			if !domain_ips.contains(&ip) {
-				domain_ips.push(ip);
+		let mut domain_rules = seen_rules;
+		if let Some(allowed_domains) = egress_allow_domains {
+			let clean = clean_domains(Some(allowed_domains));
+			if let Ok(mut policy) =
+				policy::EgressPolicy::new(policy::SystemResolver, &clean, &lease.egress_allow)
+			{
+				let now = START_INSTANT.elapsed();
+				for domain in &clean {
+					if let Ok(ips) = policy.resolve_allowed(domain, now) {
+						for ip in ips {
+							let ip_str = ip.to_string();
+							if !domain_rules.contains_key(&ip_str) {
+								domain_rules.insert(ip_str, 0);
+							}
+						}
+					}
+				}
 			}
 		}
-		domain_ips.sort_by_key(|ip| ip.parse::<Ipv4Addr>().ok());
-		for (idx, ip) in domain_ips.iter().enumerate() {
+		for (ip, idx) in domain_rules {
 			iptables_delete(&domain_rule(
 				IptablesAction::Delete,
 				&lease.name,
 				&lease.guest_cidr(),
-				ip,
+				&ip,
 				idx,
 			))?;
 		}
@@ -1053,68 +1184,58 @@ fn clean_domains(domains: Option<&[String]>) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_domain_ips(domains: &[String]) -> Vec<String> {
-	let mut ips = BTreeSet::new();
-	for domain in domains {
-		let host = domain.strip_prefix("*.").unwrap_or(domain).trim();
-		if host.is_empty() {
-			continue;
-		}
-		let Ok(addrs) = (host, 0_u16).to_socket_addrs() else {
-			continue;
-		};
-		for addr in addrs {
-			if let IpAddr::V4(ip) = addr.ip() {
-				ips.insert(ip);
-			}
-		}
-	}
-	ips.into_iter().map(|ip| ip.to_string()).collect()
-}
-
-#[cfg(target_os = "linux")]
 fn start_domain_refresher(
 	name: &str,
 	guest_cidr: &str,
 	domains: Vec<String>,
-	initial_ips: Vec<String>,
+	rules: BTreeMap<String, usize>,
+	next_idx: usize,
+	trusted: Vec<String>,
 ) -> Result<()> {
-	let refresher = DomainRefresher::new(name, guest_cidr, domains, initial_ips).start()?;
+	let refresher =
+		DomainRefresher::new(name, guest_cidr, domains, rules, next_idx, trusted).start()?;
 	REFRESHERS.lock().insert(name.to_owned(), refresher);
 	Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn stop_domain_refresher(name: &str) -> Vec<String> {
+fn stop_domain_refresher(name: &str) -> BTreeMap<String, usize> {
 	let refresher = REFRESHERS.lock().remove(name);
-	refresher.map_or_else(Vec::new, DomainRefresher::stop)
+	refresher.map_or_else(BTreeMap::new, DomainRefresher::stop)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 struct DomainRefresher {
 	name:       String,
 	guest_cidr: String,
 	domains:    Vec<String>,
-	seen:       Arc<Mutex<BTreeSet<String>>>,
+	trusted:    Vec<String>,
+	rules:      Arc<Mutex<BTreeMap<String, usize>>>,
 	next_idx:   Arc<Mutex<usize>>,
 	stop_tx:    mpsc::Sender<()>,
 	stop_rx:    Option<mpsc::Receiver<()>>,
 	thread:     Option<JoinHandle<()>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 impl DomainRefresher {
 	const INTERVAL: Duration = Duration::from_mins(1);
 
-	fn new(name: &str, guest_cidr: &str, domains: Vec<String>, initial_ips: Vec<String>) -> Self {
+	fn new(
+		name: &str,
+		guest_cidr: &str,
+		domains: Vec<String>,
+		rules: BTreeMap<String, usize>,
+		next_idx: usize,
+		trusted: Vec<String>,
+	) -> Self {
 		let (stop_tx, stop_rx) = mpsc::channel();
-		let seen = initial_ips.into_iter().collect::<BTreeSet<_>>();
-		let next_idx = seen.len();
 		Self {
 			name: name.to_owned(),
 			guest_cidr: guest_cidr.to_owned(),
 			domains,
-			seen: Arc::new(Mutex::new(seen)),
+			trusted,
+			rules: Arc::new(Mutex::new(rules)),
 			next_idx: Arc::new(Mutex::new(next_idx)),
 			stop_tx,
 			stop_rx: Some(stop_rx),
@@ -1127,36 +1248,125 @@ impl DomainRefresher {
 			return Err(EngineError::engine("domain refresher already started"));
 		};
 		let name = self.name.clone();
-		let guest_cidr = self.guest_cidr.clone();
+		let _guest_cidr = self.guest_cidr.clone();
 		let domains = self.domains.clone();
-		let seen = Arc::clone(&self.seen);
+		let trusted = self.trusted.clone();
+		let rules = Arc::clone(&self.rules);
 		let next_idx = Arc::clone(&self.next_idx);
 		let thread_name = format!("vmon-egress-dns-{name}");
 		let thread = thread::Builder::new().name(thread_name).spawn(move || {
+			let Ok(mut policy) = policy::EgressPolicy::new(policy::SystemResolver, &domains, &trusted)
+			else {
+				return;
+			};
 			loop {
 				match stop_rx.recv_timeout(Self::INTERVAL) {
 					Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
 					Err(mpsc::RecvTimeoutError::Timeout) => {},
 				}
-				let current = resolve_domain_ips(&domains);
-				for ip in current {
-					if seen.lock().contains(&ip) {
-						continue;
+				let now = START_INSTANT.elapsed();
+				let mut current_ips = BTreeSet::new();
+				let mut refresh_failed = false;
+				for domain in &domains {
+					if let Ok(ips) = policy.resolve_allowed(domain, now) {
+						for ip in ips {
+							current_ips.insert(ip.to_string());
+						}
+					} else {
+						refresh_failed = true;
+						break;
 					}
+				}
+
+				if refresh_failed {
+					#[cfg(target_os = "linux")]
+					{
+						let to_delete = {
+							let rules_guard = rules.lock();
+							rules_guard.clone()
+						};
+						for (ip, idx) in to_delete {
+							let _ = iptables_delete(&domain_rule(
+								IptablesAction::Delete,
+								&name,
+								&_guest_cidr,
+								&ip,
+								idx,
+							));
+						}
+					}
+					{
+						let mut rules_guard = rules.lock();
+						rules_guard.clear();
+					}
+					break;
+				}
+
+				let mut to_add = Vec::new();
+				let mut to_remove = Vec::new();
+
+				{
+					let rules_guard = rules.lock();
+					for ip in rules_guard.keys() {
+						if !current_ips.contains(ip) {
+							to_remove.push(ip.clone());
+						}
+					}
+					for ip in &current_ips {
+						if !rules_guard.contains_key(ip) {
+							to_add.push(ip.clone());
+						}
+					}
+				}
+
+				// 1. Add refreshed/new rules FIRST (only on success, update rules map after)
+				for ip in to_add {
 					let idx = {
-						let mut idx = next_idx.lock();
-						let current = *idx;
-						*idx += 1;
+						let mut next_idx_guard = next_idx.lock();
+						let current = *next_idx_guard;
+						*next_idx_guard += 1;
 						current
 					};
-					let _ = iptables_ensure(&domain_rule(
+					#[cfg(target_os = "linux")]
+					let res = iptables_ensure(&domain_rule(
 						IptablesAction::Insert,
 						&name,
-						&guest_cidr,
+						&_guest_cidr,
 						&ip,
 						idx,
 					));
-					seen.lock().insert(ip);
+					#[cfg(not(target_os = "linux"))]
+					let res: Result<(), EngineError> = Ok(());
+
+					if res.is_ok() {
+						let mut rules_guard = rules.lock();
+						rules_guard.insert(ip.clone(), idx);
+					}
+				}
+
+				// 2. Delete stale rules SECOND (only on success, update rules map after)
+				for ip in to_remove {
+					let idx = {
+						let rules_guard = rules.lock();
+						rules_guard.get(&ip).copied()
+					};
+					if let Some(_idx) = idx {
+						#[cfg(target_os = "linux")]
+						let res = iptables_delete(&domain_rule(
+							IptablesAction::Delete,
+							&name,
+							&_guest_cidr,
+							&ip,
+							_idx,
+						));
+						#[cfg(not(target_os = "linux"))]
+						let res: Result<(), EngineError> = Ok(());
+
+						if res.is_ok() {
+							let mut rules_guard = rules.lock();
+							rules_guard.remove(&ip);
+						}
+					}
 				}
 			}
 		})?;
@@ -1164,12 +1374,23 @@ impl DomainRefresher {
 		Ok(self)
 	}
 
-	fn stop(mut self) -> Vec<String> {
+	fn stop(mut self) -> BTreeMap<String, usize> {
 		let _ = self.stop_tx.send(());
 		if let Some(thread) = self.thread.take() {
 			let _ = thread.join();
 		}
-		self.seen.lock().iter().cloned().collect()
+		let rules = self.rules.lock().clone();
+		#[cfg(target_os = "linux")]
+		for (ip, idx) in &rules {
+			let _ = iptables_delete(&domain_rule(
+				IptablesAction::Delete,
+				&self.name,
+				&self.guest_cidr,
+				ip,
+				*idx,
+			));
+		}
+		rules
 	}
 }
 
@@ -1378,5 +1599,71 @@ mod tests {
 			domain_rule(IptablesAction::Delete, &lease.name, &lease.guest_cidr(), "203.0.113.9", 0,),
 			domain_delete
 		);
+	}
+
+	#[test]
+	fn test_domain_refresher_rule_indexing_state() {
+		let rules = BTreeMap::from([("1.1.1.1".to_owned(), 0), ("8.8.8.8".to_owned(), 1)]);
+		let next_idx = 2;
+		let refresher = DomainRefresher::new(
+			"test-sb",
+			"10.0.2.15/32",
+			vec!["api.example.com".to_owned()],
+			rules,
+			next_idx,
+			vec![],
+		)
+		.start()
+		.unwrap();
+		assert_eq!(refresher.rules.lock().get("1.1.1.1"), Some(&0));
+		assert_eq!(refresher.rules.lock().get("8.8.8.8"), Some(&1));
+		assert_eq!(*refresher.next_idx.lock(), 2);
+
+		let stopped_rules = refresher.stop();
+		assert_eq!(stopped_rules.get("1.1.1.1"), Some(&0));
+		assert_eq!(stopped_rules.get("8.8.8.8"), Some(&1));
+	}
+
+	#[test]
+	fn test_protected_deny_rule_argv() {
+		let rule =
+			protected_deny_rule(IptablesAction::Append, "test-sb", "10.0.2.15/32", "127.0.0.0/8", 3);
+		assert_eq!(rule, vec![
+			"-A".to_owned(),
+			"FORWARD".to_owned(),
+			"-i".to_owned(),
+			"test-sb".to_owned(),
+			"-s".to_owned(),
+			"10.0.2.15/32".to_owned(),
+			"-d".to_owned(),
+			"127.0.0.0/8".to_owned(),
+			"-m".to_owned(),
+			"comment".to_owned(),
+			"--comment".to_owned(),
+			"vmon:test-sb:deny-range-3".to_owned(),
+			"-j".to_owned(),
+			"REJECT".to_owned(),
+		]);
+	}
+
+	#[test]
+	fn test_domain_rule_argv() {
+		let rule = domain_rule(IptablesAction::Insert, "test-sb", "10.0.2.15/32", "1.1.1.1", 5);
+		assert_eq!(rule, vec![
+			"-I".to_owned(),
+			"FORWARD".to_owned(),
+			"-i".to_owned(),
+			"test-sb".to_owned(),
+			"-s".to_owned(),
+			"10.0.2.15/32".to_owned(),
+			"-d".to_owned(),
+			"1.1.1.1/32".to_owned(),
+			"-m".to_owned(),
+			"comment".to_owned(),
+			"--comment".to_owned(),
+			"vmon:test-sb:domain-5".to_owned(),
+			"-j".to_owned(),
+			"ACCEPT".to_owned(),
+		]);
 	}
 }

@@ -33,7 +33,7 @@ class ImageArtifact:
     media_type: str = "application/octet-stream"
 
 
-type ImageStepKind = Literal[
+ImageStepKind = Literal[
     "uv_sync",
     "uv_install",
     "apt_install",
@@ -193,7 +193,7 @@ class Image:
         artifact_digests: dict[str, str] = {}
         try:
             artifact_digests = {item.key: item.sha256 for item in self.artifacts()}
-        except FileNotFoundError, NotADirectoryError, ImageError:
+        except (FileNotFoundError, NotADirectoryError, ImageError):
             pass
         return {
             "source": {

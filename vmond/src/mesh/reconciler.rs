@@ -94,14 +94,13 @@ pub trait MeshReconcileState: Send + Sync {
 	fn live_member_ids(&self) -> Vec<String>;
 	fn peer_url(&self, node_id: &str) -> Option<String>;
 	fn is_peer_healthy(&self, node_id: &str) -> bool;
-	fn owner_of(&self, sid: &str) -> Option<String>;
+	fn owner_of(&self, sid: &str) -> Result<Option<String>>;
 	fn restore_owner(&self, sid: &str, exclude: &HashSet<String>) -> Option<String>;
 	fn restore_quorum_met(&self, confirmations: usize) -> bool;
 	fn quorum_needed(&self) -> usize;
 	fn drain_orphans(&self) -> Vec<(String, String)>;
 	fn requeue_orphan(&self, sid: &str, dead: &str);
-	fn next_epoch(&self, sid: &str) -> u64;
-	fn broadcast_owner(&self, sid: &str, node_id: &str, epoch: u64) -> Result<()>;
+	fn next_epoch(&self, sid: &str) -> Result<u64>;
 	fn update_record_owner(
 		&self,
 		sid: &str,
@@ -113,7 +112,7 @@ pub trait MeshReconcileState: Send + Sync {
 	fn worker_end(&self, key: &str);
 	fn note_event(&self, event: &str);
 	fn replica_targets(&self, sid: &str, replicas: usize) -> Vec<String>;
-	fn fenced_local_ids(&self, owned_ids: &[String]) -> Vec<String>;
+	fn fenced_local_ids(&self, owned_ids: &[String]) -> Result<Vec<String>>;
 	fn forget_local_owner(&self, sid: &str);
 }
 
@@ -138,14 +137,14 @@ pub trait ReconcileEngine: Send + Sync {
 }
 
 pub trait CreateRecordStore: Send + Sync {
-	fn get(&self, sid: &str) -> Option<CreateRecord>;
+	fn get(&self, sid: &str) -> Result<Option<CreateRecord>>;
 	fn reconcile_records(&self) -> Result<()>;
 }
 
 pub trait ReplicaStore: Send + Sync {
-	fn get(&self, sid: &str) -> Option<ReplicaRecord>;
-	fn holds(&self, sid: &str) -> bool;
-	fn secrets_ready(&self, sid: &str) -> bool;
+	fn get<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<Option<ReplicaRecord>>>;
+	fn holds(&self, sid: &str) -> Result<bool>;
+	fn secrets_ready(&self, sid: &str) -> Result<bool>;
 	fn drop_replica(&self, sid: &str) -> Result<()>;
 }
 
@@ -234,7 +233,7 @@ impl<'a> Reconciler<'a> {
 			self.reconcile_orphan(&sid, &dead).await;
 		}
 		let owned_ids = self.engine.owned_ids()?;
-		for sid in self.mesh.fenced_local_ids(&owned_ids) {
+		for sid in self.mesh.fenced_local_ids(&owned_ids)? {
 			self.fence_local(&sid).await;
 		}
 		Ok(())
@@ -244,7 +243,7 @@ impl<'a> Reconciler<'a> {
 		let mut digest = String::new();
 		let mut snapshot_dir = PathBuf::new();
 		let result: Result<()> = async {
-			let ha = self.ha_for_sid(sid);
+			let ha = self.ha_for_sid(sid)?;
 			if ha == "off" {
 				last.remove(sid);
 				self.checkpoint_times.lock().remove(sid);
@@ -348,11 +347,11 @@ impl<'a> Reconciler<'a> {
 		}
 	}
 
-	fn ha_for_sid(&self, sid: &str) -> String {
-		if let Some(record) = self.records.get(sid) {
-			return record.ha;
+	fn ha_for_sid(&self, sid: &str) -> Result<String> {
+		if let Some(record) = self.records.get(sid)? {
+			return Ok(record.ha);
 		}
-		self
+		Ok(self
 			.engine
 			.get(sid)
 			.ok()
@@ -363,12 +362,12 @@ impl<'a> Reconciler<'a> {
 					.and_then(Value::as_str)
 					.map(str::to_owned)
 			})
-			.unwrap_or_else(|| "async".to_owned())
+			.unwrap_or_else(|| "async".to_owned()))
 	}
 
 	async fn reconcile_orphan(&self, sid: &str, dead: &str) {
 		let result = async {
-			if let Some(owner) = self.mesh.owner_of(sid)
+			if let Some(owner) = self.mesh.owner_of(sid)?
 				&& owner != dead
 				&& (owner == self.mesh.node_id() || self.mesh.is_peer_healthy(&owner))
 			{
@@ -382,7 +381,7 @@ impl<'a> Reconciler<'a> {
 			if self.mesh.restore_owner(sid, &exclude).as_deref() != Some(self.mesh.node_id()) {
 				return Ok(true);
 			}
-			let create_record = self.records.get(sid);
+			let create_record = self.records.get(sid)?;
 			let ha = create_record
 				.as_ref()
 				.map_or("async", |record| record.ha.as_str());
@@ -405,8 +404,9 @@ impl<'a> Reconciler<'a> {
 				return Ok(false);
 			}
 			let allow_checkpoint = matches!(ha, "async" | "async+rerun");
+			let replica_held = self.replicas.holds(sid)?;
 			let replica_ready =
-				allow_checkpoint && self.replicas.holds(sid) && self.replicas.secrets_ready(sid);
+				allow_checkpoint && replica_held && self.replicas.secrets_ready(sid)?;
 			if replica_ready {
 				return self
 					.restore_from_replica(sid, dead, create_record.as_ref(), restore_quorum)
@@ -415,9 +415,9 @@ impl<'a> Reconciler<'a> {
 			if can_rerun && self.rerun_from_record(sid, dead)? {
 				return Ok(false);
 			}
-			if !self.replicas.holds(sid) {
+			if !replica_held {
 				warn!("cannot auto-restore {sid}: no local replica (will retry)");
-			} else if !self.replicas.secrets_ready(sid) {
+			} else if !self.replicas.secrets_ready(sid)? {
 				warn!("cannot auto-restore {sid}: replica secrets unavailable after restart");
 			}
 			Ok(true)
@@ -486,8 +486,9 @@ impl<'a> Reconciler<'a> {
 			let rec = self
 				.replicas
 				.get(sid)
+				.await?
 				.ok_or_else(|| EngineError::not_found("no local replica"))?;
-			let epoch = self.mesh.next_epoch(sid);
+			let epoch = self.mesh.next_epoch(sid)?;
 			let lease_records = self
 				.leases
 				.acquire_writable_volume_leases(&rec.params, epoch)
@@ -511,7 +512,6 @@ impl<'a> Reconciler<'a> {
 			self
 				.engine
 				.record_volume_leases(&restored.name, &lease_records)?;
-			self.mesh.broadcast_owner(sid, self.mesh.node_id(), epoch)?;
 			self
 				.mesh
 				.update_record_owner(sid, self.mesh.node_id(), epoch, false)?;
@@ -526,7 +526,7 @@ impl<'a> Reconciler<'a> {
 	}
 
 	fn rerun_from_record(&self, sid: &str, dead: &str) -> Result<bool> {
-		let Some(record) = self.records.get(sid) else {
+		let Some(record) = self.records.get(sid)? else {
 			return Ok(false);
 		};
 		if !record_can_rerun(&record) {
@@ -537,8 +537,7 @@ impl<'a> Reconciler<'a> {
 			return Ok(true);
 		}
 		let result = (|| {
-			let epoch = self.mesh.next_epoch(sid);
-			self.mesh.broadcast_owner(sid, self.mesh.node_id(), epoch)?;
+			let epoch = self.mesh.next_epoch(sid)?;
 			let mut params = params_object(record.params.clone())?;
 			let kind = params
 				.remove("_kind")

@@ -210,12 +210,12 @@ type SandboxServiceClient interface {
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	Tunnels(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
-	// Initiates state migration of the sandbox to a target destination or host.
+	// Migrates a running sandbox to another mesh node.
 	//
-	// Replaces: POST /v1/sandboxes/{id}/migrate
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-	//   - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+	//   - `invalid` (INVALID_ARGUMENT): The target node ID is empty or unknown.
+	//   - `unsupported` (UNIMPLEMENTED): The server is not part of a mesh.
 	Migrate(ctx context.Context, in *MigrateRequest, opts ...grpc.CallOption) (*JsonView, error)
 	// Captures a snapshot of the sandbox's memory, register, and device state.
 	//
@@ -688,12 +688,12 @@ type SandboxServiceServer interface {
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	Tunnels(context.Context, *SandboxRef) (*JsonView, error)
-	// Initiates state migration of the sandbox to a target destination or host.
+	// Migrates a running sandbox to another mesh node.
 	//
-	// Replaces: POST /v1/sandboxes/{id}/migrate
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-	//   - `invalid` (INVALID_ARGUMENT): Target destination is invalid or unreachable.
+	//   - `invalid` (INVALID_ARGUMENT): The target node ID is empty or unknown.
+	//   - `unsupported` (UNIMPLEMENTED): The server is not part of a mesh.
 	Migrate(context.Context, *MigrateRequest) (*JsonView, error)
 	// Captures a snapshot of the sandbox's memory, register, and device state.
 	//

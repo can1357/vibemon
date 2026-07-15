@@ -116,59 +116,13 @@ await client.driver.refresh(true);
 
 Discovery is throttled and lazy. The roster keeps configured seeds and merges healthy advertised peers. Closing the client releases or closes every transport owned by its driver.
 
-## Routing and resource affinity
+## Routing and stable-ID reconnect
 
-The mesh driver selects a reachable endpoint for client-wide requests. A sandbox returned by create, lookup, restore, fork, or list is pinned to the endpoint that supplied it. Resource handles are owner-pinned; they are not portable requests that should be manually routed to every member.
+The mesh driver selects a reachable endpoint for client-wide requests. A sandbox returned by create, lookup, restore, fork, or list is identified by its stable sandbox ID; any routing state is private to the SDK.
 
-When a sandbox-scoped request reports `not_found` and several endpoints exist, each SDK can locate the current owner and re-pin the handle. Migration asks the server to move the sandbox, then refreshes or resolves its current owner.
+When a sandbox-scoped request reports `not_found` and several endpoints exist, each SDK resolves the current owner once and retries the request. Callers retain the sandbox ID and do not select a worker node or manage an endpoint.
 
-<div class="sdk-snippets" data-sdk-snippets>
-<div data-sdk-language="python">
-
-```python
-sandbox = client.sandboxes.create(image="alpine")
-try:
-    print("before:", sandbox.endpoint)
-    sandbox.migrate("node-b")
-    print("after:", sandbox.endpoint)
-finally:
-    sandbox.terminate()
-```
-
-</div>
-<div data-sdk-language="go">
-
-```go
-sandbox, err := client.Sandboxes.Create(ctx, vmon.SandboxCreateRequest{Image: "alpine"})
-if err != nil {
-    return err
-}
-defer sandbox.Terminate(ctx)
-
-if _, err := sandbox.Migrate(ctx, "node-b"); err != nil {
-    return err
-}
-fmt.Println("migrated to", sandbox.Node)
-```
-
-</div>
-<div data-sdk-language="typescript">
-
-```ts
-const sandbox = await client.sandboxes.create({ image: "alpine" });
-try {
-  console.log("before:", sandbox.endpoint);
-  await sandbox.migrate("node-b");
-  console.log("after:", sandbox.endpoint);
-} finally {
-  await sandbox.terminate();
-}
-```
-
-</div>
-</div>
-
-Use a target node identifier accepted by the daemon. Migration is a server operation; the refreshed sandbox view reports the resulting placement.
+Migration is a server operation. Call `migrate(target)` in Python or TypeScript, or `Migrate(ctx, target)` in Go, with a mesh node ID. The SDK updates the cached sandbox view and resolves its serving endpoint after the move; the stable sandbox ID does not change. See [Sandboxes](sandboxes.md#lifecycle-actions).
 
 ## Failover boundaries
 
@@ -176,4 +130,4 @@ Drivers fail over only on transport failures that did not successfully complete 
 
 This policy does not provide at-most-once or exactly-once mutation semantics. Use explicit API controls such as sandbox creation `idempotency_key`, and make durable-function side effects idempotent. See [Shared Concepts](shared-concepts.md), [Errors](errors.md), and [Mesh and High Availability](../platform/mesh.md).
 
-Sandbox list operations query the live roster, merge rows by sandbox ID, and support tag and node filtering. A partial result can remain useful when another endpoint has a transport failure; if every attempted endpoint fails at the transport layer, the operation returns that failure.
+Sandbox list operations query the live roster, merge rows by sandbox ID, and support tag filtering. A partial result can remain useful when another endpoint has a transport failure; if every attempted endpoint fails at the transport layer, the operation returns that failure.

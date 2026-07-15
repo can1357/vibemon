@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Sequence
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+R = TypeVar("R")
 
 
-class CallGroup[R]:
+class CallGroup(Generic[R]):
     """A durable collection of calls with structured cancellation.
 
     The group never owns call results.  It stores only durable handles and

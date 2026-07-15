@@ -14,7 +14,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
 from ._endpoint import GrpcStubs, decode_view, dump_json
 from .driver import (
@@ -23,7 +23,7 @@ from .driver import (
     MeshDriver,
     parse_dsn,
 )
-from .errors import ProtocolError, TransportError
+from .errors import APIError, ProtocolError, TransportError
 from .options import FunctionOptions
 from .sandbox import (
     Sandbox,
@@ -37,6 +37,10 @@ from .sandbox import (
 from .secret import Secret
 from .v1 import api_pb2
 from .volume import S3Mount, Volume
+
+P = ParamSpec("P")
+Y = TypeVar("Y")
+R = TypeVar("R")
 
 if TYPE_CHECKING:
     from .models import Health, MeshNode, MeshStatus, PoolStats, ServerInfo
@@ -140,7 +144,7 @@ class Client:
         )
 
     @overload
-    def function[**P, Y](  # type: ignore[overload-overlap]
+    def function(  # type: ignore[overload-overlap]
         self,
         function: Callable[P, Iterator[Y]],
         *,
@@ -156,7 +160,7 @@ class Client:
     ) -> GeneratorRemoteFunction[P, Y]: ...
 
     @overload
-    def function[**P, Y](  # type: ignore[overload-overlap]
+    def function(  # type: ignore[overload-overlap]
         self,
         function: Callable[P, AsyncIterator[Y]],
         *,
@@ -172,7 +176,7 @@ class Client:
     ) -> AsyncGeneratorRemoteFunction[P, Y]: ...
 
     @overload
-    def function[**P, Y](  # type: ignore[overload-overlap]
+    def function(  # type: ignore[overload-overlap]
         self,
         function: Callable[P, Coroutine[Any, Any, Y]],
         *,
@@ -188,7 +192,7 @@ class Client:
     ) -> AsyncRemoteFunction[P, Y]: ...
 
     @overload
-    def function[**P, R](
+    def function(
         self,
         function: Callable[P, R],
         *,
@@ -386,17 +390,31 @@ class SandboxAPI:
             ),
             error="create returned a non-object response",
         )
-        sandbox = Sandbox(self._client, value, endpoint=endpoint)
+        sandbox = Sandbox._from_route(self._client, value, endpoint)
         sandbox._bind_defaults(workdir=workdir, env=env, tags=tags, secrets=secret_items)
         return sandbox
 
     def get(self, sandbox_id: str) -> Sandbox:
-        """Fetch a sandbox and pin it to the responding endpoint."""
-        value, endpoint = self._client._view(
-            lambda stubs: stubs.sandbox.Get(api_pb2.SandboxRef(id=sandbox_id)),
-            error="inspect returned a non-object response",
-        )
-        return Sandbox(self._client, value, endpoint=endpoint)
+        """Reconnect to a sandbox by stable ID and pin its current endpoint."""
+
+        def request(stubs: GrpcStubs) -> api_pb2.JsonView:
+            return stubs.sandbox.Get(api_pb2.SandboxRef(id=sandbox_id))
+
+        try:
+            value, endpoint = self._client._view(
+                request,
+                error="inspect returned a non-object response",
+            )
+        except APIError as error:
+            if error.code != "not_found" or len(self._client.driver.endpoints()) <= 1:
+                raise
+            endpoint = self._client.driver.resolve_sandbox(sandbox_id)
+            value, endpoint = self._client._view(
+                request,
+                endpoint=endpoint,
+                error="inspect returned a non-object response",
+            )
+        return Sandbox._from_route(self._client, value, endpoint)
 
     def ref(self, sandbox_id: str) -> Sandbox:
         """Create a bound sandbox reference without performing I/O."""
@@ -405,7 +423,6 @@ class SandboxAPI:
     def list(
         self,
         tags: Mapping[str, str] | None = None,
-        node: str | None = None,
     ) -> builtins.list[Sandbox]:
         """List and merge sandboxes across every live roster endpoint."""
         tag_items = [f"{key}={value}" for key, value in sorted(tags.items())] if tags else []
@@ -414,7 +431,7 @@ class SandboxAPI:
         if len(live) <= 1:
             hint = live[0].url if live else None
             response, endpoint = self._fetch(tag_items, hint)
-            return self._views(response, endpoint, node)
+            return self._views(response, endpoint)
 
         results: builtins.list[tuple[api_pb2.ListSandboxesResponse, str] | TransportError] = []
         with ThreadPoolExecutor(max_workers=len(live)) as executor:
@@ -434,7 +451,7 @@ class SandboxAPI:
                 continue
             succeeded = True
             response, endpoint = result
-            for sandbox in self._views(response, endpoint, node):
+            for sandbox in self._views(response, endpoint):
                 merged.setdefault(sandbox.id, sandbox)
         if not succeeded and last_error is not None:
             raise last_error
@@ -452,16 +469,13 @@ class SandboxAPI:
         self,
         response: api_pb2.ListSandboxesResponse,
         endpoint: str | None,
-        node: str | None,
     ) -> builtins.list[Sandbox]:
         sandboxes: builtins.list[Sandbox] = []
         for payload in response.sandboxes_json:
             row = decode_view(payload, "sandbox list returned a malformed response")
             if not isinstance(row.get("name") or row.get("id"), str):
                 raise ProtocolError("sandbox list returned a malformed response")
-            if node is not None and row.get("node") != node:
-                continue
-            sandboxes.append(Sandbox(self._client, row, endpoint=endpoint))
+            sandboxes.append(Sandbox._from_route(self._client, row, endpoint))
         return sandboxes
 
 
@@ -490,7 +504,7 @@ class SnapshotAPI:
             ),
             error="restore returned a non-object response",
         )
-        sandbox = Sandbox(self._client, value, endpoint=endpoint)
+        sandbox = Sandbox._from_route(self._client, value, endpoint)
         sandbox._bind_defaults(
             workdir=kwargs.get("workdir"),
             env=kwargs.get("env"),
@@ -523,7 +537,7 @@ class SnapshotAPI:
                 row.get("name") or row.get("id"), str
             ):
                 raise ProtocolError("fork returned a malformed clone")
-            sandbox = Sandbox(self._client, row, endpoint=endpoint)
+            sandbox = Sandbox._from_route(self._client, row, endpoint)
             sandbox._bind_defaults(
                 workdir=kwargs.get("workdir"),
                 env=kwargs.get("env"),

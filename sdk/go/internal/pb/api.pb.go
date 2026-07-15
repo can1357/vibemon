@@ -2380,12 +2380,12 @@ func (x *NetworkSetRequest) GetDomainAllow() *StringList {
 	return nil
 }
 
-// MigrateRequest represents parameters to migrate a sandbox.
+// Identifies a sandbox and its destination mesh node.
 type MigrateRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The unique identifier of the target sandbox to migrate.
+	// The sandbox to migrate.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	// The destination address or host URI.
+	// The destination mesh node ID.
 	Target        string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -83,15 +83,29 @@ export interface SnapshotFilesystemRequest {
   name?: string | null;
 }
 
-/** Snapshot restore request. */
-export type RestoreRequest = Partial<SandboxCreateRequest> & {
+/** Runtime-only fields that can change without altering captured VM devices. */
+export interface SnapshotRuntimeOptions {
   agent?: boolean | null;
-};
+  command?: string[] | null;
+  env?: Record<string, string> | null;
+  readiness_probe?: number | string | { port: number } | null;
+  secrets?: SecretWire[] | null;
+  s3_mounts?: Record<string, S3MountSpec | string> | null;
+  tags?: Record<string, string> | null;
+  timeout?: number | null;
+  timeout_secs?: number | null;
+  workdir?: string | null;
+}
 
-/** Snapshot fork request. */
-export type ForkRequest = Partial<SandboxCreateRequest> & {
+/** Snapshot restore request. */
+export interface RestoreRequest extends SnapshotRuntimeOptions {
+  name?: string | null;
+}
+
+/** Atomic snapshot fork request for 1 through 32 clones. */
+export interface ForkRequest extends SnapshotRuntimeOptions {
   count: number;
-};
+}
 
 /** Warm-pool update request. */
 export type PoolSetRequest = Partial<SandboxCreateRequest> & {
@@ -101,11 +115,11 @@ export type PoolSetRequest = Partial<SandboxCreateRequest> & {
 /** Tolerant sandbox view returned by the daemon. */
 export interface SandboxInfo {
   id: string;
-  node?: string | null;
   state?: string;
   status?: string;
   name?: string | null;
   tags?: Record<string, string> | null;
+  node?: string | null;
   [key: string]: unknown;
 }
 

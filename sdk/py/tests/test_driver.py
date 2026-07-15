@@ -138,7 +138,7 @@ def test_failover_and_discovery() -> None:
             server_a.stop()
             sandboxes = client.sandboxes.list()
             assert [sandbox.id for sandbox in sandboxes] == ["on-b"]
-            assert sandboxes[0].endpoint == server_b.url
+            assert sandboxes[0]._endpoint == server_b.url
     finally:
         server_a.stop()
         server_b.stop()
@@ -152,10 +152,13 @@ def test_sandbox_relocate() -> None:
             client_b.sandboxes.create(name="moved", image="alpine")
 
         with connect(_multi_dsn(server_a, server_b), discover=False) as client:
+            reconnected = client.sandboxes.get("moved")
+            assert reconnected.id == "moved"
+            assert reconnected._endpoint == server_b.url
+
             sandbox = client.sandboxes.ref("moved")
             assert sandbox.refresh().status == "running"
-            assert sandbox.endpoint == server_b.url
-            assert sandbox.node == "node-b"
+            assert sandbox._endpoint == server_b.url
 
             missing = client.sandboxes.ref("missing")
             with pytest.raises(APIError) as exc_info:
@@ -235,3 +238,45 @@ def test_sandbox_list_empty_success_wins_over_transport_failure() -> None:
     finally:
         server_a.stop()
         server_b.stop()
+
+
+def test_error_retryable_metadata() -> None:
+    import grpc
+
+    from vmon._endpoint import translate_rpc_error
+    from vmon.errors import APIError
+
+    class MockCall(grpc.Call, grpc.RpcError):
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.ABORTED
+
+        def details(self) -> str:
+            return "busy details"
+
+        def trailing_metadata(self) -> list[tuple[str, str]]:
+            return [
+                ("vmon-code", "busy"),
+                ("vmon-retryable", "true"),
+                ("vmon-action", "re-register"),
+            ]
+
+    err = translate_rpc_error(MockCall())
+    assert isinstance(err, APIError)
+    assert err.code == "busy"
+    assert err.retryable is True
+    assert err.action == "re-register"
+
+    # Test fallback default when absent
+    class MockCallNoMeta(grpc.Call, grpc.RpcError):
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.ABORTED
+
+        def details(self) -> str:
+            return "busy details"
+
+        def trailing_metadata(self) -> list[tuple[str, str]]:
+            return [("vmon-code", "busy")]
+
+    err_fallback = translate_rpc_error(MockCallNoMeta())
+    assert isinstance(err_fallback, APIError)
+    assert err_fallback.retryable is True

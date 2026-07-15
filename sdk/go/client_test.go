@@ -18,6 +18,7 @@ import (
 	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -161,6 +162,36 @@ func TestTypedResponsesRejectMalformedPayloads(t *testing.T) {
 	}
 }
 
+func TestSandboxGetReconnectsByStableID(t *testing.T) {
+	old := &sandboxServiceStub{get: func(context.Context, *pb.SandboxRef) (*pb.JsonView, error) {
+		return nil, status.Error(codes.NotFound, "moved")
+	}}
+	current := &sandboxServiceStub{get: func(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+		if ref.GetId() != "box" {
+			return nil, status.Error(codes.InvalidArgument, "unexpected id")
+		}
+		return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+	}}
+	dialer := routingDialer(map[string]*bufconn.Listener{
+		"a.test:80": startSandboxServiceStub(t, old),
+		"b.test:80": startSandboxServiceStub(t, current),
+	})
+	driver := &stubDriver{endpoints: []EndpointInfo{
+		{URL: "http://a.test", Healthy: true},
+		{URL: "http://b.test", Healthy: true},
+	}}
+	client := NewClient(driver, withGRPCDialer(dialer))
+	defer client.Close()
+
+	sandbox, err := client.Sandboxes.Get(context.Background(), "box")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sandbox.ID != "box" || sandbox.endpoint != "http://b.test" {
+		t.Fatalf("sandbox=%#v endpoint=%q", sandbox, sandbox.endpoint)
+	}
+}
+
 func TestSandboxRelocatesOnceOnNotFound(t *testing.T) {
 	var mu sync.Mutex
 	oldGets, newGets := 0, 0
@@ -200,12 +231,11 @@ func TestSandboxRelocatesOnceOnNotFound(t *testing.T) {
 	}
 }
 
-func TestSandboxListFiltersNodeAndOnlySkipsTransportErrors(t *testing.T) {
+func TestSandboxListOnlySkipsTransportErrors(t *testing.T) {
 	t.Run("transport error", func(t *testing.T) {
 		live := &sandboxServiceStub{list: func(context.Context, *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
 			return &pb.ListSandboxesResponse{SandboxesJson: []string{
-				`{"id":"other","node":"node-a"}`,
-				`{"id":"wanted","node":"node-b"}`,
+				`{"id":"wanted"}`,
 			}}, nil
 		}}
 		// a.test has no route: its dial fails and the call fails over to b.
@@ -213,7 +243,7 @@ func TestSandboxListFiltersNodeAndOnlySkipsTransportErrors(t *testing.T) {
 		driver := &stubDriver{endpoints: []EndpointInfo{{URL: "http://a.test", Healthy: true}, {URL: "http://b.test", Healthy: true}}}
 		client := NewClient(driver, withGRPCDialer(dialer))
 		defer client.Close()
-		sandboxes, err := client.Sandboxes.List(context.Background(), SandboxListOptions{Node: "node-b"})
+		sandboxes, err := client.Sandboxes.List(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,6 +401,27 @@ func TestExtendPreservesSandboxIDWhenResponseOmitsIt(t *testing.T) {
 	}
 	if extended.ID != "box" || sandbox.ID != "box" {
 		t.Fatalf("extended ID=%q sandbox ID=%q", extended.ID, sandbox.ID)
+	}
+}
+
+func TestMigrateUpdatesSandboxNode(t *testing.T) {
+	stub := &sandboxServiceStub{migrate: func(_ context.Context, request *pb.MigrateRequest) (*pb.JsonView, error) {
+		if request.GetId() != "box" || request.GetTarget() != "node-b" {
+			return nil, status.Error(codes.InvalidArgument, "unexpected migrate request")
+		}
+		return &pb.JsonView{Json: `{"id":"box","node":"node-b","status":"running","migration":{"precopy_ms":12,"downtime_ms":3,"total_ms":15}}`}, nil
+	}}
+	sandbox := bufconnClient(t, startSandboxServiceStub(t, stub)).Sandboxes.Ref("box")
+	migrated, err := sandbox.Migrate(context.Background(), "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Node != "node-b" {
+		t.Fatalf("migrated node=%q", migrated.Node)
+	}
+	timing, ok := migrated.MigrationTiming()
+	if !ok || timing.PrecopyMS != 12 || timing.DowntimeMS != 3 || timing.TotalMS != 15 {
+		t.Fatalf("migration timing=%+v ok=%t", timing, ok)
 	}
 }
 
@@ -558,4 +609,35 @@ func TestWaitReadyProbes(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestAPIErrorRetryableAndActionMetadata(t *testing.T) {
+	err := apiErrorFromStatus(
+		status.Error(codes.Aborted, "busy details"),
+		"test ops",
+		metadata.Pairs(
+			"vmon-code", "busy",
+			"vmon-retryable", "true",
+			"vmon-action", "re-register",
+		),
+	)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	if apiErr.Code != "busy" || !apiErr.Retryable || apiErr.Action != "re-register" {
+		t.Fatalf("apiErr=%#v", apiErr)
+	}
+
+	errFallback := apiErrorFromStatus(
+		status.Error(codes.Aborted, "busy details"),
+		"test ops",
+		metadata.Pairs("vmon-code", "busy"),
+	)
+	if !errors.As(errFallback, &apiErr) {
+		t.Fatalf("expected APIError")
+	}
+	if !apiErr.Retryable {
+		t.Fatalf("expected fallback retryable=true")
+	}
 }

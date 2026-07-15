@@ -18,12 +18,13 @@ use crate::{
 	Result,
 	engine::{
 		agent::AgentConn,
-		spawn::{LaunchSpec, MicroVm},
+		spawn::{LaunchSpec, SandboxRuntime, SandboxVm, VmonRuntime},
 	},
 };
 
 const REFILL_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_PING_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REFILL_BATCH: usize = 32;
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Format the portable template key used by placement and pool APIs.
@@ -57,11 +58,13 @@ pub struct PoolStats {
 /// A background-filled deque of restored/forked, agent-pinged VMs.
 pub struct WarmPool {
 	template:     PathBuf,
+	has_rootfs:   bool,
 	size:         AtomicUsize,
 	fork:         bool,
 	agent:        bool,
 	ping_timeout: Duration,
-	ready:        Mutex<VecDeque<MicroVm>>,
+	runtime:      Arc<dyn SandboxRuntime>,
+	ready:        Mutex<VecDeque<SandboxVm>>,
 	stop:         AtomicBool,
 	hits:         AtomicU64,
 	misses:       AtomicU64,
@@ -71,7 +74,16 @@ pub struct WarmPool {
 impl WarmPool {
 	/// Start a refiller for `template` with `size` parked VMs.
 	pub fn new(template: impl Into<PathBuf>, size: usize) -> Result<Arc<Self>> {
-		Self::with_options(template, size, true, true, DEFAULT_PING_TIMEOUT)
+		Self::with_runtime(template, size, Arc::new(VmonRuntime))
+	}
+
+	/// Start a refiller using the selected sandbox runtime.
+	pub fn with_runtime(
+		template: impl Into<PathBuf>,
+		size: usize,
+		runtime: Arc<dyn SandboxRuntime>,
+	) -> Result<Arc<Self>> {
+		Self::with_runtime_options(template, size, true, true, DEFAULT_PING_TIMEOUT, runtime)
 	}
 
 	/// Start a configurable refiller, mostly used by tests and restore-only
@@ -83,12 +95,27 @@ impl WarmPool {
 		agent: bool,
 		ping_timeout: Duration,
 	) -> Result<Arc<Self>> {
+		Self::with_runtime_options(template, size, fork, agent, ping_timeout, Arc::new(VmonRuntime))
+	}
+
+	fn with_runtime_options(
+		template: impl Into<PathBuf>,
+		size: usize,
+		fork: bool,
+		agent: bool,
+		ping_timeout: Duration,
+		runtime: Arc<dyn SandboxRuntime>,
+	) -> Result<Arc<Self>> {
+		let template = template.into();
+		let has_rootfs = template.join("rootfs.img").is_file();
 		let pool = Arc::new(Self {
-			template: template.into(),
+			template,
+			has_rootfs,
 			size: AtomicUsize::new(size),
 			fork,
 			agent,
 			ping_timeout,
+			runtime,
 			ready: Mutex::new(VecDeque::new()),
 			stop: AtomicBool::new(false),
 			hits: AtomicU64::new(0),
@@ -114,14 +141,14 @@ impl WarmPool {
 		let mut ready = self.ready.lock();
 		while ready.len() > size {
 			if let Some(vm) = ready.pop_back() {
-				Self::teardown(vm);
+				self.teardown(vm);
 			}
 		}
 	}
 
 	/// Pop a ready clone in O(1), optionally renaming it to the requested
 	/// sandbox name.
-	pub fn claim(&self, name: Option<&str>) -> Result<Option<MicroVm>> {
+	pub fn claim(&self, name: Option<&str>) -> Result<Option<SandboxVm>> {
 		let Some(vm) = self.ready.lock().pop_front() else {
 			self.misses.fetch_add(1, Ordering::Relaxed);
 			return Ok(None);
@@ -155,27 +182,59 @@ impl WarmPool {
 		}
 		let parked = self.ready.lock().drain(..).collect::<Vec<_>>();
 		for vm in parked {
-			Self::teardown(vm);
+			self.teardown(vm);
 		}
 	}
 
 	fn refill_loop(self: Arc<Self>) {
 		while !self.stop.load(Ordering::Relaxed) {
-			let short = self.ready.lock().len() < self.size.load(Ordering::Relaxed);
-			if short && let Some(vm) = self.spawn_one() {
-				if self.stop.load(Ordering::Relaxed) {
-					Self::teardown(vm);
-				} else {
-					self.ready.lock().push_back(vm);
-				}
+			let ready = self.ready.lock().len();
+			let target = self.size.load(Ordering::Relaxed);
+			if ready < target {
+				self.refill_batch(target - ready);
 			}
 			thread::sleep(REFILL_POLL);
 		}
 	}
 
-	fn spawn_one(&self) -> Option<MicroVm> {
+	/// Refill independent pool slots concurrently. Only this background thread
+	/// produces ready VMs, so launches do not race; capacity is checked again
+	/// before publishing results to make a concurrent resize safe.
+	fn refill_batch(&self, shortfall: usize) {
+		let count = shortfall.min(MAX_REFILL_BATCH);
+		if count == 0 {
+			return;
+		}
+		let spawned = thread::scope(|scope| {
+			let workers = (0..count)
+				.map(|_| scope.spawn(|| self.spawn_one()))
+				.collect::<Vec<_>>();
+			workers
+				.into_iter()
+				.filter_map(|worker| worker.join().ok().flatten())
+				.collect::<Vec<_>>()
+		});
+
+		let mut overflow = Vec::new();
+		{
+			let mut ready = self.ready.lock();
+			let target = self.size.load(Ordering::Relaxed);
+			for vm in spawned {
+				if self.stop.load(Ordering::Relaxed) || ready.len() >= target {
+					overflow.push(vm);
+				} else {
+					ready.push_back(vm);
+				}
+			}
+		}
+		for vm in overflow {
+			self.teardown(vm);
+		}
+	}
+
+	fn spawn_one(&self) -> Option<SandboxVm> {
 		let vm_name = pooled_name(&self.template);
-		let vm = MicroVm::new(vm_name);
+		let vm = self.runtime.sandbox(&vm_name);
 		let mut spec = if self.fork {
 			LaunchSpec::fork_from(vm.api_sock(), &self.template)
 		} else {
@@ -183,15 +242,15 @@ impl WarmPool {
 		};
 		// Pool VMs must not share the template's writable image: overlay it so
 		// each claimed sandbox owns a checkpointable per-VM disk.
-		let base_disk = self.template.join("rootfs.img");
-		if base_disk.is_file() {
+		if self.has_rootfs {
+			let base_disk = self.template.join("rootfs.img");
 			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
 		}
 		if self.agent {
 			spec = spec.with_agent_sock(vm.dir().join("agent.sock"));
 		}
-		if let Err(_err) = vm.launch(&spec) {
-			let _ = vm.remove();
+		if let Err(_err) = self.runtime.launch(&vm, &spec) {
+			let _ = self.runtime.remove(&vm);
 			return None;
 		}
 		if self.agent {
@@ -202,16 +261,16 @@ impl WarmPool {
 					result
 				});
 			if let Err(_err) = readiness {
-				Self::teardown(vm);
+				self.teardown(vm);
 				return None;
 			}
 		}
 		Some(vm)
 	}
 
-	fn teardown(vm: MicroVm) {
-		let _ = vm.stop(true);
-		let _ = vm.remove();
+	fn teardown(&self, vm: SandboxVm) {
+		let _ = self.runtime.stop(&vm, true);
+		let _ = self.runtime.remove(&vm);
 	}
 }
 
@@ -275,7 +334,7 @@ impl PoolRegistry {
 	}
 }
 
-fn rename_vm(vm: MicroVm, name: &str) -> Result<MicroVm> {
+fn rename_vm(vm: SandboxVm, name: &str) -> Result<SandboxVm> {
 	let old_meta = vm.meta()?;
 	let old_dir = vm.dir().to_path_buf();
 	let parent = old_dir
@@ -287,7 +346,7 @@ fn rename_vm(vm: MicroVm, name: &str) -> Result<MicroVm> {
 	}
 	fs::create_dir_all(parent)?;
 	fs::rename(old_dir, &new_dir)?;
-	let renamed = MicroVm::from_dir(name.to_owned(), new_dir);
+	let renamed = SandboxVm::from_dir(name.to_owned(), new_dir);
 	let mut meta = serde_json::Map::new();
 	meta.insert("sock".to_owned(), serde_json::json!(renamed.api_sock().to_string_lossy()));
 	if let Some(value) = old_meta.get("agent_sock") {
@@ -331,6 +390,8 @@ fn pooled_name(template: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::time::Instant;
+
 	use super::*;
 
 	#[test]
@@ -359,7 +420,7 @@ mod tests {
 		let tmp = tempfile::tempdir()?;
 		let old_dir = tmp.path().join("vms").join("old");
 		fs::create_dir_all(&old_dir)?;
-		let vm = MicroVm::from_dir("old", &old_dir);
+		let vm = SandboxVm::from_dir("old", &old_dir);
 		let mut meta = serde_json::Map::new();
 		meta.insert(
 			"agent_sock".to_owned(),
@@ -418,5 +479,179 @@ mod tests {
 		let stats = registry.list();
 		assert_eq!(stats["ref"], PoolStats { ready: 0, hits: 0, misses: 0, size: 0 });
 		registry.shutdown();
+	}
+	#[derive(Debug)]
+	struct RecordingRuntime {
+		root:   PathBuf,
+		events: Mutex<Vec<&'static str>>,
+	}
+
+	impl SandboxRuntime for RecordingRuntime {
+		fn name(&self) -> &'static str {
+			"recording"
+		}
+
+		fn sandbox(&self, name: &str) -> SandboxVm {
+			SandboxVm::from_dir(name, self.root.join(name))
+		}
+
+		fn launch(&self, vm: &SandboxVm, _spec: &LaunchSpec) -> Result<()> {
+			fs::create_dir_all(vm.dir())?;
+			self.events.lock().push("launch");
+			Ok(())
+		}
+
+		fn stop(&self, _vm: &SandboxVm, _wait: bool) -> Result<()> {
+			self.events.lock().push("stop");
+			Ok(())
+		}
+
+		fn remove(&self, vm: &SandboxVm) -> Result<()> {
+			self.events.lock().push("remove");
+			fs::remove_dir_all(vm.dir())?;
+			Ok(())
+		}
+
+		fn is_running(&self, _vm: &SandboxVm) -> Result<bool> {
+			Ok(true)
+		}
+	}
+
+	#[test]
+	fn warm_pool_delegates_lifecycle_to_selected_runtime() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let runtime = Arc::new(RecordingRuntime {
+			root:   tmp.path().join("vms"),
+			events: Mutex::new(Vec::new()),
+		});
+		let backend: Arc<dyn SandboxRuntime> = runtime.clone();
+		let pool = WarmPool::with_runtime_options(
+			tmp.path().join("template"),
+			1,
+			false,
+			false,
+			Duration::ZERO,
+			backend,
+		)?;
+		let deadline = Instant::now() + Duration::from_secs(1);
+		while pool.stats().ready == 0 && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(1));
+		}
+		assert_eq!(pool.stats().ready, 1);
+
+		pool.shutdown();
+		assert_eq!(*runtime.events.lock(), ["launch", "stop", "remove"]);
+		Ok(())
+	}
+	#[derive(Debug)]
+	struct DelayedRuntime {
+		root:             PathBuf,
+		delay:            Duration,
+		concurrency_peak: Mutex<usize>,
+		concurrency_now:  Mutex<usize>,
+	}
+
+	impl SandboxRuntime for DelayedRuntime {
+		fn name(&self) -> &'static str {
+			"delayed"
+		}
+
+		fn sandbox(&self, name: &str) -> SandboxVm {
+			SandboxVm::from_dir(name, self.root.join(name))
+		}
+
+		fn launch(&self, vm: &SandboxVm, _spec: &LaunchSpec) -> Result<()> {
+			fs::create_dir_all(vm.dir())?;
+			{
+				let mut now = self.concurrency_now.lock();
+				*now += 1;
+				let mut peak = self.concurrency_peak.lock();
+				*peak = (*peak).max(*now);
+			}
+			thread::sleep(self.delay);
+			{
+				let mut now = self.concurrency_now.lock();
+				*now -= 1;
+			}
+			Ok(())
+		}
+
+		fn stop(&self, _vm: &SandboxVm, _wait: bool) -> Result<()> {
+			Ok(())
+		}
+
+		fn remove(&self, vm: &SandboxVm) -> Result<()> {
+			let _ = fs::remove_dir_all(vm.dir());
+			Ok(())
+		}
+
+		fn is_running(&self, _vm: &SandboxVm) -> Result<bool> {
+			Ok(true)
+		}
+	}
+
+	#[test]
+	fn warm_pool_refills_concurrently_and_respects_target_bounds() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let delay = Duration::from_millis(50);
+		let runtime = Arc::new(DelayedRuntime {
+			root: tmp.path().join("vms"),
+			delay,
+			concurrency_peak: Mutex::new(0),
+			concurrency_now: Mutex::new(0),
+		});
+
+		// Execute 32 launches sequentially as a baseline for the maximum batch.
+		let t_seq_start = Instant::now();
+		for i in 0..32 {
+			let vm = runtime.sandbox(&format!("serial-{i}"));
+			let spec = LaunchSpec::restore(vm.api_sock(), tmp.path().join("template"));
+			runtime.launch(&vm, &spec)?;
+		}
+		let elapsed_seq = t_seq_start.elapsed();
+
+		// Execute the same 32 launches through the bounded concurrent refiller.
+		let backend: Arc<dyn SandboxRuntime> = runtime.clone();
+		let t_concurrent_start = Instant::now();
+		let pool = WarmPool::with_runtime_options(
+			tmp.path().join("template"),
+			32,
+			false,
+			false,
+			Duration::ZERO,
+			backend,
+		)?;
+
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while pool.stats().ready < 32 && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(1));
+		}
+		let elapsed_concurrent = t_concurrent_start.elapsed();
+
+		assert_eq!(pool.stats().ready, 32, "Concurrent pool failed to reach full size");
+		pool.shutdown();
+
+		let peak_concurrency = *runtime.concurrency_peak.lock();
+		println!(
+			"{}",
+			serde_json::json!({
+				"kind": "warm_pool_refill",
+				"clones": 32,
+				"baseline_serial_ms": elapsed_seq.as_millis(),
+				"optimized_parallel_ms": elapsed_concurrent.as_millis(),
+				"peak_parallel_spawns": peak_concurrency,
+			})
+		);
+
+		// Assert parallel execution and bounds checks
+		assert!(
+			peak_concurrency > 1,
+			"WarmPool refill did not run launches in parallel: peak={peak_concurrency}"
+		);
+		assert!(
+			elapsed_concurrent < elapsed_seq,
+			"Parallel pool refill took longer than sequential baseline"
+		);
+		Ok(())
 	}
 }

@@ -101,3 +101,9 @@ A two-node mesh cannot form a post-failure majority. Quorum restore is off by de
 Writable mesh volumes use a different mechanism: quorum-granted, epoch-fenced leases. A holder renews by half the TTL and self-fences writers if renewal misses that deadline. No successor can receive a vote until the full TTL from the prior grant has elapsed. This is the single-writer mechanism for writable volume data.
 
 Writable volumes require at least three nodes in a mesh context and are rejected at create on smaller meshes; they never silently degrade to a host lock. Read-only volumes are unrestricted. On a local daemon, the host-local `flock` protects only same-host concurrency.
+
+## Kubernetes mesh
+
+The Helm chart deploys `vmon serve` as a StatefulSet on KVM-labelled hosts. Every pod is both an API endpoint and a VM owner; the public Service can send a request to any healthy pod. Pod zero initializes the mesh, and the other stable pod identities join it before becoming ready.
+
+PostgreSQL stores cluster ownership and fencing records. S3 stores portable checkpoint and function artifacts. Gossip still carries liveness and capacity, but it is not the source of truth for ownership. The chart enforces one host-networked pod per Kubernetes node so API ports and TAP devices do not collide.

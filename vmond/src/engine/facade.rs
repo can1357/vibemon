@@ -4,8 +4,9 @@ use std::{
 	collections::{BTreeMap, HashMap, HashSet},
 	fmt::Write as _,
 	fs,
-	io::{self, Seek, SeekFrom, Write as _},
+	io::{self, Read, Seek, SeekFrom, Write as _},
 	net::IpAddr,
+	os::unix::fs::OpenOptionsExt,
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -17,8 +18,10 @@ use std::{
 
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::runtime::Runtime;
+use vmm::snapshot::is_safe_snapshot_name;
 
 use crate::{
 	config::{ServeConfig, WarmImage},
@@ -28,12 +31,14 @@ use crate::{
 		control::ControlClient,
 		diskdelta,
 		s3proxy::S3Proxy,
-		spawn::{LaunchSpec, MicroVm, RemoteFsShare, VolumeMount},
+		spawn::{LaunchSpec, RemoteFsShare, SandboxRuntime, SandboxVm, VmonRuntime, VolumeMount},
 	},
 	error::{EngineError, Result},
 	home::Home,
 	image::{self, CachedTemplate, TemplateBooter, TemplateRequest, TemplateSpec},
-	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, S3MountSpec, SandboxCreate},
+	models::{
+		ForkBody, MAX_FORK_CLONES, NetworkBody, PoolPutBody, RestoreBody, S3MountSpec, SandboxCreate,
+	},
 	net::{self, SandboxNetwork},
 	pools::{PoolRegistry, WarmPool, template_key},
 	registry::{Registry, VmRecord},
@@ -54,6 +59,7 @@ const WARM_VOLUME_SLOTS: u64 = 8;
 const ALLOWED_HA: [&str; 4] = ["async", "async+rerun", "off", "rerun"];
 const S3_MOUNTS_FILE: &str = "s3-mounts.json";
 const MAX_S3_MOUNTS: usize = 8;
+const MAX_SNAPSHOT_METADATA_BYTES: u64 = 64 * 1024;
 
 /// Single owner of the microVM registry and all VM lifecycle logic.
 #[derive(Clone)]
@@ -62,15 +68,17 @@ pub struct Engine {
 }
 
 struct EngineInner {
-	config:      ServeConfig,
-	home:        Home,
-	registry:    Registry,
-	runtimes:    Mutex<HashMap<String, RuntimeState>>,
-	pools:       PoolRegistry,
-	events:      Mutex<Vec<Sender<Value>>>,
-	counters:    Counters,
-	latency:     Mutex<CreateLatency>,
-	net_runtime: Runtime,
+	config:          ServeConfig,
+	home:            Home,
+	registry:        Registry,
+	runtimes:        Mutex<HashMap<String, RuntimeState>>,
+	pools:           PoolRegistry,
+	events:          Mutex<Vec<Sender<Value>>>,
+	event_sequence:  AtomicU64,
+	counters:        Counters,
+	latency:         Mutex<CreateLatency>,
+	net_runtime:     Runtime,
+	sandbox_runtime: Arc<dyn SandboxRuntime>,
 }
 
 #[derive(Default)]
@@ -140,6 +148,41 @@ struct CreatePlan {
 	networked_warm_linux: bool,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotOptions {
+	agent:           Option<bool>,
+	env:             Option<HashMap<String, String>>,
+	workdir:         Option<String>,
+	tags:            Option<HashMap<String, String>>,
+	timeout:         Option<f64>,
+	timeout_secs:    Option<u64>,
+	readiness_probe: Option<Value>,
+	secrets:         Option<Vec<Value>>,
+	s3_mounts:       Option<HashMap<String, S3MountSpec>>,
+	command:         Option<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct ResolvedSnapshotOptions {
+	agent:           bool,
+	env:             BTreeMap<String, String>,
+	secret_env:      BTreeMap<String, String>,
+	secret_names:    Vec<String>,
+	workdir:         Option<String>,
+	tags:            HashMap<String, String>,
+	timeout_secs:    Option<u64>,
+	readiness_probe: Option<Value>,
+	s3_mounts:       Option<HashMap<String, S3MountSpec>>,
+	command:         Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotLaunchMode {
+	Restore,
+	Fork,
+}
+
 struct ResolvedVolume {
 	mountpoint: String,
 	name:       String,
@@ -158,9 +201,16 @@ struct ResolvedS3Mount {
 }
 
 impl Engine {
-	/// Construct the real engine, rehydrate state, and start configured warm
-	/// pools.
+	/// Construct the real engine with the built-in `vmon vmm` runtime.
 	pub fn new(config: ServeConfig) -> Result<Self> {
+		Self::with_runtime(config, Arc::new(VmonRuntime))
+	}
+
+	/// Construct the engine with an explicitly selected sandbox runtime.
+	pub fn with_runtime(
+		config: ServeConfig,
+		sandbox_runtime: Arc<dyn SandboxRuntime>,
+	) -> Result<Self> {
 		align_process_home(&config.home);
 		let home = Home::new(config.home.clone());
 		fs::create_dir_all(home.vms_dir())?;
@@ -179,9 +229,11 @@ impl Engine {
 				runtimes: Mutex::new(HashMap::new()),
 				pools: PoolRegistry::new(),
 				events: Mutex::new(Vec::new()),
+				event_sequence: AtomicU64::new(0),
 				counters: Counters::default(),
 				latency: Mutex::new(CreateLatency::default()),
 				net_runtime,
+				sandbox_runtime,
 			}),
 		};
 		engine.reacquire_volume_locks(lock_requests);
@@ -197,6 +249,30 @@ impl Engine {
 
 	fn home(&self) -> &Home {
 		&self.inner.home
+	}
+
+	fn sandbox(&self, name: &str) -> SandboxVm {
+		self.inner.sandbox_runtime.sandbox(name)
+	}
+
+	fn launch_sandbox(&self, vm: &SandboxVm, spec: &LaunchSpec) -> Result<()> {
+		self.inner.sandbox_runtime.launch(vm, spec)?;
+		vm.save_meta(Map::from_iter([(
+			"runtime".to_owned(),
+			json!(self.inner.sandbox_runtime.name()),
+		)]))
+	}
+
+	fn stop_sandbox(&self, vm: &SandboxVm, wait: bool) -> Result<()> {
+		self.inner.sandbox_runtime.stop(vm, wait)
+	}
+
+	fn remove_sandbox(&self, vm: &SandboxVm) -> Result<()> {
+		self.inner.sandbox_runtime.remove(vm)
+	}
+
+	fn sandbox_is_running(&self, vm: &SandboxVm) -> Result<bool> {
+		self.inner.sandbox_runtime.is_running(vm)
 	}
 
 	fn reacquire_volume_locks(&self, requests: Vec<(String, Vec<String>)>) {
@@ -231,10 +307,12 @@ impl Engine {
 		};
 		let cached = image::cached_template(self, &request)?;
 		let key = template_key_for_cached(&cached);
-		let old = self
-			.inner
-			.pools
-			.set(key, WarmPool::new(cached.snapshot_dir, warm.count)?);
+		let pool = WarmPool::with_runtime(
+			cached.snapshot_dir,
+			warm.count,
+			Arc::clone(&self.inner.sandbox_runtime),
+		)?;
+		let old = self.inner.pools.set(key, pool);
 		if let Some(old) = old {
 			old.shutdown();
 		}
@@ -276,12 +354,8 @@ impl Engine {
 			.filter(|name| !name.is_empty())
 			.unwrap_or_else(|| format!("sb-{}", random_hex(12)));
 		params.name = Some(sid.clone());
-		if self
-			.inner
-			.registry
-			.get(&sid)
-			.is_some_and(|record| record.status != "terminated")
-		{
+		validate_local_name("sandbox name", &sid)?;
+		if self.inner.registry.get(&sid).is_some() || self.sandbox(&sid).dir().exists() {
 			return Err(EngineError::busy(format!("sandbox '{sid}' already exists")));
 		}
 		let ha = match params.ha.as_deref().filter(|ha| !ha.is_empty()) {
@@ -499,13 +573,27 @@ impl Engine {
 
 	/// Rebuild remote filesystem clients from a snapshot's credential-free mount
 	/// metadata.
-	fn snapshot_s3_mounts(&self, snapshot_dir: &Path) -> Result<Vec<ResolvedS3Mount>> {
+	fn snapshot_s3_mounts(
+		&self,
+		snapshot_dir: &Path,
+		requested: Option<HashMap<String, S3MountSpec>>,
+	) -> Result<Vec<ResolvedS3Mount>> {
 		let path = snapshot_dir.join(S3_MOUNTS_FILE);
 		if !path.is_file() {
+			if requested.as_ref().is_some_and(|mounts| !mounts.is_empty()) {
+				return Err(EngineError::invalid(
+					"cannot add S3 mounts to a snapshot without remote filesystem devices",
+				));
+			}
 			return Ok(Vec::new());
 		}
-		let source = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+		let source = serde_json::from_slice::<Value>(&read_snapshot_metadata(&path)?)?;
 		if source.as_object().is_some_and(Map::is_empty) {
+			if requested.as_ref().is_some_and(|mounts| !mounts.is_empty()) {
+				return Err(EngineError::invalid(
+					"cannot add S3 mounts to a snapshot without remote filesystem devices",
+				));
+			}
 			return Ok(Vec::new());
 		}
 		let mut params = Map::from_iter([("s3_mounts".to_owned(), source)]);
@@ -515,11 +603,14 @@ impl Engine {
 				snapshot_dir.display()
 			))
 		})?;
-		let mounts = serde_json::from_value(
-			params
-				.remove("s3_mounts")
-				.expect("restored S3 mount parameters remain present"),
-		)?;
+		let mounts = match requested {
+			Some(mounts) => mounts,
+			None => serde_json::from_value(
+				params
+					.remove("s3_mounts")
+					.expect("restored S3 mount parameters remain present"),
+			)?,
+		};
 		let mut used_tags = HashSet::new();
 		let mut mounts = self.resolve_s3_mounts(Some(mounts), &mut used_tags)?;
 		apply_restored_s3_tags(&mut mounts, &[], &tags)?;
@@ -529,7 +620,7 @@ impl Engine {
 	/// Start a per-VM proxy before its remote virtio-fs devices connect.
 	fn with_s3_proxy(
 		&self,
-		vm: &MicroVm,
+		vm: &SandboxVm,
 		mut spec: LaunchSpec,
 		mounts: &[ResolvedS3Mount],
 	) -> Result<(LaunchSpec, Option<S3Proxy>)> {
@@ -561,7 +652,7 @@ impl Engine {
 		Ok(())
 	}
 
-	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(MicroVm, RuntimeState)> {
+	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(SandboxVm, RuntimeState)> {
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
 			env: image_env(plan.image_spec.as_ref(), plan.params.env.as_ref()),
@@ -587,7 +678,11 @@ impl Engine {
 		if let Some(timeout_secs) = plan.timeout_secs
 			&& runtime.timeout_stop.is_none()
 		{
-			runtime.timeout_stop = Some(start_timeout_watchdog(vm.name().to_owned(), timeout_secs));
+			runtime.timeout_stop = Some(start_timeout_watchdog(
+				vm.name().to_owned(),
+				timeout_secs,
+				Arc::clone(&self.inner.sandbox_runtime),
+			));
 		}
 		if runtime.timeout_stop.is_some() && plan.pool_key.is_empty() {
 			// no-op branch kept explicit: fresh launches pass --timeout-secs to
@@ -677,14 +772,22 @@ impl Engine {
 		Ok((vm, runtime))
 	}
 
-	fn claim_or_launch_vm(&self, plan: &CreatePlan, runtime: &mut RuntimeState) -> Result<MicroVm> {
+	fn claim_or_launch_vm(
+		&self,
+		plan: &CreatePlan,
+		runtime: &mut RuntimeState,
+	) -> Result<SandboxVm> {
 		if (plan.params.block_network || plan.networked_warm)
 			&& plan.volume_specs.is_empty()
 			&& plan.s3_specs.is_empty()
 			&& plan.params.fs_dir.is_none()
 		{
 			if plan.params.pool_size > 0 {
-				let pool = WarmPool::new(&plan.template_dir, plan.params.pool_size as usize)?;
+				let pool = WarmPool::with_runtime(
+					&plan.template_dir,
+					plan.params.pool_size as usize,
+					Arc::clone(&self.inner.sandbox_runtime),
+				)?;
 				let old = self
 					.inner
 					.pools
@@ -707,7 +810,11 @@ impl Engine {
 				}
 				if let Some(secs) = plan.timeout_secs {
 					let _ = control_for_vm(&vm)?.extend(secs);
-					runtime.timeout_stop = Some(start_timeout_watchdog(vm.name().to_owned(), secs));
+					runtime.timeout_stop = Some(start_timeout_watchdog(
+						vm.name().to_owned(),
+						secs,
+						Arc::clone(&self.inner.sandbox_runtime),
+					));
 				}
 				return Ok(vm);
 			}
@@ -749,8 +856,8 @@ impl Engine {
 		plan: &CreatePlan,
 		tap: Option<String>,
 		runtime: &mut RuntimeState,
-	) -> Result<MicroVm> {
-		let vm = MicroVm::new(&plan.sid);
+	) -> Result<SandboxVm> {
+		let vm = self.sandbox(&plan.sid);
 		let mut spec = LaunchSpec::restore(vm.api_sock(), &plan.template_dir)
 			.with_agent_sock(vm.dir().join("agent.sock"))
 			.with_mem_mib(u64::from(plan.params.memory))
@@ -790,7 +897,7 @@ impl Engine {
 			);
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
-		vm.launch(&spec)?;
+		self.launch_sandbox(&vm, &spec)?;
 		runtime.s3_proxy = s3_proxy;
 		if !plan.params.block_network && runtime.network.is_none() {
 			runtime.network_spec = Some(json!({
@@ -804,8 +911,8 @@ impl Engine {
 		Ok(vm)
 	}
 
-	fn launch_cold_vm(&self, plan: &CreatePlan, runtime: &mut RuntimeState) -> Result<MicroVm> {
-		let vm = MicroVm::new(&plan.sid);
+	fn launch_cold_vm(&self, plan: &CreatePlan, runtime: &mut RuntimeState) -> Result<SandboxVm> {
+		let vm = self.sandbox(&plan.sid);
 		let base_disk = plan.template_dir.join("rootfs.img");
 		if !base_disk.is_file() {
 			return Err(EngineError::engine(format!(
@@ -846,7 +953,7 @@ impl Engine {
 			)?);
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
-		vm.launch(&spec)?;
+		self.launch_sandbox(&vm, &spec)?;
 		runtime.s3_proxy = s3_proxy;
 		Ok(vm)
 	}
@@ -931,7 +1038,7 @@ impl Engine {
 		if let Some(agent) = cached_agent.filter(|agent| !agent.is_closed()) {
 			return Ok(agent);
 		}
-		let vm = MicroVm::new(name);
+		let vm = self.sandbox(name);
 		let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
 		self
 			.inner
@@ -943,7 +1050,7 @@ impl Engine {
 		Ok(agent)
 	}
 
-	fn agent_for_vm(vm: &MicroVm, timeout: Duration) -> Result<AgentConn> {
+	fn agent_for_vm(vm: &SandboxVm, timeout: Duration) -> Result<AgentConn> {
 		AgentConn::connect(&vm.agent_sock()?, timeout)
 	}
 
@@ -969,10 +1076,6 @@ impl Engine {
 		Ok(())
 	}
 
-	#[allow(
-		clippy::unused_self,
-		reason = "kept as an Engine method so entry command helpers stay grouped"
-	)]
 	fn run_entry_command(
 		&self,
 		name: String,
@@ -982,7 +1085,7 @@ impl Engine {
 			fs::OpenOptions::new()
 				.create(true)
 				.append(true)
-				.open(MicroVm::new(&name).log_path())?,
+				.open(self.sandbox(&name).log_path())?,
 		));
 		let parts = session.split();
 		let _ = parts.control.close_stdin();
@@ -1027,43 +1130,42 @@ impl Engine {
 				&& record.detail.get("returncode").is_none_or(Value::is_null)
 				&& let Some(returncode) = Self::poll_returncode(&record.name)
 			{
-				let _ = self.persist_status(&record.name, "stopped", Some(returncode), None);
-				if let Some(updated) = self.inner.registry.get(&record.name) {
+				let _ = self.persist_status(&record.id, "stopped", Some(returncode), None);
+				if let Some(updated) = self.inner.registry.get(&record.id) {
 					return Ok(updated);
 				}
 			}
 			return Ok(record);
 		}
-		let vm = MicroVm::new(&record.name);
-		if record.pid.is_some() && !vm.is_running()? {
+		let vm = self.sandbox(&record.name);
+		if record.pid.is_some() && !self.sandbox_is_running(&vm)? {
 			// The VMM died on its own (e.g. --timeout-secs self-kill, guest
 			// poweroff): surface its status.json exit code in the view like
 			// Python's poll()/status.json path does.
 			let returncode = Self::poll_returncode(&record.name);
-			let _ = self.persist_status(&record.name, "stopped", returncode, None);
-			return self
+			let _ = self.persist_status(&record.id, "stopped", returncode, None);
+			let updated = self
 				.inner
 				.registry
-				.get(&record.name)
-				.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{}'", record.name)));
+				.get(&record.id)
+				.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{}'", record.id)))?;
+			self.publish_record_event("stopped", &updated);
+			return Ok(updated);
 		}
 		Ok(record)
 	}
 
 	fn persist_status(
 		&self,
-		name: &str,
+		id: &str,
 		status: &str,
 		returncode: Option<i64>,
 		terminated_at: Option<f64>,
 	) -> Result<()> {
-		self.inner.registry.persist_record_status(
-			self.home(),
-			name,
-			status,
-			returncode,
-			terminated_at,
-		)
+		self
+			.inner
+			.registry
+			.persist_record_status(self.home(), id, status, returncode, terminated_at)
 	}
 
 	fn teardown(&self, record: &VmRecord) -> Option<i64> {
@@ -1087,8 +1189,8 @@ impl Engine {
 		} else {
 			teardown_network(name);
 		}
-		let vm = MicroVm::new(name);
-		let _ = vm.stop(true);
+		let vm = self.sandbox(name);
+		let _ = self.stop_sandbox(&vm, true);
 		if returncode.is_none() {
 			returncode = Self::poll_returncode(name);
 		}
@@ -1096,7 +1198,7 @@ impl Engine {
 	}
 
 	fn poll_returncode(name: &str) -> Option<i64> {
-		let vm = MicroVm::new(name);
+		let vm = SandboxVm::new(name);
 		// The jail-aware control-socket parent is a best-effort candidate; the
 		// plain VM dir must still be probed when metadata is unreadable.
 		let mut candidates = Vec::with_capacity(2);
@@ -1138,15 +1240,199 @@ impl Engine {
 		self.snapshot_root().join(name)
 	}
 
+	fn require_snapshot_dir(&self, name: &str) -> Result<PathBuf> {
+		validate_local_name("snapshot name", name)?;
+		let root = match fs::canonicalize(self.snapshot_root()) {
+			Ok(root) => root,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
+				return Err(EngineError::not_found(format!("snapshot not found: {name}")));
+			},
+			Err(error) => return Err(error.into()),
+		};
+		let dir = root.join(name);
+		let metadata = match fs::symlink_metadata(&dir) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
+				return Err(EngineError::not_found(format!("snapshot not found: {name}")));
+			},
+			Err(error) => return Err(error.into()),
+		};
+		if metadata.file_type().is_symlink() || !metadata.is_dir() {
+			return Err(EngineError::invalid(format!(
+				"snapshot {name:?} is not a regular snapshot directory"
+			)));
+		}
+		let canonical = fs::canonicalize(&dir)?;
+		if canonical.parent() != Some(root.as_path()) {
+			return Err(EngineError::invalid(format!(
+				"snapshot {name:?} resolves outside the snapshot root"
+			)));
+		}
+		Ok(canonical)
+	}
+
+	fn ensure_snapshot_target_available(&self, name: &str) -> Result<()> {
+		validate_local_name("sandbox name", name)?;
+		if self.inner.registry.get(name).is_some() || self.sandbox(name).dir().exists() {
+			return Err(EngineError::busy(format!("sandbox already exists: {name}")));
+		}
+		Ok(())
+	}
+
+	fn rollback_snapshot_vm(&self, vm: &SandboxVm) {
+		let name = vm.name();
+		if let Some(mut runtime) = self.inner.runtimes.lock().remove(name)
+			&& let Some(stop) = runtime.timeout_stop.take()
+		{
+			let _ = stop.send(());
+		}
+		self.inner.registry.remove(name);
+		let _ = self.stop_sandbox(vm, false);
+		let _ = self.remove_sandbox(vm);
+	}
+
+	fn launch_snapshot_vm(
+		&self,
+		snapshot: &str,
+		snapshot_dir: &Path,
+		name: String,
+		mode: SnapshotLaunchMode,
+		options: &ResolvedSnapshotOptions,
+		s3_mounts: &[ResolvedS3Mount],
+	) -> Result<(SandboxVm, VmRecord)> {
+		self.ensure_snapshot_target_available(&name)?;
+		let vm = self.sandbox(&name);
+		let result = (|| {
+			let mut spec = match mode {
+				SnapshotLaunchMode::Restore => LaunchSpec::restore(vm.api_sock(), snapshot_dir),
+				SnapshotLaunchMode::Fork => LaunchSpec::fork_from(vm.api_sock(), snapshot_dir),
+			}
+			.with_agent_sock(vm.dir().join("agent.sock"));
+			let base_disk = snapshot_dir.join("rootfs.img");
+			if base_disk.is_file() {
+				spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
+			}
+			let needs_agent = options.agent
+				|| !s3_mounts.is_empty()
+				|| options.readiness_probe.is_some()
+				|| options
+					.command
+					.as_ref()
+					.is_some_and(|command| !command.is_empty());
+			if matches!(mode, SnapshotLaunchMode::Restore) && needs_agent {
+				spec = spec.with_console_agent();
+			}
+			if let Some(timeout_secs) = options.timeout_secs {
+				spec = spec.with_timeout_secs(timeout_secs);
+			}
+			let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, s3_mounts)?;
+			self.launch_sandbox(&vm, &spec)?;
+
+			let mut runtime = RuntimeState {
+				secret_env: options.secret_env.clone(),
+				env: options.env.clone(),
+				workdir: options.workdir.clone(),
+				s3_proxy,
+				..RuntimeState::default()
+			};
+			if let Some(timeout_secs) = options.timeout_secs {
+				runtime.timeout_stop = Some(start_timeout_watchdog(
+					name.clone(),
+					timeout_secs,
+					Arc::clone(&self.inner.sandbox_runtime),
+				));
+			}
+			if needs_agent {
+				let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
+				agent.ping(AGENT_CONNECT_TIMEOUT)?;
+				Self::mount_s3_in_guest(&agent, s3_mounts)?;
+				if let Some(probe) = &options.readiness_probe {
+					Self::wait_until_ready(
+						&agent,
+						&runtime,
+						probe,
+						options.timeout_secs.map_or(300.0, |secs| secs as f64),
+					)?;
+				}
+				runtime.agent = Some(agent);
+			}
+
+			let mut detail = vm.meta()?;
+			detail.insert("workdir".to_owned(), json!(runtime.workdir));
+			detail.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
+			detail.insert("secret_names".to_owned(), json!(options.secret_names));
+			detail.insert("tags".to_owned(), json!(options.tags));
+			detail.insert("timeout_secs".to_owned(), json!(options.timeout_secs));
+			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(s3_mounts));
+			if let Some(command) = &options.command {
+				detail.insert("command".to_owned(), json!(command));
+			}
+			vm.save_meta(detail.clone())?;
+
+			self.inner.runtimes.lock().insert(name.clone(), runtime);
+			if let Some(command) = options
+				.command
+				.as_ref()
+				.filter(|command| !command.is_empty())
+			{
+				self.start_entry_command(name.clone(), command.clone())?;
+			}
+			let now = unix_time();
+			let record = VmRecord {
+				id:            name.clone(),
+				name:          name.clone(),
+				status:        "running".to_owned(),
+				pid:           detail
+					.get("pid")
+					.and_then(Value::as_i64)
+					.and_then(|pid| i32::try_from(pid).ok()),
+				source:        Some(format!("{}:{snapshot}", match mode {
+					SnapshotLaunchMode::Restore => "restore",
+					SnapshotLaunchMode::Fork => "fork",
+				})),
+				created_at:    now,
+				timeout:       options.timeout_secs.map(|secs| secs as f64),
+				detail:        Value::Object(detail),
+				tags:          options.tags.clone(),
+				last_active:   now,
+				terminated_at: None,
+				error:         None,
+			};
+			self
+				.inner
+				.registry
+				.insert_persisted(self.home(), record.clone())?;
+			Ok((vm.clone(), record))
+		})();
+		if result.is_err() {
+			self.rollback_snapshot_vm(&vm);
+		}
+		result
+	}
+
 	fn snapshot_machine(
-		vm: &MicroVm,
+		&self,
+		vm: &SandboxVm,
 		name: &str,
 		keep_running: bool,
 		disk_src: Option<&Path>,
 		snapshot_root: &Path,
 		track: bool,
 	) -> Result<PathBuf> {
-		let dir = snapshot_root.join(name);
+		validate_local_name("snapshot name", name)?;
+		fs::create_dir_all(snapshot_root)?;
+		let root = fs::canonicalize(snapshot_root)?;
+		let dir = root.join(name);
+		match fs::symlink_metadata(&dir) {
+			Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+				return Err(EngineError::invalid(format!(
+					"snapshot {name:?} is not a regular snapshot directory"
+				)));
+			},
+			Ok(_) => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(error.into()),
+		}
 		let mut control = control_for_vm(vm)?;
 		control.pause()?;
 		// Copy the disk while still paused so the image matches the captured
@@ -1158,34 +1444,56 @@ impl Engine {
 			}
 			Ok(Value::Null)
 		});
-		if keep_running {
+		if let Err(error) = snapshot_result {
 			let _ = control.resume();
-			snapshot_result?;
+			return Err(error);
+		}
+		if keep_running {
+			control.resume()?;
 		} else {
-			// Stop only once the checkpoint is known-good; a failed snapshot or
-			// disk copy must not tear down the source VM.
-			snapshot_result?;
-			let _ = vm.stop(true);
+			let _ = self.stop_sandbox(vm, true);
 		}
 		Ok(dir)
 	}
 
-	fn publish_event(&self, event: &str, mut data: Map<String, Value>) {
-		data.insert("event".to_owned(), json!(event));
+	fn publish_event(&self, event_type: &str, mut data: Map<String, Value>) {
+		let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+		data.insert("type".to_owned(), json!(event_type));
+		data.insert("sequence".to_owned(), json!(sequence));
 		data.insert("ts".to_owned(), json!(unix_time()));
 		let payload = Value::Object(data);
 		let mut subscribers = self.inner.events.lock();
 		subscribers.retain(|sender| sender.send(payload.clone()).is_ok());
 	}
 
-	fn publish_record_event(&self, event: &str, record: &VmRecord) {
-		self.publish_event(
-			event,
-			Map::from_iter([
-				("id".to_owned(), json!(record.id)),
-				("name".to_owned(), json!(record.name)),
-			]),
-		);
+	fn publish_record_event(&self, event_type: &str, record: &VmRecord) {
+		let status = match event_type {
+			"paused" => "paused",
+			"removed" => "removed",
+			"ready" | "resumed" | "restore" | "fork" => "running",
+			_ => &record.status,
+		};
+		let mut data = Map::from_iter([
+			("id".to_owned(), json!(record.id)),
+			("name".to_owned(), json!(record.name)),
+			("status".to_owned(), json!(status)),
+			("source".to_owned(), json!(record.source)),
+			("tags".to_owned(), json!(record.tags)),
+		]);
+		if let Some(returncode) = record.detail.get("returncode").and_then(Value::as_i64) {
+			data.insert("returncode".to_owned(), json!(returncode));
+		}
+		if let Some(reason) = record
+			.detail
+			.get("terminated_reason")
+			.and_then(Value::as_str)
+		{
+			data.insert("reason".to_owned(), json!(reason));
+		}
+		if let Some(error) = &record.error {
+			data.insert("error".to_owned(), json!(error));
+		}
+		self.publish_event(event_type, data);
 	}
 
 	fn inc_counter(&self, name: &str) {
@@ -1353,7 +1661,8 @@ impl Engine {
 				detail.remove("volume_leases");
 			}
 		});
-		let _ = MicroVm::new(sid)
+		let _ = self
+			.sandbox(sid)
 			.save_meta(Map::from_iter([("volume_leases".to_owned(), Value::Object(Map::new()))]));
 		Ok(())
 	}
@@ -1455,7 +1764,7 @@ impl Engine {
 			params.insert("workdir".to_owned(), json!(workdir));
 		}
 		if !secret_env.is_empty() {
-			// Carried over the (bearer-authed) cluster channel, like the
+			// Carried over the bearer-authenticated cluster channel, like the
 			// memory image; the peer keeps them in memory only.
 			params.insert("secrets".to_owned(), json!([{ "name": "carried", "values": secret_env }]));
 		}
@@ -1510,9 +1819,9 @@ impl Engine {
 		let t0 = std::time::Instant::now();
 		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
-		let vm = MicroVm::new(sid);
+		let vm = self.sandbox(sid);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let snapshot_dir = Self::snapshot_machine(
+		let snapshot_dir = self.snapshot_machine(
 			&vm,
 			&snapshot,
 			true,
@@ -1594,7 +1903,7 @@ impl Engine {
 			})?;
 		let snapshot = format!("migrate-{sid}-{}", unix_millis());
 		let dir = self.snapshot_dir(&snapshot);
-		let vm = MicroVm::new(sid);
+		let vm = self.sandbox(sid);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
 		let mut control = control_for_vm(&vm)?;
 		control.pause()?;
@@ -1675,7 +1984,8 @@ impl Engine {
 	) -> Result<Value> {
 		let rootfs = delta_dir.join("rootfs.img");
 		if !rootfs.is_file() {
-			let live = MicroVm::new(sid)
+			let live = self
+				.sandbox(sid)
 				.rootfs_img()
 				.ok()
 				.filter(|path| path.is_file());
@@ -1758,7 +2068,7 @@ impl Engine {
 
 	fn mesh_update_detail_fields(&self, sid: &str, fields: Map<String, Value>) -> Result<()> {
 		self.get_record(sid, false)?;
-		let vm = MicroVm::new(sid);
+		let vm = self.sandbox(sid);
 		vm.save_meta(fields.clone())?;
 		self.inner.registry.update(sid, |record| {
 			if !record.detail.is_object() {
@@ -1791,11 +2101,11 @@ impl Engine {
 
 impl TemplateBooter for Engine {
 	fn boot_verify_and_snapshot(&self, spec: &TemplateSpec) -> Result<()> {
-		let old = MicroVm::new(&spec.vm_name);
-		if old.is_running().unwrap_or(false) {
-			let _ = old.stop(true);
+		let old = self.sandbox(&spec.vm_name);
+		if self.sandbox_is_running(&old).unwrap_or(false) {
+			let _ = self.stop_sandbox(&old, true);
 		}
-		let _ = old.remove();
+		let _ = self.remove_sandbox(&old);
 		let (tap_name, guest_config) = if spec.tap_slot {
 			let config = net::allocate_guest_config(&spec.vm_name)?;
 			net::setup_tap(&config.tap, &config.guest_ip, &config.host_ip, config.prefix, None, None)?;
@@ -1803,7 +2113,7 @@ impl TemplateBooter for Engine {
 		} else {
 			(None, None)
 		};
-		let vm = MicroVm::new(&spec.vm_name);
+		let vm = self.sandbox(&spec.vm_name);
 		let launch_result = (|| -> Result<()> {
 			let mut launch = LaunchSpec::boot_rootfs(
 				vm.api_sock(),
@@ -1828,10 +2138,10 @@ impl TemplateBooter for Engine {
 				launch =
 					launch.with_volume(VolumeMount::new(&volume.tag, &volume.dir, volume.readonly)?);
 			}
-			vm.launch(&launch)?;
+			self.launch_sandbox(&vm, &launch)?;
 			Self::agent_for_vm(&vm, Duration::from_secs(spec.timeout))?
 				.ping(Duration::from_secs(spec.timeout))?;
-			Self::snapshot_machine(
+			self.snapshot_machine(
 				&vm,
 				&spec.template_name,
 				false,
@@ -1841,7 +2151,7 @@ impl TemplateBooter for Engine {
 			)?;
 			Ok(())
 		})();
-		let _ = vm.remove();
+		let _ = self.remove_sandbox(&vm);
 		if let Some(config) = guest_config {
 			let _ = net::teardown_tap(
 				&config.tap,
@@ -1873,9 +2183,28 @@ impl EngineApi for Engine {
 		}
 		let request_time = Instant::now();
 		let mut plan = self.prepare_create(params)?;
+		self.publish_event(
+			"creating",
+			Map::from_iter([
+				("id".to_owned(), json!(plan.sid)),
+				("name".to_owned(), json!(plan.sid)),
+				("status".to_owned(), json!("creating")),
+				("tags".to_owned(), json!(plan.tags)),
+			]),
+		);
 		let (vm, runtime) = match self.launch_create(&mut plan) {
 			Ok(result) => result,
 			Err(err) => {
+				self.publish_event(
+					"failed",
+					Map::from_iter([
+						("id".to_owned(), json!(plan.sid)),
+						("name".to_owned(), json!(plan.sid)),
+						("status".to_owned(), json!("failed")),
+						("code".to_owned(), json!(err.code.as_str())),
+						("error".to_owned(), json!(&err.message)),
+					]),
+				);
 				drop(plan);
 				return Err(err);
 			},
@@ -1951,7 +2280,10 @@ impl EngineApi for Engine {
 			error:         None,
 		};
 		self.inner.runtimes.lock().insert(plan.sid.clone(), runtime);
-		self.inner.registry.insert(record.clone());
+		self
+			.inner
+			.registry
+			.insert_persisted(self.home(), record.clone())?;
 		if let Some(key) = plan
 			.params
 			.idempotency_key
@@ -1969,14 +2301,7 @@ impl EngineApi for Engine {
 				.mul_add(1000.0, latency.sum_ms);
 			latency.count += 1;
 		}
-		self.publish_event(
-			"created",
-			Map::from_iter([
-				("id".to_owned(), json!(record.id)),
-				("name".to_owned(), json!(record.name)),
-				("tags".to_owned(), json!(record.tags)),
-			]),
-		);
+		self.publish_record_event("created", &record);
 		self.publish_record_event("ready", &record);
 		if let Some(command) = plan
 			.params
@@ -2044,7 +2369,7 @@ impl EngineApi for Engine {
 	fn remove(&self, id: &str) -> Result<Value> {
 		let record = self.get_record(id, false)?;
 		let _ = self.teardown(&record);
-		MicroVm::new(id).remove()?;
+		self.remove_sandbox(&self.sandbox(id))?;
 		self.inner.registry.remove(id);
 		self.publish_record_event("removed", &record);
 		Ok(json!({ "name": id, "removed": true }))
@@ -2060,7 +2385,7 @@ impl EngineApi for Engine {
 		let mut update = Map::new();
 		update.insert("terminated_reason".to_owned(), json!(actual_reason));
 		update.insert("oom".to_owned(), json!(oom));
-		let _ = MicroVm::new(id).save_meta(update);
+		let _ = self.sandbox(id).save_meta(update);
 		self
 			.inner
 			.registry
@@ -2074,74 +2399,61 @@ impl EngineApi for Engine {
 			.get(id)
 			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
 		self.inc_counter("terminated");
-		self.publish_event(
-			"finished",
-			Map::from_iter([
-				("id".to_owned(), json!(record.id)),
-				("name".to_owned(), json!(record.name)),
-				("reason".to_owned(), json!(actual_reason)),
-				("returncode".to_owned(), json!(returncode)),
-			]),
-		);
-		self.publish_event(
-			"terminated",
-			Map::from_iter([
-				("id".to_owned(), json!(record.id)),
-				("name".to_owned(), json!(record.name)),
-				("reason".to_owned(), json!(actual_reason)),
-				("returncode".to_owned(), json!(returncode)),
-			]),
-		);
+		self.publish_record_event("terminated", &record);
 		Ok(record.view())
 	}
 
 	fn pause(&self, id: &str) -> Result<Value> {
 		let record = self.get_record(id, true)?;
-		let result = control_for_vm(&MicroVm::new(id))?.pause()?;
+		let result = control_for_vm(&self.sandbox(id))?.pause()?;
 		self.publish_record_event("paused", &record);
 		Ok(result)
 	}
 
 	fn resume(&self, id: &str) -> Result<Value> {
 		let record = self.get_record(id, true)?;
-		let result = control_for_vm(&MicroVm::new(id))?.resume()?;
+		let result = control_for_vm(&self.sandbox(id))?.resume()?;
 		self.publish_record_event("resumed", &record);
 		Ok(result)
 	}
 
 	fn extend(&self, id: &str, secs: u64) -> Result<Value> {
 		self.get_record(id, true)?;
-		let deadline = control_for_vm(&MicroVm::new(id))?.extend(secs)?;
+		let deadline = control_for_vm(&self.sandbox(id))?.extend(secs)?;
 		self.inner.registry.update(id, |record| {
 			record.timeout = Some(secs as f64);
 			record.touch();
 		});
 		let mut update = Map::new();
 		update.insert("timeout_secs".to_owned(), json!(secs));
-		let _ = MicroVm::new(id).save_meta(update);
+		let _ = self.sandbox(id).save_meta(update);
 		if let Some(state) = self.inner.runtimes.lock().get_mut(id) {
 			if let Some(stop) = state.timeout_stop.take() {
 				let _ = stop.send(());
 			}
-			state.timeout_stop = Some(start_timeout_watchdog(id.to_owned(), secs));
+			state.timeout_stop = Some(start_timeout_watchdog(
+				id.to_owned(),
+				secs,
+				Arc::clone(&self.inner.sandbox_runtime),
+			));
 		}
 		Ok(json!({ "deadline_unix": deadline }))
 	}
 
 	fn metrics(&self, id: &str) -> Result<Value> {
 		self.get_record(id, true)?;
-		control_for_vm(&MicroVm::new(id))?.metrics()
+		control_for_vm(&self.sandbox(id))?.metrics()
 	}
 
 	fn logs(&self, id: &str) -> Result<Vec<u8>> {
 		self.get_record(id, false)?;
-		Ok(fs::read(MicroVm::new(id).log_path()).unwrap_or_default())
+		Ok(fs::read(self.sandbox(id).log_path()).unwrap_or_default())
 	}
 
 	fn logs_follow(&self, id: &str) -> Result<Receiver<Vec<u8>>> {
 		self.get_record(id, false)?;
 		let name = id.to_owned();
-		let path = MicroVm::new(id).log_path().to_path_buf();
+		let path = self.sandbox(id).log_path().to_path_buf();
 		let (tx, rx) = flume::unbounded();
 		let registry = Arc::clone(&self.inner);
 		thread::Builder::new()
@@ -2164,7 +2476,10 @@ impl EngineApi for Engine {
 						.registry
 						.get(&name)
 						.is_some_and(|record| record.status != "running")
-						|| !MicroVm::new(&name).is_running().unwrap_or(false);
+						|| {
+							let vm = registry.sandbox_runtime.sandbox(&name);
+							!registry.sandbox_runtime.is_running(&vm).unwrap_or(false)
+						};
 					if terminal {
 						return;
 					}
@@ -2448,9 +2763,9 @@ impl EngineApi for Engine {
 	fn snapshot(&self, id: &str, name: Option<String>, stop: bool) -> Result<Value> {
 		let record = self.get_record(id, true)?;
 		let snapshot = name.unwrap_or_else(|| format!("{}-{}", id, unix_millis()));
-		let vm = MicroVm::new(id);
+		let vm = self.sandbox(id);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let dir = Self::snapshot_machine(
+		let dir = self.snapshot_machine(
 			&vm,
 			&snapshot,
 			!stop,
@@ -2504,137 +2819,64 @@ impl EngineApi for Engine {
 
 	fn snapshots(&self) -> Result<Vec<String>> {
 		let mut names = list_child_dirs(&self.snapshot_root());
-		names.extend(list_child_dirs(&self.home().templates_dir()));
 		names.sort();
-		names.dedup();
 		Ok(names)
 	}
 
 	fn restore(&self, snapshot: &str, body: RestoreBody) -> Result<Value> {
-		let name = body
-			.name
-			.unwrap_or_else(|| format!("restore-{}", random_hex(12)));
-		let snapshot_dir = self.snapshot_dir(snapshot);
-		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir)?;
-		let vm = MicroVm::new(&name);
-		let mut spec = LaunchSpec::restore(vm.api_sock(), &snapshot_dir)
-			.with_agent_sock(vm.dir().join("agent.sock"));
-		// Same-disk rule as `launch_restore_vm`: the restore owns a fresh
-		// overlay of the snapshot's disk instead of reopening (and mutating)
-		// the source VM's image.
-		let base_disk = snapshot_dir.join("rootfs.img");
-		if base_disk.is_file() {
-			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
-		}
-		if body.agent.unwrap_or(false) {
-			spec = spec.with_console_agent();
-		}
-		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &s3_mounts)?;
-		vm.launch(&spec)?;
-		if body.agent.unwrap_or(false) {
-			let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
-			agent.ping(AGENT_CONNECT_TIMEOUT)?;
-			Self::mount_s3_in_guest(&agent, &s3_mounts)?;
-			agent.close();
-		}
-		let mut detail = vm.meta()?;
-		if !s3_mounts.is_empty() {
-			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
-		}
-		if let Some(s3_proxy) = s3_proxy {
-			self
-				.inner
-				.runtimes
-				.lock()
-				.insert(name.clone(), RuntimeState {
-					s3_proxy: Some(s3_proxy),
-					..RuntimeState::default()
-				});
-		}
-		let record = VmRecord {
-			id: name.clone(),
+		let RestoreBody { name, agent, extra } = body;
+		let name = name.unwrap_or_else(|| format!("restore-{}", random_hex(12)));
+		let options = resolve_snapshot_options(extra, agent)?;
+		let snapshot_dir = self.require_snapshot_dir(snapshot)?;
+		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir, options.s3_mounts.clone())?;
+		let (_, record) = self.launch_snapshot_vm(
+			snapshot,
+			&snapshot_dir,
 			name,
-			status: "running".to_owned(),
-			pid: detail
-				.get("pid")
-				.and_then(Value::as_i64)
-				.and_then(|pid| i32::try_from(pid).ok()),
-			source: Some(format!("restore:{snapshot}")),
-			created_at: unix_time(),
-			timeout: None,
-			detail: Value::Object(detail),
-			tags: HashMap::new(),
-			last_active: unix_time(),
-			terminated_at: None,
-			error: None,
-		};
-		self.inner.registry.insert(record.clone());
+			SnapshotLaunchMode::Restore,
+			&options,
+			&s3_mounts,
+		)?;
 		self.publish_record_event("restore", &record);
 		Ok(record.view())
 	}
 
 	fn fork(&self, snapshot: &str, body: ForkBody) -> Result<Value> {
-		let count = body.count.max(1);
-		let mut clones = Vec::new();
-		let snapshot_dir = self.snapshot_dir(snapshot);
-		let base_disk = snapshot_dir.join("rootfs.img");
-		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir)?;
+		let ForkBody { count, extra } = body;
+		if !(1..=MAX_FORK_CLONES).contains(&count) {
+			return Err(EngineError::invalid(format!(
+				"count must be between 1 and {MAX_FORK_CLONES}"
+			)));
+		}
+		let options = resolve_snapshot_options(extra, None)?;
+		let snapshot_dir = self.require_snapshot_dir(snapshot)?;
+		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir, options.s3_mounts.clone())?;
+		let mut launched = Vec::with_capacity(count as usize);
 		for _ in 0..count {
 			let name = format!("fork-{}", random_hex(12));
-			let vm = MicroVm::new(&name);
-			// Clones need their own agent channel: the template snapshot carries
-			// a console-agent device, and exec/files re-attach through it.
-			let mut spec = LaunchSpec::fork_from(vm.api_sock(), &snapshot_dir)
-				.with_agent_sock(vm.dir().join("agent.sock"));
-			// Same-disk rule as restore: every clone owns a CoW overlay of the
-			// snapshot's disk (the in-process fanout parent does the same for
-			// its children) instead of all clones sharing one writable image.
-			if base_disk.is_file() {
-				spec = spec.with_disk_overlay(&base_disk, vm.dir().join("rootfs.img"));
+			match self.launch_snapshot_vm(
+				snapshot,
+				&snapshot_dir,
+				name,
+				SnapshotLaunchMode::Fork,
+				&options,
+				&s3_mounts,
+			) {
+				Ok(launched_vm) => launched.push(launched_vm),
+				Err(error) => {
+					for (vm, _) in launched.iter().rev() {
+						self.rollback_snapshot_vm(vm);
+					}
+					return Err(error);
+				},
 			}
-			let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &s3_mounts)?;
-			vm.launch(&spec)?;
-			if !s3_mounts.is_empty() {
-				let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
-				agent.ping(AGENT_CONNECT_TIMEOUT)?;
-				Self::mount_s3_in_guest(&agent, &s3_mounts)?;
-				agent.close();
-			}
-			let mut meta = vm.meta()?;
-			if !s3_mounts.is_empty() {
-				meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&s3_mounts));
-			}
-			if let Some(s3_proxy) = s3_proxy {
-				self
-					.inner
-					.runtimes
-					.lock()
-					.insert(name.clone(), RuntimeState {
-						s3_proxy: Some(s3_proxy),
-						..RuntimeState::default()
-					});
-			}
-			let record = VmRecord {
-				id:            name.clone(),
-				name:          name.clone(),
-				status:        "running".to_owned(),
-				pid:           meta
-					.get("pid")
-					.and_then(Value::as_i64)
-					.and_then(|pid| i32::try_from(pid).ok()),
-				source:        Some(format!("fork:{snapshot}")),
-				created_at:    unix_time(),
-				timeout:       None,
-				detail:        Value::Object(meta.clone()),
-				tags:          HashMap::new(),
-				last_active:   unix_time(),
-				terminated_at: None,
-				error:         None,
-			};
-			self.inner.registry.insert(record.clone());
-			clones.push(
-				json!({ "name": name, "pid": record.pid, "reconstruct_ms": meta.get("reconstruct_ms") }),
-			);
+		}
+		let clones = launched
+			.iter()
+			.map(|(_, record)| record.view())
+			.collect::<Vec<_>>();
+		for (_, record) in &launched {
+			self.publish_record_event("fork", record);
 		}
 		self.publish_event(
 			"fork",
@@ -2674,7 +2916,11 @@ impl EngineApi for Engine {
 		let request = template_request_from_pool(reference, &body.extra);
 		let cached = image::cached_template(self, &request)?;
 		let key = template_key_for_cached(&cached);
-		let pool = WarmPool::new(cached.snapshot_dir, body.size as usize)?;
+		let pool = WarmPool::with_runtime(
+			cached.snapshot_dir,
+			body.size as usize,
+			Arc::clone(&self.inner.sandbox_runtime),
+		)?;
 		let old = self.inner.pools.set(key.clone(), pool);
 		if let Some(old) = old {
 			old.shutdown();
@@ -2804,6 +3050,47 @@ fn align_process_home(home: &Path) {
 	}
 }
 
+fn validate_local_name(kind: &str, name: &str) -> Result<()> {
+	if is_safe_snapshot_name(name) {
+		Ok(())
+	} else {
+		Err(EngineError::invalid(format!(
+			"{kind} must be a 1-128 byte ASCII basename using letters, digits, '.', '_', or '-'"
+		)))
+	}
+}
+
+fn read_snapshot_metadata(path: &Path) -> Result<Vec<u8>> {
+	let file = fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		.open(path)
+		.map_err(|error| {
+			EngineError::invalid(format!("opening snapshot metadata {}: {error}", path.display()))
+		})?;
+	if !file
+		.metadata()
+		.map_err(|error| {
+			EngineError::invalid(format!("stat snapshot metadata {}: {error}", path.display()))
+		})?
+		.is_file()
+	{
+		return Err(EngineError::invalid(format!(
+			"snapshot metadata {} is not a regular file",
+			path.display()
+		)));
+	}
+	let mut bytes = Vec::new();
+	Read::take(file, MAX_SNAPSHOT_METADATA_BYTES + 1).read_to_end(&mut bytes)?;
+	if bytes.len() as u64 > MAX_SNAPSHOT_METADATA_BYTES {
+		return Err(EngineError::invalid(format!(
+			"snapshot metadata {} exceeds {MAX_SNAPSHOT_METADATA_BYTES} bytes",
+			path.display()
+		)));
+	}
+	Ok(bytes)
+}
+
 fn require_positive(name: &str, value: u64) -> Result<()> {
 	if value == 0 {
 		Err(EngineError::invalid(format!("{name} must be positive")))
@@ -2891,6 +3178,33 @@ fn effective_timeout_secs(timeout_secs: Option<u64>, timeout: Option<f64>) -> Re
 		return Err(EngineError::invalid("timeout must be non-negative"));
 	}
 	Ok(Some(secs as u64))
+}
+
+fn resolve_snapshot_options(
+	extra: HashMap<String, Value>,
+	agent: Option<bool>,
+) -> Result<ResolvedSnapshotOptions> {
+	let options = serde_json::from_value::<SnapshotOptions>(json!(extra)).map_err(|error| {
+		EngineError::invalid(format!("unsupported or invalid snapshot override: {error}"))
+	})?;
+	let secrets = parse_secrets(options.secrets)?;
+	let timeout_secs = if options.timeout_secs.is_some() || options.timeout.is_some() {
+		effective_timeout_secs(options.timeout_secs, options.timeout)?
+	} else {
+		None
+	};
+	Ok(ResolvedSnapshotOptions {
+		agent: agent.or(options.agent).unwrap_or(false),
+		env: options.env.unwrap_or_default().into_iter().collect(),
+		secret_env: merge_secret_env(&secrets),
+		secret_names: secrets.into_iter().map(|secret| secret.name).collect(),
+		workdir: options.workdir,
+		tags: options.tags.unwrap_or_default(),
+		timeout_secs,
+		readiness_probe: options.readiness_probe,
+		s3_mounts: options.s3_mounts,
+		command: options.command,
+	})
 }
 
 fn parse_volume_spec(value: &Value) -> Result<(String, bool)> {
@@ -3578,7 +3892,7 @@ fn template_request_from_pool(reference: &str, extra: &HashMap<String, Value>) -
 	}
 }
 
-fn control_for_vm(vm: &MicroVm) -> Result<ControlClient> {
+fn control_for_vm(vm: &SandboxVm) -> Result<ControlClient> {
 	ControlClient::connect(vm.control_sock()?, CONTROL_TIMEOUT)
 }
 
@@ -3602,7 +3916,7 @@ fn teardown_network(name: &str) {
 }
 
 fn detect_oom(name: &str) -> bool {
-	let Ok(meta) = MicroVm::new(name).meta() else {
+	let Ok(meta) = SandboxVm::new(name).meta() else {
 		return false;
 	};
 	let mut candidates = Vec::new();
@@ -3700,7 +4014,7 @@ fn clamp_exec_timeout(timeout: Option<f64>) -> Duration {
 /// with return code 124 on time. This thread only cleans up a VM that
 /// outlives its deadline by a grace period (a wedged VMM), so it never races
 /// the self-kill's `status.json` write.
-fn start_timeout_watchdog(name: String, secs: u64) -> Sender<()> {
+fn start_timeout_watchdog(name: String, secs: u64, runtime: Arc<dyn SandboxRuntime>) -> Sender<()> {
 	const GRACE: Duration = Duration::from_secs(5);
 	let (tx, rx) = flume::bounded(1);
 	thread::Builder::new()
@@ -3710,9 +4024,9 @@ fn start_timeout_watchdog(name: String, secs: u64) -> Sender<()> {
 				.recv_timeout(Duration::from_secs(secs.max(1)) + GRACE)
 				.is_err()
 			{
-				let vm = MicroVm::new(name);
-				if vm.is_running().unwrap_or(false) {
-					let _ = vm.stop(false);
+				let vm = runtime.sandbox(&name);
+				if runtime.is_running(&vm).unwrap_or(false) {
+					let _ = runtime.stop(&vm, false);
 				}
 			}
 		})
@@ -3804,6 +4118,263 @@ mod tests {
 
 	fn valid_create() -> SandboxCreate {
 		SandboxCreate { cpus: 1, memory: 512, disk_mb: 1024, ..SandboxCreate::default() }
+	}
+
+	#[test]
+	fn snapshot_metadata_must_be_a_bounded_regular_file() {
+		let temp = TempDir::new().expect("temp");
+		let regular = temp.path().join("regular.json");
+		fs::write(&regular, b"{}").expect("regular metadata");
+		assert_eq!(read_snapshot_metadata(&regular).expect("read metadata"), b"{}");
+
+		let outside = temp.path().join("outside.json");
+		fs::write(&outside, b"{}").expect("outside metadata");
+		let symlink = temp.path().join("symlink.json");
+		std::os::unix::fs::symlink(&outside, &symlink).expect("metadata symlink");
+		assert!(read_snapshot_metadata(&symlink).is_err());
+
+		let oversized = temp.path().join("oversized.json");
+		fs::write(&oversized, vec![b' '; MAX_SNAPSHOT_METADATA_BYTES as usize + 1])
+			.expect("oversized metadata");
+		assert!(read_snapshot_metadata(&oversized).is_err());
+	}
+
+	#[test]
+	fn mesh_checkpoint_carries_secret_environment() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("secret", "secret", "running");
+		record.detail = json!({"block_network": true});
+		engine.insert_test_record(record);
+
+		let mut runtime = RuntimeState::default();
+		runtime
+			.secret_env
+			.insert("TOKEN".to_owned(), "sensitive".to_owned());
+		engine
+			.inner
+			.runtimes
+			.lock()
+			.insert("secret".to_owned(), runtime);
+
+		let (_, params) = engine
+			.mesh_checkpoint_params("secret")
+			.expect("secret-bearing sandbox can migrate");
+		assert_eq!(params["secrets"][0]["name"], "carried");
+		assert_eq!(params["secrets"][0]["values"]["TOKEN"], "sensitive");
+	}
+
+	#[test]
+	fn lifecycle_events_are_sequenced_and_describe_resulting_state() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let events = engine.subscribe_events();
+		let mut record = VmRecord::new("sandbox", "sandbox", "running");
+		record.source = Some("alpine".to_owned());
+		record.tags.insert("role".to_owned(), "worker".to_owned());
+
+		engine.publish_record_event("ready", &record);
+		record.status = "terminated".to_owned();
+		record.detail = json!({"returncode": 137, "terminated_reason": "oom"});
+		engine.publish_record_event("terminated", &record);
+		engine.publish_record_event("removed", &record);
+
+		let ready = events.recv().expect("ready event");
+		assert_eq!(ready["type"], "ready");
+		assert_eq!(ready["sequence"], 1);
+		assert_eq!(ready["status"], "running");
+		assert_eq!(ready["source"], "alpine");
+		assert_eq!(ready["tags"]["role"], "worker");
+		let terminated = events.recv().expect("terminated event");
+		assert_eq!(terminated["type"], "terminated");
+		assert_eq!(terminated["sequence"], 2);
+		assert_eq!(terminated["status"], "terminated");
+		assert_eq!(terminated["returncode"], 137);
+		assert_eq!(terminated["reason"], "oom");
+		let removed = events.recv().expect("removed event");
+		assert_eq!(removed["type"], "removed");
+		assert_eq!(removed["sequence"], 3);
+		assert_eq!(removed["status"], "removed");
+	}
+
+	struct SnapshotRuntime {
+		launches: std::sync::atomic::AtomicUsize,
+		fail_at:  usize,
+		names:    Mutex<Vec<String>>,
+	}
+
+	impl SnapshotRuntime {
+		fn new(fail_at: usize) -> Arc<Self> {
+			Arc::new(Self {
+				launches: std::sync::atomic::AtomicUsize::new(0),
+				fail_at,
+				names: Mutex::new(Vec::new()),
+			})
+		}
+
+		fn names(&self) -> Vec<String> {
+			self.names.lock().clone()
+		}
+	}
+
+	impl SandboxRuntime for SnapshotRuntime {
+		fn name(&self) -> &'static str {
+			"snapshot-test"
+		}
+
+		fn launch(&self, vm: &SandboxVm, _spec: &LaunchSpec) -> Result<()> {
+			let attempt = self.launches.fetch_add(1, Ordering::Relaxed) + 1;
+			self.names.lock().push(vm.name().to_owned());
+			fs::create_dir_all(vm.dir())?;
+			if attempt == self.fail_at {
+				return Err(EngineError::engine("injected snapshot launch failure"));
+			}
+			vm.save_meta(Map::from_iter([("pid".to_owned(), json!(1000 + attempt))]))
+		}
+
+		fn stop(&self, _vm: &SandboxVm, _wait: bool) -> Result<()> {
+			Ok(())
+		}
+
+		fn remove(&self, vm: &SandboxVm) -> Result<()> {
+			match fs::remove_dir_all(vm.dir()) {
+				Ok(()) => Ok(()),
+				Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+				Err(error) => Err(error.into()),
+			}
+		}
+
+		fn is_running(&self, vm: &SandboxVm) -> Result<bool> {
+			Ok(vm.dir().is_dir())
+		}
+	}
+
+	fn snapshot_engine(
+		temp: &TempDir,
+		fail_at: usize,
+	) -> (Engine, Arc<SnapshotRuntime>, crate::home::test_home::HomeGuard) {
+		let home = crate::home::test_home::set(temp.path());
+		let runtime = SnapshotRuntime::new(fail_at);
+		let engine =
+			Engine::with_runtime(config_for(temp), runtime.clone()).expect("snapshot engine");
+		(engine, runtime, home)
+	}
+
+	#[test]
+	fn restore_requires_a_snapshot_and_returns_a_canonical_view() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+
+		let missing = engine
+			.restore("missing", RestoreBody::default())
+			.expect_err("missing snapshots must fail before launch");
+		assert_eq!(missing.code.as_str(), "not_found");
+		assert!(runtime.names().is_empty());
+
+		for unsafe_name in ["../escape", "nested/snapshot", ".hidden", r"nested\snapshot"] {
+			let error = engine
+				.restore(unsafe_name, RestoreBody::default())
+				.expect_err("unsafe snapshot name");
+			assert_eq!(error.code.as_str(), "invalid");
+			let error = engine
+				.create(SandboxCreate { name: Some(unsafe_name.to_owned()), ..valid_create() })
+				.expect_err("unsafe sandbox name");
+			assert_eq!(error.code.as_str(), "invalid");
+		}
+		assert!(!temp.path().join("escape").exists());
+
+		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
+		std::os::unix::fs::symlink(temp.path(), engine.snapshot_dir("linked"))
+			.expect("snapshot symlink");
+		let linked = engine
+			.restore("linked", RestoreBody::default())
+			.expect_err("snapshot symlinks must be rejected");
+		assert_eq!(linked.code.as_str(), "invalid");
+		let unsafe_target = engine
+			.restore("base", RestoreBody {
+				name: Some("../escape".to_owned()),
+				..RestoreBody::default()
+			})
+			.expect_err("unsafe restore target");
+		assert_eq!(unsafe_target.code.as_str(), "invalid");
+		fs::create_dir_all(engine.home().templates_dir().join("image-template")).expect("template");
+		assert_eq!(engine.snapshots().expect("snapshot list"), ["base"]);
+		let view = engine
+			.restore("base", RestoreBody {
+				name: Some("restored".to_owned()),
+				..RestoreBody::default()
+			})
+			.expect("restore");
+		assert_eq!(view["id"], "restored");
+		assert_eq!(view["name"], "restored");
+		assert_eq!(view["status"], "running");
+		assert_eq!(view["source"], "restore:base");
+		assert!(
+			view["created_at"]
+				.as_f64()
+				.is_some_and(|created| created > 0.0)
+		);
+		assert_eq!(engine.get("restored").expect("persisted view")["id"], "restored");
+
+		let collision = engine
+			.restore("base", RestoreBody {
+				name: Some("restored".to_owned()),
+				..RestoreBody::default()
+			})
+			.expect_err("restore must not overwrite a sandbox");
+		assert_eq!(collision.code.as_str(), "busy");
+		assert_eq!(runtime.names(), ["restored"]);
+	}
+
+	#[test]
+	fn fork_rejects_invalid_counts_and_rolls_back_a_partial_batch() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, 2);
+		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
+
+		for count in [0, MAX_FORK_CLONES + 1] {
+			let error = engine
+				.fork("base", ForkBody { count, extra: HashMap::new() })
+				.expect_err("invalid count");
+			assert_eq!(error.code.as_str(), "invalid");
+		}
+		assert!(runtime.names().is_empty());
+
+		let error = engine
+			.fork("base", ForkBody { count: 3, extra: HashMap::new() })
+			.expect_err("second clone fails");
+		assert_eq!(error.message, "injected snapshot launch failure");
+		let names = runtime.names();
+		assert_eq!(names.len(), 2);
+		assert!(engine.list(None).expect("registry list").is_empty());
+		for name in names {
+			assert!(!temp.path().join("vms").join(name).exists());
+		}
+	}
+
+	#[test]
+	fn fork_returns_full_canonical_views() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
+
+		let value = engine
+			.fork("base", ForkBody { count: 2, extra: HashMap::new() })
+			.expect("fork");
+		let clones = value["clones"].as_array().expect("clone views");
+		assert_eq!(clones.len(), 2);
+		for clone in clones {
+			assert!(
+				clone["id"]
+					.as_str()
+					.is_some_and(|id| id.starts_with("fork-"))
+			);
+			assert_eq!(clone["name"], clone["id"]);
+			assert_eq!(clone["status"], "running");
+			assert_eq!(clone["source"], "fork:base");
+			assert!(clone["created_at"].as_f64().is_some());
+		}
+		assert_eq!(engine.list(None).expect("registry list").len(), 2);
 	}
 
 	#[test]

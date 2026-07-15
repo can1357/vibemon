@@ -196,6 +196,8 @@ type APIError struct {
 	Code       string
 	Message    string
 	Truncated  bool
+	Retryable  bool
+	Action     string
 }
 
 // Error returns the string representation of the API error.
@@ -421,6 +423,24 @@ func vmonCodeFromMetadata(responseMetadata []metadata.MD) string {
 	return ""
 }
 
+func vmonRetryableFromMetadata(responseMetadata []metadata.MD) (bool, bool) {
+	for _, md := range responseMetadata {
+		if values := md.Get("vmon-retryable"); len(values) != 0 && values[0] != "" {
+			return strings.ToLower(values[0]) == "true", true
+		}
+	}
+	return false, false
+}
+
+func vmonActionFromMetadata(responseMetadata []metadata.MD) string {
+	for _, md := range responseMetadata {
+		if values := md.Get("vmon-action"); len(values) != 0 && values[0] != "" {
+			return values[0]
+		}
+	}
+	return ""
+}
+
 // apiErrorFromStatus converts a gRPC call error into the SDK error taxonomy.
 // The stable daemon code is read from `vmon-code` response metadata (trailers
 // preferred, then headers); the gRPC status code is the fallback. Connection
@@ -465,7 +485,12 @@ func apiErrorFromStatus(err error, operation string, responseMetadata ...metadat
 	if message == "" {
 		message = statusErr.Code().String()
 	}
-	return &APIError{StatusCode: vmonCodeToHTTPStatus[code], Code: code, Message: message}
+	retry, ok := vmonRetryableFromMetadata(responseMetadata)
+	if !ok {
+		retry = code == "busy" || code == "ha_unavailable" || code == "unavailable_secret"
+	}
+	action := vmonActionFromMetadata(responseMetadata)
+	return &APIError{StatusCode: vmonCodeToHTTPStatus[code], Code: code, Message: message, Retryable: retry, Action: action}
 }
 
 func isNotFoundAPIError(err error) bool {
@@ -595,7 +620,7 @@ func (client *Client) meshStatusJSON(ctx context.Context) ([]byte, error) {
 	return view, nil
 }
 
-// ---- residual HTTP plumbing (healthz, /metrics, OpenAPI, ports proxy) ----
+// ---- residual HTTP plumbing (healthz, /metrics, ports proxy) ----
 
 func (client *Client) request(ctx context.Context, request DriverRequest) (*http.Response, string, error) {
 	if client == nil || client.driver == nil {
@@ -663,9 +688,11 @@ func apiErrorFromResponse(response *http.Response) error {
 		body = body[:maxErrorResponseBytes]
 	}
 	var wire struct {
-		Code    string `json:"code"`
-		Error   string `json:"error"`
-		Message string `json:"message"`
+		Code      string `json:"code"`
+		Error     string `json:"error"`
+		Message   string `json:"message"`
+		Retryable any    `json:"retryable"`
+		Action    string `json:"action"`
 	}
 	_ = json.Unmarshal(body, &wire)
 	message := firstNonempty(wire.Message, wire.Error, strings.TrimSpace(string(body)))
@@ -676,5 +703,13 @@ func apiErrorFromResponse(response *http.Response) error {
 	if readErr != nil && message == "" {
 		message = readErr.Error()
 	}
-	return &APIError{StatusCode: response.StatusCode, Code: wire.Code, Message: message, Truncated: truncated}
+	var retry bool
+	if b, ok := wire.Retryable.(bool); ok {
+		retry = b
+	} else if s, ok := wire.Retryable.(string); ok {
+		retry = strings.ToLower(s) == "true"
+	} else {
+		retry = wire.Code == "busy" || wire.Code == "ha_unavailable" || wire.Code == "unavailable_secret"
+	}
+	return &APIError{StatusCode: response.StatusCode, Code: wire.Code, Message: message, Truncated: truncated, Retryable: retry, Action: wire.Action}
 }

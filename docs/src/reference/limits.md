@@ -22,6 +22,15 @@ quota. Per-worker `ResourceSpec` declares whole vCPUs, memory bytes, ephemeral
 disk bytes, architecture, HA policy, volumes, and network policy, but the proto
 does not define global numeric caps for those fields.
 
+## Server request caps
+
+| Setting | Accepted range | Default |
+| --- | --- | --- |
+| Snapshot fork batch | 1–32 clones | none; `count` is required |
+
+Fork batches are atomic. A failed clone causes the server to remove the other
+clones created by that request.
+
 ## S3 mount admission
 
 A sandbox create request supports at most **8** S3 mounts. At creation, the

@@ -7,7 +7,7 @@
 
 use std::{
 	collections::{BTreeMap, HashMap},
-	fmt,
+	fmt, io,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use quick_xml::de::from_str;
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
+use sha2::Digest;
 use tracing::warn;
 
 use crate::{EngineError, Result};
@@ -25,6 +26,9 @@ use crate::{EngineError, Result};
 const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK_SIZE: usize = 1 << 20;
+const MULTIPART_PART_SIZE: usize = 16 << 20;
+const MULTIPART_MAX_PARTS: u32 = 10_000;
+const MULTIPART_TIMEOUT: Duration = Duration::from_mins(5);
 const CHUNK_CACHE_CAP: usize = 256 << 20;
 const MAX_LIST_ENTRIES: usize = 100_000;
 type ListCacheEntry = (Instant, Arc<Vec<ObjEntry>>);
@@ -184,6 +188,12 @@ struct ChunkKey {
 	index: u64,
 }
 
+#[derive(Deserialize)]
+struct InitiateMultipartUploadResult {
+	#[serde(rename = "UploadId")]
+	upload_id: String,
+}
+
 struct CachedChunk {
 	data:      Bytes,
 	last_used: u64,
@@ -229,6 +239,11 @@ impl ChunkLru {
 			.entries
 			.insert(key, CachedChunk { data, last_used: self.clock });
 	}
+
+	fn clear(&mut self) {
+		self.entries.clear();
+		self.bytes = 0;
+	}
 }
 
 impl S3Client {
@@ -255,6 +270,12 @@ impl S3Client {
 			list_cache: Mutex::new(ListCache::new()),
 			chunks: Mutex::new(ChunkLru { entries: HashMap::new(), bytes: 0, clock: 0 }),
 		})
+	}
+
+	/// Clear the in-memory S3 caches.
+	pub fn clear_cache(&self) {
+		self.list_cache.lock().clear();
+		self.chunks.lock().clear();
 	}
 
 	/// Verifies bucket access with a one-key `ListObjectsV2` request.
@@ -331,6 +352,239 @@ impl S3Client {
 			mtime: entry.mtime,
 			etag:  entry.etag.clone(),
 		})
+	}
+
+	/// Put (upload) a whole object to S3.
+	pub async fn put(&self, path: &str, body: Vec<u8>) -> std::result::Result<(), S3Error> {
+		let key = self.object_key(path)?;
+		let response = self
+			.request_with_body(Method::PUT, &key, &[], Some(body))
+			.await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		// Invalidate list cache for parent directory
+		if let Some((parent, _)) = path.rsplit_once('/') {
+			self.list_cache.lock().remove(parent);
+		} else {
+			self.list_cache.lock().remove("");
+		}
+		Ok(())
+	}
+
+	/// Streams an arbitrarily large object through S3 multipart upload.
+	pub async fn put_multipart(
+		&self,
+		path: &str,
+		mut body: tokio::sync::mpsc::Receiver<io::Result<Bytes>>,
+	) -> std::result::Result<(), S3Error> {
+		let key = self.object_key(path)?;
+		let uploads = vec![("uploads".to_owned(), String::new())];
+		let response = self
+			.request_with_body_timeout(Method::POST, &key, &uploads, None, MULTIPART_TIMEOUT)
+			.await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let response_body = response
+			.text()
+			.await
+			.map_err(|error| S3Error::Io(format!("reading multipart-init response: {error}")))?;
+		let upload = from_str::<InitiateMultipartUploadResult>(&response_body)
+			.map_err(|error| S3Error::Io(format!("invalid multipart-init response: {error}")))?;
+		if upload.upload_id.is_empty() {
+			return Err(S3Error::Io("multipart-init response omitted UploadId".to_owned()));
+		}
+
+		let result = async {
+			let mut pending = Vec::with_capacity(MULTIPART_PART_SIZE);
+			let mut parts = Vec::new();
+			while let Some(chunk) = body.recv().await {
+				let chunk =
+					chunk.map_err(|error| S3Error::Io(format!("producing upload body: {error}")))?;
+				let mut offset = 0;
+				while offset < chunk.len() {
+					let take = (MULTIPART_PART_SIZE - pending.len()).min(chunk.len() - offset);
+					pending.extend_from_slice(&chunk[offset..offset + take]);
+					offset += take;
+					if pending.len() == MULTIPART_PART_SIZE {
+						let part =
+							std::mem::replace(&mut pending, Vec::with_capacity(MULTIPART_PART_SIZE));
+						let part_number =
+							u32::try_from(parts.len() + 1).map_err(|_| S3Error::BadRequest)?;
+						parts.push(
+							self
+								.upload_part(&key, &upload.upload_id, part_number, part)
+								.await?,
+						);
+					}
+				}
+			}
+			if !pending.is_empty() || parts.is_empty() {
+				let part_number = u32::try_from(parts.len() + 1).map_err(|_| S3Error::BadRequest)?;
+				parts.push(
+					self
+						.upload_part(&key, &upload.upload_id, part_number, pending)
+						.await?,
+				);
+			}
+			let mut complete = String::from("<CompleteMultipartUpload>");
+			for (index, etag) in parts.iter().enumerate() {
+				complete.push_str("<Part><PartNumber>");
+				complete.push_str(&(index + 1).to_string());
+				complete.push_str("</PartNumber><ETag>");
+				complete.push_str(&quick_xml::escape::escape(etag));
+				complete.push_str("</ETag></Part>");
+			}
+			complete.push_str("</CompleteMultipartUpload>");
+			let query = vec![("uploadId".to_owned(), upload.upload_id.clone())];
+			let response = self
+				.request_with_body_timeout(
+					Method::POST,
+					&key,
+					&query,
+					Some(complete.into_bytes()),
+					MULTIPART_TIMEOUT,
+				)
+				.await?;
+			if !response.status().is_success() {
+				return Err(response_error(response.status()));
+			}
+			Ok(())
+		}
+		.await;
+
+		if let Err(error) = result {
+			let query = vec![("uploadId".to_owned(), upload.upload_id)];
+			let _ = self
+				.request_with_body_timeout(Method::DELETE, &key, &query, None, MULTIPART_TIMEOUT)
+				.await;
+			return Err(error);
+		}
+		self.invalidate_parent(path);
+		Ok(())
+	}
+
+	async fn upload_part(
+		&self,
+		key: &str,
+		upload_id: &str,
+		part_number: u32,
+		body: Vec<u8>,
+	) -> std::result::Result<String, S3Error> {
+		if part_number == 0 || part_number > MULTIPART_MAX_PARTS {
+			return Err(S3Error::BadRequest);
+		}
+		let query = vec![
+			("partNumber".to_owned(), part_number.to_string()),
+			("uploadId".to_owned(), upload_id.to_owned()),
+		];
+		let response = self
+			.request_with_body_timeout(Method::PUT, key, &query, Some(body), MULTIPART_TIMEOUT)
+			.await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		response
+			.headers()
+			.get(reqwest::header::ETAG)
+			.and_then(|etag| etag.to_str().ok())
+			.map(str::to_owned)
+			.ok_or_else(|| S3Error::Io("multipart upload response omitted ETag".to_owned()))
+	}
+
+	fn invalidate_parent(&self, path: &str) {
+		if let Some((parent, _)) = path.rsplit_once('/') {
+			self.list_cache.lock().remove(parent);
+		} else {
+			self.list_cache.lock().remove("");
+		}
+	}
+
+	/// Delete an object from S3.
+	pub async fn remove(&self, path: &str) -> std::result::Result<(), S3Error> {
+		let key = self.object_key(path)?;
+		let response = self
+			.request_with_body(Method::DELETE, &key, &[], None)
+			.await?;
+		if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
+			return Err(response_error(response.status()));
+		}
+		// Invalidate list cache for parent directory and chunks
+		if let Some((parent, _)) = path.rsplit_once('/') {
+			self.list_cache.lock().remove(parent);
+		} else {
+			self.list_cache.lock().remove("");
+		}
+		Ok(())
+	}
+
+	async fn request_with_body(
+		&self,
+		method: Method,
+		key: &str,
+		query: &[(String, String)],
+		body: Option<Vec<u8>>,
+	) -> std::result::Result<reqwest::Response, S3Error> {
+		self
+			.request_with_body_timeout(method, key, query, body, HTTP_TIMEOUT)
+			.await
+	}
+
+	async fn request_with_body_timeout(
+		&self,
+		method: Method,
+		key: &str,
+		query: &[(String, String)],
+		body: Option<Vec<u8>>,
+		timeout: Duration,
+	) -> std::result::Result<reqwest::Response, S3Error> {
+		let (url, canonical_uri, canonical_query) = self.request_url(key, query)?;
+		let host = request_host(&url)?;
+		let mut request = self.http.request(method.clone(), url).timeout(timeout);
+		if let Some(payload) = &body {
+			request = request.body(payload.clone());
+		}
+		if self.cfg.auth != S3Auth::Anonymous {
+			let creds = self.cfg.creds.as_ref().ok_or(S3Error::BadRequest)?;
+			let now = Utc::now();
+			let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+			let payload_hash = if let Some(payload) = &body {
+				hex::encode(sha2::Sha256::digest(payload))
+			} else {
+				UNSIGNED_PAYLOAD.to_owned()
+			};
+			let mut headers = vec![
+				("host".to_owned(), host.clone()),
+				("x-amz-content-sha256".to_owned(), payload_hash.clone()),
+				("x-amz-date".to_owned(), date.clone()),
+			];
+			if let Some(token) = &creds.session_token {
+				headers.push(("x-amz-security-token".to_owned(), token.clone()));
+			}
+			let authorization = sigv4::authorization(
+				method.as_str(),
+				&canonical_uri,
+				&canonical_query,
+				&headers,
+				&payload_hash,
+				now,
+				&self.cfg.region,
+				creds,
+			);
+			request = request
+				.header("host", host)
+				.header("x-amz-content-sha256", payload_hash)
+				.header("x-amz-date", date)
+				.header("authorization", authorization);
+			if let Some(token) = &creds.session_token {
+				request = request.header("x-amz-security-token", token);
+			}
+		}
+		request
+			.send()
+			.await
+			.map_err(|error| S3Error::Io(format!("sending S3 request: {error}")))
 	}
 
 	/// Reads up to `len` bytes using cached one-mebibyte ranged GETs.

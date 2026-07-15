@@ -23,7 +23,7 @@ _INPUT_DONE = object()
 
 # A session starter receives a factory producing a fresh ExecInput iterator per
 # connection attempt and returns the response stream plus the chosen endpoint.
-type SessionStarter = Callable[[Callable[[], Iterator[api_pb2.ExecInput]]], tuple[Any, str | None]]
+SessionStarter = Callable[[Callable[[], Iterator[api_pb2.ExecInput]]], tuple[Any, str | None]]
 
 
 class ByteStream(Iterable[bytes]):

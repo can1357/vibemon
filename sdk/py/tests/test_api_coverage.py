@@ -130,19 +130,22 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             assert updated_policy.block_network is True
             assert updated_policy.cidr_allow == ("10.0.0.0/8",)
             assert updated_policy.domain_allow == ("example.com",)
-            assert sandbox.migrate("node-b").node == "node-b"
             assert sandbox.pause().status == "paused"
             assert sandbox.resume().status == "running"
             assert sandbox.extend(15).raw["deadline_unix"] == 1_800_000_000
             assert sandbox.metrics()["vcpu_exits"] == 7
+            assert sandbox.node == server.node_id
+            assert sandbox.migrate("node-b").node == "node-b"
+            migration = server.last_rpc("SandboxService/Migrate", id="box/name")
+            assert migration.json["target"] == "node-b"
 
-            assert sandbox.snapshot("base/snapshot") == "base/snapshot"
-            assert client.snapshots.list() == ["base/snapshot"]
+            assert sandbox.snapshot("base-snapshot") == "base-snapshot"
+            assert client.snapshots.list() == ["base-snapshot"]
             assert sandbox.snapshot_filesystem("filesystem-image") == "filesystem-image"
 
-            restored = client.snapshots.restore("base/snapshot", name="restored")
+            restored = client.snapshots.restore("base-snapshot", name="restored")
             assert restored.id == "restored"
-            clones = client.snapshots.fork("base/snapshot", count=2)
+            clones = client.snapshots.fork("base-snapshot", count=2)
             assert len(clones) == 2
             assert len({clone.id for clone in clones}) == 2
 

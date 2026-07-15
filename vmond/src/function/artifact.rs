@@ -2,15 +2,24 @@
 
 use std::{
 	fs::{self, File, OpenOptions},
+	future::Future,
 	io::{Read, Seek, SeekFrom, Write},
 	os::unix::fs::OpenOptionsExt,
 	path::{Path, PathBuf},
+	sync::Arc,
+	thread,
 };
 
+use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{EngineError, Result};
+use crate::{
+	EngineError, Result,
+	config::{ClusterMode, ServeConfig},
+	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig},
+};
 
 /// SHA-256 digest length in bytes.
 pub const SHA256_BYTES: usize = 32;
@@ -26,10 +35,22 @@ pub struct StoredArtifact {
 	pub path:   PathBuf,
 }
 
-/// Filesystem-backed immutable SHA-256 content store.
-#[derive(Clone, Debug)]
+/// Immutable SHA-256 content store. Production uses S3 as the authoritative
+/// object store and keeps verified bytes in `root` only as a local cache.
+#[derive(Clone)]
 pub struct ArtifactStore {
 	root: PathBuf,
+	s3:   Option<Arc<S3Client>>,
+}
+
+impl std::fmt::Debug for ArtifactStore {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ArtifactStore")
+			.field("root", &self.root)
+			.field("authoritative_s3", &self.s3.is_some())
+			.finish()
+	}
 }
 
 /// A digest-verified artifact positioned at its first byte.
@@ -79,6 +100,8 @@ pub struct ArtifactWriter {
 	max_size:        u64,
 	written:         u64,
 	committed:       bool,
+	s3:              Option<Arc<S3Client>>,
+	object_key:      String,
 }
 
 impl ArtifactWriter {
@@ -128,6 +151,38 @@ impl ArtifactWriter {
 			.final_path
 			.parent()
 			.ok_or_else(|| EngineError::engine("artifact path has no parent"))?;
+
+		if let Some(s3) = &self.s3 {
+			let (tx, rx) = mpsc::channel(4);
+			let temp_path = self.temporary.clone();
+			let s3_clone = s3.clone();
+			let key = self.object_key.clone();
+			let upload_task = async move {
+				s3_clone
+					.put_multipart(&key, rx)
+					.await
+					.map_err(|err| EngineError::engine(format!("failed S3 multipart upload: {err:?}")))
+			};
+			let read_thread = thread::spawn(move || -> std::io::Result<()> {
+				let mut file = File::open(&temp_path)?;
+				let mut buf = vec![0u8; 8 * 1024 * 1024];
+				while let Ok(n) = file.read(&mut buf) {
+					if n == 0 {
+						break;
+					}
+					let bytes = Bytes::copy_from_slice(&buf[..n]);
+					if tx.blocking_send(Ok(bytes)).is_err() {
+						break;
+					}
+				}
+				Ok(())
+			});
+			block_on(upload_task)?;
+			read_thread
+				.join()
+				.map_err(|_| EngineError::engine("multipart reader thread panicked"))??;
+		}
+
 		if self.final_path.exists() {
 			verify_file(&self.final_path, &digest, self.expected_size)?;
 			fs::remove_file(&self.temporary)?;
@@ -146,7 +201,6 @@ impl ArtifactWriter {
 		Ok(StoredArtifact { digest, size: self.expected_size, path: self.final_path.clone() })
 	}
 }
-
 impl Drop for ArtifactWriter {
 	fn drop(&mut self) {
 		if !self.committed {
@@ -157,16 +211,64 @@ impl Drop for ArtifactWriter {
 }
 
 impl ArtifactStore {
+	/// Open explicitly configured durable metadata backend.
+	pub fn open_with_config(root: impl Into<PathBuf>, config: &ServeConfig) -> Result<Self> {
+		let root = root.into();
+		fs::create_dir_all(&root)?;
+		let s3 = if config.cluster_mode == ClusterMode::Production {
+			let creds =
+				if let (Some(key), Some(secret)) = (&config.s3_access_key, &config.s3_secret_key) {
+					Some(S3Credentials {
+						access_key:    key.clone(),
+						secret_key:    secret.clone(),
+						session_token: None,
+					})
+				} else {
+					None
+				};
+			let s3_cfg = S3MountConfig {
+				bucket: config.s3_bucket.clone().unwrap_or_default(),
+				prefix: config.s3_prefix.clone().unwrap_or_default(),
+				region: config
+					.s3_region
+					.clone()
+					.unwrap_or_else(|| "us-east-1".to_owned()),
+				endpoint: config.s3_endpoint.clone(),
+				read_only: false,
+				creds,
+				auth: if config.s3_access_key.is_some() {
+					S3Auth::Inline
+				} else {
+					S3Auth::Anonymous
+				},
+			};
+			let client = S3Client::new(s3_cfg).map_err(|err| {
+				EngineError::engine(format!("failed to initialize S3 client: {err:?}"))
+			})?;
+			Some(Arc::new(client))
+		} else {
+			None
+		};
+		Ok(Self { root, s3 })
+	}
+
 	/// Open (and create) an artifact directory.
 	pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
 		let root = root.into();
 		fs::create_dir_all(&root)?;
-		Ok(Self { root })
+		Ok(Self { root, s3: None })
 	}
 
 	/// Return the artifact root.
 	pub fn root(&self) -> &Path {
 		&self.root
+	}
+
+	/// Clear the authoritative S3 client caches if configured.
+	pub fn clear_cache(&self) {
+		if let Some(s3) = &self.s3 {
+			s3.clear_cache();
+		}
 	}
 
 	/// Begin a confined incremental upload with an exact digest, size, and
@@ -207,6 +309,8 @@ impl ArtifactStore {
 			max_size,
 			written: 0,
 			committed: false,
+			s3: self.s3.clone(),
+			object_key: digest_hex,
 		})
 	}
 
@@ -292,11 +396,22 @@ impl ArtifactStore {
 	/// Remove an artifact file. Missing files are treated as already removed.
 	pub fn remove(&self, digest: &str) -> Result<()> {
 		let path = self.path_for(digest)?;
+		self.remove_remote(digest)?;
 		match fs::remove_file(path) {
 			Ok(()) => Ok(()),
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
 			Err(error) => Err(error.into()),
 		}
+	}
+
+	fn remove_remote(&self, digest: &str) -> Result<()> {
+		let Some(s3) = &self.s3 else {
+			return Ok(());
+		};
+		let s3 = Arc::clone(s3);
+		let key = digest.to_owned();
+		block_on(async move { s3.remove(&key).await })
+			.map_err(|error| EngineError::engine(format!("failed to remove S3 artifact: {error:?}")))
 	}
 
 	/// Delete expired, unreferenced artifacts using a recoverable trash phase.
@@ -327,13 +442,30 @@ impl ArtifactStore {
 					"artifact {digest} has an invalid persisted path"
 				)));
 			}
-			let trash = trash_dir.join(&digest);
-			fs::rename(&expected, &trash)?;
+			let cached_trash = trash_dir.join(&digest);
+			let (trash, cached) = match fs::rename(&expected, &cached_trash) {
+				Ok(()) => (cached_trash, true),
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.s3.is_some() => {
+					let marker = trash_dir.join(format!("{digest}.delete"));
+					OpenOptions::new()
+						.write(true)
+						.create_new(true)
+						.mode(0o600)
+						.open(&marker)?
+						.sync_all()?;
+					File::open(&trash_dir)?.sync_all()?;
+					(marker, false)
+				},
+				Err(error) => return Err(error.into()),
+			};
 			if store.delete_unreferenced_artifact(&digest, now_ms)? {
+				self.remove_remote(&digest)?;
 				remove_if_present(&trash, &mut remove_file)?;
 				removed += 1;
-			} else {
+			} else if cached {
 				fs::rename(&trash, &expected)?;
+			} else {
+				remove_if_present(&trash, &mut remove_file)?;
 			}
 		}
 		Ok(removed)
@@ -355,16 +487,20 @@ impl ArtifactStore {
 			if !entry.file_type()?.is_file() {
 				continue;
 			}
-			let Some(digest) = entry.file_name().to_str().map(str::to_owned) else {
+			let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
 				continue;
 			};
-			if validate_digest_hex(&digest).is_err() {
+			let (digest, delete_only) = name
+				.strip_suffix(".delete")
+				.map_or((name.as_str(), false), |digest| (digest, true));
+			if validate_digest_hex(digest).is_err() {
 				continue;
 			}
 			let trash = entry.path();
-			match store.stat_artifact(&digest) {
+			match store.stat_artifact(digest) {
+				Ok(_) if delete_only => remove_if_present(&trash, remove_file)?,
 				Ok(_) => {
-					let expected = self.path_for(&digest)?;
+					let expected = self.path_for(digest)?;
 					if expected.exists() {
 						remove_if_present(&trash, remove_file)?;
 					} else {
@@ -372,6 +508,7 @@ impl ArtifactStore {
 					}
 				},
 				Err(error) if error.code == crate::ErrorCode::NotFound => {
+					self.remove_remote(digest)?;
 					remove_if_present(&trash, remove_file)?;
 				},
 				Err(error) => return Err(error),
@@ -380,16 +517,75 @@ impl ArtifactStore {
 		Ok(())
 	}
 
+	fn fetch_s3_to_cache(&self, digest: &str) -> Result<PathBuf> {
+		let s3 = self
+			.s3
+			.as_ref()
+			.ok_or_else(|| EngineError::engine("S3 is not configured"))?;
+		let final_path = self.path_for(digest)?;
+		let parent = final_path
+			.parent()
+			.ok_or_else(|| EngineError::engine("path has no parent"))?;
+		fs::create_dir_all(parent)?;
+		let temp_path = parent.join(format!(".{digest}.download-{}", Uuid::new_v4()));
+		let mut file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(0o600)
+			.open(&temp_path)?;
+
+		let mut hasher = Sha256::new();
+		let mut offset = 0u64;
+		let chunk_size = 1024 * 1024;
+		let s3_clone = s3.clone();
+		let key = digest.to_owned();
+		loop {
+			let s3_inner = s3_clone.clone();
+			let key_inner = key.clone();
+			let chunk = block_on(async move {
+				s3_inner
+					.read(&key_inner, offset, chunk_size)
+					.await
+					.map_err(|err| EngineError::engine(format!("failed to read chunk from S3: {err:?}")))
+			})?;
+			if chunk.is_empty() {
+				break;
+			}
+			file.write_all(&chunk)?;
+			hasher.update(&chunk);
+			offset += chunk.len() as u64;
+		}
+		file.sync_all()?;
+		drop(file);
+
+		let actual = hex::encode(hasher.finalize());
+		if actual != digest {
+			let _ = fs::remove_file(&temp_path);
+			return Err(EngineError::engine("S3 downloaded artifact digest mismatch"));
+		}
+
+		if final_path.exists() {
+			let _ = fs::remove_file(&temp_path);
+		} else {
+			fs::rename(&temp_path, &final_path)?;
+		}
+		Ok(final_path)
+	}
+
 	fn open_file(&self, digest: &str) -> Result<File> {
 		let path = self.path_for(digest)?;
-		File::open(path).map_err(|error| {
-			if error.kind() == std::io::ErrorKind::NotFound {
-				EngineError::not_found(format!("artifact {digest} not found"))
-			} else {
-				error.into()
-			}
-		})
+		match File::open(&path) {
+			Ok(file) => Ok(file),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.s3.is_some() => {
+				let cached_path = self.fetch_s3_to_cache(digest)?;
+				File::open(cached_path).map_err(Into::into)
+			},
+			Err(error) => Err(error.into()),
+		}
 	}
+}
+fn block_on<F: Future>(future: F) -> F::Output {
+	tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
 fn remove_if_present(

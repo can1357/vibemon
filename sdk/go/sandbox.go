@@ -304,20 +304,21 @@ func (sandbox *Sandbox) Extend(ctx context.Context, seconds uint64) (*Sandbox, e
 	})
 }
 
-// Migrate relocates the sandbox to a different target node.
+// Migrate moves the sandbox to a mesh node and re-pins its serving endpoint.
 func (sandbox *Sandbox) Migrate(ctx context.Context, target string) (*Sandbox, error) {
-	out, err := sandbox.action(ctx, "migrate sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+	if target == "" {
+		return nil, errors.New("vmon: target node id is required")
+	}
+	updated, err := sandbox.action(ctx, "migrate sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Migrate(ctx, &pb.MigrateRequest{Id: sandbox.ID, Target: target}, opts...)
 	})
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := sandbox.client.resolveSandbox(ctx, sandbox.ID, sandbox.endpoint)
-	if err != nil {
+	if _, err := sandbox.pinEndpoint(ctx); err != nil {
 		return nil, err
 	}
-	sandbox.endpoint = endpoint
-	return out, nil
+	return updated, nil
 }
 
 // Snapshot captures the current filesystem and memory state of the sandbox.

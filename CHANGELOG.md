@@ -29,6 +29,14 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added production cluster mode with `PostgreSQL` ownership and leases, S3-backed
+  function artifacts, a Helm chart, and separate rootless BuildKit workers.
+- Added idempotent single-node install and uninstall scripts plus a self-contained
+  Docker Compose deployment.
+- Added focused performance tests for create-to-first-exec latency and 32-clone
+  fork density, including post-removal process, descriptor, and thread checks.
+- Added real-guest compatibility workloads for headless Chromium and rootful
+  Docker inside a sandbox.
 - Added Windows (WHP) support for sandbox snapshots, restores, and live-migration
 - Added Windows support for virtual networking via TAP-Windows adapters
 - Added Windows support for virtio-fs read-only volume mounts
@@ -185,6 +193,16 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Made sandbox IDs the public routing contract; Python, TypeScript, and Go SDKs
+  now keep worker affinity private and re-resolve ownership after relocation.
+- Aligned Python and TypeScript sandbox lifecycle, exec, file, port, network,
+  snapshot, restore, and fork operations.
+- Lowered the Python SDK requirement to 3.11 and added CI coverage for Python
+  3.11, 3.12, and 3.13.
+- Refilled warm-pool slots concurrently in bounded batches of 32 instead of
+  restoring them serially.
+- Added sequenced lifecycle state to engine events and exposed stable
+  `retryable` and recovery `action` fields through every SDK error surface.
 - Updated remote function error reporting to include full stack trace context in error objects
 - Updated durable function runner to use bidirectional protocol handshake for capability discovery
 - Refined checkpointing to include granular timing metrics for snapshot, stamp, and indexing steps
@@ -253,6 +271,15 @@ All notable changes to this project are recorded here.
 - Renamed the hypervisor binary from `vmon` to `vmm` to resolve naming collisions
 - Renamed the project from VibeVMM to Vibemon, and the `VVM`/`vvm` brand prefix to `VMON`/`vmon` throughout. The binary, Python package, CLI, and daemon are now `vmon`/`vmond` (`python -m vmon`); environment variables are `VMON_*` (e.g. `VMON_HOME`, `VMON_API_TOKEN`, `VMON_E2E`); the state directory is `~/.vmon` with the daemon socket at `~/.vmon/vmond.sock`; guest kernel-cmdline keys, serial markers (`VMON_OK`), the bundled `vmon-agent`, the served web UI title, and the Rich console theme keys all follow suit. The generic term "virtual machine monitor" (`vmm`/`VMM`) is unchanged.
 - Switched the snapshot on-disk format from bincode to postcard and advanced the current format to version 3, adding serialized libslirp state for macOS user-net snapshots and rejecting older snapshots with a recapture-required error.
+
+### Hardened
+
+- Moved Dockerfile execution off the serving host into a disposable rootless
+  BuildKit worker and rejected secret-bearing `ARG` and `ENV` instructions.
+- Bounded and validated guest-controlled agent frames, snapshot structure,
+  canonical paths, regular files, and content digests before allocation or use.
+- Blocked metadata, loopback, link-local, and private destinations from domain
+  egress rules, and made DNS refresh failures remove stale allow rules.
 
 ### Fixed
 

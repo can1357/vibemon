@@ -18,6 +18,7 @@ use std::{
 use futures_util::{FutureExt, future::BoxFuture};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
 	sync::{Notify, broadcast},
 	task::JoinHandle,
@@ -51,29 +52,32 @@ const OWNER_EPOCH_FLOOR: u64 = 0;
 
 /// Live mesh runtime shared by API routes, peer routes, and background loops.
 pub struct MeshRuntime {
-	config:             ServeConfig,
-	membership_path:    PathBuf,
-	node_id:            String,
-	membership:         RwLock<MembershipState>,
-	token:              RwLock<String>,
-	default_advertise:  String,
-	transport:          PeerHttpClient,
-	engine:             MeshEngineAdapter,
-	records:            record::RecordStore,
-	replicas:           replica::ReplicaStore,
-	function_store:     FunctionStore,
-	leases:             lease::LeaseManager,
-	owners:             RwLock<BTreeMap<String, (String, u64)>>,
-	orphans:            Mutex<Vec<(String, String)>>,
-	idem_pins:          RwLock<BTreeMap<String, String>>,
-	workers:            Mutex<HashSet<String>>,
-	events:             Mutex<Vec<String>>,
-	compat_backend:     String,
-	compat_arch:        String,
-	cpu_baseline:       String,
-	weights:            PlacementWeights,
-	replicate_notify:   Notify,
+	pub(crate) config: ServeConfig,
+	home: Home,
+	membership_path: PathBuf,
+	node_id: String,
+	membership: RwLock<MembershipState>,
+	token: RwLock<String>,
+	default_advertise: String,
+	transport: PeerHttpClient,
+	pub(crate) engine: MeshEngineAdapter,
+	records: record::RecordStore,
+	replicas: replica::ReplicaStore,
+	pub(crate) function_store: FunctionStore,
+	leases: lease::LeaseManager,
+	owners: RwLock<BTreeMap<String, (String, u64)>>,
+	orphans: Mutex<Vec<(String, String)>>,
+	idem_pins: RwLock<BTreeMap<String, String>>,
+	workers: Mutex<HashSet<String>>,
+	events: Mutex<Vec<String>>,
+	compat_backend: String,
+	compat_arch: String,
+	cpu_baseline: String,
+	weights: PlacementWeights,
+	replicate_notify: Notify,
 	background_started: AtomicBool,
+	pub(crate) cluster_store: Option<Arc<super::cluster_store::ProductionStore>>,
+	s3_client: Option<Arc<crate::s3::S3Client>>,
 }
 
 impl MeshRuntime {
@@ -94,17 +98,48 @@ impl MeshRuntime {
 		let replicas = replica::ReplicaStore::for_home(home.clone());
 		replicas.load();
 		let function_store = FunctionStore::open(&home)?;
-		let leases = lease::LeaseManager::for_home(home);
+		let leases = lease::LeaseManager::for_home(home.clone());
 		let (compat_backend, compat_arch) = state::probe_compat();
 		let cpu_baseline = state::probe_cpu_baseline();
-		let owners = records
-			.list()
+		let cluster_store = if config.cluster_mode == crate::config::ClusterMode::Production {
+			let url = config.postgres_url.clone().unwrap_or_default();
+			Some(Arc::new(super::cluster_store::ProductionStore::connect(&url)?))
+		} else {
+			None
+		};
+		let s3_client = if config.cluster_mode == crate::config::ClusterMode::Production {
+			let s3_cfg = crate::s3::S3MountConfig {
+				bucket:    config.s3_bucket.clone().unwrap_or_default(),
+				prefix:    config.s3_prefix.clone().unwrap_or_default(),
+				region:    config.s3_region.clone().unwrap_or_default(),
+				endpoint:  config.s3_endpoint.clone(),
+				read_only: false,
+				creds:     Some(crate::s3::S3Credentials {
+					access_key:    config.s3_access_key.clone().unwrap_or_default(),
+					secret_key:    config.s3_secret_key.clone().unwrap_or_default(),
+					session_token: None,
+				}),
+				auth:      crate::s3::S3Auth::Inline,
+			};
+			Some(Arc::new(
+				crate::s3::S3Client::new(s3_cfg).map_err(|e| EngineError::engine(e.to_string()))?,
+			))
+		} else {
+			None
+		};
+		let ownership_records = if let Some(store) = &cluster_store {
+			store.list()?
+		} else {
+			records.list()
+		};
+		let owners = ownership_records
 			.into_iter()
 			.map(|record| (record.sid, (record.owner, i64_to_u64(record.epoch))))
 			.collect();
 		Ok(Arc::new(Self {
 			node_id: membership.node_id.clone(),
 			config: config.clone(),
+			home,
 			membership_path,
 			membership: RwLock::new(membership),
 			token: RwLock::new(token),
@@ -126,7 +161,19 @@ impl MeshRuntime {
 			weights: placement_weights(&config),
 			replicate_notify: Notify::new(),
 			background_started: AtomicBool::new(false),
+			cluster_store,
+			s3_client,
 		}))
+	}
+
+	/// Verify production object storage before accepting requests.
+	pub async fn verify_storage(&self) -> Result<()> {
+		if let Some(s3) = &self.s3_client {
+			s3.probe()
+				.await
+				.map_err(|error| EngineError::engine(format!("S3 checkpoint store: {error}")))?;
+		}
+		Ok(())
 	}
 
 	/// Build the peer-route state object from the shared concrete runtime.
@@ -141,7 +188,8 @@ impl MeshRuntime {
 			self.clone() as Arc<dyn MeshLeaseManager>,
 			self.clone() as Arc<dyn MeshRecordStore>,
 			self.clone() as Arc<dyn MeshReplicaStore>,
-			Arc::new(TemplateTransfer) as Arc<dyn MeshTemplateTransfer>,
+			Arc::new(TemplateTransfer { s3: self.s3_client.clone(), home: self.home.clone() })
+				as Arc<dyn MeshTemplateTransfer>,
 			self.route_config(),
 		)
 	}
@@ -391,6 +439,11 @@ impl MeshRuntime {
 		holder: &str,
 		epoch: u64,
 	) -> MeshResult<LeaseRecord> {
+		if let Some(store) = &self.cluster_store {
+			return store
+				.acquire_lease(volume, holder, epoch, DEFAULT_TTL)
+				.map_err(engine_to_mesh);
+		}
 		let local = self
 			.leases
 			.vote_grant(volume, holder, epoch, DEFAULT_TTL)
@@ -570,7 +623,8 @@ impl MeshRuntime {
 		leases: &Map<String, Value>,
 	) -> MeshResult<()> {
 		let values = leases.values().cloned().collect::<Vec<_>>();
-		self.release_lease_values(values).await?;
+		tokio::task::yield_now().await;
+		self.release_lease_values(values)?;
 		self
 			.engine
 			.engine
@@ -583,37 +637,43 @@ impl MeshRuntime {
 			.iter()
 			.map(lease_record_value)
 			.collect::<MeshResult<Vec<_>>>()?;
-		self.release_lease_values(values).await
+		tokio::task::yield_now().await;
+		self.release_lease_values(values)
 	}
 
-	async fn release_lease_values(&self, leases: Vec<Value>) -> MeshResult<()> {
+	#[allow(clippy::unnecessary_wraps, reason = "trait signature compatibility")]
+	fn release_lease_values(&self, leases: Vec<Value>) -> MeshResult<()> {
 		for value in leases {
 			let Some((volume, holder, epoch)) = lease_tuple(&value) else {
 				continue;
 			};
-			self
-				.leases
-				.vote_release(&volume, &holder, epoch)
-				.map_err(engine_to_mesh)?;
-			let payload = json!({"volume": volume, "holder_node": holder, "epoch": epoch});
-			for peer in self.peers() {
-				let _ = self
-					.transport
-					.post(&peer.advertise, "/v1/mesh/lease/release", &payload, None)
-					.await;
+			if let Some(store) = &self.cluster_store
+				&& let Err(e) = store.release_lease(&volume, &holder, epoch)
+			{
+				eprintln!("Error releasing lease in cluster_store: {e}");
 			}
 		}
 		Ok(())
 	}
 
 	fn record_orphan_for_dead_owner(&self, dead: &str) {
-		let owned = self
-			.owners
-			.read()
-			.iter()
-			.filter(|(_, (owner, _))| owner.as_str() == dead)
-			.map(|(sid, _)| sid.clone())
-			.collect::<Vec<_>>();
+		let owned = if let Some(store) = &self.cluster_store {
+			match store.owned_by(dead) {
+				Ok(owned) => owned,
+				Err(error) => {
+					tracing::error!(%error, owner = dead, "failed to query orphaned sandboxes");
+					return;
+				},
+			}
+		} else {
+			self
+				.owners
+				.read()
+				.iter()
+				.filter(|(_, (owner, _))| owner.as_str() == dead)
+				.map(|(sid, _)| sid.clone())
+				.collect()
+		};
 		let mut orphans = self.orphans.lock();
 		for sid in owned {
 			if !orphans
@@ -623,6 +683,58 @@ impl MeshRuntime {
 				orphans.push((sid, dead.to_owned()));
 			}
 		}
+	}
+
+	async fn materialize_replica(
+		&self,
+		mut shared: replica::ReplicaRecord,
+	) -> Result<replica::ReplicaRecord> {
+		let local = self
+			.replicas
+			.get(&shared.sid)
+			.filter(|record| record.digest == shared.digest);
+		if let Some(local) = &local
+			&& Path::new(&local.snapshot_dir).is_dir()
+		{
+			return Ok(local.clone());
+		}
+		if shared.needs_secrets
+			&& let Some(local) = local
+			&& self.replicas.secrets_ready(&shared.sid)
+		{
+			shared.params = local.params;
+		}
+		let snapshot_name = Path::new(&shared.snapshot_dir)
+			.file_name()
+			.and_then(|name| name.to_str())
+			.filter(|name| !name.is_empty() && *name != "." && *name != "..")
+			.ok_or_else(|| {
+				EngineError::invalid("replica snapshot path has no valid final component")
+			})?;
+		let cache_id =
+			hex::encode(Sha256::digest(format!("{}\0{}", shared.sid, shared.digest).as_bytes()));
+		let extract_root = self.home.replicas_dir().join("objects").join(cache_id);
+		let snapshot_dir = extract_root.join(snapshot_name);
+		if !snapshot_dir.is_dir() {
+			let s3 = self
+				.s3_client
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("shared replica requires S3"))?;
+			let key = snapshot_object(&shared.digest);
+			let stat = s3
+				.stat(&key)
+				.await
+				.map_err(|error| EngineError::engine(format!("reading shared replica: {error}")))?;
+			download_s3_bundle(s3, &key, stat.size, &extract_root).await?;
+			if !snapshot_dir.is_dir() {
+				return Err(EngineError::engine(
+					"shared replica bundle did not contain its checkpoint directory",
+				));
+			}
+		}
+		shared.snapshot_dir = snapshot_dir.to_string_lossy().into_owned();
+		self.replicas.put_record(shared.clone())?;
+		Ok(shared)
 	}
 }
 
@@ -676,6 +788,13 @@ impl MeshControl for MeshRuntime {
 		caps: Option<NodeCapsWire>,
 	) -> MeshResult<MeshSetupResult> {
 		let mut membership = self.membership.write();
+		if membership.enabled && membership.advertise == advertise {
+			return Ok(MeshSetupResult {
+				blob:      state::encode_blob(&membership.advertise, &self.token.read()),
+				node_id:   membership.node_id.clone(),
+				advertise: membership.advertise.clone(),
+			});
+		}
 		let node_id = self.node_id.clone();
 		let caps = caps.map_or(membership.caps, node_caps);
 		*membership = MembershipState::enabled(node_id, advertise, region, caps);
@@ -833,20 +952,26 @@ impl MeshControl for MeshRuntime {
 			|| local.template_index.contains_key(key)
 	}
 
-	fn authoritative_owner(&self, sid: &str) -> Option<(String, i64)> {
-		self
+	fn authoritative_owner(&self, sid: &str) -> MeshResult<Option<(String, i64)>> {
+		if let Some(store) = &self.cluster_store {
+			return store
+				.resolve(sid)
+				.map(|record| record.map(|record| (record.owner, record.epoch)))
+				.map_err(engine_to_mesh);
+		}
+		Ok(self
 			.owners
 			.read()
 			.get(sid)
-			.map(|(owner, epoch)| (owner.clone(), u64_to_i64(*epoch)))
+			.map(|(owner, epoch)| (owner.clone(), u64_to_i64(*epoch))))
 	}
 
 	fn local_epoch(&self, sid: &str) -> i64 {
 		u64_to_i64(self.local_epoch_u64(sid))
 	}
 
-	fn owner_of(&self, sid: &str) -> Option<String> {
-		self.owners.read().get(sid).map(|(owner, _)| owner.clone())
+	fn owner_of(&self, sid: &str) -> MeshResult<Option<String>> {
+		Ok(self.authoritative_owner(sid)?.map(|(owner, _)| owner))
 	}
 
 	fn record_owner(&self, sid: &str, node_id: &str, epoch: i64) {
@@ -993,23 +1118,68 @@ impl HeartbeatView for MeshRuntime {
 
 impl MeshRecordStore for MeshRuntime {
 	fn get(&self, sid: &str) -> MeshResult<Option<CreateRecordWire>> {
+		if let Some(store) = &self.cluster_store {
+			let mut record = store.resolve(sid).map_err(engine_to_mesh)?;
+			if let Some(record) = &mut record {
+				self.records.attach_secrets(record);
+			}
+			return Ok(record.map(record_wire));
+		}
 		Ok(self.records.get(sid).map(record_wire))
 	}
 
 	fn put(&self, record: CreateRecordWire) -> MeshResult<()> {
-		self
-			.records
-			.put(create_record(record)?)
-			.map_err(engine_to_mesh)
+		let mut record = create_record(record)?;
+		if let Some(store) = &self.cluster_store {
+			let (params, secrets) = record::split_secrets(&record.params);
+			record.params = params;
+			store.record(&record).map_err(engine_to_mesh)?;
+			self.records.remember_secrets(&record.sid, secrets);
+		} else {
+			self.records.put(record).map_err(engine_to_mesh)?;
+		}
+		Ok(())
 	}
 
-	fn remove(&self, sid: &str) -> MeshResult<()> {
+	fn remove(&self, sid: &str, owner: &str, epoch: i64) -> MeshResult<()> {
+		if let Some(store) = &self.cluster_store {
+			store.remove(sid, owner, epoch).map_err(engine_to_mesh)?;
+			self.records.forget_secrets(sid);
+			return Ok(());
+		}
+		let Some(record) = self.records.get(sid) else {
+			return Ok(());
+		};
+		if record.owner != owner || record.epoch != epoch {
+			return Err(MeshError::invalid(format!(
+				"record removal for {sid} at {owner}/{epoch} was fenced by {}/{}",
+				record.owner, record.epoch
+			)));
+		}
 		self.records.remove(sid).map_err(engine_to_mesh)
+	}
+
+	fn list(&self) -> MeshResult<Vec<CreateRecordWire>> {
+		if let Some(store) = &self.cluster_store {
+			let mut records = store.list().map_err(engine_to_mesh)?;
+			for record in &mut records {
+				self.records.attach_secrets(record);
+			}
+			Ok(records.into_iter().map(record_wire).collect())
+		} else {
+			Ok(self.records.list().into_iter().map(record_wire).collect())
+		}
 	}
 }
 
 impl MeshReplicaStore for MeshRuntime {
 	fn get(&self, sid: &str) -> MeshResult<Option<ReplicaRecordWire>> {
+		if let Some(store) = &self.cluster_store {
+			return store
+				.replica(sid)
+				.map(|record| record.map(replica_wire))
+				.map_err(engine_to_mesh);
+		}
 		Ok(self.replicas.get(sid).map(replica_wire))
 	}
 
@@ -1020,18 +1190,56 @@ impl MeshReplicaStore for MeshRuntime {
 		source_node: String,
 		snapshot_dir: String,
 		params: Map<String, Value>,
-	) -> MeshResult<()> {
-		self
-			.replicas
-			.put(sid, digest, source_node, snapshot_dir, params)
-			.map_err(engine_to_mesh)
+	) -> BoxFuture<'_, MeshResult<()>> {
+		async move {
+			if let Some(store) = &self.cluster_store {
+				let (clean, secrets) = record::split_secrets(&params);
+				let shared = replica::ReplicaRecord::new(
+					sid.clone(),
+					digest.clone(),
+					source_node.clone(),
+					snapshot_dir.clone(),
+					clean,
+					secrets.is_some(),
+				)
+				.map_err(engine_to_mesh)?;
+				let s3 = self
+					.s3_client
+					.as_ref()
+					.ok_or_else(|| MeshError::new("production replica storage requires S3"))?;
+				let key = snapshot_object(&digest);
+				match s3.stat(&key).await {
+					Ok(_) => {},
+					Err(crate::s3::S3Error::NotFound) => {
+						upload_s3_bundle(s3, &key, Path::new(&snapshot_dir))
+							.await
+							.map_err(engine_to_mesh)?;
+					},
+					Err(error) => {
+						return Err(MeshError::new(format!("checking shared replica object: {error}")));
+					},
+				}
+				store.put_replica(&shared).map_err(engine_to_mesh)?;
+			}
+			self
+				.replicas
+				.put(sid, digest, source_node, snapshot_dir, params)
+				.map_err(engine_to_mesh)
+		}
+		.boxed()
 	}
 
 	fn list(&self) -> MeshResult<Vec<String>> {
+		if let Some(store) = &self.cluster_store {
+			return store.list_replicas().map_err(engine_to_mesh);
+		}
 		Ok(self.replicas.list())
 	}
 
 	fn remove(&self, sid: &str) -> MeshResult<()> {
+		if let Some(store) = &self.cluster_store {
+			store.remove_replica(sid).map_err(engine_to_mesh)?;
+		}
 		self.replicas.remove(sid).map_err(engine_to_mesh)
 	}
 }
@@ -1044,6 +1252,14 @@ impl MeshLeaseManager for MeshRuntime {
 		epoch: i64,
 		ttl: f64,
 	) -> MeshResult<Map<String, Value>> {
+		if let Some(store) = &self.cluster_store {
+			let result = store.acquire_lease(&volume, &holder_node, i64_to_u64(epoch), ttl);
+			let decision = match result {
+				Ok(record) => lease::LeaseDecision::granted(record),
+				Err(err) => lease::LeaseDecision::denied(None, err.to_string()),
+			};
+			return decision_object(Ok(decision));
+		}
 		decision_object(
 			self
 				.leases
@@ -1058,6 +1274,14 @@ impl MeshLeaseManager for MeshRuntime {
 		epoch: i64,
 		ttl: f64,
 	) -> MeshResult<Map<String, Value>> {
+		if let Some(store) = &self.cluster_store {
+			let result = store.acquire_lease(&volume, &holder_node, i64_to_u64(epoch), ttl);
+			let decision = match result {
+				Ok(record) => lease::LeaseDecision::granted(record),
+				Err(err) => lease::LeaseDecision::denied(None, err.to_string()),
+			};
+			return decision_object(Ok(decision));
+		}
 		decision_object(
 			self
 				.leases
@@ -1071,6 +1295,14 @@ impl MeshLeaseManager for MeshRuntime {
 		holder_node: String,
 		epoch: i64,
 	) -> MeshResult<Map<String, Value>> {
+		if let Some(store) = &self.cluster_store {
+			let result = store.release_lease(&volume, &holder_node, i64_to_u64(epoch));
+			let decision = match result {
+				Ok(()) => lease::LeaseDecision::released(),
+				Err(err) => lease::LeaseDecision::denied(None, err.to_string()),
+			};
+			return decision_object(Ok(decision));
+		}
 		decision_object(
 			self
 				.leases
@@ -1096,7 +1328,7 @@ impl MeshLeaseManager for MeshRuntime {
 	}
 
 	fn release_leases(&self, leases: Vec<Value>) -> BoxFuture<'_, MeshResult<()>> {
-		async move { self.release_lease_values(leases).await }.boxed()
+		async move { self.release_lease_values(leases) }.boxed()
 	}
 
 	fn release_record_volume_leases(&self, sid: String) -> BoxFuture<'_, MeshResult<()>> {
@@ -1153,8 +1385,8 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 		MeshControl::is_peer_healthy(self, node_id)
 	}
 
-	fn owner_of(&self, sid: &str) -> Option<String> {
-		MeshControl::owner_of(self, sid)
+	fn owner_of(&self, sid: &str) -> Result<Option<String>> {
+		MeshControl::owner_of(self, sid).map_err(|error| EngineError::engine(error.to_string()))
 	}
 
 	fn restore_owner(&self, sid: &str, exclude: &HashSet<String>) -> Option<String> {
@@ -1179,13 +1411,11 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 		self.orphans.lock().push((sid.to_owned(), dead.to_owned()));
 	}
 
-	fn next_epoch(&self, sid: &str) -> u64 {
-		self.local_epoch_u64(sid).saturating_add(1)
-	}
-
-	fn broadcast_owner(&self, sid: &str, node_id: &str, epoch: u64) -> Result<()> {
-		MeshControl::record_owner(self, sid, node_id, u64_to_i64(epoch));
-		Ok(())
+	fn next_epoch(&self, sid: &str) -> Result<u64> {
+		let epoch = MeshControl::authoritative_owner(self, sid)
+			.map_err(mesh_to_engine)?
+			.map_or(0, |(_, epoch)| epoch);
+		Ok(i64_to_u64(epoch).saturating_add(1))
 	}
 
 	fn update_record_owner(
@@ -1195,7 +1425,15 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 		epoch: u64,
 		_require_quorum: bool,
 	) -> Result<()> {
-		let _ = self.records.update_owner(sid, node_id, u64_to_i64(epoch))?;
+		if let Some(store) = &self.cluster_store {
+			store.claim(sid, node_id, u64_to_i64(epoch))?;
+		} else if self
+			.records
+			.update_owner(sid, node_id, u64_to_i64(epoch))?
+			.is_none()
+		{
+			return Err(EngineError::not_found(format!("no create record for sandbox {sid}")));
+		}
 		MeshControl::record_owner(self, sid, node_id, u64_to_i64(epoch));
 		Ok(())
 	}
@@ -1216,15 +1454,16 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 		MeshControl::replica_targets(self, sid, replicas)
 	}
 
-	fn fenced_local_ids(&self, owned_ids: &[String]) -> Vec<String> {
-		let local = reconciler::MeshReconcileState::node_id(self).to_owned();
-		owned_ids
-			.iter()
-			.filter(|sid| {
-				reconciler::MeshReconcileState::owner_of(self, sid).is_some_and(|owner| owner != local)
-			})
-			.cloned()
-			.collect()
+	fn fenced_local_ids(&self, owned_ids: &[String]) -> Result<Vec<String>> {
+		let local = reconciler::MeshReconcileState::node_id(self);
+		let mut fenced = Vec::new();
+		for sid in owned_ids {
+			if reconciler::MeshReconcileState::owner_of(self, sid)?.is_some_and(|owner| owner != local)
+			{
+				fenced.push(sid.clone());
+			}
+		}
+		Ok(fenced)
 	}
 
 	fn forget_local_owner(&self, sid: &str) {
@@ -1233,30 +1472,69 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 }
 
 impl reconciler::CreateRecordStore for MeshRuntime {
-	fn get(&self, sid: &str) -> Option<reconciler::CreateRecord> {
-		self.records.get(sid).map(reconcile_record)
+	fn get(&self, sid: &str) -> Result<Option<reconciler::CreateRecord>> {
+		if let Some(store) = &self.cluster_store {
+			return store
+				.resolve(sid)
+				.map(|record| record.map(reconcile_record));
+		}
+		Ok(self.records.get(sid).map(reconcile_record))
 	}
 
 	fn reconcile_records(&self) -> Result<()> {
-		self.records.load();
+		if self.cluster_store.is_none() {
+			self.records.load();
+		}
 		Ok(())
 	}
 }
 
 impl reconciler::ReplicaStore for MeshRuntime {
-	fn get(&self, sid: &str) -> Option<reconciler::ReplicaRecord> {
-		self.replicas.get(sid).map(reconcile_replica)
+	fn get<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<Option<reconciler::ReplicaRecord>>> {
+		async move {
+			if let Some(store) = &self.cluster_store {
+				let Some(shared) = store.replica(sid)? else {
+					return Ok(None);
+				};
+				return self
+					.materialize_replica(shared)
+					.await
+					.map(reconcile_replica)
+					.map(Some);
+			}
+			Ok(self.replicas.get(sid).map(reconcile_replica))
+		}
+		.boxed()
 	}
 
-	fn holds(&self, sid: &str) -> bool {
-		self.replicas.holds(sid)
+	fn holds(&self, sid: &str) -> Result<bool> {
+		if let Some(store) = &self.cluster_store {
+			return store.replica(sid).map(|record| record.is_some());
+		}
+		Ok(self.replicas.holds(sid))
 	}
 
-	fn secrets_ready(&self, sid: &str) -> bool {
-		self.replicas.secrets_ready(sid)
+	fn secrets_ready(&self, sid: &str) -> Result<bool> {
+		if let Some(store) = &self.cluster_store {
+			let Some(shared) = store.replica(sid)? else {
+				return Ok(false);
+			};
+			if !shared.needs_secrets {
+				return Ok(true);
+			}
+			return Ok(self
+				.replicas
+				.get(sid)
+				.is_some_and(|local| local.digest == shared.digest)
+				&& self.replicas.secrets_ready(sid));
+		}
+		Ok(self.replicas.secrets_ready(sid))
 	}
 
 	fn drop_replica(&self, sid: &str) -> Result<()> {
+		if let Some(store) = &self.cluster_store {
+			store.remove_replica(sid)?;
+		}
 		self.replicas.drop_replica(sid)
 	}
 }
@@ -1319,7 +1597,7 @@ impl reconciler::LeaseManager for MeshRuntime {
 
 #[derive(Clone)]
 pub struct MeshEngineAdapter {
-	engine: Arc<Engine>,
+	pub(crate) engine: Arc<Engine>,
 }
 
 impl MeshEngineAdapter {
@@ -1575,7 +1853,93 @@ impl reconciler::ReconcileEngine for MeshEngineAdapter {
 	}
 }
 
-struct TemplateTransfer;
+fn snapshot_object(digest: &str) -> String {
+	format!("templates/{digest}.vbundle")
+}
+
+async fn upload_s3_bundle(s3: &crate::s3::S3Client, key: &str, root: &Path) -> Result<()> {
+	let (tx, rx) = tokio::sync::mpsc::channel(4);
+	let root = root.to_owned();
+	let producer = tokio::task::spawn_blocking(move || {
+		let mut writer = super::bundle::ChannelWriter::new(tx);
+		match super::bundle::write_bundle(&root, &mut writer, &|_| true) {
+			Ok(()) => {
+				writer.finish(Ok(()));
+				Ok(())
+			},
+			Err(error) => {
+				let message = error.to_string();
+				writer.finish(Err(error));
+				Err(EngineError::engine(message))
+			},
+		}
+	});
+	let uploaded = s3
+		.put_multipart(key, rx)
+		.await
+		.map_err(|error| EngineError::engine(format!("uploading shared replica: {error}")));
+	let produced = producer
+		.await
+		.map_err(|error| EngineError::engine(format!("replica bundle task failed: {error}")))?;
+	uploaded?;
+	produced
+}
+
+async fn download_s3_bundle(
+	s3: &crate::s3::S3Client,
+	key: &str,
+	size: u64,
+	dest_root: &Path,
+) -> Result<()> {
+	if dest_root.exists() {
+		tokio::fs::remove_dir_all(dest_root).await?;
+	}
+	if let Some(parent) = dest_root.parent() {
+		tokio::fs::create_dir_all(parent).await?;
+	}
+	let (tx, rx) = tokio::sync::mpsc::channel(4);
+	let extract_root = dest_root.to_owned();
+	let extractor = tokio::task::spawn_blocking(move || {
+		super::bundle::read_bundle(super::bundle::ChannelReader::new(rx), &extract_root)
+	});
+	let transferred = async {
+		let mut offset = 0u64;
+		while offset < size {
+			let len = (size - offset).min(1 << 20) as u32;
+			let chunk = s3
+				.read(key, offset, len)
+				.await
+				.map_err(|error| EngineError::engine(format!("downloading shared replica: {error}")))?;
+			if chunk.is_empty() {
+				return Err(EngineError::engine("shared replica ended before its advertised size"));
+			}
+			offset = offset.saturating_add(chunk.len() as u64);
+			tx.send(Ok(chunk))
+				.await
+				.map_err(|_| EngineError::engine("replica extractor stopped early"))?;
+		}
+		Ok(())
+	}
+	.await;
+	drop(tx);
+	let extracted = extractor
+		.await
+		.map_err(|error| EngineError::engine(format!("replica extraction task failed: {error}")))?;
+	if let Err(error) = transferred {
+		let _ = tokio::fs::remove_dir_all(dest_root).await;
+		return Err(error);
+	}
+	if let Err(error) = extracted {
+		let _ = tokio::fs::remove_dir_all(dest_root).await;
+		return Err(error);
+	}
+	Ok(())
+}
+
+struct TemplateTransfer {
+	s3:   Option<Arc<crate::s3::S3Client>>,
+	home: Home,
+}
 
 impl MeshTemplateTransfer for TemplateTransfer {
 	fn pull_template<'a>(
@@ -1586,6 +1950,30 @@ impl MeshTemplateTransfer for TemplateTransfer {
 		token: String,
 	) -> BoxFuture<'a, MeshResult<String>> {
 		async move {
+			if let Some(s3) = &self.s3 {
+				let key = snapshot_object(&digest);
+				match s3.stat(&key).await {
+					Ok(stat) => {
+						let dest_root = self
+							.home
+							.templates_dir()
+							.join(format!(".pull-{}", uuid::Uuid::new_v4()));
+						download_s3_bundle(s3, &key, stat.size, &dest_root)
+							.await
+							.map_err(engine_to_mesh)?;
+						let installed = transfer::install_pulled_template(&dest_root, &digest)
+							.map_err(engine_to_mesh)?;
+						let _ = tokio::fs::remove_dir_all(&dest_root).await;
+						return Ok(installed.to_string_lossy().into_owned());
+					},
+					Err(crate::s3::S3Error::NotFound) => {},
+					Err(error) => {
+						return Err(MeshError::new(format!(
+							"checking shared checkpoint object: {error}"
+						)));
+					},
+				}
+			}
 			let path = transfer::pull_template(client, &peer_url, &digest, &token)
 				.await
 				.map_err(engine_to_mesh)?;
@@ -1602,6 +1990,37 @@ impl MeshTemplateTransfer for TemplateTransfer {
 		token: String,
 	) -> BoxFuture<'a, MeshResult<MetadataPull>> {
 		async move {
+			if let Some(s3) = &self.s3 {
+				let key = snapshot_object(&digest);
+				match s3.stat(&key).await {
+					Ok(stat) => {
+						let dest_root = self
+							.home
+							.templates_dir()
+							.join(format!(".pull-{}", uuid::Uuid::new_v4()));
+						download_s3_bundle(s3, &key, stat.size, &dest_root)
+							.await
+							.map_err(engine_to_mesh)?;
+						let installed =
+							transfer::install_lazy_template_stub(&dest_root, &digest, &peer_url)
+								.map_err(engine_to_mesh)?;
+						let _ = tokio::fs::remove_dir_all(&dest_root).await;
+						let metadata =
+							transfer::remote_page_metadata(&installed).map_err(engine_to_mesh)?;
+						return Ok(MetadataPull {
+							template:        installed.to_string_lossy().into_owned(),
+							remote_page_url: metadata.page_url,
+							digest:          metadata.digest,
+						});
+					},
+					Err(crate::s3::S3Error::NotFound) => {},
+					Err(error) => {
+						return Err(MeshError::new(format!(
+							"checking shared checkpoint object: {error}"
+						)));
+					},
+				}
+			}
 			let path = transfer::pull_template_metadata(client, &peer_url, &digest, &token)
 				.await
 				.map_err(engine_to_mesh)?;

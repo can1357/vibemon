@@ -16,6 +16,10 @@ mod ws;
 use std::{collections::HashMap, hash::BuildHasher};
 
 pub use error::{ApiError, ErrorBody};
+#[cfg(test)]
+pub(crate) use grpc::GrpcApi;
+#[cfg(test)]
+pub(crate) use state::{ApiState, Transport};
 
 /// Serve the v1 API over `$VMON_HOME/vmond.sock` and optional TCP.
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> crate::Result<()>
@@ -27,8 +31,6 @@ where
 
 #[cfg(test)]
 pub(crate) use routes::router as test_router;
-#[cfg(test)]
-pub(crate) use state::{ApiState, Transport};
 
 #[cfg(test)]
 mod tests {
@@ -314,7 +316,7 @@ mod tests {
 				.expect("captured inputs")
 				.migrations
 				.push((id.to_owned(), target.to_owned()));
-			Self::unexpected("migrate")
+			Ok(json!({"id": id, "node": target}))
 		}
 	}
 
@@ -352,7 +354,8 @@ mod tests {
 			)
 			.expect("write test CAS pointer");
 			let engine_api: Arc<dyn EngineApi> = engine.clone();
-			let functions = FunctionDomain::open(home, engine_api).expect("open function domain");
+			let functions =
+				FunctionDomain::open(home, engine_api, &config).expect("open function domain");
 			let package = functions
 				.artifacts()
 				.put(b"api test package")
@@ -521,7 +524,15 @@ mod tests {
 			Some(&reqwest::header::HeaderValue::from_static("Bearer"))
 		);
 		let body: Value = response.json().await.expect("missing token json");
-		assert_eq!(body, json!({"code":"unauthorized","message":"unauthorized"}));
+		assert_eq!(
+			body,
+			json!({
+				"code": "unauthorized",
+				"message": "unauthorized",
+				"action": "provide a valid bearer token",
+				"retryable": false
+			})
+		);
 	}
 
 	#[tokio::test]
@@ -555,6 +566,34 @@ mod tests {
 		let captures = engine.captures();
 		assert!(captures.pool_sets.is_empty());
 		assert!(captures.migrations.is_empty());
+	}
+
+	#[tokio::test]
+	async fn api_admin_migrate_returns_updated_view_and_validates_target() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine.clone()).await;
+		let mut sandboxes = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
+
+		let response = sandboxes
+			.migrate(authed(
+				pb::MigrateRequest { id: "sb".to_owned(), target: "node-b".to_owned() },
+				"admin-token",
+			))
+			.await
+			.expect("admin migrate succeeds")
+			.into_inner();
+		let view: Value = serde_json::from_str(&response.json).expect("migration view JSON");
+		assert_eq!(view, json!({"id": "sb", "node": "node-b"}));
+
+		let status = sandboxes
+			.migrate(authed(
+				pb::MigrateRequest { id: "sb".to_owned(), target: String::new() },
+				"admin-token",
+			))
+			.await
+			.expect_err("empty migration target rejected");
+		assert_eq!(status.code(), Code::InvalidArgument);
+		assert_eq!(engine.captures().migrations, vec![("sb".to_owned(), "node-b".to_owned())]);
 	}
 
 	#[tokio::test]

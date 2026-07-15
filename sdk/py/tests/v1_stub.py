@@ -840,8 +840,9 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
     def Migrate(self, request: api_pb2.MigrateRequest, context: Any) -> api_pb2.JsonView:
         self._enter(context, "Migrate", {"id": request.id, "target": request.target})
         sandbox = self._sandbox(context, request.id)
-        sandbox["view"]["node"] = request.target
-        return _view_json({"id": request.id, "node": request.target})
+        with self._stub._lock:
+            sandbox["view"]["node"] = request.target
+        return _view_json(dict(sandbox["view"]))
 
     def Snapshot(self, request: api_pb2.SnapshotRequest, context: Any) -> api_pb2.JsonView:
         name = request.name if request.HasField("name") else ""

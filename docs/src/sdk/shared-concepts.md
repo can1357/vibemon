@@ -27,17 +27,14 @@ or direct guest-network handles. The [Networking](../platform/networking.md)
 and [Storage and Volumes](../platform/storage.md) pages describe the platform
 semantics that those handles operate on.
 
-Values returned from a create, get, restore, or fork operation include the
-endpoint that served them. The client retains that endpoint as the preferred
-endpoint for follow-on work on that sandbox or durable resource. This
-**endpoint pinning** preserves affinity and avoids treating every object
-operation as a cluster-wide broadcast.
+Create, get, restore, fork, and list operations return handles identified by a
+stable resource ID. The SDK privately remembers which mesh endpoint served each
+handle so follow-on operations avoid a cluster-wide broadcast; applications do
+not select or retain worker-node addresses.
 
-An ID-only sandbox reference is different: it has no known serving endpoint
-yet. On its first operation, the driver may search the configured roster for
-the owner. If a resource moves or a previously pinned endpoint is no longer
-useful, use the language API's refresh/relocate or resolution behavior rather
-than assuming a resource handle is globally routable.
+An ID-only sandbox reference starts without a route. On its first operation,
+or after ownership moves, the SDK resolves the current owner and retries the
+sandbox-scoped request once. Callers continue using the same stable ID.
 
 ## Durable calls
 

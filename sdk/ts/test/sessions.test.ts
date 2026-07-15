@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import { Code, createRouterTransport } from "@connectrpc/connect";
 import type { Driver, DriverRequestOptions, DriverResponse, EndpointInfo } from "../src";
-import { APIError, Client, EventStream, LogStream, MeshDriver, Sandbox } from "../src";
+import { APIError, Client, EventStream, LogStream, MeshDriver } from "../src";
+import { channelFor, sandboxFromRoute } from "../src/sandbox";
 import {
   type ExecInput,
   ExecInputSchema,
@@ -275,9 +276,9 @@ test("port WebSockets relocate a migrated sandbox after not_found", async () => 
     },
     close() {},
   };
-  const sandbox = new Sandbox(new Client(driver), { id: "moved" }, "http://node-a");
+  const sandbox = sandboxFromRoute(new Client(driver), { id: "moved" }, "http://node-a");
   expect(await sandbox.ports.websocket(8080, "attach")).toBe(socket);
-  expect(sandbox.endpoint).toBe("http://node-b");
+  expect(channelFor(sandbox).endpoint).toBe("http://node-b");
   socket.close();
 });
 

@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 import grpc
@@ -24,6 +24,8 @@ from ._endpoint import (
 from .context import ContextStore, state_dir
 from .errors import APIError, ProtocolError, TransportError
 from .v1 import api_pb2
+
+T = TypeVar("T")
 
 DEFAULT_PORT = 8000
 DEFAULT_TIMEOUT = 60.0
@@ -55,7 +57,7 @@ class EndpointInfo:
 class Driver(Protocol):
     """Transport seam consumed by :class:`vmon.Client`."""
 
-    def call[T](
+    def call(
         self,
         fn: Callable[[GrpcStubs], T],
         *,
@@ -313,7 +315,7 @@ class MeshDriver:
         self._refreshing = False
         self._closed = False
 
-    def call[T](
+    def call(
         self,
         fn: Callable[[GrpcStubs], T],
         *,
@@ -331,7 +333,7 @@ class MeshDriver:
         transport = self._transport(selected)
         return transport.aio_stubs, transport.aio_metadata, self.timeout, selected
 
-    def _call[T](
+    def _call(
         self,
         fn: Callable[[GrpcStubs], T],
         *,
@@ -546,7 +548,7 @@ class MeshDriver:
                     raise ProtocolError("mesh status returned a malformed response")
                 discovered = roster_from_status(value)
                 self._merge_discovered(discovered)
-            except APIError, ProtocolError, TransportError, ValueError:
+            except (APIError, ProtocolError, TransportError, ValueError):
                 pass
         finally:
             with self._lock:

@@ -31,6 +31,10 @@ node_modules/
 sdk/py/vmon.egg-info/
 sdk/py/build
 
+# Release staging artifacts; CI publishes these rather than committing them.
+/dist/
+sdk/py/dist/
+
 # Python tooling caches and virtualenvs
 .pytest_cache/
 .mypy_cache/
