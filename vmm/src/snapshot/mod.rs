@@ -10,10 +10,13 @@
 //! `crate::arch::state` (selected at compile time) and are referenced here only
 //! by type name, so this module compiles identically on `x86_64` and aarch64.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
 	fs::{self, File, OpenOptions},
 	io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-	os::unix::fs::OpenOptionsExt,
 	path::{Path, PathBuf},
 };
 
@@ -22,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use virtio_queue::QueueState;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion, bitmap::Bitmap};
 use vm_superio::serial::SerialState as VmSerialState;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 #[cfg(target_arch = "x86_64")]
 use crate::layout::PCI_VIRTIO_BAR_SIZE;
@@ -453,13 +458,31 @@ fn next_generation(dir: &Path) -> Result<u64> {
 	}
 }
 
+fn snapshot_read_options() -> OpenOptions {
+	let mut options = OpenOptions::new();
+	options.read(true);
+	#[cfg(unix)]
+	options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+	#[cfg(windows)]
+	options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+	options
+}
+
+fn snapshot_create_options() -> OpenOptions {
+	let mut options = OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	options
+		.mode(0o600)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+	#[cfg(windows)]
+	options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+	options
+}
+
 fn current_generation(dir: &Path) -> Result<Option<u64>> {
 	let path = dir.join(CURRENT_GENERATION_FILE);
-	let file = match OpenOptions::new()
-		.read(true)
-		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-		.open(&path)
-	{
+	let file = match snapshot_read_options().open(&path) {
 		Ok(file) => file,
 		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(err(format!("opening {}: {error}", path.display()))),
@@ -517,9 +540,7 @@ fn publish_generation(dir: &Path, generation: u64) -> Result<()> {
 }
 
 fn open_snapshot_file(path: &Path) -> Result<File> {
-	let file = OpenOptions::new()
-		.read(true)
-		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+	let file = snapshot_read_options()
 		.open(path)
 		.map_err(|error| err(format!("opening {}: {error}", path.display())))?;
 	if !file
@@ -533,11 +554,7 @@ fn open_snapshot_file(path: &Path) -> Result<File> {
 }
 
 fn create_snapshot_file(path: &Path) -> Result<File> {
-	OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.mode(0o600)
-		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+	snapshot_create_options()
 		.open(path)
 		.map_err(|error| err(format!("creating {}: {error}", path.display())))
 }
@@ -1937,6 +1954,7 @@ mod tests {
 		))
 	}
 
+	#[cfg(not(target_os = "windows"))]
 	fn temp_root_dir(prefix: &str) -> PathBuf {
 		let path = unique_temp_path(prefix);
 		fs::create_dir(&path).unwrap();
@@ -2128,6 +2146,7 @@ mod tests {
 		assert!(err.contains("newer than supported"));
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn snapshot_files_reject_symlinks_for_reads_and_writes() {
 		let dir = temp_root_dir("vmon-snapshot-symlink");
