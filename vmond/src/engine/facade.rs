@@ -152,6 +152,7 @@ struct CreatePlan {
 #[serde(deny_unknown_fields)]
 struct SnapshotOptions {
 	agent:           Option<bool>,
+	block_network:   Option<bool>,
 	env:             Option<HashMap<String, String>>,
 	workdir:         Option<String>,
 	tags:            Option<HashMap<String, String>>,
@@ -166,6 +167,7 @@ struct SnapshotOptions {
 #[derive(Clone)]
 struct ResolvedSnapshotOptions {
 	agent:           bool,
+	block_network:   Option<bool>,
 	env:             BTreeMap<String, String>,
 	secret_env:      BTreeMap<String, String>,
 	secret_names:    Vec<String>,
@@ -1358,6 +1360,9 @@ impl Engine {
 			}
 
 			let mut detail = vm.meta()?;
+			if let Some(block_network) = options.block_network {
+				detail.insert("block_network".to_owned(), json!(block_network));
+			}
 			detail.insert("workdir".to_owned(), json!(runtime.workdir));
 			detail.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
 			detail.insert("secret_names".to_owned(), json!(options.secret_names));
@@ -3195,6 +3200,7 @@ fn resolve_snapshot_options(
 	};
 	Ok(ResolvedSnapshotOptions {
 		agent: agent.or(options.agent).unwrap_or(false),
+		block_network: options.block_network,
 		env: options.env.unwrap_or_default().into_iter().collect(),
 		secret_env: merge_secret_env(&secrets),
 		secret_names: secrets.into_iter().map(|secret| secret.name).collect(),
@@ -4137,6 +4143,17 @@ mod tests {
 		fs::write(&oversized, vec![b' '; MAX_SNAPSHOT_METADATA_BYTES as usize + 1])
 			.expect("oversized metadata");
 		assert!(read_snapshot_metadata(&oversized).is_err());
+	}
+
+	#[test]
+	fn snapshot_options_accept_blocked_network_metadata() {
+		let options = resolve_snapshot_options(
+			HashMap::from([("block_network".to_owned(), Value::Bool(true))]),
+			None,
+		)
+		.expect("blocked-network snapshot options");
+
+		assert_eq!(options.block_network, Some(true));
 	}
 
 	#[test]

@@ -22,12 +22,33 @@ jobs:
       # Pin the guest kernel to the fetched test asset; otherwise default_kernel()
       # falls back to the runner's own /boot/vmlinuz-*, which is root-only (0600).
       VMON_KERNEL: ${{ github.workspace }}/target/test-assets/bzImage-x86_64
+      VMON_BUILDKIT_ADDR: tcp://127.0.0.1:1234
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepare KVM host
         uses: ./.github/actions/kvm-host
+
+      - name: Start rootless BuildKit worker
+        run: |
+          docker run --detach --name vmon-buildkit --privileged \
+            --publish 127.0.0.1:1234:1234 \
+            moby/buildkit:v0.20.2-rootless \
+            --addr tcp://0.0.0.0:1234 \
+            --oci-worker-no-process-sandbox
+          docker cp vmon-buildkit:/usr/bin/buildctl /tmp/buildctl
+          sudo install -m 0755 /tmp/buildctl /usr/local/bin/buildctl
+          for attempt in {1..30}; do
+            if buildctl --addr "$VMON_BUILDKIT_ADDR" debug workers >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              docker logs vmon-buildkit
+              exit 1
+            fi
+            sleep 1
+          done
 
       - name: Run Rust gated integration suite
         run: VMON_E2E=1 cargo test --tests -- --test-threads=1
@@ -37,6 +58,10 @@ jobs:
 
       - name: Run Rust cluster e2e
         run: VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
+
+      - name: Stop rootless BuildKit worker
+        if: always()
+        run: docker rm --force vmon-buildkit || true
 
   hvf-integration:
     name: HVF integration
