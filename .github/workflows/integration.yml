@@ -32,6 +32,9 @@ jobs:
 
       - name: Start rootless BuildKit worker
         run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
           docker run --detach --name vmon-buildkit --privileged \
             --publish 127.0.0.1:1234:1234 \
             moby/buildkit:v0.20.2-rootless \
