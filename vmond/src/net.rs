@@ -4,7 +4,7 @@
 pub mod policy;
 
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use std::collections::{HashMap, btree_map::Entry};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
@@ -534,8 +534,8 @@ pub fn setup_tap(
 			let ips = policy.resolve_allowed(domain, now)?;
 			for ip in ips {
 				let ip_str = ip.to_string();
-				if !rules.contains_key(&ip_str) {
-					rules.insert(ip_str, next_idx);
+				if let Entry::Vacant(entry) = rules.entry(ip_str) {
+					entry.insert(next_idx);
 					next_idx += 1;
 				}
 			}
@@ -640,9 +640,7 @@ pub fn teardown_tap(
 					if let Ok(ips) = policy.resolve_allowed(domain, now) {
 						for ip in ips {
 							let ip_str = ip.to_string();
-							if !domain_rules.contains_key(&ip_str) {
-								domain_rules.insert(ip_str, 0);
-							}
+							domain_rules.entry(ip_str).or_insert(0);
 						}
 					}
 				}
@@ -1248,7 +1246,10 @@ impl DomainRefresher {
 			return Err(EngineError::engine("domain refresher already started"));
 		};
 		let name = self.name.clone();
-		let _guest_cidr = self.guest_cidr.clone();
+		#[cfg(target_os = "linux")]
+		let guest_cidr = self.guest_cidr.clone();
+		#[cfg(not(target_os = "linux"))]
+		let _ = &self.guest_cidr;
 		let domains = self.domains.clone();
 		let trusted = self.trusted.clone();
 		let rules = Arc::clone(&self.rules);
@@ -1289,7 +1290,7 @@ impl DomainRefresher {
 							let _ = iptables_delete(&domain_rule(
 								IptablesAction::Delete,
 								&name,
-								&_guest_cidr,
+								&guest_cidr,
 								&ip,
 								idx,
 							));
@@ -1328,13 +1329,7 @@ impl DomainRefresher {
 						current
 					};
 					#[cfg(target_os = "linux")]
-					let res = iptables_ensure(&domain_rule(
-						IptablesAction::Insert,
-						&name,
-						&_guest_cidr,
-						&ip,
-						idx,
-					));
+					let res = iptables_ensure(&domain_rule(IptablesAction::Insert, &name, &guest_cidr, &ip, idx));
 					#[cfg(not(target_os = "linux"))]
 					let res: Result<(), EngineError> = Ok(());
 
@@ -1350,14 +1345,16 @@ impl DomainRefresher {
 						let rules_guard = rules.lock();
 						rules_guard.get(&ip).copied()
 					};
-					if let Some(_idx) = idx {
+					if let Some(idx) = idx {
+						#[cfg(not(target_os = "linux"))]
+						let _ = idx;
 						#[cfg(target_os = "linux")]
 						let res = iptables_delete(&domain_rule(
 							IptablesAction::Delete,
 							&name,
-							&_guest_cidr,
+							&guest_cidr,
 							&ip,
-							_idx,
+							idx,
 						));
 						#[cfg(not(target_os = "linux"))]
 						let res: Result<(), EngineError> = Ok(());
