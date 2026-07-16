@@ -77,100 +77,106 @@ pub struct RemoteFsMount {
 #[derive(Clone)]
 pub struct Config {
 	/// Kernel image. Required for a fresh boot; `None` when restoring/forking.
-	pub kernel:             Option<PathBuf>,
-	pub cmdline:            Option<String>,
-	pub mem_mib:            usize,
+	pub kernel: Option<PathBuf>,
+	pub cmdline: Option<String>,
+	pub mem_mib: usize,
 	/// Host-RAM resident page target in MiB for transparent zram+paging.
-	pub mem_target_mib:     Option<usize>,
+	pub mem_target_mib: Option<usize>,
 	/// Maximum in-process compressed page store in MiB before spilling to swap.
 	pub zram_store_max_mib: Option<usize>,
 	/// Optional operator-provided swap file for pager overflow.
-	pub zram_swap_file:     Option<PathBuf>,
+	pub zram_swap_file: Option<PathBuf>,
 	/// HTTP page source for lazy snapshot restore; token comes from process env.
-	pub remote_page_url:    Option<String>,
+	pub remote_page_url: Option<String>,
 	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
-	pub ksm:                bool,
-	pub cpus:               u8,
-	pub rootfs:             Option<PathBuf>,
-	pub rootfs_read_only:   bool,
-	pub initrd:             Option<PathBuf>,
-	pub tap:                Option<String>,
+	pub ksm: bool,
+	pub cpus: u8,
+	pub rootfs: Option<PathBuf>,
+	pub rootfs_read_only: bool,
+	pub initrd: Option<PathBuf>,
+	pub tap: Option<String>,
 	/// Attach entitlement-free user-mode NAT networking instead of host
 	/// TAP/vmnet.
-	pub user_net:           bool,
+	pub user_net: bool,
+	/// Restrict user-mode networking to DHCP and one configured virtual-gateway
+	/// service.
+	pub user_net_restricted: bool,
+	/// TCP port on the slirp virtual gateway allowed by restricted user
+	/// networking.
+	pub user_net_allow_host_port: Option<u16>,
 	/// Whether `--mac` was explicitly supplied (used for snapshot restore
 	/// overrides).
-	pub mac_specified:      bool,
-	pub mac:                [u8; 6],
+	pub mac_specified: bool,
+	pub mac: [u8; 6],
 	/// virtio transport (`mmio` everywhere, `pci` on `x86_64` only).
-	pub transport:          Transport,
+	pub transport: Transport,
 	/// One read-only virtio-fs mount tag exposed to the guest.
-	pub fs_tag:             Option<String>,
+	pub fs_tag: Option<String>,
 	/// Host directory backing the read-only virtio-fs share.
-	pub fs_dir:             Option<PathBuf>,
+	pub fs_dir: Option<PathBuf>,
 	/// Unix control socket (pause/resume/snapshot/quit). `None` disables the
 	/// control plane.
-	pub api_sock:           Option<PathBuf>,
+	pub api_sock: Option<PathBuf>,
 	/// Root for named lifecycle snapshots. `None` disables named snapshots.
-	pub snapshot_root:      Option<PathBuf>,
+	pub snapshot_root: Option<PathBuf>,
 	/// Host Unix socket bridged byte-for-byte to the virtio-console agent port.
-	pub agent_sock:         Option<PathBuf>,
+	pub agent_sock: Option<PathBuf>,
 	/// Restore a snapshot directory instead of booting a kernel.
-	pub restore:            Option<PathBuf>,
+	pub restore: Option<PathBuf>,
 	/// Fork (`CoW`) from a template snapshot directory instead of booting.
-	pub fork_from:          Option<PathBuf>,
+	pub fork_from: Option<PathBuf>,
 	/// Create a `CoW` overlay of this base disk and serve it as `--rootfs`.
-	pub disk_overlay_of:    Option<PathBuf>,
+	pub disk_overlay_of: Option<PathBuf>,
 	/// Number of children to spawn with `--fork-from` (default 1).
-	pub count:              u32,
+	pub count: u32,
 	/// Attach a virtio-console agent channel (/dev/hvc0) for warm-boot exec.
-	pub console_agent:      bool,
+	pub console_agent: bool,
 	/// Attach a virtio-rng entropy device (/dev/hwrng) seeded from
 	/// `/dev/urandom`.
-	pub rng:                bool,
+	pub rng: bool,
 	/// After (warm) boot, send this command line to the guest agent over the
 	/// console.
-	pub agent_exec:         Option<String>,
+	pub agent_exec: Option<String>,
 	/// Two-process jailer toggle.
-	pub jail:               bool,
+	pub jail: bool,
 	/// VM/jail identifier.
-	pub id:                 Option<String>,
+	pub id: Option<String>,
 	/// Jail root directory.
-	pub jail_root:          Option<PathBuf>,
+	pub jail_root: Option<PathBuf>,
 	/// cgroup v2 cpu.max value.
-	pub cgroup_cpu_max:     Option<String>,
+	pub cgroup_cpu_max: Option<String>,
 	/// cgroup v2 memory.max value.
-	pub cgroup_mem_max:     Option<String>,
+	pub cgroup_mem_max: Option<String>,
 	/// cgroup v2 pids.max value.
-	pub cgroup_pids_max:    Option<u64>,
+	pub cgroup_pids_max: Option<u64>,
 	/// cgroup mode.
-	pub cgroup_mode:        CgroupMode,
+	pub cgroup_mode: CgroupMode,
 	/// Seccomp default action.
-	pub seccomp_action:     SeccompAction,
+	pub seccomp_action: SeccompAction,
 	/// Operator-supplied network namespace path.
-	pub netns:              Option<PathBuf>,
+	pub netns: Option<PathBuf>,
 	/// Boot mode.
-	pub boot_mode:          BootMode,
+	pub boot_mode: BootMode,
 	/// Firmware image for UEFI boot.
-	pub firmware:           Option<PathBuf>,
+	pub firmware: Option<PathBuf>,
 	/// Log output format.
-	pub log_format:         LogFormat,
+	pub log_format: LogFormat,
 	/// Log level filter string.
-	pub log_level:          String,
+	pub log_level: String,
 	/// Explicit opt-out from standalone default-on filters; `--jail` still
 	/// forces filters.
-	pub no_sandbox:         bool,
+	pub no_sandbox: bool,
 	/// UID to drop to when filters are enabled and vmon starts as root.
-	pub sandbox_uid:        Option<u32>,
+	pub sandbox_uid: Option<u32>,
 	/// GID to drop to when filters are enabled and vmon starts as root.
-	pub sandbox_gid:        Option<u32>,
+	pub sandbox_gid: Option<u32>,
 	/// Wall-clock hard deadline in seconds; the VMM self-terminates when
 	/// reached.
-	pub timeout_secs:       Option<u64>,
+	pub timeout_secs: Option<u64>,
 	/// Named writable (or `:ro`) virtio-fs volumes; one device per entry.
-	pub volumes:            Vec<FsMount>,
+	pub volumes: Vec<FsMount>,
 	/// Read-only virtio-fs mounts backed by per-VM object proxy sockets.
-	pub remote_fs:          Vec<RemoteFsMount>,
+	pub remote_fs: Vec<RemoteFsMount>,
 }
 
 /// Raw command-line surface parsed by clap; flag tokenization only.
@@ -251,6 +257,15 @@ struct CliArgs {
 	/// Entitlement-free user-mode NAT networking (macOS); only value is `user`
 	#[arg(long, value_name = "MODE")]
 	net: Option<String>,
+
+	/// Block user-net guest egress except DHCP and one virtual-gateway service.
+	#[arg(long)]
+	user_net_restricted: bool,
+
+	/// TCP port on the virtual host gateway allowed by restricted user
+	/// networking.
+	#[arg(long, value_name = "PORT")]
+	user_net_allow_host_port: Option<u16>,
 
 	/// Guest MAC (default: 02:00:00:00:00:01)
 	#[arg(long, value_name = "ADDR", value_parser = parse_mac)]
@@ -553,6 +568,21 @@ impl Config {
 		if user_net && cli.tap.is_some() {
 			bail!("--net user cannot be combined with --tap");
 		}
+		if cli.user_net_restricted && !user_net {
+			bail!("--user-net-restricted requires --net user");
+		}
+		if cli.user_net_restricted && !cfg!(target_os = "macos") {
+			bail!("--user-net-restricted is currently supported only on macOS");
+		}
+		if cli.user_net_restricted && cli.user_net_allow_host_port.is_none() {
+			bail!("--user-net-restricted requires --user-net-allow-host-port");
+		}
+		if cli.user_net_restricted && cli.user_net_allow_host_port == Some(0) {
+			bail!("--user-net-allow-host-port must be nonzero");
+		}
+		if !cli.user_net_restricted && cli.user_net_allow_host_port.is_some() {
+			bail!("--user-net-allow-host-port requires --user-net-restricted");
+		}
 		if user_net && !cfg!(any(target_os = "macos", target_os = "windows")) {
 			bail!("--net user is currently supported only on macOS and Windows");
 		}
@@ -684,6 +714,8 @@ impl Config {
 			initrd: cli.initrd,
 			tap: cli.tap,
 			user_net,
+			user_net_restricted: cli.user_net_restricted,
+			user_net_allow_host_port: cli.user_net_allow_host_port,
 			mac_specified,
 			mac,
 			transport,
@@ -1012,6 +1044,7 @@ mod tests {
 		assert_eq!(cfg.seccomp_action, SeccompAction::Errno);
 		assert!(cfg.netns.is_none());
 		assert!(!cfg.user_net);
+		assert!(!cfg.user_net_restricted);
 		assert_eq!(cfg.boot_mode, BootMode::Direct);
 		assert!(cfg.firmware.is_none());
 		assert_eq!(cfg.log_format, LogFormat::Text);
@@ -1211,6 +1244,59 @@ mod tests {
 			.expect("--net user parses on macOS");
 		assert!(cfg.user_net);
 		assert!(cfg.tap.is_none());
+		assert!(!cfg.user_net_restricted);
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn accepts_restricted_user_net_on_supported_hosts() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--net",
+			"user",
+			"--user-net-restricted",
+			"--user-net-allow-host-port",
+			"8443",
+		])
+		.expect("restricted user networking parses on supported hosts");
+		assert!(cfg.user_net);
+		assert!(cfg.user_net_restricted);
+		assert_eq!(cfg.user_net_allow_host_port, Some(8443));
+	}
+
+	#[test]
+	fn rejects_restricted_user_net_without_a_nonzero_gateway_port() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--net", "user", "--user-net-restricted"],
+			"requires --user-net-allow-host-port",
+		);
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--net",
+				"user",
+				"--user-net-restricted",
+				"--user-net-allow-host-port",
+				"0",
+			],
+			"must be nonzero",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--user-net-allow-host-port", "8443"],
+			"requires --user-net-restricted",
+		);
+	}
+
+	#[test]
+	fn rejects_restricted_user_net_without_user_net() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--user-net-restricted"],
+			"requires --net user",
+		);
 	}
 
 	#[test]

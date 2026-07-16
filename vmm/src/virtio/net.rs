@@ -138,6 +138,20 @@ impl Net {
 		Ok(Self::with_backend(Backend::User(user::UserNet::new_with_state(mac, state)?), mac))
 	}
 
+	/// Construct a user-net backend that blocks guest egress except slirp
+	/// services.
+	#[cfg(target_os = "macos")]
+	pub fn new_restricted_user_with_state(
+		mac: [u8; 6],
+		allowed_host_port: u16,
+		state: Option<Vec<u8>>,
+	) -> Result<Self> {
+		Ok(Self::with_backend(
+			Backend::User(user::UserNet::new_restricted_with_state(mac, allowed_host_port, state)?),
+			mac,
+		))
+	}
+
 	fn with_backend(backend: Backend, mac: [u8; 6]) -> Self {
 		let features = net_features_for_offloads(backend.supported_offloads());
 		let mut config = vec![0u8; CONFIG_SPACE_SIZE];
@@ -686,6 +700,26 @@ mod tests {
 		assert!(!feature_acked(features, VIRTIO_NET_F_GUEST_CSUM_BIT));
 		assert!(!feature_acked(features, VIRTIO_NET_F_HOST_TSO4_BIT));
 		assert!(!feature_acked(features, VIRTIO_NET_F_GUEST_TSO6_BIT));
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn restricted_user_net_state_restores_its_egress_policy() {
+		let mac = [0x02, 0, 0, 0, 0, 1];
+		let net = Net::new_restricted_user_with_state(mac, 8443, None).expect("restricted user net");
+		let state = net
+			.user_net_state()
+			.expect("save restricted user net")
+			.expect("user net state");
+		assert_eq!(&state[..8], b"VMUN\x02\x01\x20\xfb");
+		drop(net);
+
+		let restored = Net::new_user_with_state(mac, Some(state)).expect("restore user net");
+		let restored_state = restored
+			.user_net_state()
+			.expect("save restored user net")
+			.expect("user net state");
+		assert_eq!(&restored_state[..8], b"VMUN\x02\x01\x20\xfb");
 	}
 
 	#[test]

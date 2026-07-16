@@ -2100,7 +2100,11 @@ impl Vmm {
 		}
 
 		if let Some(backend) = fresh_net_backend(&config) {
-			let device = open_net_device(&backend, None)?;
+			let device = open_fresh_net_device(
+				&backend,
+				config.user_net_restricted,
+				config.user_net_allow_host_port,
+			)?;
 			match config.transport {
 				Transport::Mmio => {
 					wire_device(
@@ -2358,9 +2362,12 @@ impl Vmm {
 					};
 					Arc::new(Mutex::new(block))
 				},
-				BackendHint::Net { .. } | BackendHint::UserNet { .. } => {
-					open_net_device(&backend, ds.user_net_state.as_deref())?
-				},
+				BackendHint::Net { .. } | BackendHint::UserNet { .. } => open_net_device(
+					&backend,
+					ds.user_net_state.as_deref(),
+					config.user_net_restricted,
+					config.user_net_allow_host_port,
+				)?,
 				BackendHint::Fs { tag, shared_dir, read_only } => {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
 						err("snapshot virtio-fs backend is missing serialized fs state")
@@ -3532,6 +3539,8 @@ fn fresh_net_backend(config: &Config) -> Option<BackendHint> {
 fn open_net_device(
 	backend: &BackendHint,
 	user_net_state: Option<&[u8]>,
+	user_net_restricted: bool,
+	user_net_allow_host_port: Option<u16>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	match backend {
 		BackendHint::Net { tap, mac } => {
@@ -3539,23 +3548,89 @@ fn open_net_device(
 			let mac = tap.mac();
 			Ok(Arc::new(Mutex::new(Net::new(tap, mac))))
 		},
-		BackendHint::UserNet { mac } => open_user_net_device(*mac, user_net_state),
+		BackendHint::UserNet { mac } => {
+			open_user_net_device(*mac, user_net_state, user_net_restricted, user_net_allow_host_port)
+		},
 		_ => Err(err("backend is not a virtio-net device")),
 	}
+}
+
+fn open_fresh_net_device(
+	backend: &BackendHint,
+	user_net_restricted: bool,
+	user_net_allow_host_port: Option<u16>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	match backend {
+		BackendHint::Net { tap, mac } => {
+			let tap = Tap::open(tap, *mac)?;
+			let mac = tap.mac();
+			Ok(Arc::new(Mutex::new(Net::new(tap, mac))))
+		},
+		BackendHint::UserNet { mac } => {
+			open_fresh_user_net_device(*mac, user_net_restricted, user_net_allow_host_port)
+		},
+		_ => Err(err("backend is not a virtio-net device")),
+	}
+}
+
+#[cfg(target_os = "macos")]
+fn open_fresh_user_net_device(
+	mac: [u8; 6],
+	user_net_restricted: bool,
+	user_net_allow_host_port: Option<u16>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	let net = if user_net_restricted {
+		let allowed_host_port = user_net_allow_host_port
+			.filter(|port| *port != 0)
+			.ok_or_else(|| {
+				err("--user-net-restricted requires a nonzero --user-net-allow-host-port")
+			})?;
+		Net::new_restricted_user_with_state(mac, allowed_host_port, None)?
+	} else {
+		Net::new_user_with_state(mac, None)?
+	};
+	Ok(Arc::new(Mutex::new(net)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_fresh_user_net_device(
+	_mac: [u8; 6],
+	_user_net_restricted: bool,
+	_user_net_allow_host_port: Option<u16>,
+) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	Err(err("--net user is currently supported only on macOS"))
 }
 
 #[cfg(target_os = "macos")]
 fn open_user_net_device(
 	mac: [u8; 6],
 	user_net_state: Option<&[u8]>,
+	user_net_restricted: bool,
+	user_net_allow_host_port: Option<u16>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
-	Ok(Arc::new(Mutex::new(Net::new_user_with_state(mac, user_net_state.map(<[u8]>::to_vec))?)))
+	let net = if user_net_restricted {
+		let allowed_host_port = user_net_allow_host_port
+			.filter(|port| *port != 0)
+			.ok_or_else(|| {
+				err("--user-net-restricted requires a nonzero --user-net-allow-host-port")
+			})?;
+		Net::new_restricted_user_with_state(
+			mac,
+			allowed_host_port,
+			user_net_state.map(<[u8]>::to_vec),
+		)?
+	} else {
+		Net::new_user_with_state(mac, user_net_state.map(<[u8]>::to_vec))?
+	};
+	Ok(Arc::new(Mutex::new(net)))
 }
 
 #[cfg(not(target_os = "macos"))]
 fn open_user_net_device(
 	_mac: [u8; 6],
 	_user_net_state: Option<&[u8]>,
+	_user_net_restricted: bool,
+	_user_net_allow_host_port: Option<u16>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	Err(err("--net user is currently supported only on macOS"))
 }
@@ -4263,6 +4338,7 @@ mod backend_restore_tests {
 			path:      "/etc/passwd".to_owned(),
 			read_only: false,
 		});
+
 		let backend =
 			resolve_backend(&state, &config(&["--rootfs", "/safe/rootfs.img"])).expect("binding");
 		assert!(matches!(
@@ -4276,5 +4352,29 @@ mod backend_restore_tests {
 		});
 		let backend = resolve_backend(&state, &config(&["--tap", "safe-tap"])).expect("binding");
 		assert!(matches!(backend, BackendHint::Net { tap, .. } if tap == "safe-tap"));
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn restricted_fresh_user_net_persists_its_policy_for_restore() {
+		let mac = [0x02, 0, 0, 0, 0, 1];
+		let fresh =
+			open_fresh_user_net_device(mac, true, Some(8443)).expect("fresh restricted user network");
+		let state = fresh
+			.lock()
+			.user_net_state()
+			.expect("save restricted user network")
+			.expect("user network state");
+		assert_eq!(&state[..8], b"VMUN\x02\x01\x20\xfb");
+		drop(fresh);
+
+		let restored =
+			open_user_net_device(mac, Some(&state), false, None).expect("restore user network");
+		let restored_state = restored
+			.lock()
+			.user_net_state()
+			.expect("save restored user network")
+			.expect("user network state");
+		assert_eq!(&restored_state[..8], b"VMUN\x02\x01\x20\xfb");
 	}
 }

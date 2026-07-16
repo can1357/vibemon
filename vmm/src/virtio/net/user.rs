@@ -1,12 +1,13 @@
 //! Entitlement-free user-mode networking backend for virtio-net on macOS.
 //!
 //! The guest still sees a virtio-net NIC, but packets are handled by libslirp
-//! in userspace instead of vmnet.framework. This provides outbound NAT, DHCP,
-//! and DNS without `com.apple.vm.networking`; inbound connectivity requires
-//! explicit forwarding support. Snapshots serialize libslirp's guest-visible
-//! state (DHCP lease, ARP/NAT tables) on the slirp thread. Host-side sockets
-//! are not carried across restore, so in-flight TCP connections reset; new
-//! outbound connections work after restore.
+//! in userspace. Default mode provides outbound NAT, DHCP, and DNS without
+//! `com.apple.vm.networking`; restricted mode accepts only guest DHCP and one
+//! configured virtual-gateway service. Inbound connectivity requires explicit
+//! forwarding support. Snapshots serialize libslirp's guest-visible state
+//! (DHCP lease, ARP/NAT tables) on the slirp thread. Host-side sockets are not
+//! carried across restore, so in-flight TCP connections reset; new permitted
+//! connections work after restore.
 
 use std::{
 	cell::RefCell,
@@ -38,19 +39,30 @@ const USER_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 const MAX_PENDING_RX_FRAMES: usize = 1024;
 const MAX_PENDING_TX_FRAMES: usize = 1024;
 const SLIRP_STATE_VERSION_BYTES: usize = 4;
+const USER_NET_STATE_MAGIC: [u8; 4] = *b"VMUN";
+const USER_NET_STATE_FORMAT_VERSION: u8 = 2;
+const USER_NET_STATE_HEADER_BYTES: usize = 8;
+const ETHERTYPE_ARP: u16 = 0x0806;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_SERVER_PORT: u16 = 67;
 
 /// User-mode NAT backend driven by a private libslirp thread.
 pub struct UserNet {
-	tx:          Sender<Command>,
-	command_evt: EventFd,
-	packet_evt:  EventFd,
-	packets:     Arc<Mutex<VecDeque<Vec<u8>>>>,
-	thread:      Option<JoinHandle<()>>,
+	tx:                Sender<Command>,
+	command_evt:       EventFd,
+	packet_evt:        EventFd,
+	packets:           Arc<Mutex<VecDeque<Vec<u8>>>>,
+	thread:            Option<JoinHandle<()>>,
+	allowed_host_port: Option<u16>,
+	restricted_egress: bool,
 }
 
 enum Command {
 	Packet(Vec<u8>),
-	Save(Sender<Result<Vec<u8>>>),
+	Save(bool, Option<u16>, Sender<Result<Vec<u8>>>),
 	Stop,
 }
 
@@ -73,7 +85,34 @@ impl UserNet {
 	/// Start an entitlement-free user-mode NAT backend and optionally restore
 	/// its serialized guest-visible libslirp state before the backend is exposed
 	/// to vCPUs.
-	pub fn new_with_state(_mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
+	pub fn new_with_state(mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
+		Self::new_with_restricted_egress(mac, false, None, state)
+	}
+
+	/// Start a user-mode backend that permits only DHCP and one TCP service on
+	/// the virtual host gateway.
+	pub fn new_restricted_with_state(
+		mac: [u8; 6],
+		allowed_host_port: u16,
+		state: Option<Vec<u8>>,
+	) -> Result<Self> {
+		if allowed_host_port == 0 {
+			return Err(err("restricted user-net host port must be nonzero"));
+		}
+		Self::new_with_restricted_egress(mac, true, Some(allowed_host_port), state)
+	}
+
+	fn new_with_restricted_egress(
+		_mac: [u8; 6],
+		restricted_egress: bool,
+		allowed_host_port: Option<u16>,
+		state: Option<Vec<u8>>,
+	) -> Result<Self> {
+		let (restricted_egress, allowed_host_port) =
+			restriction_for_state(restricted_egress, allowed_host_port, state.as_deref())?;
+		let state = state
+			.map(|state| split_user_net_state(&state).map(|(_, _, slirp_state)| slirp_state.to_vec()))
+			.transpose()?;
 		let (tx, rx) = flume::bounded(MAX_PENDING_TX_FRAMES);
 		let command_evt = EventFd::new(EFD_NONBLOCK)
 			.map_err(|e| err(format!("creating user-net command eventfd: {e}")))?;
@@ -101,6 +140,7 @@ impl UserNet {
 					handler_command_evt,
 					handler_packet_evt,
 					thread_packets,
+					restricted_egress,
 					state,
 					ready_tx,
 				);
@@ -111,7 +151,15 @@ impl UserNet {
 			.recv()
 			.map_err(|_| err("user-net slirp thread exited during startup"))?
 		{
-			Ok(()) => Ok(Self { tx, command_evt, packet_evt, packets, thread: Some(thread) }),
+			Ok(()) => Ok(Self {
+				tx,
+				command_evt,
+				packet_evt,
+				packets,
+				allowed_host_port,
+				restricted_egress,
+				thread: Some(thread),
+			}),
 			Err(e) => {
 				let _ = thread.join();
 				Err(e)
@@ -148,6 +196,11 @@ impl UserNet {
 				"virtio-net TX buffer is smaller than the vnet header",
 			));
 		}
+		if self.restricted_egress
+			&& !allows_restricted_egress(&buf[VNET_HDR_SIZE..], self.allowed_host_port)
+		{
+			return Ok(buf.len());
+		}
 		let frame = buf[VNET_HDR_SIZE..].to_vec();
 		match self.tx.try_send(Command::Packet(frame)) {
 			Ok(()) => {
@@ -164,7 +217,7 @@ impl UserNet {
 		let (reply_tx, reply_rx) = flume::bounded(1);
 		self
 			.tx
-			.send(Command::Save(reply_tx))
+			.send(Command::Save(self.restricted_egress, self.allowed_host_port, reply_tx))
 			.map_err(|_| err("saving user-net state failed: slirp thread gone"))?;
 		self
 			.command_evt
@@ -332,6 +385,7 @@ fn run_slirp(
 	handler_loop_evt: EventFd,
 	packet_evt: EventFd,
 	packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+	restricted_egress: bool,
 	state: Option<Vec<u8>>,
 	ready: Sender<Result<()>>,
 ) {
@@ -343,7 +397,7 @@ fn run_slirp(
 		timers: Vec::new(),
 	}));
 	let context = Context::new(
-		false,
+		restricted_egress,
 		true,
 		USER_NET,
 		USER_MASK,
@@ -437,8 +491,8 @@ fn drain_commands(context: &Context<Rc<RefCell<SlirpHandler>>>, rx: &Receiver<Co
 	loop {
 		match rx.try_recv() {
 			Ok(Command::Packet(frame)) => context.input(&frame),
-			Ok(Command::Save(reply)) => {
-				let _ = reply.send(save_slirp_state(context));
+			Ok(Command::Save(restricted_egress, allowed_host_port, reply)) => {
+				let _ = reply.send(save_slirp_state(context, restricted_egress, allowed_host_port));
 			},
 			Ok(Command::Stop) => return false,
 			Err(TryRecvError::Empty) => return true,
@@ -447,13 +501,138 @@ fn drain_commands(context: &Context<Rc<RefCell<SlirpHandler>>>, rx: &Receiver<Co
 	}
 }
 
-fn save_slirp_state(context: &Context<Rc<RefCell<SlirpHandler>>>) -> Result<Vec<u8>> {
-	let mut data = state_version().to_be_bytes().to_vec();
-	let mut state = context
+fn save_slirp_state(
+	context: &Context<Rc<RefCell<SlirpHandler>>>,
+	restricted_egress: bool,
+	allowed_host_port: Option<u16>,
+) -> Result<Vec<u8>> {
+	let mut state = state_version().to_be_bytes().to_vec();
+	let mut slirp_state = context
 		.state_get()
 		.map_err(|e| err(format!("saving libslirp state: {e}")))?;
-	data.append(&mut state);
-	Ok(data)
+	state.append(&mut slirp_state);
+	Ok(encode_user_net_state(restricted_egress, allowed_host_port, state))
+}
+
+fn encode_user_net_state(
+	restricted_egress: bool,
+	allowed_host_port: Option<u16>,
+	slirp_state: Vec<u8>,
+) -> Vec<u8> {
+	let mut state = Vec::with_capacity(USER_NET_STATE_HEADER_BYTES + slirp_state.len());
+	state.extend_from_slice(&USER_NET_STATE_MAGIC);
+	state.push(USER_NET_STATE_FORMAT_VERSION);
+	state.push(u8::from(restricted_egress));
+	state.extend_from_slice(&allowed_host_port.unwrap_or(0).to_be_bytes());
+	state.extend_from_slice(&slirp_state);
+	state
+}
+
+/// Merge the requested policy with snapshot state without weakening a newly
+/// requested restriction. A fresh credential gateway port supersedes a stale
+/// snapshot port; otherwise persisted policy remains authoritative.
+fn restriction_for_state(
+	requested: bool,
+	requested_host_port: Option<u16>,
+	state: Option<&[u8]>,
+) -> Result<(bool, Option<u16>)> {
+	if requested {
+		return Ok((true, requested_host_port));
+	}
+	state
+		.map(|state| {
+			split_user_net_state(state)
+				.map(|(restricted_egress, allowed_host_port, _)| (restricted_egress, allowed_host_port))
+		})
+		.transpose()
+		.map(|persisted| persisted.unwrap_or((false, None)))
+}
+
+fn split_user_net_state(data: &[u8]) -> Result<(bool, Option<u16>, &[u8])> {
+	if data.len() < USER_NET_STATE_HEADER_BYTES {
+		return Err(err("user-net state is missing its format header"));
+	}
+	if data[..USER_NET_STATE_MAGIC.len()] != USER_NET_STATE_MAGIC {
+		return Err(err("user-net state has an unrecognized format"));
+	}
+	if data[4] != USER_NET_STATE_FORMAT_VERSION {
+		return Err(err(format!("unsupported user-net state format {}", data[4])));
+	}
+	let restricted_egress = match data[5] {
+		0 => false,
+		1 => true,
+		value => return Err(err(format!("invalid user-net restricted-egress state {value}"))),
+	};
+	let allowed_host_port = u16::from_be_bytes([data[6], data[7]]);
+	let allowed_host_port = if restricted_egress {
+		if allowed_host_port == 0 {
+			return Err(err("restricted user-net state is missing its allowed host port"));
+		}
+		Some(allowed_host_port)
+	} else {
+		if allowed_host_port != 0 {
+			return Err(err("unrestricted user-net state has an allowed host port"));
+		}
+		None
+	};
+	Ok((restricted_egress, allowed_host_port, &data[USER_NET_STATE_HEADER_BYTES..]))
+}
+
+/// Permit only DHCP and one configured TCP service on the virtual host
+/// gateway.
+fn allows_restricted_egress(frame: &[u8], allowed_host_port: Option<u16>) -> bool {
+	if frame.len() < 14 {
+		return false;
+	}
+	match u16::from_be_bytes([frame[12], frame[13]]) {
+		ETHERTYPE_ARP => allows_restricted_arp(frame),
+		ETHERTYPE_IPV4 => allows_restricted_ipv4(frame, allowed_host_port),
+		_ => false,
+	}
+}
+
+fn allows_restricted_arp(frame: &[u8]) -> bool {
+	const ARP_HEADER_BYTES: usize = 28;
+	const ARP_OFFSET: usize = 14;
+	if frame.len() < ARP_OFFSET + ARP_HEADER_BYTES
+		|| u16::from_be_bytes([frame[ARP_OFFSET + 6], frame[ARP_OFFSET + 7]]) != 1
+	{
+		return false;
+	}
+	let target = &frame[ARP_OFFSET + 24..ARP_OFFSET + 28];
+	target == USER_HOST.octets().as_slice()
+}
+
+fn allows_restricted_ipv4(frame: &[u8], allowed_host_port: Option<u16>) -> bool {
+	const IPV4_OFFSET: usize = 14;
+	if frame.len() < IPV4_OFFSET + 20 || frame[IPV4_OFFSET] >> 4 != 4 {
+		return false;
+	}
+	let header_bytes = usize::from(frame[IPV4_OFFSET] & 0x0f) * 4;
+	if header_bytes < 20 || frame.len() < IPV4_OFFSET + header_bytes {
+		return false;
+	}
+	let destination = &frame[IPV4_OFFSET + 16..IPV4_OFFSET + 20];
+	if frame[IPV4_OFFSET + 9] == IPPROTO_UDP && frame.len() >= IPV4_OFFSET + header_bytes + 4 {
+		let transport = &frame[IPV4_OFFSET + header_bytes..];
+		let source_port = u16::from_be_bytes([transport[0], transport[1]]);
+		let destination_port = u16::from_be_bytes([transport[2], transport[3]]);
+		if source_port == DHCP_CLIENT_PORT
+			&& destination_port == DHCP_SERVER_PORT
+			&& (destination == [255, 255, 255, 255] || destination == [10, 0, 2, 255])
+		{
+			return true;
+		}
+	}
+	if frame[IPV4_OFFSET + 9] != IPPROTO_TCP || frame.len() < IPV4_OFFSET + header_bytes + 4 {
+		return false;
+	}
+	let destination_port = u16::from_be_bytes([
+		frame[IPV4_OFFSET + header_bytes + 2],
+		frame[IPV4_OFFSET + header_bytes + 3],
+	]);
+	destination == USER_HOST.octets().as_slice()
+		&& Some(destination_port) == allowed_host_port
 }
 
 fn load_slirp_state(context: &Context<Rc<RefCell<SlirpHandler>>>, data: &[u8]) -> Result<()> {
@@ -525,4 +704,73 @@ fn from_poll_events(revents: libc::c_short) -> PollEvents {
 		out |= PollEvents::poll_hup();
 	}
 	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn ipv4_frame(
+		protocol: u8,
+		destination: [u8; 4],
+		source_port: u16,
+		destination_port: u16,
+	) -> Vec<u8> {
+		let mut frame = vec![0; 14 + 20 + 8];
+		frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+		frame[14] = 0x45;
+		frame[23] = protocol;
+		frame[30..34].copy_from_slice(&destination);
+		frame[34..36].copy_from_slice(&source_port.to_be_bytes());
+		frame[36..38].copy_from_slice(&destination_port.to_be_bytes());
+		frame
+	}
+
+	#[test]
+	fn restricted_egress_only_admits_dhcp_and_configured_gateway_port() {
+		let allowed_host_port = Some(8443);
+		assert!(allows_restricted_egress(
+			&ipv4_frame(IPPROTO_UDP, [255; 4], 68, 67),
+			allowed_host_port
+		));
+		assert!(!allows_restricted_egress(
+			&ipv4_frame(IPPROTO_UDP, USER_DNS.octets(), 1, 53),
+			allowed_host_port
+		));
+		assert!(!allows_restricted_egress(
+			&ipv4_frame(IPPROTO_TCP, USER_DNS.octets(), 1, 53),
+			allowed_host_port
+		));
+		assert!(allows_restricted_egress(
+			&ipv4_frame(IPPROTO_TCP, USER_HOST.octets(), 1, 8443),
+			allowed_host_port
+		));
+		assert!(!allows_restricted_egress(
+			&ipv4_frame(IPPROTO_TCP, USER_HOST.octets(), 1, 443),
+			allowed_host_port
+		));
+		assert!(!allows_restricted_egress(
+			&ipv4_frame(IPPROTO_TCP, [8, 8, 8, 8], 1, 443),
+			allowed_host_port
+		));
+	}
+
+	#[test]
+	fn requested_restriction_overrides_snapshot_policy_and_gateway_port() {
+		let restricted = encode_user_net_state(true, Some(8443), vec![0, 0, 0, 7]);
+		assert_eq!(
+			restriction_for_state(false, None, Some(&restricted)).expect("valid state"),
+			(true, Some(8443))
+		);
+		assert_eq!(
+			restriction_for_state(true, Some(9443), Some(&restricted)).expect("valid state"),
+			(true, Some(9443))
+		);
+
+		let unrestricted = encode_user_net_state(false, None, vec![0, 0, 0, 7]);
+		assert_eq!(
+			restriction_for_state(true, Some(8443), Some(&unrestricted)).expect("valid state"),
+			(true, Some(8443))
+		);
+	}
 }
