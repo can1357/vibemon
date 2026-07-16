@@ -6,8 +6,6 @@
 //! kernel. Once running, an optional Unix control socket drives
 //! pause/resume/snapshot.
 
-#[cfg(target_os = "macos")]
-use std::sync::atomic::AtomicBool;
 use std::{
 	collections::VecDeque,
 	fs,
@@ -20,7 +18,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicU8, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 	},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant},
@@ -46,6 +44,7 @@ use crate::{
 	config::{BootMode, Config, MAX_COUNT, Transport},
 	control::{self, ControlCmd, ControlKind, PauseGate, RunState, VcpuCmd},
 	devices::{Bus, serial::SerialDevice},
+	disk_snapshot,
 	hv::{Exit, Vcpu, Vm},
 	layout::{IRQ_BASE, MMIO_DEVICE_SIZE, MMIO_MEM_START, SERIAL_IRQ},
 	metrics::VmExit,
@@ -89,14 +88,17 @@ type ConsoleOutput = (Arc<Mutex<Vec<u8>>>, EventFd, EventFd);
 
 /// Everything needed to start one virtio device's worker thread.
 struct WorkerSpec {
-	device:      Arc<Mutex<dyn VirtioDevice>>,
-	queue_evt:   EventFd,
-	kill_evt:    EventFd,
-	pause_evt:   EventFd,
-	resume_evt:  EventFd,
-	ack_evt:     EventFd,
-	failure_evt: EventFd,
-	failure_msg: Arc<Mutex<Option<String>>>,
+	device:           Arc<Mutex<dyn VirtioDevice>>,
+	queue_evt:        EventFd,
+	kill_evt:         EventFd,
+	pause_evt:        EventFd,
+	resume_evt:       EventFd,
+	ack_evt:          EventFd,
+	failure_evt:      EventFd,
+	failure_msg:      Arc<Mutex<Option<String>>>,
+	pause_requested:  Arc<AtomicBool>,
+	pause_generation: Arc<AtomicU64>,
+	ack_generation:   Arc<AtomicU64>,
 }
 
 enum DeviceTransport {
@@ -122,21 +124,24 @@ impl FsSave {
 /// VMM-side handle to a wired virtio device: lets the lifecycle pause/resume
 /// the worker and read transport/queue/interrupt state for a snapshot.
 struct DeviceHandle {
-	kind:        DeviceKind,
-	mmio_base:   u64,
-	gsi:         u32,
-	transport:   DeviceTransport,
-	device:      Arc<Mutex<dyn VirtioDevice>>,
-	interrupt:   Arc<Interrupt>,
-	backend:     BackendHint,
-	fs:          Option<FsSave>,
+	kind:             DeviceKind,
+	mmio_base:        u64,
+	gsi:              u32,
+	transport:        DeviceTransport,
+	device:           Arc<Mutex<dyn VirtioDevice>>,
+	interrupt:        Arc<Interrupt>,
+	backend:          BackendHint,
+	fs:               Option<FsSave>,
 	/// Clones of the worker's control eventfds (the worker holds the originals).
-	pause_evt:   EventFd,
-	resume_evt:  EventFd,
-	ack_evt:     EventFd,
-	failure_evt: EventFd,
-	failure_msg: Arc<Mutex<Option<String>>>,
-	kill_evt:    EventFd,
+	pause_evt:        EventFd,
+	resume_evt:       EventFd,
+	ack_evt:          EventFd,
+	failure_evt:      EventFd,
+	failure_msg:      Arc<Mutex<Option<String>>>,
+	kill_evt:         EventFd,
+	pause_requested:  Arc<AtomicBool>,
+	pause_generation: Arc<AtomicU64>,
+	ack_generation:   Arc<AtomicU64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -186,37 +191,41 @@ pub struct Vmm {
 	pager:         Option<Arc<crate::pager::Pager>>,
 	pager_handler: Option<JoinHandle<()>>,
 
-	pio_bus:        Arc<Bus>,
-	mmio_bus:       Arc<Bus>,
-	serial:         Arc<Mutex<SerialDevice>>,
-	devices:        Vec<DeviceHandle>,
-	worker_specs:   Vec<WorkerSpec>,
-	worker_handles: Vec<JoinHandle<()>>,
+	pio_bus:          Arc<Bus>,
+	mmio_bus:         Arc<Bus>,
+	serial:           Arc<Mutex<SerialDevice>>,
+	devices:          Vec<DeviceHandle>,
+	worker_specs:     Vec<WorkerSpec>,
+	worker_handles:   Vec<JoinHandle<()>>,
 	/// Host end of the virtio-console agent channel (input buffer + wake
 	/// eventfd), present when `--console-agent` is set. Used to push bytes into
 	/// the guest.
-	console_input:  Option<ConsoleInput>,
+	console_input:    Option<ConsoleInput>,
 	/// Guest-output side of the virtio-console agent channel, used by
 	/// `--agent-sock` to bridge raw bytes back to the host client.
-	console_output: Option<ConsoleOutput>,
-	/// Wall-clock timeout in seconds (`--timeout-secs`); arms a hard deadline.
-	timeout_secs:   Option<u64>,
+	console_output:   Option<ConsoleOutput>,
+	/// User lifetime timeout seconds (`--timeout-secs`).
+	timeout_secs:     Option<u64>,
+	/// Production ownership watchdog seconds (`--owner-lease-secs`).
+	owner_lease_secs: Option<u64>,
 	/// Monotonic origin used for uptime and deadline math.
-	started_at:     Instant,
+	started_at:       Instant,
 	/// Snapshot name a dirty-tracking window is armed against: a delta against
 	/// exactly this base may use the hypervisor log + host-write bitmap
 	/// instead of a full RAM scan. Consumed (cleared) by that delta.
-	dirty_base:     Mutex<Option<String>>,
-	/// Active hard deadline; armed at serve start, reset live by `extend`.
-	deadline:       Option<Instant>,
+	dirty_base:       Mutex<Option<String>>,
+	/// User lifetime deadline, reset only by `extend`.
+	deadline:         Option<Instant>,
+	/// Ownership deadline, reset only by `rearm_owner_lease`.
+	owner_deadline:   Option<Instant>,
 	/// Control-plane socket path; `status.json` is written beside it on exit.
-	api_sock:       Option<PathBuf>,
+	api_sock:         Option<PathBuf>,
 	/// VMM-level exit reason; the first thread to stop the VM records it.
-	exit_reason:    Arc<AtomicU8>,
+	exit_reason:      Arc<AtomicU8>,
 	#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-	gic:            Gic,
+	gic:              Gic,
 	#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-	gic:            Option<Gic>,
+	gic:              Option<Gic>,
 }
 
 struct AgentSocket {
@@ -1263,7 +1272,7 @@ fn machine_info(vmm: &Vmm) -> MachineInfo {
 			.iter()
 			.map(|device| device_kind_name(device.kind))
 			.collect(),
-		deadline_unix: vmm.deadline.map(deadline_to_unix),
+		deadline_unix: earliest_deadline(vmm.deadline, vmm.owner_deadline).map(deadline_to_unix),
 		uptime_ms:     vmm.started_at.elapsed().as_millis() as u64,
 	}
 }
@@ -1322,6 +1331,30 @@ fn deadline_or_now(base: Instant, secs: u64, label: &str) -> Instant {
 			warn!("{e}; expiring immediately");
 			base
 		},
+	}
+}
+
+/// Return the deadline that stops the VM first.
+fn earliest_deadline(user: Option<Instant>, owner: Option<Instant>) -> Option<Instant> {
+	match (user, owner) {
+		(Some(user), Some(owner)) => Some(user.min(owner)),
+		(Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+		(None, None) => None,
+	}
+}
+
+#[cfg(test)]
+mod deadline_tests {
+	use super::*;
+
+	#[test]
+	fn earliest_deadline_preserves_absent_owner_and_prefers_owner_when_earlier() {
+		let now = Instant::now();
+		let user = now + Duration::from_secs(10);
+		let owner = now + Duration::from_secs(5);
+		assert_eq!(earliest_deadline(Some(user), None), Some(user));
+		assert_eq!(earliest_deadline(Some(user), Some(owner)), Some(owner));
+		assert_eq!(earliest_deadline(None, Some(owner)), Some(owner));
 	}
 }
 
@@ -2155,8 +2188,13 @@ impl Vmm {
 		let macos_startup = MacosStartup::Boot { entry: loaded.entry, initrd, virtio_infos };
 
 		let (txs, rxs) = vcpu_channels(config.cpus);
+		let gate = if config.start_paused {
+			PauseGate::new_paused(u32::from(config.cpus))
+		} else {
+			PauseGate::new(u32::from(config.cpus))
+		};
 		Ok(Self {
-			gate: PauseGate::new(u32::from(config.cpus)),
+			gate,
 			cpus: config.cpus,
 			mem_mib: config.mem_mib,
 			cmdline,
@@ -2183,9 +2221,11 @@ impl Vmm {
 			console_input,
 			console_output,
 			timeout_secs: config.timeout_secs,
+			owner_lease_secs: config.owner_lease_secs,
 			started_at: Instant::now(),
 			dirty_base: Mutex::new(None),
 			deadline: None,
+			owner_deadline: None,
 			api_sock: config.api_sock,
 			exit_reason: Arc::new(AtomicU8::new(0)),
 			#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -2462,8 +2502,13 @@ impl Vmm {
 		}
 
 		let (txs, rxs) = vcpu_channels(snap.cpus);
+		let gate = if config.start_paused {
+			PauseGate::new_paused(u32::from(snap.cpus))
+		} else {
+			PauseGate::new(u32::from(snap.cpus))
+		};
 		Ok(Self {
-			gate: PauseGate::new(u32::from(snap.cpus)),
+			gate,
 			cpus: snap.cpus,
 			mem_mib: snap.mem_mib,
 			cmdline: snap.cmdline,
@@ -2490,9 +2535,11 @@ impl Vmm {
 			console_input,
 			console_output,
 			timeout_secs: config.timeout_secs,
+			owner_lease_secs: config.owner_lease_secs,
 			started_at: Instant::now(),
 			dirty_base: Mutex::new(None),
 			deadline: None,
+			owner_deadline: None,
 			api_sock: config.api_sock.clone(),
 			exit_reason: Arc::new(AtomicU8::new(0)),
 			#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -2514,11 +2561,14 @@ impl Vmm {
 			let gate = self.gate.clone();
 			let exit_reason = self.exit_reason.clone();
 			let control = WorkerControl {
-				pause_evt:   spec.pause_evt,
-				resume_evt:  spec.resume_evt,
-				ack_evt:     spec.ack_evt,
-				failure_evt: spec.failure_evt,
-				failure_msg: spec.failure_msg,
+				pause_evt:        spec.pause_evt,
+				resume_evt:       spec.resume_evt,
+				ack_evt:          spec.ack_evt,
+				failure_evt:      spec.failure_evt,
+				failure_msg:      spec.failure_msg,
+				pause_requested:  spec.pause_requested,
+				pause_generation: spec.pause_generation,
+				ack_generation:   spec.ack_generation,
 			};
 			let device = spec.device;
 			let queue_evt = spec.queue_evt;
@@ -2732,24 +2782,37 @@ impl Vmm {
 		mut status_file: Option<std::fs::File>,
 		agent_bridge: Option<JoinHandle<()>>,
 	) -> Result<()> {
+		self.deadline = self
+			.timeout_secs
+			.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
+		let owner_watchdog = self.owner_lease_secs.map(|secs| {
+			let watchdog = control::OwnerWatchdog::new(Some(deadline_or_now(
+				self.started_at,
+				secs,
+				"--owner-lease-secs",
+			)));
+			let gate = self.gate.clone();
+			let exit_reason = self.exit_reason.clone();
+			watchdog.start(move || {
+				set_exit_reason(&exit_reason, VmmExit::Timeout);
+				gate.set_state(RunState::Stopping);
+				gate.signal_all_vcpus();
+			});
+			watchdog
+		});
+		self.owner_deadline = None;
 		let exit;
 		if let Some(server) = control_server {
 			let cleanup = server.cleanup_token();
 			let (tx, rx) = flume::unbounded::<ControlCmd>();
-			server.start(tx);
-			// Arm the wall-clock hard deadline (if --timeout-secs was set) so the
-			// VMM self-terminates; `extend` resets self.deadline live.
-			self.deadline = self
-				.timeout_secs
-				.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
+			server.start(tx, owner_watchdog.clone());
 			exit = loop {
 				self.sweep_pager_if_needed();
-				let wait = match self.deadline {
-					Some(deadline) => {
+				let wait = self
+					.deadline
+					.map_or(Duration::from_millis(200), |deadline| {
 						Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now()))
-					},
-					None => Duration::from_millis(200),
-				};
+					});
 				match rx.recv_timeout(wait) {
 					Ok(cmd) => {
 						let quit = matches!(cmd.kind, ControlKind::Quit);
@@ -2760,9 +2823,6 @@ impl Vmm {
 						}
 					},
 					Err(RecvTimeoutError::Timeout) => {
-						// The gate going Stopping out from under us is a guest halt
-						// (Shutdown) or a fatal vCPU/worker error (Killed); the first
-						// stopping thread recorded which via exit_reason.
 						if self.gate.state() == RunState::Stopping {
 							break VmmExit::from_u8(self.exit_reason.load(Ordering::SeqCst));
 						}
@@ -2771,7 +2831,6 @@ impl Vmm {
 						break VmmExit::from_u8(self.exit_reason.load(Ordering::SeqCst));
 					},
 				}
-				// Hard wall-clock deadline reached: drive the same teardown as Quit.
 				if let Some(deadline) = self.deadline
 					&& Instant::now() >= deadline
 				{
@@ -2781,13 +2840,12 @@ impl Vmm {
 				}
 			};
 			cleanup.cleanup();
+			if let Some(watchdog) = &owner_watchdog {
+				watchdog.shutdown();
+			}
 		} else {
-			// Arm the wall-clock hard deadline without a control socket: a timer
-			// thread stops the VM at the deadline so the vCPU joins return.
+			let deadline = self.deadline;
 			let deadline_timer = if self.pager.is_some() {
-				let deadline = self
-					.timeout_secs
-					.map(|secs| deadline_or_now(self.started_at, secs, "--timeout-secs"));
 				loop {
 					if self.gate.state() == RunState::Stopping {
 						break None;
@@ -2804,10 +2862,9 @@ impl Vmm {
 					thread::sleep(Duration::from_millis(200));
 				}
 			} else {
-				self.timeout_secs.map(|secs| {
+				deadline.map(|deadline| {
 					let gate = self.gate.clone();
 					let exit_reason = self.exit_reason.clone();
-					let deadline = deadline_or_now(self.started_at, secs, "--timeout-secs");
 					thread::spawn(move || {
 						loop {
 							let now = Instant::now();
@@ -2839,7 +2896,9 @@ impl Vmm {
 			}
 			let shutdown = self.shutdown_threads();
 			let agent_shutdown = join_agent_bridge(agent_bridge);
-			// No control loop: the guest ran to completion or a thread stopped it.
+			if let Some(watchdog) = &owner_watchdog {
+				watchdog.shutdown();
+			}
 			let exit_now = VmmExit::from_u8(self.exit_reason.load(Ordering::SeqCst));
 			write_final_status(status_file.as_mut(), self.api_sock.as_deref(), exit_now);
 			if let Some(message) = join_error {
@@ -2924,6 +2983,21 @@ impl Vmm {
 					.map(|()| json!({}))
 					.map_err(|e| control::ApiError::internal(e.to_string()))
 			},
+			ControlKind::DiskSnapshot { name } => {
+				let dir = snapshot_name_to_path(snapshot_root, &name)?;
+				self
+					.disk_snapshot(&dir)
+					.map(|manifest| {
+						json!({
+							"artifact": "disk",
+							"path": format!("{name}/{}", disk_snapshot::DISK_DIR),
+							"rootfs": manifest.rootfs,
+							"capture": manifest.capture,
+							"bytes": manifest.bytes,
+						})
+					})
+					.map_err(|e| control::ApiError::internal(e.to_string()))
+			},
 			ControlKind::Quit => {
 				self.gate.set_state(RunState::Stopping);
 				self.gate.signal_all_vcpus();
@@ -2958,6 +3032,17 @@ impl Vmm {
 				let deadline_unix = deadline_to_unix(deadline);
 				Ok(json!({ "deadline_unix": deadline_unix }))
 			},
+			ControlKind::RearmOwnerLease { secs } => {
+				if !(1..=86_400).contains(&secs) {
+					return Err(control::ApiError::bad_request(
+						"rearm_owner_lease params.secs must be between 1 and 86400",
+					));
+				}
+				let deadline = checked_deadline(Instant::now(), secs, "rearm_owner_lease params.secs")
+					.map_err(|e| control::ApiError::bad_request(e.to_string()))?;
+				self.owner_deadline = Some(deadline);
+				Ok(json!({ "deadline_unix": deadline_to_unix(deadline) }))
+			},
 		}
 	}
 
@@ -2991,13 +3076,15 @@ impl Vmm {
 
 		for (device_index, d) in self.devices.iter().enumerate() {
 			self.ensure_not_stopping("pause worker signal")?;
+			let generation = d.pause_generation.fetch_add(1, Ordering::AcqRel) + 1;
+			d.pause_requested.store(true, Ordering::Release);
 			d.pause_evt.write(1).map_err(|e| {
 				err(format!(
 					"pause worker signal failed for device {device_index} {}: {e}",
 					device_kind_name(d.kind)
 				))
 			})?;
-			self.wait_for_worker_ack(device_index, d)?;
+			self.wait_for_worker_ack(device_index, d, generation)?;
 		}
 		self.ensure_not_stopping("pause complete")?;
 		Ok(())
@@ -3108,7 +3195,12 @@ impl Vmm {
 			})
 	}
 
-	fn wait_for_worker_ack(&self, device_index: usize, device: &DeviceHandle) -> Result<()> {
+	fn wait_for_worker_ack(
+		&self,
+		device_index: usize,
+		device: &DeviceHandle,
+		expected_generation: u64,
+	) -> Result<()> {
 		let deadline = Instant::now() + PAUSE_WORKER_ACK_TIMEOUT;
 		loop {
 			self.ensure_not_stopping("pause worker ack")?;
@@ -3131,7 +3223,8 @@ impl Vmm {
 					"pause worker ack failed for device {device_index} {}: {e}",
 					device_kind_name(device.kind)
 				))
-			})? {
+			})? && device.ack_generation.load(Ordering::Acquire) >= expected_generation
+			{
 				return Ok(());
 			}
 		}
@@ -3204,6 +3297,7 @@ impl Vmm {
 			RunState::Paused => {},
 		}
 		for (device_index, d) in self.devices.iter().enumerate() {
+			d.pause_requested.store(false, Ordering::Release);
 			if let Err(e) = d.resume_evt.write(1) {
 				return self.fail_resume(err(format!(
 					"resume worker signal failed for device {device_index} {}: {e}",
@@ -3236,6 +3330,99 @@ impl Vmm {
 		buf.lock().extend(frames.iter().copied());
 		evt.write(1)?;
 		Ok(())
+	}
+
+	/// Capture a coherent root disk without serializing VM state. A running VM
+	/// establishes its boundary by quiescing the block worker; a fully paused VM
+	/// already has that worker stopped and may capture directly.
+	fn disk_snapshot(&self, dir: &Path) -> Result<disk_snapshot::DiskManifest> {
+		let workers_already_paused = match self.gate.state() {
+			RunState::Running => false,
+			RunState::Paused => true,
+			RunState::Stopping => return Err(err("disk snapshot requires a live VM")),
+		};
+		let blocks = self
+			.devices
+			.iter()
+			.enumerate()
+			.filter_map(|(index, device)| {
+				matches!(
+					(&device.kind, &device.backend),
+					(DeviceKind::Block, BackendHint::Block { read_only: false, .. })
+				)
+				.then_some(index)
+			})
+			.collect::<Vec<_>>();
+		if blocks.len() != 1 {
+			return Err(err("disk snapshot requires exactly one writable virtio-block root device"));
+		}
+
+		let mut requested = Vec::with_capacity(blocks.len());
+		let capture = if workers_already_paused {
+			let index = blocks[0];
+			disk_snapshot::write_disk_point(dir, |destination| {
+				self.devices[index].device.lock().capture_disk(destination)
+			})
+		} else {
+			(|| {
+				for &index in &blocks {
+					let device = &self.devices[index];
+					self.ensure_not_stopping("disk snapshot worker signal")?;
+					// Publish the intent before the event, allowing a timeout cleanup
+					// to cancel a worker which has not consumed the event yet.
+					let generation = device.pause_generation.fetch_add(1, Ordering::AcqRel) + 1;
+					device.pause_requested.store(true, Ordering::Release);
+					requested.push(index);
+					device.pause_evt.write(1).map_err(|e| {
+						err(format!(
+							"disk snapshot worker signal failed for device {index} {}: {e}",
+							device_kind_name(device.kind)
+						))
+					})?;
+					self.wait_for_worker_ack(index, device, generation)?;
+				}
+				let index = blocks[0];
+				disk_snapshot::write_disk_point(dir, |destination| {
+					self.devices[index].device.lock().capture_disk(destination)
+				})
+			})()
+		};
+
+		// This is deliberately independent of `Vmm::resume`: vCPUs never
+		// stopped, and every requested worker must be released even after clone,
+		// manifest, or acknowledgement failure.
+		let thaw = self.release_disk_workers(&requested);
+		match (capture, thaw) {
+			(Ok(manifest), Ok(())) => Ok(manifest),
+			(Ok(_), Err(thaw)) => {
+				disk_snapshot::remove_disk_point(dir);
+				Err(thaw)
+			},
+			(Err(capture), Ok(())) => Err(capture),
+			(Err(capture), Err(thaw)) => Err(err(format!(
+				"disk snapshot failed: {capture}; additionally failed to release block worker: {thaw}"
+			))),
+		}
+	}
+
+	/// Cancel/release every block worker previously requested by
+	/// [`Self::disk_snapshot`]. It attempts all releases before returning the
+	/// first failure so an error cannot strand another worker.
+	fn release_disk_workers(&self, requested: &[usize]) -> Result<()> {
+		let mut release_error = None;
+		for &index in requested {
+			let device = &self.devices[index];
+			device.pause_requested.store(false, Ordering::Release);
+			if let Err(e) = device.resume_evt.write(1)
+				&& release_error.is_none()
+			{
+				release_error = Some(err(format!(
+					"disk snapshot worker release failed for device {index} {}: {e}",
+					device_kind_name(device.kind)
+				)));
+			}
+		}
+		release_error.map_or(Ok(()), Err)
 	}
 
 	/// Write a complete snapshot of the (paused) VM to `dir`.
@@ -3816,6 +4003,9 @@ fn wire_device(
 	let failure_evt = EventFd::new(0)?;
 	let failure_msg = Arc::new(Mutex::new(None));
 	let kill_evt = EventFd::new(EFD_NONBLOCK)?;
+	let pause_requested = Arc::new(AtomicBool::new(false));
+	let pause_generation = Arc::new(AtomicU64::new(0));
+	let ack_generation = Arc::new(AtomicU64::new(0));
 
 	devices.push(DeviceHandle {
 		kind,
@@ -3832,6 +4022,9 @@ fn wire_device(
 		failure_evt: failure_evt.try_clone()?,
 		failure_msg: failure_msg.clone(),
 		kill_evt: kill_evt.try_clone()?,
+		pause_requested: pause_requested.clone(),
+		pause_generation: pause_generation.clone(),
+		ack_generation: ack_generation.clone(),
 	});
 	workers.push(WorkerSpec {
 		device,
@@ -3842,6 +4035,9 @@ fn wire_device(
 		ack_evt,
 		failure_evt,
 		failure_msg,
+		pause_requested,
+		pause_generation,
+		ack_generation,
 	});
 	Ok(())
 }
@@ -3921,6 +4117,9 @@ fn wire_pci_device(
 	let failure_evt = EventFd::new(0)?;
 	let failure_msg = Arc::new(Mutex::new(None));
 	let kill_evt = EventFd::new(EFD_NONBLOCK)?;
+	let pause_requested = Arc::new(AtomicBool::new(false));
+	let pause_generation = Arc::new(AtomicU64::new(0));
+	let ack_generation = Arc::new(AtomicU64::new(0));
 
 	devices.push(DeviceHandle {
 		kind,
@@ -3937,6 +4136,9 @@ fn wire_pci_device(
 		failure_evt: failure_evt.try_clone()?,
 		failure_msg: failure_msg.clone(),
 		kill_evt: kill_evt.try_clone()?,
+		pause_requested: pause_requested.clone(),
+		pause_generation: pause_generation.clone(),
+		ack_generation: ack_generation.clone(),
 	});
 	workers.push(WorkerSpec {
 		device,
@@ -3947,6 +4149,9 @@ fn wire_pci_device(
 		ack_evt,
 		failure_evt,
 		failure_msg,
+		pause_requested,
+		pause_generation,
+		ack_generation,
 	});
 	Ok(())
 }
@@ -4088,6 +4293,26 @@ fn configure_and_boot(
 	Ok(())
 }
 
+/// Park a vCPU before it can enter the hypervisor and wait for its resume.
+///
+/// Returning `true` grants one pass through the vCPU run loop; `false` means
+/// the thread must exit without entering the hypervisor.
+fn park_vcpu_until_resumed(
+	gate: &PauseGate,
+	id: u8,
+	cmd_rx: &Receiver<VcpuCmd>,
+	mut save_state: impl FnMut(Sender<Result<crate::arch::state::VcpuState>>),
+) -> bool {
+	gate.mark_parked(id as usize);
+	loop {
+		match cmd_rx.recv() {
+			Ok(VcpuCmd::Resume) => return true,
+			Ok(VcpuCmd::Stop) | Err(_) => return false,
+			Ok(VcpuCmd::SaveState(tx)) => save_state(tx),
+		}
+	}
+}
+
 /// The KVM run loop for one vCPU. Parks on pause, exits on stop/fatal.
 #[allow(clippy::too_many_arguments, reason = "Vcpu run loop has many inputs")]
 fn run_vcpu(
@@ -4112,16 +4337,10 @@ fn run_vcpu(
 				// the vtimer itself, so these are HVF-only no-ops elsewhere.
 				#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 				vcpu.freeze_vtimer();
-				gate.mark_parked(id as usize);
-				loop {
-					match cmd_rx.recv() {
-						Ok(VcpuCmd::Resume) => break,
-						Ok(VcpuCmd::Stop) => return,
-						Ok(VcpuCmd::SaveState(tx)) => {
-							let _ = tx.send(vcpu.save_state(xsave_size));
-						},
-						Err(_) => return,
-					}
+				if !park_vcpu_until_resumed(&gate, id, &cmd_rx, |tx| {
+					let _ = tx.send(vcpu.save_state(xsave_size));
+				}) {
+					return;
 				}
 				#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 				if let Err(e) = vcpu.thaw_vtimer() {
@@ -4274,7 +4493,30 @@ fn restore_terminal() {
 
 #[cfg(test)]
 mod backend_restore_tests {
+	use std::sync::atomic::AtomicUsize;
+
 	use super::*;
+
+	#[test]
+	fn initially_paused_vcpu_waits_before_first_hypervisor_run() {
+		let gate = PauseGate::new_paused(1);
+		let (tx, rx) = flume::unbounded();
+		let run_calls = Arc::new(AtomicUsize::new(0));
+		let run_calls_in_vcpu = run_calls.clone();
+		let gate_in_vcpu = gate.clone();
+		let handle = thread::spawn(move || {
+			if park_vcpu_until_resumed(&gate_in_vcpu, 0, &rx, |_| {}) {
+				run_calls_in_vcpu.fetch_add(1, Ordering::SeqCst);
+			}
+		});
+
+		assert!(gate.wait_for_all_parked(Duration::from_secs(1)));
+		assert_eq!(run_calls.load(Ordering::SeqCst), 0, "no vcpu.run before resume");
+
+		tx.send(VcpuCmd::Resume).expect("resume parked vCPU");
+		handle.join().expect("vCPU gate thread exits");
+		assert_eq!(run_calls.load(Ordering::SeqCst), 1);
+	}
 
 	fn config(extra: &[&str]) -> Config {
 		Config::from_args(

@@ -181,6 +181,21 @@ impl ControlClient {
 		result
 	}
 
+	/// Capture a disk-only recovery artifact without serializing RAM or device
+	/// state. The VMM performs its own short block-worker quiesce.
+	pub fn disk_snapshot(&mut self, name: &str) -> Result<Value> {
+		self
+			.reader
+			.get_mut()
+			.set_read_timeout(Some(SNAPSHOT_REPLY_TIMEOUT))?;
+		let result = self.request("disk_snapshot", json!({ "name": name }));
+		self
+			.reader
+			.get_mut()
+			.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+		result
+	}
+
 	/// Re-arm the VMM wall-clock deadline and return its Unix timestamp.
 	pub fn extend(&mut self, secs: u64) -> Result<i64> {
 		let result = self.request("extend", json!({ "secs": secs }))?;
@@ -188,6 +203,18 @@ impl ControlClient {
 			.get("deadline_unix")
 			.and_then(Value::as_i64)
 			.ok_or_else(|| EngineError::engine("control extend reply missing deadline_unix"))
+	}
+
+	/// Re-arm only the VMM production ownership watchdog and return its Unix
+	/// deadline, leaving any user lifetime timeout untouched.
+	pub fn rearm_owner_lease(&mut self, secs: u64) -> Result<i64> {
+		let result = self.request("rearm_owner_lease", json!({ "secs": secs }))?;
+		result
+			.get("deadline_unix")
+			.and_then(Value::as_i64)
+			.ok_or_else(|| {
+				EngineError::engine("control rearm_owner_lease reply missing deadline_unix")
+			})
 	}
 
 	/// Return the live metrics JSON payload.

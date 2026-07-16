@@ -631,8 +631,7 @@ fn allows_restricted_ipv4(frame: &[u8], allowed_host_port: Option<u16>) -> bool 
 		frame[IPV4_OFFSET + header_bytes + 2],
 		frame[IPV4_OFFSET + header_bytes + 3],
 	]);
-	destination == USER_HOST.octets().as_slice()
-		&& Some(destination_port) == allowed_host_port
+	destination == USER_HOST.octets().as_slice() && Some(destination_port) == allowed_host_port
 }
 
 fn load_slirp_state(context: &Context<Rc<RefCell<SlirpHandler>>>, data: &[u8]) -> Result<()> {

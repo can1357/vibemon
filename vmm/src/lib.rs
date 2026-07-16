@@ -10,6 +10,7 @@ mod arch;
 mod config;
 mod control;
 mod devices;
+mod disk_snapshot;
 mod hv;
 #[cfg(target_os = "linux")]
 mod jail;
@@ -41,6 +42,9 @@ mod windows_pipe;
 
 use config::{Config, LogFormat};
 use tracing_subscriber::EnvFilter;
+/// Create a no-follow copy-on-write disk overlay, falling back to a
+/// sparse-aware copy when reflinking is unavailable.
+pub use virtio::block::create_cow_overlay;
 
 /// Run the per-VM monitor: parse `args` (flags only, no argv[0]), init
 /// tracing, boot or restore, block until shutdown.

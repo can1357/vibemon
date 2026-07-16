@@ -30,7 +30,8 @@ use std::{
 	io::{self, BufRead, BufReader, Read, Write},
 	path::PathBuf,
 	sync::Arc,
-	time::Duration,
+	thread::{self, JoinHandle},
+	time::{Duration, Instant},
 };
 
 use flume::{RecvTimeoutError, Sender};
@@ -149,6 +150,22 @@ impl PauseGate {
 		})
 	}
 
+	/// Create a gate for `cpus` vCPU threads, initially [`RunState::Paused`].
+	///
+	/// The caller must construct this before spawning vCPU threads so every
+	/// thread observes the pause before its first hypervisor run call.
+	pub fn new_paused(cpus: u32) -> Arc<Self> {
+		Arc::new(Self {
+			state: Mutex::new(RunState::Paused),
+			cv: Condvar::new(),
+			parked: Mutex::new(vec![false; cpus as usize]),
+			cpus,
+			#[cfg(target_os = "linux")]
+			tids: Mutex::new(vec![None; cpus as usize]),
+			kicker: Mutex::new(None),
+		})
+	}
+
 	/// Current run state.
 	pub fn state(&self) -> RunState {
 		*self.state.lock()
@@ -256,10 +273,25 @@ pub enum ControlKind {
 	Info,
 	Pause,
 	Resume,
-	Snapshot { name: String, base: Option<String>, track: bool },
+	Snapshot {
+		name:  String,
+		base:  Option<String>,
+		track: bool,
+	},
+	/// Capture only the active writable root disk. Unlike `Snapshot`, this
+	/// leaves vCPUs running and never serializes VM/RAM state.
+	DiskSnapshot {
+		name: String,
+	},
 	Quit,
 	Metrics,
-	Extend { secs: u64 },
+	Extend {
+		secs: u64,
+	},
+	/// Re-arm only the production ownership watchdog.
+	RearmOwnerLease {
+		secs: u64,
+	},
 }
 
 /// JSON error object returned by the lifecycle API.
@@ -305,6 +337,100 @@ pub type ControlReply = std::result::Result<serde_json::Value, ApiError>;
 pub struct ControlCmd {
 	pub kind:  ControlKind,
 	pub reply: Sender<ControlReply>,
+}
+/// Shared ownership watchdog state, updated directly by the control socket so
+/// a lease renewal never waits behind a long-running lifecycle command.
+#[derive(Clone)]
+pub struct OwnerWatchdog {
+	inner:  Arc<(Mutex<OwnerWatchdogState>, Condvar)>,
+	handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+struct OwnerWatchdogState {
+	deadline: Option<Instant>,
+	stopped:  bool,
+}
+
+impl OwnerWatchdog {
+	/// Create a watchdog with its initial deadline already armed.
+	pub fn new(deadline: Option<Instant>) -> Self {
+		Self {
+			inner:  Arc::new((
+				Mutex::new(OwnerWatchdogState { deadline, stopped: false }),
+				Condvar::new(),
+			)),
+			handle: Arc::new(Mutex::new(None)),
+		}
+	}
+
+	/// Start expiry handling. The callback must stop the VMM without waiting on
+	/// the lifecycle command receiver.
+	pub fn start(&self, on_expire: impl FnOnce() + Send + 'static) {
+		let inner = self.inner.clone();
+		let handle = thread::spawn(move || {
+			let (state, wake) = &*inner;
+			let mut state = state.lock();
+			while !state.stopped {
+				let Some(deadline) = state.deadline else {
+					wake.wait(&mut state);
+					continue;
+				};
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				if remaining.is_zero() {
+					state.stopped = true;
+					drop(state);
+					on_expire();
+					return;
+				}
+				wake.wait_for(&mut state, remaining);
+			}
+		});
+		*self.handle.lock() = Some(handle);
+	}
+
+	/// Reset only the ownership deadline to now plus `secs`.
+	pub fn rearm(&self, secs: u64) -> std::result::Result<i64, ApiError> {
+		if !(1..=86_400).contains(&secs) {
+			return Err(ApiError::bad_request(
+				"rearm_owner_lease params.secs must be between 1 and 86400",
+			));
+		}
+		let deadline = Instant::now()
+			.checked_add(Duration::from_secs(secs))
+			.ok_or_else(|| {
+				ApiError::bad_request("rearm_owner_lease params.secs is too far in the future")
+			})?;
+		let (state, wake) = &*self.inner;
+		let mut state = state.lock();
+		if state.stopped {
+			return Err(ApiError::internal("owner watchdog is no longer active"));
+		}
+		state.deadline = Some(deadline);
+		drop(state);
+		wake.notify_all();
+		Ok(deadline_to_unix(deadline))
+	}
+
+	/// Stop and join the timer thread.
+	pub fn shutdown(&self) {
+		let (state, wake) = &*self.inner;
+		state.lock().stopped = true;
+		wake.notify_all();
+		let handle = self.handle.lock().take();
+		if let Some(handle) = handle {
+			let _ = handle.join();
+		}
+	}
+}
+
+fn deadline_to_unix(deadline: Instant) -> i64 {
+	let now = Instant::now();
+	let now_unix = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0, |duration| duration.as_secs() as i64);
+	now_unix.saturating_add(
+		i64::try_from(deadline.saturating_duration_since(now).as_secs()).unwrap_or(i64::MAX),
+	)
 }
 
 /// Filesystem owner to prepare for a pre-bound control socket.
@@ -364,7 +490,7 @@ impl ControlServer {
 		}
 	}
 
-	pub fn start(self, tx: Sender<ControlCmd>) {
+	pub fn start(self, tx: Sender<ControlCmd>, watchdog: Option<OwnerWatchdog>) {
 		let launch_uid = self.launch_uid;
 		std::thread::spawn(move || {
 			for stream in self.listener.incoming() {
@@ -374,7 +500,8 @@ impl ControlServer {
 						.is_ok()
 				{
 					let tx = tx.clone();
-					std::thread::spawn(move || handle_connection(stream, tx));
+					let watchdog = watchdog.clone();
+					std::thread::spawn(move || handle_connection(stream, tx, watchdog));
 				}
 			}
 		});
@@ -415,7 +542,7 @@ impl ControlServer {
 	}
 
 	/// Serve control requests on named-pipe instances.
-	pub fn start(self, tx: Sender<ControlCmd>) {
+	pub fn start(self, tx: Sender<ControlCmd>, watchdog: Option<OwnerWatchdog>) {
 		let pipe_name = self.pipe_name;
 		let first = self.listener.into_inner();
 		std::thread::spawn(move || {
@@ -426,7 +553,8 @@ impl ControlServer {
 				}
 				listener = create_control_pipe(&pipe_name, false).ok();
 				let tx = tx.clone();
-				std::thread::spawn(move || handle_connection(pipe, tx));
+				let watchdog = watchdog.clone();
+				std::thread::spawn(move || handle_connection(pipe, tx, watchdog));
 			}
 		});
 	}
@@ -997,7 +1125,11 @@ impl ControlStream for std::fs::File {
 }
 
 /// Serve one client connection until EOF or an IO error.
-fn handle_connection<S: ControlStream>(stream: S, tx: Sender<ControlCmd>) {
+fn handle_connection<S: ControlStream>(
+	stream: S,
+	tx: Sender<ControlCmd>,
+	watchdog: Option<OwnerWatchdog>,
+) {
 	let Ok(mut writer) = stream.duplicate() else {
 		return;
 	};
@@ -1034,6 +1166,22 @@ fn handle_connection<S: ControlStream>(stream: S, tx: Sender<ControlCmd>) {
 		};
 
 		crate::metrics::record_control_request();
+		if let ControlKind::RearmOwnerLease { secs } = kind {
+			let reply = watchdog
+				.as_ref()
+				.ok_or_else(|| ApiError::bad_request("owner watchdog is not configured"))
+				.and_then(|watchdog| watchdog.rearm(secs))
+				.map(|deadline_unix| serde_json::json!({ "deadline_unix": deadline_unix }));
+			if match reply {
+				Ok(result) => write_success(&mut writer, id, result),
+				Err(error) => write_error(&mut writer, Some(id), error),
+			}
+			.is_err()
+			{
+				return;
+			}
+			continue;
+		}
 
 		let (rtx, rrx) = flume::bounded::<ControlReply>(1);
 		if tx.send(ControlCmd { kind, reply: rtx }).is_err() {
@@ -1155,6 +1303,14 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 			};
 			ControlKind::Snapshot { name: name.to_owned(), base, track }
 		},
+		"disk_snapshot" => {
+			let name = request
+				.params
+				.get("name")
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(|| ApiError::bad_request("disk_snapshot params.name must be a string"))?;
+			ControlKind::DiskSnapshot { name: name.to_owned() }
+		},
 		"quit" => ControlKind::Quit,
 		"metrics" => ControlKind::Metrics,
 		"extend" => {
@@ -1165,6 +1321,16 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 				.ok_or_else(|| ApiError::bad_request("extend params.secs must be a number"))?;
 			ControlKind::Extend { secs }
 		},
+		"rearm_owner_lease" => {
+			let secs = request
+				.params
+				.get("secs")
+				.and_then(serde_json::Value::as_u64)
+				.ok_or_else(|| {
+					ApiError::bad_request("rearm_owner_lease params.secs must be a number")
+				})?;
+			ControlKind::RearmOwnerLease { secs }
+		},
 		method => return Err(ApiError::unknown_method(format!("unknown lifecycle method {method}"))),
 	};
 	Ok((request.id, kind))
@@ -1173,6 +1339,15 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 #[cfg(all(test, unix))]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn initially_paused_gate_reports_paused_before_vcpu_registration() {
+		let gate = PauseGate::new_paused(2);
+
+		assert_eq!(gate.state(), RunState::Paused);
+		assert_eq!(gate.parked_count(), 0);
+		assert!(!gate.wait_for_all_parked(Duration::from_millis(1)));
+	}
 
 	#[test]
 	fn json_parse_maps_methods_and_snapshot_name() {
@@ -1203,6 +1378,79 @@ mod tests {
 
 		let (_, kind) = parse_request(r#"{"id":9,"method":"metrics","params":null}"#).unwrap();
 		assert!(matches!(kind, ControlKind::Metrics));
+	}
+
+	#[test]
+	fn json_parse_maps_owner_lease_rearm() {
+		let (id, kind) =
+			parse_request(r#"{"id":11,"method":"rearm_owner_lease","params":{"secs":15}}"#).unwrap();
+		assert_eq!(id, 11);
+		assert!(matches!(kind, ControlKind::RearmOwnerLease { secs: 15 }));
+	}
+
+	#[test]
+	fn owner_watchdog_rearm_extends_while_command_work_is_blocked() {
+		let watchdog = OwnerWatchdog::new(Some(Instant::now() + Duration::from_millis(20)));
+		let (tx, rx) = flume::bounded(1);
+		watchdog.start(move || {
+			let _ = tx.send(());
+		});
+		watchdog.rearm(1).unwrap();
+		assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+		watchdog.shutdown();
+	}
+
+	#[test]
+	fn owner_rearm_bypasses_unserved_lifecycle_receiver() {
+		use std::io::{BufRead, BufReader, Write};
+
+		let (server, mut client) = UnixStream::pair().expect("create connected control streams");
+		client
+			.set_read_timeout(Some(Duration::from_millis(100)))
+			.expect("set client read timeout");
+		let (tx, rx) = flume::unbounded();
+		let watchdog = OwnerWatchdog::new(Some(Instant::now() + Duration::from_secs(1)));
+		let watcher = watchdog.clone();
+		watchdog.start(|| {});
+		std::thread::spawn(move || handle_connection(server, tx, Some(watcher)));
+
+		let mut reader = BufReader::new(client.try_clone().expect("clone client stream"));
+		let mut line = String::new();
+		reader.read_line(&mut line).expect("read banner");
+		client
+			.write_all(br#"{"id":1,"method":"rearm_owner_lease","params":{"secs":1}}"#)
+			.and_then(|()| client.write_all(b"\n"))
+			.expect("send rearm request");
+		line.clear();
+		reader
+			.read_line(&mut line)
+			.expect("read immediate rearm reply");
+		let reply: serde_json::Value = serde_json::from_str(&line).expect("parse rearm reply");
+		assert_eq!(reply["ok"], true);
+		assert!(rx.try_recv().is_err(), "rearm must not wait behind lifecycle work");
+		drop(client);
+		watchdog.shutdown();
+	}
+
+	#[test]
+	fn owner_watchdog_expires_without_command_receiver() {
+		let watchdog = OwnerWatchdog::new(Some(Instant::now() + Duration::from_millis(20)));
+		let (tx, rx) = flume::bounded(1);
+		watchdog.start(move || {
+			let _ = tx.send(());
+		});
+		rx.recv_timeout(Duration::from_secs(1))
+			.expect("watchdog expires");
+		assert!(watchdog.rearm(1).is_err(), "expired watchdog cannot be resurrected");
+		watchdog.shutdown();
+	}
+
+	#[test]
+	fn json_parse_maps_disk_snapshot_name() {
+		let (id, kind) =
+			parse_request(r#"{"id":10,"method":"disk_snapshot","params":{"name":"disk-0"}}"#).unwrap();
+		assert_eq!(id, 10);
+		assert!(matches!(kind, ControlKind::DiskSnapshot { name } if name == "disk-0"));
 	}
 
 	#[test]

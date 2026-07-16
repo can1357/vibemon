@@ -12,12 +12,11 @@ use std::os::unix::io::AsRawFd;
 #[cfg(not(target_os = "windows"))]
 use std::{
 	fs,
-	io::{Seek, SeekFrom},
 	os::unix::fs::{MetadataExt, OpenOptionsExt},
 };
 use std::{
 	fs::{File, OpenOptions},
-	io,
+	io::{self, Seek, SeekFrom},
 	path::Path,
 	sync::Arc,
 };
@@ -43,7 +42,10 @@ use crate::os::EventFd;
 use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
-	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
+	virtio::{
+		DiskCapture, DiskCaptureMethod, Interrupt, VirtioDevice, WorkerWaitSource,
+		descriptor_range_valid,
+	},
 };
 
 /// Create `dest` as a copy-on-write reflink of `base` (instant on
@@ -211,6 +213,93 @@ fn sparse_copy(src: &mut File, dst: &File) -> io::Result<()> {
 	}
 	dst.set_len(offset)?;
 	Ok(())
+}
+
+/// Clone the already-open active backing file into a new recovery artifact.
+///
+/// The source descriptor is deliberately supplied by [`Block`], rather than
+/// reopening the configured path: a path replacement after boot must not make
+/// a recovery point capture a different disk. The VMM calls this only after
+/// the block worker has drained all submissions.
+#[cfg(not(target_os = "windows"))]
+fn clone_open_disk(source: &File, destination: &Path) -> Result<DiskCapture> {
+	match fs::symlink_metadata(destination) {
+		Ok(_) => {
+			return Err(err(format!(
+				"disk recovery destination {} already exists",
+				destination.display()
+			)));
+		},
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+		Err(e) => {
+			return Err(err(format!(
+				"checking disk recovery destination {}: {e}",
+				destination.display()
+			)));
+		},
+	}
+	let destination = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(destination)
+		.map_err(|e| err(format!("creating disk recovery image: {e}")))?;
+	let bytes = source
+		.metadata()
+		.map_err(|e| err(format!("reading active disk length: {e}")))?
+		.len();
+
+	#[cfg(target_os = "linux")]
+	if linux::try_reflink(source, &destination).is_none() {
+		destination
+			.sync_all()
+			.map_err(|e| err(format!("syncing reflinked disk recovery image: {e}")))?;
+		return Ok(DiskCapture { bytes, method: DiskCaptureMethod::Reflink });
+	}
+
+	// A copy fallback is intentionally made while the block worker remains
+	// stopped. It is therefore coherent, but not non-blocking: VCPUs may stall
+	// on block IO until this copy completes.
+	let mut source = source
+		.try_clone()
+		.map_err(|e| err(format!("cloning active disk descriptor: {e}")))?;
+	source
+		.seek(SeekFrom::Start(0))
+		.map_err(|e| err(format!("seeking active disk for sparse recovery copy: {e}")))?;
+	sparse_copy(&mut source, &destination)
+		.map_err(|e| err(format!("sparse-copying disk recovery image: {e}")))?;
+	destination
+		.sync_all()
+		.map_err(|e| err(format!("syncing sparse disk recovery image: {e}")))?;
+	Ok(DiskCapture { bytes, method: DiskCaptureMethod::SparseCopy })
+}
+
+#[cfg(target_os = "windows")]
+fn clone_open_disk(source: &File, destination: &Path) -> Result<DiskCapture> {
+	use std::io::{Read, Write};
+
+	let mut source = source
+		.try_clone()
+		.map_err(|e| err(format!("cloning active disk descriptor: {e}")))?;
+	let bytes = source.metadata()?.len();
+	let mut destination = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.open(destination)
+		.map_err(|e| err(format!("creating disk recovery image: {e}")))?;
+	source.seek(SeekFrom::Start(0))?;
+	let mut buffer = [0u8; 64 * 1024];
+	loop {
+		let read = source.read(&mut buffer)?;
+		if read == 0 {
+			break;
+		}
+		destination.write_all(&buffer[..read])?;
+	}
+	destination.sync_all()?;
+	Ok(DiskCapture { bytes, method: DiskCaptureMethod::SparseCopy })
 }
 
 const SECTOR_SIZE: u64 = 512;
@@ -652,6 +741,17 @@ impl VirtioDevice for Block {
 			}
 		}
 		Ok(())
+	}
+
+	fn capture_disk(&mut self, destination: &Path) -> Result<DiskCapture> {
+		// `run_worker` already drains before acknowledging its pause request.
+		// Repeat the drain here so this primitive remains safe if it is used by
+		// a future control path that has acquired the device lock directly.
+		self.drain()?;
+		self.disk.sync_all().map_err(|e| {
+			err(format!("syncing active virtio-block disk before recovery capture: {e}"))
+		})?;
+		clone_open_disk(&self.disk, destination)
 	}
 }
 
@@ -1148,6 +1248,7 @@ pub(super) mod sync_io {
 #[cfg(test)]
 mod tests {
 	use std::{
+		io::Write,
 		path::{Path, PathBuf},
 		sync::atomic::{AtomicU64, Ordering},
 	};
@@ -1335,5 +1436,28 @@ mod tests {
 		assert!(bitmap.dirty_at(0), "the single written byte must be dirty");
 		assert!(!bitmap.dirty_at(0x6_0000), "bytes past the short read must stay clean");
 		assert!(!bitmap.dirty_at(0x8_0000), "the second range must stay clean");
+	}
+
+	#[test]
+	fn active_disk_clone_includes_boundary_bytes_not_later_writes() {
+		let tmp = TestDir::new();
+		let source_path = tmp.path().join("active.img");
+		let image = tmp.path().join("capture.img");
+		let mut source = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(&source_path)
+			.expect("create source disk");
+		source.write_all(b"before").expect("write before boundary");
+		source.sync_all().expect("sync boundary write");
+
+		let capture = clone_open_disk(&source, &image).expect("capture active disk");
+		assert_eq!(capture.bytes, 6);
+		source.seek(SeekFrom::Start(0)).expect("rewind source");
+		source.write_all(b"after!").expect("write after boundary");
+		source.sync_all().expect("sync later write");
+
+		assert_eq!(std::fs::read(image).expect("read captured image"), b"before");
 	}
 }

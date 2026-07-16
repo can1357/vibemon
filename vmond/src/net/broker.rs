@@ -18,12 +18,12 @@ use crate::{EngineError, Result};
 pub enum Request {
 	/// Create a TAP and install its fail-closed forwarding policy.
 	Setup {
-		name:                 String,
-		guest_ip:             String,
-		host_ip:              String,
-		prefix:               u8,
-		egress_allow:         Option<Vec<String>>,
-		egress_allow_domains: Option<Vec<String>>,
+		name:                  String,
+		guest_ip:              String,
+		host_ip:               String,
+		prefix:                u8,
+		egress_allow:          Option<Vec<String>>,
+		egress_allow_domains:  Option<Vec<String>>,
 		previous_egress_allow: Option<Vec<String>>,
 	},
 	/// Permit the fixed credential gateway port for one existing lease.
@@ -142,9 +142,7 @@ pub fn serve(socket: &Path, owner_uid: Option<u32>) -> Result<()> {
 								Err(error) => Response::Error(error.to_string()),
 							}
 						},
-						_ => Response::Error(
-							"network broker caller is not the socket owner".to_owned(),
-						),
+						_ => Response::Error("network broker caller is not the socket owner".to_owned()),
 					};
 					let _ = write_frame(&mut stream, &response);
 				},
@@ -373,12 +371,12 @@ mod tests {
 	#[test]
 	fn protocol_round_trip_and_bounded_decode() {
 		let request = Request::Setup {
-			name:                 "tv0123456789".to_owned(),
-			guest_ip:             "172.20.0.2".to_owned(),
-			host_ip:              "172.20.0.1".to_owned(),
-			prefix:               30,
-			egress_allow:         Some(vec!["1.1.1.1/32".to_owned()]),
-			egress_allow_domains: Some(vec!["example.com".to_owned()]),
+			name:                  "tv0123456789".to_owned(),
+			guest_ip:              "172.20.0.2".to_owned(),
+			host_ip:               "172.20.0.1".to_owned(),
+			prefix:                30,
+			egress_allow:          Some(vec!["1.1.1.1/32".to_owned()]),
+			egress_allow_domains:  Some(vec!["example.com".to_owned()]),
 			previous_egress_allow: None,
 		};
 		let mut bytes = Vec::new();

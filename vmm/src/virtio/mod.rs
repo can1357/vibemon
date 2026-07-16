@@ -20,9 +20,10 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::{
 	io,
+	path::Path,
 	sync::{
 		Arc,
-		atomic::{AtomicU32, Ordering},
+		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 	},
 };
 
@@ -135,6 +136,37 @@ impl Interrupt {
 	}
 }
 
+/// Result of cloning an active virtio-block backing file for a disk-only
+/// recovery point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskCapture {
+	pub bytes:  u64,
+	pub method: DiskCaptureMethod,
+}
+
+/// Copy mechanism used for a disk recovery artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskCaptureMethod {
+	/// The filesystem created a copy-on-write reflink.
+	#[cfg_attr(
+		not(target_os = "linux"),
+		allow(dead_code, reason = "constructed by Linux FICLONE disk recovery capture")
+	)]
+	Reflink,
+	/// Reflink was unavailable; the source was sparse-copied while its block
+	/// worker remained quiesced.
+	SparseCopy,
+}
+
+impl DiskCaptureMethod {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Reflink => "reflink",
+			Self::SparseCopy => "sparse-copy",
+		}
+	}
+}
+
 /// A virtio device backend (block, net, ...).
 ///
 /// The transport handles the control-plane registers and, on `DRIVER_OK`, calls
@@ -194,6 +226,13 @@ pub trait VirtioDevice: Send {
 	fn drain(&mut self) -> Result<()> {
 		Ok(())
 	}
+	/// Clone the currently attached backing image into `destination` for a
+	/// disk-only recovery point. The caller has stopped this device's worker,
+	/// so implementations may establish a precise write boundary without
+	/// parking vCPUs. Non-block devices reject the operation.
+	fn capture_disk(&mut self, _destination: &Path) -> Result<DiskCapture> {
+		Err(err("disk-only recovery requires a virtio-block device"))
+	}
 }
 
 const QUEUE_TOKEN: u64 = 0;
@@ -210,20 +249,26 @@ const FD_TOKEN_BASE: u64 = 4;
 /// release the worker back into its normal loop.
 pub struct WorkerControl {
 	/// VMM writes 1 -> worker should quiesce.
-	pub pause_evt:   EventFd,
+	pub pause_evt:        EventFd,
 	/// VMM writes 1 -> worker resumes.
-	pub resume_evt:  EventFd,
+	pub resume_evt:       EventFd,
 	/// Worker writes 1 once quiesced (VMM waits on this).
-	pub ack_evt:     EventFd,
+	pub ack_evt:          EventFd,
 	/// Worker writes 1 if quiescing fails; the VMM rejects the pause/snapshot.
-	pub failure_evt: EventFd,
+	pub failure_evt:      EventFd,
 	/// Human-readable failure recorded before `failure_evt` is signalled.
-	pub failure_msg: Arc<Mutex<Option<String>>>,
+	pub failure_msg:      Arc<Mutex<Option<String>>>,
+	/// The VMM's current request. Clearing this before `resume_evt` makes a
+	/// timed-out pause cancellable even when a worker has not yet consumed its
+	/// pause event, so a failed disk capture cannot strand the block path.
+	pub pause_requested:  Arc<AtomicBool>,
+	/// Monotonically increasing pause request generation. Each pause requester
+	/// publishes a new generation before waking the worker.
+	pub pause_generation: Arc<AtomicU64>,
+	/// Generation the worker has fully quiesced. It is stored before `ack_evt`
+	/// is signalled so a later request cannot accept a stale wakeup.
+	pub ack_generation:   Arc<AtomicU64>,
 }
-
-/// Event loop for a single virtio device: waits for queue notifications,
-/// backend IO readiness, pause/resume control, or the kill signal, dispatching
-/// into the device under lock.
 pub fn run_worker(
 	device: Arc<Mutex<dyn VirtioDevice>>,
 	queue_evt: EventFd,
@@ -259,9 +304,12 @@ pub fn run_worker(
 			},
 			PAUSE_TOKEN => {
 				let _ = control.pause_evt.read();
+				if !control.pause_requested.load(Ordering::Acquire) {
+					continue;
+				}
+				let requested_generation = control.pause_generation.load(Ordering::Acquire);
 				{
 					let mut dev = device.lock();
-					let _ = queue_evt.read();
 					if let Err(e) = dev.process_queue_notify() {
 						let message = format!("pause queue drain failed: {e}");
 						*control.failure_msg.lock() = Some(message.clone());
@@ -275,13 +323,30 @@ pub fn run_worker(
 						return Err(err(message));
 					}
 				}
+				if !control.pause_requested.load(Ordering::Acquire)
+					|| control.pause_generation.load(Ordering::Acquire) != requested_generation
+				{
+					continue;
+				}
+				control
+					.ack_generation
+					.store(requested_generation, Ordering::Release);
 				let _ = control.ack_evt.write(1);
+				if !control.pause_requested.load(Ordering::Acquire)
+					|| control.pause_generation.load(Ordering::Acquire) != requested_generation
+				{
+					continue;
+				}
 				'paused: loop {
 					let (pause_token, _) = pause_wait_set.wait()?;
 					match pause_token {
 						RESUME_TOKEN => {
 							let _ = control.resume_evt.read();
-							break 'paused;
+							if !control.pause_requested.load(Ordering::Acquire)
+								|| control.pause_generation.load(Ordering::Acquire) != requested_generation
+							{
+								break 'paused;
+							}
 						},
 						KILL_TOKEN => {
 							let _ = kill_evt.read();
@@ -405,4 +470,182 @@ fn wait_handles(handles: &[RawHandle]) -> io::Result<usize> {
 		return Err(io::Error::last_os_error());
 	}
 	Err(io::Error::other(format!("unexpected WaitForMultipleObjects result {result:#x}")))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::{
+			Arc,
+			atomic::{AtomicBool, AtomicU64, Ordering},
+			mpsc::{Receiver, Sender, channel},
+		},
+		thread,
+		time::Duration,
+	};
+
+	use super::*;
+
+	struct IdleDevice;
+
+	impl VirtioDevice for IdleDevice {
+		fn device_type(&self) -> u32 {
+			0
+		}
+
+		fn queue_max_sizes(&self) -> &[u16] {
+			&[]
+		}
+
+		fn features(&self) -> u64 {
+			0
+		}
+
+		fn ack_features(&mut self, _value: u64) {}
+
+		fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+
+		fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+
+		fn activate(
+			&mut self,
+			_mem: GuestMemoryMmap,
+			_interrupt: Arc<Interrupt>,
+			_queues: Vec<Queue>,
+		) -> Result<()> {
+			Ok(())
+		}
+
+		fn process_queue_notify(&mut self) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	struct DelayedPauseDevice {
+		entered: Sender<()>,
+		release: Receiver<()>,
+	}
+
+	impl VirtioDevice for DelayedPauseDevice {
+		fn device_type(&self) -> u32 {
+			0
+		}
+
+		fn queue_max_sizes(&self) -> &[u16] {
+			&[]
+		}
+
+		fn features(&self) -> u64 {
+			0
+		}
+
+		fn ack_features(&mut self, _value: u64) {}
+
+		fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+
+		fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+
+		fn activate(
+			&mut self,
+			_mem: GuestMemoryMmap,
+			_interrupt: Arc<Interrupt>,
+			_queues: Vec<Queue>,
+		) -> Result<()> {
+			Ok(())
+		}
+
+		fn process_queue_notify(&mut self) -> Result<()> {
+			self.entered.send(()).unwrap();
+			self.release.recv().unwrap();
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn cancelled_quiesce_releases_worker_after_capture_error_path() {
+		let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(IdleDevice));
+		let queue_evt = EventFd::new(0).unwrap();
+		let kill_evt = EventFd::new(0).unwrap();
+		let pause_evt = EventFd::new(0).unwrap();
+		let resume_evt = EventFd::new(0).unwrap();
+		let ack_evt = EventFd::new(0).unwrap();
+		let failure_evt = EventFd::new(0).unwrap();
+		let worker_kill_evt = kill_evt.try_clone().unwrap();
+		let pause_requested = Arc::new(AtomicBool::new(true));
+		let pause_generation = Arc::new(AtomicU64::new(1));
+		let ack_generation = Arc::new(AtomicU64::new(0));
+		let control = WorkerControl {
+			pause_evt: pause_evt.try_clone().unwrap(),
+			resume_evt: resume_evt.try_clone().unwrap(),
+			ack_evt: ack_evt.try_clone().unwrap(),
+			failure_evt,
+			failure_msg: Arc::new(Mutex::new(None)),
+			pause_requested: pause_requested.clone(),
+			pause_generation,
+			ack_generation,
+		};
+		let worker = thread::spawn(move || run_worker(device, queue_evt, worker_kill_evt, control));
+
+		pause_evt.write(1).unwrap();
+		ack_evt.read().unwrap();
+		pause_requested.store(false, Ordering::Release);
+		resume_evt.write(1).unwrap();
+		thread::sleep(Duration::from_millis(10));
+		kill_evt.write(1).unwrap();
+		assert!(worker.join().unwrap().is_ok());
+	}
+
+	#[test]
+	fn cancelled_pause_ack_does_not_satisfy_next_generation() {
+		let (entered_tx, entered_rx) = channel();
+		let (release_tx, release_rx) = channel();
+		let device: Arc<Mutex<dyn VirtioDevice>> =
+			Arc::new(Mutex::new(DelayedPauseDevice { entered: entered_tx, release: release_rx }));
+		let queue_evt = EventFd::new(0).unwrap();
+		let kill_evt = EventFd::new(0).unwrap();
+		let pause_evt = EventFd::new(0).unwrap();
+		let resume_evt = EventFd::new(0).unwrap();
+		let ack_evt = EventFd::new(0).unwrap();
+		let failure_evt = EventFd::new(0).unwrap();
+		let worker_kill_evt = kill_evt.try_clone().unwrap();
+		let pause_requested = Arc::new(AtomicBool::new(false));
+		let pause_generation = Arc::new(AtomicU64::new(0));
+		let ack_generation = Arc::new(AtomicU64::new(0));
+		let control = WorkerControl {
+			pause_evt: pause_evt.try_clone().unwrap(),
+			resume_evt: resume_evt.try_clone().unwrap(),
+			ack_evt: ack_evt.try_clone().unwrap(),
+			failure_evt,
+			failure_msg: Arc::new(Mutex::new(None)),
+			pause_requested: pause_requested.clone(),
+			pause_generation: pause_generation.clone(),
+			ack_generation: ack_generation.clone(),
+		};
+		let worker = thread::spawn(move || run_worker(device, queue_evt, worker_kill_evt, control));
+
+		let first_generation = pause_generation.fetch_add(1, Ordering::AcqRel) + 1;
+		pause_requested.store(true, Ordering::Release);
+		pause_evt.write(1).unwrap();
+		entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+		pause_requested.store(false, Ordering::Release);
+		resume_evt.write(1).unwrap();
+		let second_generation = pause_generation.fetch_add(1, Ordering::AcqRel) + 1;
+		pause_requested.store(true, Ordering::Release);
+		pause_evt.write(1).unwrap();
+		assert_eq!(first_generation, 1);
+		assert_eq!(second_generation, 2);
+		release_tx.send(()).unwrap();
+		entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+		assert_eq!(ack_generation.load(Ordering::Acquire), 0);
+
+		release_tx.send(()).unwrap();
+		ack_evt.read().unwrap();
+		assert_eq!(ack_generation.load(Ordering::Acquire), second_generation);
+
+		pause_requested.store(false, Ordering::Release);
+		resume_evt.write(1).unwrap();
+		kill_evt.write(1).unwrap();
+		assert!(worker.join().unwrap().is_ok());
+	}
 }

@@ -117,6 +117,11 @@ pub struct Config {
 	/// Unix control socket (pause/resume/snapshot/quit). `None` disables the
 	/// control plane.
 	pub api_sock: Option<PathBuf>,
+	/// Start vCPU threads paused until the internal control plane resumes them.
+	///
+	/// This is used by the daemon's durable lifecycle transitions and is not a
+	/// public sandbox-create option.
+	pub start_paused: bool,
 	/// Root for named lifecycle snapshots. `None` disables named snapshots.
 	pub snapshot_root: Option<PathBuf>,
 	/// Host Unix socket bridged byte-for-byte to the virtio-console agent port.
@@ -173,6 +178,9 @@ pub struct Config {
 	/// Wall-clock hard deadline in seconds; the VMM self-terminates when
 	/// reached.
 	pub timeout_secs: Option<u64>,
+	/// Production ownership watchdog in seconds; self-terminates unless the
+	/// control plane re-arms it after each authoritative lease renewal.
+	pub owner_lease_secs: Option<u64>,
 	/// Named writable (or `:ro`) virtio-fs volumes; one device per entry.
 	pub volumes: Vec<FsMount>,
 	/// Read-only virtio-fs mounts backed by per-VM object proxy sockets.
@@ -293,7 +301,10 @@ struct CliArgs {
 
 	/// Unix control socket (pause/resume/snapshot/quit)
 	#[arg(long, value_name = "PATH")]
-	api_sock: Option<PathBuf>,
+	api_sock:     Option<PathBuf>,
+	/// Start paused until an internal control-plane resume request.
+	#[arg(long)]
+	start_paused: bool,
 
 	/// Root for named JSON lifecycle snapshots
 	#[arg(long, value_name = "DIR")]
@@ -399,6 +410,10 @@ struct CliArgs {
 	/// Exit after n seconds (1..=86400)
 	#[arg(long, value_name = "N")]
 	timeout_secs: Option<u64>,
+
+	/// Production ownership watchdog seconds (1..=86400).
+	#[arg(long, value_name = "N")]
+	owner_lease_secs: Option<u64>,
 }
 
 impl Config {
@@ -502,6 +517,11 @@ impl Config {
 			&& !(1..=86_400).contains(&n)
 		{
 			bail!("--timeout-secs must be between 1 and 86400 (got {n})");
+		}
+		if let Some(n) = cli.owner_lease_secs
+			&& !(1..=86_400).contains(&n)
+		{
+			bail!("--owner-lease-secs must be between 1 and 86400 (got {n})");
 		}
 		if cli.cgroup_pids_max == Some(0) {
 			bail!("--cgroup-pids-max must be greater than 0");
@@ -722,6 +742,7 @@ impl Config {
 			fs_tag: cli.fs_tag,
 			fs_dir: cli.fs_dir,
 			api_sock: cli.api_sock,
+			start_paused: cli.start_paused,
 			snapshot_root: cli.snapshot_root,
 			agent_sock: cli.agent_sock,
 			restore: cli.restore,
@@ -748,6 +769,7 @@ impl Config {
 			sandbox_uid,
 			sandbox_gid,
 			timeout_secs: cli.timeout_secs,
+			owner_lease_secs: cli.owner_lease_secs,
 			volumes: cli.volumes,
 			remote_fs: cli.remote_fs,
 		})
@@ -1050,6 +1072,16 @@ mod tests {
 		assert_eq!(cfg.log_format, LogFormat::Text);
 		assert_eq!(cfg.log_level, "info");
 		assert!(!cfg.no_sandbox);
+	}
+
+	#[test]
+	fn start_paused_is_an_internal_cli_flag() {
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--start-paused"])
+			.expect("internal start-paused flag parses");
+		assert!(cfg.start_paused);
+
+		let cfg = parse_config(&["vmon", "--kernel", "k"]).expect("default config parses");
+		assert!(!cfg.start_paused);
 	}
 
 	#[cfg(not(target_os = "windows"))]
@@ -1482,6 +1514,17 @@ mod tests {
 		let cfg = parse_config(&["vmon", "--kernel", "k", "--timeout-secs", "120"])
 			.expect("valid --timeout-secs parses");
 		assert_eq!(cfg.timeout_secs, Some(120));
+	}
+
+	#[test]
+	fn owner_lease_secs_parses_and_validates_range() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--owner-lease-secs", "0"],
+			"--owner-lease-secs must be between 1 and 86400",
+		);
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--owner-lease-secs", "15"])
+			.expect("valid --owner-lease-secs parses");
+		assert_eq!(cfg.owner_lease_secs, Some(15));
 	}
 
 	#[cfg(target_os = "linux")]
