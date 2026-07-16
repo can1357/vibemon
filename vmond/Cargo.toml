@@ -13,6 +13,7 @@ workspace = true
 axum = { version = "0.8", features = ["http2", "ws"] }
 base64 = "0.22"
 chrono = "0.4"
+chacha20poly1305 = "0.10"
 chrono-tz = "0.10"
 cron = "0.15"
 flume = { version = "0.11", default-features = false }
@@ -26,7 +27,7 @@ include_dir = "0.7"
 libc = "0.2"
 parking_lot = "0.12.5"
 rayon = "1"
-rand = "0.9"
+rand = "0.10"
 quick-xml = { version = "0.41", features = ["serialize"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +40,7 @@ tokio-stream = "0.1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+zeroize = "1"
 vmm = { path = "../vmm" }
 vmon-proto = { path = "../proto" }
 vmon-agent = { path = "../agent" }
