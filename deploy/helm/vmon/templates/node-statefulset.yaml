@@ -112,6 +112,10 @@ spec:
               value: "10000"
             - name: VMON_REGION
               value: {{ .Values.nodes.region | quote }}
+            {{- if eq .Values.global.clusterMode "production" }}
+            - name: VMON_PORTABLE_HISTORY_KEY_ID
+              value: {{ .Values.nodes.portableHistoryKeyId | quote }}
+            {{- end }}
             - name: VMON_API_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -170,6 +174,11 @@ spec:
               mountPath: /dev/net/tun
             - name: data
               mountPath: /var/lib/vmon
+            {{- if eq .Values.global.clusterMode "production" }}
+            - name: portable-history-key
+              mountPath: /etc/vmon/portable-history
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -187,3 +196,12 @@ spec:
           hostPath:
             path: /var/lib/vmon
             type: DirectoryOrCreate
+        {{- if eq .Values.global.clusterMode "production" }}
+        - name: portable-history-key
+          secret:
+            secretName: {{ include "vmon.apiSecret" . }}
+            defaultMode: 256
+            items:
+              - key: portable-history-key
+                path: key
+        {{- end }}

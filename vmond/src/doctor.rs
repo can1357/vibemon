@@ -13,7 +13,10 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-	config::{SERVE_CONFIG_KEYS, ServeConfig, cli_option_for, env_var_for, resolve_serve_config},
+	config::{
+		ClusterMode, SERVE_CONFIG_KEYS, ServeConfig, cli_option_for, env_var_for,
+		resolve_serve_config,
+	},
 	home, image,
 };
 
@@ -157,6 +160,13 @@ pub fn collect_serve_config_checks(config: &ServeConfig) -> Vec<Check> {
 			"warm images",
 			format!("invalid image ref(s): {}", bad_refs.join(", ")),
 			"use OCI refs without whitespace, e.g. alpine:latest=2",
+		));
+	}
+	if config.cluster_mode == ClusterMode::Production {
+		checks.push(Check::warn(
+			"S3 multipart lifecycle",
+			"the bucket's stale multipart-upload lifecycle cannot be verified by vmond",
+			"configure the bucket to AbortIncompleteMultipartUpload after the publish retry window",
 		));
 	}
 	checks

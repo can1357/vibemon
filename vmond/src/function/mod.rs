@@ -288,14 +288,9 @@ impl FunctionDomain {
 			));
 		}
 		let artifact = self.artifacts.put(snapshot.engine_snapshot.as_bytes())?;
-		self.store.record_artifact(
-			&artifact.digest,
-			artifact.size,
+		self.store.record_stored_artifact(
+			&artifact,
 			Some("application/vnd.vmon.engine-snapshot-name"),
-			artifact
-				.path
-				.to_str()
-				.ok_or_else(|| EngineError::engine("snapshot artifact path is not UTF-8"))?,
 			snapshot.created_at_unix_millis,
 			None,
 		)?;

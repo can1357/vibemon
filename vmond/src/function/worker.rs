@@ -2331,16 +2331,7 @@ fn materialize_output_bytes(
 			.ok_or_else(|| WorkerError::infrastructure("artifact_store", "invalid artifact root"))?;
 		let store = Store::open_with_config(&Home::new(home_root), config).map_err(engine_error)?;
 		store
-			.record_artifact(
-				&stored.digest,
-				stored.size,
-				None,
-				stored.path.to_str().ok_or_else(|| {
-					WorkerError::infrastructure("artifact_store", "artifact path is not UTF-8")
-				})?,
-				now_ms(),
-				None,
-			)
+			.record_stored_artifact(&stored, None, now_ms(), None)
 			.map_err(engine_error)?;
 		value["artifact_digest"] = json!(stored.digest);
 	}

@@ -2,6 +2,7 @@
 //! volumes.
 
 use std::{
+	ffi::OsStr,
 	fs::{self, File, OpenOptions, Permissions},
 	io::{self, Read, Write},
 	os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -12,6 +13,8 @@ use chacha20poly1305::{
 	Key, XChaCha20Poly1305, XNonce,
 	aead::{Aead, KeyInit, Payload},
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{EngineError, Result, home::Home, mesh::bundle};
@@ -31,6 +34,31 @@ const DIR_MODE: u32 = 0o700;
 #[derive(Clone, Debug)]
 pub struct Keyring {
 	dir: PathBuf,
+}
+
+/// Immutable key material loaded once for a single scope-and-archive operation.
+///
+/// Holding this value prevents a key-file replacement from selecting an object
+/// scope with one key and encrypting or decrypting it with another.
+pub(crate) struct KeySnapshot {
+	key_id: String,
+	key:    Zeroizing<[u8; 32]>,
+}
+
+impl KeySnapshot {
+	/// Customer key identifier authenticated in the archive header.
+	pub(crate) fn key_id(&self) -> &str {
+		&self.key_id
+	}
+
+	/// Opaque HMAC scope for object-store paths under this exact key material.
+	pub(crate) fn object_key_scope(&self) -> String {
+		Keyring::object_key_scope_from_key(&self.key_id, &self.key)
+	}
+
+	fn key(&self) -> &[u8; 32] {
+		&self.key
+	}
 }
 
 impl Keyring {
@@ -75,6 +103,22 @@ impl Keyring {
 		Ok(key)
 	}
 
+	/// Load one immutable key snapshot for a coupled scope-and-archive
+	/// operation.
+	pub(crate) fn snapshot(&self, key_id: &str) -> Result<KeySnapshot> {
+		Ok(KeySnapshot { key_id: key_id.to_owned(), key: self.load(key_id)? })
+	}
+
+	/// Derive a scope from an already loaded key snapshot.
+	pub(crate) fn object_key_scope_from_key(key_id: &str, key: &[u8; 32]) -> String {
+		let mut mac =
+			<Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts a 256-bit key");
+		mac.update(b"vmond:replica-object-key-scope:v1\0");
+		mac.update(&(key_id.len() as u64).to_be_bytes());
+		mac.update(key_id.as_bytes());
+		hex::encode(mac.finalize().into_bytes())
+	}
+
 	fn ensure_default(&self) -> Result<()> {
 		let path = self.dir.join("default.key");
 		match fs::symlink_metadata(&path) {
@@ -97,6 +141,7 @@ impl Keyring {
 		file.write_all(hex::encode(*key).as_bytes())?;
 		file.write_all(b"\n")?;
 		file.sync_all()?;
+		sync_parent_directory(&self.dir)?;
 		key.zeroize();
 		Ok(())
 	}
@@ -125,6 +170,7 @@ impl EncryptedArchive {
 			.and_then(|file| {
 				file.sync_all()?;
 				fs::rename(&temporary, destination)?;
+				sync_parent_directory(parent)?;
 				Ok(())
 			});
 		if result.is_err() {
@@ -186,7 +232,8 @@ impl EncryptedArchive {
 			.and_then(|()| encrypted.finish())
 			.and_then(|file| file.sync_all())
 			.map_err(EngineError::from)
-			.and_then(|()| fs::rename(&temporary, destination).map_err(EngineError::from));
+			.and_then(|()| fs::rename(&temporary, destination).map_err(EngineError::from))
+			.and_then(|()| sync_parent_directory(parent).map_err(EngineError::from));
 		if result.is_err() {
 			let _ = fs::remove_file(&temporary);
 		}
@@ -207,9 +254,59 @@ impl EncryptedArchive {
 		}
 		Ok(bytes)
 	}
+
+	/// Start streaming an encrypted archive into any writer without staging
+	/// plaintext on disk.
+	pub(crate) fn encrypt<W: Write>(
+		writer: W,
+		keyring: &Keyring,
+		key_id: &str,
+	) -> Result<EncryptWriter<W>> {
+		let key = keyring.load(key_id)?;
+		EncryptWriter::new(writer, key_id, &key).map_err(EngineError::from)
+	}
+
+	/// Start streaming encryption with an already loaded immutable key snapshot.
+	pub(crate) fn encrypt_with_snapshot<W: Write>(
+		writer: W,
+		snapshot: &KeySnapshot,
+	) -> Result<EncryptWriter<W>> {
+		EncryptWriter::new(writer, snapshot.key_id(), snapshot.key()).map_err(EngineError::from)
+	}
+
+	/// Consume a stream encrypted under this exact loaded key snapshot.
+	///
+	/// The archive header must name the snapshot key and the reader is drained
+	/// through its authenticated terminator before this returns.
+	pub(crate) fn decrypt_with_snapshot<R: Read, T>(
+		reader: R,
+		snapshot: &KeySnapshot,
+		consume: impl FnOnce(&mut DecryptReader<R>) -> Result<T>,
+	) -> Result<T> {
+		let mut decrypted = DecryptReader::new_with_snapshot(reader, snapshot)?;
+		let value = consume(&mut decrypted)?;
+		io::copy(&mut decrypted, &mut io::sink())?;
+		Ok(value)
+	}
+
+	/// Consume a streamed encrypted archive and drain it through its
+	/// authenticated terminal record before returning. Draining rejects
+	/// truncated or trailing ciphertext even when `consume` stops after a valid
+	/// bundle payload.
+	pub(crate) fn decrypt<R: Read, T>(
+		reader: R,
+		keyring: &Keyring,
+		consume: impl FnOnce(&mut DecryptReader<R>) -> Result<T>,
+	) -> Result<T> {
+		let mut decrypted = DecryptReader::new(reader, keyring)?;
+		let value = consume(&mut decrypted)?;
+		io::copy(&mut decrypted, &mut io::sink())?;
+		Ok(value)
+	}
 }
 
-struct EncryptWriter<W: Write> {
+/// Streaming encryptor returned by [`EncryptedArchive::encrypt`].
+pub(crate) struct EncryptWriter<W: Write> {
 	inner:      Option<W>,
 	cipher:     XChaCha20Poly1305,
 	key_id:     Vec<u8>,
@@ -267,7 +364,7 @@ impl<W: Write> EncryptWriter<W> {
 		Ok(())
 	}
 
-	fn finish(mut self) -> io::Result<W> {
+	pub(crate) fn finish(mut self) -> io::Result<W> {
 		self.seal_buffer(false)?;
 		self.seal_buffer(true)?;
 		let mut inner = self.inner.take().expect("encrypt writer is unfinished");
@@ -301,7 +398,7 @@ impl<W: Write> Write for EncryptWriter<W> {
 	}
 }
 
-struct DecryptReader<R: Read> {
+pub(crate) struct DecryptReader<R: Read> {
 	inner:      R,
 	cipher:     XChaCha20Poly1305,
 	key_id:     Vec<u8>,
@@ -339,6 +436,40 @@ impl<R: Read> DecryptReader<R> {
 		Ok(Self {
 			inner,
 			cipher: XChaCha20Poly1305::new(Key::from_slice(&key[..])),
+			key_id,
+			nonce_seed,
+			counter: 0,
+			chunk_size,
+			buffer: Vec::new(),
+			offset: 0,
+			finished: false,
+		})
+	}
+
+	fn new_with_snapshot(mut inner: R, snapshot: &KeySnapshot) -> Result<Self> {
+		let mut magic = [0_u8; MAGIC.len()];
+		inner.read_exact(&mut magic)?;
+		if &magic != MAGIC {
+			return Err(EngineError::invalid("not a vmon encrypted archive"));
+		}
+		let key_len = usize::from(read_u16(&mut inner)?);
+		if key_len == 0 || key_len > MAX_KEY_ID {
+			return Err(EngineError::invalid("encrypted archive key id is invalid"));
+		}
+		let mut key_id = vec![0_u8; key_len];
+		inner.read_exact(&mut key_id)?;
+		if key_id.as_slice() != snapshot.key_id().as_bytes() {
+			return Err(EngineError::invalid("encrypted archive key does not match replica key"));
+		}
+		let mut nonce_seed = [0_u8; 16];
+		inner.read_exact(&mut nonce_seed)?;
+		let chunk_size = read_u32(&mut inner)? as usize;
+		if chunk_size == 0 || chunk_size > CHUNK_SIZE {
+			return Err(EngineError::invalid("encrypted archive chunk size is invalid"));
+		}
+		Ok(Self {
+			inner,
+			cipher: XChaCha20Poly1305::new(Key::from_slice(snapshot.key())),
 			key_id,
 			nonce_seed,
 			counter: 0,
@@ -440,6 +571,67 @@ fn temporary_path(destination: &Path) -> PathBuf {
 	destination.with_file_name(format!(".{name}.{suffix}.tmp"))
 }
 
+/// Remove archive temporary files left by interrupted sealing during startup.
+///
+/// Call only while no archive writers are active. The traversal does not follow
+/// symbolic links and only removes regular files matching `temporary_path`.
+pub(crate) fn cleanup_stale_temporary_files(root: &Path) -> Result<()> {
+	match fs::symlink_metadata(root) {
+		Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
+		Ok(metadata) if metadata.is_dir() => cleanup_stale_temporary_files_in(root),
+		Ok(_) => Err(EngineError::invalid(format!(
+			"temporary archive cleanup root {} must be a directory",
+			root.display()
+		))),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error.into()),
+	}
+}
+
+fn cleanup_stale_temporary_files_in(directory: &Path) -> Result<()> {
+	for entry in fs::read_dir(directory)? {
+		let entry = entry?;
+		let file_type = entry.file_type()?;
+		if file_type.is_dir() {
+			cleanup_stale_temporary_files_in(&entry.path())?;
+		} else if file_type.is_file() && is_temporary_archive_name(&entry.file_name()) {
+			fs::remove_file(entry.path())?;
+			sync_parent_directory(directory)?;
+		}
+	}
+	Ok(())
+}
+
+fn is_temporary_archive_name(name: &OsStr) -> bool {
+	let Some(name) = name.to_str() else {
+		return false;
+	};
+	let Some(name) = name.strip_prefix('.') else {
+		return false;
+	};
+	let Some(name) = name.strip_suffix(".tmp") else {
+		return false;
+	};
+	let Some((destination, suffix)) = name.rsplit_once('.') else {
+		return false;
+	};
+	!destination.is_empty()
+		&& suffix.len() == 16
+		&& suffix
+			.bytes()
+			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+	File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+	Ok(())
+}
+
 fn validate_key_id(key_id: &str) -> Result<()> {
 	if key_id.is_empty()
 		|| key_id.len() > MAX_KEY_ID
@@ -489,14 +681,25 @@ fn engine_io(error: EngineError) -> io::Error {
 mod tests {
 	use std::{
 		fs::{self, OpenOptions},
-		io::Write,
-		os::unix::fs::OpenOptionsExt,
+		io::{Cursor, Write},
+		os::unix::fs::{OpenOptionsExt, symlink},
+		path::Path,
 	};
 
 	use tempfile::TempDir;
 
-	use super::{EncryptedArchive, KEY_MODE, Keyring};
-	use crate::home::Home;
+	use super::{EncryptedArchive, KEY_MODE, Keyring, cleanup_stale_temporary_files};
+	use crate::{home::Home, image::cas::snapshot_digest, mesh::bundle};
+
+	fn assert_no_temporary_files(directory: &Path) {
+		assert!(fs::read_dir(directory).unwrap().all(|entry| {
+			!entry
+				.unwrap()
+				.file_name()
+				.to_string_lossy()
+				.ends_with(".tmp")
+		}));
+	}
 
 	#[test]
 	fn encrypted_archive_roundtrip_and_authentication() {
@@ -517,6 +720,7 @@ mod tests {
 
 		let opened = EncryptedArchive::open(&archive, &temp.path().join("opened"), &keyring).unwrap();
 		assert_eq!(fs::read(opened.join("data")).unwrap(), b"secret payload");
+		assert_no_temporary_files(temp.path());
 
 		let mut bytes = fs::read(&archive).unwrap();
 
@@ -537,6 +741,81 @@ mod tests {
 	}
 
 	#[test]
+	fn streaming_archive_roundtrip_authenticates_and_hides_plaintext() {
+		let temp = TempDir::new().unwrap();
+		let home = Home::new(temp.path().join("home"));
+		let keyring = Keyring::open(&home).unwrap();
+		let source = temp.path().join("snapshot");
+		fs::create_dir(&source).unwrap();
+		let sentinel = b"replica-plaintext-sentinel";
+		fs::write(source.join("memory.bin"), sentinel).unwrap();
+		let snapshot = keyring.snapshot("default").unwrap();
+
+		let mut encrypted = EncryptedArchive::encrypt_with_snapshot(Vec::new(), &snapshot).unwrap();
+		bundle::write_bundle(&source, &mut encrypted, &|_| true).unwrap();
+		let ciphertext = encrypted.finish().unwrap();
+		assert!(
+			!ciphertext
+				.windows(sentinel.len())
+				.any(|window| window == sentinel)
+		);
+		let mut other_key = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(KEY_MODE)
+			.open(home.keys_dir().join("other.key"))
+			.unwrap();
+		writeln!(other_key, "{}", "22".repeat(32)).unwrap();
+		let other_snapshot = keyring.snapshot("other").unwrap();
+		assert!(
+			EncryptedArchive::decrypt_with_snapshot(
+				Cursor::new(ciphertext.clone()),
+				&other_snapshot,
+				|reader| bundle::read_bundle(reader, &temp.path().join("wrong-key")),
+			)
+			.is_err()
+		);
+
+		fs::write(home.keys_dir().join("default.key"), "33".repeat(32)).unwrap();
+		let restored_after_key_swap = temp.path().join("restored-after-key-swap");
+		EncryptedArchive::decrypt_with_snapshot(
+			Cursor::new(ciphertext.clone()),
+			&snapshot,
+			|reader| bundle::read_bundle(reader, &restored_after_key_swap),
+		)
+		.unwrap();
+		assert_eq!(
+			snapshot_digest(&source).unwrap(),
+			snapshot_digest(&restored_after_key_swap.join("snapshot")).unwrap()
+		);
+
+		let restored = temp.path().join("restored");
+		EncryptedArchive::decrypt_with_snapshot(
+			Cursor::new(ciphertext.clone()),
+			&snapshot,
+			|reader| bundle::read_bundle(reader, &restored),
+		)
+		.unwrap();
+		assert_eq!(
+			snapshot_digest(&source).unwrap(),
+			snapshot_digest(&restored.join("snapshot")).unwrap()
+		);
+
+		let mut tampered = ciphertext;
+		let last = tampered.len() - 1;
+		tampered[last] ^= 0x80;
+		let rejected = temp.path().join("rejected");
+		assert!(
+			EncryptedArchive::decrypt_with_snapshot(Cursor::new(tampered), &snapshot, |reader| {
+				bundle::read_bundle(reader, &rejected)
+			})
+			.is_err()
+		);
+		let _ = fs::remove_dir_all(&rejected);
+		assert!(!rejected.exists());
+	}
+
+	#[test]
 	fn revoking_customer_key_blocks_decryption() {
 		let temp = TempDir::new().unwrap();
 		let home = Home::new(temp.path().join("home"));
@@ -550,7 +829,70 @@ mod tests {
 		writeln!(key_file, "{}", "11".repeat(32)).unwrap();
 		let record = temp.path().join("record.venc");
 		EncryptedArchive::seal_bytes(b"credential", &record, &keyring, "customer").unwrap();
+		assert_eq!(EncryptedArchive::open_bytes(&record, &keyring, 1024).unwrap(), b"credential");
+		assert_no_temporary_files(temp.path());
 		fs::remove_file(home.keys_dir().join("customer.key")).unwrap();
 		assert!(EncryptedArchive::open_bytes(&record, &keyring, 1024).is_err());
+	}
+
+	#[test]
+	fn default_key_reopens_after_creation() {
+		let temp = TempDir::new().unwrap();
+		let home = Home::new(temp.path().join("home"));
+		let keyring = Keyring::open(&home).unwrap();
+		let key = keyring.load("default").unwrap();
+		drop(keyring);
+
+		let reopened = Keyring::open(&home).unwrap();
+
+		assert_eq!(*reopened.load("default").unwrap(), *key);
+	}
+
+	#[test]
+	fn startup_cleanup_removes_only_matching_regular_temporary_files() {
+		let temp = TempDir::new().unwrap();
+		let root = temp.path().join("archives");
+		let nested = root.join("nested");
+		fs::create_dir_all(&nested).unwrap();
+
+		let stale = root.join(".state.venc.0123456789abcdef.tmp");
+		let nested_stale = nested.join(".record.venc.abcdef0123456789.tmp");
+		fs::write(&stale, b"stale").unwrap();
+		fs::write(&nested_stale, b"stale").unwrap();
+
+		let invalid_hex = root.join(".state.venc.0123456789abcdeg.tmp");
+		let empty_destination = root.join(".0123456789abcdef.tmp");
+		let missing_prefix = root.join("state.venc.0123456789abcdef.tmp");
+		let matching_directory = root.join(".directory.0123456789abcdef.tmp");
+		for path in [&invalid_hex, &empty_destination, &missing_prefix] {
+			fs::write(path, b"keep").unwrap();
+		}
+		fs::create_dir(&matching_directory).unwrap();
+
+		let linked_file_target = root.join("linked-file-target");
+		let matching_link = root.join(".link.0123456789abcdef.tmp");
+		fs::write(&linked_file_target, b"keep").unwrap();
+		symlink(&linked_file_target, &matching_link).unwrap();
+		let outside = temp.path().join("outside");
+		let outside_stale = outside.join(".state.venc.0123456789abcdef.tmp");
+		fs::create_dir(&outside).unwrap();
+		fs::write(&outside_stale, b"keep").unwrap();
+		symlink(&outside, root.join("linked-directory")).unwrap();
+
+		cleanup_stale_temporary_files(&root).unwrap();
+
+		assert!(!stale.exists());
+		assert!(!nested_stale.exists());
+		for path in [&invalid_hex, &empty_destination, &missing_prefix] {
+			assert!(path.exists(), "{} should be retained", path.display());
+		}
+		assert!(matching_directory.is_dir());
+		assert!(
+			fs::symlink_metadata(&matching_link)
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert!(outside_stale.exists());
 	}
 }

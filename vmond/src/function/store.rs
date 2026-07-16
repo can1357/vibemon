@@ -1,14 +1,7 @@
 //! Transactional durable store for the function runtime.
 
-use std::{
-	collections::HashSet,
-	fs,
-	ops::{Deref, DerefMut},
-	str::FromStr,
-	sync::{Mutex, MutexGuard},
-};
+use std::{collections::HashSet, fs, str::FromStr, sync::Mutex};
 
-use ::postgres::Client as PgClient;
 use chrono::{TimeZone as _, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
@@ -17,11 +10,12 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use vmon_proto::{prost::Message, v1::*};
 
+use super::artifact::{ArtifactDigestLease, StoredArtifact};
 use crate::{
 	EngineError, Result,
 	config::{ClusterMode, ServeConfig},
 	home::Home,
-	postgres as pg,
+	postgres::{self as pg, Client as PgClient},
 };
 
 const SCHEMA_VERSION: u32 = 5;
@@ -101,144 +95,148 @@ pub struct Store {
 
 enum StoreConnection {
 	Sqlite(Mutex<Connection>),
-	Postgres(PgConnection),
+	Postgres(Box<PgConnection>),
 }
 
 struct PgConnection {
-	client: Mutex<Option<PgClient>>,
+	client:              Mutex<Option<PgClient>>,
+	#[cfg(test)]
+	persistence_failure: Mutex<Option<PgPersistenceFailure>>,
 }
 
-enum StoreConnectionGuard<'a> {
-	Sqlite(MutexGuard<'a, Connection>),
-	Postgres(PgStoreGuard<'a>),
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PgPersistenceFailure {
+	Update,
+	Commit,
 }
 
-struct PgStoreGuard<'a> {
-	client:     MutexGuard<'a, Option<PgClient>>,
-	connection: Connection,
-}
-
-impl Deref for StoreConnectionGuard<'_> {
-	type Target = Connection;
-
-	fn deref(&self) -> &Self::Target {
+impl StoreConnection {
+	fn with_connection<T>(&self, operation: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
 		match self {
-			Self::Sqlite(connection) => connection,
-			Self::Postgres(guard) => &guard.connection,
+			Self::Sqlite(connection) => {
+				let mut connection = connection.lock().map_err(lock_error)?;
+				operation(&mut connection)
+			},
+			Self::Postgres(connection) => connection.with_connection(operation),
 		}
 	}
 }
 
-impl DerefMut for StoreConnectionGuard<'_> {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		match self {
-			Self::Sqlite(connection) => connection,
-			Self::Postgres(guard) => &mut guard.connection,
-		}
-	}
-}
+impl PgConnection {
+	fn with_connection<T>(&self, operation: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+		let mut client = self.client.lock().map_err(lock_error)?;
+		let pg_client: &mut PgClient = (*client)
+			.as_mut()
+			.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
+		let bytes = blocking(move || {
+			pg_client.batch_execute("BEGIN").map_err(pg_error)?;
+			match pg_client.query_opt(
+				"SELECT state FROM function_store_state WHERE singleton = TRUE FOR UPDATE",
+				&[],
+			) {
+				Ok(Some(row)) => Ok(row.get::<_, Vec<u8>>(0)),
+				Ok(None) => {
+					let _ = pg_client.batch_execute("ROLLBACK");
+					Err(EngineError::engine("function PostgreSQL store is uninitialized"))
+				},
+				Err(error) => {
+					let _ = pg_client.batch_execute("ROLLBACK");
+					Err(pg_error(error))
+				},
+			}
+		})?;
+		let mut connection = match open_serialized_connection(&bytes) {
+			Ok(connection) => connection,
+			Err(error) => {
+				rollback_postgres(&mut client);
+				return Err(error);
+			},
+		};
+		let before = match connection.serialize(rusqlite::MAIN_DB).map_err(sql_error) {
+			Ok(state) => state.to_vec(),
+			Err(error) => {
+				rollback_postgres(&mut client);
+				return Err(error);
+			},
+		};
 
-impl Drop for PgStoreGuard<'_> {
-	fn drop(&mut self) {
-		let result = blocking(|| {
-			let client = self
-				.client
-				.as_mut()
-				.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
-			let state = self
-				.connection
-				.serialize(rusqlite::MAIN_DB)
-				.map_err(sql_error)?;
-			let bytes: &[u8] = &state;
-			let updated = client
-				.execute("UPDATE function_store_state SET state = $1 WHERE singleton = TRUE", &[&bytes])
+		let value = match operation(&mut connection) {
+			Ok(value) => value,
+			Err(error) => {
+				rollback_postgres(&mut client);
+				return Err(error);
+			},
+		};
+		let after = match connection.serialize(rusqlite::MAIN_DB).map_err(sql_error) {
+			Ok(state) => state.to_vec(),
+			Err(error) => {
+				rollback_postgres(&mut client);
+				return Err(error);
+			},
+		};
+		if before == after {
+			rollback_postgres(&mut client);
+			return Ok(value);
+		}
+
+		#[cfg(test)]
+		let persistence_failure = self.persistence_failure.lock().map_err(lock_error)?.take();
+		#[cfg(test)]
+		if let Some(failure) = persistence_failure {
+			rollback_postgres(&mut client);
+			return Err(EngineError::engine(match failure {
+				PgPersistenceFailure::Update => "injected PostgreSQL state update failure",
+				PgPersistenceFailure::Commit => "injected PostgreSQL state commit failure",
+			}));
+		}
+
+		let pg_client: &mut PgClient = (*client)
+			.as_mut()
+			.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
+		let persisted = blocking(move || {
+			let updated = pg_client
+				.execute("UPDATE function_store_state SET state = $1 WHERE singleton = TRUE", &[&after])
 				.map_err(pg_error)?;
 			if updated != 1 {
 				return Err(EngineError::engine(
 					"function PostgreSQL store lost its singleton state row",
 				));
 			}
-			client.batch_execute("COMMIT").map_err(pg_error)
+			pg_client.batch_execute("COMMIT").map_err(pg_error)
 		});
-		if let Err(error) = result {
-			if let Some(client) = self.client.as_mut() {
-				let _ = blocking(|| client.batch_execute("ROLLBACK"));
-			}
-			if std::thread::panicking() {
-				tracing::error!(%error, "failed to persist function metadata during unwind");
-			} else {
-				panic!("failed to persist function metadata: {error}");
-			}
+		if let Err(error) = persisted {
+			rollback_postgres(&mut client);
+			return Err(error);
 		}
+		Ok(value)
 	}
 }
 
-impl StoreConnection {
-	fn lock(&self) -> Result<StoreConnectionGuard<'_>> {
-		match self {
-			Self::Sqlite(connection) => connection
-				.lock()
-				.map(StoreConnectionGuard::Sqlite)
-				.map_err(lock_error),
-			Self::Postgres(connection) => connection.lock(),
-		}
-	}
-}
-
+#[cfg(test)]
 impl PgConnection {
-	fn lock(&self) -> Result<StoreConnectionGuard<'_>> {
-		let mut client_guard = self.client.lock().map_err(lock_error)?;
-		blocking(|| {
-			let client = client_guard
-				.as_mut()
-				.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
-			client.batch_execute("BEGIN").map_err(pg_error)?;
-			let bytes = match client.query_opt(
-				"SELECT state FROM function_store_state WHERE singleton = TRUE FOR UPDATE",
-				&[],
-			) {
-				Ok(Some(row)) => row.get::<_, Vec<u8>>(0),
-				Ok(None) => {
-					let _ = client.batch_execute("ROLLBACK");
-					return Err(EngineError::engine("function PostgreSQL store is uninitialized"));
-				},
-				Err(error) => {
-					let _ = client.batch_execute("ROLLBACK");
-					return Err(pg_error(error));
-				},
-			};
-			let connection = match open_serialized_connection(&bytes) {
-				Ok(connection) => connection,
-				Err(error) => {
-					let _ = client.batch_execute("ROLLBACK");
-					return Err(error);
-				},
-			};
-			Ok(StoreConnectionGuard::Postgres(PgStoreGuard { client: client_guard, connection }))
-		})
+	fn fail_next_persistence(&self, failure: PgPersistenceFailure) -> Result<()> {
+		*self.persistence_failure.lock().map_err(lock_error)? = Some(failure);
+		Ok(())
 	}
 }
 
-impl Drop for PgConnection {
-	fn drop(&mut self) {
-		let client = self
-			.client
-			.get_mut()
-			.unwrap_or_else(|e| e.into_inner())
-			.take();
-		if let Some(client) = client {
-			blocking(move || drop(client));
-		}
+fn rollback_postgres(client: &mut Option<PgClient>) {
+	if let Some(client) = client.as_mut() {
+		let _ = blocking(move || client.batch_execute("ROLLBACK"));
 	}
 }
 
-fn blocking<T>(operation: impl FnOnce() -> T) -> T {
-	if tokio::runtime::Handle::try_current()
-		.is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-	{
-		tokio::task::block_in_place(operation)
-	} else {
-		operation()
+fn blocking<T: Send>(operation: impl FnOnce() -> T + Send) -> T {
+	match tokio::runtime::Handle::try_current() {
+		Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+			tokio::task::block_in_place(operation)
+		},
+		Ok(_) => std::thread::scope(|scope| match scope.spawn(operation).join() {
+			Ok(value) => value,
+			Err(payload) => std::panic::resume_unwind(payload),
+		}),
+		Err(_) => operation(),
 	}
 }
 
@@ -258,6 +256,18 @@ fn open_sqlite_connection<P: AsRef<std::path::Path>>(path: P) -> Result<Connecti
 		.map_err(sql_error)?;
 	migrate(&connection)?;
 	Ok(connection)
+}
+
+fn empty_serialized_store_state() -> Result<Vec<u8>> {
+	let connection = Connection::open_in_memory().map_err(sql_error)?;
+	connection
+		.pragma_update(None, "foreign_keys", "ON")
+		.map_err(sql_error)?;
+	migrate(&connection)?;
+	connection
+		.serialize(rusqlite::MAIN_DB)
+		.map(|state| state.to_vec())
+		.map_err(sql_error)
 }
 
 fn open_serialized_connection(bytes: &[u8]) -> Result<Connection> {
@@ -305,6 +315,8 @@ impl Store {
 	}
 
 	fn open_postgres(url: &str) -> Result<Self> {
+		let initial_state = empty_serialized_store_state()?;
+
 		let mut client = pg::connect(url, "function PostgreSQL store")?;
 		blocking(|| {
 			client
@@ -315,29 +327,22 @@ impl Store {
 					)",
 				)
 				.map_err(pg_error)?;
-			let exists = client
-				.query_opt("SELECT singleton FROM function_store_state WHERE singleton = TRUE", &[])
-				.map_err(pg_error)?
-				.is_some();
-			if !exists {
-				let connection = Connection::open_in_memory().map_err(sql_error)?;
-				connection
-					.pragma_update(None, "foreign_keys", "ON")
-					.map_err(sql_error)?;
-				migrate(&connection)?;
-				let state = connection.serialize(rusqlite::MAIN_DB).map_err(sql_error)?;
-				let bytes: &[u8] = &state;
-				client
-					.execute("INSERT INTO function_store_state (singleton, state) VALUES (TRUE, $1)", &[
-						&bytes,
-					])
-					.map_err(pg_error)?;
-			}
+			client
+				.execute(
+					"INSERT INTO function_store_state (singleton, state) VALUES (TRUE, $1)
+					 ON CONFLICT (singleton) DO NOTHING",
+					&[&initial_state],
+				)
+				.map_err(pg_error)?;
 			Ok::<(), EngineError>(())
 		})?;
-		Ok(Self {
-			connection: StoreConnection::Postgres(PgConnection { client: Mutex::new(Some(client)) }),
-		})
+		let connection = PgConnection {
+			client: Mutex::new(Some(client)),
+			#[cfg(test)]
+			persistence_failure: Mutex::new(None),
+		};
+		connection.with_connection(|_| Ok(()))?;
+		Ok(Self { connection: StoreConnection::Postgres(Box::new(connection)) })
 	}
 
 	/// Register an immutable revision, deduplicating by the full canonical spec
@@ -360,68 +365,71 @@ impl Store {
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("function is required"))?;
 		let request_fingerprint = digest_hex.as_bytes();
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if let Some(resource) = idempotent_resource(&tx, "register", request_id, request_fingerprint)?
-		{
-			let revision = revision_by_id(&tx, &resource)?;
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "register", request_id, request_fingerprint)?
+			{
+				let revision = revision_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(revision);
+			}
+			if let Some(revision) = revision_by_digest(&tx, &digest_hex)? {
+				put_idempotency(
+					&tx,
+					"register",
+					request_id,
+					request_fingerprint,
+					revision_id(&revision)?,
+					now_ms,
+				)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(revision);
+			}
+			let id = Uuid::new_v4().to_string();
+			let revision = FunctionRevision {
+				r#ref:                  Some(RevisionRef {
+					function:    Some(function.clone()),
+					revision_id: id.clone(),
+				}),
+				spec:                   Some(spec.clone()),
+				spec_digest:            Some(Digest {
+					algorithm: DigestAlgorithm::Sha256 as i32,
+					value:     digest.to_vec(),
+				}),
+				created_at_unix_millis: now_ms,
+				status:                 FunctionRevisionStatus::Ready as i32,
+				unavailable_secrets:    Vec::new(),
+				snapshot_presence:      None,
+			};
+			tx.execute(
+				"INSERT INTO revisions(id,digest,namespace,name,spec,record,created_ms) \
+				 VALUES(?,?,?,?,?,?,?)",
+				params![
+					id,
+					digest_hex,
+					function.namespace,
+					function.name,
+					spec_bytes,
+					revision.encode_to_vec(),
+					u64_i64(now_ms)?
+				],
+			)
+			.map_err(sql_error)?;
+			put_idempotency(&tx, "register", request_id, request_fingerprint, &id, now_ms)?;
+			for digest in function_spec_artifacts(spec) {
+				add_artifact_ref(&tx, &digest, "revision", &id)?;
+			}
 			tx.commit().map_err(sql_error)?;
-			return Ok(revision);
-		}
-		if let Some(revision) = revision_by_digest(&tx, &digest_hex)? {
-			put_idempotency(
-				&tx,
-				"register",
-				request_id,
-				request_fingerprint,
-				revision_id(&revision)?,
-				now_ms,
-			)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(revision);
-		}
-		let id = Uuid::new_v4().to_string();
-		let revision = FunctionRevision {
-			r#ref:                  Some(RevisionRef {
-				function:    Some(function.clone()),
-				revision_id: id.clone(),
-			}),
-			spec:                   Some(spec.clone()),
-			spec_digest:            Some(Digest {
-				algorithm: DigestAlgorithm::Sha256 as i32,
-				value:     digest.to_vec(),
-			}),
-			created_at_unix_millis: now_ms,
-			status:                 FunctionRevisionStatus::Ready as i32,
-			unavailable_secrets:    Vec::new(),
-			snapshot_presence:      None,
-		};
-		tx.execute(
-			"INSERT INTO revisions(id,digest,namespace,name,spec,record,created_ms) \
-			 VALUES(?,?,?,?,?,?,?)",
-			params![
-				id,
-				digest_hex,
-				function.namespace,
-				function.name,
-				spec_bytes,
-				revision.encode_to_vec(),
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		put_idempotency(&tx, "register", request_id, request_fingerprint, &id, now_ms)?;
-		for digest in function_spec_artifacts(spec) {
-			add_artifact_ref(&tx, &digest, "revision", &id)?;
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(revision)
+			Ok(revision)
+		})
 	}
 
 	/// Resolve a pinned revision identifier.
 	pub fn get_revision(&self, revision_id: &str) -> Result<FunctionRevision> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		revision_by_id(&connection, revision_id)
+		self
+			.connection
+			.with_connection(|connection| revision_by_id(connection, revision_id))
 	}
 
 	/// Recompute persisted revision availability from currently missing secret
@@ -431,32 +439,33 @@ impl Store {
 		revision_id: &str,
 		unavailable: Vec<SecretRef>,
 	) -> Result<FunctionRevision> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut revision = revision_by_id(&tx, revision_id)?;
-		let declared = &revision
-			.spec
-			.as_ref()
-			.ok_or_else(|| EngineError::engine("revision missing spec"))?
-			.secrets;
-		for secret in &unavailable {
-			if !declared.contains(secret) {
-				return Err(EngineError::invalid("unavailable secret was not declared by revision"));
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut revision = revision_by_id(&tx, revision_id)?;
+			let declared = &revision
+				.spec
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("revision missing spec"))?
+				.secrets;
+			for secret in &unavailable {
+				if !declared.contains(secret) {
+					return Err(EngineError::invalid("unavailable secret was not declared by revision"));
+				}
 			}
-		}
-		revision.unavailable_secrets = unavailable;
-		revision.status = if revision.unavailable_secrets.is_empty() {
-			FunctionRevisionStatus::Ready as i32
-		} else {
-			FunctionRevisionStatus::Unavailable as i32
-		};
-		tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
-			revision.encode_to_vec(),
-			revision_id
-		])
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(revision)
+			revision.unavailable_secrets = unavailable;
+			revision.status = if revision.unavailable_secrets.is_empty() {
+				FunctionRevisionStatus::Ready as i32
+			} else {
+				FunctionRevisionStatus::Unavailable as i32
+			};
+			tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
+				revision.encode_to_vec(),
+				revision_id
+			])
+			.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(revision)
+		})
 	}
 
 	/// Persist a reloadable snapshot record and atomically attach it to its
@@ -474,100 +483,105 @@ impl Store {
 		if snapshot.protocol_version == 0 {
 			return Err(EngineError::invalid("snapshot protocol version is required"));
 		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut revision = revision_by_id(&tx, &revision_ref.revision_id)?;
-		if revision.r#ref.as_ref() != Some(revision_ref) {
-			return Err(EngineError::invalid("snapshot revision identity mismatch"));
-		}
-		let mut record = snapshot.clone();
-		let id = record
-			.r#ref
-			.as_ref()
-			.map(|value| value.snapshot_id.clone())
-			.filter(|value| !value.is_empty())
-			.unwrap_or_else(|| Uuid::new_v4().to_string());
-		record.r#ref = Some(FunctionSnapshotRef { snapshot_id: id.clone() });
-		tx.execute(
-			"INSERT INTO function_snapshots(id,revision_id,record,created_ms) VALUES(?,?,?,?)",
-			params![
-				id,
-				revision_ref.revision_id,
-				record.encode_to_vec(),
-				u64_i64(record.created_at_unix_millis)?
-			],
-		)
-		.map_err(sql_error)?;
-		add_artifact_ref(&tx, &artifact_digest, "function_snapshot", &id)?;
-		revision.snapshot_presence =
-			Some(function_revision::SnapshotPresence::Snapshot(record.clone()));
-		tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
-			revision.encode_to_vec(),
-			revision_ref.revision_id
-		])
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(record)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut revision = revision_by_id(&tx, &revision_ref.revision_id)?;
+			if revision.r#ref.as_ref() != Some(revision_ref) {
+				return Err(EngineError::invalid("snapshot revision identity mismatch"));
+			}
+			let mut record = snapshot.clone();
+			let id = record
+				.r#ref
+				.as_ref()
+				.map(|value| value.snapshot_id.clone())
+				.filter(|value| !value.is_empty())
+				.unwrap_or_else(|| Uuid::new_v4().to_string());
+			record.r#ref = Some(FunctionSnapshotRef { snapshot_id: id.clone() });
+			tx.execute(
+				"INSERT INTO function_snapshots(id,revision_id,record,created_ms) VALUES(?,?,?,?)",
+				params![
+					id,
+					revision_ref.revision_id,
+					record.encode_to_vec(),
+					u64_i64(record.created_at_unix_millis)?
+				],
+			)
+			.map_err(sql_error)?;
+			add_artifact_ref(&tx, &artifact_digest, "function_snapshot", &id)?;
+			revision.snapshot_presence =
+				Some(function_revision::SnapshotPresence::Snapshot(record.clone()));
+			tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
+				revision.encode_to_vec(),
+				revision_ref.revision_id
+			])
+			.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(record)
+		})
 	}
 
 	/// Durably detach and delete a revision snapshot after permanent corruption.
 	pub fn detach_function_snapshot(&self, revision_id: &str) -> Result<()> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut revision = revision_by_id(&tx, revision_id)?;
-		let snapshot_id = revision
-			.snapshot_presence
-			.as_ref()
-			.and_then(|presence| match presence {
-				function_revision::SnapshotPresence::Snapshot(record) => record
-					.r#ref
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut revision = revision_by_id(&tx, revision_id)?;
+			let snapshot_id =
+				revision
+					.snapshot_presence
 					.as_ref()
-					.map(|reference| reference.snapshot_id.clone()),
-			});
-		revision.snapshot_presence = None;
-		tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
-			revision.encode_to_vec(),
-			revision_id
-		])
-		.map_err(sql_error)?;
-		if let Some(snapshot_id) = snapshot_id {
-			tx.execute(
-				"DELETE FROM artifact_refs WHERE owner_kind='function_snapshot' AND owner_id=?",
-				[&snapshot_id],
-			)
+					.and_then(|presence| match presence {
+						function_revision::SnapshotPresence::Snapshot(record) => record
+							.r#ref
+							.as_ref()
+							.map(|reference| reference.snapshot_id.clone()),
+					});
+			revision.snapshot_presence = None;
+			tx.execute("UPDATE revisions SET record=? WHERE id=?", params![
+				revision.encode_to_vec(),
+				revision_id
+			])
 			.map_err(sql_error)?;
-			tx.execute("DELETE FROM function_snapshots WHERE id=?", [&snapshot_id])
+			if let Some(snapshot_id) = snapshot_id {
+				tx.execute(
+					"DELETE FROM artifact_refs WHERE owner_kind='function_snapshot' AND owner_id=?",
+					[&snapshot_id],
+				)
 				.map_err(sql_error)?;
-		}
-		tx.commit().map_err(sql_error)
+				tx.execute("DELETE FROM function_snapshots WHERE id=?", [&snapshot_id])
+					.map_err(sql_error)?;
+			}
+			tx.commit().map_err(sql_error)
+		})
 	}
 
 	/// Reload an immutable function snapshot record.
 	pub fn get_function_snapshot(&self, snapshot_id: &str) -> Result<FunctionSnapshotRecord> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let bytes: Vec<u8> = connection
-			.query_row("SELECT record FROM function_snapshots WHERE id=?", [snapshot_id], |row| {
-				row.get(0)
-			})
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("function snapshot not found"))?;
-		decode_message(&bytes)
+		self.connection.with_connection(|connection| {
+			let bytes: Vec<u8> = connection
+				.query_row("SELECT record FROM function_snapshots WHERE id=?", [snapshot_id], |row| {
+					row.get(0)
+				})
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("function snapshot not found"))?;
+			decode_message(&bytes)
+		})
 	}
 
 	/// Resolve the active revision for a logical function.
 	pub fn get_active_revision(&self, function: &FunctionRef) -> Result<FunctionRevision> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let id: String = connection
-			.query_row(
-				"SELECT revision_id FROM aliases WHERE namespace=? AND name=?",
-				params![function.namespace, function.name],
-				|row| row.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("function has no active revision"))?;
-		revision_by_id(&connection, &id)
+		self.connection.with_connection(|connection| {
+			let id: String = connection
+				.query_row(
+					"SELECT revision_id FROM aliases WHERE namespace=? AND name=?",
+					params![function.namespace, function.name],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("function has no active revision"))?;
+			revision_by_id(connection, &id)
+		})
 	}
 
 	/// Atomically change a logical function alias with optional
@@ -582,38 +596,39 @@ impl Store {
 			.function
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("revision function is required"))?;
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let stored = revision_by_id(&tx, &revision.revision_id)?;
-		if stored
-			.r#ref
-			.as_ref()
-			.and_then(|value| value.function.as_ref())
-			!= Some(function)
-		{
-			return Err(EngineError::invalid("revision does not belong to function"));
-		}
-		let current: Option<String> = tx
-			.query_row(
-				"SELECT revision_id FROM aliases WHERE namespace=? AND name=?",
-				params![function.namespace, function.name],
-				|row| row.get(0),
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let stored = revision_by_id(&tx, &revision.revision_id)?;
+			if stored
+				.r#ref
+				.as_ref()
+				.and_then(|value| value.function.as_ref())
+				!= Some(function)
+			{
+				return Err(EngineError::invalid("revision does not belong to function"));
+			}
+			let current: Option<String> = tx
+				.query_row(
+					"SELECT revision_id FROM aliases WHERE namespace=? AND name=?",
+					params![function.namespace, function.name],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?;
+			check_expected_revision(current.as_deref(), expected_current)?;
+			tx.execute(
+				"INSERT INTO aliases(namespace,name,revision_id,updated_ms) VALUES(?,?,?,?) ON \
+				 CONFLICT(namespace,name) DO UPDATE SET \
+				 revision_id=excluded.revision_id,updated_ms=excluded.updated_ms",
+				params![function.namespace, function.name, revision.revision_id, u64_i64(now_ms)?],
 			)
-			.optional()
 			.map_err(sql_error)?;
-		check_expected_revision(current.as_deref(), expected_current)?;
-		tx.execute(
-			"INSERT INTO aliases(namespace,name,revision_id,updated_ms) VALUES(?,?,?,?) ON \
-			 CONFLICT(namespace,name) DO UPDATE SET \
-			 revision_id=excluded.revision_id,updated_ms=excluded.updated_ms",
-			params![function.namespace, function.name, revision.revision_id, u64_i64(now_ms)?],
-		)
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(FunctionRecord {
-			function:               Some(function.clone()),
-			current:                Some(revision.clone()),
-			updated_at_unix_millis: now_ms,
+			tx.commit().map_err(sql_error)?;
+			Ok(FunctionRecord {
+				function:               Some(function.clone()),
+				current:                Some(revision.clone()),
+				updated_at_unix_millis: now_ms,
+			})
 		})
 	}
 
@@ -626,72 +641,77 @@ impl Store {
 	) -> Result<Page<FunctionRevision>> {
 		let limit = normalized_page_size(page_size);
 		let (after_ms, after_id) = decode_page_token(page_token)?;
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT record,created_ms,id FROM revisions WHERE (?1 IS NULL OR namespace=?1) AND \
-				 (created_ms>?2 OR (created_ms=?2 AND id>?3)) ORDER BY created_ms,id LIMIT ?4",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(params![namespace, u64_i64(after_ms)?, after_id, i64::from(limit + 1)], |row| {
-				Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-			})
-			.map_err(sql_error)?;
-		page_from_rows(rows, limit, decode_message)
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT record,created_ms,id FROM revisions WHERE (?1 IS NULL OR namespace=?1) AND \
+					 (created_ms>?2 OR (created_ms=?2 AND id>?3)) ORDER BY created_ms,id LIMIT ?4",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(
+					params![namespace, u64_i64(after_ms)?, after_id, i64::from(limit + 1)],
+					|row| {
+						Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+					},
+				)
+				.map_err(sql_error)?;
+			page_from_rows(rows, limit, decode_message)
+		})
 	}
 
 	/// Delete an inactive, unreferenced immutable function revision.
 	pub fn delete_revision(&self, revision: &RevisionRef) -> Result<()> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let stored = revision_by_id(&tx, &revision.revision_id)?;
-		if stored.r#ref.as_ref().and_then(|r| r.function.as_ref()) != revision.function.as_ref() {
-			return Err(EngineError::invalid("revision belongs to another function"));
-		}
-		let referenced: bool = tx
-			.query_row(
-				"SELECT EXISTS(SELECT 1 FROM aliases WHERE revision_id=? UNION ALL SELECT 1 FROM \
-				 app_members WHERE revision_id=? UNION ALL SELECT 1 FROM calls WHERE revision_id=? \
-				 UNION ALL SELECT 1 FROM actors WHERE revision_id=?)",
-				params![
-					revision.revision_id,
-					revision.revision_id,
-					revision.revision_id,
-					revision.revision_id
-				],
-				|r| r.get(0),
-			)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let stored = revision_by_id(&tx, &revision.revision_id)?;
+			if stored.r#ref.as_ref().and_then(|r| r.function.as_ref()) != revision.function.as_ref() {
+				return Err(EngineError::invalid("revision belongs to another function"));
+			}
+			let referenced: bool = tx
+				.query_row(
+					"SELECT EXISTS(SELECT 1 FROM aliases WHERE revision_id=? UNION ALL SELECT 1 FROM \
+					 app_members WHERE revision_id=? UNION ALL SELECT 1 FROM calls WHERE revision_id=? \
+					 UNION ALL SELECT 1 FROM actors WHERE revision_id=?)",
+					params![
+						revision.revision_id,
+						revision.revision_id,
+						revision.revision_id,
+						revision.revision_id
+					],
+					|r| r.get(0),
+				)
+				.map_err(sql_error)?;
+			if referenced {
+				return Err(EngineError::busy("revision is active or referenced"));
+			}
+			let mut snapshots = tx
+				.prepare("SELECT id FROM function_snapshots WHERE revision_id=?")
+				.map_err(sql_error)?;
+			let snapshot_ids = snapshots
+				.query_map([&revision.revision_id], |row| row.get::<_, String>(0))
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(snapshots);
+			for snapshot_id in snapshot_ids {
+				tx.execute(
+					"DELETE FROM artifact_refs WHERE owner_kind='function_snapshot' AND owner_id=?",
+					[&snapshot_id],
+				)
+				.map_err(sql_error)?;
+			}
+			tx.execute("DELETE FROM function_snapshots WHERE revision_id=?", [&revision.revision_id])
+				.map_err(sql_error)?;
+			tx.execute("DELETE FROM artifact_refs WHERE owner_kind='revision' AND owner_id=?", [
+				&revision.revision_id,
+			])
 			.map_err(sql_error)?;
-		if referenced {
-			return Err(EngineError::busy("revision is active or referenced"));
-		}
-		let mut snapshots = tx
-			.prepare("SELECT id FROM function_snapshots WHERE revision_id=?")
-			.map_err(sql_error)?;
-		let snapshot_ids = snapshots
-			.query_map([&revision.revision_id], |row| row.get::<_, String>(0))
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(snapshots);
-		for snapshot_id in snapshot_ids {
-			tx.execute(
-				"DELETE FROM artifact_refs WHERE owner_kind='function_snapshot' AND owner_id=?",
-				[&snapshot_id],
-			)
-			.map_err(sql_error)?;
-		}
-		tx.execute("DELETE FROM function_snapshots WHERE revision_id=?", [&revision.revision_id])
-			.map_err(sql_error)?;
-		tx.execute("DELETE FROM artifact_refs WHERE owner_kind='revision' AND owner_id=?", [
-			&revision.revision_id,
-		])
-		.map_err(sql_error)?;
-		tx.execute("DELETE FROM revisions WHERE id=?", [&revision.revision_id])
-			.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(())
+			tx.execute("DELETE FROM revisions WHERE id=?", [&revision.revision_id])
+				.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(())
+		})
 	}
 
 	/// Atomically publish an immutable application revision.
@@ -712,85 +732,86 @@ impl Store {
 		canonical_request.functions.clone_from(&bindings);
 		canonical_request.request_id.clear();
 		let fingerprint = canonical_request.encode_to_vec();
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if let Some(resource) =
-			idempotent_resource(&tx, "activate_app", &request.request_id, &fingerprint)?
-		{
-			let value = app_revision_by_id(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		for binding in &bindings {
-			let revision = binding
-				.revision
-				.as_ref()
-				.ok_or_else(|| EngineError::invalid("app binding revision is required"))?;
-			revision_by_id(&tx, &revision.revision_id)?;
-		}
-		let current: Option<String> = tx
-			.query_row(
-				"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
-				params![app.namespace, app.name],
-				|row| row.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?;
-		check_expected_app(
-			current.as_deref(),
-			request.expected_current_presence.as_ref().map(|v| match v {
-				activate_app_request::ExpectedCurrentPresence::ExpectedCurrent(r) => r,
-			}),
-		)?;
-		let id = Uuid::new_v4().to_string();
-		let value = AppRevision {
-			r#ref:                  Some(AppRevisionRef {
-				app:         Some(app.clone()),
-				revision_id: id.clone(),
-			}),
-			functions:              bindings.clone(),
-			content_digest:         Some(Digest {
-				algorithm: DigestAlgorithm::Sha256 as i32,
-				value:     digest.to_vec(),
-			}),
-			created_at_unix_millis: now_ms,
-			previous_presence:      current.map(|revision_id| {
-				app_revision::PreviousPresence::Previous(AppRevisionRef {
-					app: Some(app.clone()),
-					revision_id,
-				})
-			}),
-		};
-		tx.execute(
-			"INSERT INTO app_revisions(id,namespace,name,digest,record,created_ms) \
-			 VALUES(?,?,?,?,?,?)",
-			params![
-				id,
-				app.namespace,
-				app.name,
-				hex::encode(digest),
-				value.encode_to_vec(),
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		for binding in &bindings {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "activate_app", &request.request_id, &fingerprint)?
+			{
+				let value = app_revision_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			for binding in &bindings {
+				let revision = binding
+					.revision
+					.as_ref()
+					.ok_or_else(|| EngineError::invalid("app binding revision is required"))?;
+				revision_by_id(&tx, &revision.revision_id)?;
+			}
+			let current: Option<String> = tx
+				.query_row(
+					"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
+					params![app.namespace, app.name],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?;
+			check_expected_app(
+				current.as_deref(),
+				request.expected_current_presence.as_ref().map(|v| match v {
+					activate_app_request::ExpectedCurrentPresence::ExpectedCurrent(r) => r,
+				}),
+			)?;
+			let id = Uuid::new_v4().to_string();
+			let value = AppRevision {
+				r#ref:                  Some(AppRevisionRef {
+					app:         Some(app.clone()),
+					revision_id: id.clone(),
+				}),
+				functions:              bindings.clone(),
+				content_digest:         Some(Digest {
+					algorithm: DigestAlgorithm::Sha256 as i32,
+					value:     digest.to_vec(),
+				}),
+				created_at_unix_millis: now_ms,
+				previous_presence:      current.map(|revision_id| {
+					app_revision::PreviousPresence::Previous(AppRevisionRef {
+						app: Some(app.clone()),
+						revision_id,
+					})
+				}),
+			};
 			tx.execute(
-				"INSERT INTO app_members(app_revision_id,name,revision_id) VALUES(?,?,?)",
-				params![id, binding.name, binding.revision.as_ref().unwrap().revision_id],
+				"INSERT INTO app_revisions(id,namespace,name,digest,record,created_ms) \
+				 VALUES(?,?,?,?,?,?)",
+				params![
+					id,
+					app.namespace,
+					app.name,
+					hex::encode(digest),
+					value.encode_to_vec(),
+					u64_i64(now_ms)?
+				],
 			)
 			.map_err(sql_error)?;
-		}
-		tx.execute(
-			"INSERT INTO app_aliases(namespace,name,revision_id,updated_ms) VALUES(?,?,?,?) ON \
-			 CONFLICT(namespace,name) DO UPDATE SET \
-			 revision_id=excluded.revision_id,updated_ms=excluded.updated_ms",
-			params![app.namespace, app.name, id, u64_i64(now_ms)?],
-		)
-		.map_err(sql_error)?;
-		put_idempotency(&tx, "activate_app", &request.request_id, &fingerprint, &id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			for binding in &bindings {
+				tx.execute(
+					"INSERT INTO app_members(app_revision_id,name,revision_id) VALUES(?,?,?)",
+					params![id, binding.name, binding.revision.as_ref().unwrap().revision_id],
+				)
+				.map_err(sql_error)?;
+			}
+			tx.execute(
+				"INSERT INTO app_aliases(namespace,name,revision_id,updated_ms) VALUES(?,?,?,?) ON \
+				 CONFLICT(namespace,name) DO UPDATE SET \
+				 revision_id=excluded.revision_id,updated_ms=excluded.updated_ms",
+				params![app.namespace, app.name, id, u64_i64(now_ms)?],
+			)
+			.map_err(sql_error)?;
+			put_idempotency(&tx, "activate_app", &request.request_id, &fingerprint, &id, now_ms)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Atomically move an app alias back to an existing immutable revision.
@@ -804,69 +825,72 @@ impl Store {
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("target app is required"))?;
 		let fingerprint = target.encode_to_vec();
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if let Some(resource) =
-			idempotent_resource(&tx, "rollback_app", &request.request_id, &fingerprint)?
-		{
-			let value = app_revision_by_id(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		let value = app_revision_by_id(&tx, &target.revision_id)?;
-		if value.r#ref.as_ref().and_then(|r| r.app.as_ref()) != Some(app) {
-			return Err(EngineError::invalid("app revision belongs to another app"));
-		}
-		let current: Option<String> = tx
-			.query_row(
-				"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
-				params![app.namespace, app.name],
-				|r| r.get(0),
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "rollback_app", &request.request_id, &fingerprint)?
+			{
+				let value = app_revision_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			let value = app_revision_by_id(&tx, &target.revision_id)?;
+			if value.r#ref.as_ref().and_then(|r| r.app.as_ref()) != Some(app) {
+				return Err(EngineError::invalid("app revision belongs to another app"));
+			}
+			let current: Option<String> = tx
+				.query_row(
+					"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
+					params![app.namespace, app.name],
+					|r| r.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?;
+			check_expected_app(
+				current.as_deref(),
+				request.expected_current_presence.as_ref().map(|v| match v {
+					rollback_app_request::ExpectedCurrentPresence::ExpectedCurrent(r) => r,
+				}),
+			)?;
+			tx.execute(
+				"UPDATE app_aliases SET revision_id=?,updated_ms=? WHERE namespace=? AND name=?",
+				params![target.revision_id, u64_i64(now_ms)?, app.namespace, app.name],
 			)
-			.optional()
 			.map_err(sql_error)?;
-		check_expected_app(
-			current.as_deref(),
-			request.expected_current_presence.as_ref().map(|v| match v {
-				rollback_app_request::ExpectedCurrentPresence::ExpectedCurrent(r) => r,
-			}),
-		)?;
-		tx.execute(
-			"UPDATE app_aliases SET revision_id=?,updated_ms=? WHERE namespace=? AND name=?",
-			params![target.revision_id, u64_i64(now_ms)?, app.namespace, app.name],
-		)
-		.map_err(sql_error)?;
-		put_idempotency(
-			&tx,
-			"rollback_app",
-			&request.request_id,
-			&fingerprint,
-			&target.revision_id,
-			now_ms,
-		)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			put_idempotency(
+				&tx,
+				"rollback_app",
+				&request.request_id,
+				&fingerprint,
+				&target.revision_id,
+				now_ms,
+			)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Resolve a pinned app revision.
 	pub fn get_app_revision(&self, id: &str) -> Result<AppRevision> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		app_revision_by_id(&c, id)
+		self
+			.connection
+			.with_connection(|c| app_revision_by_id(c, id))
 	}
 
 	/// Resolve the current app revision.
 	pub fn get_active_app(&self, app: &AppRef) -> Result<AppRevision> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let id: String = c
-			.query_row(
-				"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
-				params![app.namespace, app.name],
-				|r| r.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("app has no active revision"))?;
-		app_revision_by_id(&c, &id)
+		self.connection.with_connection(|c| {
+			let id: String = c
+				.query_row(
+					"SELECT revision_id FROM app_aliases WHERE namespace=? AND name=?",
+					params![app.namespace, app.name],
+					|r| r.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("app has no active revision"))?;
+			app_revision_by_id(c, &id)
+		})
 	}
 
 	/// Create a call and all initial inputs in one transaction.
@@ -875,117 +899,121 @@ impl Store {
 		let target = request.target.as_ref().unwrap();
 		let revision_ref = target.function.as_ref().unwrap();
 		let fingerprint = canonical_call_fingerprint(request);
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		if let Some(resource) =
-			idempotent_resource(&tx, "create_call", &request.request_id, &fingerprint)?
-		{
-			let value = call_record(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		let revision = revision_by_id(&tx, &revision_ref.revision_id)?;
-		if revision.r#ref.as_ref().and_then(|r| r.function.as_ref()) != revision_ref.function.as_ref()
-		{
-			return Err(EngineError::invalid(
-				"revision function identity does not match stored revision",
-			));
-		}
-		if let Some(call_target::Receiver::Actor(actor_target)) = &target.receiver {
-			let actor_ref = actor_target
-				.actor
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "create_call", &request.request_id, &fingerprint)?
+			{
+				let value = call_record(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			let revision = revision_by_id(&tx, &revision_ref.revision_id)?;
+			if revision.r#ref.as_ref().and_then(|r| r.function.as_ref())
+				!= revision_ref.function.as_ref()
+			{
+				return Err(EngineError::invalid(
+					"revision function identity does not match stored revision",
+				));
+			}
+			if let Some(call_target::Receiver::Actor(actor_target)) = &target.receiver {
+				let actor_ref = actor_target
+					.actor
+					.as_ref()
+					.ok_or_else(|| EngineError::invalid("actor target is required"))?;
+				let actor = actor_by_id(&tx, &actor_ref.actor_id)?;
+				if actor.function.as_ref() != Some(revision_ref) {
+					return Err(EngineError::invalid("actor target revision does not match actor"));
+				}
+			}
+			let spec = revision
+				.spec
 				.as_ref()
-				.ok_or_else(|| EngineError::invalid("actor target is required"))?;
-			let actor = actor_by_id(&tx, &actor_ref.actor_id)?;
-			if actor.function.as_ref() != Some(revision_ref) {
-				return Err(EngineError::invalid("actor target revision does not match actor"));
+				.ok_or_else(|| EngineError::engine("revision missing spec"))?;
+			reject_unroutable_function_ha(spec)?;
+			let lifecycle =
+				FunctionLifecycle::try_from(spec.lifecycle).unwrap_or(FunctionLifecycle::Stateless);
+			let expected = match target.receiver.as_ref() {
+				Some(call_target::Receiver::Actor(_)) => FunctionLifecycle::Actor,
+				Some(call_target::Receiver::Service(_)) => FunctionLifecycle::Instance,
+				None => FunctionLifecycle::Stateless,
+			};
+			if lifecycle != expected {
+				return Err(EngineError::invalid(
+					"call receiver is incompatible with function lifecycle",
+				));
 			}
-		}
-		let spec = revision
-			.spec
-			.as_ref()
-			.ok_or_else(|| EngineError::engine("revision missing spec"))?;
-		reject_unroutable_function_ha(spec)?;
-		let lifecycle =
-			FunctionLifecycle::try_from(spec.lifecycle).unwrap_or(FunctionLifecycle::Stateless);
-		let expected = match target.receiver.as_ref() {
-			Some(call_target::Receiver::Actor(_)) => FunctionLifecycle::Actor,
-			Some(call_target::Receiver::Service(_)) => FunctionLifecycle::Instance,
-			None => FunctionLifecycle::Stateless,
-		};
-		if lifecycle != expected {
-			return Err(EngineError::invalid("call receiver is incompatible with function lifecycle"));
-		}
-		let input_serializer = spec
-			.serializer
-			.as_ref()
-			.ok_or_else(|| EngineError::engine("revision missing serializer"))?
-			.input_serializer;
-		for input in &request.inputs {
-			validate_input_serializer(input, input_serializer)?;
-		}
-		let timeouts = spec.timeouts.as_ref();
-		let queue_deadline =
-			timeouts.and_then(|t| (t.queue_millis > 0).then(|| now_ms.saturating_add(t.queue_millis)));
-		let execution_ms = timeouts.map_or(0, |t| t.execution_millis);
-		let ttl = request.result_ttl_millis_presence.as_ref().map_or_else(
-			|| timeouts.map_or(0, |t| t.result_ttl_millis),
-			|v| match v {
-				create_call_request::ResultTtlMillisPresence::ResultTtlMillis(v) => *v,
-			},
-		);
-		let id = Uuid::new_v4().to_string();
-		let persisted = request.clone();
-		let mut persisted_ids = HashSet::new();
-		if persisted
-			.inputs
-			.iter()
-			.any(|input| !persisted_ids.insert(&input.input_id))
-		{
-			return Err(EngineError::invalid("input ids must be unique"));
-		}
-		let status = if persisted.inputs.is_empty() && !persisted.inputs_closed {
-			CallStatus::Pending
-		} else {
-			CallStatus::Queued
-		};
-		tx.execute(
-			"INSERT INTO \
-			 calls(id,revision_id,actor_id,kind,status,input_closed,request,created_ms,updated_ms,\
-			 queued_ms,queue_deadline_ms,execution_timeout_ms,result_ttl_ms,event_seq,result_seq) \
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)",
-			params![
-				id,
-				revision_ref.revision_id,
-				target.receiver.as_ref().and_then(|value| match value {
-					call_target::Receiver::Actor(target) =>
-						target.actor.as_ref().map(|actor| actor.actor_id.as_str()),
-					call_target::Receiver::Service(_) => None,
-				}),
-				request.r#type,
-				status as i32,
-				persisted.inputs_closed,
-				persisted.encode_to_vec(),
-				u64_i64(now_ms)?,
-				u64_i64(now_ms)?,
-				u64_i64(now_ms)?,
-				opt_u64_i64(queue_deadline)?,
-				u64_i64(execution_ms)?,
-				u64_i64(ttl)?
-			],
-		)
-		.map_err(sql_error)?;
-		for input in &persisted.inputs {
-			insert_input(&tx, &id, input, now_ms)?;
-			for digest in call_input_artifacts(input) {
-				add_artifact_ref(&tx, &digest, "input", &format!("{id}:{}", input.index))?;
+			let input_serializer = spec
+				.serializer
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("revision missing serializer"))?
+				.input_serializer;
+			for input in &request.inputs {
+				validate_input_serializer(input, input_serializer)?;
 			}
-		}
-		append_status_event(&tx, &id, status, now_ms)?;
-		put_idempotency(&tx, "create_call", &request.request_id, &fingerprint, &id, now_ms)?;
-		let value = call_record(&tx, &id)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			let timeouts = spec.timeouts.as_ref();
+			let queue_deadline = timeouts
+				.and_then(|t| (t.queue_millis > 0).then(|| now_ms.saturating_add(t.queue_millis)));
+			let execution_ms = timeouts.map_or(0, |t| t.execution_millis);
+			let ttl = request.result_ttl_millis_presence.as_ref().map_or_else(
+				|| timeouts.map_or(0, |t| t.result_ttl_millis),
+				|v| match v {
+					create_call_request::ResultTtlMillisPresence::ResultTtlMillis(v) => *v,
+				},
+			);
+			let id = Uuid::new_v4().to_string();
+			let persisted = request.clone();
+			let mut persisted_ids = HashSet::new();
+			if persisted
+				.inputs
+				.iter()
+				.any(|input| !persisted_ids.insert(&input.input_id))
+			{
+				return Err(EngineError::invalid("input ids must be unique"));
+			}
+			let status = if persisted.inputs.is_empty() && !persisted.inputs_closed {
+				CallStatus::Pending
+			} else {
+				CallStatus::Queued
+			};
+			tx.execute(
+				"INSERT INTO \
+				 calls(id,revision_id,actor_id,kind,status,input_closed,request,created_ms,updated_ms,\
+				 queued_ms,queue_deadline_ms,execution_timeout_ms,result_ttl_ms,event_seq,result_seq) \
+				 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)",
+				params![
+					id,
+					revision_ref.revision_id,
+					target.receiver.as_ref().and_then(|value| match value {
+						call_target::Receiver::Actor(target) =>
+							target.actor.as_ref().map(|actor| actor.actor_id.as_str()),
+						call_target::Receiver::Service(_) => None,
+					}),
+					request.r#type,
+					status as i32,
+					persisted.inputs_closed,
+					persisted.encode_to_vec(),
+					u64_i64(now_ms)?,
+					u64_i64(now_ms)?,
+					u64_i64(now_ms)?,
+					opt_u64_i64(queue_deadline)?,
+					u64_i64(execution_ms)?,
+					u64_i64(ttl)?
+				],
+			)
+			.map_err(sql_error)?;
+			for input in &persisted.inputs {
+				insert_input(&tx, &id, input, now_ms)?;
+				for digest in call_input_artifacts(input) {
+					add_artifact_ref(&tx, &digest, "input", &format!("{id}:{}", input.index))?;
+				}
+			}
+			append_status_event(&tx, &id, status, now_ms)?;
+			put_idempotency(&tx, "create_call", &request.request_id, &fingerprint, &id, now_ms)?;
+			let value = call_record(&tx, &id)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Append one exactly-next input transactionally. Replays of identical
@@ -995,83 +1023,84 @@ impl Store {
 			return Err(EngineError::invalid("client input id is required"));
 		}
 		validate_call_input(input)?;
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		let (closed, count, status, revision_id): (bool, u64, i32, String) = tx
-			.query_row(
-				"SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE \
-				 call_id=calls.id),status,revision_id FROM calls WHERE id=?",
-				[call_id],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call not found"))?;
-		if !matches!(
-			CallStatus::try_from(status).unwrap_or(CallStatus::Unspecified),
-			CallStatus::Pending | CallStatus::Queued | CallStatus::Running
-		) {
-			return Err(EngineError::invalid("call does not accept inputs"));
-		}
-		let input_serializer = revision_by_id(&tx, &revision_id)?
-			.spec
-			.and_then(|spec| spec.serializer)
-			.ok_or_else(|| EngineError::engine("revision missing serializer"))?
-			.input_serializer;
-		validate_input_serializer(input, input_serializer)?;
-		if closed {
-			return Err(EngineError::invalid("call inputs are closed"));
-		}
-		if input.index < count {
-			let existing: Vec<u8> = tx
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			let (closed, count, status, revision_id): (bool, u64, i32, String) = tx
 				.query_row(
-					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-					params![call_id, u64_i64(input.index)?],
-					|r| r.get(0),
+					"SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE \
+					 call_id=calls.id),status,revision_id FROM calls WHERE id=?",
+					[call_id],
+					|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
 				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("call not found"))?;
+			if !matches!(
+				CallStatus::try_from(status).unwrap_or(CallStatus::Unspecified),
+				CallStatus::Pending | CallStatus::Queued | CallStatus::Running
+			) {
+				return Err(EngineError::invalid("call does not accept inputs"));
+			}
+			let input_serializer = revision_by_id(&tx, &revision_id)?
+				.spec
+				.and_then(|spec| spec.serializer)
+				.ok_or_else(|| EngineError::engine("revision missing serializer"))?
+				.input_serializer;
+			validate_input_serializer(input, input_serializer)?;
+			if closed {
+				return Err(EngineError::invalid("call inputs are closed"));
+			}
+			if input.index < count {
+				let existing: Vec<u8> = tx
+					.query_row(
+						"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+						params![call_id, u64_i64(input.index)?],
+						|r| r.get(0),
+					)
+					.map_err(sql_error)?;
+				if existing != input.encode_to_vec() {
+					return Err(EngineError::invalid("input index already contains different payload"));
+				}
+				tx.commit().map_err(sql_error)?;
+				return Ok(count);
+			}
+			if input.index != count {
+				return Err(EngineError::invalid(format!(
+					"input index must be contiguous; expected {count}"
+				)));
+			}
+			let mut statement = tx
+				.prepare("SELECT payload FROM inputs WHERE call_id=?")
 				.map_err(sql_error)?;
-			if existing != input.encode_to_vec() {
-				return Err(EngineError::invalid("input index already contains different payload"));
+			let blobs = statement
+				.query_map([call_id], |row| row.get::<_, Vec<u8>>(0))
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			for blob in blobs {
+				let existing: CallInput = decode_message(&blob)?;
+				if existing.input_id == input.input_id {
+					return Err(EngineError::invalid("input id already exists in call"));
+				}
+			}
+			insert_input(&tx, call_id, input, now_ms)?;
+			if status == CallStatus::Pending as i32 {
+				tx.execute("UPDATE calls SET status=?,queued_ms=?,updated_ms=? WHERE id=?", params![
+					CallStatus::Queued as i32,
+					u64_i64(now_ms)?,
+					u64_i64(now_ms)?,
+					call_id
+				])
+				.map_err(sql_error)?;
+				append_status_event(&tx, call_id, CallStatus::Queued, now_ms)?;
+			}
+			for digest in call_input_artifacts(input) {
+				add_artifact_ref(&tx, &digest, "input", &format!("{call_id}:{}", input.index))?;
 			}
 			tx.commit().map_err(sql_error)?;
-			return Ok(count);
-		}
-		if input.index != count {
-			return Err(EngineError::invalid(format!(
-				"input index must be contiguous; expected {count}"
-			)));
-		}
-		let mut statement = tx
-			.prepare("SELECT payload FROM inputs WHERE call_id=?")
-			.map_err(sql_error)?;
-		let blobs = statement
-			.query_map([call_id], |row| row.get::<_, Vec<u8>>(0))
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		for blob in blobs {
-			let existing: CallInput = decode_message(&blob)?;
-			if existing.input_id == input.input_id {
-				return Err(EngineError::invalid("input id already exists in call"));
-			}
-		}
-		insert_input(&tx, call_id, input, now_ms)?;
-		if status == CallStatus::Pending as i32 {
-			tx.execute("UPDATE calls SET status=?,queued_ms=?,updated_ms=? WHERE id=?", params![
-				CallStatus::Queued as i32,
-				u64_i64(now_ms)?,
-				u64_i64(now_ms)?,
-				call_id
-			])
-			.map_err(sql_error)?;
-			append_status_event(&tx, call_id, CallStatus::Queued, now_ms)?;
-		}
-		for digest in call_input_artifacts(input) {
-			add_artifact_ref(&tx, &digest, "input", &format!("{call_id}:{}", input.index))?;
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(count + 1)
+			Ok(count + 1)
+		})
 	}
 
 	/// Close an input stream only when its committed count matches the caller's
@@ -1082,83 +1111,85 @@ impl Store {
 		expected_count: u64,
 		now_ms: u64,
 	) -> Result<CallRecord> {
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		let (closed, count): (bool, u64) = tx
-			.query_row(
-				"SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id) FROM calls \
-				 WHERE id=?",
-				[call_id],
-				|r| Ok((r.get(0)?, r.get(1)?)),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call not found"))?;
-		if count != expected_count {
-			return Err(EngineError::invalid(format!(
-				"expected {expected_count} inputs, found {count}"
-			)));
-		}
-		if !closed {
-			tx.execute("UPDATE calls SET input_closed=1,updated_ms=? WHERE id=?", params![
-				u64_i64(now_ms)?,
-				call_id
-			])
-			.map_err(sql_error)?;
-			let response = StreamCallInputsResponse {
-				call:                   Some(CallRef { call_id: call_id.into() }),
-				committed_input_count:  count,
-				last_input_presence:    None,
-				max_inputs_outstanding: 0,
-			};
-			append_event(
-				&tx,
-				call_id,
-				CallEventType::InputClosed,
-				call_event::Payload::InputClosed(response),
-				now_ms,
-			)?;
-		}
-		complete_call_tx(&tx, call_id, now_ms)?;
-		let value = call_record(&tx, call_id)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			let (closed, count): (bool, u64) = tx
+				.query_row(
+					"SELECT input_closed,(SELECT COUNT(*) FROM inputs WHERE call_id=calls.id) FROM \
+					 calls WHERE id=?",
+					[call_id],
+					|r| Ok((r.get(0)?, r.get(1)?)),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("call not found"))?;
+			if count != expected_count {
+				return Err(EngineError::invalid(format!(
+					"expected {expected_count} inputs, found {count}"
+				)));
+			}
+			if !closed {
+				tx.execute("UPDATE calls SET input_closed=1,updated_ms=? WHERE id=?", params![
+					u64_i64(now_ms)?,
+					call_id
+				])
+				.map_err(sql_error)?;
+				let response = StreamCallInputsResponse {
+					call:                   Some(CallRef { call_id: call_id.into() }),
+					committed_input_count:  count,
+					last_input_presence:    None,
+					max_inputs_outstanding: 0,
+				};
+				append_event(
+					&tx,
+					call_id,
+					CallEventType::InputClosed,
+					call_event::Payload::InputClosed(response),
+					now_ms,
+				)?;
+			}
+			complete_call_tx(&tx, call_id, now_ms)?;
+			let value = call_record(&tx, call_id)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Return the latest durable call record.
 	pub fn get_call(&self, id: &str) -> Result<CallRecord> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		call_record(&c, id)
+		self.connection.with_connection(|c| call_record(c, id))
 	}
 
 	/// Return one persisted input, including a server-assigned stable input ID.
 	pub fn get_input(&self, call_id: &str, index: u64) -> Result<CallInput> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let bytes: Vec<u8> = connection
-			.query_row(
-				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-				params![call_id, u64_i64(index)?],
-				|row| row.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call input not found"))?;
-		decode_message(&bytes)
+		self.connection.with_connection(|connection| {
+			let bytes: Vec<u8> = connection
+				.query_row(
+					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+					params![call_id, u64_i64(index)?],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("call input not found"))?;
+			decode_message(&bytes)
+		})
 	}
 
 	/// Return one indexed durable result.
 	pub fn get_result(&self, call_id: &str, index: u64) -> Result<CallResult> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let bytes: Vec<u8> = connection
-			.query_row(
-				"SELECT payload FROM results WHERE call_id=? AND result_index=?",
-				params![call_id, u64_i64(index)?],
-				|r| r.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call result not found"))?;
-		decode_message(&bytes)
+		self.connection.with_connection(|connection| {
+			let bytes: Vec<u8> = connection
+				.query_row(
+					"SELECT payload FROM results WHERE call_id=? AND result_index=?",
+					params![call_id, u64_i64(index)?],
+					|r| r.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("call result not found"))?;
+			decode_message(&bytes)
+		})
 	}
 
 	/// List calls with stable pagination and typed filters.
@@ -1180,52 +1211,53 @@ impl Store {
 			});
 		let (token_ms, token_id) = decode_page_token(&request.page_token)?;
 		let limit = normalized_page_size(request.page_size);
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT c.id,c.created_ms FROM calls c JOIN revisions r ON r.id=c.revision_id WHERE \
-				 (?1 IS NULL OR r.namespace=?1) AND (?2 IS NULL OR r.name=?2) AND (?3 IS NULL OR \
-				 c.status=?3) AND (?4 IS NULL OR c.actor_id=?4) AND c.created_ms>=?5 AND \
-				 (c.created_ms>?6 OR (c.created_ms=?6 AND c.id>?7)) ORDER BY c.created_ms,c.id LIMIT \
-				 ?8",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(
-				params![
-					function.map(|f| f.namespace.as_str()),
-					function.map(|f| f.name.as_str()),
-					status,
-					actor.map(|a| a.actor_id.as_str()),
-					u64_i64(created_after)?,
-					u64_i64(token_ms)?,
-					token_id,
-					i64::from(limit + 1)
-				],
-				|r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-			)
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		let more = rows.len() > limit as usize;
-		let rows = if more {
-			&rows[..limit as usize]
-		} else {
-			&rows[..]
-		};
-		let next_page_token = if more {
-			rows
-				.last()
-				.map(|(id, ms)| format!("{ms}:{id}"))
-				.unwrap_or_default()
-		} else {
-			String::new()
-		};
-		let mut items = Vec::with_capacity(rows.len());
-		for (id, _) in rows {
-			items.push(call_record(&connection, id)?);
-		}
-		Ok(Page { items, next_page_token })
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT c.id,c.created_ms FROM calls c JOIN revisions r ON r.id=c.revision_id \
+					 WHERE (?1 IS NULL OR r.namespace=?1) AND (?2 IS NULL OR r.name=?2) AND (?3 IS \
+					 NULL OR c.status=?3) AND (?4 IS NULL OR c.actor_id=?4) AND c.created_ms>=?5 AND \
+					 (c.created_ms>?6 OR (c.created_ms=?6 AND c.id>?7)) ORDER BY c.created_ms,c.id \
+					 LIMIT ?8",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(
+					params![
+						function.map(|f| f.namespace.as_str()),
+						function.map(|f| f.name.as_str()),
+						status,
+						actor.map(|a| a.actor_id.as_str()),
+						u64_i64(created_after)?,
+						u64_i64(token_ms)?,
+						token_id,
+						i64::from(limit + 1)
+					],
+					|r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+				)
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			let more = rows.len() > limit as usize;
+			let rows = if more {
+				&rows[..limit as usize]
+			} else {
+				&rows[..]
+			};
+			let next_page_token = if more {
+				rows
+					.last()
+					.map(|(id, ms)| format!("{ms}:{id}"))
+					.unwrap_or_default()
+			} else {
+				String::new()
+			};
+			let mut items = Vec::with_capacity(rows.len());
+			for (id, _) in rows {
+				items.push(call_record(connection, id)?);
+			}
+			Ok(Page { items, next_page_token })
+		})
 	}
 
 	/// Lease the oldest available input across all revisions.
@@ -1240,40 +1272,41 @@ impl Store {
 
 	/// Summarize revisions that currently have eligible queued work.
 	pub fn queued_revisions(&self, now_ms: u64) -> Result<Vec<QueuedRevision>> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		expire_deadlines_tx(&tx, now_ms)?;
-		let mut statement = tx
-			.prepare(
-				"SELECT c.revision_id,MIN(i.available_ms),COUNT(*) FROM inputs i JOIN calls c ON \
-				 c.id=i.call_id WHERE i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND \
-				 (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.revision_id ORDER \
-				 BY MIN(i.available_ms),c.revision_id",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(
-				params![
-					INPUT_QUEUED,
-					u64_i64(now_ms)?,
-					CallStatus::Queued as i32,
-					CallStatus::Running as i32,
-					u64_i64(now_ms)?
-				],
-				|row| {
-					Ok(QueuedRevision {
-						revision_id:         row.get(0)?,
-						oldest_available_ms: row.get(1)?,
-						queued_inputs:       row.get(2)?,
-					})
-				},
-			)
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		tx.commit().map_err(sql_error)?;
-		Ok(rows)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			expire_deadlines_tx(&tx, now_ms)?;
+			let mut statement = tx
+				.prepare(
+					"SELECT c.revision_id,MIN(i.available_ms),COUNT(*) FROM inputs i JOIN calls c ON \
+					 c.id=i.call_id WHERE i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND \
+					 (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.revision_id \
+					 ORDER BY MIN(i.available_ms),c.revision_id",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(
+					params![
+						INPUT_QUEUED,
+						u64_i64(now_ms)?,
+						CallStatus::Queued as i32,
+						CallStatus::Running as i32,
+						u64_i64(now_ms)?
+					],
+					|row| {
+						Ok(QueuedRevision {
+							revision_id:         row.get(0)?,
+							oldest_available_ms: row.get(1)?,
+							queued_inputs:       row.get(2)?,
+						})
+					},
+				)
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			tx.commit().map_err(sql_error)?;
+			Ok(rows)
+		})
 	}
 
 	/// Lease the oldest available input for one immutable revision pool.
@@ -1308,33 +1341,34 @@ impl Store {
 		if revision_id.is_empty() {
 			return Err(EngineError::invalid("revision id is required"));
 		}
-		let connection = self.connection.lock().map_err(lock_error)?;
-		connection
-			.query_row(
-				"SELECT c.id,MIN(i.available_ms),COUNT(*) FROM calls c JOIN inputs i ON \
-				 i.call_id=c.id WHERE i.status=? AND i.available_ms<=? AND c.revision_id=? AND \
-				 c.kind=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR \
-				 c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms ORDER BY \
-				 MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
-				params![
-					INPUT_QUEUED,
-					u64_i64(now_ms)?,
-					revision_id,
-					CallType::Batch as i32,
-					CallStatus::Queued as i32,
-					CallStatus::Running as i32,
-					u64_i64(now_ms)?
-				],
-				|row| {
-					Ok(QueuedBatch {
-						call_id:             row.get(0)?,
-						oldest_available_ms: row.get(1)?,
-						queued_inputs:       row.get(2)?,
-					})
-				},
-			)
-			.optional()
-			.map_err(sql_error)
+		self.connection.with_connection(|connection| {
+			connection
+				.query_row(
+					"SELECT c.id,MIN(i.available_ms),COUNT(*) FROM calls c JOIN inputs i ON \
+					 i.call_id=c.id WHERE i.status=? AND i.available_ms<=? AND c.revision_id=? AND \
+					 c.kind=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR \
+					 c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms ORDER BY \
+					 MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
+					params![
+						INPUT_QUEUED,
+						u64_i64(now_ms)?,
+						revision_id,
+						CallType::Batch as i32,
+						CallStatus::Queued as i32,
+						CallStatus::Running as i32,
+						u64_i64(now_ms)?
+					],
+					|row| {
+						Ok(QueuedBatch {
+							call_id:             row.get(0)?,
+							oldest_available_ms: row.get(1)?,
+							queued_inputs:       row.get(2)?,
+						})
+					},
+				)
+				.optional()
+				.map_err(sql_error)
+		})
 	}
 
 	/// Atomically lease an ordered dynamic batch for one immutable revision.
@@ -1351,51 +1385,171 @@ impl Store {
 				"revision id, worker id, positive lease duration, and positive batch size are required",
 			));
 		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		expire_deadlines_tx(&tx, now_ms)?;
-		let selected_call: Option<String> = tx
-			.query_row(
-				"SELECT c.id FROM calls c JOIN inputs i ON i.call_id=c.id WHERE i.status=? AND \
-				 i.available_ms<=? AND c.revision_id=? AND c.kind=? AND c.status IN (?,?) AND \
-				 (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms \
-				 ORDER BY MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
-				params![
-					INPUT_QUEUED,
-					u64_i64(now_ms)?,
-					revision_id,
-					CallType::Batch as i32,
-					CallStatus::Queued as i32,
-					CallStatus::Running as i32,
-					u64_i64(now_ms)?
-				],
-				|row| row.get(0),
-			)
-			.optional()
-			.map_err(sql_error)?;
-		let Some(selected_call) = selected_call else {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			expire_deadlines_tx(&tx, now_ms)?;
+			let selected_call: Option<String> = tx
+				.query_row(
+					"SELECT c.id FROM calls c JOIN inputs i ON i.call_id=c.id WHERE i.status=? AND \
+					 i.available_ms<=? AND c.revision_id=? AND c.kind=? AND c.status IN (?,?) AND \
+					 (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?) GROUP BY c.id,c.created_ms \
+					 ORDER BY MIN(i.available_ms),c.created_ms,c.id LIMIT 1",
+					params![
+						INPUT_QUEUED,
+						u64_i64(now_ms)?,
+						revision_id,
+						CallType::Batch as i32,
+						CallStatus::Queued as i32,
+						CallStatus::Running as i32,
+						u64_i64(now_ms)?
+					],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?;
+			let Some(selected_call) = selected_call else {
+				tx.commit().map_err(sql_error)?;
+				return Ok(Vec::new());
+			};
+			let mut statement = tx
+				.prepare(
+					"SELECT input_index FROM inputs WHERE call_id=? AND status=? AND available_ms<=? \
+					 ORDER BY input_index LIMIT ?",
+				)
+				.map_err(sql_error)?;
+			let candidates = statement
+				.query_map(
+					params![selected_call, INPUT_QUEUED, u64_i64(now_ms)?, i64::from(max_size)],
+					|row| row.get::<_, i64>(0),
+				)
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			let revision = revision_by_id(&tx, revision_id)?;
+			let mut leased = Vec::with_capacity(candidates.len());
+			for index in candidates {
+				let call_id = selected_call.clone();
+				let attempt_id = Uuid::new_v4().to_string();
+				let generation: i64 = tx
+					.query_row(
+						"SELECT lease_generation+1 FROM inputs WHERE call_id=? AND input_index=?",
+						params![call_id, index],
+						|row| row.get(0),
+					)
+					.map_err(sql_error)?;
+				let changed = tx
+					.execute(
+						"UPDATE inputs SET \
+						 status=?,lease_owner=?,lease_expiry_ms=?,lease_generation=?,attempt_id=? WHERE \
+						 call_id=? AND input_index=? AND status=? AND available_ms<=? AND EXISTS(SELECT \
+						 1 FROM calls c WHERE c.id=inputs.call_id AND c.revision_id=? AND c.kind=? AND \
+						 c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?))",
+						params![
+							INPUT_LEASED,
+							worker_id,
+							u64_i64(now_ms.saturating_add(lease_ms))?,
+							generation,
+							attempt_id,
+							call_id,
+							index,
+							INPUT_QUEUED,
+							u64_i64(now_ms)?,
+							revision_id,
+							CallType::Batch as i32,
+							CallStatus::Queued as i32,
+							CallStatus::Running as i32,
+							u64_i64(now_ms)?
+						],
+					)
+					.map_err(sql_error)?;
+				if changed != 1 {
+					continue;
+				}
+				let input_blob: Vec<u8> = tx
+					.query_row(
+						"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+						params![call_id, index],
+						|row| row.get(0),
+					)
+					.map_err(sql_error)?;
+				let input = decode_message(&input_blob)?;
+				let (user_attempts, infra_attempts, available_ms): (u32, u32, u64) = tx
+					.query_row(
+						"SELECT user_attempts,infra_attempts,available_ms FROM inputs WHERE call_id=? \
+						 AND input_index=?",
+						params![call_id, index],
+						|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+					)
+					.map_err(sql_error)?;
+				let execution_timeout: u64 = tx
+					.query_row("SELECT execution_timeout_ms FROM calls WHERE id=?", [&call_id], |row| {
+						row.get(0)
+					})
+					.map_err(sql_error)?;
+				let call = call_record(&tx, &call_id)?;
+				leased.push(LeasedInput {
+					lease: LeaseToken {
+						call_id,
+						input_index: index as u64,
+						worker_id: worker_id.into(),
+						lease_generation: generation as u64,
+					},
+					revision: revision.clone(),
+					input,
+					call,
+					user_attempts,
+					infra_attempts,
+					execution_deadline_ms: (execution_timeout > 0)
+						.then(|| now_ms.saturating_add(execution_timeout)),
+					attempt_id,
+					available_ms,
+				});
+			}
 			tx.commit().map_err(sql_error)?;
-			return Ok(Vec::new());
-		};
-		let mut statement = tx
-			.prepare(
-				"SELECT input_index FROM inputs WHERE call_id=? AND status=? AND available_ms<=? \
-				 ORDER BY input_index LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		let candidates = statement
-			.query_map(
-				params![selected_call, INPUT_QUEUED, u64_i64(now_ms)?, i64::from(max_size)],
-				|row| row.get::<_, i64>(0),
-			)
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		let revision = revision_by_id(&tx, revision_id)?;
-		let mut leased = Vec::with_capacity(candidates.len());
-		for index in candidates {
-			let call_id = selected_call.clone();
+			Ok(leased)
+		})
+	}
+
+	fn lease_next_matching(
+		&self,
+		revision_id: Option<&str>,
+		worker_id: &str,
+		now_ms: u64,
+		lease_ms: u64,
+		exclude_batch: bool,
+	) -> Result<Option<LeasedInput>> {
+		if worker_id.is_empty() || lease_ms == 0 {
+			return Err(EngineError::invalid("worker id and positive lease duration are required"));
+		}
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			expire_deadlines_tx(&tx, now_ms)?;
+			let candidate: Option<(String, i64)> = tx
+				.query_row(
+					"SELECT i.call_id,i.input_index FROM inputs i JOIN calls c ON c.id=i.call_id WHERE \
+					 i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND (c.queue_deadline_ms \
+					 IS NULL OR c.queue_deadline_ms>?) AND (? IS NULL OR c.revision_id=?) AND (?=0 OR \
+					 c.kind<>?) ORDER BY i.available_ms,c.created_ms,i.call_id,i.input_index LIMIT 1",
+					params![
+						INPUT_QUEUED,
+						u64_i64(now_ms)?,
+						CallStatus::Queued as i32,
+						CallStatus::Running as i32,
+						u64_i64(now_ms)?,
+						revision_id,
+						revision_id,
+						exclude_batch,
+						CallType::Batch as i32
+					],
+					|row| Ok((row.get(0)?, row.get(1)?)),
+				)
+				.optional()
+				.map_err(sql_error)?;
+			let Some((call_id, index)) = candidate else {
+				tx.commit().map_err(sql_error)?;
+				return Ok(None);
+			};
 			let attempt_id = Uuid::new_v4().to_string();
 			let generation: i64 = tx
 				.query_row(
@@ -1408,9 +1562,7 @@ impl Store {
 				.execute(
 					"UPDATE inputs SET \
 					 status=?,lease_owner=?,lease_expiry_ms=?,lease_generation=?,attempt_id=? WHERE \
-					 call_id=? AND input_index=? AND status=? AND available_ms<=? AND EXISTS(SELECT 1 \
-					 FROM calls c WHERE c.id=inputs.call_id AND c.revision_id=? AND c.kind=? AND \
-					 c.status IN (?,?) AND (c.queue_deadline_ms IS NULL OR c.queue_deadline_ms>?))",
+					 call_id=? AND input_index=? AND status=?",
 					params![
 						INPUT_LEASED,
 						worker_id,
@@ -1419,19 +1571,17 @@ impl Store {
 						attempt_id,
 						call_id,
 						index,
-						INPUT_QUEUED,
-						u64_i64(now_ms)?,
-						revision_id,
-						CallType::Batch as i32,
-						CallStatus::Queued as i32,
-						CallStatus::Running as i32,
-						u64_i64(now_ms)?
+						INPUT_QUEUED
 					],
 				)
 				.map_err(sql_error)?;
 			if changed != 1 {
-				continue;
+				return Err(EngineError::busy("input lease was claimed concurrently"));
 			}
+			let selected_revision: String = tx
+				.query_row("SELECT revision_id FROM calls WHERE id=?", [&call_id], |row| row.get(0))
+				.map_err(sql_error)?;
+			let revision = revision_by_id(&tx, &selected_revision)?;
 			let input_blob: Vec<u8> = tx
 				.query_row(
 					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
@@ -1454,14 +1604,14 @@ impl Store {
 				})
 				.map_err(sql_error)?;
 			let call = call_record(&tx, &call_id)?;
-			leased.push(LeasedInput {
+			let item = LeasedInput {
 				lease: LeaseToken {
 					call_id,
 					input_index: index as u64,
 					worker_id: worker_id.into(),
 					lease_generation: generation as u64,
 				},
-				revision: revision.clone(),
+				revision,
 				input,
 				call,
 				user_attempts,
@@ -1470,181 +1620,75 @@ impl Store {
 					.then(|| now_ms.saturating_add(execution_timeout)),
 				attempt_id,
 				available_ms,
-			});
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(leased)
-	}
-
-	fn lease_next_matching(
-		&self,
-		revision_id: Option<&str>,
-		worker_id: &str,
-		now_ms: u64,
-		lease_ms: u64,
-		exclude_batch: bool,
-	) -> Result<Option<LeasedInput>> {
-		if worker_id.is_empty() || lease_ms == 0 {
-			return Err(EngineError::invalid("worker id and positive lease duration are required"));
-		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		expire_deadlines_tx(&tx, now_ms)?;
-		let candidate: Option<(String, i64)> = tx
-			.query_row(
-				"SELECT i.call_id,i.input_index FROM inputs i JOIN calls c ON c.id=i.call_id WHERE \
-				 i.status=? AND i.available_ms<=? AND c.status IN (?,?) AND (c.queue_deadline_ms IS \
-				 NULL OR c.queue_deadline_ms>?) AND (? IS NULL OR c.revision_id=?) AND (?=0 OR \
-				 c.kind<>?) ORDER BY i.available_ms,c.created_ms,i.call_id,i.input_index LIMIT 1",
-				params![
-					INPUT_QUEUED,
-					u64_i64(now_ms)?,
-					CallStatus::Queued as i32,
-					CallStatus::Running as i32,
-					u64_i64(now_ms)?,
-					revision_id,
-					revision_id,
-					exclude_batch,
-					CallType::Batch as i32
-				],
-				|row| Ok((row.get(0)?, row.get(1)?)),
-			)
-			.optional()
-			.map_err(sql_error)?;
-		let Some((call_id, index)) = candidate else {
+			};
 			tx.commit().map_err(sql_error)?;
-			return Ok(None);
-		};
-		let attempt_id = Uuid::new_v4().to_string();
-		let generation: i64 = tx
-			.query_row(
-				"SELECT lease_generation+1 FROM inputs WHERE call_id=? AND input_index=?",
-				params![call_id, index],
-				|row| row.get(0),
-			)
-			.map_err(sql_error)?;
-		let changed = tx
-			.execute(
-				"UPDATE inputs SET \
-				 status=?,lease_owner=?,lease_expiry_ms=?,lease_generation=?,attempt_id=? WHERE \
-				 call_id=? AND input_index=? AND status=?",
-				params![
-					INPUT_LEASED,
-					worker_id,
-					u64_i64(now_ms.saturating_add(lease_ms))?,
-					generation,
-					attempt_id,
-					call_id,
-					index,
-					INPUT_QUEUED
-				],
-			)
-			.map_err(sql_error)?;
-		if changed != 1 {
-			return Err(EngineError::busy("input lease was claimed concurrently"));
-		}
-		let selected_revision: String = tx
-			.query_row("SELECT revision_id FROM calls WHERE id=?", [&call_id], |row| row.get(0))
-			.map_err(sql_error)?;
-		let revision = revision_by_id(&tx, &selected_revision)?;
-		let input_blob: Vec<u8> = tx
-			.query_row(
-				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-				params![call_id, index],
-				|row| row.get(0),
-			)
-			.map_err(sql_error)?;
-		let input = decode_message(&input_blob)?;
-		let (user_attempts, infra_attempts, available_ms): (u32, u32, u64) = tx
-			.query_row(
-				"SELECT user_attempts,infra_attempts,available_ms FROM inputs WHERE call_id=? AND \
-				 input_index=?",
-				params![call_id, index],
-				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-			)
-			.map_err(sql_error)?;
-		let execution_timeout: u64 = tx
-			.query_row("SELECT execution_timeout_ms FROM calls WHERE id=?", [&call_id], |row| {
-				row.get(0)
-			})
-			.map_err(sql_error)?;
-		let call = call_record(&tx, &call_id)?;
-		let item = LeasedInput {
-			lease: LeaseToken {
-				call_id,
-				input_index: index as u64,
-				worker_id: worker_id.into(),
-				lease_generation: generation as u64,
-			},
-			revision,
-			input,
-			call,
-			user_attempts,
-			infra_attempts,
-			execution_deadline_ms: (execution_timeout > 0)
-				.then(|| now_ms.saturating_add(execution_timeout)),
-			attempt_id,
-			available_ms,
-		};
-		tx.commit().map_err(sql_error)?;
-		Ok(Some(item))
+			Ok(Some(item))
+		})
 	}
 
 	/// Extend a live lease, rejecting stale owners and generations.
 	pub fn heartbeat(&self, lease: &LeaseToken, now_ms: u64, lease_ms: u64) -> Result<()> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let changed = c
-			.execute(
-				"UPDATE inputs SET lease_expiry_ms=? WHERE call_id=? AND input_index=? AND \
-				 lease_owner=? AND lease_generation=? AND status IN (?,?) AND lease_expiry_ms>?",
-				params![
-					u64_i64(now_ms.saturating_add(lease_ms))?,
-					lease.call_id,
-					u64_i64(lease.input_index)?,
-					lease.worker_id,
-					u64_i64(lease.lease_generation)?,
-					INPUT_LEASED,
-					INPUT_RUNNING,
-					u64_i64(now_ms)?
-				],
-			)
-			.map_err(sql_error)?;
-		lease_changed(changed)
+		self.connection.with_connection(|c| {
+			let changed = c
+				.execute(
+					"UPDATE inputs SET lease_expiry_ms=? WHERE call_id=? AND input_index=? AND \
+					 lease_owner=? AND lease_generation=? AND status IN (?,?) AND lease_expiry_ms>?",
+					params![
+						u64_i64(now_ms.saturating_add(lease_ms))?,
+						lease.call_id,
+						u64_i64(lease.input_index)?,
+						lease.worker_id,
+						u64_i64(lease.lease_generation)?,
+						INPUT_LEASED,
+						INPUT_RUNNING,
+						u64_i64(now_ms)?
+					],
+				)
+				.map_err(sql_error)?;
+			lease_changed(changed)
+		})
 	}
 
 	/// Mark a leased input running and append its stable attempt event
 	/// atomically.
 	pub fn mark_running(&self, lease: &LeaseToken, now_ms: u64, startup: StartupKind) -> Result<()> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		require_lease(&tx, lease, &[INPUT_LEASED], now_ms)?;
-		require_executable_call(&tx, &lease.call_id)?;
-		tx.execute(
-			"UPDATE inputs SET status=?,started_ms=COALESCE(started_ms,?),user_attempts=CASE WHEN \
-			 user_attempts=0 THEN 1 ELSE user_attempts END WHERE call_id=? AND input_index=?",
-			params![INPUT_RUNNING, u64_i64(now_ms)?, lease.call_id, u64_i64(lease.input_index)?],
-		)
-		.map_err(sql_error)?;
-		let status = call_status(&tx, &lease.call_id)?;
-		if status == CallStatus::Queued {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			require_lease(&tx, lease, &[INPUT_LEASED], now_ms)?;
+			require_executable_call(&tx, &lease.call_id)?;
 			tx.execute(
-				"UPDATE calls SET status=?,started_ms=COALESCE(started_ms,?),updated_ms=? WHERE id=?",
-				params![CallStatus::Running as i32, u64_i64(now_ms)?, u64_i64(now_ms)?, lease.call_id],
+				"UPDATE inputs SET status=?,started_ms=COALESCE(started_ms,?),user_attempts=CASE WHEN \
+				 user_attempts=0 THEN 1 ELSE user_attempts END WHERE call_id=? AND input_index=?",
+				params![INPUT_RUNNING, u64_i64(now_ms)?, lease.call_id, u64_i64(lease.input_index)?],
 			)
 			.map_err(sql_error)?;
-			append_status_event(&tx, &lease.call_id, CallStatus::Running, now_ms)?;
-		}
-		append_attempt_transition(
-			&tx,
-			lease,
-			AttemptStatus::Started,
-			AttemptFailureKind::Unspecified,
-			None,
-			startup,
-			now_ms,
-		)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(())
+			let status = call_status(&tx, &lease.call_id)?;
+			if status == CallStatus::Queued {
+				tx.execute(
+					"UPDATE calls SET status=?,started_ms=COALESCE(started_ms,?),updated_ms=? WHERE \
+					 id=?",
+					params![
+						CallStatus::Running as i32,
+						u64_i64(now_ms)?,
+						u64_i64(now_ms)?,
+						lease.call_id
+					],
+				)
+				.map_err(sql_error)?;
+				append_status_event(&tx, &lease.call_id, CallStatus::Running, now_ms)?;
+			}
+			append_attempt_transition(
+				&tx,
+				lease,
+				AttemptStatus::Started,
+				AttemptFailureKind::Unspecified,
+				None,
+				startup,
+				now_ms,
+			)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(())
+		})
 	}
 
 	/// Commit one terminal input outcome exactly once.
@@ -1655,20 +1699,100 @@ impl Store {
 		stats: Option<&AttemptStats>,
 		now_ms: u64,
 	) -> Result<()> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now_ms)?;
-		require_executable_call(&tx, &lease.call_id)?;
-		let kind = call_kind(&tx, &lease.call_id)?;
-		if kind == CallType::Generator {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now_ms)?;
+			require_executable_call(&tx, &lease.call_id)?;
+			let kind = call_kind(&tx, &lease.call_id)?;
+			if kind == CallType::Generator {
+				tx.execute(
+					"UPDATE inputs SET \
+					 status=?,finished_ms=?,result=NULL,lease_owner=NULL,lease_expiry_ms=NULL WHERE \
+					 call_id=? AND input_index=?",
+					params![
+						INPUT_SUCCEEDED,
+						u64_i64(now_ms)?,
+						lease.call_id,
+						u64_i64(lease.input_index)?
+					],
+				)
+				.map_err(sql_error)?;
+				persist_attempt_stats(&tx, lease, stats)?;
+				append_attempt_transition(
+					&tx,
+					lease,
+					AttemptStatus::Succeeded,
+					AttemptFailureKind::Unspecified,
+					None,
+					StartupKind::Unspecified,
+					now_ms,
+				)?;
+				complete_call_tx(&tx, &lease.call_id, now_ms)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(());
+			}
+			if result.index != lease.input_index {
+				return Err(EngineError::invalid("result index does not match lease"));
+			}
+			let sequence = next_result_sequence(&tx, &lease.call_id)?;
+			let mut stored = result.clone();
+			stored.call = Some(CallRef { call_id: lease.call_id.clone() });
+			stored.sequence = sequence;
+			stored.created_at_unix_millis = now_ms;
+			stored.input_index = lease.input_index;
+			if stored.input_id.is_empty() {
+				let input: CallInput = decode_message(
+					&tx.query_row::<Vec<u8>, _, _>(
+						"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+						params![lease.call_id, u64_i64(lease.input_index)?],
+						|row| row.get(0),
+					)
+					.map_err(sql_error)?,
+				)?;
+				stored.input_id = input.input_id;
+			}
+			stored.yield_index_presence = None;
+			tx.execute(
+				"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) \
+				 VALUES(?,?,?,?,?)",
+				params![
+					lease.call_id,
+					u64_i64(stored.index)?,
+					u64_i64(sequence)?,
+					stored.encode_to_vec(),
+					u64_i64(now_ms)?
+				],
+			)
+			.map_err(sql_error)?;
 			tx.execute(
 				"UPDATE inputs SET \
-				 status=?,finished_ms=?,result=NULL,lease_owner=NULL,lease_expiry_ms=NULL WHERE \
+				 status=?,finished_ms=?,result=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE \
 				 call_id=? AND input_index=?",
-				params![INPUT_SUCCEEDED, u64_i64(now_ms)?, lease.call_id, u64_i64(lease.input_index)?],
+				params![
+					INPUT_SUCCEEDED,
+					u64_i64(now_ms)?,
+					stored.encode_to_vec(),
+					lease.call_id,
+					u64_i64(lease.input_index)?
+				],
 			)
 			.map_err(sql_error)?;
 			persist_attempt_stats(&tx, lease, stats)?;
+			for digest in result_artifacts(&stored) {
+				add_artifact_ref(
+					&tx,
+					&digest,
+					"result",
+					&format!("{}:{}", lease.call_id, stored.index),
+				)?;
+			}
+			append_event(
+				&tx,
+				&lease.call_id,
+				CallEventType::Result,
+				call_event::Payload::Result(stored),
+				now_ms,
+			)?;
 			append_attempt_transition(
 				&tx,
 				lease,
@@ -1680,75 +1804,8 @@ impl Store {
 			)?;
 			complete_call_tx(&tx, &lease.call_id, now_ms)?;
 			tx.commit().map_err(sql_error)?;
-			return Ok(());
-		}
-		if result.index != lease.input_index {
-			return Err(EngineError::invalid("result index does not match lease"));
-		}
-		let sequence = next_result_sequence(&tx, &lease.call_id)?;
-		let mut stored = result.clone();
-		stored.call = Some(CallRef { call_id: lease.call_id.clone() });
-		stored.sequence = sequence;
-		stored.created_at_unix_millis = now_ms;
-		stored.input_index = lease.input_index;
-		if stored.input_id.is_empty() {
-			let input: CallInput = decode_message(
-				&tx.query_row::<Vec<u8>, _, _>(
-					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-					params![lease.call_id, u64_i64(lease.input_index)?],
-					|row| row.get(0),
-				)
-				.map_err(sql_error)?,
-			)?;
-			stored.input_id = input.input_id;
-		}
-		stored.yield_index_presence = None;
-		tx.execute(
-			"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",
-			params![
-				lease.call_id,
-				u64_i64(stored.index)?,
-				u64_i64(sequence)?,
-				stored.encode_to_vec(),
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		tx.execute(
-			"UPDATE inputs SET status=?,finished_ms=?,result=?,lease_owner=NULL,lease_expiry_ms=NULL \
-			 WHERE call_id=? AND input_index=?",
-			params![
-				INPUT_SUCCEEDED,
-				u64_i64(now_ms)?,
-				stored.encode_to_vec(),
-				lease.call_id,
-				u64_i64(lease.input_index)?
-			],
-		)
-		.map_err(sql_error)?;
-		persist_attempt_stats(&tx, lease, stats)?;
-		for digest in result_artifacts(&stored) {
-			add_artifact_ref(&tx, &digest, "result", &format!("{}:{}", lease.call_id, stored.index))?;
-		}
-		append_event(
-			&tx,
-			&lease.call_id,
-			CallEventType::Result,
-			call_event::Payload::Result(stored),
-			now_ms,
-		)?;
-		append_attempt_transition(
-			&tx,
-			lease,
-			AttemptStatus::Succeeded,
-			AttemptFailureKind::Unspecified,
-			None,
-			StartupKind::Unspecified,
-			now_ms,
-		)?;
-		complete_call_tx(&tx, &lease.call_id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(())
+			Ok(())
+		})
 	}
 
 	/// Commit one generator yield without terminalizing the leased input.
@@ -1760,56 +1817,58 @@ impl Store {
 		now_ms: u64,
 	) -> Result<CallEvent> {
 		validate_envelope(&value)?;
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		require_lease(&tx, lease, &[INPUT_RUNNING], now_ms)?;
-		require_executable_call(&tx, &lease.call_id)?;
-		if call_kind(&tx, &lease.call_id)? != CallType::Generator {
-			return Err(EngineError::invalid("only generator calls may commit yields"));
-		}
-		let sequence = next_result_sequence(&tx, &lease.call_id)?;
-		let input: CallInput = decode_message(
-			&tx.query_row::<Vec<u8>, _, _>(
-				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-				params![lease.call_id, u64_i64(lease.input_index)?],
-				|row| row.get(0),
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			require_lease(&tx, lease, &[INPUT_RUNNING], now_ms)?;
+			require_executable_call(&tx, &lease.call_id)?;
+			if call_kind(&tx, &lease.call_id)? != CallType::Generator {
+				return Err(EngineError::invalid("only generator calls may commit yields"));
+			}
+			let sequence = next_result_sequence(&tx, &lease.call_id)?;
+			let input: CallInput = decode_message(
+				&tx.query_row::<Vec<u8>, _, _>(
+					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+					params![lease.call_id, u64_i64(lease.input_index)?],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?,
+			)?;
+			let result = CallResult {
+				call: Some(CallRef { call_id: lease.call_id.clone() }),
+				index,
+				outcome: Some(call_result::Outcome::Value(value)),
+				created_at_unix_millis: now_ms,
+				sequence,
+				input_id: input.input_id,
+				input_index: lease.input_index,
+				yield_index_presence: Some(call_result::YieldIndexPresence::YieldIndex(index)),
+			};
+			tx.execute(
+				"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) \
+				 VALUES(?,?,?,?,?)",
+				params![
+					lease.call_id,
+					u64_i64(index)?,
+					u64_i64(sequence)?,
+					result.encode_to_vec(),
+					u64_i64(now_ms)?
+				],
 			)
-			.map_err(sql_error)?,
-		)?;
-		let result = CallResult {
-			call: Some(CallRef { call_id: lease.call_id.clone() }),
-			index,
-			outcome: Some(call_result::Outcome::Value(value)),
-			created_at_unix_millis: now_ms,
-			sequence,
-			input_id: input.input_id,
-			input_index: lease.input_index,
-			yield_index_presence: Some(call_result::YieldIndexPresence::YieldIndex(index)),
-		};
-		tx.execute(
-			"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",
-			params![
-				lease.call_id,
-				u64_i64(index)?,
-				u64_i64(sequence)?,
-				result.encode_to_vec(),
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		for digest in result_artifacts(&result) {
-			add_artifact_ref(&tx, &digest, "result", &format!("{}:{index}", lease.call_id))?;
-		}
-		let event_sequence = append_event(
-			&tx,
-			&lease.call_id,
-			CallEventType::Yield,
-			call_event::Payload::YieldResult(result),
-			now_ms,
-		)?;
-		let event = event_by_sequence(&tx, &lease.call_id, event_sequence)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(event)
+			.map_err(sql_error)?;
+			for digest in result_artifacts(&result) {
+				add_artifact_ref(&tx, &digest, "result", &format!("{}:{index}", lease.call_id))?;
+			}
+			let event_sequence = append_event(
+				&tx,
+				&lease.call_id,
+				CallEventType::Yield,
+				call_event::Payload::YieldResult(result),
+				now_ms,
+			)?;
+			let event = event_by_sequence(&tx, &lease.call_id, event_sequence)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(event)
+		})
 	}
 
 	/// Append worker log bytes while the owning lease is live.
@@ -1823,30 +1882,31 @@ impl Store {
 		if data.len() > 1024 * 1024 {
 			return Err(EngineError::invalid("log event exceeds 1 MiB"));
 		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		require_lease(&tx, lease, &[INPUT_RUNNING], now_ms)?;
-		let input: CallInput = decode_message(
-			&tx.query_row::<Vec<u8>, _, _>(
-				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-				params![lease.call_id, u64_i64(lease.input_index)?],
-				|row| row.get(0),
-			)
-			.map_err(sql_error)?,
-		)?;
-		let sequence = append_event_with_metadata(
-			&tx,
-			&lease.call_id,
-			CallEventType::Log,
-			call_event::Payload::Log(LogEvent { stream: stream as i32, data }),
-			Some(input.input_id),
-			Some(lease.input_index),
-			None,
-			now_ms,
-		)?;
-		let event = event_by_sequence(&tx, &lease.call_id, sequence)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(event)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			require_lease(&tx, lease, &[INPUT_RUNNING], now_ms)?;
+			let input: CallInput = decode_message(
+				&tx.query_row::<Vec<u8>, _, _>(
+					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+					params![lease.call_id, u64_i64(lease.input_index)?],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?,
+			)?;
+			let sequence = append_event_with_metadata(
+				&tx,
+				&lease.call_id,
+				CallEventType::Log,
+				call_event::Payload::Log(LogEvent { stream: stream as i32, data }),
+				Some(input.input_id),
+				Some(lease.input_index),
+				None,
+				now_ms,
+			)?;
+			let event = event_by_sequence(&tx, &lease.call_id, sequence)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(event)
+		})
 	}
 
 	/// Append a durable call-scoped log without attributing it to an input.
@@ -1860,27 +1920,29 @@ impl Store {
 		if data.len() > 1024 * 1024 {
 			return Err(EngineError::invalid("log event exceeds 1 MiB"));
 		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if call_status(&tx, call_id)? != CallStatus::Running {
-			return Err(EngineError::invalid("call-scoped logs require a running call"));
-		}
-		let sequence = append_event(
-			&tx,
-			call_id,
-			CallEventType::Log,
-			call_event::Payload::Log(LogEvent { stream: stream as i32, data }),
-			now_ms,
-		)?;
-		let event = event_by_sequence(&tx, call_id, sequence)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(event)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if call_status(&tx, call_id)? != CallStatus::Running {
+				return Err(EngineError::invalid("call-scoped logs require a running call"));
+			}
+			let sequence = append_event(
+				&tx,
+				call_id,
+				CallEventType::Log,
+				call_event::Payload::Log(LogEvent { stream: stream as i32, data }),
+				now_ms,
+			)?;
+			let event = event_by_sequence(&tx, call_id, sequence)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(event)
+		})
 	}
 
 	/// Return one exact event sequence for post-commit watcher publication.
 	pub fn get_event(&self, call_id: &str, sequence: u64) -> Result<CallEvent> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		event_by_sequence(&connection, call_id, sequence)
+		self
+			.connection
+			.with_connection(|connection| event_by_sequence(connection, call_id, sequence))
 	}
 
 	/// Commit a non-retryable user failure.
@@ -1925,26 +1987,27 @@ impl Store {
 	/// Return live ownership tokens that must be interrupted for call
 	/// cancellation.
 	pub fn active_leases_for_call(&self, call_id: &str) -> Result<Vec<LeaseToken>> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT input_index,lease_owner,lease_generation FROM inputs WHERE call_id=? AND \
-				 status IN (?,?) AND lease_owner IS NOT NULL ORDER BY input_index",
-			)
-			.map_err(sql_error)?;
-		let leases = statement
-			.query_map(params![call_id, INPUT_LEASED, INPUT_RUNNING], |row| {
-				Ok(LeaseToken {
-					call_id:          call_id.into(),
-					input_index:      row.get(0)?,
-					worker_id:        row.get(1)?,
-					lease_generation: row.get(2)?,
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT input_index,lease_owner,lease_generation FROM inputs WHERE call_id=? AND \
+					 status IN (?,?) AND lease_owner IS NOT NULL ORDER BY input_index",
+				)
+				.map_err(sql_error)?;
+			let leases = statement
+				.query_map(params![call_id, INPUT_LEASED, INPUT_RUNNING], |row| {
+					Ok(LeaseToken {
+						call_id:          call_id.into(),
+						input_index:      row.get(0)?,
+						worker_id:        row.get(1)?,
+						lease_generation: row.get(2)?,
+					})
 				})
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		Ok(leases)
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			Ok(leases)
+		})
 	}
 
 	/// Persist cancellation before workers are signalled.
@@ -1956,60 +2019,60 @@ impl Store {
 		now_ms: u64,
 	) -> Result<CallRecord> {
 		let fingerprint = Sha256::digest([call_id.as_bytes(), reason.as_bytes()].concat());
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if let Some(resource) = idempotent_resource(&tx, "cancel_call", request_id, &fingerprint)? {
-			let value = call_record(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		let status = call_status(&tx, call_id)?;
-		if terminal_call(status) {
-			let value = call_record(&tx, call_id)?;
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if let Some(resource) = idempotent_resource(&tx, "cancel_call", request_id, &fingerprint)?
+			{
+				let value = call_record(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			let status = call_status(&tx, call_id)?;
+			if terminal_call(status) {
+				let value = call_record(&tx, call_id)?;
+				put_idempotency(&tx, "cancel_call", request_id, &fingerprint, call_id, now_ms)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			if status != CallStatus::Cancelling {
+				tx.execute(
+					"UPDATE calls SET status=?,cancel_reason=?,updated_ms=? WHERE id=?",
+					params![CallStatus::Cancelling as i32, reason, u64_i64(now_ms)?, call_id],
+				)
+				.map_err(sql_error)?;
+				append_event(
+					&tx,
+					call_id,
+					CallEventType::CancelRequested,
+					call_event::Payload::CancelRequested(CancelCallRequest {
+						call:       Some(CallRef { call_id: call_id.into() }),
+						reason:     reason.into(),
+						request_id: request_id.into(),
+					}),
+					now_ms,
+				)?;
+				append_status_event(&tx, call_id, CallStatus::Cancelling, now_ms)?;
+				tx.execute(
+					"UPDATE inputs SET status=?,finished_ms=? WHERE call_id=? AND status=?",
+					params![INPUT_CANCELLED, u64_i64(now_ms)?, call_id, INPUT_QUEUED],
+				)
+				.map_err(sql_error)?;
+			}
+			let active: u64 = tx
+				.query_row(
+					"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
+					params![call_id, INPUT_LEASED, INPUT_RUNNING],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?;
+			if active == 0 {
+				finalize_cancelled_tx(&tx, call_id, now_ms)?;
+			}
 			put_idempotency(&tx, "cancel_call", request_id, &fingerprint, call_id, now_ms)?;
+			let value = call_record(&tx, call_id)?;
 			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		if status != CallStatus::Cancelling {
-			tx.execute("UPDATE calls SET status=?,cancel_reason=?,updated_ms=? WHERE id=?", params![
-				CallStatus::Cancelling as i32,
-				reason,
-				u64_i64(now_ms)?,
-				call_id
-			])
-			.map_err(sql_error)?;
-			append_event(
-				&tx,
-				call_id,
-				CallEventType::CancelRequested,
-				call_event::Payload::CancelRequested(CancelCallRequest {
-					call:       Some(CallRef { call_id: call_id.into() }),
-					reason:     reason.into(),
-					request_id: request_id.into(),
-				}),
-				now_ms,
-			)?;
-			append_status_event(&tx, call_id, CallStatus::Cancelling, now_ms)?;
-			tx.execute(
-				"UPDATE inputs SET status=?,finished_ms=? WHERE call_id=? AND status=?",
-				params![INPUT_CANCELLED, u64_i64(now_ms)?, call_id, INPUT_QUEUED],
-			)
-			.map_err(sql_error)?;
-		}
-		let active: u64 = tx
-			.query_row(
-				"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
-				params![call_id, INPUT_LEASED, INPUT_RUNNING],
-				|row| row.get(0),
-			)
-			.map_err(sql_error)?;
-		if active == 0 {
-			finalize_cancelled_tx(&tx, call_id, now_ms)?;
-		}
-		put_idempotency(&tx, "cancel_call", request_id, &fingerprint, call_id, now_ms)?;
-		let value = call_record(&tx, call_id)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			Ok(value)
+		})
 	}
 
 	/// Terminalize a worker-owned input after a persisted cancellation request.
@@ -2019,222 +2082,232 @@ impl Store {
 		reason: &str,
 		now_ms: u64,
 	) -> Result<CallRecord> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		require_lease(&tx, lease, &[INPUT_LEASED, INPUT_RUNNING], now_ms)?;
-		if call_status(&tx, &lease.call_id)? != CallStatus::Cancelling {
-			return Err(EngineError::invalid("call has no pending cancellation"));
-		}
-		append_attempt_transition(
-			&tx,
-			lease,
-			AttemptStatus::Cancelled,
-			AttemptFailureKind::Cancelled,
-			None,
-			StartupKind::Unspecified,
-			now_ms,
-		)?;
-		tx.execute(
-			"UPDATE inputs SET \
-			 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,error=NULL WHERE call_id=? \
-			 AND input_index=?",
-			params![INPUT_CANCELLED, u64_i64(now_ms)?, lease.call_id, u64_i64(lease.input_index)?],
-		)
-		.map_err(sql_error)?;
-		if !reason.is_empty() {
-			tx.execute("UPDATE calls SET cancel_reason=? WHERE id=?", params![reason, lease.call_id])
-				.map_err(sql_error)?;
-		}
-		let active: u64 = tx
-			.query_row(
-				"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
-				params![lease.call_id, INPUT_LEASED, INPUT_RUNNING],
-				|row| row.get(0),
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			require_lease(&tx, lease, &[INPUT_LEASED, INPUT_RUNNING], now_ms)?;
+			if call_status(&tx, &lease.call_id)? != CallStatus::Cancelling {
+				return Err(EngineError::invalid("call has no pending cancellation"));
+			}
+			append_attempt_transition(
+				&tx,
+				lease,
+				AttemptStatus::Cancelled,
+				AttemptFailureKind::Cancelled,
+				None,
+				StartupKind::Unspecified,
+				now_ms,
+			)?;
+			tx.execute(
+				"UPDATE inputs SET \
+				 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,error=NULL WHERE \
+				 call_id=? AND input_index=?",
+				params![INPUT_CANCELLED, u64_i64(now_ms)?, lease.call_id, u64_i64(lease.input_index)?],
 			)
 			.map_err(sql_error)?;
-		if active == 0 {
-			finalize_cancelled_tx(&tx, &lease.call_id, now_ms)?;
-		}
-		let value = call_record(&tx, &lease.call_id)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			if !reason.is_empty() {
+				tx.execute("UPDATE calls SET cancel_reason=? WHERE id=?", params![
+					reason,
+					lease.call_id
+				])
+				.map_err(sql_error)?;
+			}
+			let active: u64 = tx
+				.query_row(
+					"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
+					params![lease.call_id, INPUT_LEASED, INPUT_RUNNING],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?;
+			if active == 0 {
+				finalize_cancelled_tx(&tx, &lease.call_id, now_ms)?;
+			}
+			let value = call_record(&tx, &lease.call_id)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Requeue expired leases and persist infrastructure-attempt failures.
 	pub fn expire_leases(&self, now_ms: u64) -> Result<u64> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut statement = tx
-			.prepare(
-				"SELECT call_id,input_index,COALESCE(lease_owner,''),lease_generation,attempt_id FROM \
-				 inputs WHERE status IN (?,?) AND lease_expiry_ms<=?",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(params![INPUT_LEASED, INPUT_RUNNING, u64_i64(now_ms)?], |row| {
-				Ok((
-					row.get::<_, String>(0)?,
-					row.get::<_, u64>(1)?,
-					row.get::<_, String>(2)?,
-					row.get::<_, u64>(3)?,
-					row.get::<_, Option<String>>(4)?,
-				))
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		let mut cancelling_calls = HashSet::new();
-		for (call, index, worker, generation, attempt_id) in &rows {
-			let lease = LeaseToken {
-				call_id:          call.clone(),
-				input_index:      *index,
-				worker_id:        worker.clone(),
-				lease_generation: *generation,
-			};
-			if call_status(&tx, call)? == CallStatus::Cancelling {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut statement = tx
+				.prepare(
+					"SELECT call_id,input_index,COALESCE(lease_owner,''),lease_generation,attempt_id \
+					 FROM inputs WHERE status IN (?,?) AND lease_expiry_ms<=?",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(params![INPUT_LEASED, INPUT_RUNNING, u64_i64(now_ms)?], |row| {
+					Ok((
+						row.get::<_, String>(0)?,
+						row.get::<_, u64>(1)?,
+						row.get::<_, String>(2)?,
+						row.get::<_, u64>(3)?,
+						row.get::<_, Option<String>>(4)?,
+					))
+				})
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			let mut cancelling_calls = HashSet::new();
+			for (call, index, worker, generation, attempt_id) in &rows {
+				let lease = LeaseToken {
+					call_id:          call.clone(),
+					input_index:      *index,
+					worker_id:        worker.clone(),
+					lease_generation: *generation,
+				};
+				if call_status(&tx, call)? == CallStatus::Cancelling {
+					if attempt_id.is_some() {
+						append_attempt_transition(
+							&tx,
+							&lease,
+							AttemptStatus::Cancelled,
+							AttemptFailureKind::Cancelled,
+							None,
+							StartupKind::Unspecified,
+							now_ms,
+						)?;
+					}
+					tx.execute(
+						"UPDATE inputs SET \
+						 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,attempt_id=NULL \
+						 WHERE call_id=? AND input_index=?",
+						params![INPUT_CANCELLED, u64_i64(now_ms)?, call, index],
+					)
+					.map_err(sql_error)?;
+					cancelling_calls.insert(call.clone());
+					continue;
+				}
 				if attempt_id.is_some() {
+					let error = CallError {
+						code: "lease_expired".into(),
+						message: "worker lease expired".into(),
+						r#type: "InfrastructureError".into(),
+						retryable: true,
+						..Default::default()
+					};
 					append_attempt_transition(
 						&tx,
 						&lease,
-						AttemptStatus::Cancelled,
-						AttemptFailureKind::Cancelled,
-						None,
+						AttemptStatus::Failed,
+						AttemptFailureKind::Infrastructure,
+						Some(&error),
 						StartupKind::Unspecified,
 						now_ms,
 					)?;
 				}
 				tx.execute(
 					"UPDATE inputs SET \
-					 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,attempt_id=NULL \
-					 WHERE call_id=? AND input_index=?",
-					params![INPUT_CANCELLED, u64_i64(now_ms)?, call, index],
+					 status=?,available_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,\
+					 infra_attempts=infra_attempts+1,attempt_id=NULL WHERE call_id=? AND input_index=?",
+					params![INPUT_QUEUED, u64_i64(now_ms)?, call, index],
 				)
 				.map_err(sql_error)?;
-				cancelling_calls.insert(call.clone());
-				continue;
+				if call_status(&tx, call)? == CallStatus::Running {
+					tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
+						CallStatus::Queued as i32,
+						u64_i64(now_ms)?,
+						call
+					])
+					.map_err(sql_error)?;
+					append_status_event(&tx, call, CallStatus::Queued, now_ms)?;
+				}
 			}
-			if attempt_id.is_some() {
-				let error = CallError {
-					code: "lease_expired".into(),
-					message: "worker lease expired".into(),
-					r#type: "InfrastructureError".into(),
-					retryable: true,
-					..Default::default()
-				};
-				append_attempt_transition(
-					&tx,
-					&lease,
-					AttemptStatus::Failed,
-					AttemptFailureKind::Infrastructure,
-					Some(&error),
-					StartupKind::Unspecified,
-					now_ms,
-				)?;
+			for call in cancelling_calls {
+				let active: u64 = tx
+					.query_row(
+						"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
+						params![call, INPUT_LEASED, INPUT_RUNNING],
+						|row| row.get(0),
+					)
+					.map_err(sql_error)?;
+				if active == 0 {
+					finalize_cancelled_tx(&tx, &call, now_ms)?;
+				}
 			}
-			tx.execute(
-				"UPDATE inputs SET \
-				 status=?,available_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,\
-				 infra_attempts=infra_attempts+1,attempt_id=NULL WHERE call_id=? AND input_index=?",
-				params![INPUT_QUEUED, u64_i64(now_ms)?, call, index],
-			)
-			.map_err(sql_error)?;
-			if call_status(&tx, call)? == CallStatus::Running {
-				tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
-					CallStatus::Queued as i32,
-					u64_i64(now_ms)?,
-					call
-				])
-				.map_err(sql_error)?;
-				append_status_event(&tx, call, CallStatus::Queued, now_ms)?;
-			}
-		}
-		for call in cancelling_calls {
-			let active: u64 = tx
-				.query_row(
-					"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
-					params![call, INPUT_LEASED, INPUT_RUNNING],
-					|row| row.get(0),
-				)
-				.map_err(sql_error)?;
-			if active == 0 {
-				finalize_cancelled_tx(&tx, &call, now_ms)?;
-			}
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(rows.len() as u64)
+			tx.commit().map_err(sql_error)?;
+			Ok(rows.len() as u64)
+		})
 	}
 
 	/// Complete calls whose closed input set is entirely terminal.
 	pub fn complete_ready_calls(&self, now_ms: u64) -> Result<Vec<String>> {
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		let mut s = tx
-			.prepare("SELECT id FROM calls WHERE input_closed=1 AND status IN (?,?)")
-			.map_err(sql_error)?;
-		let ids = s
-			.query_map(params![CallStatus::Queued as i32, CallStatus::Running as i32], |r| {
-				r.get::<_, String>(0)
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(s);
-		let mut completed = Vec::new();
-		for id in ids {
-			if complete_call_tx(&tx, &id, now_ms)? {
-				completed.push(id);
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			let mut s = tx
+				.prepare("SELECT id FROM calls WHERE input_closed=1 AND status IN (?,?)")
+				.map_err(sql_error)?;
+			let ids = s
+				.query_map(params![CallStatus::Queued as i32, CallStatus::Running as i32], |r| {
+					r.get::<_, String>(0)
+				})
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(s);
+			let mut completed = Vec::new();
+			for id in ids {
+				if complete_call_tx(&tx, &id, now_ms)? {
+					completed.push(id);
+				}
 			}
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(completed)
+			tx.commit().map_err(sql_error)?;
+			Ok(completed)
+		})
 	}
 
 	/// Expire retained result payloads and release their artifact references.
 	pub fn expire_results(&self, now_ms: u64) -> Result<u64> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut statement = tx
-			.prepare("SELECT id FROM calls WHERE result_expiry_ms IS NOT NULL AND result_expiry_ms<=?")
-			.map_err(sql_error)?;
-		let calls = statement
-			.query_map([u64_i64(now_ms)?], |row| row.get::<_, String>(0))
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		for id in &calls {
-			tx.execute(
-				"DELETE FROM artifact_refs WHERE owner_kind='result' AND (owner_id=? OR owner_id LIKE \
-				 ?)",
-				params![id, format!("{id}:%")],
-			)
-			.map_err(sql_error)?;
-			tx.execute("DELETE FROM results WHERE call_id=?", [id])
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut statement = tx
+				.prepare(
+					"SELECT id FROM calls WHERE result_expiry_ms IS NOT NULL AND result_expiry_ms<=?",
+				)
 				.map_err(sql_error)?;
-			tx.execute("DELETE FROM events WHERE call_id=? AND event_type IN (?,?)", params![
-				id,
-				CallEventType::Yield as i32,
-				CallEventType::Result as i32
-			])
-			.map_err(sql_error)?;
-			tx.execute("UPDATE inputs SET result=NULL WHERE call_id=?", [id])
+			let calls = statement
+				.query_map([u64_i64(now_ms)?], |row| row.get::<_, String>(0))
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
 				.map_err(sql_error)?;
-			tx.execute("UPDATE calls SET result_expiry_ms=NULL WHERE id=?", [id])
+			drop(statement);
+			for id in &calls {
+				tx.execute(
+					"DELETE FROM artifact_refs WHERE owner_kind='result' AND (owner_id=? OR owner_id \
+					 LIKE ?)",
+					params![id, format!("{id}:%")],
+				)
 				.map_err(sql_error)?;
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(calls.len() as u64)
+				tx.execute("DELETE FROM results WHERE call_id=?", [id])
+					.map_err(sql_error)?;
+				tx.execute("DELETE FROM events WHERE call_id=? AND event_type IN (?,?)", params![
+					id,
+					CallEventType::Yield as i32,
+					CallEventType::Result as i32
+				])
+				.map_err(sql_error)?;
+				tx.execute("UPDATE inputs SET result=NULL WHERE call_id=?", [id])
+					.map_err(sql_error)?;
+				tx.execute("UPDATE calls SET result_expiry_ms=NULL WHERE id=?", [id])
+					.map_err(sql_error)?;
+			}
+			tx.commit().map_err(sql_error)?;
+			Ok(calls.len() as u64)
+		})
 	}
 
 	/// Return the durable event sequence frontier for subscribe-before-replay.
 	pub fn event_frontier(&self, call_id: &str) -> Result<u64> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		connection
-			.query_row("SELECT event_seq FROM calls WHERE id=?", [call_id], |row| row.get(0))
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("call not found"))
+		self.connection.with_connection(|connection| {
+			connection
+				.query_row("SELECT event_seq FROM calls WHERE id=?", [call_id], |row| row.get(0))
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("call not found"))
+		})
 	}
 
 	/// Replay immutable call events strictly after a durable cursor.
@@ -2244,19 +2317,21 @@ impl Store {
 		after_sequence: u64,
 		limit: u32,
 	) -> Result<Vec<CallEvent>> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let mut s = c
-			.prepare(
-				"SELECT payload FROM events WHERE call_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		let rows = s
-			.query_map(
-				params![call_id, u64_i64(after_sequence)?, i64::from(normalized_page_size(limit))],
-				|r| r.get::<_, Vec<u8>>(0),
-			)
-			.map_err(sql_error)?;
-		decode_rows(rows)
+		self.connection.with_connection(|c| {
+			let mut s = c
+				.prepare(
+					"SELECT payload FROM events WHERE call_id=? AND sequence>? ORDER BY sequence LIMIT \
+					 ?",
+				)
+				.map_err(sql_error)?;
+			let rows = s
+				.query_map(
+					params![call_id, u64_i64(after_sequence)?, i64::from(normalized_page_size(limit))],
+					|r| r.get::<_, Vec<u8>>(0),
+				)
+				.map_err(sql_error)?;
+			decode_rows(rows)
+		})
 	}
 
 	/// Alias used by call watchers.
@@ -2276,19 +2351,21 @@ impl Store {
 		after_sequence: u64,
 		limit: u32,
 	) -> Result<Vec<CallResult>> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let mut s = c
-			.prepare(
-				"SELECT payload FROM results WHERE call_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		let rows = s
-			.query_map(
-				params![call_id, u64_i64(after_sequence)?, i64::from(normalized_page_size(limit))],
-				|r| r.get::<_, Vec<u8>>(0),
-			)
-			.map_err(sql_error)?;
-		decode_rows(rows)
+		self.connection.with_connection(|c| {
+			let mut s = c
+				.prepare(
+					"SELECT payload FROM results WHERE call_id=? AND sequence>? ORDER BY sequence \
+					 LIMIT ?",
+				)
+				.map_err(sql_error)?;
+			let rows = s
+				.query_map(
+					params![call_id, u64_i64(after_sequence)?, i64::from(normalized_page_size(limit))],
+					|r| r.get::<_, Vec<u8>>(0),
+				)
+				.map_err(sql_error)?;
+			decode_rows(rows)
+		})
 	}
 
 	/// Alias used by reconnecting result consumers.
@@ -2321,131 +2398,135 @@ impl Store {
 		);
 		validate_id(&id, "schedule id")?;
 		let fingerprint = canonical_schedule_fingerprint(request);
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		if let Some(resource) =
-			idempotent_resource(&tx, "schedule", &request.request_id, &fingerprint)?
-		{
-			let v = schedule_by_id(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(v);
-		}
-		let app_ref = spec
-			.app
-			.as_ref()
-			.ok_or_else(|| EngineError::invalid("schedule app revision is required"))?;
-		let app_revision = app_revision_by_id(&tx, &app_ref.revision_id)?;
-		if app_revision.r#ref.as_ref() != Some(app_ref) {
-			return Err(EngineError::invalid("schedule app identity does not match stored revision"));
-		}
-		let target_revision = spec
-			.target
-			.as_ref()
-			.and_then(|target| target.function.as_ref())
-			.ok_or_else(|| EngineError::invalid("schedule target revision is required"))?;
-		let stored_target = revision_by_id(&tx, &target_revision.revision_id)?;
-		if stored_target.r#ref.as_ref() != Some(target_revision) {
-			return Err(EngineError::invalid(
-				"schedule target identity does not match stored revision",
-			));
-		}
-		if !app_revision
-			.functions
-			.iter()
-			.any(|binding| binding.revision.as_ref() == Some(target_revision))
-		{
-			return Err(EngineError::invalid(
-				"schedule target is not a member of the pinned app revision",
-			));
-		}
-		let created: u64 = tx
-			.query_row("SELECT created_ms FROM schedules WHERE id=?", [&id], |r| r.get(0))
-			.optional()
-			.map_err(sql_error)?
-			.unwrap_or(now_ms);
-		let value = ScheduleRecord {
-			r#ref:                  Some(ScheduleRef { schedule_id: id.clone() }),
-			spec:                   Some(spec.clone()),
-			created_at_unix_millis: created,
-			updated_at_unix_millis: now_ms,
-			next_run_presence:      next_run_ms
-				.map(schedule_record::NextRunPresence::NextRunUnixMillis),
-		};
-		let app = spec
-			.app
-			.as_ref()
-			.and_then(|r| r.app.as_ref())
-			.ok_or_else(|| EngineError::invalid("schedule app revision is required"))?;
-		let function = spec
-			.target
-			.as_ref()
-			.and_then(|t| t.function.as_ref())
-			.and_then(|r| r.function.as_ref())
-			.ok_or_else(|| EngineError::invalid("schedule target function is required"))?;
-		tx.execute("DELETE FROM artifact_refs WHERE owner_kind='schedule' AND owner_id=?", [&id])
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "schedule", &request.request_id, &fingerprint)?
+			{
+				let v = schedule_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(v);
+			}
+			let app_ref = spec
+				.app
+				.as_ref()
+				.ok_or_else(|| EngineError::invalid("schedule app revision is required"))?;
+			let app_revision = app_revision_by_id(&tx, &app_ref.revision_id)?;
+			if app_revision.r#ref.as_ref() != Some(app_ref) {
+				return Err(EngineError::invalid(
+					"schedule app identity does not match stored revision",
+				));
+			}
+			let target_revision = spec
+				.target
+				.as_ref()
+				.and_then(|target| target.function.as_ref())
+				.ok_or_else(|| EngineError::invalid("schedule target revision is required"))?;
+			let stored_target = revision_by_id(&tx, &target_revision.revision_id)?;
+			if stored_target.r#ref.as_ref() != Some(target_revision) {
+				return Err(EngineError::invalid(
+					"schedule target identity does not match stored revision",
+				));
+			}
+			if !app_revision
+				.functions
+				.iter()
+				.any(|binding| binding.revision.as_ref() == Some(target_revision))
+			{
+				return Err(EngineError::invalid(
+					"schedule target is not a member of the pinned app revision",
+				));
+			}
+			let created: u64 = tx
+				.query_row("SELECT created_ms FROM schedules WHERE id=?", [&id], |r| r.get(0))
+				.optional()
+				.map_err(sql_error)?
+				.unwrap_or(now_ms);
+			let value = ScheduleRecord {
+				r#ref:                  Some(ScheduleRef { schedule_id: id.clone() }),
+				spec:                   Some(spec.clone()),
+				created_at_unix_millis: created,
+				updated_at_unix_millis: now_ms,
+				next_run_presence:      next_run_ms
+					.map(schedule_record::NextRunPresence::NextRunUnixMillis),
+			};
+			let app = spec
+				.app
+				.as_ref()
+				.and_then(|r| r.app.as_ref())
+				.ok_or_else(|| EngineError::invalid("schedule app revision is required"))?;
+			let function = spec
+				.target
+				.as_ref()
+				.and_then(|t| t.function.as_ref())
+				.and_then(|r| r.function.as_ref())
+				.ok_or_else(|| EngineError::invalid("schedule target function is required"))?;
+			tx.execute("DELETE FROM artifact_refs WHERE owner_kind='schedule' AND owner_id=?", [&id])
+				.map_err(sql_error)?;
+			tx.execute(
+				"INSERT INTO \
+				 schedules(id,app_namespace,app_name,function_namespace,function_name,status,record,\
+				 created_ms,updated_ms,next_run_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO \
+				 UPDATE SET \
+				 app_namespace=excluded.app_namespace,app_name=excluded.app_name,\
+				 function_namespace=excluded.function_namespace,function_name=excluded.function_name,\
+				 status=excluded.status,record=excluded.record,updated_ms=excluded.updated_ms,\
+				 next_run_ms=excluded.next_run_ms",
+				params![
+					id,
+					app.namespace,
+					app.name,
+					function.namespace,
+					function.name,
+					spec.status,
+					value.encode_to_vec(),
+					u64_i64(created)?,
+					u64_i64(now_ms)?,
+					opt_u64_i64(next_run_ms)?
+				],
+			)
 			.map_err(sql_error)?;
-		tx.execute(
-			"INSERT INTO \
-			 schedules(id,app_namespace,app_name,function_namespace,function_name,status,record,\
-			 created_ms,updated_ms,next_run_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO \
-			 UPDATE SET \
-			 app_namespace=excluded.app_namespace,app_name=excluded.app_name,\
-			 function_namespace=excluded.function_namespace,function_name=excluded.function_name,\
-			 status=excluded.status,record=excluded.record,updated_ms=excluded.updated_ms,\
-			 next_run_ms=excluded.next_run_ms",
-			params![
-				id,
-				app.namespace,
-				app.name,
-				function.namespace,
-				function.name,
-				spec.status,
-				value.encode_to_vec(),
-				u64_i64(created)?,
-				u64_i64(now_ms)?,
-				opt_u64_i64(next_run_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		for digest in envelope_artifacts(spec.target.as_ref().and_then(|t| t.input.as_ref())) {
-			add_artifact_ref(&tx, &digest, "schedule", &id)?;
-		}
-		put_idempotency(&tx, "schedule", &request.request_id, &fingerprint, &id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			for digest in envelope_artifacts(spec.target.as_ref().and_then(|t| t.input.as_ref())) {
+				add_artifact_ref(&tx, &digest, "schedule", &id)?;
+			}
+			put_idempotency(&tx, "schedule", &request.request_id, &fingerprint, &id, now_ms)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Return valid active schedules due at or before `now_ms`, isolating
 	/// corrupt rows.
 	pub fn due_schedules(&self, now_ms: u64, limit: u32) -> Result<Vec<ScheduleRecord>> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT id,record FROM schedules WHERE status=? AND next_run_ms<=? ORDER BY \
-				 next_run_ms,id LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(
-				params![
-					ScheduleStatus::Active as i32,
-					u64_i64(now_ms)?,
-					i64::from(normalized_page_size(limit))
-				],
-				|row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-			)
-			.map_err(sql_error)?;
-		let mut schedules = Vec::new();
-		for row in rows {
-			let (id, bytes) = row.map_err(sql_error)?;
-			match decode_message(&bytes) {
-				Ok(record) => schedules.push(record),
-				Err(error) => {
-					tracing::warn!(schedule_id=%id,%error,"skipping corrupt durable schedule");
-				},
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT id,record FROM schedules WHERE status=? AND next_run_ms<=? ORDER BY \
+					 next_run_ms,id LIMIT ?",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(
+					params![
+						ScheduleStatus::Active as i32,
+						u64_i64(now_ms)?,
+						i64::from(normalized_page_size(limit))
+					],
+					|row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+				)
+				.map_err(sql_error)?;
+			let mut schedules = Vec::new();
+			for row in rows {
+				let (id, bytes) = row.map_err(sql_error)?;
+				match decode_message(&bytes) {
+					Ok(record) => schedules.push(record),
+					Err(error) => {
+						tracing::warn!(schedule_id=%id,%error,"skipping corrupt durable schedule");
+					},
+				}
 			}
-		}
-		Ok(schedules)
+			Ok(schedules)
+		})
 	}
 
 	/// Advance a schedule only if its expected prior next-run value still
@@ -2457,20 +2538,22 @@ impl Store {
 		next_ms: Option<u64>,
 		now_ms: u64,
 	) -> Result<bool> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let changed = c
-			.execute(
-				"UPDATE schedules SET next_run_ms=?,updated_ms=? WHERE id=? AND next_run_ms=?",
-				params![opt_u64_i64(next_ms)?, u64_i64(now_ms)?, id, u64_i64(expected_ms)?],
-			)
-			.map_err(sql_error)?;
-		Ok(changed == 1)
+		self.connection.with_connection(|c| {
+			let changed = c
+				.execute(
+					"UPDATE schedules SET next_run_ms=?,updated_ms=? WHERE id=? AND next_run_ms=?",
+					params![opt_u64_i64(next_ms)?, u64_i64(now_ms)?, id, u64_i64(expected_ms)?],
+				)
+				.map_err(sql_error)?;
+			Ok(changed == 1)
+		})
 	}
 
 	/// Return one schedule by stable identifier.
 	pub fn get_schedule(&self, id: &str) -> Result<ScheduleRecord> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		schedule_by_id(&connection, id)
+		self
+			.connection
+			.with_connection(|connection| schedule_by_id(connection, id))
 	}
 
 	/// List schedules with optional logical app/function filters.
@@ -2483,43 +2566,45 @@ impl Store {
 		});
 		let (after_ms, after_id) = decode_page_token(&request.page_token)?;
 		let limit = normalized_page_size(request.page_size);
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT record,created_ms,id FROM schedules WHERE (?1 IS NULL OR app_namespace=?1) \
-				 AND (?2 IS NULL OR app_name=?2) AND (?3 IS NULL OR function_namespace=?3) AND (?4 IS \
-				 NULL OR function_name=?4) AND (created_ms>?5 OR (created_ms=?5 AND id>?6)) ORDER BY \
-				 created_ms,id LIMIT ?7",
-			)
-			.map_err(sql_error)?;
-		let rows = statement
-			.query_map(
-				params![
-					app.map(|a| a.namespace.as_str()),
-					app.map(|a| a.name.as_str()),
-					function.map(|f| f.namespace.as_str()),
-					function.map(|f| f.name.as_str()),
-					u64_i64(after_ms)?,
-					after_id,
-					i64::from(limit + 1)
-				],
-				|r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
-			)
-			.map_err(sql_error)?;
-		page_from_rows(rows, limit, decode_message)
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT record,created_ms,id FROM schedules WHERE (?1 IS NULL OR app_namespace=?1) \
+					 AND (?2 IS NULL OR app_name=?2) AND (?3 IS NULL OR function_namespace=?3) AND (?4 \
+					 IS NULL OR function_name=?4) AND (created_ms>?5 OR (created_ms=?5 AND id>?6)) \
+					 ORDER BY created_ms,id LIMIT ?7",
+				)
+				.map_err(sql_error)?;
+			let rows = statement
+				.query_map(
+					params![
+						app.map(|a| a.namespace.as_str()),
+						app.map(|a| a.name.as_str()),
+						function.map(|f| f.namespace.as_str()),
+						function.map(|f| f.name.as_str()),
+						u64_i64(after_ms)?,
+						after_id,
+						i64::from(limit + 1)
+					],
+					|r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+				)
+				.map_err(sql_error)?;
+			page_from_rows(rows, limit, decode_message)
+		})
 	}
 
 	/// Delete a schedule and release its artifact references.
 	pub fn delete_schedule(&self, id: &str) -> Result<()> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		schedule_by_id(&tx, id)?;
-		tx.execute("DELETE FROM artifact_refs WHERE owner_kind='schedule' AND owner_id=?", [id])
-			.map_err(sql_error)?;
-		tx.execute("DELETE FROM schedules WHERE id=?", [id])
-			.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(())
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			schedule_by_id(&tx, id)?;
+			tx.execute("DELETE FROM artifact_refs WHERE owner_kind='schedule' AND owner_id=?", [id])
+				.map_err(sql_error)?;
+			tx.execute("DELETE FROM schedules WHERE id=?", [id])
+				.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(())
+		})
 	}
 
 	/// Create calls for due schedules before CAS-advancing their durable
@@ -2581,67 +2666,70 @@ impl Store {
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("actor function is required"))?;
 		let fingerprint = canonical_actor_fingerprint(request);
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		if let Some(resource) = idempotent_resource(&tx, "actor", &request.request_id, &fingerprint)?
-		{
-			let v = actor_by_id(&tx, &resource)?;
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "actor", &request.request_id, &fingerprint)?
+			{
+				let v = actor_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(v);
+			}
+			revision_by_id(&tx, &function.revision_id)?;
+			let id = Uuid::new_v4().to_string();
+			let value = ActorRecord {
+				r#ref: Some(ActorRef { actor_id: id.clone() }),
+				function: Some(function.clone()),
+				status: ActorStatus::Creating as i32,
+				created_at_unix_millis: now_ms,
+				updated_at_unix_millis: now_ms,
+				latest_checkpoint_presence: None,
+				labels: request.labels.clone(),
+			};
+			tx.execute(
+				"INSERT INTO actors(id,revision_id,status,request,record,created_ms,updated_ms) \
+				 VALUES(?,?,?,?,?,?,?)",
+				params![
+					id,
+					function.revision_id,
+					value.status,
+					request.encode_to_vec(),
+					value.encode_to_vec(),
+					u64_i64(now_ms)?,
+					u64_i64(now_ms)?
+				],
+			)
+			.map_err(sql_error)?;
+			for digest in actor_initial_artifacts(request) {
+				add_artifact_ref(&tx, &digest, "actor", &id)?;
+			}
+			put_idempotency(&tx, "actor", &request.request_id, &fingerprint, &id, now_ms)?;
 			tx.commit().map_err(sql_error)?;
-			return Ok(v);
-		}
-		revision_by_id(&tx, &function.revision_id)?;
-		let id = Uuid::new_v4().to_string();
-		let value = ActorRecord {
-			r#ref: Some(ActorRef { actor_id: id.clone() }),
-			function: Some(function.clone()),
-			status: ActorStatus::Creating as i32,
-			created_at_unix_millis: now_ms,
-			updated_at_unix_millis: now_ms,
-			latest_checkpoint_presence: None,
-			labels: request.labels.clone(),
-		};
-		tx.execute(
-			"INSERT INTO actors(id,revision_id,status,request,record,created_ms,updated_ms) \
-			 VALUES(?,?,?,?,?,?,?)",
-			params![
-				id,
-				function.revision_id,
-				value.status,
-				request.encode_to_vec(),
-				value.encode_to_vec(),
-				u64_i64(now_ms)?,
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		for digest in actor_initial_artifacts(request) {
-			add_artifact_ref(&tx, &digest, "actor", &id)?;
-		}
-		put_idempotency(&tx, "actor", &request.request_id, &fingerprint, &id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+			Ok(value)
+		})
 	}
 
 	/// Get an actor record.
 	pub fn get_actor(&self, id: &str) -> Result<ActorRecord> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		actor_by_id(&c, id)
+		self.connection.with_connection(|c| actor_by_id(c, id))
 	}
 
 	/// Return an immutable actor checkpoint.
 	pub fn get_checkpoint(&self, id: &str) -> Result<ActorCheckpoint> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		checkpoint_by_id(&connection, id)
+		self
+			.connection
+			.with_connection(|connection| checkpoint_by_id(connection, id))
 	}
 
 	/// Return the checkpoint already committed for an idempotency request.
 	pub fn checkpoint_for_request(&self, request_id: &str) -> Result<Option<ActorCheckpoint>> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let Some(resource) = idempotent_resource_unchecked(&connection, "checkpoint", request_id)?
-		else {
-			return Ok(None);
-		};
-		Ok(Some(checkpoint_by_id(&connection, &resource)?))
+		self.connection.with_connection(|connection| {
+			let Some(resource) = idempotent_resource_unchecked(connection, "checkpoint", request_id)?
+			else {
+				return Ok(None);
+			};
+			Ok(Some(checkpoint_by_id(connection, &resource)?))
+		})
 	}
 
 	/// Mark an actor deleted without silently discarding its checkpoints.
@@ -2657,11 +2745,12 @@ impl Store {
 		worker_id: Option<&str>,
 		now_ms: u64,
 	) -> Result<ActorRecord> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let value = set_actor_status_tx(&tx, id, None, status, worker_id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let value = set_actor_status_tx(&tx, id, None, status, worker_id, now_ms)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Compare-and-swap an actor lifecycle state.
@@ -2673,11 +2762,12 @@ impl Store {
 		worker_id: Option<&str>,
 		now_ms: u64,
 	) -> Result<ActorRecord> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let value = set_actor_status_tx(&tx, id, Some(expected), status, worker_id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let value = set_actor_status_tx(&tx, id, Some(expected), status, worker_id, now_ms)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Persist an immutable actor checkpoint and atomically point the actor at
@@ -2697,70 +2787,75 @@ impl Store {
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("checkpoint state is required"))?;
 		let fingerprint = Sha256::digest(checkpoint.encode_to_vec());
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		if let Some(resource) = idempotent_resource(&tx, "checkpoint", request_id, &fingerprint)? {
-			let v = checkpoint_by_id(&tx, &resource)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(v);
-		}
-		let mut actor_record = actor_by_id(&tx, &actor.actor_id)?;
-		let function = checkpoint
-			.function
-			.as_ref()
-			.ok_or_else(|| EngineError::invalid("checkpoint function is required"))?;
-		if actor_record.function.as_ref() != Some(function) {
-			return Err(EngineError::invalid("checkpoint function does not match actor"));
-		}
-		let operation_sequence: u64 = tx
-			.query_row("SELECT operation_sequence FROM actors WHERE id=?", [&actor.actor_id], |row| {
-				row.get(0)
-			})
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			if let Some(resource) = idempotent_resource(&tx, "checkpoint", request_id, &fingerprint)? {
+				let v = checkpoint_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(v);
+			}
+			let mut actor_record = actor_by_id(&tx, &actor.actor_id)?;
+			let function = checkpoint
+				.function
+				.as_ref()
+				.ok_or_else(|| EngineError::invalid("checkpoint function is required"))?;
+			if actor_record.function.as_ref() != Some(function) {
+				return Err(EngineError::invalid("checkpoint function does not match actor"));
+			}
+			let operation_sequence: u64 = tx
+				.query_row(
+					"SELECT operation_sequence FROM actors WHERE id=?",
+					[&actor.actor_id],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?;
+			if checkpoint.sequence < operation_sequence {
+				return Err(EngineError::invalid(
+					"checkpoint sequence precedes actor operation frontier",
+				));
+			}
+			if let Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(previous)) =
+				&actor_record.latest_checkpoint_presence
+				&& checkpoint_by_id(&tx, &previous.checkpoint_id)?.sequence >= checkpoint.sequence
+			{
+				return Err(EngineError::invalid("checkpoint sequence must increase"));
+			}
+			let id = Uuid::new_v4().to_string();
+			let mut value = checkpoint.clone();
+			value.r#ref = Some(ActorCheckpointRef { checkpoint_id: id.clone() });
+			value.created_at_unix_millis = now_ms;
+			tx.execute(
+				"INSERT INTO checkpoints(id,actor_id,revision_id,sequence,record,created_ms) \
+				 VALUES(?,?,?,?,?,?)",
+				params![
+					id,
+					actor.actor_id,
+					function.revision_id,
+					u64_i64(value.sequence)?,
+					value.encode_to_vec(),
+					u64_i64(now_ms)?
+				],
+			)
 			.map_err(sql_error)?;
-		if checkpoint.sequence < operation_sequence {
-			return Err(EngineError::invalid("checkpoint sequence precedes actor operation frontier"));
-		}
-		if let Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(previous)) =
-			&actor_record.latest_checkpoint_presence
-			&& checkpoint_by_id(&tx, &previous.checkpoint_id)?.sequence >= checkpoint.sequence
-		{
-			return Err(EngineError::invalid("checkpoint sequence must increase"));
-		}
-		let id = Uuid::new_v4().to_string();
-		let mut value = checkpoint.clone();
-		value.r#ref = Some(ActorCheckpointRef { checkpoint_id: id.clone() });
-		value.created_at_unix_millis = now_ms;
-		tx.execute(
-			"INSERT INTO checkpoints(id,actor_id,revision_id,sequence,record,created_ms) \
-			 VALUES(?,?,?,?,?,?)",
-			params![
+			actor_record.latest_checkpoint_presence =
+				Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(ActorCheckpointRef {
+					checkpoint_id: id.clone(),
+				}));
+			actor_record.updated_at_unix_millis = now_ms;
+			tx.execute("UPDATE actors SET checkpoint_id=?,record=?,updated_ms=? WHERE id=?", params![
 				id,
-				actor.actor_id,
-				function.revision_id,
-				u64_i64(value.sequence)?,
-				value.encode_to_vec(),
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		actor_record.latest_checkpoint_presence =
-			Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(ActorCheckpointRef {
-				checkpoint_id: id.clone(),
-			}));
-		actor_record.updated_at_unix_millis = now_ms;
-		tx.execute("UPDATE actors SET checkpoint_id=?,record=?,updated_ms=? WHERE id=?", params![
-			id,
-			actor_record.encode_to_vec(),
-			u64_i64(now_ms)?,
-			actor.actor_id
-		])
-		.map_err(sql_error)?;
-		for digest in envelope_artifacts(Some(state)) {
-			add_artifact_ref(&tx, &digest, "checkpoint", &id)?;
-		}
-		put_idempotency(&tx, "checkpoint", request_id, &fingerprint, &id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(value)
+				actor_record.encode_to_vec(),
+				u64_i64(now_ms)?,
+				actor.actor_id
+			])
+			.map_err(sql_error)?;
+			for digest in envelope_artifacts(Some(state)) {
+				add_artifact_ref(&tx, &digest, "checkpoint", &id)?;
+			}
+			put_idempotency(&tx, "checkpoint", request_id, &fingerprint, &id, now_ms)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(value)
+		})
 	}
 
 	/// Restore an actor pointer to a compatible immutable checkpoint.
@@ -2772,73 +2867,75 @@ impl Store {
 		now_ms: u64,
 	) -> Result<ActorRecord> {
 		let fingerprint = Sha256::digest([actor_id.as_bytes(), checkpoint_id.as_bytes()].concat());
-		let mut c = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut c)?;
-		if idempotent_resource(&tx, "restore_actor", request_id, &fingerprint)?.is_some() {
-			let v = actor_by_id(&tx, actor_id)?;
+		self.connection.with_connection(|c| {
+			let tx = immediate(c)?;
+			if idempotent_resource(&tx, "restore_actor", request_id, &fingerprint)?.is_some() {
+				let v = actor_by_id(&tx, actor_id)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(v);
+			}
+			let checkpoint = checkpoint_by_id(&tx, checkpoint_id)?;
+			let mut actor = actor_by_id(&tx, actor_id)?;
+			if actor.status == ActorStatus::Deleted as i32 {
+				return Err(EngineError::invalid("deleted actor cannot be restored"));
+			}
+			if actor.function != checkpoint.function {
+				return Err(EngineError::invalid("checkpoint is incompatible with actor function"));
+			}
+			actor.latest_checkpoint_presence =
+				Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(ActorCheckpointRef {
+					checkpoint_id: checkpoint_id.into(),
+				}));
+			actor.status = ActorStatus::Stopped as i32;
+			actor.updated_at_unix_millis = now_ms;
+			tx.execute(
+				"UPDATE actors SET \
+				 status=?,worker_id=NULL,checkpoint_id=?,operation_sequence=?,record=?,updated_ms=? \
+				 WHERE id=?",
+				params![
+					actor.status,
+					checkpoint_id,
+					u64_i64(checkpoint.sequence)?,
+					actor.encode_to_vec(),
+					u64_i64(now_ms)?,
+					actor_id
+				],
+			)
+			.map_err(sql_error)?;
+			put_idempotency(&tx, "restore_actor", request_id, &fingerprint, actor_id, now_ms)?;
 			tx.commit().map_err(sql_error)?;
-			return Ok(v);
-		}
-		let checkpoint = checkpoint_by_id(&tx, checkpoint_id)?;
-		let mut actor = actor_by_id(&tx, actor_id)?;
-		if actor.status == ActorStatus::Deleted as i32 {
-			return Err(EngineError::invalid("deleted actor cannot be restored"));
-		}
-		if actor.function != checkpoint.function {
-			return Err(EngineError::invalid("checkpoint is incompatible with actor function"));
-		}
-		actor.latest_checkpoint_presence =
-			Some(actor_record::LatestCheckpointPresence::LatestCheckpoint(ActorCheckpointRef {
-				checkpoint_id: checkpoint_id.into(),
-			}));
-		actor.status = ActorStatus::Stopped as i32;
-		actor.updated_at_unix_millis = now_ms;
-		tx.execute(
-			"UPDATE actors SET \
-			 status=?,worker_id=NULL,checkpoint_id=?,operation_sequence=?,record=?,updated_ms=? \
-			 WHERE id=?",
-			params![
-				actor.status,
-				checkpoint_id,
-				u64_i64(checkpoint.sequence)?,
-				actor.encode_to_vec(),
-				u64_i64(now_ms)?,
-				actor_id
-			],
-		)
-		.map_err(sql_error)?;
-		put_idempotency(&tx, "restore_actor", request_id, &fingerprint, actor_id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(actor)
+			Ok(actor)
+		})
 	}
 
 	/// Allocate the next durable actor operation and CAS READY to BUSY.
 	pub fn allocate_actor_operation(&self, actor_id: &str, now_ms: u64) -> Result<u64> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut actor = actor_by_id(&tx, actor_id)?;
-		if actor.status != ActorStatus::Ready as i32 {
-			return Err(EngineError::busy("actor is not ready"));
-		}
-		let sequence: u64 = tx
-			.query_row(
-				"UPDATE actors SET operation_sequence=operation_sequence+1 WHERE id=? AND status=? \
-				 RETURNING operation_sequence",
-				params![actor_id, ActorStatus::Ready as i32],
-				|row| row.get(0),
-			)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut actor = actor_by_id(&tx, actor_id)?;
+			if actor.status != ActorStatus::Ready as i32 {
+				return Err(EngineError::busy("actor is not ready"));
+			}
+			let sequence: u64 = tx
+				.query_row(
+					"UPDATE actors SET operation_sequence=operation_sequence+1 WHERE id=? AND status=? \
+					 RETURNING operation_sequence",
+					params![actor_id, ActorStatus::Ready as i32],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?;
+			actor.status = ActorStatus::Busy as i32;
+			actor.updated_at_unix_millis = now_ms;
+			tx.execute("UPDATE actors SET status=?,record=?,updated_ms=? WHERE id=?", params![
+				actor.status,
+				actor.encode_to_vec(),
+				u64_i64(now_ms)?,
+				actor_id
+			])
 			.map_err(sql_error)?;
-		actor.status = ActorStatus::Busy as i32;
-		actor.updated_at_unix_millis = now_ms;
-		tx.execute("UPDATE actors SET status=?,record=?,updated_ms=? WHERE id=?", params![
-			actor.status,
-			actor.encode_to_vec(),
-			u64_i64(now_ms)?,
-			actor_id
-		])
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(sequence)
+			tx.commit().map_err(sql_error)?;
+			Ok(sequence)
+		})
 	}
 
 	/// Complete the exact current actor operation and CAS BUSY to READY.
@@ -2848,61 +2945,63 @@ impl Store {
 		sequence: u64,
 		now_ms: u64,
 	) -> Result<ActorRecord> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let current: u64 = tx
-			.query_row(
-				"SELECT operation_sequence FROM actors WHERE id=? AND status=?",
-				params![actor_id, ActorStatus::Busy as i32],
-				|row| row.get(0),
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let current: u64 = tx
+				.query_row(
+					"SELECT operation_sequence FROM actors WHERE id=? AND status=?",
+					params![actor_id, ActorStatus::Busy as i32],
+					|row| row.get(0),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::busy("actor is not busy"))?;
+			if current != sequence {
+				return Err(EngineError::busy("actor operation sequence changed"));
+			}
+			let mut actor = actor_by_id(&tx, actor_id)?;
+			actor.status = ActorStatus::Ready as i32;
+			actor.updated_at_unix_millis = now_ms;
+			tx.execute(
+				"UPDATE actors SET status=?,record=?,updated_ms=? WHERE id=? AND status=? AND \
+				 operation_sequence=?",
+				params![
+					actor.status,
+					actor.encode_to_vec(),
+					u64_i64(now_ms)?,
+					actor_id,
+					ActorStatus::Busy as i32,
+					u64_i64(sequence)?
+				],
 			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::busy("actor is not busy"))?;
-		if current != sequence {
-			return Err(EngineError::busy("actor operation sequence changed"));
-		}
-		let mut actor = actor_by_id(&tx, actor_id)?;
-		actor.status = ActorStatus::Ready as i32;
-		actor.updated_at_unix_millis = now_ms;
-		tx.execute(
-			"UPDATE actors SET status=?,record=?,updated_ms=? WHERE id=? AND status=? AND \
-			 operation_sequence=?",
-			params![
-				actor.status,
-				actor.encode_to_vec(),
-				u64_i64(now_ms)?,
-				actor_id,
-				ActorStatus::Busy as i32,
-				u64_i64(sequence)?
-			],
-		)
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(actor)
+			.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(actor)
+		})
 	}
 
 	/// Persist explicit worker loss, restoring only from an existing checkpoint.
 	pub fn mark_actor_worker_lost(&self, actor_id: &str, now_ms: u64) -> Result<ActorRecord> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut actor = actor_by_id(&tx, actor_id)?;
-		if actor.status == ActorStatus::Deleted as i32 {
-			return Err(EngineError::invalid("deleted actor cannot lose a worker"));
-		}
-		actor.status = if actor.latest_checkpoint_presence.is_some() {
-			ActorStatus::Stopped as i32
-		} else {
-			ActorStatus::Failed as i32
-		};
-		actor.updated_at_unix_millis = now_ms;
-		tx.execute(
-			"UPDATE actors SET status=?,worker_id=NULL,record=?,updated_ms=? WHERE id=?",
-			params![actor.status, actor.encode_to_vec(), u64_i64(now_ms)?, actor_id],
-		)
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(actor)
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut actor = actor_by_id(&tx, actor_id)?;
+			if actor.status == ActorStatus::Deleted as i32 {
+				return Err(EngineError::invalid("deleted actor cannot lose a worker"));
+			}
+			actor.status = if actor.latest_checkpoint_presence.is_some() {
+				ActorStatus::Stopped as i32
+			} else {
+				ActorStatus::Failed as i32
+			};
+			actor.updated_at_unix_millis = now_ms;
+			tx.execute(
+				"UPDATE actors SET status=?,worker_id=NULL,record=?,updated_ms=? WHERE id=?",
+				params![actor.status, actor.encode_to_vec(), u64_i64(now_ms)?, actor_id],
+			)
+			.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(actor)
+		})
 	}
 
 	/// Fork a new actor identity directly from an immutable compatible
@@ -2917,265 +3016,331 @@ impl Store {
 			.as_ref()
 			.ok_or_else(|| EngineError::invalid("fork checkpoint is required"))?;
 		let fingerprint = canonical_fork_fingerprint(request);
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		if let Some(resource) =
-			idempotent_resource(&tx, "fork_actor", &request.request_id, &fingerprint)?
-		{
-			let value = actor_by_id(&tx, &resource)?;
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			if let Some(resource) =
+				idempotent_resource(&tx, "fork_actor", &request.request_id, &fingerprint)?
+			{
+				let value = actor_by_id(&tx, &resource)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(value);
+			}
+			let checkpoint = checkpoint_by_id(&tx, &checkpoint_ref.checkpoint_id)?;
+			let function = checkpoint
+				.function
+				.clone()
+				.ok_or_else(|| EngineError::engine("checkpoint missing function"))?;
+			let id = Uuid::new_v4().to_string();
+			let record = ActorRecord {
+				r#ref: Some(ActorRef { actor_id: id.clone() }),
+				function: Some(function.clone()),
+				status: ActorStatus::Stopped as i32,
+				created_at_unix_millis: now_ms,
+				updated_at_unix_millis: now_ms,
+				latest_checkpoint_presence: Some(
+					actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint_ref.clone()),
+				),
+				labels: request.labels.clone(),
+			};
+			tx.execute(
+				"INSERT INTO \
+				 actors(id,revision_id,status,request,record,worker_id,checkpoint_id,\
+				 operation_sequence,created_ms,updated_ms) VALUES(?,?,?,?,?,NULL,?,?,?,?)",
+				params![
+					id,
+					function.revision_id,
+					record.status,
+					request.encode_to_vec(),
+					record.encode_to_vec(),
+					checkpoint_ref.checkpoint_id,
+					u64_i64(checkpoint.sequence)?,
+					u64_i64(now_ms)?,
+					u64_i64(now_ms)?
+				],
+			)
+			.map_err(sql_error)?;
+			put_idempotency(&tx, "fork_actor", &request.request_id, &fingerprint, &id, now_ms)?;
 			tx.commit().map_err(sql_error)?;
-			return Ok(value);
-		}
-		let checkpoint = checkpoint_by_id(&tx, &checkpoint_ref.checkpoint_id)?;
-		let function = checkpoint
-			.function
-			.clone()
-			.ok_or_else(|| EngineError::engine("checkpoint missing function"))?;
-		let id = Uuid::new_v4().to_string();
-		let record = ActorRecord {
-			r#ref: Some(ActorRef { actor_id: id.clone() }),
-			function: Some(function.clone()),
-			status: ActorStatus::Stopped as i32,
-			created_at_unix_millis: now_ms,
-			updated_at_unix_millis: now_ms,
-			latest_checkpoint_presence: Some(
-				actor_record::LatestCheckpointPresence::LatestCheckpoint(checkpoint_ref.clone()),
-			),
-			labels: request.labels.clone(),
-		};
-		tx.execute(
-			"INSERT INTO \
-			 actors(id,revision_id,status,request,record,worker_id,checkpoint_id,operation_sequence,\
-			 created_ms,updated_ms) VALUES(?,?,?,?,?,NULL,?,?,?,?)",
-			params![
-				id,
-				function.revision_id,
-				record.status,
-				request.encode_to_vec(),
-				record.encode_to_vec(),
-				checkpoint_ref.checkpoint_id,
-				u64_i64(checkpoint.sequence)?,
-				u64_i64(now_ms)?,
-				u64_i64(now_ms)?
-			],
-		)
-		.map_err(sql_error)?;
-		put_idempotency(&tx, "fork_actor", &request.request_id, &fingerprint, &id, now_ms)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(record)
+			Ok(record)
+		})
 	}
 
 	/// Requeue all pre-restart work and explicitly fail actors without
 	/// checkpoints.
 	pub fn recover_startup(&self, now_ms: u64) -> Result<RecoverySummary> {
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let mut statement = tx
-			.prepare(
-				"SELECT i.call_id,i.input_index,COALESCE(i.lease_owner,''),i.lease_generation,i.\
-				 attempt_id,c.status FROM inputs i JOIN calls c ON c.id=i.call_id WHERE i.status IN \
-				 (?,?)",
-			)
-			.map_err(sql_error)?;
-		let work = statement
-			.query_map(params![INPUT_LEASED, INPUT_RUNNING], |row| {
-				Ok((
-					row.get::<_, String>(0)?,
-					row.get::<_, u64>(1)?,
-					row.get::<_, String>(2)?,
-					row.get::<_, u64>(3)?,
-					row.get::<_, Option<String>>(4)?,
-					row.get::<_, i32>(5)?,
-				))
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		let mut requeued = 0;
-		let mut queued_calls = HashSet::new();
-		let mut cancelling_calls = HashSet::new();
-		for (call, index, worker, generation, attempt_id, status) in &work {
-			let lease = LeaseToken {
-				call_id:          call.clone(),
-				input_index:      *index,
-				worker_id:        worker.clone(),
-				lease_generation: *generation,
-			};
-			if *status == CallStatus::Cancelling as i32 {
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let mut statement = tx
+				.prepare(
+					"SELECT i.call_id,i.input_index,COALESCE(i.lease_owner,''),i.lease_generation,i.\
+					 attempt_id,c.status FROM inputs i JOIN calls c ON c.id=i.call_id WHERE i.status \
+					 IN (?,?)",
+				)
+				.map_err(sql_error)?;
+			let work = statement
+				.query_map(params![INPUT_LEASED, INPUT_RUNNING], |row| {
+					Ok((
+						row.get::<_, String>(0)?,
+						row.get::<_, u64>(1)?,
+						row.get::<_, String>(2)?,
+						row.get::<_, u64>(3)?,
+						row.get::<_, Option<String>>(4)?,
+						row.get::<_, i32>(5)?,
+					))
+				})
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			let mut requeued = 0;
+			let mut queued_calls = HashSet::new();
+			let mut cancelling_calls = HashSet::new();
+			for (call, index, worker, generation, attempt_id, status) in &work {
+				let lease = LeaseToken {
+					call_id:          call.clone(),
+					input_index:      *index,
+					worker_id:        worker.clone(),
+					lease_generation: *generation,
+				};
+				if *status == CallStatus::Cancelling as i32 {
+					if attempt_id.is_some() {
+						append_attempt_transition(
+							&tx,
+							&lease,
+							AttemptStatus::Cancelled,
+							AttemptFailureKind::Cancelled,
+							None,
+							StartupKind::Unspecified,
+							now_ms,
+						)?;
+					}
+					tx.execute(
+						"UPDATE inputs SET \
+						 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,attempt_id=NULL \
+						 WHERE call_id=? AND input_index=?",
+						params![INPUT_CANCELLED, u64_i64(now_ms)?, call, index],
+					)
+					.map_err(sql_error)?;
+					cancelling_calls.insert(call.clone());
+					continue;
+				}
 				if attempt_id.is_some() {
+					let error = CallError {
+						code: "startup_recovery".into(),
+						message: "execution interrupted by control-plane restart".into(),
+						r#type: "InfrastructureError".into(),
+						retryable: true,
+						..Default::default()
+					};
 					append_attempt_transition(
 						&tx,
 						&lease,
-						AttemptStatus::Cancelled,
-						AttemptFailureKind::Cancelled,
-						None,
+						AttemptStatus::Failed,
+						AttemptFailureKind::Infrastructure,
+						Some(&error),
 						StartupKind::Unspecified,
 						now_ms,
 					)?;
 				}
 				tx.execute(
 					"UPDATE inputs SET \
-					 status=?,finished_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,attempt_id=NULL \
-					 WHERE call_id=? AND input_index=?",
-					params![INPUT_CANCELLED, u64_i64(now_ms)?, call, index],
+					 status=?,available_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,\
+					 infra_attempts=infra_attempts+1,attempt_id=NULL WHERE call_id=? AND input_index=?",
+					params![INPUT_QUEUED, u64_i64(now_ms)?, call, index],
 				)
 				.map_err(sql_error)?;
-				cancelling_calls.insert(call.clone());
-				continue;
+				requeued += 1;
+				if *status == CallStatus::Running as i32 {
+					queued_calls.insert(call.clone());
+				}
 			}
-			if attempt_id.is_some() {
-				let error = CallError {
-					code: "startup_recovery".into(),
-					message: "execution interrupted by control-plane restart".into(),
-					r#type: "InfrastructureError".into(),
-					retryable: true,
-					..Default::default()
+			for call in queued_calls {
+				tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
+					CallStatus::Queued as i32,
+					u64_i64(now_ms)?,
+					call
+				])
+				.map_err(sql_error)?;
+				append_status_event(&tx, &call, CallStatus::Queued, now_ms)?;
+			}
+			for call in cancelling_calls {
+				finalize_cancelled_tx(&tx, &call, now_ms)?;
+			}
+			let mut statement = tx
+				.prepare(
+					"SELECT id,checkpoint_id FROM actors WHERE worker_id IS NOT NULL AND status IN \
+					 (?,?)",
+				)
+				.map_err(sql_error)?;
+			let actors = statement
+				.query_map(params![ActorStatus::Ready as i32, ActorStatus::Busy as i32], |row| {
+					Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+				})
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			drop(statement);
+			let mut lost = 0;
+			for (id, checkpoint) in actors {
+				let status = if checkpoint.is_some() {
+					ActorStatus::Stopped
+				} else {
+					lost += 1;
+					ActorStatus::Failed
 				};
-				append_attempt_transition(
-					&tx,
-					&lease,
-					AttemptStatus::Failed,
-					AttemptFailureKind::Infrastructure,
-					Some(&error),
-					StartupKind::Unspecified,
-					now_ms,
-				)?;
+				let mut record = actor_by_id(&tx, &id)?;
+				record.status = status as i32;
+				record.updated_at_unix_millis = now_ms;
+				tx.execute(
+					"UPDATE actors SET status=?,worker_id=NULL,record=?,updated_ms=? WHERE id=?",
+					params![status as i32, record.encode_to_vec(), u64_i64(now_ms)?, id],
+				)
+				.map_err(sql_error)?;
 			}
-			tx.execute(
-				"UPDATE inputs SET \
-				 status=?,available_ms=?,lease_owner=NULL,lease_expiry_ms=NULL,\
-				 infra_attempts=infra_attempts+1,attempt_id=NULL WHERE call_id=? AND input_index=?",
-				params![INPUT_QUEUED, u64_i64(now_ms)?, call, index],
-			)
-			.map_err(sql_error)?;
-			requeued += 1;
-			if *status == CallStatus::Running as i32 {
-				queued_calls.insert(call.clone());
-			}
-		}
-		for call in queued_calls {
-			tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
-				CallStatus::Queued as i32,
-				u64_i64(now_ms)?,
-				call
-			])
-			.map_err(sql_error)?;
-			append_status_event(&tx, &call, CallStatus::Queued, now_ms)?;
-		}
-		for call in cancelling_calls {
-			finalize_cancelled_tx(&tx, &call, now_ms)?;
-		}
-		let mut statement = tx
-			.prepare(
-				"SELECT id,checkpoint_id FROM actors WHERE worker_id IS NOT NULL AND status IN (?,?)",
-			)
-			.map_err(sql_error)?;
-		let actors = statement
-			.query_map(params![ActorStatus::Ready as i32, ActorStatus::Busy as i32], |row| {
-				Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		drop(statement);
-		let mut lost = 0;
-		for (id, checkpoint) in actors {
-			let status = if checkpoint.is_some() {
-				ActorStatus::Stopped
-			} else {
-				lost += 1;
-				ActorStatus::Failed
-			};
-			let mut record = actor_by_id(&tx, &id)?;
-			record.status = status as i32;
-			record.updated_at_unix_millis = now_ms;
-			tx.execute(
-				"UPDATE actors SET status=?,worker_id=NULL,record=?,updated_ms=? WHERE id=?",
-				params![status as i32, record.encode_to_vec(), u64_i64(now_ms)?, id],
-			)
-			.map_err(sql_error)?;
-		}
-		tx.commit().map_err(sql_error)?;
-		Ok(RecoverySummary { requeued_inputs: requeued, lost_actors: lost })
+			tx.commit().map_err(sql_error)?;
+			Ok(RecoverySummary { requeued_inputs: requeued, lost_actors: lost })
+		})
 	}
 
-	/// Record metadata for a verified content-addressed artifact.
-	pub fn record_artifact(
+	/// Commit metadata for an artifact whose digest publication lease is still
+	/// held. Artifact locations are always the canonical digest, never a
+	/// node-local cache path.
+	pub fn record_stored_artifact(
+		&self,
+		artifact: &StoredArtifact,
+		media_type: Option<&str>,
+		created_ms: u64,
+		expires_ms: Option<u64>,
+	) -> Result<()> {
+		self.record_artifact_locked(
+			&artifact.lease,
+			artifact.size,
+			media_type,
+			created_ms,
+			expires_ms,
+		)
+	}
+
+	fn record_artifact_locked(
+		&self,
+		lease: &ArtifactDigestLease,
+		size: u64,
+		media_type: Option<&str>,
+		created_ms: u64,
+		expires_ms: Option<u64>,
+	) -> Result<()> {
+		let digest = lease.digest();
+		validate_digest_hex(digest)?;
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let existing: Option<(u64, Option<String>)> = tx
+				.query_row("SELECT size,media_type FROM artifacts WHERE digest=?", [digest], |row| {
+					Ok((row.get(0)?, row.get(1)?))
+				})
+				.optional()
+				.map_err(sql_error)?;
+			if let Some((stored_size, stored_media)) = existing
+				&& (stored_size != size || stored_media.as_deref() != media_type)
+			{
+				return Err(EngineError::invalid(
+					"artifact digest already has conflicting immutable metadata",
+				));
+			}
+			tx.execute(
+				"INSERT INTO artifacts(digest,size,media_type,created_ms,expires_ms,path) \
+				 VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING",
+				params![
+					digest,
+					u64_i64(size)?,
+					media_type,
+					u64_i64(created_ms)?,
+					opt_u64_i64(expires_ms)?,
+					digest,
+				],
+			)
+			.map_err(sql_error)?;
+			tx.commit().map_err(sql_error)?;
+			Ok(())
+		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn record_artifact(
 		&self,
 		digest: &str,
 		size: u64,
 		media_type: Option<&str>,
-		path: &str,
+		_path: &str,
 		created_ms: u64,
 		expires_ms: Option<u64>,
 	) -> Result<()> {
 		validate_digest_hex(digest)?;
-		if path.is_empty() {
-			return Err(EngineError::invalid("artifact path is required"));
-		}
-		let mut connection = self.connection.lock().map_err(lock_error)?;
-		let tx = immediate(&mut connection)?;
-		let existing: Option<(u64, String, Option<String>)> = tx
-			.query_row("SELECT size,path,media_type FROM artifacts WHERE digest=?", [digest], |row| {
-				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-			})
-			.optional()
+		self.connection.with_connection(|connection| {
+			let tx = immediate(connection)?;
+			let existing: Option<(u64, Option<String>)> = tx
+				.query_row("SELECT size,media_type FROM artifacts WHERE digest=?", [digest], |row| {
+					Ok((row.get(0)?, row.get(1)?))
+				})
+				.optional()
+				.map_err(sql_error)?;
+			if let Some((stored_size, stored_media)) = existing
+				&& (stored_size != size || stored_media.as_deref() != media_type)
+			{
+				return Err(EngineError::invalid(
+					"artifact digest already has conflicting immutable metadata",
+				));
+			}
+			tx.execute(
+				"INSERT INTO artifacts(digest,size,media_type,created_ms,expires_ms,path) \
+				 VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING",
+				params![
+					digest,
+					u64_i64(size)?,
+					media_type,
+					u64_i64(created_ms)?,
+					opt_u64_i64(expires_ms)?,
+					digest,
+				],
+			)
 			.map_err(sql_error)?;
-		if let Some((stored_size, stored_path, stored_media)) = existing
-			&& (stored_size != size || stored_path != path || stored_media.as_deref() != media_type)
-		{
-			return Err(EngineError::invalid(
-				"artifact digest already has conflicting immutable metadata",
-			));
-		}
-		tx.execute(
-			"INSERT INTO artifacts(digest,size,media_type,created_ms,expires_ms,path) \
-			 VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING",
-			params![
-				digest,
-				u64_i64(size)?,
-				media_type,
-				u64_i64(created_ms)?,
-				opt_u64_i64(expires_ms)?,
-				path
-			],
-		)
-		.map_err(sql_error)?;
-		tx.commit().map_err(sql_error)?;
-		Ok(())
+			tx.commit().map_err(sql_error)?;
+			Ok(())
+		})
 	}
 
 	/// Return persisted artifact metadata.
 	pub fn stat_artifact(&self, digest: &str) -> Result<ArtifactMetadata> {
 		validate_digest_hex(digest)?;
-		let connection = self.connection.lock().map_err(lock_error)?;
-		connection
-			.query_row(
-				"SELECT size,media_type,created_ms,expires_ms,path FROM artifacts WHERE digest=?",
-				[digest],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-			)
-			.optional()
-			.map_err(sql_error)?
-			.ok_or_else(|| EngineError::not_found("artifact not found"))
+		self.connection.with_connection(|connection| {
+			connection
+				.query_row(
+					"SELECT size,media_type,created_ms,expires_ms,path FROM artifacts WHERE digest=?",
+					[digest],
+					|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+				)
+				.optional()
+				.map_err(sql_error)?
+				.ok_or_else(|| EngineError::not_found("artifact not found"))
+		})
 	}
 
 	/// Return locally available artifacts that can reduce function worker
 	/// startup.
 	pub fn placement_artifact_digests(&self, limit: u32) -> Result<Vec<String>> {
-		let connection = self.connection.lock().map_err(lock_error)?;
-		let mut statement = connection
-			.prepare(
-				"SELECT DISTINCT a.digest FROM artifacts a JOIN artifact_refs r ON r.digest=a.digest \
-				 WHERE r.owner_kind IN ('revision','function_snapshot') ORDER BY a.digest LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		statement
-			.query_map([i64::from(limit.clamp(1, 4096))], |row| row.get(0))
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)
+		self.connection.with_connection(|connection| {
+			let mut statement = connection
+				.prepare(
+					"SELECT DISTINCT a.digest FROM artifacts a JOIN artifact_refs r ON \
+					 r.digest=a.digest WHERE r.owner_kind IN ('revision','function_snapshot') ORDER BY \
+					 a.digest LIMIT ?",
+				)
+				.map_err(sql_error)?;
+			statement
+				.query_map([i64::from(limit.clamp(1, 4096))], |row| row.get(0))
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)
+		})
 	}
 
 	/// Return expired artifacts with no durable metadata references.
@@ -3184,35 +3349,58 @@ impl Store {
 		now_ms: u64,
 		limit: u32,
 	) -> Result<Vec<(String, String)>> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let mut s = c
-			.prepare(
-				"SELECT a.digest,a.path FROM artifacts a WHERE a.expires_ms IS NOT NULL AND \
-				 a.expires_ms<=? AND NOT EXISTS(SELECT 1 FROM artifact_refs r WHERE \
-				 r.digest=a.digest) ORDER BY a.expires_ms,a.digest LIMIT ?",
-			)
-			.map_err(sql_error)?;
-		let rows = s
-			.query_map(params![u64_i64(now_ms)?, i64::from(normalized_page_size(limit))], |r| {
-				Ok((r.get(0)?, r.get(1)?))
-			})
-			.map_err(sql_error)?
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(sql_error)?;
-		Ok(rows)
+		self.connection.with_connection(|c| {
+			let mut s = c
+				.prepare(
+					"SELECT a.digest,a.path FROM artifacts a WHERE a.expires_ms IS NOT NULL AND \
+					 a.expires_ms<=? AND NOT EXISTS(SELECT 1 FROM artifact_refs r WHERE \
+					 r.digest=a.digest) ORDER BY a.expires_ms,a.digest LIMIT ?",
+				)
+				.map_err(sql_error)?;
+			let rows = s
+				.query_map(params![u64_i64(now_ms)?, i64::from(normalized_page_size(limit))], |r| {
+					Ok((r.get(0)?, r.get(1)?))
+				})
+				.map_err(sql_error)?
+				.collect::<std::result::Result<Vec<_>, _>>()
+				.map_err(sql_error)?;
+			Ok(rows)
+		})
 	}
 
 	/// Delete artifact metadata only while it remains expired and unreferenced.
+	#[cfg(test)]
 	pub fn delete_unreferenced_artifact(&self, digest: &str, now_ms: u64) -> Result<bool> {
-		let c = self.connection.lock().map_err(lock_error)?;
-		let changed = c
-			.execute(
-				"DELETE FROM artifacts WHERE digest=? AND expires_ms IS NOT NULL AND expires_ms<=? \
-				 AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE digest=artifacts.digest)",
-				params![digest, u64_i64(now_ms)?],
-			)
-			.map_err(sql_error)?;
-		Ok(changed == 1)
+		self.connection.with_connection(|c| {
+			let changed = c
+				.execute(
+					"DELETE FROM artifacts WHERE digest=? AND expires_ms IS NOT NULL AND expires_ms<=? \
+					 AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE digest=artifacts.digest)",
+					params![digest, u64_i64(now_ms)?],
+				)
+				.map_err(sql_error)?;
+			Ok(changed == 1)
+		})
+	}
+
+	/// Delete metadata only while the caller retains the matching digest
+	/// lease. The check and delete execute under one metadata transaction.
+	pub(crate) fn delete_unreferenced_artifact_locked(
+		&self,
+		lease: &ArtifactDigestLease,
+		now_ms: u64,
+	) -> Result<bool> {
+		let digest = lease.digest();
+		self.connection.with_connection(|c| {
+			let changed = c
+				.execute(
+					"DELETE FROM artifacts WHERE digest=? AND expires_ms IS NOT NULL AND expires_ms<=? \
+					 AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE digest=artifacts.digest)",
+					params![digest, u64_i64(now_ms)?],
+				)
+				.map_err(sql_error)?;
+			Ok(changed == 1)
+		})
 	}
 }
 
@@ -4358,79 +4546,81 @@ fn fail_user_error(
 	stats: Option<&AttemptStats>,
 	now: u64,
 ) -> Result<()> {
-	let mut connection = store.connection.lock().map_err(lock_error)?;
-	let tx = immediate(&mut connection)?;
-	require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now)?;
-	require_executable_call(&tx, &lease.call_id)?;
-	persist_attempt_stats(&tx, lease, stats)?;
-	append_attempt_transition(
-		&tx,
-		lease,
-		AttemptStatus::Failed,
-		AttemptFailureKind::User,
-		Some(error),
-		StartupKind::Unspecified,
-		now,
-	)?;
-	if call_kind(&tx, &lease.call_id)? == CallType::Batch {
-		let sequence = next_result_sequence(&tx, &lease.call_id)?;
-		let input: CallInput = decode_message(
-			&tx.query_row::<Vec<u8>, _, _>(
-				"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
-				params![lease.call_id, u64_i64(lease.input_index)?],
-				|row| row.get(0),
-			)
-			.map_err(sql_error)?,
-		)?;
-		let result = CallResult {
-			call: Some(CallRef { call_id: lease.call_id.clone() }),
-			index: lease.input_index,
-			created_at_unix_millis: now,
-			sequence,
-			input_id: input.input_id,
-			input_index: lease.input_index,
-			outcome: Some(call_result::Outcome::Error(error.clone())),
-			yield_index_presence: None,
-		};
-		tx.execute(
-			"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) VALUES(?,?,?,?,?)",
-			params![
-				lease.call_id,
-				u64_i64(lease.input_index)?,
-				u64_i64(sequence)?,
-				result.encode_to_vec(),
-				u64_i64(now)?
-			],
-		)
-		.map_err(sql_error)?;
-		tx.execute(
-			"UPDATE inputs SET \
-			 status=?,finished_ms=?,result=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE \
-			 call_id=? AND input_index=?",
-			params![
-				INPUT_FAILED,
-				u64_i64(now)?,
-				result.encode_to_vec(),
-				error.encode_to_vec(),
-				lease.call_id,
-				u64_i64(lease.input_index)?
-			],
-		)
-		.map_err(sql_error)?;
-		append_event(
+	store.connection.with_connection(|connection| {
+		let tx = immediate(connection)?;
+		require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now)?;
+		require_executable_call(&tx, &lease.call_id)?;
+		persist_attempt_stats(&tx, lease, stats)?;
+		append_attempt_transition(
 			&tx,
-			&lease.call_id,
-			CallEventType::Result,
-			call_event::Payload::Result(result),
+			lease,
+			AttemptStatus::Failed,
+			AttemptFailureKind::User,
+			Some(error),
+			StartupKind::Unspecified,
 			now,
 		)?;
-		complete_call_tx(&tx, &lease.call_id, now)?;
+		if call_kind(&tx, &lease.call_id)? == CallType::Batch {
+			let sequence = next_result_sequence(&tx, &lease.call_id)?;
+			let input: CallInput = decode_message(
+				&tx.query_row::<Vec<u8>, _, _>(
+					"SELECT payload FROM inputs WHERE call_id=? AND input_index=?",
+					params![lease.call_id, u64_i64(lease.input_index)?],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?,
+			)?;
+			let result = CallResult {
+				call: Some(CallRef { call_id: lease.call_id.clone() }),
+				index: lease.input_index,
+				created_at_unix_millis: now,
+				sequence,
+				input_id: input.input_id,
+				input_index: lease.input_index,
+				outcome: Some(call_result::Outcome::Error(error.clone())),
+				yield_index_presence: None,
+			};
+			tx.execute(
+				"INSERT INTO results(call_id,result_index,sequence,payload,created_ms) \
+				 VALUES(?,?,?,?,?)",
+				params![
+					lease.call_id,
+					u64_i64(lease.input_index)?,
+					u64_i64(sequence)?,
+					result.encode_to_vec(),
+					u64_i64(now)?
+				],
+			)
+			.map_err(sql_error)?;
+			tx.execute(
+				"UPDATE inputs SET \
+				 status=?,finished_ms=?,result=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL WHERE \
+				 call_id=? AND input_index=?",
+				params![
+					INPUT_FAILED,
+					u64_i64(now)?,
+					result.encode_to_vec(),
+					error.encode_to_vec(),
+					lease.call_id,
+					u64_i64(lease.input_index)?
+				],
+			)
+			.map_err(sql_error)?;
+			append_event(
+				&tx,
+				&lease.call_id,
+				CallEventType::Result,
+				call_event::Payload::Result(result),
+				now,
+			)?;
+			complete_call_tx(&tx, &lease.call_id, now)?;
+			tx.commit().map_err(sql_error)?;
+			return Ok(());
+		}
+		finish_error_tx(&tx, lease, error, now)?;
 		tx.commit().map_err(sql_error)?;
-		return Ok(());
-	}
-	finish_error_tx(&tx, lease, error, now)?;
-	tx.commit().map_err(sql_error)?;
-	Ok(())
+		Ok(())
+	})
 }
 fn finish_error_tx(tx: &Connection, lease: &LeaseToken, error: &CallError, now: u64) -> Result<()> {
 	tx.execute(
@@ -4480,72 +4670,73 @@ fn retry_error(
 	infra: bool,
 	now: u64,
 ) -> Result<()> {
-	let mut connection = store.connection.lock().map_err(lock_error)?;
-	let tx = immediate(&mut connection)?;
-	require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now)?;
-	require_executable_call(&tx, &lease.call_id)?;
-	persist_attempt_stats(&tx, lease, stats)?;
-	append_attempt_transition(
-		&tx,
-		lease,
-		AttemptStatus::Failed,
-		if infra {
-			AttemptFailureKind::Infrastructure
-		} else {
-			AttemptFailureKind::User
-		},
-		Some(error),
-		StartupKind::Unspecified,
-		now,
-	)?;
-	if call_kind(&tx, &lease.call_id)? == CallType::Generator {
-		let committed_output: bool = tx
+	store.connection.with_connection(|connection| {
+		let tx = immediate(connection)?;
+		require_lease(&tx, lease, &[INPUT_RUNNING, INPUT_LEASED], now)?;
+		require_executable_call(&tx, &lease.call_id)?;
+		persist_attempt_stats(&tx, lease, stats)?;
+		append_attempt_transition(
+			&tx,
+			lease,
+			AttemptStatus::Failed,
+			if infra {
+				AttemptFailureKind::Infrastructure
+			} else {
+				AttemptFailureKind::User
+			},
+			Some(error),
+			StartupKind::Unspecified,
+			now,
+		)?;
+		if call_kind(&tx, &lease.call_id)? == CallType::Generator {
+			let committed_output: bool = tx
+				.query_row(
+					"SELECT EXISTS(SELECT 1 FROM results WHERE call_id=? LIMIT 1)",
+					params![lease.call_id],
+					|row| row.get(0),
+				)
+				.map_err(sql_error)?;
+			if committed_output {
+				finish_error_tx(&tx, lease, error, now)?;
+				tx.commit().map_err(sql_error)?;
+				return Ok(());
+			}
+		}
+		tx.execute(
+			"UPDATE inputs SET \
+			 status=?,available_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL,\
+			 infra_attempts=infra_attempts+?,user_attempts=user_attempts+?,attempt_id=NULL WHERE \
+			 call_id=? AND input_index=?",
+			params![
+				INPUT_QUEUED,
+				u64_i64(retry_at)?,
+				error.encode_to_vec(),
+				u32::from(infra),
+				u32::from(!infra),
+				lease.call_id,
+				u64_i64(lease.input_index)?
+			],
+		)
+		.map_err(sql_error)?;
+		let active: u64 = tx
 			.query_row(
-				"SELECT EXISTS(SELECT 1 FROM results WHERE call_id=? LIMIT 1)",
-				params![lease.call_id],
+				"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
+				params![lease.call_id, INPUT_LEASED, INPUT_RUNNING],
 				|row| row.get(0),
 			)
 			.map_err(sql_error)?;
-		if committed_output {
-			finish_error_tx(&tx, lease, error, now)?;
-			tx.commit().map_err(sql_error)?;
-			return Ok(());
+		if active == 0 && call_status(&tx, &lease.call_id)? == CallStatus::Running {
+			tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
+				CallStatus::Queued as i32,
+				u64_i64(now)?,
+				lease.call_id
+			])
+			.map_err(sql_error)?;
+			append_status_event(&tx, &lease.call_id, CallStatus::Queued, now)?;
 		}
-	}
-	tx.execute(
-		"UPDATE inputs SET \
-		 status=?,available_ms=?,error=?,lease_owner=NULL,lease_expiry_ms=NULL,\
-		 infra_attempts=infra_attempts+?,user_attempts=user_attempts+?,attempt_id=NULL WHERE \
-		 call_id=? AND input_index=?",
-		params![
-			INPUT_QUEUED,
-			u64_i64(retry_at)?,
-			error.encode_to_vec(),
-			u32::from(infra),
-			u32::from(!infra),
-			lease.call_id,
-			u64_i64(lease.input_index)?
-		],
-	)
-	.map_err(sql_error)?;
-	let active: u64 = tx
-		.query_row(
-			"SELECT COUNT(*) FROM inputs WHERE call_id=? AND status IN (?,?)",
-			params![lease.call_id, INPUT_LEASED, INPUT_RUNNING],
-			|row| row.get(0),
-		)
-		.map_err(sql_error)?;
-	if active == 0 && call_status(&tx, &lease.call_id)? == CallStatus::Running {
-		tx.execute("UPDATE calls SET status=?,updated_ms=? WHERE id=?", params![
-			CallStatus::Queued as i32,
-			u64_i64(now)?,
-			lease.call_id
-		])
-		.map_err(sql_error)?;
-		append_status_event(&tx, &lease.call_id, CallStatus::Queued, now)?;
-	}
-	tx.commit().map_err(sql_error)?;
-	Ok(())
+		tx.commit().map_err(sql_error)?;
+		Ok(())
+	})
 }
 
 fn finalize_cancelled_tx(c: &Connection, id: &str, now: u64) -> Result<()> {
@@ -4990,17 +5181,60 @@ mod tests {
 		let temp = tempfile::tempdir().unwrap();
 		let home = Home::new(temp.path());
 		let store = Store::open(&home).unwrap();
+
 		record_package(&store);
 		let revision = store.register_function(&spec(), "register-1", 10).unwrap();
 		(temp, home, store, revision)
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
-	async fn production_metadata_is_shared_across_store_instances() {
+	#[test]
+	fn connection_boundary_returns_operation_errors_without_poisoning_sqlite() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = Store::open(&Home::new(temp.path())).unwrap();
+		let error = store
+			.connection
+			.with_connection(|_| Err::<(), _>(EngineError::engine("operation failed")))
+			.unwrap_err();
+		assert_eq!(error.message, "operation failed");
+		store
+			.connection
+			.with_connection(|connection| {
+				connection
+					.query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+					.map_err(sql_error)
+			})
+			.unwrap();
+	}
+
+	#[test]
+	fn postgres_concurrent_bootstrap_seed_is_deterministic() {
+		assert_eq!(empty_serialized_store_state().unwrap(), empty_serialized_store_state().unwrap());
+	}
+
+	fn postgres_state_bytes(store: &Store) -> Result<Vec<u8>> {
+		let StoreConnection::Postgres(connection) = &store.connection else {
+			return Err(EngineError::engine("expected PostgreSQL store"));
+		};
+		let mut client = connection.client.lock().map_err(lock_error)?;
+		let pg_client: &mut PgClient = (*client)
+			.as_mut()
+			.ok_or_else(|| EngineError::engine("function PostgreSQL store connection is closed"))?;
+		blocking(move || {
+			pg_client
+				.query_one("SELECT state FROM function_store_state WHERE singleton = TRUE", &[])
+				.map(|row| row.get(0))
+				.map_err(pg_error)
+		})
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn postgres_operation_error_rolls_back_persistence_failures_retry_reads_do_not_rewrite_and_mutations_flush()
+	 {
 		if std::net::TcpStream::connect(("127.0.0.1", 15433)).is_err() {
 			eprintln!("SKIP production function store: PostgreSQL is unavailable on port 15433");
 			return;
 		}
+		let _database_guard = crate::postgres::TEST_DATABASE_LOCK.lock().await;
 		tokio::task::yield_now().await;
 		let config = crate::config::resolve_serve_config(&std::collections::HashMap::from([
 			("cluster_mode".to_owned(), "production".to_owned()),
@@ -5008,8 +5242,12 @@ mod tests {
 				"postgres_url".to_owned(),
 				"postgresql://fastbench:fastbench@127.0.0.1:15433/fastbench".to_owned(),
 			),
+			("s3_region".to_owned(), "us-east-1".to_owned()),
+			("s3_access_key".to_owned(), "key".to_owned()),
+			("s3_secret_key".to_owned(), "secret".to_owned()),
 			("s3_endpoint".to_owned(), "http://127.0.0.1:9000".to_owned()),
 			("s3_bucket".to_owned(), "test".to_owned()),
+			("portable_history_key_id".to_owned(), "cluster-recovery".to_owned()),
 		]))
 		.unwrap();
 		let first_home = tempfile::tempdir().unwrap();
@@ -5021,10 +5259,61 @@ mod tests {
 			.record_artifact(&digest, 17, Some("application/octet-stream"), &path, 42, None)
 			.unwrap();
 
+		let before_read = postgres_state_bytes(&first).unwrap();
+		assert_eq!(
+			first.stat_artifact(&digest).unwrap(),
+			(17, Some("application/octet-stream".to_owned()), 42, None, digest.clone())
+		);
+		assert_eq!(postgres_state_bytes(&first).unwrap(), before_read);
+
+		let error = first
+			.connection
+			.with_connection(|connection| {
+				connection
+					.execute("CREATE TABLE boundary_rollback_probe(value INTEGER)", [])
+					.map_err(sql_error)?;
+				Err::<(), _>(EngineError::engine("operation failed"))
+			})
+			.unwrap_err();
+		assert_eq!(error.message, "operation failed");
+		assert_eq!(
+			first
+				.connection
+				.with_connection(|connection| {
+					connection
+						.query_row(
+							"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND \
+							 name='boundary_rollback_probe'",
+							[],
+							|row| row.get::<_, i64>(0),
+						)
+						.map_err(sql_error)
+				})
+				.unwrap(),
+			0
+		);
+
+		let StoreConnection::Postgres(pg) = &first.connection else {
+			panic!("expected PostgreSQL store");
+		};
+		for failure in [PgPersistenceFailure::Update, PgPersistenceFailure::Commit] {
+			pg.fail_next_persistence(failure).unwrap();
+			let failed_digest = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
+			assert!(
+				first
+					.record_artifact(&failed_digest, 1, None, "/persistence-failure", 43, None)
+					.is_err()
+			);
+			assert!(first.stat_artifact(&failed_digest).is_err());
+			first
+				.record_artifact(&failed_digest, 1, None, "/persistence-failure", 43, None)
+				.unwrap();
+		}
+
 		let second = Store::open_with_config(&Home::new(second_home.path()), &config).unwrap();
 		assert_eq!(
 			second.stat_artifact(&digest).unwrap(),
-			(17, Some("application/octet-stream".to_owned()), 42, None, path)
+			(17, Some("application/octet-stream".to_owned()), 42, None, digest)
 		);
 	}
 
@@ -5035,10 +5324,13 @@ mod tests {
 		store
 			.record_artifact(&result_digest, 1, None, "/result", 2, None)
 			.unwrap();
-		{
-			let connection = store.connection.lock().unwrap();
-			add_artifact_ref(&connection, &result_digest, "result", "call:0").unwrap();
-		}
+		store
+			.connection
+			.with_connection(|connection| {
+				add_artifact_ref(connection, &result_digest, "result", "call:0")?;
+				Ok(())
+			})
+			.unwrap();
 		assert_eq!(store.placement_artifact_digests(100).unwrap(), vec![hex::encode([7_u8; 32])]);
 	}
 
@@ -5444,24 +5736,26 @@ mod tests {
 			.r#ref
 			.unwrap()
 			.call_id;
-		{
-			let mut connection = store.connection.lock().unwrap();
-			let tx = immediate(&mut connection).unwrap();
-			for index in 0..10_005 {
-				append_event(
-					&tx,
-					&call_id,
-					CallEventType::Log,
-					call_event::Payload::Log(LogEvent {
-						stream: LogStream::Structured as i32,
-						data:   index.to_string().into_bytes(),
-					}),
-					21,
-				)
-				.unwrap();
-			}
-			tx.commit().unwrap();
-		}
+		store
+			.connection
+			.with_connection(|connection| {
+				let tx = immediate(connection)?;
+				for index in 0..10_005 {
+					append_event(
+						&tx,
+						&call_id,
+						CallEventType::Log,
+						call_event::Payload::Log(LogEvent {
+							stream: LogStream::Structured as i32,
+							data:   index.to_string().into_bytes(),
+						}),
+						21,
+					)?;
+				}
+				tx.commit().map_err(sql_error)?;
+				Ok(())
+			})
+			.unwrap();
 		let frontier = store.event_frontier(&call_id).unwrap();
 		let first = store.list_events(&call_id, 0, 10_000).unwrap();
 		assert_eq!(first.len(), 10_000);
@@ -5861,11 +6155,16 @@ mod tests {
 		let mut request = call_request(&revision, "artifact-call");
 		request.inputs[0].payload = Some(call_input::Payload::Value(artifact_value));
 		reopened.create_call(&request, 30).unwrap();
+		let kept_digest = kept.digest.clone();
+		let kept_size = kept.size;
+		let gone_digest = gone.digest.clone();
+		drop(kept);
+		drop(gone);
 		let expired = reopened.unreferenced_expired_artifacts(3, 100).unwrap();
-		assert_eq!(expired, vec![(gone.digest.clone(), gone.path.to_string_lossy().into_owned())]);
+		assert_eq!(expired, vec![(gone_digest.clone(), gone_digest.clone())]);
 		assert_eq!(artifacts.gc_expired(&reopened, 3, 100).unwrap(), 1);
-		assert!(artifacts.read(&gone.digest, None).is_err());
-		assert!(artifacts.read(&kept.digest, Some(kept.size)).is_ok());
+		assert!(artifacts.read(&gone_digest, None).is_err());
+		assert!(artifacts.read(&kept_digest, Some(kept_size)).is_ok());
 		let snapshot_id = snapshot.r#ref.unwrap().snapshot_id;
 		let revision_id = revision_ref(&revision).revision_id;
 		reopened.detach_function_snapshot(&revision_id).unwrap();
@@ -5933,13 +6232,15 @@ mod tests {
 		assert_eq!(store.get_call(&batch_id).unwrap().status, CallStatus::Failed as i32);
 		let queued_status: i32 = store
 			.connection
-			.lock()
-			.unwrap()
-			.query_row(
-				"SELECT status FROM inputs WHERE call_id=? AND input_index=1",
-				[&batch_id],
-				|row| row.get(0),
-			)
+			.with_connection(|connection| {
+				connection
+					.query_row(
+						"SELECT status FROM inputs WHERE call_id=? AND input_index=1",
+						[&batch_id],
+						|row| row.get(0),
+					)
+					.map_err(sql_error)
+			})
 			.unwrap();
 		assert_eq!(queued_status, INPUT_FAILED);
 	}
@@ -6397,8 +6698,8 @@ mod tests {
 			.unwrap();
 		store.delete_revision(&revision_ref(&revision)).unwrap();
 		assert_eq!(store.unreferenced_expired_artifacts(3, 10).unwrap(), vec![(
-			digest,
-			"/snapshot".into()
+			digest.clone(),
+			digest
 		)]);
 	}
 

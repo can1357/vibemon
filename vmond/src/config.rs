@@ -147,6 +147,12 @@ pub struct ServeConfig {
 	pub s3_secret_key: Option<String>,
 	/// S3-compatible key prefix.
 	pub s3_prefix: Option<String>,
+	/// Age threshold in seconds for stale multipart uploads; zero disables the
+	/// janitor.
+	pub s3_multipart_stale_sec: f64,
+	/// Shared key ID provisioned with identical material on every production
+	/// node for portable recovery archives.
+	pub portable_history_key_id: Option<String>,
 	sources: HashMap<String, ConfigSource>,
 }
 
@@ -245,6 +251,8 @@ impl Default for ServeConfig {
 			s3_access_key: None,
 			s3_secret_key: None,
 			s3_prefix: None,
+			s3_multipart_stale_sec: 7.0 * 24.0 * 3600.0,
+			portable_history_key_id: None,
 			sources,
 		}
 	}
@@ -292,6 +300,8 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"s3_access_key",
 	"s3_secret_key",
 	"s3_prefix",
+	"s3_multipart_stale_sec",
+	"portable_history_key_id",
 ];
 
 /// Environment variable names for serve config fields.
@@ -336,6 +346,8 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("s3_access_key", "VMON_S3_ACCESS_KEY"),
 	("s3_secret_key", "VMON_S3_SECRET_KEY"),
 	("s3_prefix", "VMON_S3_PREFIX"),
+	("s3_multipart_stale_sec", "VMON_S3_MULTIPART_STALE_SEC"),
+	("portable_history_key_id", "VMON_PORTABLE_HISTORY_KEY_ID"),
 ];
 
 /// CLI option spellings for serve config fields.
@@ -380,6 +392,8 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("s3_access_key", "--s3-access-key"),
 	("s3_secret_key", "--s3-secret-key"),
 	("s3_prefix", "--s3-prefix"),
+	("s3_multipart_stale_sec", "--s3-multipart-stale-sec"),
+	("portable_history_key_id", "--portable-history-key-id"),
 ];
 
 const CONFIG_PATH_KEYS: &[&str] = &["config", "config_path"];
@@ -424,6 +438,26 @@ pub fn resolve_serve_config(cli_overrides: &HashMap<String, String>) -> Result<S
 			.is_none_or(|s| s.trim().is_empty())
 		{
 			return Err(EngineError::invalid("production mode requires s3_bucket"));
+		}
+		for required in ["s3_region", "s3_access_key", "s3_secret_key"] {
+			let present = match required {
+				"s3_region" => config.s3_region.as_deref(),
+				"s3_access_key" => config.s3_access_key.as_deref(),
+				"s3_secret_key" => config.s3_secret_key.as_deref(),
+				_ => unreachable!("all production S3 requirements are enumerated above"),
+			};
+			if present.is_none_or(|value| value.trim().is_empty()) {
+				return Err(EngineError::invalid(format!("production mode requires {required}")));
+			}
+		}
+		if config
+			.portable_history_key_id
+			.as_deref()
+			.is_none_or(|key_id| key_id.trim().is_empty() || key_id == "default")
+		{
+			return Err(EngineError::invalid(
+				"production mode requires a non-default portable_history_key_id shared by every node",
+			));
 		}
 	}
 	Ok(config)
@@ -703,6 +737,18 @@ fn apply_value(
 		},
 		"s3_prefix" => {
 			config.s3_prefix = empty_string_as_none(key, value)?;
+		},
+		"s3_multipart_stale_sec" => {
+			let parsed = non_negative_float(key, value)?;
+			if parsed > 0.0 && parsed < 3600.0 {
+				return Err(EngineError::invalid(format!(
+					"{key} must be zero or at least 3600 seconds"
+				)));
+			}
+			config.s3_multipart_stale_sec = parsed;
+		},
+		"portable_history_key_id" => {
+			config.portable_history_key_id = empty_string_as_none(key, value)?;
 		},
 		_ => return Err(EngineError::invalid(format!("unsupported serve config key {key:?}"))),
 	}
@@ -1069,6 +1115,85 @@ mod tests {
 	}
 
 	#[test]
+	fn s3_multipart_stale_sec_defaults_and_validation() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+
+		// 1. Default value assertion
+		let default_config = resolve_serve_config(&HashMap::new()).expect("default config");
+		assert_eq!(default_config.s3_multipart_stale_sec, 7.0 * 24.0 * 3600.0);
+		assert_eq!(default_config.source("s3_multipart_stale_sec"), Some(ConfigSource::Default));
+
+		// 2. Env overlay assertion
+		EnvGuard::set("VMON_S3_MULTIPART_STALE_SEC", "86400");
+		let env_config = resolve_serve_config(&HashMap::new()).expect("env config");
+		assert_eq!(env_config.s3_multipart_stale_sec, 86400.0);
+		assert_eq!(env_config.source("s3_multipart_stale_sec"), Some(ConfigSource::Env));
+
+		// 3. CLI override assertion
+		let cli_config = resolve_serve_config(&HashMap::from([(
+			"s3_multipart_stale_sec".to_owned(),
+			"172800".to_owned(),
+		)]))
+		.expect("CLI config");
+		assert_eq!(cli_config.s3_multipart_stale_sec, 172800.0);
+		assert_eq!(cli_config.source("s3_multipart_stale_sec"), Some(ConfigSource::Flag));
+
+		// Reset EnvGuard for subsequent test cases
+		let _env_guard = EnvGuard::clear();
+
+		// 4. TOML override assertion
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let config_path = tmp.path().join("serve.toml");
+		fs::write(&config_path, "[serve]\ns3_multipart_stale_sec = 10000.5\n").expect("write config");
+		EnvGuard::set("VMON_CONFIG", config_path.to_str().expect("utf8 path"));
+		let toml_config = resolve_serve_config(&HashMap::new()).expect("toml config");
+		assert_eq!(toml_config.s3_multipart_stale_sec, 10000.5);
+		assert_eq!(toml_config.source("s3_multipart_stale_sec"), Some(ConfigSource::File));
+
+		// 5. Validations
+		// Zero is valid (disables janitor)
+		let zero_config = resolve_serve_config(&HashMap::from([(
+			"s3_multipart_stale_sec".to_owned(),
+			"0".to_owned(),
+		)]))
+		.expect("zero is valid");
+		assert_eq!(zero_config.s3_multipart_stale_sec, 0.0);
+
+		// >= 3600 is valid
+		let valid_config = resolve_serve_config(&HashMap::from([(
+			"s3_multipart_stale_sec".to_owned(),
+			"3600".to_owned(),
+		)]))
+		.expect("3600 is valid");
+		assert_eq!(valid_config.s3_multipart_stale_sec, 3600.0);
+
+		// >0 and <3600 is invalid
+		for invalid_val in ["1", "3599.9"] {
+			let err = resolve_serve_config(&HashMap::from([(
+				"s3_multipart_stale_sec".to_owned(),
+				invalid_val.to_owned(),
+			)]))
+			.expect_err("should reject values under 3600");
+			assert!(err.message.contains("s3_multipart_stale_sec"));
+			assert!(
+				err.message
+					.contains("must be zero or at least 3600 seconds")
+			);
+		}
+
+		// Negative is invalid
+		for negative_val in ["-1", "-3600"] {
+			let err = resolve_serve_config(&HashMap::from([(
+				"s3_multipart_stale_sec".to_owned(),
+				negative_val.to_owned(),
+			)]))
+			.expect_err("should reject negative values");
+			assert!(err.message.contains("s3_multipart_stale_sec"));
+		}
+	}
+
+	#[test]
 	fn rejects_unknown_config_keys() {
 		let _lock = test_home::lock();
 		let _env_guard = EnvGuard::clear();
@@ -1119,6 +1244,28 @@ mod tests {
 		.expect_err("should reject missing s3 bucket");
 		assert!(err.message.contains("s3_bucket"));
 
+		// Production must also provide signed-request settings.
+		let err = resolve_serve_config(&HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			("postgres_url".to_owned(), "postgresql://user:pass@host/db".to_owned()),
+			("s3_endpoint".to_owned(), "http://localhost:9000".to_owned()),
+			("s3_bucket".to_owned(), "my-bucket".to_owned()),
+		]))
+		.expect_err("should reject missing S3 signing configuration");
+		assert!(err.message.contains("s3_region"));
+
+		let err = resolve_serve_config(&HashMap::from([
+			("cluster_mode".to_owned(), "production".to_owned()),
+			("postgres_url".to_owned(), "postgresql://user:pass@host/db".to_owned()),
+			("s3_endpoint".to_owned(), "http://localhost:9000".to_owned()),
+			("s3_bucket".to_owned(), "my-bucket".to_owned()),
+			("s3_region".to_owned(), "us-east-1".to_owned()),
+			("s3_access_key".to_owned(), "key".to_owned()),
+			("s3_secret_key".to_owned(), "secret".to_owned()),
+		]))
+		.expect_err("should reject missing shared portable-history key");
+		assert!(err.message.contains("portable_history_key_id"));
+
 		// Production with all required configuration should pass
 		let config = resolve_serve_config(&HashMap::from([
 			("cluster_mode".to_owned(), "production".to_owned()),
@@ -1129,6 +1276,7 @@ mod tests {
 			("s3_access_key".to_owned(), "key".to_owned()),
 			("s3_secret_key".to_owned(), "secret".to_owned()),
 			("s3_prefix".to_owned(), "pre/".to_owned()),
+			("portable_history_key_id".to_owned(), "cluster-recovery".to_owned()),
 		]))
 		.expect("valid production configuration");
 		assert_eq!(config.cluster_mode, ClusterMode::Production);
@@ -1138,6 +1286,7 @@ mod tests {
 		assert_eq!(config.s3_region.as_deref(), Some("us-east-1"));
 		assert_eq!(config.s3_access_key.as_deref(), Some("key"));
 		assert_eq!(config.s3_secret_key.as_deref(), Some("secret"));
+		assert_eq!(config.portable_history_key_id.as_deref(), Some("cluster-recovery"));
 		assert_eq!(config.s3_prefix.as_deref(), Some("pre/"));
 	}
 }

@@ -21,6 +21,8 @@
         "replicaCount": { "type": "integer", "minimum": 1 },
         "apiToken": { "type": "string" },
         "clientToken": { "type": "string" },
+        "portableHistoryKeyId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$", "not": { "const": "default" } },
+        "portableHistoryKey": { "type": "string" },
         "region": { "type": "string" },
         "hostNetwork": { "type": "boolean" },
         "image": {
@@ -48,7 +50,7 @@
         "livenessProbe": { "type": "object" },
         "readinessProbe": { "type": "object" }
       },
-      "required": ["replicaCount", "apiToken", "image", "service"]
+      "required": ["replicaCount", "apiToken", "portableHistoryKeyId", "portableHistoryKey", "image", "service"]
     },
     "buildkit": {
       "type": "object",
@@ -184,6 +186,23 @@
       "then": {
         "properties": {
           "externalS3": { "required": ["accessKey", "secretKey"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "allOf": [
+          { "properties": { "global": { "properties": { "clusterMode": { "const": "production" } } } } },
+          { "properties": { "existingSecret": { "maxLength": 0 } } }
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodes": {
+            "properties": {
+              "portableHistoryKey": { "pattern": "^[0-9A-Fa-f]{64}$" }
+            }
+          }
         }
       }
     },

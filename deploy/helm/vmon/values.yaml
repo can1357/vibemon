@@ -1,6 +1,6 @@
 # Reuse one externally managed Secret instead of rendering credentials here.
-# It must contain api-token, postgres-password, access-key, and secret-key;
-# client-token is optional.
+# It must contain api-token, postgres-password, access-key, secret-key, and
+# portable-history-key; client-token is optional.
 existingSecret: ""
 
 global:
@@ -20,6 +20,10 @@ nodes:
     port: 8000
   apiToken: ""
   clientToken: ""
+  # All production nodes must share this 32-byte recovery key. Supply 64
+  # hexadecimal characters or provide portable-history-key in existingSecret.
+  portableHistoryKeyId: cluster-recovery
+  portableHistoryKey: ""
   region: ""
   hostNetwork: true
   resources:

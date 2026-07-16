@@ -6,7 +6,7 @@
 //! defined by its remote filesystem device.
 
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, HashMap, HashSet},
 	fmt, io,
 	sync::Arc,
 	time::{Duration, Instant},
@@ -31,7 +31,11 @@ const MULTIPART_MAX_PARTS: u32 = 10_000;
 const MULTIPART_TIMEOUT: Duration = Duration::from_mins(5);
 const CHUNK_CACHE_CAP: usize = 256 << 20;
 const MAX_LIST_ENTRIES: usize = 100_000;
+const COPY_RESPONSE_BODY_CAP: usize = 64 << 10;
 type ListCacheEntry = (Instant, Arc<Vec<ObjEntry>>);
+const COPY_OBJECT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+const MULTIPART_COPY_PART_SIZE: u64 = COPY_OBJECT_MAX_SIZE;
+const S3_OBJECT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 type ListCache = HashMap<String, ListCacheEntry>;
 
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -173,12 +177,35 @@ pub struct ObjStat {
 	pub etag:  Option<String>,
 }
 
+/// One object returned by a bounded maintenance scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S3ScanEntry {
+	/// Mount-relative object key.
+	pub key:   String,
+	/// Object length in bytes.
+	pub size:  u64,
+	/// Last modification time as Unix seconds.
+	pub mtime: u64,
+	/// Object `ETag`.
+	pub etag:  Option<String>,
+}
+
+/// One bounded page of objects for maintenance callers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S3ScanPage {
+	/// Objects in this page.
+	pub entries:                 Vec<S3ScanEntry>,
+	/// Opaque continuation token for the following page.
+	pub next_continuation_token: Option<String>,
+}
+
 /// Signed S3 client with bounded directory and ranged-data caches.
 pub struct S3Client {
-	http:       reqwest::Client,
-	cfg:        S3MountConfig,
-	list_cache: Mutex<ListCache>,
-	chunks:     Mutex<ChunkLru>,
+	http:           reqwest::Client,
+	cfg:            S3MountConfig,
+	list_cache:     Mutex<ListCache>,
+	chunks:         Mutex<ChunkLru>,
+	active_uploads: Mutex<HashSet<(String, String)>>,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -194,6 +221,58 @@ struct InitiateMultipartUploadResult {
 	upload_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename = "Error")]
+struct S3ServiceError {
+	#[serde(rename = "Code")]
+	code:    String,
+	#[serde(rename = "Message")]
+	message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "CopyPartResult")]
+struct CopyPartResult {
+	#[serde(rename = "ETag")]
+	etag: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "ListMultipartUploadsResult")]
+struct ListMultipartUploadsResult {
+	#[serde(rename = "Upload", default)]
+	uploads:               Vec<MultipartUpload>,
+	#[serde(rename = "IsTruncated", default)]
+	is_truncated:          bool,
+	#[serde(rename = "NextKeyMarker")]
+	next_key_marker:       Option<String>,
+	#[serde(rename = "NextUploadIdMarker")]
+	next_upload_id_marker: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MultipartUpload {
+	#[serde(rename = "Key")]
+	key:       String,
+	#[serde(rename = "UploadId")]
+	upload_id: String,
+	#[serde(rename = "Initiated")]
+	initiated: String,
+}
+
+struct ActiveMultipartUpload<'a> {
+	uploads:   &'a Mutex<HashSet<(String, String)>>,
+	key:       String,
+	upload_id: String,
+}
+
+impl Drop for ActiveMultipartUpload<'_> {
+	fn drop(&mut self) {
+		let key = std::mem::take(&mut self.key);
+		let upload_id = std::mem::take(&mut self.upload_id);
+		self.uploads.lock().remove(&(key, upload_id));
+	}
+}
 struct CachedChunk {
 	data:      Bytes,
 	last_used: u64,
@@ -269,6 +348,7 @@ impl S3Client {
 			cfg,
 			list_cache: Mutex::new(ListCache::new()),
 			chunks: Mutex::new(ChunkLru { entries: HashMap::new(), bytes: 0, clock: 0 }),
+			active_uploads: Mutex::new(HashSet::new()),
 		})
 	}
 
@@ -276,6 +356,27 @@ impl S3Client {
 	pub fn clear_cache(&self) {
 		self.list_cache.lock().clear();
 		self.chunks.lock().clear();
+	}
+
+	/// Maps a raw bucket key returned by S3 back into this mount's relative
+	/// namespace for distributed object locking.
+	///
+	/// Returns [`S3Error::BadRequest`] when the key is not within the configured
+	/// mount prefix or cannot name a valid mount-relative path.
+	pub fn mount_relative_object_key(&self, key: &str) -> std::result::Result<String, S3Error> {
+		let path = if self.cfg.prefix.is_empty() {
+			key
+		} else if key == self.cfg.prefix {
+			""
+		} else {
+			key.strip_prefix(&self.cfg.prefix)
+				.and_then(|path| path.strip_prefix('/'))
+				.ok_or(S3Error::BadRequest)?
+		};
+		if !valid_relative_path(path) {
+			return Err(S3Error::BadRequest);
+		}
+		Ok(path.to_owned())
 	}
 
 	/// Verifies bucket access with a one-key `ListObjectsV2` request.
@@ -329,6 +430,85 @@ impl S3Client {
 		Ok(entries)
 	}
 
+	/// Lists up to `max_keys` objects below `prefix` without directory caches.
+	///
+	/// Callers must retain and pass the opaque continuation token until the page
+	/// reports no next token.
+	pub async fn scan_keys_page(
+		&self,
+		prefix: &str,
+		continuation: Option<&str>,
+		max_keys: u16,
+	) -> std::result::Result<S3ScanPage, S3Error> {
+		if !valid_relative_path(prefix)
+			|| !(1..=1000).contains(&max_keys)
+			|| continuation.is_some_and(|token| token.is_empty() || token.contains('\0'))
+		{
+			return Err(S3Error::BadRequest);
+		}
+		let raw_prefix = self.list_prefix(prefix)?;
+		let mount_root = self.object_key("")?;
+		let page = self
+			.list_page_flat(&raw_prefix, continuation, max_keys)
+			.await?;
+		let mut entries = Vec::with_capacity(page.contents.len());
+		for entry in page.contents {
+			let key = if mount_root.is_empty() {
+				entry.key
+			} else {
+				entry
+					.key
+					.strip_prefix(&format!("{mount_root}/"))
+					.ok_or_else(|| {
+						S3Error::Io("S3 scan returned a key outside its mount prefix".to_owned())
+					})?
+					.to_owned()
+			};
+			if !(prefix.is_empty() || key.starts_with(&format!("{prefix}/")) || key == prefix) {
+				return Err(S3Error::Io(
+					"S3 scan returned a key outside its requested prefix".to_owned(),
+				));
+			}
+			entries.push(S3ScanEntry {
+				key,
+				size: entry.size,
+				mtime: parse_mtime(&entry.last_modified)?,
+				etag: entry.etag,
+			});
+		}
+		let next_continuation_token = if page.is_truncated {
+			let next = page.next_continuation_token.ok_or_else(|| {
+				S3Error::Io("truncated S3 ListObjectsV2 response lacks a continuation token".to_owned())
+			})?;
+			if continuation == Some(next.as_str()) {
+				return Err(S3Error::Io(
+					"S3 ListObjectsV2 continuation token did not advance".to_owned(),
+				));
+			}
+			Some(next)
+		} else {
+			None
+		};
+		Ok(S3ScanPage { entries, next_continuation_token })
+	}
+
+	/// Enumerate every object below a mount-relative prefix without UI caching
+	/// or the bounded-directory cap.
+	pub async fn scan_keys(&self, prefix: &str) -> std::result::Result<Vec<String>, S3Error> {
+		let mut keys = Vec::new();
+		let mut continuation = None;
+		loop {
+			let page = self
+				.scan_keys_page(prefix, continuation.as_deref(), 1000)
+				.await?;
+			keys.extend(page.entries.into_iter().map(|entry| entry.key));
+			let Some(next) = page.next_continuation_token else {
+				return Ok(keys);
+			};
+			continuation = Some(next);
+		}
+	}
+
 	/// Resolves metadata from the parent listing instead of issuing a HEAD
 	/// request.
 	pub async fn stat(&self, path: &str) -> std::result::Result<ObjStat, S3Error> {
@@ -354,6 +534,99 @@ impl S3Client {
 		})
 	}
 
+	/// Fetches exact object metadata with a signed S3 `HEAD` request.
+	///
+	/// Unlike [`Self::stat`], this bypasses directory listing caches and caps.
+	pub async fn head_object(&self, path: &str) -> std::result::Result<ObjStat, S3Error> {
+		let key = self.object_key(path)?;
+		let response = self.request(Method::HEAD, &key, &[], None, None).await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let size = response
+			.headers()
+			.get(reqwest::header::CONTENT_LENGTH)
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.parse::<u64>().ok())
+			.ok_or_else(|| S3Error::Io("S3 HEAD response omitted Content-Length".to_owned()))?;
+		let last_modified = response
+			.headers()
+			.get(reqwest::header::LAST_MODIFIED)
+			.and_then(|value| value.to_str().ok())
+			.ok_or_else(|| S3Error::Io("S3 HEAD response omitted Last-Modified".to_owned()))?;
+		let mtime = DateTime::parse_from_rfc2822(last_modified)
+			.map_err(|error| S3Error::Io(format!("invalid S3 HEAD Last-Modified: {error}")))?
+			.timestamp();
+		let mtime = u64::try_from(mtime)
+			.map_err(|_| S3Error::Io("S3 HEAD Last-Modified predates Unix epoch".to_owned()))?;
+		let etag = response
+			.headers()
+			.get(reqwest::header::ETAG)
+			.and_then(|value| value.to_str().ok())
+			.map(str::to_owned);
+		Ok(ObjStat { kind: ObjKind::File, size, mtime, etag })
+	}
+
+	/// Reads one exact conditional byte range using metadata from
+	/// [`Self::head_object`].
+	///
+	/// This bypasses listing caches and returns [`S3Error::Stale`] when the
+	/// object's `ETag` no longer matches `stat`.
+	pub async fn read_range_if_match(
+		&self,
+		path: &str,
+		stat: &ObjStat,
+		offset: u64,
+		len: u32,
+	) -> std::result::Result<Bytes, S3Error> {
+		if stat.kind != ObjKind::File || len as usize > CHUNK_SIZE {
+			return Err(S3Error::BadRequest);
+		}
+		if offset >= stat.size || len == 0 {
+			return Ok(Bytes::new());
+		}
+		let etag = stat
+			.etag
+			.as_deref()
+			.ok_or_else(|| S3Error::Io("S3 HEAD response omitted ETag".to_owned()))?;
+		let expected = u64::from(len).min(stat.size - offset);
+		let end = offset + expected - 1;
+		let key = self.object_key(path)?;
+		let range = format!("bytes={offset}-{end}");
+		let response = self
+			.request(Method::GET, &key, &[], Some(&range), Some(etag))
+			.await?;
+		if response.status() == StatusCode::PRECONDITION_FAILED {
+			return Err(S3Error::Stale);
+		}
+		if response.status() == StatusCode::PARTIAL_CONTENT {
+			let content_range = response
+				.headers()
+				.get(reqwest::header::CONTENT_RANGE)
+				.and_then(|value| value.to_str().ok())
+				.ok_or_else(|| S3Error::Io("S3 range response omitted Content-Range".to_owned()))?;
+			validate_content_range(content_range, offset, end, stat.size)?;
+		} else if response.status() != StatusCode::OK || offset != 0 || expected != stat.size {
+			return Err(response_error(response.status()));
+		}
+		if response
+			.content_length()
+			.is_some_and(|length| length != expected)
+		{
+			return Err(S3Error::Io("S3 range response length did not match its range".to_owned()));
+		}
+		let body = response
+			.bytes()
+			.await
+			.map_err(|error| S3Error::Io(format!("reading S3 exact range response: {error}")))?;
+		if body.len() != expected as usize {
+			return Err(S3Error::Io(
+				"S3 range response body length did not match its range".to_owned(),
+			));
+		}
+		Ok(body)
+	}
+
 	/// Put (upload) a whole object to S3.
 	pub async fn put(&self, path: &str, body: Vec<u8>) -> std::result::Result<(), S3Error> {
 		let key = self.object_key(path)?;
@@ -368,6 +641,173 @@ impl S3Client {
 			self.list_cache.lock().remove(parent);
 		} else {
 			self.list_cache.lock().remove("");
+		}
+		Ok(())
+	}
+
+	/// Copies one mount-relative object to another using S3's server-side copy.
+	///
+	/// Successful HTTP responses are inspected for an embedded S3 `<Error>`.
+	pub async fn copy_object(
+		&self,
+		source_relative: &str,
+		dest_relative: &str,
+		source_size: u64,
+	) -> std::result::Result<(), S3Error> {
+		if source_size > S3_OBJECT_MAX_SIZE {
+			return Err(S3Error::BadRequest);
+		}
+		let source = self.object_key(source_relative)?;
+		let destination = self.object_key(dest_relative)?;
+		if source_size <= COPY_OBJECT_MAX_SIZE {
+			self.copy_object_single(&source, &destination).await?;
+		} else {
+			self
+				.copy_object_multipart(&source, &destination, source_size)
+				.await?;
+		}
+		self.invalidate_parent(dest_relative);
+		Ok(())
+	}
+
+	async fn copy_object_single(
+		&self,
+		source: &str,
+		destination: &str,
+	) -> std::result::Result<(), S3Error> {
+		let response = self.copy_request(source, destination, &[], None).await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let response_body =
+			read_bounded_response(response, COPY_RESPONSE_BODY_CAP, "copy response").await?;
+		if let Ok(error) = from_str::<S3ServiceError>(&response_body) {
+			let message = error.message.as_deref().unwrap_or("no message");
+			return Err(S3Error::Io(format!(
+				"copy-object returned S3 error {}: {message}",
+				error.code
+			)));
+		}
+		Ok(())
+	}
+
+	async fn copy_object_multipart(
+		&self,
+		source: &str,
+		destination: &str,
+		source_size: u64,
+	) -> std::result::Result<(), S3Error> {
+		let part_count = source_size.div_ceil(MULTIPART_COPY_PART_SIZE);
+		if part_count > u64::from(MULTIPART_MAX_PARTS) {
+			return Err(S3Error::BadRequest);
+		}
+		let uploads = vec![("uploads".to_owned(), String::new())];
+		let response = self
+			.request_with_body_timeout(Method::POST, destination, &uploads, None, MULTIPART_TIMEOUT)
+			.await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let response_body = response
+			.text()
+			.await
+			.map_err(|error| S3Error::Io(format!("reading multipart-copy init response: {error}")))?;
+		let upload = from_str::<InitiateMultipartUploadResult>(&response_body)
+			.map_err(|error| S3Error::Io(format!("invalid multipart-copy init response: {error}")))?;
+		if upload.upload_id.is_empty() {
+			return Err(S3Error::Io("multipart-copy init response omitted UploadId".to_owned()));
+		}
+		self
+			.active_uploads
+			.lock()
+			.insert((destination.to_owned(), upload.upload_id.clone()));
+		let _active_upload = ActiveMultipartUpload {
+			uploads:   &self.active_uploads,
+			key:       destination.to_owned(),
+			upload_id: upload.upload_id.clone(),
+		};
+
+		let result = async {
+			let mut parts = Vec::with_capacity(usize::try_from(part_count).unwrap_or(usize::MAX));
+			for index in 0..part_count {
+				let start = index * MULTIPART_COPY_PART_SIZE;
+				let end = start
+					.saturating_add(MULTIPART_COPY_PART_SIZE - 1)
+					.min(source_size - 1);
+				let part_number = u32::try_from(index + 1).map_err(|_| S3Error::BadRequest)?;
+				let query = vec![
+					("partNumber".to_owned(), part_number.to_string()),
+					("uploadId".to_owned(), upload.upload_id.clone()),
+				];
+				let range = format!("bytes={start}-{end}");
+				let response = self
+					.copy_request(source, destination, &query, Some(&range))
+					.await?;
+				if !response.status().is_success() {
+					return Err(response_error(response.status()));
+				}
+				let response_body =
+					read_bounded_response(response, COPY_RESPONSE_BODY_CAP, "copy-part response")
+						.await?;
+				if let Ok(error) = from_str::<S3ServiceError>(&response_body) {
+					let message = error.message.as_deref().unwrap_or("no message");
+					return Err(S3Error::Io(format!(
+						"copy-part returned S3 error {}: {message}",
+						error.code
+					)));
+				}
+				let part = from_str::<CopyPartResult>(&response_body)
+					.map_err(|error| S3Error::Io(format!("invalid copy-part response: {error}")))?;
+				parts.push(
+					part
+						.etag
+						.ok_or_else(|| S3Error::Io("copy-part response omitted ETag".to_owned()))?,
+				);
+			}
+			let mut complete = String::from("<CompleteMultipartUpload>");
+			for (index, etag) in parts.iter().enumerate() {
+				complete.push_str("<Part><PartNumber>");
+				complete.push_str(&(index + 1).to_string());
+				complete.push_str("</PartNumber><ETag>");
+				complete.push_str(&quick_xml::escape::escape(etag));
+				complete.push_str("</ETag></Part>");
+			}
+			complete.push_str("</CompleteMultipartUpload>");
+			let query = vec![("uploadId".to_owned(), upload.upload_id.clone())];
+			let response = self
+				.request_with_body_timeout(
+					Method::POST,
+					destination,
+					&query,
+					Some(complete.into_bytes()),
+					MULTIPART_TIMEOUT,
+				)
+				.await?;
+			if !response.status().is_success() {
+				return Err(response_error(response.status()));
+			}
+			let response_body = read_bounded_response(
+				response,
+				COPY_RESPONSE_BODY_CAP,
+				"multipart-copy complete response",
+			)
+			.await?;
+			if let Ok(error) = from_str::<S3ServiceError>(&response_body) {
+				let message = error.message.as_deref().unwrap_or("no message");
+				return Err(S3Error::Io(format!(
+					"multipart-copy complete returned S3 error {}: {message}",
+					error.code
+				)));
+			}
+			Ok(())
+		}
+		.await;
+		if let Err(error) = result {
+			let query = vec![("uploadId".to_owned(), upload.upload_id)];
+			let _ = self
+				.request_with_body_timeout(Method::DELETE, destination, &query, None, MULTIPART_TIMEOUT)
+				.await;
+			return Err(error);
 		}
 		Ok(())
 	}
@@ -395,6 +835,15 @@ impl S3Client {
 		if upload.upload_id.is_empty() {
 			return Err(S3Error::Io("multipart-init response omitted UploadId".to_owned()));
 		}
+		self
+			.active_uploads
+			.lock()
+			.insert((key.clone(), upload.upload_id.clone()));
+		let _active_upload = ActiveMultipartUpload {
+			uploads:   &self.active_uploads,
+			key:       key.clone(),
+			upload_id: upload.upload_id.clone(),
+		};
 
 		let result = async {
 			let mut pending = Vec::with_capacity(MULTIPART_PART_SIZE);
@@ -450,6 +899,16 @@ impl S3Client {
 			if !response.status().is_success() {
 				return Err(response_error(response.status()));
 			}
+			let response_body = response.text().await.map_err(|error| {
+				S3Error::Io(format!("reading multipart-complete response: {error}"))
+			})?;
+			if let Ok(error) = from_str::<S3ServiceError>(&response_body) {
+				let message = error.message.as_deref().unwrap_or("no message");
+				return Err(S3Error::Io(format!(
+					"multipart-complete returned S3 error {}: {message}",
+					error.code
+				)));
+			}
 			Ok(())
 		}
 		.await;
@@ -462,6 +921,251 @@ impl S3Client {
 			return Err(error);
 		}
 		self.invalidate_parent(path);
+		Ok(())
+	}
+
+	/// Aborts incomplete uploads under a mount-relative prefix initiated before
+	/// `older_than`, returning the number successfully aborted.
+	pub async fn abort_stale_multipart_uploads(
+		&self,
+		prefix: &str,
+		older_than: DateTime<Utc>,
+	) -> std::result::Result<usize, S3Error> {
+		const MAX_PAGES: usize = 100;
+		const PAGE_SIZE: u16 = 1000;
+
+		let prefix = self.object_key(prefix)?;
+		let mut markers: Option<(String, String)> = None;
+		let mut aborted = 0;
+		for page_number in 0..MAX_PAGES {
+			let page = self
+				.list_multipart_uploads_page(
+					&prefix,
+					markers.as_ref().map(|(key, _)| key.as_str()),
+					markers.as_ref().map(|(_, upload_id)| upload_id.as_str()),
+					PAGE_SIZE,
+				)
+				.await?;
+			for upload in page.uploads {
+				if self
+					.active_uploads
+					.lock()
+					.contains(&(upload.key.clone(), upload.upload_id.clone()))
+				{
+					continue;
+				}
+				let initiated = DateTime::parse_from_rfc3339(&upload.initiated)
+					.map_err(|error| {
+						S3Error::Io(format!(
+							"invalid S3 multipart Initiated timestamp {:?}: {error}",
+							upload.initiated
+						))
+					})?
+					.with_timezone(&Utc);
+				if initiated < older_than {
+					self
+						.abort_multipart_upload(&upload.key, &upload.upload_id)
+						.await?;
+					aborted += 1;
+				}
+			}
+			if !page.is_truncated {
+				return Ok(aborted);
+			}
+			let key_marker = page.next_key_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks a key marker".to_owned())
+			})?;
+			let upload_id_marker = page.next_upload_id_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks an upload ID marker".to_owned())
+			})?;
+			markers = Some((key_marker, upload_id_marker));
+			if page_number + 1 == MAX_PAGES {
+				warn!(prefix, "S3 multipart listing reached the 100-page cap; truncating");
+			}
+		}
+		Ok(aborted)
+	}
+
+	/// Aborts stale uploads only after `guard` has locked the candidate's
+	/// mount-relative object key and a fresh listing still identifies the same
+	/// stale upload.
+	///
+	/// Guard-acquisition, revalidation, and abort failures leave that upload
+	/// untouched and do not stop the sweep.
+	pub async fn abort_stale_multipart_uploads_guarded<G, F, E>(
+		&self,
+		prefix: &str,
+		older_than: DateTime<Utc>,
+		mut guard: F,
+	) -> std::result::Result<usize, S3Error>
+	where
+		F: FnMut(&str) -> std::result::Result<G, E>,
+		E: fmt::Display,
+	{
+		const MAX_PAGES: usize = 100;
+		const PAGE_SIZE: u16 = 1000;
+
+		let prefix = self.object_key(prefix)?;
+		let mut markers: Option<(String, String)> = None;
+		let mut aborted = 0;
+		for page_number in 0..MAX_PAGES {
+			let page = self
+				.list_multipart_uploads_page(
+					&prefix,
+					markers.as_ref().map(|(key, _)| key.as_str()),
+					markers.as_ref().map(|(_, upload_id)| upload_id.as_str()),
+					PAGE_SIZE,
+				)
+				.await?;
+			for upload in page.uploads {
+				if self
+					.active_uploads
+					.lock()
+					.contains(&(upload.key.clone(), upload.upload_id.clone()))
+					|| multipart_initiated(&upload.initiated)? >= older_than
+				{
+					continue;
+				}
+				let relative_key = self.mount_relative_object_key(&upload.key)?;
+				let _guard = match guard(&relative_key) {
+					Ok(guard) => guard,
+					Err(error) => {
+						warn!(key = upload.key, "could not guard stale S3 multipart upload: {error}");
+						continue;
+					},
+				};
+				let refreshed = match self
+					.find_multipart_upload(&upload.key, &upload.upload_id)
+					.await
+				{
+					Ok(upload) => upload,
+					Err(error) => {
+						warn!(
+							key = upload.key,
+							"could not revalidate stale S3 multipart upload: {error}"
+						);
+						continue;
+					},
+				};
+				let Some(refreshed) = refreshed else {
+					continue;
+				};
+				if self
+					.active_uploads
+					.lock()
+					.contains(&(refreshed.key.clone(), refreshed.upload_id.clone()))
+					|| multipart_initiated(&refreshed.initiated)? >= older_than
+				{
+					continue;
+				}
+				if let Err(error) = self
+					.abort_multipart_upload(&refreshed.key, &refreshed.upload_id)
+					.await
+				{
+					warn!(key = refreshed.key, "could not abort stale S3 multipart upload: {error}");
+					continue;
+				}
+				aborted += 1;
+			}
+			if !page.is_truncated {
+				return Ok(aborted);
+			}
+			let key_marker = page.next_key_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks a key marker".to_owned())
+			})?;
+			let upload_id_marker = page.next_upload_id_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks an upload ID marker".to_owned())
+			})?;
+			markers = Some((key_marker, upload_id_marker));
+			if page_number + 1 == MAX_PAGES {
+				warn!(prefix, "S3 multipart listing reached the 100-page cap; truncating");
+			}
+		}
+		Ok(aborted)
+	}
+
+	async fn find_multipart_upload(
+		&self,
+		key: &str,
+		upload_id: &str,
+	) -> std::result::Result<Option<MultipartUpload>, S3Error> {
+		const MAX_PAGES: usize = 100;
+		const PAGE_SIZE: u16 = 1000;
+
+		let mut markers: Option<(String, String)> = None;
+		for _ in 0..MAX_PAGES {
+			let page = self
+				.list_multipart_uploads_page(
+					key,
+					markers.as_ref().map(|(key, _)| key.as_str()),
+					markers.as_ref().map(|(_, upload_id)| upload_id.as_str()),
+					PAGE_SIZE,
+				)
+				.await?;
+			if let Some(upload) = page
+				.uploads
+				.into_iter()
+				.find(|upload| upload.key == key && upload.upload_id == upload_id)
+			{
+				return Ok(Some(upload));
+			}
+			if !page.is_truncated {
+				return Ok(None);
+			}
+			let key_marker = page.next_key_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks a key marker".to_owned())
+			})?;
+			let upload_id_marker = page.next_upload_id_marker.ok_or_else(|| {
+				S3Error::Io("truncated S3 multipart listing lacks an upload ID marker".to_owned())
+			})?;
+			markers = Some((key_marker, upload_id_marker));
+		}
+		warn!(key, "S3 multipart revalidation reached the 100-page cap; treating upload as missing");
+		Ok(None)
+	}
+
+	async fn list_multipart_uploads_page(
+		&self,
+		prefix: &str,
+		key_marker: Option<&str>,
+		upload_id_marker: Option<&str>,
+		max_uploads: u16,
+	) -> std::result::Result<ListMultipartUploadsResult, S3Error> {
+		let mut query = vec![
+			("max-uploads".to_owned(), max_uploads.to_string()),
+			("prefix".to_owned(), prefix.to_owned()),
+			("uploads".to_owned(), String::new()),
+		];
+		if let Some(marker) = key_marker {
+			query.push(("key-marker".to_owned(), marker.to_owned()));
+		}
+		if let Some(marker) = upload_id_marker {
+			query.push(("upload-id-marker".to_owned(), marker.to_owned()));
+		}
+		let response = self.request(Method::GET, "", &query, None, None).await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let body = response
+			.text()
+			.await
+			.map_err(|error| S3Error::Io(format!("reading S3 multipart listing response: {error}")))?;
+		from_str(&body)
+			.map_err(|error| S3Error::Io(format!("parsing S3 ListMultipartUploads XML: {error}")))
+	}
+
+	async fn abort_multipart_upload(
+		&self,
+		key: &str,
+		upload_id: &str,
+	) -> std::result::Result<(), S3Error> {
+		let query = vec![("uploadId".to_owned(), upload_id.to_owned())];
+		let response = self
+			.request_with_body_timeout(Method::DELETE, key, &query, None, MULTIPART_TIMEOUT)
+			.await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
 		Ok(())
 	}
 
@@ -587,6 +1291,65 @@ impl S3Client {
 			.map_err(|error| S3Error::Io(format!("sending S3 request: {error}")))
 	}
 
+	async fn copy_request(
+		&self,
+		source: &str,
+		destination: &str,
+		query: &[(String, String)],
+		copy_range: Option<&str>,
+	) -> std::result::Result<reqwest::Response, S3Error> {
+		let (url, canonical_uri, canonical_query) = self.request_url(destination, query)?;
+		let host = request_host(&url)?;
+		let copy_source = format!("/{}/{}", encode_component(&self.cfg.bucket), encode_path(source));
+		let mut request = self
+			.http
+			.request(Method::PUT, url)
+			.timeout(MULTIPART_TIMEOUT)
+			.header("x-amz-copy-source", &copy_source);
+		if let Some(copy_range) = copy_range {
+			request = request.header("x-amz-copy-source-range", copy_range);
+		}
+		if self.cfg.auth != S3Auth::Anonymous {
+			let creds = self.cfg.creds.as_ref().ok_or(S3Error::BadRequest)?;
+			let now = Utc::now();
+			let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+			let mut headers = vec![
+				("host".to_owned(), host.clone()),
+				("x-amz-content-sha256".to_owned(), UNSIGNED_PAYLOAD.to_owned()),
+				("x-amz-copy-source".to_owned(), copy_source.clone()),
+				("x-amz-date".to_owned(), date.clone()),
+			];
+			if let Some(copy_range) = copy_range {
+				headers.push(("x-amz-copy-source-range".to_owned(), copy_range.to_owned()));
+			}
+			if let Some(token) = &creds.session_token {
+				headers.push(("x-amz-security-token".to_owned(), token.clone()));
+			}
+			let authorization = sigv4::authorization(
+				Method::PUT.as_str(),
+				&canonical_uri,
+				&canonical_query,
+				&headers,
+				UNSIGNED_PAYLOAD,
+				now,
+				&self.cfg.region,
+				creds,
+			);
+			request = request
+				.header("host", host)
+				.header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
+				.header("x-amz-date", date)
+				.header("authorization", authorization);
+			if let Some(token) = &creds.session_token {
+				request = request.header("x-amz-security-token", token);
+			}
+		}
+		request
+			.send()
+			.await
+			.map_err(|error| S3Error::Io(format!("sending S3 copy request: {error}")))
+	}
+
 	/// Reads up to `len` bytes using cached one-mebibyte ranged GETs.
 	pub async fn read(
 		&self,
@@ -659,6 +1422,31 @@ impl S3Client {
 		}
 		self.chunks.lock().insert(key, chunk.clone());
 		Ok(chunk)
+	}
+
+	async fn list_page_flat(
+		&self,
+		prefix: &str,
+		continuation: Option<&str>,
+		max_keys: u16,
+	) -> std::result::Result<ListBucketResult, S3Error> {
+		let mut query = vec![
+			("list-type".to_owned(), "2".to_owned()),
+			("max-keys".to_owned(), max_keys.to_string()),
+			("prefix".to_owned(), prefix.to_owned()),
+		];
+		if let Some(token) = continuation {
+			query.push(("continuation-token".to_owned(), token.to_owned()));
+		}
+		let response = self.request(Method::GET, "", &query, None, None).await?;
+		if !response.status().is_success() {
+			return Err(response_error(response.status()));
+		}
+		let body = response
+			.text()
+			.await
+			.map_err(|error| S3Error::Io(format!("reading S3 listing response: {error}")))?;
+		from_str(&body).map_err(|error| S3Error::Io(format!("parsing S3 ListObjectsV2 XML: {error}")))
 	}
 
 	async fn fetch_chunk(
@@ -878,6 +1666,58 @@ fn response_error(status: StatusCode) -> S3Error {
 	}
 }
 
+fn validate_content_range(
+	value: &str,
+	expected_start: u64,
+	expected_end: u64,
+	expected_size: u64,
+) -> std::result::Result<(), S3Error> {
+	let value = value
+		.strip_prefix("bytes ")
+		.ok_or_else(|| S3Error::Io("invalid S3 Content-Range unit".to_owned()))?;
+	let (range, size) = value
+		.split_once('/')
+		.ok_or_else(|| S3Error::Io("invalid S3 Content-Range".to_owned()))?;
+	let (start, end) = range
+		.split_once('-')
+		.ok_or_else(|| S3Error::Io("invalid S3 Content-Range".to_owned()))?;
+	let start = start
+		.parse::<u64>()
+		.map_err(|_| S3Error::Io("invalid S3 Content-Range start".to_owned()))?;
+	let end = end
+		.parse::<u64>()
+		.map_err(|_| S3Error::Io("invalid S3 Content-Range end".to_owned()))?;
+	let size = size
+		.parse::<u64>()
+		.map_err(|_| S3Error::Io("invalid S3 Content-Range size".to_owned()))?;
+	if (start, end, size) != (expected_start, expected_end, expected_size) {
+		return Err(S3Error::Io("S3 Content-Range did not match the requested range".to_owned()));
+	}
+	Ok(())
+}
+
+async fn read_bounded_response(
+	response: reqwest::Response,
+	cap: usize,
+	context: &str,
+) -> std::result::Result<String, S3Error> {
+	if response
+		.content_length()
+		.is_some_and(|length| length > cap as u64)
+	{
+		return Err(S3Error::Io(format!("S3 {context} exceeds the {cap}-byte limit")));
+	}
+	let body = response
+		.bytes()
+		.await
+		.map_err(|error| S3Error::Io(format!("reading S3 {context}: {error}")))?;
+	if body.len() > cap {
+		return Err(S3Error::Io(format!("S3 {context} exceeds the {cap}-byte limit")));
+	}
+	String::from_utf8(body.to_vec())
+		.map_err(|error| S3Error::Io(format!("S3 {context} was not valid UTF-8: {error}")))
+}
+
 fn valid_relative_path(path: &str) -> bool {
 	path.is_empty()
 		|| path
@@ -919,6 +1759,14 @@ fn parse_mtime(value: &str) -> std::result::Result<u64, S3Error> {
 		.timestamp();
 	u64::try_from(timestamp)
 		.map_err(|_| S3Error::Io(format!("S3 LastModified timestamp predates Unix epoch: {value:?}")))
+}
+
+fn multipart_initiated(value: &str) -> std::result::Result<DateTime<Utc>, S3Error> {
+	DateTime::parse_from_rfc3339(value)
+		.map(|timestamp| timestamp.with_timezone(&Utc))
+		.map_err(|error| {
+			S3Error::Io(format!("invalid S3 multipart Initiated timestamp {value:?}: {error}"))
+		})
 }
 
 fn merge_listing(
@@ -1100,9 +1948,607 @@ mod sigv4 {
 
 #[cfg(test)]
 mod tests {
-	use chrono::{TimeZone, Utc};
+	use std::{collections::VecDeque, sync::Arc};
+
+	use axum::{
+		Router,
+		body::Body,
+		extract::State,
+		http::{HeaderValue, Request, StatusCode},
+		response::{IntoResponse, Response},
+		routing::any,
+	};
+	use chrono::{Duration, TimeZone, Utc};
 
 	use super::*;
+
+	#[derive(Clone)]
+	struct MockS3 {
+		replies:        Arc<Mutex<VecDeque<MockReply>>>,
+		requests:       Arc<Mutex<Vec<String>>>,
+		copy_sources:   Arc<Mutex<Vec<Option<String>>>>,
+		copy_ranges:    Arc<Mutex<Vec<Option<String>>>>,
+		authorizations: Arc<Mutex<Vec<Option<String>>>>,
+		content_ranges: Arc<Mutex<VecDeque<Option<String>>>>,
+	}
+
+	struct MockReply {
+		status: StatusCode,
+		body:   &'static str,
+		etag:   Option<&'static str>,
+	}
+
+	async fn mock_s3(State(mock): State<MockS3>, request: Request<Body>) -> Response {
+		mock.requests.lock().push(format!(
+			"{} {}",
+			request.method(),
+			request.uri().path_and_query().unwrap()
+		));
+		mock.copy_sources.lock().push(
+			request
+				.headers()
+				.get("x-amz-copy-source")
+				.and_then(|value| value.to_str().ok())
+				.map(str::to_owned),
+		);
+		mock.copy_ranges.lock().push(
+			request
+				.headers()
+				.get("x-amz-copy-source-range")
+				.and_then(|value| value.to_str().ok())
+				.map(str::to_owned),
+		);
+		mock.authorizations.lock().push(
+			request
+				.headers()
+				.get("authorization")
+				.and_then(|value| value.to_str().ok())
+				.map(str::to_owned),
+		);
+		let reply = mock
+			.replies
+			.lock()
+			.pop_front()
+			.expect("unexpected S3 request");
+		let mut response = (reply.status, reply.body).into_response();
+		if let Some(etag) = reply.etag {
+			response
+				.headers_mut()
+				.insert(reqwest::header::ETAG, HeaderValue::from_static(etag));
+		}
+		if request.headers().contains_key(reqwest::header::RANGE)
+			&& let Some(Some(content_range)) = mock.content_ranges.lock().pop_front()
+		{
+			response.headers_mut().insert(
+				reqwest::header::CONTENT_RANGE,
+				HeaderValue::from_str(&content_range).expect("valid mock Content-Range"),
+			);
+		}
+		if request.method() == Method::HEAD {
+			response
+				.headers_mut()
+				.insert(reqwest::header::CONTENT_LENGTH, HeaderValue::from_static("4294967296"));
+			response.headers_mut().insert(
+				reqwest::header::LAST_MODIFIED,
+				HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"),
+			);
+		}
+		response
+	}
+
+	async fn mock_client(
+		replies: Vec<MockReply>,
+	) -> (S3Client, MockS3, tokio::task::JoinHandle<()>) {
+		let mock = MockS3 {
+			replies:        Arc::new(Mutex::new(replies.into())),
+			requests:       Arc::new(Mutex::new(Vec::new())),
+			copy_sources:   Arc::new(Mutex::new(Vec::new())),
+			copy_ranges:    Arc::new(Mutex::new(Vec::new())),
+			authorizations: Arc::new(Mutex::new(Vec::new())),
+			content_ranges: Arc::new(Mutex::new(VecDeque::new())),
+		};
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("bind mock S3");
+		let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
+		let server_mock = mock.clone();
+		let server = tokio::spawn(async move {
+			axum::serve(listener, Router::new().fallback(any(mock_s3)).with_state(server_mock))
+				.await
+				.expect("serve mock S3");
+		});
+		let client = S3Client::new(S3MountConfig {
+			bucket:    "bucket".to_owned(),
+			prefix:    String::new(),
+			region:    "us-east-1".to_owned(),
+			endpoint:  Some(endpoint),
+			read_only: false,
+			creds:     None,
+			auth:      S3Auth::Anonymous,
+		})
+		.expect("mock S3 config");
+		(client, mock, server)
+	}
+
+	#[tokio::test]
+	async fn copy_object_sends_signed_encoded_copy_source() {
+		let (mut client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::OK,
+			body:   "<CopyObjectResult><ETag>&quot;copy&quot;</ETag></CopyObjectResult>",
+			etag:   None,
+		}])
+		.await;
+		client.cfg.auth = S3Auth::Inline;
+		client.cfg.creds = Some(S3Credentials {
+			access_key:    "access".to_owned(),
+			secret_key:    "secret".to_owned(),
+			session_token: None,
+		});
+
+		client
+			.copy_object("source folder/input", "final/output", 1024)
+			.await
+			.expect("copy succeeds");
+		assert_eq!(&*mock.requests.lock(), &["PUT /bucket/final/output"]);
+		assert_eq!(&*mock.copy_sources.lock(), &[Some("/bucket/source%20folder/input".to_owned())]);
+		assert!(
+			mock.authorizations.lock()[0]
+				.as_deref()
+				.is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 "))
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn copy_object_embedded_error_fails() {
+		let (client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::OK,
+
+			body: "<Error><Code>InternalError</Code><Message>retry</Message></Error>",
+			etag: None,
+		}])
+		.await;
+
+		let error = client
+			.copy_object("source", "destination", 1024)
+			.await
+			.expect_err("embedded error fails");
+		assert!(error.to_string().contains("InternalError"));
+		assert_eq!(&*mock.copy_sources.lock(), &[Some("/bucket/source".to_owned())]);
+		server.abort();
+	}
+	#[tokio::test]
+	async fn head_object_bypasses_large_listing_and_returns_exact_metadata() {
+		let (client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::OK,
+			body:   "",
+			etag:   Some("\"head-etag\""),
+		}])
+		.await;
+
+		let stat = client
+			.head_object("beyond-listing-cap/object")
+			.await
+			.expect("HEAD succeeds without a listing");
+		assert_eq!(stat.kind, ObjKind::File);
+		assert_eq!(stat.size, 4_294_967_296);
+		assert_eq!(stat.etag.as_deref(), Some("\"head-etag\""));
+		assert_eq!(
+			stat.mtime,
+			Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+				.single()
+				.unwrap()
+				.timestamp() as u64
+		);
+		assert_eq!(&*mock.requests.lock(), &["HEAD /bucket/beyond-listing-cap/object"]);
+		server.abort();
+	}
+
+	fn exact_stat() -> ObjStat {
+		ObjStat { kind: ObjKind::File, size: 6, mtime: 0, etag: Some("\"etag\"".to_owned()) }
+	}
+
+	#[tokio::test]
+	async fn exact_range_bypasses_listing_and_validates_content_range() {
+		let (client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::PARTIAL_CONTENT,
+			body:   "abc",
+			etag:   None,
+		}])
+		.await;
+		mock
+			.content_ranges
+			.lock()
+			.push_back(Some("bytes 0-2/6".to_owned()));
+
+		assert_eq!(
+			client
+				.read_range_if_match("beyond-listing-cap/object", &exact_stat(), 0, 3)
+				.await
+				.expect("exact range succeeds"),
+			Bytes::from_static(b"abc")
+		);
+		assert_eq!(&*mock.requests.lock(), &["GET /bucket/beyond-listing-cap/object"]);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn exact_range_maps_mutation_to_stale() {
+		let (client, _mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::PRECONDITION_FAILED,
+			body:   "",
+			etag:   None,
+		}])
+		.await;
+
+		assert_eq!(
+			client
+				.read_range_if_match("object", &exact_stat(), 0, 3)
+				.await
+				.expect_err("If-Match mutation fails"),
+			S3Error::Stale
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn exact_range_rejects_malformed_content_range() {
+		let (client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::PARTIAL_CONTENT,
+			body:   "abc",
+			etag:   None,
+		}])
+		.await;
+		mock
+			.content_ranges
+			.lock()
+			.push_back(Some("not-a-range".to_owned()));
+
+		assert!(matches!(
+			client
+				.read_range_if_match("object", &exact_stat(), 0, 3)
+				.await,
+			Err(S3Error::Io(_))
+		));
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn exact_range_rejects_short_or_oversize_bodies() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply { status: StatusCode::PARTIAL_CONTENT, body: "ab", etag: None },
+			MockReply { status: StatusCode::PARTIAL_CONTENT, body: "abcd", etag: None },
+		])
+		.await;
+		mock
+			.content_ranges
+			.lock()
+			.extend([Some("bytes 0-2/6".to_owned()), Some("bytes 0-2/6".to_owned())]);
+
+		for _ in 0..2 {
+			assert!(matches!(
+				client
+					.read_range_if_match("object", &exact_stat(), 0, 3)
+					.await,
+				Err(S3Error::Io(_))
+			));
+		}
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn scan_keys_page_consumes_three_continuation_pages() {
+		let (client, _mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>one</\
+				         NextContinuationToken><Contents><Key>logs/one</\
+				         Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>&quot;one&quot;</\
+				         ETag><Size>1</Size></Contents></ListBucketResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>two</\
+				         NextContinuationToken><Contents><Key>logs/two</\
+				         Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>&quot;two&quot;</\
+				         ETag><Size>2</Size></Contents></ListBucketResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>logs/three</\
+				         Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>&quot;three&quot;\
+				         </ETag><Size>3</Size></Contents></ListBucketResult>",
+				etag:   None,
+			},
+		])
+		.await;
+
+		let first = client
+			.scan_keys_page("logs", None, 1)
+			.await
+			.expect("first page");
+		let second = client
+			.scan_keys_page("logs", first.next_continuation_token.as_deref(), 1)
+			.await
+			.expect("second page");
+		let third = client
+			.scan_keys_page("logs", second.next_continuation_token.as_deref(), 1)
+			.await
+			.expect("third page");
+		assert_eq!(first.entries[0].key, "logs/one");
+		assert_eq!(second.entries[0].key, "logs/two");
+		assert_eq!(third.entries[0].key, "logs/three");
+		assert!(third.next_continuation_token.is_none());
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn large_copy_uses_ranged_multipart_copy_and_completes() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></\
+				         InitiateMultipartUploadResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<CopyPartResult><ETag>&quot;part-1&quot;</ETag></CopyPartResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<CopyPartResult><ETag>&quot;part-2&quot;</ETag></CopyPartResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<CompleteMultipartUploadResult/>",
+				etag:   None,
+			},
+		])
+		.await;
+
+		client
+			.copy_object("source", "destination", COPY_OBJECT_MAX_SIZE + 1)
+			.await
+			.expect("multipart copy succeeds");
+		assert_eq!(&*mock.copy_ranges.lock(), &[
+			None,
+			Some("bytes=0-5368709119".to_owned()),
+			Some("bytes=5368709120-5368709120".to_owned()),
+			None,
+		]);
+		assert!(
+			mock
+				.requests
+				.lock()
+				.iter()
+				.any(|request| request == "POST /bucket/destination?uploadId=upload-1")
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn multipart_copy_part_error_aborts_upload() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></\
+				         InitiateMultipartUploadResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<Error><Code>InternalError</Code><Message>retry</Message></Error>",
+				etag:   None,
+			},
+			MockReply { status: StatusCode::NO_CONTENT, body: "", etag: None },
+		])
+		.await;
+
+		let error = client
+			.copy_object("source", "destination", COPY_OBJECT_MAX_SIZE + 1)
+			.await
+			.expect_err("part error fails copy");
+		assert!(error.to_string().contains("InternalError"));
+		assert!(
+			mock
+				.requests
+				.lock()
+				.iter()
+				.any(|request| request == "DELETE /bucket/destination?uploadId=upload-1")
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn multipart_complete_embedded_error_aborts_upload() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></\
+				         InitiateMultipartUploadResult>",
+				etag:   None,
+			},
+			MockReply { status: StatusCode::OK, body: "", etag: Some("\"part-1\"") },
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<Error><Code>InternalError</Code><Message>retry</Message></Error>",
+				etag:   None,
+			},
+			MockReply { status: StatusCode::NO_CONTENT, body: "", etag: None },
+		])
+		.await;
+		let (sender, receiver) = tokio::sync::mpsc::channel(1);
+		sender
+			.send(Ok(Bytes::from_static(b"body")))
+			.await
+			.expect("send body");
+		drop(sender);
+
+		let error = client
+			.put_multipart("object", receiver)
+			.await
+			.expect_err("embedded error fails");
+		assert!(error.to_string().contains("InternalError"));
+		assert!(
+			mock
+				.requests
+				.lock()
+				.iter()
+				.any(|request| request == "DELETE /bucket/object?uploadId=upload-1")
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn stale_multipart_janitor_aborts_residue_but_retains_young_uploads() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListMultipartUploadsResult><IsTruncated>false</\
+				         IsTruncated><Upload><Key>residue/dead</Key><UploadId>old-upload</\
+				         UploadId><Initiated>2024-01-01T00:00:00Z</Initiated></\
+				         Upload><Upload><Key>residue/live</Key><UploadId>young-upload</\
+				         UploadId><Initiated>2025-01-01T00:00:00Z</Initiated></Upload></\
+				         ListMultipartUploadsResult>",
+				etag:   None,
+			},
+			MockReply { status: StatusCode::NO_CONTENT, body: "", etag: None },
+		])
+		.await;
+
+		let aborted = client
+			.abort_stale_multipart_uploads(
+				"residue",
+				Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).single().unwrap(),
+			)
+			.await
+			.expect("janitor succeeds");
+		assert_eq!(aborted, 1);
+		let requests = mock.requests.lock();
+		assert!(
+			requests
+				.iter()
+				.any(|request| request == "DELETE /bucket/residue/dead?uploadId=old-upload")
+		);
+		assert!(
+			!requests
+				.iter()
+				.any(|request| request.contains("young-upload"))
+		);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn stale_multipart_janitor_skips_old_in_process_upload() {
+		let (client, mock, server) = mock_client(vec![MockReply {
+			status: StatusCode::OK,
+			body:   "<ListMultipartUploadsResult><IsTruncated>false</\
+			         IsTruncated><Upload><Key>residue/active</Key><UploadId>active-upload</\
+			         UploadId><Initiated>2024-01-01T00:00:00Z</Initiated></Upload></\
+			         ListMultipartUploadsResult>",
+			etag:   None,
+		}])
+		.await;
+		client
+			.active_uploads
+			.lock()
+			.insert(("residue/active".to_owned(), "active-upload".to_owned()));
+
+		assert_eq!(
+			client
+				.abort_stale_multipart_uploads(
+					"residue",
+					Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).single().unwrap(),
+				)
+				.await
+				.expect("janitor succeeds"),
+			0
+		);
+		assert_eq!(mock.requests.lock().len(), 1);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn guarded_janitor_revalidates_after_delayed_publisher() {
+		let (mut client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListMultipartUploadsResult><IsTruncated>false</\
+				         IsTruncated><Upload><Key>mount/residue/publishing</Key><UploadId>old-upload</\
+				         UploadId><Initiated>2024-01-01T00:00:00Z</Initiated></Upload></\
+				         ListMultipartUploadsResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></\
+				         ListMultipartUploadsResult>",
+				etag:   None,
+			},
+		])
+		.await;
+		client.cfg.prefix = "mount".to_owned();
+		let guarded_keys = Arc::new(Mutex::new(Vec::new()));
+		let observed_keys = guarded_keys.clone();
+
+		assert_eq!(
+			client
+				.abort_stale_multipart_uploads_guarded(
+					"residue",
+					Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).single().unwrap(),
+					move |key| {
+						observed_keys.lock().push(key.to_owned());
+						Ok::<_, S3Error>(())
+					},
+				)
+				.await
+				.expect("guarded janitor succeeds"),
+			0
+		);
+		assert_eq!(&*guarded_keys.lock(), &["residue/publishing"]);
+		assert_eq!(mock.requests.lock().len(), 2);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn stale_multipart_janitor_uses_both_pagination_markers() {
+		let (client, mock, server) = mock_client(vec![
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListMultipartUploadsResult><IsTruncated>true</\
+				         IsTruncated><NextKeyMarker>residue/first</\
+				         NextKeyMarker><NextUploadIdMarker>first-upload</NextUploadIdMarker></\
+				         ListMultipartUploadsResult>",
+				etag:   None,
+			},
+			MockReply {
+				status: StatusCode::OK,
+				body:   "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></\
+				         ListMultipartUploadsResult>",
+				etag:   None,
+			},
+		])
+		.await;
+
+		assert_eq!(
+			client
+				.abort_stale_multipart_uploads("residue", Utc::now() - Duration::days(1))
+				.await
+				.expect("janitor succeeds"),
+			0
+		);
+		assert!(mock.requests.lock().iter().any(|request| {
+			request
+				== "GET /bucket?key-marker=residue%2Ffirst&max-uploads=1000&prefix=residue&\
+				    upload-id-marker=first-upload&uploads="
+		}));
+		server.abort();
+	}
 
 	#[test]
 	fn parses_s3_uri_and_normalizes_prefix() {

@@ -46,14 +46,11 @@ impl Resolve for PublicDnsResolver {
 			let addresses = match tokio::net::lookup_host((host.as_str(), 0)).await {
 				Ok(addresses) => addresses.collect::<Vec<_>>(),
 				Err(error) => {
-					return Err(Box::new(error)
-						as Box<dyn std::error::Error + Send + Sync + 'static>);
+					return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>);
 				},
 			};
 			if let Err(error) = validate_resolved_addresses(&host, &addresses) {
-				return Err(
-					Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>
-				);
+				return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>);
 			}
 			Ok(Box::new(addresses.into_iter()) as Addrs)
 		})
@@ -275,18 +272,9 @@ async fn broker_request(
 			value
 				.to_str()
 				.map_or(true, |value| !value.trim().eq_ignore_ascii_case("identity"))
-		})
-	{
-		record(
-			&state,
-			&request.credential,
-			"failed",
-			Some("encoded_response"),
-			Some(host),
-		);
-		return Err(GatewayError::bad_gateway(
-			"credential upstream returned an encoded response",
-		));
+		}) {
+		record(&state, &request.credential, "failed", Some("encoded_response"), Some(host));
+		return Err(GatewayError::bad_gateway("credential upstream returned an encoded response"));
 	}
 	let status = response.status().as_u16();
 	let mut headers = HashMap::new();
@@ -581,9 +569,7 @@ mod tests {
 
 	use tempfile::TempDir;
 
-	use super::{
-		is_protected, redact_secrets, validate_public_host, validate_resolved_addresses,
-	};
+	use super::{is_protected, redact_secrets, validate_public_host, validate_resolved_addresses};
 	use crate::{
 		home::Home,
 		security::{

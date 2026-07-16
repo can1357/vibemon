@@ -18,6 +18,19 @@ data:
   start-node.sh: |
     #!/bin/sh
     set -eu
+    if [ "$VMON_CLUSTER_MODE" = "production" ]; then
+      key_dir=/var/lib/vmon/security/keys
+      key_path="$key_dir/$VMON_PORTABLE_HISTORY_KEY_ID.key"
+      temporary_key="$key_path.new"
+      umask 077
+      mkdir -p "$key_dir"
+      chmod 700 "$key_dir"
+      rm -f "$temporary_key"
+      cp /etc/vmon/portable-history/key "$temporary_key"
+      chmod 600 "$temporary_key"
+      mv -f "$temporary_key" "$key_path"
+    fi
+
     db_username=$(jq -nr --arg value "$VMON_DB_USERNAME" '$value | @uri')
     db_password=$(jq -nr --arg value "$VMON_DB_PASSWORD" '$value | @uri')
     db_name=$(jq -nr --arg value "$VMON_DB_NAME" '$value | @uri')
