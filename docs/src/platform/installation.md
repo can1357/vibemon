@@ -124,11 +124,13 @@ Then install with non-default credentials:
 ```sh
 helm install vmon ./deploy/helm/vmon \
   --set nodes.apiToken="$(openssl rand -hex 32)" \
+  --set nodes.portableHistoryKeyId=cluster-recovery \
+  --set-string nodes.portableHistoryKey="$(openssl rand -hex 32)" \
   --set postgresql.auth.password="replace-this-password" \
   --set s3Storage.auth.accessKey="replace-this-access-key" \
   --set s3Storage.auth.secretKey="replace-this-secret-key"
 ```
 
-The bundled PostgreSQL and MinIO workloads are for evaluation. For production, set `postgresql.enabled=false` and `s3Storage.enabled=false`, then fill `externalDatabase` and `externalS3`. Set `buildkit.enabled=false` and `buildkit.address` to use an operator-managed builder.
+The bundled PostgreSQL and MinIO workloads are for evaluation. For production, set `postgresql.enabled=false` and `s3Storage.enabled=false`, then fill `externalDatabase` and `externalS3`. Set `buildkit.enabled=false` and `buildkit.address` to use an operator-managed builder. Prefer `existingSecret` for credentials; it must contain `api-token`, `postgres-password`, `access-key`, `secret-key`, and the shared 64-hex-character `portable-history-key` (`client-token` is optional).
 
 `just validate-deploy` checks the shell scripts, Compose model, rendered Helm chart, and Kubernetes schemas. The full value contract is in `deploy/helm/vmon/values.schema.json`.

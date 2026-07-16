@@ -124,7 +124,7 @@ if sandbox.Status != "running" && sandbox.Status != "ready" {
 }
 ```
 
-The returned `Sandbox` exposes fields including `ID`, `Name`, `Status`, `Node`, timestamps, tags, `ReturnCode`, and `ErrorMessage`. Unknown response fields remain available in `Details` as `json.RawMessage`. Do not construct a `Sandbox` directly: obtain one through `Create`, `Get`, `List`, or `Ref` so its `Files` and `Ports` services are initialized.
+The returned `Sandbox` exposes typed fields including `ID`, `Name`, `Status`, `DesiredState`, `ObservedState`, `StateGeneration`, `LifecycleFailure`, `HA`, `RestartPolicy`, `Node`, timestamps, tags, `ReturnCode`, and `ErrorMessage`. Unknown response fields remain available in `Details` as `json.RawMessage`. Do not construct a `Sandbox` directly: obtain one through `Create`, `Get`, `List`, or `Ref` so its `Files` and `Ports` services are initialized.
 
 </div>
 <div data-sdk-language="typescript">
@@ -136,7 +136,7 @@ const previews = await client.sandboxes.list({
   tags: { service: "preview" },
 });
 
-console.log(current.info.state);
+console.log(current.info.observed_state);
 await deferred.stop();
 ```
 
@@ -145,18 +145,38 @@ await deferred.stop();
 </div>
 </div>
 
+Current servers return the following lifecycle fields on every sandbox view. Python and TypeScript use the wire names below; Go exposes the corresponding `DesiredState`, `ObservedState`, `StateGeneration`, `LifecycleFailure`, `HA`, and `RestartPolicy` fields.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | Serving-status summary retained for compatibility. Use the desired and observed fields to inspect lifecycle progress. |
+| `desired_state` | Durable target accepted by the server, such as `running`, `paused`, `suspended`, or `stopped`. |
+| `observed_state` | State the current owner has materialized. It can lag the desired state while an operation is in progress. |
+| `state_generation` | Monotonic transition generation. A newer accepted lifecycle request has a larger generation. |
+| `lifecycle_failure` | Failure for the current transition, or `null` when no transition failure is recorded. |
+| `ha` | Selected durability tier: `off`, `async`, `rerun`, or `async+rerun`. |
+| `restart_policy` | Server-derived owner-loss policy, normally `none` or `rerun`. |
+
 ## Lifecycle and placement
 
 Lifecycle operations act on the identified server sandbox. Stopping execution, immediately terminating resources, and removing the server record are distinct operations. Use the least destructive action that matches the intent. Named volumes have their own lifecycle and are not removed with the sandbox.
 
-Pause and resume suspend and reactivate execution in memory. `suspend()` is
-different: it creates a durable checkpoint, releases the live VM, and keeps
-the sandbox identity for `history()` and `rollback()`. An idle timeout uses the
-same suspend path rather than deleting the sandbox. A later rollback restores
-the selected retained recovery point to that identity. A missing recovery
-point, unavailable customer key, incompatible host dependency, or failed
-checkpoint returns a daemon error; do not treat a suspended sandbox as a
-running VM.
+Pause keeps the VM allocated and quiesces its virtual CPUs. `resume()` resumes
+that in-memory VM when paused; when the sandbox is durably suspended, the same
+method restores its exact committed suspend checkpoint and preserves its ID.
+`suspend()` is transactional: it captures a checkpoint, commits the suspended
+state, releases the live VM, and keeps the identity manageable. A capture or
+publication failure leaves the prior VM and observed state intact.
+
+`history()` returns immutable points from oldest to newest. A `disk` point
+contains durable disk state and cold-boots on rollback, so guest processes do
+not survive. A `checkpoint` point contains VM execution state and resumes
+captured processes. `rollback()` stages and validates a replacement before
+cutover; a failed replacement does not destroy the current source. Production
+meshes additionally fence these operations through PostgreSQL ownership leases
+and publish encrypted portable history to S3. See
+[Snapshots, Restore, and Fork](../platform/snapshots.md) and
+[Mesh and High Availability](../platform/mesh.md).
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -167,7 +187,7 @@ running VM.
 | `stop()` | Stop execution while retaining the server record. |
 | `terminate()` | Terminate the sandbox; repeated calls on the same handle are idempotent. |
 | `remove()` | Delete the record; repeated calls on the same handle are idempotent. |
-| `pause()` / `resume()` | Pause or resume virtual CPUs and return updated `SandboxInfo`. |
+| `pause()` / `resume()` | Pause virtual CPUs, resume a paused VM, or restore a durably suspended VM. |
 | `suspend()` | Checkpoint durably, release the live VM, and retain the sandbox ID. |
 | `history()` | List retained recovery points from oldest to newest. |
 | `rollback(recovery_point)` | Restore this ID to the named recovery point and return updated `SandboxInfo`. |
@@ -182,9 +202,11 @@ sandbox.refresh()
 print(sandbox.info.status)
 
 checkpoint = sandbox.suspend()
+print(checkpoint.desired_state, checkpoint.observed_state)
+resumed = sandbox.resume()
 point = sandbox.history()[-1]
 restored = sandbox.rollback(point.name)
-print(checkpoint.status, restored.status)
+print(resumed.observed_state, restored.observed_state)
 
 
 updated = sandbox.migrate("node-b")
@@ -203,7 +225,7 @@ sandbox.remove()
 | `Stop(ctx)` | Perform the API's ordinary graceful stop. | Updated `*Sandbox` |
 | `Terminate(ctx)` | Immediately halt and release sandbox resources. | `error` |
 | `Remove(ctx)` | Remove the sandbox record. | `error` |
-| `Pause(ctx)` / `Resume(ctx)` | Suspend or reactivate execution. | Updated `*Sandbox` |
+| `Pause(ctx)` / `Resume(ctx)` | Pause virtual CPUs, resume a paused VM, or restore a durably suspended VM. | Updated `*Sandbox` |
 | `Suspend(ctx)` | Checkpoint durably and release the live VM. | Updated `*Sandbox` |
 | `History(ctx)` | List retained recovery points from oldest to newest. | `[]RecoveryPoint`, `error` |
 | `Rollback(ctx, recoveryPoint)` | Restore this ID to one retained recovery point. | Updated `*Sandbox` |
@@ -212,6 +234,12 @@ sandbox.remove()
 
 ```go
 if _, err := sandbox.Suspend(ctx); err != nil {
+    return err
+}
+if sandbox.DesiredState != "suspended" || sandbox.ObservedState != "suspended" {
+    return fmt.Errorf("suspend did not converge: %#v", sandbox)
+}
+if _, err := sandbox.Resume(ctx); err != nil {
     return err
 }
 points, err := sandbox.History(ctx)
@@ -246,8 +274,8 @@ if err := sandbox.Terminate(ctx); err != nil {
 | `stop(wait = true)` | Request graceful shutdown and, by default, wait for `stopped` or `exited`. | `Promise<SandboxInfo>` |
 | `terminate(wait = true)` | Force termination and, by default, wait for `terminated`, `stopped`, or `exited`. | `Promise<void>` |
 | `remove()` | Remove the sandbox record. | `Promise<void>` |
-| `pause()` / `resume()` | Pause or resume execution. | `Promise<SandboxInfo>` |
-| `suspend()` | Checkpoint durably and release the live VM. | `Promise<SandboxInfo>` |
+| `pause()` / `resume()` | Pause virtual CPUs, resume a paused VM, or restore a durably suspended VM. | `Promise<SandboxInfo>` |
+| `suspend()` | Transactionally checkpoint, release the live VM, and preserve its ID. | `Promise<SandboxInfo>` |
 | `history()` | List retained recovery points from oldest to newest. | `Promise<RecoveryPoint[]>` |
 | `rollback(recoveryPoint)` | Restore this ID to one retained recovery point. | `Promise<SandboxInfo>` |
 | `extend(secs)` | Extend the lease in seconds. | `Promise<SandboxInfo>` |
@@ -259,9 +287,13 @@ The implicit state wait in `stop()` and `terminate()` is bounded at five minutes
 await sandbox.stop();
 await sandbox.extend(600);
 const suspended = await sandbox.suspend();
-const [point] = await sandbox.history();
+console.log(suspended.desired_state, suspended.observed_state);
+const resumed = await sandbox.resume();
+const points = await sandbox.history();
+const point = points.at(-1);
+if (!point) throw new Error("no recovery point retained");
 const restored = await sandbox.rollback(point.name);
-console.log(suspended.status, restored.status);
+console.log(resumed.observed_state, restored.observed_state);
 const moved = await sandbox.migrate("node-b");
 console.log(moved.node);
 await sandbox.terminate(false);

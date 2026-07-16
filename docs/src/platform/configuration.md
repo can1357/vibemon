@@ -56,7 +56,7 @@ The following table gives the TOML key, environment variable, and flag. String v
 | `network_broker_socket` | `VMON_NETWORK_BROKER_SOCKET` | — | Absolute Linux network-broker socket path. Start the broker separately with `vmon net-broker --socket PATH --owner-uid "$(id -u vmon)"` when it runs as root, or run a dedicated `CAP_NET_ADMIN` broker copy as the daemon service UID. There is no `vmon serve` flag. |
 | `history_disk_sec` | `VMON_HISTORY_DISK_SEC` | `--history-disk-sec` | Rolling disk recovery-point cadence in seconds; zero disables it; default 300. |
 | `history_checkpoint_sec` | `VMON_HISTORY_CHECKPOINT_SEC` | `--history-checkpoint-sec` | Full-checkpoint recovery-point cadence in seconds; zero disables it; default 3600. |
-| `history_retention` | `VMON_HISTORY_RETENTION` | `--history-retention` | Maximum retained recovery points per sandbox; default 24. |
+| `history_retention` | `VMON_HISTORY_RETENTION` | `--history-retention` | Recovery-point count limit; default 24. Production portable history applies it independently to each `disk` and `checkpoint` tier. |
 | `history_max_age_sec` | `VMON_HISTORY_MAX_AGE_SEC` | `--history-max-age-sec` | Recovery-point maximum age in seconds; zero disables age pruning; default 604800. |
 | `template_ttl_sec` | `VMON_TEMPLATE_TTL_SEC` | `--template-ttl-sec` | Maximum age for unused image templates in seconds; default 2592000. |
 | `function_artifact_max_bytes` | `VMON_FUNCTION_ARTIFACT_MAX_BYTES` | `--function-artifact-max-bytes` | Maximum uncompressed streamed function artifact, from 1 through 2^50 bytes; default 4 GiB. |
@@ -78,6 +78,16 @@ The following table gives the TOML key, environment variable, and flag. String v
 | `mesh_w_local` | `VMON_MESH_W_LOCAL` | `--mesh-w-local` | Positive local-node placement weight. |
 | `mesh_w_region` | `VMON_MESH_W_REGION` | `--mesh-w-region` | Positive region-affinity placement weight. |
 | `mesh_w_inflight` | `VMON_MESH_W_INFLIGHT` | `--mesh-w-inflight` | Positive inflight-create placement penalty. |
+| `cluster_mode` | `VMON_CLUSTER_MODE` | `--cluster-mode` | `single-node` (default) or `production`. Production makes PostgreSQL authoritative for ownership/lifecycle and S3 authoritative for portable objects. |
+| `postgres_url` | `VMON_POSTGRES_URL` | `--postgres-url` | PostgreSQL connection URL; required in production mode. |
+| `s3_endpoint` | `VMON_S3_ENDPOINT` | `--s3-endpoint` | S3-compatible endpoint URL; required in production mode. Custom endpoints use path-style requests. |
+| `s3_bucket` | `VMON_S3_BUCKET` | `--s3-bucket` | S3 bucket for portable history, replicas, and function artifacts; required in production mode. |
+| `s3_region` | `VMON_S3_REGION` | `--s3-region` | S3 region; required in production mode. |
+| `s3_access_key` | `VMON_S3_ACCESS_KEY` | `--s3-access-key` | S3 access key; required in production mode. Prefer a protected environment source. |
+| `s3_secret_key` | `VMON_S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key; required in production mode. Prefer a protected environment source. |
+| `s3_prefix` | `VMON_S3_PREFIX` | `--s3-prefix` | Optional object-key prefix shared by every node in the cluster. |
+| `s3_multipart_stale_sec` | `VMON_S3_MULTIPART_STALE_SEC` | `--s3-multipart-stale-sec` | Stale multipart-upload cleanup age; default seven days. Zero disables cleanup; a positive value must be at least 3600 seconds. |
+| `portable_history_key_id` | `VMON_PORTABLE_HISTORY_KEY_ID` | `--portable-history-key-id` | Non-`default` shared key ID required in production. Every node must provision identical key material at `$VMON_HOME/security/keys/<id>.key`. |
 
 Boolean environment values accept `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false (case-insensitive). TOML accepts booleans and also integer `0` or `1` for `restore_quorum`.
 
@@ -91,6 +101,27 @@ Keep non-secret policy in TOML and inject the bearer token from a protected envi
 export VMON_API_TOKEN="$(cat /run/secrets/vmon-api-token)"
 vmon serve --config /etc/vmon/serve.toml
 ```
+
+Production mode is an explicit hard-dependency mode. Every node must resolve
+the same PostgreSQL database, S3 namespace, and portable-history key:
+
+```toml
+[serve]
+cluster_mode = "production"
+postgres_url = "postgresql://vmon@postgres/vmon"
+s3_endpoint = "https://s3.example.internal"
+s3_bucket = "vmon-production"
+s3_region = "us-east-1"
+s3_prefix = "cluster-a/"
+portable_history_key_id = "cluster-recovery"
+```
+
+Supply `VMON_S3_ACCESS_KEY` and `VMON_S3_SECRET_KEY` from the deployment's
+secret store. Provision the same 32-byte hex key as
+`$VMON_HOME/security/keys/cluster-recovery.key` on every node with mode `0600` or
+stricter. The server rejects production configuration with any missing
+requirement; it does not fall back to node-local ownership or unencrypted
+objects. See [Security](security.md) for the key-file contract.
 
 For a TLS listener, configure both certificate and key together, whether through TOML, environment, or flags:
 

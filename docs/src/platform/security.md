@@ -20,7 +20,7 @@ tenant_tokens = { "tenant-token-from-secret-store" = "acme" }
 tenant_keys = { acme = "acme-kms-2026-07" }
 ```
 
-The key ID identifies a 32-byte hex key file at `$VMON_HOME/keys/<key-id>.key`. The file must be a regular file, mode `0600` or stricter, and not group- or world-readable. The daemon rejects a request that needs an unavailable or malformed key rather than writing unencrypted data.
+The key ID identifies a 32-byte hex key file at `$VMON_HOME/security/keys/<key-id>.key`. The file must be a regular file, mode `0600` or stricter, and not group- or world-readable. The daemon rejects a request that needs an unavailable or malformed key rather than writing unencrypted data.
 
 New snapshot archives, credential records, and persistent volume archives are authenticated and encrypted with the owning tenant's key ID. Existing encrypted data retains its recorded key ID: keep that key available for restore, rollback, volume attachment, or credential resolution. Deleting or replacing a key before its encrypted data is deleted makes that data unavailable; key-ID assignment is not a key-management service or a data re-encryption operation.
 

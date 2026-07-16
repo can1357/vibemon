@@ -51,8 +51,28 @@ For cluster setup, warm pools, storage, and snapshot operations, use the corresp
 
 ## Production cluster storage
 
-`VMON_CLUSTER_MODE=production` requires both PostgreSQL and S3 configuration. The daemon refuses to start when the PostgreSQL URL, S3 endpoint, or bucket is missing.
+`VMON_CLUSTER_MODE=production` makes PostgreSQL the authority for sandbox
+ownership epochs, owner leases, lifecycle markers, rollback/migration claims,
+and deletion tombstones. S3 is the authoritative byte store for encrypted
+portable recovery history, replicas, and function artifacts. Gossip remains
+the liveness and capacity plane; it cannot override a PostgreSQL owner.
 
-Set `VMON_POSTGRES_URL` to the PostgreSQL connection string. Configure object storage with `VMON_S3_ENDPOINT`, `VMON_S3_BUCKET`, `VMON_S3_REGION`, `VMON_S3_ACCESS_KEY`, and `VMON_S3_SECRET_KEY`; `VMON_S3_PREFIX` is optional. Custom S3 endpoints use path-style requests.
+Production startup requires `VMON_POSTGRES_URL`, `VMON_S3_ENDPOINT`,
+`VMON_S3_BUCKET`, `VMON_S3_REGION`, `VMON_S3_ACCESS_KEY`,
+`VMON_S3_SECRET_KEY`, and a non-`default`
+`VMON_PORTABLE_HISTORY_KEY_ID`. `VMON_S3_PREFIX` is optional. The selected
+32-byte hex key file must exist with identical material on every node at
+`$VMON_HOME/security/keys/<id>.key`. Missing requirements are startup errors, not
+degraded local operation.
+
+The server renews every serving owner's PostgreSQL lease and arms a local
+watchdog from the database-reported remaining TTL. A node that cannot renew in
+time stops the VM and removes local serving authority before a successor can
+activate. Suspend, rollback, migration, and deletion publish bytes first and
+commit their authoritative marker transactionally; failed publication or
+commit leaves the previous owner/state in force. See
+[Configuration](configuration.md) and
+[Mesh and High Availability](mesh.md) for complete setup and failure
+semantics.
 
 Dockerfile builds also require `buildctl` on `PATH` and `VMON_BUILDKIT_ADDR` pointing to an isolated BuildKit daemon. There is no fallback to Docker, Buildah, or a host shell.

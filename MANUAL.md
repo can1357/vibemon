@@ -148,16 +148,18 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `logs` | show a VM's console (`-f` to follow) | `vmon logs web -f` |
 | `inspect` | print a VM's full detail view as JSON | `vmon inspect web` |
 | `stats` | show a VM's live runtime metrics | `vmon stats web` |
-| `pause` / `resume` | suspend / resume | `vmon pause web` |
+| `pause` / `resume` | quiesce / resume a retained live VM | `vmon pause web` |
+| `suspend` | durably checkpoint and release the live VM | `vmon suspend web` |
+| `history` / `rollback` | list retained recovery points / restore the same sandbox ID to one point | `vmon history web` · `vmon rollback web checkpoint-...` |
 | `extend` | reset a running VM's deadline (seconds from now) | `vmon extend web 600` |
 | `snapshot` | snapshot a VM into a template | `vmon snapshot web tpl --stop` |
 | `restore` | warm-boot from a snapshot | `vmon restore tpl --name web2` |
 | `fork` | CoW-clone N copies from a snapshot | `vmon fork tpl --count 5` |
 | `stop` / `rm` | stop / remove a microVM | `vmon stop web` |
 | `daemon` | `start` / `stop` / `status` of the local `vmond` daemon | `vmon daemon status` |
-| `serve` | run the daemon **and** the REST API + web panel (one owner) | `vmon serve --token secret` |
+| `serve` | run the daemon, gRPC API, and web panel (one owner) | `vmon serve --token secret` |
 | `doctor` | print a prerequisite checklist (VMM binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, bundled agent, daemon, and Python/host environment); `--serve` validates `ServeConfig`; exits non-zero on hard failures | `vmon doctor` |
-| `completion [bash|zsh|fish]` | print a sourceable Click shell-completion script | `eval "$(vmon completion zsh)"` |
+| `completion [bash|zsh|fish]` | print a sourceable clap shell-completion script | `eval "$(vmon completion zsh)"` |
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
 `--disk-mb` (default 1024), `--timeout <s>` (default 300), `--arch x86_64|aarch64`,

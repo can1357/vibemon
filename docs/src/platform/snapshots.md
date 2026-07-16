@@ -20,20 +20,48 @@ delete dependent snapshots first or retain the base.
 
 ## Suspend, recovery history, and rollback
 
-`SandboxService.Suspend` creates a durable checkpoint, removes the live VM,
-and retains the sandbox ID. `History` lists the retained disk and full
-checkpoint recovery points from oldest to newest. `Rollback` restores that
-same sandbox identity to the selected immutable recovery point. It does not
-create a second sandbox or change the owning tenant.
+`SandboxService.Suspend` captures a full checkpoint, durably records the
+`suspended` lifecycle state, removes the live VM, and retains the sandbox ID.
+`SandboxService.Resume` restores that exact committed checkpoint; callers do
+not need to select a history entry. If capture, encryption, publication, or the
+state commit fails, the source VM remains authoritative and the server does not
+report a committed suspend.
 
-The daemon captures disk history every 300 seconds and full checkpoints every
-3600 seconds by default. It retains at most 24 points and prunes points older
-than seven days. Configure the cadences, retention, and age limits in
-[Configuration](configuration.md). A zero cadence disables that capture type;
-a zero maximum age disables age pruning. A checkpoint can fail because storage,
-the selected encryption key, or an external dependency is unavailable. The
-sandbox remains in its prior state when that happens; inspect the returned
-gRPC error and do not assume a recovery point exists.
+`History` lists immutable recovery points from oldest to newest:
+
+| `kind` | Capture behavior | Rollback behavior |
+| --- | --- | --- |
+| `disk` | Quiesces only the writable block worker long enough to capture durable root-disk state; the VM and guest processes continue running. | Cold-boots from the captured disk. In-memory processes and device state are not restored. |
+| `checkpoint` | Captures memory, vCPUs, machine and device state, and durable disk state. Periodic capture resumes the source after capture. | Restores the captured VM execution state, including guest processes. |
+
+`Rollback` restores the same sandbox identity to the selected point. The
+server stages and validates the replacement before cutover, so a failed
+restore leaves the current source intact. The selected immutable point remains
+retained while rollback reconciliation is pending.
+
+The CLI exposes the same lifecycle without bypassing ownership:
+
+```sh
+vmon suspend web
+vmon history web
+vmon resume web
+vmon rollback web <recovery-point>
+```
+
+The daemon schedules disk history every 300 seconds and checkpoint history
+every 3600 seconds by default. It prunes according to the configured count and
+seven-day maximum age while protecting an active rollback target. Production
+portable storage applies retention independently to the `disk` and
+`checkpoint` tiers and preserves the newest committed point in each tier.
+Configure cadences and pruning in [Configuration](configuration.md). A zero
+cadence disables that capture type; a zero maximum age disables age pruning.
+
+In `single-node` mode, encrypted recovery archives live under the daemon home.
+In `production` mode, object bytes are encrypted and published to S3 while
+PostgreSQL transactionally commits ownership, lifecycle markers, manifests,
+rollback pins, and deletion tombstones. Uncommitted uploads are not listed or
+restorable. Remote adoption and rollback require the configured restore safety
+checks; see [Mesh and High Availability](mesh.md).
 
 ## VMM snapshot contents
 
@@ -127,10 +155,11 @@ requires all of the following:
 
 Cross-hypervisor and cross-architecture restore are unsupported. A migration
 RPC exists (`SandboxService.Migrate` takes a sandbox ID and destination), but
-it is not a guarantee that a snapshot can be restored across architectures,
-hypervisor backends, or differing host resources. Treat migration as
-control-plane state transfer subject to the same snapshot compatibility and
-external-dependency constraints; do not rely on cross-backend restore.
+the target is still subject to the same snapshot compatibility and
+external-dependency constraints. In production mode the source first records a
+durable migration intent, the target restores under a fenced claim, ownership
+commits in PostgreSQL, and only then may the target serve. Retries converge on
+that committed owner; a source that loses or expires its lease self-fences.
 
 ## Templates
 

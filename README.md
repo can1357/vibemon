@@ -231,12 +231,27 @@ The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine,
 
 | Command | What it does |
 | --- | --- |
+| `vmon suspend NAME` / `history NAME` / `rollback NAME POINT` | Durably suspend a sandbox, list its retained disk/checkpoint recovery points, or restore its identity to one point. `vmon resume NAME` restores the committed suspend checkpoint. |
 | `vmon doctor` | Prints the local prerequisite checklist (vmon binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, guest agent, daemon, and host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
 | `vmon completion [bash|zsh|fish]` | Prints a sourceable shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
 
 The Python, TypeScript, and Go packages are thin clients for the Rust API. Each exposes the same object hierarchy: a root client, resource namespaces (`sandboxes`, `snapshots`, `volumes`, `pools`, and `mesh`), and sandbox-bound process, file, and port objects. They do not ship a CLI, daemon, server, web bundle, guest-agent bundle, or VMM implementation.
 
 SDK resource operations use the generated `vmon.v1` gRPC services. Browser and TypeScript clients carry the same protobuf calls over the server's `/grpc` WebSocket bridge; only health, Prometheus metrics, and sandbox port proxying remain HTTP. Public responses are exported model types, and malformed response envelopes raise each SDK's `ProtocolError`.
+
+Sandbox views expose `desired_state`, `observed_state`, `state_generation`,
+`lifecycle_failure`, `ha`, and `restart_policy` in all three SDK model types.
+Pause retains the VM; resume handles either an in-memory pause or an exact
+durable suspend marker. Recovery history identifies `disk` cold-boot points
+and `checkpoint` execution-state points, and rollback keeps the source
+authoritative until its replacement is ready.
+
+Production clusters are explicit: `cluster_mode=production` requires
+PostgreSQL ownership/lifecycle authority, S3 portable object storage, and one
+non-`default` portable-history key provisioned identically at
+`$VMON_HOME/security/keys/<id>.key` on every node. Owner lease expiry
+self-fences the local VMM; the server never degrades to local authority. See
+the platform configuration, mesh, and snapshot guides.
 
 All three SDKs accept the network forms below. Python and Go additionally support the local UDS form; browser builds of the TypeScript SDK are deliberately network-only.
 
@@ -383,31 +398,36 @@ vmon fork tpl --arch aarch64 --count 2
 
 ### Durability and downtime
 
-Mesh creates write a durable create record before acknowledgement. On meshes with at least three expected members, the record must reach a strict majority; on a two-node mesh the implemented tier is weaker: every live peer must ack, and if no peer is live the local node accepts the record. Anti-entropy re-pushes locally owned records so a surviving gateway does not answer `unknown sid` for an acknowledged create.
+In `cluster_mode=production`, PostgreSQL transactionally stores the create
+record, owner epoch, lifecycle state, and owner lease before acknowledgement.
+S3 stores encrypted portable checkpoints and replicas after verification; a
+PostgreSQL manifest commit makes them visible. In the default
+`cluster_mode=single-node`, development meshes copy create records and
+checkpoints to required peers and provide only best-effort epoch fencing.
 
-The per-sandbox durability tier is `ha=off|async|rerun|async+rerun`. Mesh nodes default to `ha=async`; local daemon creates default to `off`. `async` means periodic non-destructive checkpoints to rendezvous-ranked peers (`replicate_sec`, default 60s on mesh; `VMON_REPLICATE_SEC=0` disables). `rerun` means a surviving node can re-execute the durable create record at a higher epoch if no checkpoint exists. `async+rerun` prefers the checkpoint and falls back to rerun.
+The per-sandbox durability tier is
+`ha=off|async|rerun|async+rerun`. Mesh creates default to `async`; local daemon
+creates default to `off`. `async` captures every 60 seconds by default;
+`VMON_REPLICATE_SEC=0` disables it. `rerun` permits a fenced successor to
+re-execute the durable create record at least once when no checkpoint exists.
+`async+rerun` prefers checkpoint restore and falls back to rerun.
 
-Use the REST/SDK request field when you need a non-default tier:
-
-```sh
-curl -sS -H "Authorization: Bearer T" -H "Content-Type: application/json" \
-  -d '{"image":"alpine","detach":true,"ha":"async+rerun"}' \
-  http://<gateway>:8000/v1/run
+```python
+with vmon.connect("vmon+context://prod") as client:
+    sandbox = client.sandboxes.create(
+        image="alpine",
+        ha="async+rerun",
+        idempotency_key="nightly-build",
+    )
 ```
 
-Automatic orphan restore is quorum-gated by default at `expected_members >= 3`: the elected survivor asks peers via `GET /v1/mesh/reachable/{node}` and must collect a strict majority of the expected cluster confirming the former owner is unreachable. Set `VMON_RESTORE_QUORUM=0` to force it off. A two-node mesh cannot form a post-failure majority, so quorum restore defaults off and the status payload carries a two-node warning.
-
-```sh
-# default on mesh: 60s async checkpointing, one replica, quorum restore at >=3 nodes
-vmon serve --config serve.toml
-
-# force replication off for this gateway
-VMON_REPLICATE_SEC=0 vmon serve --config serve.toml
-```
+Automatic orphan restore is quorum-gated by default with at least three
+expected members. A two-node mesh cannot form a post-failure majority, so that
+guard defaults off and `mesh status` reports a warning.
 
 Networked sandboxes are HA/migration-eligible. Linux restores allocate a fresh TAP on the destination; macOS/HVF restores reopen user-net and replay guest-visible libslirp state (DHCP lease, ARP/NAT tables). Host-side TCP flows are not preserved. `fs_dir` host shares are rejected on mesh creates; use a volume.
 
-Writable mesh volumes use quorum-granted, epoch-fenced leases with TTL self-fencing. The holder renews by `ttl/2`; if renewal misses that deadline it stops writers, and a successor cannot be granted until the full TTL has elapsed. Writable volumes on mesh contexts require at least three nodes and are rejected otherwise; read-only volumes are unrestricted. The local daemon still uses the plain host `flock`.
+Writable mesh volumes use epoch-fenced leases with TTL self-fencing. Production grants them through PostgreSQL; development meshes use strict-majority peer votes. Writable volumes require at least three expected members and are rejected otherwise. Read-only volumes are unrestricted; a local daemon uses only host `flock`.
 
 Before planned downtime, move work or drain the node:
 
@@ -416,11 +436,11 @@ VMON_API_TOKEN=T vmon mesh migrate <name> <node>
 VMON_API_TOKEN=T vmon mesh leave --drain
 ```
 
-Fencing is epoch-based and best-effort for non-volume state. It bounds split-brain to the partition window and converges on rejoin; writable volume safety comes from leases, not epochs alone.
+Production owner and volume leases are authoritative: missed renewal self-fences the local VMM or writer before a successor activates. Development-mode non-volume epochs remain best-effort and converge through gossip.
 
 ### Scoped client token
 
-Set `VMON_CLIENT_TOKEN` when clients should run sandboxes without full mesh administration. The client token authorizes normal sandbox commands such as `run`, `exec`, and `ps`, but mesh-admin routes (`vmon mesh ...` and `vmon mesh migrate` / `/v1/sandboxes/{id}/migrate`) reject it with `403`; the full `VMON_API_TOKEN` still has full control. Give clients their scoped token through the usual `VMON_API_TOKEN` environment variable. For `https` peer advertise URLs, the inter-node exec WebSocket proxy uses `wss`.
+Set `VMON_CLIENT_TOKEN` when clients should run sandboxes without full mesh administration. The client token authorizes normal sandbox RPCs but rejects mesh administration and `SandboxService.Migrate`; the full `VMON_API_TOKEN` retains those operations. Give SDK clients their scoped token through the usual `VMON_API_TOKEN` client environment variable.
 
 For rotation, `VMON_API_TOKEN` and `VMON_CLIENT_TOKEN` may each be a comma-separated list. During rollover, run gateways with `old,new`; any listed value authorizes for that tier, and the client tier remains blocked from mesh-admin and migrate routes.
 

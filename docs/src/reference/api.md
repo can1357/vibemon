@@ -31,7 +31,35 @@ The table is a navigation map, not a replacement for `proto/vmon/v1/api.proto`. 
 | `CallService` | Create, feed, close, inspect, list, cancel durable calls; fetch results | `StreamInputs` is bidirectional; `Watch` is server-streaming from a durable sequence cursor. |
 | `ActorService` | Create/get/checkpoint/restore/fork/delete durable actors | Actors are pinned to function revisions; checkpoints are immutable artifacts. |
 
-The resource guides explain lifecycle semantics: [Sandboxes](../sdk/shared-concepts.md), [Snapshots](../platform/snapshots.md), [Storage and Volumes](../platform/storage.md), and [Mesh and High Availability](../platform/mesh.md).
+The resource guides explain lifecycle semantics: [Sandboxes](../sdk/sandboxes.md), [Snapshots](../platform/snapshots.md), [Storage and Volumes](../platform/storage.md), and [Mesh and High Availability](../platform/mesh.md).
+
+## Sandbox lifecycle views
+
+Sandbox mutation and lookup RPCs return a JSON object in `JsonView`. The object
+is open for resource-specific fields, but current servers always provide these
+canonical lifecycle keys:
+
+| Key | Contract |
+| --- | --- |
+| `id`, `name` | Stable sandbox identity and display name. |
+| `status` | Serving-status summary retained for compatibility. |
+| `desired_state`, `observed_state` | Durable target and owner-materialized lifecycle state. |
+| `state_generation` | Monotonic generation of the accepted lifecycle transition. |
+| `lifecycle_failure` | Transition failure text or `null`. |
+| `ha`, `restart_policy` | Selected durability tier and server-derived owner-loss policy. |
+| `node` | Reporting or serving mesh node when one is available. |
+
+`Pause` retains the VM in memory. `Resume` either resumes that paused VM or
+restores the exact committed checkpoint of a durably suspended sandbox.
+`Suspend` commits a durable checkpoint before releasing the live VM. `History`
+returns oldest-to-newest immutable points whose `kind` is `disk` or
+`checkpoint`; `Rollback` preserves the sandbox ID and keeps the current source
+authoritative until its replacement is ready.
+
+SDK model decoders preserve unknown fields so a newer server can add detail
+without discarding it. Python exposes unknown fields through `SandboxInfo.raw`,
+Go through `Sandbox.Details`, and TypeScript through the open `SandboxInfo`
+index signature.
 
 ## Authentication and errors
 Clients authenticate with bearer credentials. An operator token has full control; a configured client token is restricted from mesh administration and sandbox migration. A tenant token maps to one tenant ID and cannot read or mutate another tenant's resources. The selected customer key ID encrypts that tenant's new snapshots, credential records, and persistent volume archives. The server accepts token rotation lists; keep tokens out of DSNs, source control, logs, and shell history. See [Security](../platform/security.md).

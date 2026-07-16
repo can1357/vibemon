@@ -1,8 +1,17 @@
 # Mesh and High Availability
 
-A mesh is a set of `vmon serve` gateways. Each gateway is the Rust `vmond` server; it owns its local sandbox registry and starts local VMM processes. Clients use a named context: an ordered roster of gateway URLs and a bearer token. A gateway accepts a request and proxies it to the sandbox owner when needed. The gRPC API is the authoritative control plane; HTTP remains for health, metrics, and port proxying.
+A mesh is a set of Rust `vmon serve` gateways. Each gateway owns local VMM
+processes and can proxy a request to the current sandbox owner. Clients use a
+named context containing an ordered gateway roster and bearer token. The gRPC
+API is authoritative; HTTP remains for health, metrics, port proxying, and
+mesh-internal coordination.
 
-This is a leaderless gossip mesh, not a consensus system. The safety properties in this page are intentionally tiered. See [Security](security.md) before putting a gateway on a network.
+`cluster_mode=single-node` is the default and retains the development
+gossip/peer-replica authority model. `cluster_mode=production` makes
+PostgreSQL authoritative for ownership and lifecycle and S3 authoritative for
+portable object bytes. Production has no elected vmon leader, but it is not a
+gossip-only safety model. See [Security](security.md) before putting a gateway
+on a network.
 
 ## Bootstrap a reachable cluster
 
@@ -28,6 +37,18 @@ Use HTTPS when TLS is configured, and advertise the exact HTTPS URL. Inter-node 
 vmon serve --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 VMON_API_TOKEN=T vmon mesh setup --advertise https://<node-name>:8000
 ```
+
+### Production prerequisites
+
+Every production node must use the same PostgreSQL database, S3 bucket/prefix,
+and non-default portable-history encryption key. Configure
+`cluster_mode = "production"`, `postgres_url`, the required `s3_*` values, and
+`portable_history_key_id`; provision identical key material under each node's
+`$VMON_HOME/security/keys/`. The daemon rejects incomplete production
+configuration and
+never falls back to local authority. See [Configuration](configuration.md) for
+the exact fields and [Server Operation](server.md#production-cluster-storage)
+for failure behavior.
 
 ## Contexts and client failover
 
@@ -63,9 +84,22 @@ Mesh creates reject host-local `fs_dir` shares rather than placing them with wea
 
 ## Ownership and fencing
 
-A sandbox has one owner node. That node runs the VMM and is the only node that mutates sandbox state. Ownership is claimed with a monotonic epoch; competing claims resolve by highest `(epoch, node_id)`. Nodes persist local epochs and stop a local sandbox that is superseded by a higher authoritative epoch.
+A sandbox has one owner node, identified by a monotonic epoch. That owner alone
+may serve or mutate its VMM. The two cluster modes enforce this differently:
 
-Epoch fencing is **best effort**, not distributed mutual exclusion. Gossip convergence bounds a split brain to the network-partition window and converges after rejoin, but it does not provide a consensus-grade single-writer guarantee. Do not rely on epochs alone for writable shared state.
+- In `production`, PostgreSQL allocates epochs, commits ownership changes, and
+  grants a short owner lease. The node renews the lease and arms a local
+  watchdog from the database's remaining TTL. Failed or late renewal
+  self-fences the VM and local route. A successor activates only after its
+  lease and ownership transaction commit.
+- In `single-node` development meshes, persisted epochs and gossip converge on
+  the highest claim. This is best-effort fencing bounded by gossip convergence,
+  not distributed mutual exclusion.
+
+Production migration uses a durable source intent and one migration token. The
+target stages and validates recovery, PostgreSQL commits the new owner, and the
+source is fenced before the target serves. Retrying either side converges on
+the committed owner instead of rolling ownership backward.
 
 For planned work, drain a node before taking it down:
 
@@ -75,16 +109,35 @@ VMON_API_TOKEN=T vmon mesh leave --drain
 
 ## Durability tiers
 
-Each sandbox selects `ha=off`, `async`, `rerun`, or `async+rerun`. Mesh contexts default to `async`; local daemon creates default to `off`.
+Each sandbox selects `ha=off`, `async`, `rerun`, or `async+rerun`. Mesh
+contexts default to `async`; local daemon creates default to `off`.
 
-| Tier | What it provides | Limit |
-| --- | --- | --- |
-| Metadata commit | The create record—sandbox ID, spec, owner, epoch, and idempotency key—is replicated before a create acknowledgement. | With three or more expected members, it needs a strict majority. In a two-node mesh every live peer must acknowledge, but a lone survivor can accept locally; that is weaker than majority quorum. |
-| `async` | Periodic non-destructive checkpoints go to rendezvous-ranked peers. `mesh status` shows checkpoint age. | RPO is the checkpoint cadence; work since the last checkpoint is lost on owner crash. RTO is failure detection plus restore time. It is not zero-loss replication. |
-| `rerun` | A survivor re-executes the durable create record at a higher epoch when there is no usable checkpoint. | It is at-least-once compute. Work must tolerate re-execution. |
-| `async+rerun` | Restores a checkpoint when available, otherwise re-runs. | Retains the limits of both mechanisms. |
+| Tier | Production mode | Single-node/development mesh | Limit |
+| --- | --- | --- | --- |
+| Metadata commit | PostgreSQL transactionally stores the create record, owner, epoch, lifecycle state, and lease before acknowledgement. | The create record is synchronously copied to the required live peers before acknowledgement. | This preserves control-plane identity, not uncheckpointed guest memory. |
+| `async` | Encrypted checkpoints and manifests are published to S3 and committed in PostgreSQL. | Non-destructive checkpoints are pushed to rendezvous-ranked peers. | RPO is the checkpoint cadence; RTO is detection plus restore time. It is not zero-loss replication. |
+| `rerun` | A fenced successor re-executes the durable create record when no usable checkpoint exists. | Same at-least-once rerun contract after epoch convergence. | Work must tolerate re-execution. |
+| `async+rerun` | Restores a checkpoint when available, otherwise re-runs. | Same preference using peer replicas. | Retains the limits of both mechanisms. |
 
-The default mesh replication cadence is auto-derived as 60 seconds and the default fan-out is one replica. `VMON_REPLICATE_SEC=0` disables checkpoint replication; this changes the available guest-state protection, not the durable create record behavior.
+The default mesh replication cadence is 60 seconds and fan-out is one.
+`VMON_REPLICATE_SEC=0` disables asynchronous replica capture; it does not
+remove the durable create record or production ownership lease.
+
+### Durable lifecycle and portable recovery
+
+Pause is node-local and retains the VM. Suspend is durable: the server captures
+a checkpoint, commits the suspended marker, then tears down the source.
+`Resume` restores that exact marker on the current or newly fenced owner.
+Publication or commit failure leaves the source running and no false suspended
+marker.
+
+History has `disk` and `checkpoint` tiers. Disk capture quiesces only the block
+worker and rollback cold-boots; checkpoint capture preserves VM execution
+state. In production, encrypted S3 objects remain invisible until their
+PostgreSQL manifest commits. Rollback pins the selected point, stages a
+replacement without destroying the current VM, and switches only after the
+replacement is ready. Removal uses a tombstone so interrupted object cleanup
+can resume without resurrecting ownership.
 
 Inspect actual membership, health, capacity, sandbox tier, checkpoint age, replica count, warnings, and per-node replication/restore/fence counters with:
 
@@ -92,18 +145,34 @@ Inspect actual membership, health, capacity, sandbox tier, checkpoint age, repli
 VMON_API_TOKEN=T vmon mesh status
 ```
 
-## Quorum restore and writable volumes
+## Restore safety and writable volumes
 
-At three or more expected members, automatic orphan restore is quorum-gated by default. The elected survivor must obtain strict-majority confirmation of the former owner being unreachable. The expected-member high-water mark is not reduced merely because a member is reaped. A restore is deferred and retried when quorum is short, the old owner remains reachable, the elected node is wrong, a replica or required secret is missing, or it otherwise cannot complete safely.
+At three or more expected members, automatic orphan restore is quorum-gated by
+default. The elected successor must obtain strict-majority confirmation that
+the former owner is unreachable. The expected-member high-water mark is not
+reduced merely because a member is reaped. Restore defers when quorum is short,
+the old owner remains reachable, the electee is wrong, or a required replica,
+secret, key, or host dependency is missing.
 
-A two-node mesh cannot form a post-failure majority. Quorum restore is off by default there and the status payload warns about it. `VMON_RESTORE_QUORUM=0` forces quorum restore off; doing so removes that automatic-restore guard.
+A two-node mesh cannot form a post-failure majority. Quorum restore is off by
+default there and the status payload warns about it.
+`VMON_RESTORE_QUORUM=0` disables that automatic-restore guard.
 
-Writable mesh volumes use a different mechanism: quorum-granted, epoch-fenced leases. A holder renews by half the TTL and self-fences writers if renewal misses that deadline. No successor can receive a vote until the full TTL from the prior grant has elapsed. This is the single-writer mechanism for writable volume data.
-
-Writable volumes require at least three nodes in a mesh context and are rejected at create on smaller meshes; they never silently degrade to a host lock. Read-only volumes are unrestricted. On a local daemon, the host-local `flock` protects only same-host concurrency.
+Writable volumes use epoch-fenced leases. Production grants them through
+PostgreSQL; development meshes use strict-majority peer votes. Holders renew
+before expiry and self-fence writers on missed renewal; no successor can
+activate until the previous lease is no longer valid. Writable volumes require
+at least three expected members and are rejected on smaller mesh contexts.
+Read-only volumes are unrestricted. A local daemon's host `flock` protects only
+same-host concurrency.
 
 ## Kubernetes mesh
 
-The Helm chart deploys `vmon serve` as a StatefulSet on KVM-labelled hosts. Every pod is both an API endpoint and a VM owner; the public Service can send a request to any healthy pod. Pod zero initializes the mesh, and the other stable pod identities join it before becoming ready.
-
-PostgreSQL stores cluster ownership and fencing records. S3 stores portable checkpoint and function artifacts. Gossip still carries liveness and capacity, but it is not the source of truth for ownership. The chart enforces one host-networked pod per Kubernetes node so API ports and TAP devices do not collide.
+The Helm chart deploys `vmon serve` as a StatefulSet on KVM-labelled hosts.
+Every pod is both an API endpoint and a VM owner; the public Service can send a
+request to any healthy pod. Pod zero initializes membership and other stable
+pod identities join before readiness. PostgreSQL stores ownership, fencing,
+lifecycle, and portable manifests. S3 stores encrypted portable history,
+replicas, and function artifacts. Gossip carries liveness and capacity but is
+not production ownership authority. One host-networked pod runs per Kubernetes
+node so API ports and TAP devices do not collide.

@@ -19,7 +19,7 @@ vmon --context local ps
 The primary commands are:
 
 - `vmon run [IMAGE] [CMD...]` boots an image, streams its output unless `--detach` is used, and accepts `--name`, `--mem`, `--cpus`, `--disk-mb`, `--timeout`, `--block-network`, and `--arch`.
-- `vmon ps`, `logs NAME [-f]`, `stop NAME`, `rm NAME`, `pause NAME`, `resume NAME`, `extend NAME SECS`, and `stats NAME` inspect or change a sandbox.
+- `vmon ps`, `logs NAME [-f]`, `stop NAME`, `rm NAME`, `pause NAME`, `resume NAME`, `suspend NAME`, `history NAME`, `rollback NAME POINT`, `extend NAME SECS`, and `stats NAME` inspect or change a sandbox. Pause retains the live VM; suspend releases it only after committing a durable checkpoint.
 - `vmon exec NAME [CMD...]` runs a command in an agent-enabled sandbox; add `--tty` for a PTY. `vmon shell` opens or attaches a shell and can create a fresh shell with `--image`; `-e KEY=VALUE` sets a variable and bare `-e KEY` copies it from the host.
 - `vmon cp SRC DST` transfers a file between the host and guest. `vmon fs list NAME[:PATH]` and `vmon fs stat NAME[:PATH]` inspect guest paths.
 - `vmon snapshot NAME SNAPSHOT [--stop]`, `vmon restore SNAPSHOT [--name NAME] [--agent] [--detach] [--arch ...]`, and `vmon fork SNAPSHOT [--count N] [--arch ...]` operate managed snapshots. See [Snapshots, Restore, and Fork](snapshots.md).
