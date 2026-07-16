@@ -225,6 +225,10 @@ mod linux_agent {
 						 "arch": std::env::consts::ARCH,
 					}),
 				),
+				"activity" => match activity_sample() {
+					Ok(sample) => self.send_resp(id, sample),
+					Err(error) => self.send_error(id, format!("reading guest activity: {error}")),
+				},
 				"exec" => self.start_exec(id, &request),
 				"fs_read" => self.fs_read(id, &request),
 				"fs_write" => self.fs_write(id, &request),
@@ -1014,6 +1018,46 @@ mod linux_agent {
 		fn send_error(&self, id: u32, error: impl Into<String>) {
 			self.send_resp(id, json!({"ok": false, "error": error.into()}));
 		}
+	}
+
+	fn activity_sample() -> io::Result<Value> {
+		let stat = fs::read_to_string("/proc/stat")?;
+		let cpu_ticks = stat
+			.lines()
+			.next()
+			.filter(|line| line.starts_with("cpu "))
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing aggregate CPU row"))?
+			.split_ascii_whitespace()
+			.skip(1)
+			.enumerate()
+			.filter(|(index, _)| matches!(index, 0 | 1 | 2 | 5 | 6 | 7))
+			.filter_map(|(_, value)| value.parse::<u64>().ok())
+			.fold(0_u64, u64::saturating_add);
+		let disk_sectors = fs::read_to_string("/proc/diskstats")?
+			.lines()
+			.filter_map(|line| {
+				let mut fields = line.split_ascii_whitespace();
+				let read = fields.nth(5)?.parse::<u64>().ok()?;
+				let written = fields.nth(3)?.parse::<u64>().ok()?;
+				Some(read.saturating_add(written))
+			})
+			.fold(0_u64, u64::saturating_add);
+		let network_bytes = fs::read_to_string("/proc/net/dev")?
+			.lines()
+			.filter_map(|line| line.split_once(':').map(|(_, counters)| counters))
+			.filter_map(|counters| {
+				let mut fields = counters.split_ascii_whitespace();
+				let received = fields.next()?.parse::<u64>().ok()?;
+				let sent = fields.nth(7)?.parse::<u64>().ok()?;
+				Some(received.saturating_add(sent))
+			})
+			.fold(0_u64, u64::saturating_add);
+		Ok(json!({
+			"ok": true,
+			"cpu_ticks": cpu_ticks,
+			"disk_sectors": disk_sectors,
+			"network_bytes": network_bytes,
+		}))
 	}
 
 	fn spawn_stream_thread<R>(

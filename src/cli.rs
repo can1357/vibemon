@@ -124,6 +124,8 @@ enum Commands {
 	},
 	/// Serve the HTTP sandbox API.
 	Serve(ServeArgs),
+	/// Run the narrow privileged Linux network broker.
+	NetBroker(NetBrokerArgs),
 	/// Manage remote API contexts.
 	Context {
 		#[command(subcommand)]
@@ -383,12 +385,28 @@ struct ServeArgs {
 	token: Option<String>,
 	#[arg(long)]
 	client_token: Option<String>,
+	/// JSON map from tenant bearer tokens to tenant IDs.
+	#[arg(long)]
+	tenant_tokens: Option<String>,
+	/// JSON map from tenant IDs to customer-managed encryption key IDs.
+	#[arg(long)]
+	tenant_keys: Option<String>,
 	#[arg(long)]
 	tls_cert: Option<String>,
 	#[arg(long)]
 	tls_key: Option<String>,
 	#[arg(long)]
 	idle_timeout: Option<f64>,
+	#[arg(long)]
+	history_disk_sec: Option<f64>,
+	#[arg(long)]
+	history_checkpoint_sec: Option<f64>,
+	#[arg(long)]
+	history_retention: Option<usize>,
+	#[arg(long)]
+	history_max_age_sec: Option<f64>,
+	#[arg(long)]
+	template_ttl_sec: Option<f64>,
 	/// Maximum uncompressed function artifact size accepted by the daemon.
 	#[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_125_899_906_842_624))]
 	function_artifact_max_bytes: Option<u64>,
@@ -424,6 +442,16 @@ struct ServeArgs {
 	mesh_w_region: Option<f64>,
 	#[arg(long)]
 	mesh_w_inflight: Option<f64>,
+}
+#[derive(Args)]
+struct NetBrokerArgs {
+	/// Mode-0600 Unix socket served by the broker.
+	#[arg(long)]
+	socket:    PathBuf,
+	/// UID allowed to connect to this mode-0600 socket; requires root when it
+	/// differs from the broker UID.
+	#[arg(long, value_parser = clap::value_parser!(u32).range(0..=4_294_967_294))]
+	owner_uid: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -557,10 +585,16 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Doctor(args) => Ok(cmd_doctor(args)),
 		Commands::Daemon { command } => cmd_daemon(command),
 		Commands::Serve(args) => cmd_serve(args, transport_options),
+		Commands::NetBroker(args) => cmd_net_broker(args),
 		Commands::Context { command } => cmd_context(command),
 		Commands::Mesh { command } => cmd_mesh(command, transport_options),
 		Commands::Completion(args) => Ok(cmd_completion(args)),
 	}
+}
+
+fn cmd_net_broker(args: NetBrokerArgs) -> Result<i32> {
+	vmond::net::broker::serve(&args.socket, args.owner_uid)?;
+	Ok(0)
 }
 
 fn extract_transport_options(raw_args: Vec<String>) -> Result<(TransportOptions, Vec<String>)> {
@@ -2241,9 +2275,16 @@ impl ServeArgs {
 		insert_override(&mut overrides, "port", self.port);
 		insert_override(&mut overrides, "token", self.token);
 		insert_override(&mut overrides, "client_token", self.client_token);
+		insert_override(&mut overrides, "tenant_tokens", self.tenant_tokens);
+		insert_override(&mut overrides, "tenant_keys", self.tenant_keys);
 		insert_override(&mut overrides, "tls_cert", self.tls_cert);
 		insert_override(&mut overrides, "tls_key", self.tls_key);
 		insert_override(&mut overrides, "idle_timeout", self.idle_timeout);
+		insert_override(&mut overrides, "history_disk_sec", self.history_disk_sec);
+		insert_override(&mut overrides, "history_checkpoint_sec", self.history_checkpoint_sec);
+		insert_override(&mut overrides, "history_retention", self.history_retention);
+		insert_override(&mut overrides, "history_max_age_sec", self.history_max_age_sec);
+		insert_override(&mut overrides, "template_ttl_sec", self.template_ttl_sec);
 		insert_override(
 			&mut overrides,
 			"function_artifact_max_bytes",

@@ -108,51 +108,58 @@ pub struct RemoteFsShare {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSpec {
 	/// Launch path: boot, restore, or fork.
-	pub mode:               LaunchMode,
+	pub mode: LaunchMode,
 	/// Control socket path passed as `--api-sock`.
-	pub api_sock:           PathBuf,
+	pub api_sock: PathBuf,
 	/// Kernel image for fresh boots.
-	pub kernel:             Option<PathBuf>,
+	pub kernel: Option<PathBuf>,
 	/// Guest kernel command line.
-	pub cmdline:            Option<String>,
+	pub cmdline: Option<String>,
 	/// Rootfs path passed as `--rootfs`.
-	pub rootfs:             Option<PathBuf>,
+	pub rootfs: Option<PathBuf>,
 	/// Optional overlay backing disk passed before `--rootfs`.
-	pub disk_overlay_of:    Option<PathBuf>,
+	pub disk_overlay_of: Option<PathBuf>,
 	/// Whether direct rootfs boots add `--rootfs-ro`.
-	pub rootfs_read_only:   bool,
+	pub rootfs_read_only: bool,
 	/// Memory size in MiB.
-	pub mem_mib:            Option<u64>,
+	pub mem_mib: Option<u64>,
 	/// vCPU count.
-	pub cpus:               Option<u64>,
+	pub cpus: Option<u64>,
 	/// Guest-agent Unix socket path.
-	pub agent_sock:         Option<PathBuf>,
+	pub agent_sock: Option<PathBuf>,
 	/// Optional network mode.
-	pub network:            Option<NetworkMode>,
+	pub network: Option<NetworkMode>,
+	/// Restrict user-mode networking to slirp-provided services.
+	///
+	/// This is valid only when [`Self::network`] is [`Some(NetworkMode::User)`].
+	pub user_net_restricted: bool,
+	/// TCP port on the virtual host gateway allowed by restricted user
+	/// networking.
+	pub user_net_allow_host_port: Option<u16>,
 	/// Optional guest MAC override.
-	pub mac:                Option<String>,
+	pub mac: Option<String>,
 	/// Attach virtio-rng.
-	pub rng:                bool,
+	pub rng: bool,
 	/// Optional read-only host directory share.
-	pub fs_share:           Option<FsShare>,
+	pub fs_share: Option<FsShare>,
 	/// Repeatable virtio-fs volume mounts.
-	pub volumes:            Vec<VolumeMount>,
+	pub volumes: Vec<VolumeMount>,
 	/// Repeatable object-proxy virtio-fs mounts.
-	pub remote_fs:          Vec<RemoteFsShare>,
+	pub remote_fs: Vec<RemoteFsShare>,
 	/// Optional wall-clock timeout in seconds.
-	pub timeout_secs:       Option<u64>,
+	pub timeout_secs: Option<u64>,
 	/// Snapshot root passed to the VMM.
-	pub snapshot_root:      Option<PathBuf>,
+	pub snapshot_root: Option<PathBuf>,
 	/// Mesh lazy-page HTTP source.
-	pub remote_page_url:    Option<String>,
+	pub remote_page_url: Option<String>,
 	/// Bearer token exported as `VMON_REMOTE_PAGE_TOKEN` when remote paging.
-	pub remote_page_token:  Option<String>,
+	pub remote_page_token: Option<String>,
 	/// Digest recorded in metadata for remote paging.
 	pub remote_page_digest: Option<String>,
 	/// Explicit `--console-agent` flag.
-	pub console_agent:      bool,
+	pub console_agent: bool,
 	/// Image reference recorded in metadata for fresh boots.
-	pub image:              Option<String>,
+	pub image: Option<String>,
 }
 
 impl LaunchSpec {
@@ -163,29 +170,31 @@ impl LaunchSpec {
 		rootfs: impl Into<PathBuf>,
 	) -> Self {
 		Self {
-			mode:               LaunchMode::Boot,
-			api_sock:           api_sock.into(),
-			kernel:             Some(kernel.into()),
-			cmdline:            Some(default_cmdline(false)),
-			rootfs:             Some(rootfs.into()),
-			disk_overlay_of:    None,
-			rootfs_read_only:   false,
-			mem_mib:            Some(DEFAULT_MEM_MIB),
-			cpus:               Some(DEFAULT_CPUS),
-			agent_sock:         None,
-			network:            None,
-			mac:                None,
-			rng:                false,
-			fs_share:           None,
-			volumes:            Vec::new(),
-			remote_fs:          Vec::new(),
-			timeout_secs:       None,
-			snapshot_root:      None,
-			remote_page_url:    None,
-			remote_page_token:  None,
+			mode: LaunchMode::Boot,
+			api_sock: api_sock.into(),
+			kernel: Some(kernel.into()),
+			cmdline: Some(default_cmdline(false)),
+			rootfs: Some(rootfs.into()),
+			disk_overlay_of: None,
+			rootfs_read_only: false,
+			mem_mib: Some(DEFAULT_MEM_MIB),
+			cpus: Some(DEFAULT_CPUS),
+			agent_sock: None,
+			network: None,
+			user_net_restricted: false,
+			user_net_allow_host_port: None,
+			mac: None,
+			rng: false,
+			fs_share: None,
+			volumes: Vec::new(),
+			remote_fs: Vec::new(),
+			timeout_secs: None,
+			snapshot_root: None,
+			remote_page_url: None,
+			remote_page_token: None,
 			remote_page_digest: None,
-			console_agent:      false,
-			image:              None,
+			console_agent: false,
+			image: None,
 		}
 	}
 
@@ -212,6 +221,8 @@ impl LaunchSpec {
 			cpus: None,
 			agent_sock: None,
 			network: None,
+			user_net_restricted: false,
+			user_net_allow_host_port: None,
 			mac: None,
 			rng: false,
 			fs_share: None,
@@ -274,6 +285,17 @@ impl LaunchSpec {
 	/// Attach user-mode NAT networking.
 	pub fn with_user_net(mut self) -> Self {
 		self.network = Some(NetworkMode::User);
+		self
+	}
+
+	/// Restrict user-mode networking to slirp-provided services and one TCP
+	/// port on its virtual host gateway.
+	///
+	/// The resulting launch emits `--user-net-restricted` and
+	/// `--user-net-allow-host-port` alongside `--net user`.
+	pub const fn with_restricted_user_net(mut self, allowed_host_port: u16) -> Self {
+		self.user_net_restricted = true;
+		self.user_net_allow_host_port = Some(allowed_host_port);
 		self
 	}
 
@@ -351,6 +373,24 @@ impl LaunchSpec {
 		}
 		if self.remote_page_url.is_some() && !matches!(self.mode, LaunchMode::Restore { .. }) {
 			return Err(EngineError::invalid("remote page restore requires --restore"));
+		}
+		if self.user_net_restricted && !matches!(self.network, Some(NetworkMode::User)) {
+			return Err(EngineError::invalid(
+				"restricted user networking requires user-mode networking",
+			));
+		}
+		if self.user_net_restricted && self.user_net_allow_host_port.is_none() {
+			return Err(EngineError::invalid(
+				"restricted user networking requires an allowed host port",
+			));
+		}
+		if self.user_net_allow_host_port == Some(0) {
+			return Err(EngineError::invalid("restricted user-network host port must be nonzero"));
+		}
+		if !self.user_net_restricted && self.user_net_allow_host_port.is_some() {
+			return Err(EngineError::invalid(
+				"an allowed host port requires restricted user networking",
+			));
 		}
 		if let Some(mem_mib) = self.mem_mib {
 			validate_range(mem_mib, "mem", MAX_MEM_MIB, " MiB")?;
@@ -458,7 +498,13 @@ fn append_rootfs_args(args: &mut Vec<String>, spec: &LaunchSpec, allow_direct_re
 
 fn append_network_args(args: &mut Vec<String>, spec: &LaunchSpec) {
 	match &spec.network {
-		Some(NetworkMode::User) => push_arg(args, "--net", "user"),
+		Some(NetworkMode::User) => {
+			push_arg(args, "--net", "user");
+			if let Some(allowed_host_port) = spec.user_net_allow_host_port {
+				args.push("--user-net-restricted".to_owned());
+				push_arg(args, "--user-net-allow-host-port", allowed_host_port.to_string());
+			}
+		},
 		Some(NetworkMode::Tap(tap)) => push_arg(args, "--tap", tap),
 		None => {},
 	}
@@ -1384,6 +1430,49 @@ mod tests {
 		let meta =
 			launch_metadata(&spec, 7, Path::new("/bin/vmon"), Path::new("/state/snapshots"), 1.0);
 		assert_eq!(meta["user_net"], json!(true));
+	}
+
+	#[test]
+	fn restricted_user_net_requires_user_mode_and_emits_its_flag() {
+		let spec = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img")
+			.with_user_net()
+			.with_restricted_user_net(8443);
+		assert!(spec.validate().is_ok());
+		let args = spec
+			.try_build_args()
+			.expect("valid restricted user network");
+		let idx = args
+			.iter()
+			.position(|arg| arg == "--net")
+			.expect("user net flag");
+		assert_eq!(&args[idx..idx + 5], [
+			"--net",
+			"user",
+			"--user-net-restricted",
+			"--user-net-allow-host-port",
+			"8443"
+		]);
+
+		assert!(
+			LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img")
+				.with_restricted_user_net(8443)
+				.validate()
+				.is_err()
+		);
+		assert!(
+			LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img")
+				.with_tap("tap7")
+				.with_restricted_user_net(8443)
+				.validate()
+				.is_err()
+		);
+		assert!(
+			LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img")
+				.with_user_net()
+				.with_restricted_user_net(0)
+				.validate()
+				.is_err()
+		);
 	}
 
 	#[test]

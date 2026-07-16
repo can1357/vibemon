@@ -29,6 +29,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added tenant-scoped credential management APIs (`list`, `put`, `delete`)
+- Added restricted user-mode networking capability, allowing whitelists for specific host ports
+- Added configuration options for history retention policies and template TTL settings
+- Added tenant token and encryption key mapping configuration for multi-tenant deployments
+- Added `vmon net-broker` CLI command for handling privileged network operations on Linux
 - Added `sandbox.suspend()` for durable checkpointing while preserving identity
 - Added `sandbox.history()` to list retained sandbox recovery points
 - Added `sandbox.rollback()` for restoring to retained recovery points

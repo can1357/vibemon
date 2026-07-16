@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::{
 	error::Result,
 	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
+	security::credentials::{Credential, CredentialMetadata},
 };
 
 /// A non-interactive or streaming exec request (shared by `POST /exec`, the
@@ -76,6 +77,19 @@ pub struct ShellSession {
 	pub ephemeral: bool,
 }
 
+/// Immutable rolling recovery point retained for one sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPoint {
+	/// Stable recovery-point name.
+	pub name:                   String,
+	/// `disk` or `checkpoint`.
+	pub kind:                   String,
+	/// Capture time.
+	pub created_at_unix_millis: u64,
+	/// Encrypted archive size.
+	pub size_bytes:             u64,
+}
+
 /// The engine surface the v1 API layer consumes. Sync and blocking: the API
 /// layer wraps calls in `spawn_blocking`. Views are `serde_json::Value`
 /// objects with the canonical `record.view()` keys.
@@ -95,6 +109,12 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value>;
 	fn pause(&self, id: &str) -> Result<Value>;
 	fn resume(&self, id: &str) -> Result<Value>;
+	/// Durably checkpoint and stop a sandbox while preserving its identity.
+	fn suspend(&self, id: &str) -> Result<Value>;
+	/// Return retained rolling recovery points for one sandbox.
+	fn history(&self, id: &str) -> Result<Vec<RecoveryPoint>>;
+	/// Restore a sandbox identity to an immutable recovery point.
+	fn rollback(&self, id: &str, recovery_point: &str) -> Result<Value>;
 	/// Returns `{"deadline_unix": …}`.
 	fn extend(&self, id: &str, secs: u64) -> Result<Value>;
 	fn metrics(&self, id: &str) -> Result<Value>;
@@ -140,6 +160,8 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn snapshots(&self) -> Result<Vec<String>>;
 	/// Restore a named snapshot into a fresh sandbox -> view (201).
 	fn restore(&self, snapshot: &str, body: RestoreBody) -> Result<Value>;
+	/// Delete an immutable named snapshot.
+	fn snapshot_delete(&self, snapshot: &str) -> Result<()>;
 	/// Fork `CoW` clones -> `{"clones": [<canonical sandbox view>, ...]}`.
 	fn fork(&self, snapshot: &str, body: ForkBody) -> Result<Value>;
 
@@ -151,6 +173,19 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn pool_list(&self) -> Result<Value>;
 	fn pool_set(&self, reference: &str, body: PoolPutBody) -> Result<Value>;
 	fn pool_delete(&self, reference: &str) -> Result<()>;
+
+	// -- credentials ------------------------------------------------------
+	/// List non-secret credential metadata for one authenticated tenant.
+	fn credential_list(&self, tenant: &str) -> Result<Vec<CredentialMetadata>>;
+	/// Encrypt or rotate one tenant-scoped credential.
+	fn credential_put(
+		&self,
+		tenant: &str,
+		key_id: &str,
+		credential: Credential,
+	) -> Result<CredentialMetadata>;
+	/// Revoke one tenant-scoped credential.
+	fn credential_delete(&self, tenant: &str, name: &str) -> Result<()>;
 
 	// -- system -----------------------------------------------------------
 	/// `{version, platform, arch, backend, capabilities}`.

@@ -72,6 +72,17 @@ pub struct ExitStatus {
 	pub signal: Option<i64>,
 }
 
+/// Monotonic guest workload counters used by idle reclamation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestActivity {
+	/// Non-idle aggregate CPU ticks.
+	pub cpu_ticks:     u64,
+	/// Sectors read or written across block devices.
+	pub disk_sectors:  u64,
+	/// Bytes received or sent across network interfaces.
+	pub network_bytes: u64,
+}
+
 struct AgentInner {
 	writer:  Mutex<UnixStream>,
 	state:   Mutex<State>,
@@ -187,6 +198,22 @@ impl AgentConn {
 				},
 			}
 		}
+	}
+
+	/// Sample autonomous guest CPU, disk, and network activity.
+	pub fn activity(&self, timeout: Duration) -> Result<GuestActivity> {
+		let response = self.request("activity", Value::Null, timeout)?;
+		let field = |name| {
+			response
+				.get(name)
+				.and_then(Value::as_u64)
+				.ok_or_else(|| EngineError::engine(format!("agent activity omitted {name}")))
+		};
+		Ok(GuestActivity {
+			cpu_ticks:     field("cpu_ticks")?,
+			disk_sectors:  field("disk_sectors")?,
+			network_bytes: field("network_bytes")?,
+		})
 	}
 
 	/// Configure the guest network stack.

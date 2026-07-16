@@ -1,6 +1,7 @@
 //! Host networking: TAP leases, iptables, egress, tunnels. Port of
 //! python/vmon/net.py.
 
+pub mod broker;
 pub mod policy;
 
 #[cfg(target_os = "linux")]
@@ -35,6 +36,8 @@ use tokio::{
 };
 
 use crate::error::{EngineError, Result};
+#[cfg(target_os = "linux")]
+use crate::security::CREDENTIAL_GATEWAY_PORT;
 
 #[cfg(target_os = "linux")]
 const CAP_NET_ADMIN: u32 = 12;
@@ -66,9 +69,10 @@ static START_INSTANT: std::sync::LazyLock<std::time::Instant> =
 #[cfg(target_os = "linux")]
 static REFRESHERS: LazyLock<Mutex<HashMap<String, DomainRefresher>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
-
+#[cfg(target_os = "linux")]
+static BROKER_SOCKET: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 /// A host TAP lease and its forwarding policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TapLease {
 	pub name:         String,
 	pub guest_ip:     String,
@@ -100,6 +104,17 @@ impl TapLease {
 			return Err(EngineError::invalid(format!(
 				"{guest} and {host} are not both in {network}/{prefix}"
 			)));
+		}
+		if !ipv4_contains(POOL_BASE, POOL_PREFIX, network) {
+			return Err(EngineError::invalid(format!(
+				"sandbox TAP network must be inside {POOL_BASE}/{POOL_PREFIX}"
+			)));
+		}
+		let network_value = u32::from(network);
+		if u32::from(host) != network_value + 1 || u32::from(guest) != network_value + 2 {
+			return Err(EngineError::invalid(
+				"sandbox TAP addresses must use network+1 for host and network+2 for guest",
+			));
 		}
 		let mut allowed = Vec::new();
 		for cidr in egress_allow.unwrap_or(&[]) {
@@ -174,6 +189,11 @@ impl SandboxNetwork {
 	/// Return guest-port to local loopback endpoint mappings.
 	pub fn tunnels(&self) -> BTreeMap<u16, (String, u16)> {
 		self.tunnels.mapping()
+	}
+
+	/// Permit only the fixed host credential-gateway TCP port.
+	pub fn allow_credential_gateway(&self) -> Result<()> {
+		broker_request(broker::Request::AllowCredential { lease: (&self.tap).into() }).map(|_| ())
 	}
 
 	/// Tear down tunnels, host policy, and the persisted lease.
@@ -299,6 +319,7 @@ pub async fn setup_sandbox_network(
 		config.prefix,
 		egress_allow,
 		egress_allow_domains,
+		None,
 	);
 	let tap = match tap_result {
 		Ok(tap) => tap,
@@ -363,20 +384,47 @@ pub fn tap_name(name: &str) -> String {
 	format!("tv{}", hex::encode(digest)[..10].to_owned())
 }
 
-/// Return whether this process can administer Linux networking.
+/// Configure the externally managed privileged network broker socket.
+pub fn configure_broker_socket(socket: Option<PathBuf>) {
+	#[cfg(target_os = "linux")]
+	{
+		*BROKER_SOCKET.lock() = socket;
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = socket;
+	}
+}
+
+/// Return whether a privileged network broker is configured.
 #[cfg(target_os = "linux")]
 pub fn has_net_admin() -> bool {
-	has_net_admin_impl()
+	BROKER_SOCKET.lock().is_some()
 }
 
-/// Return whether this process can administer Linux networking.
+/// Return whether a privileged network broker is configured.
 #[cfg(not(target_os = "linux"))]
 pub const fn has_net_admin() -> bool {
-	has_net_admin_impl()
+	false
+}
+fn broker_request(request: broker::Request) -> Result<Option<TapLease>> {
+	#[cfg(target_os = "linux")]
+	{
+		let socket = BROKER_SOCKET
+			.lock()
+			.clone()
+			.ok_or_else(|| EngineError::engine("network broker is not configured"))?;
+		broker::call(&socket, request)
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = request;
+		Err(EngineError::unsupported("host TAP networking requires Linux"))
+	}
 }
 
 #[cfg(target_os = "linux")]
-fn has_net_admin_impl() -> bool {
+fn has_net_admin_direct() -> bool {
 	// SAFETY: geteuid has no preconditions and reads process credentials.
 	if unsafe { libc::geteuid() } == 0 {
 		return true;
@@ -398,14 +446,9 @@ fn has_net_admin_impl() -> bool {
 	false
 }
 
-#[cfg(not(target_os = "linux"))]
-const fn has_net_admin_impl() -> bool {
-	false
-}
-
 #[cfg(target_os = "linux")]
 fn require_net_admin() -> Result<()> {
-	if has_net_admin() {
+	if has_net_admin_direct() {
 		Ok(())
 	} else {
 		Err(EngineError::engine("network setup needs root or CAP_NET_ADMIN"))
@@ -460,6 +503,55 @@ fn protected_deny_rule(
 }
 
 #[cfg(target_os = "linux")]
+fn credential_gateway_rule(action: IptablesAction, lease: &TapLease) -> Vec<String> {
+	let port = CREDENTIAL_GATEWAY_PORT.to_string();
+	strings([
+		action.flag(),
+		"INPUT",
+		"-i",
+		&lease.name,
+		"-s",
+		&lease.guest_cidr(),
+		"-d",
+		&lease.host_ip,
+		"-p",
+		"tcp",
+		"--dport",
+		&port,
+		"-m",
+		"comment",
+		"--comment",
+		&comment(&lease.name, "credential-gateway"),
+		"-j",
+		"ACCEPT",
+	])
+}
+
+#[cfg(target_os = "linux")]
+fn host_deny_rule(action: IptablesAction, lease: &TapLease) -> Vec<String> {
+	strings([
+		action.flag(),
+		"INPUT",
+		"-i",
+		&lease.name,
+		"-s",
+		&lease.guest_cidr(),
+		"-m",
+		"comment",
+		"--comment",
+		&comment(&lease.name, "host-deny"),
+		"-j",
+		"DROP",
+	])
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn allow_credential_gateway_direct(lease: &TapLease) -> Result<()> {
+	iptables_ensure(&credential_gateway_rule(IptablesAction::Insert, lease))
+}
+
+/// Ask the configured broker to create/configure a TAP and its NAT/FORWARD
+/// rules.
 pub fn setup_tap(
 	name: &str,
 	guest_ip: &str,
@@ -467,12 +559,50 @@ pub fn setup_tap(
 	prefix: u8,
 	egress_allow: Option<&[String]>,
 	egress_allow_domains: Option<&[String]>,
+	previous_egress_allow: Option<&[String]>,
+) -> Result<TapLease> {
+	let response = broker_request(broker::Request::Setup {
+		name: name.to_owned(),
+		guest_ip: guest_ip.to_owned(),
+		host_ip: host_ip.to_owned(),
+		prefix,
+		egress_allow: egress_allow.map(<[String]>::to_vec),
+		egress_allow_domains: egress_allow_domains.map(<[String]>::to_vec),
+		previous_egress_allow: previous_egress_allow.map(<[String]>::to_vec),
+	})?;
+	response.ok_or_else(|| EngineError::engine("network broker returned no TAP lease"))
+}
+
+#[cfg(target_os = "linux")]
+/// Create one TAP owned by the authenticated unprivileged daemon user.
+pub(crate) fn setup_tap_direct(
+	name: &str,
+	guest_ip: &str,
+	host_ip: &str,
+	prefix: u8,
+	egress_allow: Option<&[String]>,
+	egress_allow_domains: Option<&[String]>,
+	previous_egress_allow: Option<&[String]>,
+	owner_uid: u32,
 ) -> Result<TapLease> {
 	require_net_admin()?;
 	let lease = TapLease::new(name, guest_ip, host_ip, prefix, egress_allow)?;
 
 	if !ip_link_exists(name)? {
-		run(&argv(["ip", "tuntap", "add", "dev", name, "mode", "tap"]), true)?;
+		run(
+			&[
+				"ip".to_owned(),
+				"tuntap".to_owned(),
+				"add".to_owned(),
+				"dev".to_owned(),
+				name.to_owned(),
+				"mode".to_owned(),
+				"tap".to_owned(),
+				"user".to_owned(),
+				owner_uid.to_string(),
+			],
+			true,
+		)?;
 	}
 	run(
 		&[
@@ -486,16 +616,42 @@ pub fn setup_tap(
 		true,
 	)?;
 	run(&argv(["ip", "link", "set", "dev", name, "up"]), true)?;
+	disable_ipv6(name)?;
 	enable_ip_forward()?;
 
 	iptables_ensure(&masq_rule(IptablesAction::Append, &lease))?;
 	iptables_ensure(&return_rule(IptablesAction::Append, &lease))?;
+	iptables_delete(&credential_gateway_rule(IptablesAction::Delete, &lease))?;
+	iptables_delete(&host_deny_rule(IptablesAction::Delete, &lease))?;
+	iptables_ensure(&host_deny_rule(IptablesAction::Insert, &lease))?;
 
 	let domains = clean_domains(egress_allow_domains);
 	let restricted = egress_allow.is_some() || !domains.is_empty();
+	let prepared_domains = if restricted {
+		let mut policy =
+			policy::EgressPolicy::new(policy::SystemResolver, &domains, &lease.egress_allow)?;
+		let now = START_INSTANT.elapsed();
+		let mut rules = BTreeMap::new();
+		let mut next_idx = 0;
+		for domain in &domains {
+			for ip in policy.resolve_allowed(domain, now)? {
+				let ip = ip.to_string();
+				if let Entry::Vacant(entry) = rules.entry(ip) {
+					entry.insert(next_idx);
+					next_idx += 1;
+				}
+			}
+		}
+		Some((rules, next_idx))
+	} else {
+		None
+	};
+	// Keep a terminal deny in place throughout every policy replacement. New
+	// rules are installed around it, and unrestricted mode removes it only
+	// after the protected-range denies and public allow are complete.
+	iptables_ensure(&deny_egress_rule(IptablesAction::Append, &lease))?;
 	let prior_domain_ips = stop_domain_refresher(name);
 	iptables_delete(&unrestricted_egress_rule(IptablesAction::Delete, &lease))?;
-	iptables_delete(&deny_egress_rule(IptablesAction::Delete, &lease))?;
 	for (ip, idx) in &prior_domain_ips {
 		iptables_delete(&domain_rule(
 			IptablesAction::Delete,
@@ -503,6 +659,15 @@ pub fn setup_tap(
 			&lease.guest_cidr(),
 			ip,
 			*idx,
+		))?;
+	}
+	for (idx, cidr) in previous_egress_allow.unwrap_or(&[]).iter().enumerate() {
+		iptables_delete(&egress_cidr_rule(
+			IptablesAction::Delete,
+			&lease.name,
+			&lease.guest_cidr(),
+			cidr,
+			idx,
 		))?;
 	}
 	for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
@@ -518,28 +683,14 @@ pub fn setup_tap(
 	if restricted {
 		for (idx, cidr) in lease.egress_allow.iter().enumerate() {
 			iptables_ensure(&egress_cidr_rule(
-				IptablesAction::Append,
+				IptablesAction::Insert,
 				&lease.name,
 				&lease.guest_cidr(),
 				cidr,
 				idx,
 			))?;
 		}
-		let mut policy =
-			policy::EgressPolicy::new(policy::SystemResolver, &domains, &lease.egress_allow)?;
-		let now = START_INSTANT.elapsed();
-		let mut rules = BTreeMap::new();
-		let mut next_idx = 0;
-		for domain in &domains {
-			let ips = policy.resolve_allowed(domain, now)?;
-			for ip in ips {
-				let ip_str = ip.to_string();
-				if let Entry::Vacant(entry) = rules.entry(ip_str) {
-					entry.insert(next_idx);
-					next_idx += 1;
-				}
-			}
-		}
+		let (rules, next_idx) = prepared_domains.expect("restricted policy was prepared");
 		for (ip, idx) in &rules {
 			iptables_ensure(&domain_rule(
 				IptablesAction::Insert,
@@ -549,7 +700,6 @@ pub fn setup_tap(
 				*idx,
 			))?;
 		}
-		iptables_ensure(&deny_egress_rule(IptablesAction::Append, &lease))?;
 		if !domains.is_empty() {
 			start_domain_refresher(
 				&lease.name,
@@ -563,7 +713,7 @@ pub fn setup_tap(
 	} else {
 		for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
 			iptables_ensure(&protected_deny_rule(
-				IptablesAction::Append,
+				IptablesAction::Insert,
 				&lease.name,
 				&lease.guest_cidr(),
 				range,
@@ -571,26 +721,13 @@ pub fn setup_tap(
 			))?;
 		}
 		iptables_ensure(&unrestricted_egress_rule(IptablesAction::Append, &lease))?;
+		iptables_delete(&deny_egress_rule(IptablesAction::Delete, &lease))?;
 	}
 
 	Ok(lease)
 }
 
-/// Return an unsupported error on non-Linux hosts.
-#[cfg(not(target_os = "linux"))]
-pub fn setup_tap(
-	_name: &str,
-	_guest_ip: &str,
-	_host_ip: &str,
-	_prefix: u8,
-	_egress_allow: Option<&[String]>,
-	_egress_allow_domains: Option<&[String]>,
-) -> Result<TapLease> {
-	Err(EngineError::unsupported("host TAP networking requires Linux"))
-}
-
-/// Remove a TAP interface and the exact rules created for it.
-#[cfg(target_os = "linux")]
+/// Ask the configured broker to remove a TAP and its exact policy rules.
 pub fn teardown_tap(
 	name: &str,
 	guest_ip: Option<&str>,
@@ -599,15 +736,37 @@ pub fn teardown_tap(
 	egress_allow: Option<&[String]>,
 	egress_allow_domains: Option<&[String]>,
 ) -> Result<()> {
+	broker_request(broker::Request::Teardown {
+		name: name.to_owned(),
+		guest_ip: guest_ip.map(str::to_owned),
+		host_ip: host_ip.map(str::to_owned),
+		prefix,
+		egress_allow: egress_allow.map(<[String]>::to_vec),
+		egress_allow_domains: egress_allow_domains.map(<[String]>::to_vec),
+	})
+	.map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn teardown_tap_direct(
+	name: &str,
+	guest_ip: Option<&str>,
+	host_ip: Option<&str>,
+	prefix: u8,
+	egress_allow: Option<&[String]>,
+	egress_allow_domains: Option<&[String]>,
+) -> Result<()> {
 	let seen_rules = stop_domain_refresher(name);
-	if !has_net_admin() {
-		return Ok(());
+	if !has_net_admin_direct() {
+		return Err(EngineError::engine("network broker needs root or CAP_NET_ADMIN"));
 	}
 
 	if let (Some(guest_ip), Some(host_ip)) = (guest_ip, host_ip) {
 		let lease = TapLease::new(name, guest_ip, host_ip, prefix, egress_allow)?;
 		iptables_delete(&masq_rule(IptablesAction::Delete, &lease))?;
 		iptables_delete(&return_rule(IptablesAction::Delete, &lease))?;
+		iptables_delete(&credential_gateway_rule(IptablesAction::Delete, &lease))?;
+		iptables_delete(&host_deny_rule(IptablesAction::Delete, &lease))?;
 		iptables_delete(&unrestricted_egress_rule(IptablesAction::Delete, &lease))?;
 		for (idx, range) in PROTECTED_V4_RANGES.iter().enumerate() {
 			iptables_delete(&protected_deny_rule(
@@ -661,19 +820,6 @@ pub fn teardown_tap(
 		run(&argv(["ip", "link", "del", "dev", name]), false)?;
 	}
 	Ok(())
-}
-
-/// Return an unsupported error on non-Linux hosts.
-#[cfg(not(target_os = "linux"))]
-pub fn teardown_tap(
-	_name: &str,
-	_guest_ip: Option<&str>,
-	_host_ip: Option<&str>,
-	_prefix: u8,
-	_egress_allow: Option<&[String]>,
-	_egress_allow_domains: Option<&[String]>,
-) -> Result<()> {
-	Err(EngineError::unsupported("host TAP networking requires Linux"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1389,6 +1535,14 @@ impl DomainRefresher {
 		}
 		rules
 	}
+}
+
+#[cfg(target_os = "linux")]
+fn disable_ipv6(name: &str) -> Result<()> {
+	let path = PathBuf::from("/proc/sys/net/ipv6/conf").join(name).join("disable_ipv6");
+	fs::write(&path, "1\n").map_err(|error| {
+		EngineError::engine(format!("disabling IPv6 on sandbox TAP {name}: {error}"))
+	})
 }
 
 #[cfg(target_os = "linux")]

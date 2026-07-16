@@ -3,10 +3,10 @@
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
 	fmt::Write as _,
-	fs,
+	fs::{self, OpenOptions},
 	io::{self, Read, Seek, SeekFrom, Write as _},
 	net::IpAddr,
-	os::unix::fs::OpenOptionsExt,
+	os::unix::fs::{OpenOptionsExt, PermissionsExt},
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -20,14 +20,14 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::broadcast, task::JoinHandle};
 use vmm::snapshot::is_safe_snapshot_name;
 
 use crate::{
 	config::{ServeConfig, WarmImage},
 	engine::{
-		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, ShellSession,
-		agent::{AgentConn, ExecHandle},
+		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, RecoveryPoint, ShellSession,
+		agent::{AgentConn, ExecHandle, GuestActivity},
 		control::ControlClient,
 		diskdelta,
 		s3proxy::S3Proxy,
@@ -43,6 +43,11 @@ use crate::{
 	pools::{PoolRegistry, WarmPool, template_key},
 	registry::{Registry, VmRecord},
 	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
+	security::{
+		AuditEvent, AuditLog, CREDENTIAL_GATEWAY_PORT, CredentialGateway, CredentialProvider,
+		CredentialStore, EncryptedArchive, Keyring,
+		credentials::{Credential, CredentialMetadata},
+	},
 	volumes::{self, Secret, Volume, VolumeLock},
 };
 
@@ -68,32 +73,101 @@ pub struct Engine {
 }
 
 struct EngineInner {
-	config:          ServeConfig,
-	home:            Home,
-	registry:        Registry,
-	runtimes:        Mutex<HashMap<String, RuntimeState>>,
-	pools:           PoolRegistry,
-	events:          Mutex<Vec<Sender<Value>>>,
-	event_sequence:  AtomicU64,
-	counters:        Counters,
-	latency:         Mutex<CreateLatency>,
-	net_runtime:     Runtime,
-	sandbox_runtime: Arc<dyn SandboxRuntime>,
+	config:           ServeConfig,
+	home:             Home,
+	registry:         Registry,
+	runtimes:         Mutex<HashMap<String, RuntimeState>>,
+	pools:            PoolRegistry,
+	events:           Mutex<Vec<Sender<Value>>>,
+	event_sequence:   AtomicU64,
+	counters:         Counters,
+	latency:          Mutex<CreateLatency>,
+	net_runtime:      Runtime,
+	sandbox_runtime:  Arc<dyn SandboxRuntime>,
+	keyring:          Arc<Keyring>,
+	credentials:      Arc<CredentialStore>,
+	maintenance_busy: Mutex<HashSet<String>>,
+	audit:            AuditLog,
 }
 
 #[derive(Default)]
 struct RuntimeState {
-	agent:          Option<AgentConn>,
-	network:        Option<SandboxNetwork>,
-	volume_locks:   Vec<VolumeLock>,
-	secret_env:     BTreeMap<String, String>,
-	env:            BTreeMap<String, String>,
-	workdir:        Option<String>,
-	connect_token:  Option<String>,
-	network_policy: NetworkPolicy,
-	network_spec:   Option<Value>,
-	timeout_stop:   Option<Sender<()>>,
-	s3_proxy:       Option<S3Proxy>,
+	agent:              Option<AgentConn>,
+	network:            Option<SandboxNetwork>,
+	volume_locks:       Vec<VolumeLock>,
+	encrypted_volumes:  Vec<EncryptedVolumeMount>,
+	secret_env:         BTreeMap<String, String>,
+	env:                BTreeMap<String, String>,
+	workdir:            Option<String>,
+	connect_token:      Option<String>,
+	network_policy:     NetworkPolicy,
+	network_spec:       Option<Value>,
+	timeout_stop:       Option<Sender<()>>,
+	s3_proxy:           Option<S3Proxy>,
+	credential_gateway: Option<CredentialGateway>,
+	snapshot_source:    Option<Arc<TransientDir>>,
+	guest_activity:     Option<GuestActivity>,
+	identity_complete:   bool,
+}
+
+struct EncryptedVolumeMount {
+	name:      String,
+	mount_dir: PathBuf,
+	slot_dir:  PathBuf,
+	archive:   PathBuf,
+	key_id:    String,
+	read_only: bool,
+	sealed:    bool,
+	preserve:  bool,
+}
+
+impl EncryptedVolumeMount {
+	const fn arm(&mut self) {
+		self.preserve = true;
+	}
+
+	fn seal(&mut self, keyring: &Keyring) -> Result<()> {
+		if self.read_only {
+			self.sealed = true;
+			self.preserve = false;
+			return Ok(());
+		}
+		if self.sealed {
+			return Ok(());
+		}
+		match EncryptedArchive::seal(&self.mount_dir, &self.archive, keyring, &self.key_id) {
+			Ok(()) => {
+				self.sealed = true;
+				self.preserve = false;
+				Ok(())
+			},
+			Err(error) => {
+				self.preserve = true;
+				Err(error)
+			},
+		}
+	}
+}
+
+impl Drop for EncryptedVolumeMount {
+	fn drop(&mut self) {
+		if !self.preserve {
+			let _ = fs::remove_dir_all(&self.slot_dir);
+		}
+	}
+}
+
+struct TransientDir(PathBuf);
+
+impl Drop for TransientDir {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir_all(&self.0);
+	}
+}
+
+struct SnapshotSource {
+	path:  PathBuf,
+	guard: Option<Arc<TransientDir>>,
 }
 
 #[derive(Default, Clone)]
@@ -151,32 +225,46 @@ struct CreatePlan {
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotOptions {
-	agent:           Option<bool>,
-	block_network:   Option<bool>,
-	env:             Option<HashMap<String, String>>,
-	workdir:         Option<String>,
-	tags:            Option<HashMap<String, String>>,
-	timeout:         Option<f64>,
-	timeout_secs:    Option<u64>,
-	readiness_probe: Option<Value>,
-	secrets:         Option<Vec<Value>>,
-	s3_mounts:       Option<HashMap<String, S3MountSpec>>,
-	command:         Option<Vec<String>>,
+	agent:                  Option<bool>,
+	block_network:          Option<bool>,
+	env:                    Option<HashMap<String, String>>,
+	workdir:                Option<String>,
+	tags:                   Option<HashMap<String, String>>,
+	timeout:                Option<f64>,
+	timeout_secs:           Option<u64>,
+	readiness_probe:        Option<Value>,
+	secrets:                Option<Vec<Value>>,
+	s3_mounts:              Option<HashMap<String, S3MountSpec>>,
+	command:                Option<Vec<String>>,
+	credentials:            Option<Vec<String>>,
+	owner_tenant:           Option<String>,
+	encryption_key_id:      Option<String>,
+	ports:                  Option<Vec<u16>>,
+	egress_allow:           Option<Vec<String>>,
+	egress_allow_domains:   Option<Vec<String>>,
+	inbound_cidr_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
 struct ResolvedSnapshotOptions {
-	agent:           bool,
-	block_network:   Option<bool>,
-	env:             BTreeMap<String, String>,
-	secret_env:      BTreeMap<String, String>,
-	secret_names:    Vec<String>,
-	workdir:         Option<String>,
-	tags:            HashMap<String, String>,
-	timeout_secs:    Option<u64>,
-	readiness_probe: Option<Value>,
-	s3_mounts:       Option<HashMap<String, S3MountSpec>>,
-	command:         Option<Vec<String>>,
+	agent:                  bool,
+	block_network:          Option<bool>,
+	env:                    BTreeMap<String, String>,
+	secret_env:             BTreeMap<String, String>,
+	secret_names:           Vec<String>,
+	workdir:                Option<String>,
+	tags:                   HashMap<String, String>,
+	timeout_secs:           Option<u64>,
+	readiness_probe:        Option<Value>,
+	s3_mounts:              Option<HashMap<String, S3MountSpec>>,
+	command:                Option<Vec<String>>,
+	credentials:            Vec<String>,
+	owner_tenant:           String,
+	encryption_key_id:      String,
+	ports:                  Option<Vec<u16>>,
+	egress_allow:           Option<Vec<String>>,
+	egress_allow_domains:   Option<Vec<String>>,
+	inbound_cidr_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +280,7 @@ struct ResolvedVolume {
 	host_dir:   PathBuf,
 	read_only:  bool,
 	lock:       Option<VolumeLock>,
+	encrypted:  Option<EncryptedVolumeMount>,
 }
 
 struct ResolvedS3Mount {
@@ -218,6 +307,9 @@ impl Engine {
 		fs::create_dir_all(home.vms_dir())?;
 		fs::create_dir_all(home.templates_dir())?;
 		fs::create_dir_all(home.volumes_dir())?;
+		let keyring = Arc::new(Keyring::open(&home)?);
+		let credentials = Arc::new(CredentialStore::open(&home, Arc::clone(&keyring))?);
+		let audit = AuditLog::open(&home)?;
 		let registry = Registry::new();
 		let lock_requests = registry.rehydrate(&home)?;
 		registry.rebuild_idempotency_index();
@@ -236,9 +328,14 @@ impl Engine {
 				latency: Mutex::new(CreateLatency::default()),
 				net_runtime,
 				sandbox_runtime,
+				keyring,
+				credentials,
+				audit,
+				maintenance_busy: Mutex::new(HashSet::new()),
 			}),
 		};
-		engine.reacquire_volume_locks(lock_requests);
+		engine.reacquire_volume_locks(lock_requests)?;
+		engine.recover_orphaned_encrypted_volumes()?;
 		engine.start_configured_pools()?;
 		Ok(engine)
 	}
@@ -247,6 +344,140 @@ impl Engine {
 	/// left running.
 	pub fn shutdown(&self) {
 		self.inner.pools.shutdown();
+	}
+
+	/// Run guest-activity sampling, recovery capture, and idle suspension until
+	/// shutdown.
+	pub fn start_maintenance(
+		self: &Arc<Self>,
+		mut shutdown: broadcast::Receiver<()>,
+	) -> JoinHandle<()> {
+		let engine = Arc::clone(self);
+		let interval = engine.maintenance_interval();
+		tokio::spawn(async move {
+			let mut ticker = tokio::time::interval(interval);
+			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tokio::select! {
+					_ = ticker.tick() => {
+						let engine = Arc::clone(&engine);
+						if let Err(error) = tokio::task::spawn_blocking(move || engine.maintenance_once()).await {
+							tracing::warn!("sandbox maintenance task failed: {error}");
+						}
+					},
+					_ = shutdown.recv() => break,
+				}
+			}
+		})
+	}
+
+	fn maintenance_interval(&self) -> Duration {
+		[
+			self.inner.config.idle_timeout,
+			self.inner.config.history_disk_sec,
+			self.inner.config.history_checkpoint_sec,
+		]
+		.into_iter()
+		.filter(|seconds| *seconds > 0.0)
+		.map(|seconds| Duration::from_secs_f64((seconds / 4.0).clamp(1.0, 30.0)))
+		.min()
+		.unwrap_or(Duration::from_secs(30))
+	}
+
+	fn maintenance_once(&self) {
+		for record in self.inner.registry.list() {
+			if record.status != "running" {
+				continue;
+			}
+			if !self.inner.maintenance_busy.lock().insert(record.id.clone()) {
+				continue;
+			}
+			if let Err(error) = self.maintain_sandbox(&record) {
+				tracing::warn!(sandbox = record.id, %error, "sandbox maintenance failed");
+			}
+			self.inner.maintenance_busy.lock().remove(&record.id);
+		}
+	}
+
+	fn maintain_sandbox(&self, record: &VmRecord) -> Result<()> {
+		if record.detail.get("observed_state").and_then(Value::as_str) == Some("paused") {
+			return Ok(());
+		}
+		let active = self.sample_guest_activity(&record.id, &record.name)?;
+		let current = self
+			.inner
+			.registry
+			.get(&record.id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{}'", record.id)))?;
+		if active == Some(false)
+			&& self.inner.config.idle_timeout > 0.0
+			&& unix_time() - current.last_active >= self.inner.config.idle_timeout
+		{
+			<Self as EngineApi>::suspend(self, &record.id)?;
+			self.inc_counter("idle_reaped");
+			return Ok(());
+		}
+		let now = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
+		for (kind, cadence, field) in [
+			("disk", self.inner.config.history_disk_sec, "last_disk_history_unix_millis"),
+			(
+				"checkpoint",
+				self.inner.config.history_checkpoint_sec,
+				"last_checkpoint_history_unix_millis",
+			),
+		] {
+			if cadence <= 0.0 {
+				continue;
+			}
+			let last = current
+				.detail
+				.get(field)
+				.and_then(Value::as_u64)
+				.unwrap_or_else(|| (current.created_at * 1000.0).max(0.0) as u64);
+			if now.saturating_sub(last) < (cadence * 1000.0) as u64 {
+				continue;
+			}
+			self.capture_recovery(&record.id, kind, true)?;
+			self.mesh_update_detail_fields(
+				&record.id,
+				Map::from_iter([(field.to_owned(), json!(now))]),
+			)?;
+		}
+		Ok(())
+	}
+
+	fn sample_guest_activity(&self, id: &str, name: &str) -> Result<Option<bool>> {
+		let agent = self
+			.inner
+			.runtimes
+			.lock()
+			.get(name)
+			.and_then(|runtime| runtime.agent.clone());
+		let Some(agent) = agent else {
+			return Ok(None);
+		};
+		let sample = agent.activity(Duration::from_secs(2))?;
+		let changed = {
+			let mut runtimes = self.inner.runtimes.lock();
+			let Some(runtime) = runtimes.get_mut(name) else {
+				return Ok(None);
+			};
+			let changed = runtime.guest_activity.is_some_and(|previous| {
+				sample.cpu_ticks.saturating_sub(previous.cpu_ticks) >= 10
+					|| sample.disk_sectors != previous.disk_sectors
+					|| sample.network_bytes != previous.network_bytes
+			});
+			runtime.guest_activity = Some(sample);
+			changed
+		};
+		if changed {
+			let now = unix_time();
+			self.inner.registry.update(id, |record| record.last_active = now);
+			let _ = self.sandbox(name).save_meta(Map::from_iter([
+				("last_active".to_owned(), json!(now)),
+			]));
+		}
+		Ok(Some(changed))
 	}
 
 	fn home(&self) -> &Home {
@@ -277,19 +508,100 @@ impl Engine {
 		self.inner.sandbox_runtime.is_running(vm)
 	}
 
-	fn reacquire_volume_locks(&self, requests: Vec<(String, Vec<String>)>) {
+	fn rollback_uncommitted_runtime(&self, vm: &SandboxVm, runtime: &mut RuntimeState) {
+		if let Some(stop) = runtime.timeout_stop.take() {
+			let _ = stop.send(());
+		}
+		if let Some(agent) = runtime.agent.take() {
+			agent.close();
+		}
+		let _ = self.stop_sandbox(vm, true);
+		for volume in &mut runtime.encrypted_volumes {
+			let _ = volume.seal(&self.inner.keyring);
+		}
+		drop(runtime.credential_gateway.take());
+		drop(runtime.s3_proxy.take());
+		if let Some(network) = runtime.network.take() {
+			let _ = network.teardown();
+		} else {
+			teardown_network(vm.name());
+		}
+		let _ = self.remove_sandbox(vm);
+	}
+
+	fn reacquire_volume_locks(&self, requests: Vec<(String, Vec<String>)>) -> Result<()> {
+		let mut requested = requests.into_iter().collect::<HashMap<_, _>>();
+		let running = self
+			.inner
+			.registry
+			.list()
+			.into_iter()
+			.filter(|record| record.status == "running")
+			.collect::<Vec<_>>();
+		let mut staged_by_name = HashMap::new();
+		for record in &running {
+			let mut staged = load_staged_volume_mounts(self.home(), &record.name)?;
+			requested
+				.entry(record.name.clone())
+				.or_default()
+				.extend(staged.iter().filter(|mount| !mount.read_only).map(|mount| mount.name.clone()));
+			for mount in &mut staged {
+				mount.arm();
+			}
+			staged_by_name.insert(record.name.clone(), staged);
+		}
 		let mut runtimes = self.inner.runtimes.lock();
-		for (name, volumes) in requests {
-			let state = runtimes.entry(name).or_default();
-			for volume_name in volumes {
-				let Ok(volume) = Volume::new_in_home(self.home().root(), &volume_name) else {
-					continue;
-				};
-				if let Ok(lock) = volume.acquire_write_lock() {
-					state.volume_locks.push(lock);
-				}
+		for record in running {
+			let state = runtimes.entry(record.name.clone()).or_default();
+			let mut names = requested.remove(&record.name).unwrap_or_default();
+			names.sort();
+			names.dedup();
+			for volume_name in names {
+				let volume = Volume::new_in_home(self.home().root(), &volume_name)?;
+				state.volume_locks.push(volume.acquire_write_lock()?);
+			}
+			state.encrypted_volumes = staged_by_name.remove(&record.name).unwrap_or_default();
+		}
+		Ok(())
+	}
+
+	fn recover_orphaned_encrypted_volumes(&self) -> Result<()> {
+		let root = encrypted_volume_runtime_root(self.home());
+		let entries = match fs::read_dir(&root) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+			Err(error) => return Err(error.into()),
+		};
+		let active = self
+			.inner
+			.registry
+			.list()
+			.into_iter()
+			.filter(|record| record.status == "running")
+			.map(|record| record.name)
+			.collect::<HashSet<_>>();
+		for entry in entries {
+			let entry = entry?;
+			let sid = entry.file_name().into_string().map_err(|_| {
+				EngineError::invalid("encrypted volume runtime contains a non-UTF-8 sandbox ID")
+			})?;
+			if active.contains(&sid) {
+				continue;
+			}
+			let mut mounts = load_staged_volume_mounts(self.home(), &sid)?;
+			for mount in &mut mounts {
+				mount.arm();
+			}
+			for mount in &mut mounts {
+				mount.seal(&self.inner.keyring)?;
+			}
+			drop(mounts);
+			let sid_root = root.join(sid);
+			if sid_root.exists() {
+				fs::remove_dir_all(sid_root)?;
 			}
 		}
+		Ok(())
 	}
 
 	fn start_configured_pools(&self) -> Result<()> {
@@ -368,9 +680,24 @@ impl Engine {
 		let tags = params.tags.clone().unwrap_or_default();
 		let secrets = parse_secrets(params.secrets.take())?;
 		let secret_env = merge_secret_env(&secrets);
+		let credential_names = params.credentials.clone().unwrap_or_default();
+		if credential_names.iter().collect::<HashSet<_>>().len() != credential_names.len() {
+			return Err(EngineError::invalid("credential names must be unique"));
+		}
+		for name in &credential_names {
+			let credential = self.inner.credentials.get(&params.owner_tenant, name)?;
+			if !credential.active_at(u64::try_from(unix_millis()).unwrap_or(u64::MAX)) {
+				return Err(EngineError::invalid(format!("credential {name:?} has expired")));
+			}
+		}
 		let timeout_secs = effective_timeout_secs(params.timeout_secs, params.timeout)?;
 		let mut used_tags = HashSet::new();
-		let mut volume_specs = self.resolve_volumes(params.volumes.take(), &mut used_tags)?;
+		let mut volume_specs = self.resolve_volumes(
+			&sid,
+			&params.encryption_key_id,
+			params.volumes.take(),
+			&mut used_tags,
+		)?;
 		let mut s3_specs = self.resolve_s3_mounts(params.s3_mounts.take(), &mut used_tags)?;
 		if let Some(tags) = params.s3_restore_tags.take() {
 			apply_restored_s3_tags(&mut s3_specs, &volume_specs, &tags)?;
@@ -480,6 +807,8 @@ impl Engine {
 
 	fn resolve_volumes(
 		&self,
+		sid: &str,
+		key_id: &str,
 		volumes: Option<HashMap<String, Value>>,
 		used_tags: &mut HashSet<String>,
 	) -> Result<Vec<ResolvedVolume>> {
@@ -493,16 +822,78 @@ impl Engine {
 				Some(volume.acquire_write_lock()?)
 			};
 			let tag = unique_volume_tag(&name, used_tags);
+			let encrypted = self.materialize_encrypted_volume(sid, &volume, key_id, read_only)?;
 			out.push(ResolvedVolume {
 				mountpoint,
 				name,
 				tag,
-				host_dir: volume.path(),
+				host_dir: encrypted.mount_dir.clone(),
 				read_only,
 				lock,
+				encrypted: Some(encrypted),
 			});
 		}
 		Ok(out)
+	}
+
+	fn materialize_encrypted_volume(
+		&self,
+		sid: &str,
+		volume: &Volume,
+		key_id: &str,
+		read_only: bool,
+	) -> Result<EncryptedVolumeMount> {
+		drop(self.inner.keyring.load(key_id)?);
+		let archive = encrypted_volume_archive(self.home(), volume.name());
+		let runtime_root = encrypted_volume_runtime_root(self.home()).join(sid);
+		create_private_dir(&runtime_root)?;
+		let slot_dir = runtime_root.join(volume.name());
+		if slot_dir.exists() || slot_dir.is_symlink() {
+			return Err(EngineError::busy(format!(
+				"encrypted volume staging path {} already exists",
+				slot_dir.display()
+			)));
+		}
+		let result = (|| {
+			let mount_dir = if archive.exists() || archive.is_symlink() {
+				let metadata = fs::symlink_metadata(&archive)?;
+				if metadata.file_type().is_symlink() || !metadata.is_file() {
+					return Err(EngineError::invalid(format!(
+						"encrypted volume archive {} is not a regular file",
+						archive.display()
+					)));
+				}
+				let mount_dir = EncryptedArchive::open(&archive, &slot_dir, &self.inner.keyring)?;
+				if volume_has_plaintext(volume.path().as_path())? {
+					remove_legacy_volume_data(volume.path().as_path())?;
+				}
+				mount_dir
+			} else {
+				let mount_dir = slot_dir.join(volume.name());
+				create_private_dir(&mount_dir)?;
+				if volume_has_plaintext(volume.path().as_path())? {
+					copy_tree_without_locks(&volume.path(), &mount_dir)?;
+				}
+				EncryptedArchive::seal(&mount_dir, &archive, &self.inner.keyring, key_id)?;
+				remove_legacy_volume_data(volume.path().as_path())?;
+				mount_dir
+			};
+			write_volume_staging_manifest(&slot_dir, volume.name(), key_id, read_only)?;
+			Ok(EncryptedVolumeMount {
+				name: volume.name().to_owned(),
+				mount_dir,
+				slot_dir: slot_dir.clone(),
+				archive,
+				key_id: key_id.to_owned(),
+				read_only,
+				sealed: read_only,
+				preserve: false,
+			})
+		})();
+		if result.is_err() {
+			let _ = fs::remove_dir_all(&slot_dir);
+		}
+		result
 	}
 
 	fn resolve_s3_mounts(
@@ -654,6 +1045,65 @@ impl Engine {
 		Ok(())
 	}
 
+	fn start_credential_gateway(
+		&self,
+		plan: &CreatePlan,
+		runtime: &mut RuntimeState,
+		bind_ip: IpAddr,
+		guest_ip: IpAddr,
+	) -> Result<()> {
+		self.start_credential_gateway_for(
+			&plan.params.owner_tenant,
+			&plan.sid,
+			plan.params.credentials.as_deref().unwrap_or(&[]),
+			runtime,
+			bind_ip,
+			guest_ip,
+		)
+	}
+
+	fn start_credential_gateway_for(
+		&self,
+		tenant: &str,
+		sandbox_id: &str,
+		names: &[String],
+		runtime: &mut RuntimeState,
+		bind_ip: IpAddr,
+		guest_ip: IpAddr,
+	) -> Result<()> {
+		if names.is_empty() || runtime.credential_gateway.is_some() {
+			return Ok(());
+		}
+		let provider: Arc<dyn CredentialProvider> = self.inner.credentials.clone();
+		let gateway = CredentialGateway::start(
+			&self.inner.net_runtime,
+			bind_ip,
+			guest_ip,
+			if cfg!(target_os = "linux") {
+				CREDENTIAL_GATEWAY_PORT
+			} else {
+				0
+			},
+			tenant.to_owned(),
+			sandbox_id.to_owned(),
+			names.to_vec(),
+			provider,
+			self.inner.audit.clone(),
+		)?;
+		if cfg!(target_os = "linux") {
+			runtime
+				.network
+				.as_mut()
+				.ok_or_else(|| EngineError::engine("credential gateway requires a TAP network"))?
+				.allow_credential_gateway()?;
+		}
+		runtime
+			.env
+			.insert("VMON_CREDENTIAL_GATEWAY".to_owned(), gateway.endpoint().to_owned());
+		runtime.credential_gateway = Some(gateway);
+		Ok(())
+	}
+
 	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(SandboxVm, RuntimeState)> {
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
@@ -672,9 +1122,24 @@ impl Engine {
 				egress_allow_domains:   plan.params.egress_allow_domains.clone(),
 				inbound_cidr_allowlist: plan.params.inbound_cidr_allowlist.clone(),
 			},
+			identity_complete: true,
 			..RuntimeState::default()
 		};
 		let vm = self.claim_or_launch_vm(plan, &mut runtime)?;
+		runtime.volume_locks = plan
+			.volume_specs
+			.iter_mut()
+			.filter_map(|volume| volume.lock.take())
+			.collect();
+		runtime.encrypted_volumes = plan
+			.volume_specs
+			.iter_mut()
+			.filter_map(|volume| volume.encrypted.take())
+			.collect();
+		for volume in &mut runtime.encrypted_volumes {
+			volume.arm();
+		}
+		let setup_result = (|| {
 		let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
 		agent.ping(AGENT_CONNECT_TIMEOUT)?;
 		if let Some(timeout_secs) = plan.timeout_secs
@@ -716,7 +1181,7 @@ impl Engine {
 				"tunnels": tunnels_json(&network.tunnels()),
 				"policy": policy_json(&runtime.network_policy),
 			}));
-		} else if !plan.params.block_network {
+		} else if network_required(&plan.params) {
 			let gc = user_net_guest_config();
 			let dns = net::USER_NET_DNS
 				.iter()
@@ -736,18 +1201,13 @@ impl Engine {
 				"guest_config": gc,
 				"ports": [],
 				"tunnels": {},
-				"policy": {},
+				"policy": policy_json(&runtime.network_policy),
 			}));
 		}
 		if let Some(probe) = &plan.params.readiness_probe {
 			Self::wait_until_ready(&agent, &runtime, probe, plan.params.timeout.unwrap_or(300.0))?;
 		}
 		runtime.agent = Some(agent);
-		runtime.volume_locks = plan
-			.volume_specs
-			.iter_mut()
-			.filter_map(|volume| volume.lock.take())
-			.collect();
 		let mut meta = Map::new();
 		meta.insert("sandbox".to_owned(), json!(true));
 		meta.insert("image".to_owned(), json!(plan.image_ref));
@@ -764,13 +1224,25 @@ impl Engine {
 					.collect::<Vec<_>>()
 			),
 		);
+		meta.insert("credential_names".to_owned(), json!(plan.params.credentials));
+		meta.insert("owner_tenant".to_owned(), json!(plan.params.owner_tenant));
+		meta.insert("encryption_key_id".to_owned(), json!(plan.params.encryption_key_id));
+		meta.insert("desired_state".to_owned(), json!("running"));
+		meta.insert("observed_state".to_owned(), json!("running"));
+		meta.insert("state_generation".to_owned(), json!(1));
 		meta.insert("tags".to_owned(), json!(plan.tags));
 		meta.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
 		meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
 		meta.insert("block_network".to_owned(), json!(plan.params.block_network));
 		meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
 		meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
-		vm.save_meta(meta)?;
+			vm.save_meta(meta)?;
+			Ok(())
+		})();
+		if let Err(error) = setup_result {
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
 		Ok((vm, runtime))
 	}
 
@@ -779,10 +1251,19 @@ impl Engine {
 		plan: &CreatePlan,
 		runtime: &mut RuntimeState,
 	) -> Result<SandboxVm> {
+		if cfg!(target_os = "macos") && credentials_requested(&plan.params) {
+			self.start_credential_gateway(
+				plan,
+				runtime,
+				"127.0.0.1".parse().expect("loopback IP"),
+				net::USER_NET_GATEWAY.parse().expect("user-net gateway IP"),
+			)?;
+		}
 		if (plan.params.block_network || plan.networked_warm)
 			&& plan.volume_specs.is_empty()
 			&& plan.s3_specs.is_empty()
 			&& plan.params.fs_dir.is_none()
+			&& !credentials_requested(&plan.params)
 		{
 			if plan.params.pool_size > 0 {
 				let pool = WarmPool::with_runtime(
@@ -825,6 +1306,7 @@ impl Engine {
 			&& plan.params.fs_dir.is_none()
 			&& plan.volume_specs.is_empty()
 			&& plan.s3_specs.is_empty()
+			&& !credentials_requested(&plan.params)
 		{
 			return self.launch_restore_vm(plan, None, runtime);
 		}
@@ -832,17 +1314,23 @@ impl Engine {
 			return self.launch_restore_vm(plan, None, runtime);
 		}
 		if (plan.networked_warm_linux
-			|| (!plan.params.block_network
+			|| (network_required(&plan.params)
 				&& plan.s3_specs.is_empty()
 				&& snapshot_state_present(&plan.template_dir)))
 			&& !cfg!(target_os = "macos")
 		{
 			let network = self.setup_network(&plan.sid, &plan.params)?;
 			let tap = network.guest_config.tap.clone();
+			let host_ip = network
+				.guest_config
+				.host_ip
+				.parse()
+				.map_err(|_| EngineError::engine("allocated host gateway is not an IP address"))?;
 			runtime.network = Some(network);
+			self.start_credential_gateway(plan, runtime, host_ip, host_ip)?;
 			return self.launch_restore_vm(plan, Some(tap), runtime);
 		}
-		if !plan.params.block_network
+		if network_required(&plan.params)
 			&& plan.s3_specs.is_empty()
 			&& cfg!(target_os = "macos")
 			&& snapshot_state_present(&plan.template_dir)
@@ -878,8 +1366,16 @@ impl Engine {
 		}
 		if let Some(tap) = tap {
 			spec = spec.with_tap(tap);
-		} else if !plan.params.block_network {
+		} else if network_required(&plan.params) {
 			spec = spec.with_user_net();
+		}
+		if cfg!(target_os = "macos") && credentials_requested(&plan.params) {
+			let port = runtime
+				.credential_gateway
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("credential gateway was not started"))?
+				.port();
+			spec = spec.with_restricted_user_net(port);
 		}
 		if let Some(fs_dir) = &plan.params.fs_dir {
 			spec = spec.with_fs_share("host", fs_dir);
@@ -901,7 +1397,7 @@ impl Engine {
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		self.launch_sandbox(&vm, &spec)?;
 		runtime.s3_proxy = s3_proxy;
-		if !plan.params.block_network && runtime.network.is_none() {
+		if network_required(&plan.params) && runtime.network.is_none() {
 			runtime.network_spec = Some(json!({
 				"flavor": "user",
 				"guest_config": user_net_guest_config(),
@@ -933,14 +1429,27 @@ impl Engine {
 		if let Some(secs) = plan.timeout_secs {
 			spec = spec.with_timeout_secs(secs);
 		}
-		if !plan.params.block_network {
+		if network_required(&plan.params) {
 			if cfg!(target_os = "macos") {
 				reject_macos_host_network_features(&plan.params)?;
 				spec = spec.with_user_net();
+				if credentials_requested(&plan.params) {
+					let port = runtime
+						.credential_gateway
+						.as_ref()
+						.ok_or_else(|| EngineError::engine("credential gateway was not started"))?
+						.port();
+					spec = spec.with_restricted_user_net(port);
+				}
 			} else {
 				let network = self.setup_network(&plan.sid, &plan.params)?;
 				let tap = network.guest_config.tap.clone();
+				let host_ip =
+					network.guest_config.host_ip.parse().map_err(|_| {
+						EngineError::engine("allocated host gateway is not an IP address")
+					})?;
 				runtime.network = Some(network);
+				self.start_credential_gateway(plan, runtime, host_ip, host_ip)?;
 				spec = spec.with_tap(tap);
 			}
 		}
@@ -961,11 +1470,21 @@ impl Engine {
 	}
 
 	fn setup_network(&self, name: &str, params: &SandboxCreate) -> Result<SandboxNetwork> {
+		let egress_allow = if params.block_network {
+			Some(&[] as &[String])
+		} else {
+			params.egress_allow.as_deref()
+		};
+		let egress_allow_domains = if params.block_network {
+			Some(&[] as &[String])
+		} else {
+			params.egress_allow_domains.as_deref()
+		};
 		self.inner.net_runtime.block_on(net::setup_sandbox_network(
 			name,
 			params.ports.as_deref().unwrap_or(&[]),
-			params.egress_allow.as_deref(),
-			params.egress_allow_domains.as_deref(),
+			egress_allow,
+			egress_allow_domains,
 			params.inbound_cidr_allowlist.as_deref(),
 		))
 	}
@@ -1141,11 +1660,11 @@ impl Engine {
 		}
 		let vm = self.sandbox(&record.name);
 		if record.pid.is_some() && !self.sandbox_is_running(&vm)? {
-			// The VMM died on its own (e.g. --timeout-secs self-kill, guest
-			// poweroff): surface its status.json exit code in the view like
-			// Python's poll()/status.json path does.
+			// Seal staged volumes and release runtime resources before publishing a
+			// terminal state for autonomous guest exits.
 			let returncode = Self::poll_returncode(&record.name);
-			let _ = self.persist_status(&record.id, "stopped", returncode, None);
+			let sealed_returncode = self.teardown(&record)?.or(returncode);
+			self.persist_status(&record.id, "stopped", sealed_returncode, None)?;
 			let updated = self
 				.inner
 				.registry
@@ -1170,9 +1689,18 @@ impl Engine {
 			.persist_record_status(self.home(), id, status, returncode, terminated_at)
 	}
 
-	fn teardown(&self, record: &VmRecord) -> Option<i64> {
+	fn teardown(&self, record: &VmRecord) -> Result<Option<i64>> {
 		let name = &record.name;
 		let mut returncode = Self::poll_returncode(name);
+		let vm = self.sandbox(name);
+		if let Err(error) = self.stop_sandbox(&vm, true)
+			&& self.sandbox_is_running(&vm).unwrap_or(true)
+		{
+			return Err(error);
+		}
+		if returncode.is_none() {
+			returncode = Self::poll_returncode(name);
+		}
 		let removed = self.inner.runtimes.lock().remove(name);
 		if let Some(mut state) = removed {
 			if let Some(stop) = state.timeout_stop.take() {
@@ -1181,22 +1709,51 @@ impl Engine {
 			if let Some(agent) = state.agent.take() {
 				agent.close();
 			}
+			for volume in &mut state.encrypted_volumes {
+				if let Err(error) = volume.seal(&self.inner.keyring) {
+					self.inner.runtimes.lock().insert(name.to_owned(), state);
+					return Err(error);
+				}
+			}
 			drop(state.s3_proxy.take());
 			if let Some(network) = state.network.take() {
-				let _ = network.teardown();
+				network.teardown()?;
 			} else {
 				teardown_network(name);
 			}
 			drop(state.volume_locks);
+			drop(state.encrypted_volumes);
 		} else {
 			teardown_network(name);
 		}
-		let vm = self.sandbox(name);
-		let _ = self.stop_sandbox(&vm, true);
-		if returncode.is_none() {
-			returncode = Self::poll_returncode(name);
-		}
-		returncode
+		Ok(returncode)
+	}
+
+	fn begin_state_transition(&self, id: &str, desired: &str) -> Result<()> {
+		let record = self.get_record(id, false)?;
+		let generation = record
+			.detail
+			.get("state_generation")
+			.and_then(Value::as_u64)
+			.unwrap_or(0)
+			.saturating_add(1);
+		self.mesh_update_detail_fields(
+			id,
+			Map::from_iter([
+				("desired_state".to_owned(), json!(desired)),
+				("state_generation".to_owned(), json!(generation)),
+			]),
+		)
+	}
+
+	fn complete_state_transition(&self, id: &str, observed: &str) -> Result<()> {
+		self.mesh_update_detail_fields(
+			id,
+			Map::from_iter([
+				("observed_state".to_owned(), json!(observed)),
+				("state_changed_at_unix_millis".to_owned(), json!(unix_millis())),
+			]),
+		)
 	}
 
 	fn poll_returncode(name: &str) -> Option<i64> {
@@ -1242,35 +1799,250 @@ impl Engine {
 		self.snapshot_root().join(name)
 	}
 
-	fn require_snapshot_dir(&self, name: &str) -> Result<PathBuf> {
+	fn snapshot_archive(&self, name: &str) -> Result<PathBuf> {
 		validate_local_name("snapshot name", name)?;
-		let root = match fs::canonicalize(self.snapshot_root()) {
-			Ok(root) => root,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => {
-				return Err(EngineError::not_found(format!("snapshot not found: {name}")));
-			},
-			Err(error) => return Err(error.into()),
-		};
-		let dir = root.join(name);
-		let metadata = match fs::symlink_metadata(&dir) {
+		Ok(self.snapshot_root().join(format!("{name}.venc")))
+	}
+
+	fn open_snapshot(&self, name: &str) -> Result<SnapshotSource> {
+		let archive = self.snapshot_archive(name)?;
+		let metadata = match fs::symlink_metadata(&archive) {
 			Ok(metadata) => metadata,
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {
 				return Err(EngineError::not_found(format!("snapshot not found: {name}")));
 			},
 			Err(error) => return Err(error.into()),
 		};
-		if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		if metadata.file_type().is_symlink() || !metadata.is_file() {
 			return Err(EngineError::invalid(format!(
-				"snapshot {name:?} is not a regular snapshot directory"
+				"snapshot {name:?} is not a regular encrypted archive"
 			)));
 		}
-		let canonical = fs::canonicalize(&dir)?;
-		if canonical.parent() != Some(root.as_path()) {
+		let runtime_root = self.home().security_dir().join("runtime");
+		fs::create_dir_all(&runtime_root)?;
+		fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
+		let extract_root = runtime_root.join(format!("snapshot-{}", random_hex(24)));
+		let path = EncryptedArchive::open(&archive, &extract_root, &self.inner.keyring)?;
+		Ok(SnapshotSource { path, guard: Some(Arc::new(TransientDir(extract_root))) })
+	}
+
+	fn recovery_root(&self, id: &str) -> Result<PathBuf> {
+		validate_local_name("sandbox name", id)?;
+		Ok(self.home().security_dir().join("recovery").join(id))
+	}
+
+	fn recovery_archive(&self, id: &str, recovery_point: &str) -> Result<PathBuf> {
+		validate_local_name("recovery point", recovery_point)?;
+		Ok(self
+			.recovery_root(id)?
+			.join(format!("{recovery_point}.venc")))
+	}
+
+	fn recovery_points(&self, id: &str) -> Result<Vec<RecoveryPoint>> {
+		let root = self.recovery_root(id)?;
+		let mut points = match fs::read_dir(root) {
+			Ok(entries) => entries
+				.filter_map(std::result::Result::ok)
+				.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+				.filter_map(|entry| {
+					let file_name = entry.file_name();
+					let name = file_name.to_str()?.strip_suffix(".venc")?;
+					let mut fields = name.splitn(3, '-');
+					let created_at_unix_millis = fields.next()?.parse().ok()?;
+					let kind = fields.next()?.to_owned();
+					let size_bytes = entry.metadata().ok()?.len();
+					Some(RecoveryPoint {
+						name: name.to_owned(),
+						kind,
+						created_at_unix_millis,
+						size_bytes,
+					})
+				})
+				.collect::<Vec<_>>(),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+			Err(error) => return Err(error.into()),
+		};
+		points.sort_by_key(|point| point.created_at_unix_millis);
+		Ok(points)
+	}
+
+	fn prune_recovery(&self, id: &str, protected: Option<&str>) -> Result<()> {
+		let points = self.recovery_points(id)?;
+		let retain = self.inner.config.history_retention.max(1);
+		let now = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
+		let max_age_millis = (self.inner.config.history_max_age_sec * 1000.0) as u64;
+		for (index, point) in points.iter().enumerate() {
+			let over_count = points.len().saturating_sub(index) > retain;
+			let expired =
+				max_age_millis > 0 && now.saturating_sub(point.created_at_unix_millis) > max_age_millis;
+			if point.name != protected.unwrap_or_default()
+				&& (over_count || expired)
+				&& index + 1 < points.len()
+			{
+				fs::remove_file(self.recovery_archive(id, &point.name)?)?;
+			}
+		}
+		Ok(())
+	}
+
+	fn capture_recovery(&self, id: &str, kind: &str, keep_running: bool) -> Result<RecoveryPoint> {
+		let (record, mut params) = self.mesh_checkpoint_params(id)?;
+		let created_at_unix_millis = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
+		let recovery_point = format!("{created_at_unix_millis:020}-{kind}-{}", random_hex(8));
+		let archive = self.recovery_archive(id, &recovery_point)?;
+		let key_id = record
+			.detail
+			.get("encryption_key_id")
+			.and_then(Value::as_str)
+			.unwrap_or("default");
+		params.remove("secrets");
+		if let Some(credentials) = params.remove("credential_names") {
+			params.insert("credentials".to_owned(), credentials);
+		}
+		params.insert("agent".to_owned(), json!(true));
+		let runtime_root = self.home().security_dir().join("runtime");
+		fs::create_dir_all(&runtime_root)?;
+		fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
+		let capture_root = runtime_root.join(format!("capture-{}", random_hex(24)));
+		let capture_guard = TransientDir(capture_root.clone());
+		let vm = self.sandbox(&record.name);
+		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
+		self.snapshot_machine_while_paused(
+			&vm,
+			"state",
+			keep_running,
+			disk.as_deref(),
+			&capture_root,
+			false,
+			|dir| {
+				stamp_checkpoint_rootfs(self.home(), dir, record.detail.as_object())?;
+				stamp_checkpoint_marker(dir, record.detail.as_object())?;
+				capture_checkpoint_volumes(
+					self,
+					&record.name,
+					dir,
+					record.detail.get("volumes"),
+				)?;
+				ensure_checkpoint_template_present(dir)?;
+				fs::write(
+					dir.join("recovery.json"),
+					serde_json::to_vec(&json!({
+						"version": 1,
+						"sandbox_id": id,
+						"kind": kind,
+						"created_at_unix_millis": created_at_unix_millis,
+						"params": params,
+					}))?,
+				)?;
+				EncryptedArchive::seal(dir, &archive, &self.inner.keyring, key_id)
+			},
+		)?;
+		drop(capture_guard);
+		self.prune_recovery(id, Some(&recovery_point))?;
+		let size_bytes = fs::metadata(&archive)?.len();
+		Ok(RecoveryPoint {
+			name: recovery_point,
+			kind: kind.to_owned(),
+			created_at_unix_millis,
+			size_bytes,
+		})
+	}
+
+	fn open_recovery(
+		&self,
+		id: &str,
+		recovery_point: &str,
+	) -> Result<(SnapshotSource, Map<String, Value>)> {
+		let archive = self.recovery_archive(id, recovery_point)?;
+		let metadata = fs::symlink_metadata(&archive).map_err(|error| {
+			if error.kind() == io::ErrorKind::NotFound {
+				EngineError::not_found(format!("recovery point not found: {recovery_point}"))
+			} else {
+				error.into()
+			}
+		})?;
+		if metadata.file_type().is_symlink() || !metadata.is_file() {
 			return Err(EngineError::invalid(format!(
-				"snapshot {name:?} resolves outside the snapshot root"
+				"recovery point {recovery_point:?} is not a regular encrypted archive"
 			)));
 		}
-		Ok(canonical)
+		let runtime_root = self.home().security_dir().join("runtime");
+		fs::create_dir_all(&runtime_root)?;
+		fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
+		let extract_root = runtime_root.join(format!("recovery-{}", random_hex(24)));
+		let path = EncryptedArchive::open(&archive, &extract_root, &self.inner.keyring)?;
+		let manifest =
+			serde_json::from_slice::<Value>(&read_snapshot_metadata(&path.join("recovery.json"))?)?;
+		if manifest.get("version").and_then(Value::as_u64) != Some(1)
+			|| manifest.get("sandbox_id").and_then(Value::as_str) != Some(id)
+		{
+			return Err(EngineError::invalid("recovery manifest does not match sandbox"));
+		}
+		let params = manifest
+			.get("params")
+			.and_then(Value::as_object)
+			.cloned()
+			.ok_or_else(|| EngineError::invalid("recovery manifest is missing params"))?;
+		Ok((SnapshotSource { path, guard: Some(Arc::new(TransientDir(extract_root))) }, params))
+	}
+
+	fn restore_recovery_identity(&self, id: &str, recovery_point: &str) -> Result<Value> {
+		let previous = self.get_record(id, false)?;
+		let (source, mut params) = self.open_recovery(id, recovery_point)?;
+		params.insert("name".to_owned(), json!(id));
+		if previous.status == "running" {
+			self.teardown(&previous)?;
+		}
+		let vm = self.sandbox(id);
+		let _ = self.stop_sandbox(&vm, true);
+		self.remove_sandbox(&vm)?;
+		self.inner.registry.remove(id);
+		let result = self.restore_from_template(params, &source.path, true);
+		match result {
+			Ok(_) => {
+				if let Some(guard) = source.guard {
+					self
+						.inner
+						.runtimes
+						.lock()
+						.entry(id.to_owned())
+						.or_default()
+						.snapshot_source = Some(guard);
+				}
+				let mut restored = self.inner.registry.get(id).ok_or_else(|| {
+					EngineError::engine("recovery restore completed without a registry record")
+				})?;
+				restored.created_at = previous.created_at;
+				restored.source = previous.source;
+				if let Some(detail) = restored.detail.as_object_mut() {
+					detail.insert("status".to_owned(), json!("running"));
+					detail.insert("desired_state".to_owned(), json!("running"));
+					detail.insert("observed_state".to_owned(), json!("running"));
+					detail.insert("recovery_point".to_owned(), json!(recovery_point));
+				}
+				self
+					.inner
+					.registry
+					.insert_persisted(self.home(), restored.clone())?;
+				Ok(restored.view())
+			},
+			Err(error) => {
+				let mut fallback = previous;
+				if fallback.status != "suspended" {
+					"stopped".clone_into(&mut fallback.status);
+				}
+				if let Some(detail) = fallback.detail.as_object_mut() {
+					detail.insert("status".to_owned(), json!(fallback.status));
+					detail.insert("observed_state".to_owned(), json!(fallback.status));
+				}
+				fs::create_dir_all(self.home().vm_dir(id))?;
+				self
+					.inner
+					.registry
+					.insert_persisted(self.home(), fallback)?;
+				Err(error)
+			},
+		}
 	}
 
 	fn ensure_snapshot_target_available(&self, name: &str) -> Result<()> {
@@ -1301,10 +2073,36 @@ impl Engine {
 		mode: SnapshotLaunchMode,
 		options: &ResolvedSnapshotOptions,
 		s3_mounts: &[ResolvedS3Mount],
+		snapshot_source: Option<Arc<TransientDir>>,
 	) -> Result<(SandboxVm, VmRecord)> {
 		self.ensure_snapshot_target_available(&name)?;
 		let vm = self.sandbox(&name);
 		let result = (|| {
+			let mut runtime = RuntimeState {
+				secret_env: options.secret_env.clone(),
+				env: options.env.clone(),
+				workdir: options.workdir.clone(),
+				snapshot_source,
+				network_policy: NetworkPolicy {
+					block_network:          Some(options.block_network.unwrap_or(true)),
+					egress_allow:           options.egress_allow.clone(),
+					egress_allow_domains:   options.egress_allow_domains.clone(),
+					inbound_cidr_allowlist: options.inbound_cidr_allowlist.clone(),
+				},
+				identity_complete: true,
+				..RuntimeState::default()
+			};
+			let network_params = SandboxCreate {
+				block_network: options.block_network.unwrap_or(true),
+				ports: options.ports.clone(),
+				egress_allow: options.egress_allow.clone(),
+				egress_allow_domains: options.egress_allow_domains.clone(),
+				inbound_cidr_allowlist: options.inbound_cidr_allowlist.clone(),
+				credentials: Some(options.credentials.clone()),
+				owner_tenant: options.owner_tenant.clone(),
+				encryption_key_id: options.encryption_key_id.clone(),
+				..SandboxCreate::default()
+			};
 			let mut spec = match mode {
 				SnapshotLaunchMode::Restore => LaunchSpec::restore(vm.api_sock(), snapshot_dir),
 				SnapshotLaunchMode::Fork => LaunchSpec::fork_from(vm.api_sock(), snapshot_dir),
@@ -1314,8 +2112,62 @@ impl Engine {
 			if base_disk.is_file() {
 				spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
 			}
+			if network_required(&network_params) {
+				if cfg!(target_os = "macos") {
+					reject_macos_host_network_features(&network_params)?;
+					spec = spec.with_user_net();
+					runtime.network_spec = Some(json!({
+						"flavor": "user",
+						"guest_config": user_net_guest_config(),
+						"ports": [],
+						"tunnels": {},
+						"policy": policy_json(&runtime.network_policy),
+					}));
+					self.start_credential_gateway_for(
+						&options.owner_tenant,
+						&name,
+						&options.credentials,
+						&mut runtime,
+						"127.0.0.1".parse().expect("loopback IP"),
+						net::USER_NET_GATEWAY.parse().expect("user gateway IP"),
+					)?;
+					if !options.credentials.is_empty() {
+						let port = runtime
+							.credential_gateway
+							.as_ref()
+							.ok_or_else(|| EngineError::engine("credential gateway was not started"))?
+							.port();
+						spec = spec.with_restricted_user_net(port);
+					}
+				} else {
+					let network = self.setup_network(&name, &network_params)?;
+					let tap = network.guest_config.tap.clone();
+					let host_ip = network.guest_config.host_ip.parse().map_err(|_| {
+						EngineError::engine("allocated host gateway is not an IP address")
+					})?;
+					let tunnels = network.tunnels();
+					runtime.network_spec = Some(json!({
+						"flavor": "tap",
+						"guest_config": network_guest_json(&network.guest_config),
+						"ports": sorted_ports(options.ports.as_deref(), &tunnels),
+						"tunnels": tunnels_json(&tunnels),
+						"policy": policy_json(&runtime.network_policy),
+					}));
+					runtime.network = Some(network);
+					self.start_credential_gateway_for(
+						&options.owner_tenant,
+						&name,
+						&options.credentials,
+						&mut runtime,
+						host_ip,
+						host_ip,
+					)?;
+					spec = spec.with_tap(tap);
+				}
+			}
 			let needs_agent = options.agent
 				|| !s3_mounts.is_empty()
+				|| !options.credentials.is_empty()
 				|| options.readiness_probe.is_some()
 				|| options
 					.command
@@ -1328,15 +2180,8 @@ impl Engine {
 				spec = spec.with_timeout_secs(timeout_secs);
 			}
 			let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, s3_mounts)?;
+			runtime.s3_proxy = s3_proxy;
 			self.launch_sandbox(&vm, &spec)?;
-
-			let mut runtime = RuntimeState {
-				secret_env: options.secret_env.clone(),
-				env: options.env.clone(),
-				workdir: options.workdir.clone(),
-				s3_proxy,
-				..RuntimeState::default()
-			};
 			if let Some(timeout_secs) = options.timeout_secs {
 				runtime.timeout_stop = Some(start_timeout_watchdog(
 					name.clone(),
@@ -1360,15 +2205,20 @@ impl Engine {
 			}
 
 			let mut detail = vm.meta()?;
-			if let Some(block_network) = options.block_network {
-				detail.insert("block_network".to_owned(), json!(block_network));
-			}
+			detail.insert("block_network".to_owned(), json!(options.block_network.unwrap_or(true)));
 			detail.insert("workdir".to_owned(), json!(runtime.workdir));
 			detail.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
 			detail.insert("secret_names".to_owned(), json!(options.secret_names));
+			detail.insert("credential_names".to_owned(), json!(options.credentials));
+			detail.insert("owner_tenant".to_owned(), json!(options.owner_tenant));
+			detail.insert("encryption_key_id".to_owned(), json!(options.encryption_key_id));
+			detail.insert("desired_state".to_owned(), json!("running"));
+			detail.insert("observed_state".to_owned(), json!("running"));
+			detail.insert("state_generation".to_owned(), json!(1));
 			detail.insert("tags".to_owned(), json!(options.tags));
 			detail.insert("timeout_secs".to_owned(), json!(options.timeout_secs));
 			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(s3_mounts));
+			detail.insert("network".to_owned(), json!(runtime.network_spec));
 			if let Some(command) = &options.command {
 				detail.insert("command".to_owned(), json!(command));
 			}
@@ -1424,6 +2274,30 @@ impl Engine {
 		snapshot_root: &Path,
 		track: bool,
 	) -> Result<PathBuf> {
+		self.snapshot_machine_while_paused(
+			vm,
+			name,
+			keep_running,
+			disk_src,
+			snapshot_root,
+			track,
+			|_| Ok(()),
+		)
+	}
+
+	fn snapshot_machine_while_paused<F>(
+		&self,
+		vm: &SandboxVm,
+		name: &str,
+		keep_running: bool,
+		disk_src: Option<&Path>,
+		snapshot_root: &Path,
+		track: bool,
+		while_paused: F,
+	) -> Result<PathBuf>
+	where
+		F: FnOnce(&Path) -> Result<()>,
+	{
 		validate_local_name("snapshot name", name)?;
 		fs::create_dir_all(snapshot_root)?;
 		let root = fs::canonicalize(snapshot_root)?;
@@ -1440,13 +2314,13 @@ impl Engine {
 		}
 		let mut control = control_for_vm(vm)?;
 		control.pause()?;
-		// Copy the disk while still paused so the image matches the captured
-		// memory/state exactly; on APFS this is a cheap clone.
+		// Copy all guest-writable state while devices and vCPUs are quiesced.
 		let snapshot_result = control.snapshot(name, None, track).and_then(|_| {
 			if let Some(disk_src) = disk_src.filter(|path| path.is_file()) {
 				fs::create_dir_all(&dir)?;
 				fs::copy(disk_src, dir.join("rootfs.img"))?;
 			}
+			while_paused(&dir)?;
 			Ok(Value::Null)
 		});
 		if let Err(error) = snapshot_result {
@@ -1733,7 +2607,7 @@ impl Engine {
 	/// `Unsupported` for sandboxes that cannot move hosts (`fs_dir` shares,
 	/// rehydrated records, missing network state).
 	fn mesh_checkpoint_params(&self, sid: &str) -> Result<(VmRecord, Map<String, Value>)> {
-		let record = self.get_record(sid, true)?;
+		let record = self.get_record(sid, false)?;
 		let detail = record.detail.as_object().cloned().unwrap_or_default();
 		if detail
 			.get("fs_dir")
@@ -1749,12 +2623,17 @@ impl Engine {
 		// identity needed to restore it elsewhere.
 		let (env, secret_env, network_spec, workdir) = {
 			let runtimes = self.inner.runtimes.lock();
-			let Some(runtime) = runtimes.get(sid) else {
+			let Some(runtime) = runtimes.get(&record.name) else {
 				return Err(EngineError::unsupported(
 					"migration requires a live in-process sandbox; one rehydrated after a daemon \
 					 restart has lost the identity needed to move it",
 				));
 			};
+			if !runtime.identity_complete {
+				return Err(EngineError::unsupported(
+					"migration requires complete in-process restore identity",
+				));
+			}
 			(
 				runtime.env.clone(),
 				runtime.secret_env.clone(),
@@ -1826,19 +2705,27 @@ impl Engine {
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
 		let vm = self.sandbox(sid);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let snapshot_dir = self.snapshot_machine(
+		let mut snapshot_ms = 0;
+		let snapshot_dir = self.snapshot_machine_while_paused(
 			&vm,
 			&snapshot,
 			true,
 			disk.as_deref(),
 			&self.snapshot_root(),
 			track,
+			|snapshot_dir| {
+				snapshot_ms = t0.elapsed().as_millis();
+				stamp_checkpoint_rootfs(self.home(), snapshot_dir, record.detail.as_object())?;
+				stamp_checkpoint_marker(snapshot_dir, record.detail.as_object())?;
+				capture_checkpoint_volumes(
+					self,
+					sid,
+					snapshot_dir,
+					record.detail.get("volumes"),
+				)?;
+				ensure_checkpoint_template_present(snapshot_dir)
+			},
 		)?;
-		let snapshot_ms = t0.elapsed().as_millis();
-		stamp_checkpoint_rootfs(self.home(), &snapshot_dir, record.detail.as_object())?;
-		stamp_checkpoint_marker(&snapshot_dir, record.detail.as_object())?;
-		capture_checkpoint_volumes(self.home(), &snapshot_dir, record.detail.get("volumes"))?;
-		ensure_checkpoint_template_present(&snapshot_dir)?;
 		let stamp_ms = t0.elapsed().as_millis() - snapshot_ms;
 		let digest = image::cas::index_template(&snapshot_dir, None)?;
 		tracing::info!(
@@ -1924,7 +2811,7 @@ impl Engine {
 					)?;
 				}
 			}
-			capture_checkpoint_volumes(self.home(), &dir, record.detail.get("volumes"))?;
+			capture_checkpoint_volumes(self, sid, &dir, record.detail.get("volumes"))?;
 			stamp_checkpoint_marker(&dir, record.detail.as_object())?;
 			image::cas::index_template(&dir, None)
 		})();
@@ -1942,7 +2829,7 @@ impl Engine {
 		// Point of no return: the delta checkpoint is durable, so stop the
 		// source exactly at it. Route the stop through engine teardown so
 		// TAP/lease and volume locks are released, not just the VMM process.
-		let rc = self.teardown(&record);
+		let rc = self.teardown(&record)?;
 		self.persist_status(sid, "stopped", rc, None)?;
 		Ok(crate::mesh::reconciler::ReplicatePreparation {
 			digest,
@@ -2049,24 +2936,59 @@ impl Engine {
 	/// nor poisons the collision guard on the next attempt.
 	pub(crate) fn mesh_restore_from_template(
 		&self,
-		mut params: Map<String, Value>,
+		params: Map<String, Value>,
 		template_dir: &Path,
 		_quorum_ok: bool,
 	) -> Result<Value> {
+		self.restore_from_template(params, template_dir, false)
+	}
+
+	fn restore_from_template(
+		&self,
+		mut params: Map<String, Value>,
+		template_dir: &Path,
+		replace_volumes: bool,
+	) -> Result<Value> {
 		validate_network_restore(&params)?;
-		let created = materialize_checkpoint_volumes(
-			self.home(),
-			template_dir,
-			params.get("volumes").and_then(Value::as_object),
-		)?;
+		let key_id = params
+			.get("encryption_key_id")
+			.and_then(Value::as_str)
+			.unwrap_or("default");
+		let mut backups = Vec::new();
+		let created = if replace_volumes {
+			backups = restore_checkpoint_volumes_in_place(
+				self.home(),
+				&self.inner.keyring,
+				key_id,
+				template_dir,
+				params.get("volumes").and_then(Value::as_object),
+			)?;
+			Vec::new()
+		} else {
+			materialize_checkpoint_volumes(
+				self.home(),
+				&self.inner.keyring,
+				key_id,
+				template_dir,
+				params.get("volumes").and_then(Value::as_object),
+			)?
+		};
 		params.insert("template".to_owned(), json!(template_dir.to_string_lossy()));
 		match self.mesh_create_from_params(params) {
-			Ok(view) => Ok(view),
-			Err(err) => {
-				for path in created {
-					let _ = fs::remove_dir_all(path);
+			Ok(view) => {
+				for backup in backups {
+					backup.commit();
 				}
-				Err(err)
+				Ok(view)
+			},
+			Err(error) => {
+				for path in created {
+					remove_volume_artifact(&path);
+				}
+				for backup in backups.into_iter().rev() {
+					backup.rollback()?;
+				}
+				Err(error)
 			},
 		}
 	}
@@ -2113,7 +3035,15 @@ impl TemplateBooter for Engine {
 		let _ = self.remove_sandbox(&old);
 		let (tap_name, guest_config) = if spec.tap_slot {
 			let config = net::allocate_guest_config(&spec.vm_name)?;
-			net::setup_tap(&config.tap, &config.guest_ip, &config.host_ip, config.prefix, None, None)?;
+			net::setup_tap(
+				&config.tap,
+				&config.guest_ip,
+				&config.host_ip,
+				config.prefix,
+				None,
+				None,
+				None,
+			)?;
 			(Some(config.tap.clone()), Some(config))
 		} else {
 			(None, None)
@@ -2284,11 +3214,12 @@ impl EngineApi for Engine {
 			terminated_at: None,
 			error:         None,
 		};
+		if let Err(error) = self.inner.registry.insert_persisted(self.home(), record.clone()) {
+			let mut runtime = runtime;
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
 		self.inner.runtimes.lock().insert(plan.sid.clone(), runtime);
-		self
-			.inner
-			.registry
-			.insert_persisted(self.home(), record.clone())?;
 		if let Some(key) = plan
 			.params
 			.idempotency_key
@@ -2364,8 +3295,10 @@ impl EngineApi for Engine {
 		if record.status == "terminated" {
 			return Ok(json!({ "name": id, "status": record.status }));
 		}
-		let teardown_rc = self.teardown(&record);
+		self.begin_state_transition(id, "stopped")?;
+		let teardown_rc = self.teardown(&record)?;
 		self.persist_status(id, "stopped", returncode.or(teardown_rc), None)?;
+		self.complete_state_transition(id, "stopped")?;
 		let record = self.inner.registry.get(id).unwrap_or(record);
 		self.publish_record_event("stopped", &record);
 		Ok(json!({ "name": id, "status": "stopped" }))
@@ -2373,7 +3306,7 @@ impl EngineApi for Engine {
 
 	fn remove(&self, id: &str) -> Result<Value> {
 		let record = self.get_record(id, false)?;
-		let _ = self.teardown(&record);
+		self.teardown(&record)?;
 		self.remove_sandbox(&self.sandbox(id))?;
 		self.inner.registry.remove(id);
 		self.publish_record_event("removed", &record);
@@ -2382,7 +3315,7 @@ impl EngineApi for Engine {
 
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value> {
 		let record = self.get_record(id, true)?;
-		let returncode = self.teardown(&record);
+		let returncode = self.teardown(&record)?;
 		let terminated_at = unix_time();
 		self.persist_status(id, "terminated", returncode, Some(terminated_at))?;
 		let oom = detect_oom(id);
@@ -2409,17 +3342,90 @@ impl EngineApi for Engine {
 	}
 
 	fn pause(&self, id: &str) -> Result<Value> {
-		let record = self.get_record(id, true)?;
+		self.get_record(id, true)?;
+		self.begin_state_transition(id, "paused")?;
 		let result = control_for_vm(&self.sandbox(id))?.pause()?;
+		self.complete_state_transition(id, "paused")?;
+		let record = self
+			.inner
+			.registry
+			.get(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
 		self.publish_record_event("paused", &record);
 		Ok(result)
 	}
 
 	fn resume(&self, id: &str) -> Result<Value> {
-		let record = self.get_record(id, true)?;
+		let record = self.get_record(id, false)?;
+		if record.status == "suspended" {
+			let recovery_point = record
+				.detail
+				.get("suspend_recovery_point")
+				.and_then(Value::as_str)
+				.map(str::to_owned)
+				.or_else(|| {
+					self
+						.recovery_points(id)
+						.ok()?
+						.last()
+						.map(|point| point.name.clone())
+				})
+				.ok_or_else(|| EngineError::not_found("suspended sandbox has no recovery point"))?;
+			self.begin_state_transition(id, "running")?;
+			let view = self.restore_recovery_identity(id, &recovery_point)?;
+			if let Some(record) = self.inner.registry.get(id) {
+				self.publish_record_event("resumed", &record);
+			}
+			return Ok(view);
+		}
+		if record.status != "running" {
+			return Err(EngineError::not_running(format!("sandbox '{id}' is not running")));
+		}
+		self.begin_state_transition(id, "running")?;
 		let result = control_for_vm(&self.sandbox(id))?.resume()?;
-		self.publish_record_event("resumed", &record);
+		self.complete_state_transition(id, "running")?;
+		if let Some(record) = self.inner.registry.get(id) {
+			self.publish_record_event("resumed", &record);
+		}
 		Ok(result)
+	}
+
+	fn suspend(&self, id: &str) -> Result<Value> {
+		let record = self.get_record(id, true)?;
+		self.begin_state_transition(id, "suspended")?;
+		let recovery_point = self.capture_recovery(id, "checkpoint", false)?;
+		let returncode = self.teardown(&record)?;
+		self.persist_status(id, "suspended", returncode, None)?;
+		self.mesh_update_detail_fields(
+			id,
+			Map::from_iter([("suspend_recovery_point".to_owned(), json!(recovery_point.name))]),
+		)?;
+		self.complete_state_transition(id, "suspended")?;
+		let record = self
+			.inner
+			.registry
+			.get(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		self.publish_record_event("suspended", &record);
+		Ok(record.view())
+	}
+
+	fn history(&self, id: &str) -> Result<Vec<RecoveryPoint>> {
+		self.get_record(id, false)?;
+		self.prune_recovery(id, None)?;
+		self.recovery_points(id)
+	}
+
+	fn rollback(&self, id: &str, recovery_point: &str) -> Result<Value> {
+		self.get_record(id, false)?;
+		let (source, _) = self.open_recovery(id, recovery_point)?;
+		drop(source);
+		self.begin_state_transition(id, "running")?;
+		let view = self.restore_recovery_identity(id, recovery_point)?;
+		if let Some(record) = self.inner.registry.get(id) {
+			self.publish_record_event("rollback", &record);
+		}
+		Ok(view)
 	}
 
 	fn extend(&self, id: &str, secs: u64) -> Result<Value> {
@@ -2564,6 +3570,7 @@ impl EngineApi for Engine {
 
 	fn shell_start(&self, params: Value) -> Result<ShellSession> {
 		let ref_name = params.get("ref").and_then(Value::as_str);
+		let required_owner = params.get("_vmon_owner_tenant").and_then(Value::as_str);
 		let image = params
 			.get("image")
 			.and_then(Value::as_str)
@@ -2585,13 +3592,36 @@ impl EngineApi for Engine {
 					.map(|part| (*part).to_owned())
 					.collect()
 			});
-		if let Some(ref_name) = ref_name
-			&& self.inner.registry.get(ref_name).is_some()
-			&& self.get_record(ref_name, true).is_ok()
-		{
-			let stream =
-				self.exec_stream(ref_name, ExecRequest { cmd, tty: true, ..ExecRequest::default() })?;
-			return Ok(ShellSession { name: ref_name.to_owned(), stream, ephemeral: false });
+		if let Some(ref_name) = ref_name {
+			match self.get_record(ref_name, true) {
+				Ok(record) => {
+					let owner = record
+						.detail
+						.get("owner_tenant")
+						.and_then(Value::as_str)
+						.unwrap_or("default");
+					if required_owner.is_some_and(|required| required != owner) {
+						return Err(EngineError::not_found(format!(
+							"sandbox {ref_name:?} does not exist"
+						)));
+					}
+					let stream = self.exec_stream(
+						&record.id,
+						ExecRequest { cmd, tty: true, ..ExecRequest::default() },
+					)?;
+					return Ok(ShellSession {
+						name: record.name,
+						stream,
+						ephemeral: false,
+					});
+				},
+				Err(_) if required_owner.is_some() => {
+					return Err(EngineError::not_found(format!(
+						"sandbox {ref_name:?} does not exist"
+					)));
+				},
+				Err(_) => {},
+			}
 		}
 		let mut create = SandboxCreate {
 			image: image
@@ -2700,10 +3730,14 @@ impl EngineApi for Engine {
 					.clone()
 					.or_else(|| state.network_policy.egress_allow.clone())
 			};
-			let domain_list = policy
-				.domain_allow
-				.clone()
-				.or_else(|| state.network_policy.egress_allow_domains.clone());
+			let domain_list = if policy.block_network == Some(true) {
+				Some(Vec::new())
+			} else {
+				policy
+					.domain_allow
+					.clone()
+					.or_else(|| state.network_policy.egress_allow_domains.clone())
+			};
 			net::setup_tap(
 				&network.guest_config.tap,
 				&network.guest_config.guest_ip,
@@ -2711,10 +3745,28 @@ impl EngineApi for Engine {
 				network.guest_config.prefix,
 				allow_list.as_deref(),
 				domain_list.as_deref(),
+				state.network_policy.egress_allow.as_deref(),
 			)?;
 			state.network_policy.block_network = policy.block_network.or(Some(false));
 			state.network_policy.egress_allow = allow_list;
 			state.network_policy.egress_allow_domains = domain_list;
+			self.mesh_update_detail_fields(
+				id,
+				Map::from_iter([
+					(
+						"block_network".to_owned(),
+						json!(state.network_policy.block_network.unwrap_or(false)),
+					),
+					("egress_allow".to_owned(), json!(state.network_policy.egress_allow)),
+					(
+						"egress_allow_domains".to_owned(),
+						json!(state.network_policy.egress_allow_domains),
+					),
+				]),
+			)?;
+			if state.credential_gateway.is_some() {
+				network.allow_credential_gateway()?;
+			}
 		}
 		drop(runtimes);
 		if let Some(value) = policy.block_network {
@@ -2722,6 +3774,13 @@ impl EngineApi for Engine {
 				.inner
 				.registry
 				.set_detail_field(id, "block_network", json!(value));
+			if value {
+				self.inner.registry.set_detail_field(id, "egress_allow", json!([]));
+				self
+					.inner
+					.registry
+					.set_detail_field(id, "egress_allow_domains", json!([]));
+			}
 		}
 		if let Some(value) = policy.cidr_allow {
 			self
@@ -2768,25 +3827,41 @@ impl EngineApi for Engine {
 	fn snapshot(&self, id: &str, name: Option<String>, stop: bool) -> Result<Value> {
 		let record = self.get_record(id, true)?;
 		let snapshot = name.unwrap_or_else(|| format!("{}-{}", id, unix_millis()));
-		let vm = self.sandbox(id);
+		let archive = self.snapshot_archive(&snapshot)?;
+		if archive.exists() {
+			return Err(EngineError::busy(format!("snapshot already exists: {snapshot}")));
+		}
+		let key_id = record
+			.detail
+			.get("encryption_key_id")
+			.and_then(Value::as_str)
+			.unwrap_or("default");
+		let vm = self.sandbox(&record.name);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		let dir = self.snapshot_machine(
+		let snapshot_root = self.snapshot_root();
+		let plaintext_dir = snapshot_root.join(&snapshot);
+		let cleanup = TransientDir(plaintext_dir);
+		self.snapshot_machine_while_paused(
 			&vm,
 			&snapshot,
 			!stop,
 			disk.as_deref(),
-			&self.snapshot_root(),
+			&snapshot_root,
 			false,
+			|dir| {
+				if let Some(s3_mounts) = record
+					.detail
+					.get("s3_mounts")
+					.filter(|mounts| mounts.as_object().is_some_and(|mounts| !mounts.is_empty()))
+				{
+					fs::write(dir.join(S3_MOUNTS_FILE), serde_json::to_vec(s3_mounts)?)?;
+				}
+				EncryptedArchive::seal(dir, &archive, &self.inner.keyring, key_id)
+			},
 		)?;
-		if let Some(s3_mounts) = record
-			.detail
-			.get("s3_mounts")
-			.filter(|mounts| mounts.as_object().is_some_and(|mounts| !mounts.is_empty()))
-		{
-			fs::write(dir.join(S3_MOUNTS_FILE), serde_json::to_vec(s3_mounts)?)?;
-		}
+		drop(cleanup);
 		if stop {
-			let rc = self.teardown(&record);
+			let rc = self.teardown(&record)?;
 			self.persist_status(id, "stopped", rc, None)?;
 		}
 		self.inc_counter("snapshot");
@@ -2798,21 +3873,28 @@ impl EngineApi for Engine {
 				("snapshot".to_owned(), json!(snapshot)),
 			]),
 		);
-		Ok(json!({ "snapshot": snapshot, "dir": dir.to_string_lossy() }))
+		Ok(json!({ "snapshot": snapshot, "encrypted": true, "key_id": key_id }))
 	}
 
 	fn snapshot_fs(&self, id: &str, name: Option<String>) -> Result<Value> {
-		self.get_record(id, true)?;
+		let record = self.get_record(id, true)?;
 		let image = name.unwrap_or_else(|| format!("{id}-img-{}", unix_time() as u64));
-		let tmp = self.snapshot(id, Some(image.clone()), false)?;
-		let src_dir = PathBuf::from(tmp.get("dir").and_then(Value::as_str).unwrap_or_default());
-		let dst_dir = self.home().templates_dir().join(&image);
-		if src_dir != dst_dir {
-			if dst_dir.exists() {
-				fs::remove_dir_all(&dst_dir)?;
-			}
-			fs::rename(&src_dir, &dst_dir)?;
+		let vm = self.sandbox(id);
+		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
+		let src_dir =
+			self.snapshot_machine(&vm, &image, true, disk.as_deref(), &self.snapshot_root(), false)?;
+		if let Some(s3_mounts) = record
+			.detail
+			.get("s3_mounts")
+			.filter(|mounts| mounts.as_object().is_some_and(|mounts| !mounts.is_empty()))
+		{
+			fs::write(src_dir.join(S3_MOUNTS_FILE), serde_json::to_vec(s3_mounts)?)?;
 		}
+		let dst_dir = self.home().templates_dir().join(&image);
+		if dst_dir.exists() {
+			fs::remove_dir_all(&dst_dir)?;
+		}
+		fs::rename(&src_dir, &dst_dir)?;
 		fs::write(
 			dst_dir.join("image.json"),
 			serde_json::to_string_pretty(
@@ -2823,24 +3905,57 @@ impl EngineApi for Engine {
 	}
 
 	fn snapshots(&self) -> Result<Vec<String>> {
-		let mut names = list_child_dirs(&self.snapshot_root());
+		let mut names = match fs::read_dir(self.snapshot_root()) {
+			Ok(entries) => entries
+				.filter_map(std::result::Result::ok)
+				.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+				.filter_map(|entry| {
+					entry
+						.file_name()
+						.to_str()
+						.and_then(|name| name.strip_suffix(".venc"))
+						.map(str::to_owned)
+				})
+				.collect::<Vec<_>>(),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+			Err(error) => return Err(error.into()),
+		};
 		names.sort();
 		Ok(names)
+	}
+
+	fn snapshot_delete(&self, snapshot: &str) -> Result<()> {
+		let archive = self.snapshot_archive(snapshot)?;
+		let metadata = match fs::symlink_metadata(&archive) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
+				return Err(EngineError::not_found(format!("snapshot not found: {snapshot}")));
+			},
+			Err(error) => return Err(error.into()),
+		};
+		if metadata.file_type().is_symlink() || !metadata.is_file() {
+			return Err(EngineError::invalid(format!(
+				"snapshot {snapshot:?} is not a regular encrypted archive"
+			)));
+		}
+		fs::remove_file(archive)?;
+		Ok(())
 	}
 
 	fn restore(&self, snapshot: &str, body: RestoreBody) -> Result<Value> {
 		let RestoreBody { name, agent, extra } = body;
 		let name = name.unwrap_or_else(|| format!("restore-{}", random_hex(12)));
 		let options = resolve_snapshot_options(extra, agent)?;
-		let snapshot_dir = self.require_snapshot_dir(snapshot)?;
-		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir, options.s3_mounts.clone())?;
+		let source = self.open_snapshot(snapshot)?;
+		let s3_mounts = self.snapshot_s3_mounts(&source.path, options.s3_mounts.clone())?;
 		let (_, record) = self.launch_snapshot_vm(
 			snapshot,
-			&snapshot_dir,
+			&source.path,
 			name,
 			SnapshotLaunchMode::Restore,
 			&options,
 			&s3_mounts,
+			source.guard,
 		)?;
 		self.publish_record_event("restore", &record);
 		Ok(record.view())
@@ -2854,18 +3969,19 @@ impl EngineApi for Engine {
 			)));
 		}
 		let options = resolve_snapshot_options(extra, None)?;
-		let snapshot_dir = self.require_snapshot_dir(snapshot)?;
-		let s3_mounts = self.snapshot_s3_mounts(&snapshot_dir, options.s3_mounts.clone())?;
+		let source = self.open_snapshot(snapshot)?;
+		let s3_mounts = self.snapshot_s3_mounts(&source.path, options.s3_mounts.clone())?;
 		let mut launched = Vec::with_capacity(count as usize);
 		for _ in 0..count {
 			let name = format!("fork-{}", random_hex(12));
 			match self.launch_snapshot_vm(
 				snapshot,
-				&snapshot_dir,
+				&source.path,
 				name,
 				SnapshotLaunchMode::Fork,
 				&options,
 				&s3_mounts,
+				source.guard.clone(),
 			) {
 				Ok(launched_vm) => launched.push(launched_vm),
 				Err(error) => {
@@ -2942,6 +4058,74 @@ impl EngineApi for Engine {
 			pool.shutdown();
 		}
 		Ok(())
+	}
+
+	fn credential_list(&self, tenant: &str) -> Result<Vec<CredentialMetadata>> {
+		self.inner.credentials.list(tenant)
+	}
+
+	fn credential_put(
+		&self,
+		tenant: &str,
+		key_id: &str,
+		credential: Credential,
+	) -> Result<CredentialMetadata> {
+		let name = credential.name.clone();
+		self.inner.audit.record(&AuditEvent::new(
+			tenant,
+			"api",
+			"credential.put",
+			name.as_str(),
+			"attempted",
+		))?;
+		let metadata = match self.inner.credentials.put(tenant, key_id, credential) {
+			Ok(metadata) => metadata,
+			Err(error) => {
+				self.inner.audit.record(&AuditEvent::new(
+					tenant,
+					"api",
+					"credential.put",
+					name.as_str(),
+					"failed",
+				))?;
+				return Err(error);
+			},
+		};
+		self.inner.audit.record(&AuditEvent::new(
+			tenant,
+			"api",
+			"credential.put",
+			name,
+			"succeeded",
+		))?;
+		Ok(metadata)
+	}
+
+	fn credential_delete(&self, tenant: &str, name: &str) -> Result<()> {
+		self.inner.audit.record(&AuditEvent::new(
+			tenant,
+			"api",
+			"credential.delete",
+			name,
+			"attempted",
+		))?;
+		if let Err(error) = self.inner.credentials.delete(tenant, name) {
+			self.inner.audit.record(&AuditEvent::new(
+				tenant,
+				"api",
+				"credential.delete",
+				name,
+				"failed",
+			))?;
+			return Err(error);
+		}
+		self.inner.audit.record(&AuditEvent::new(
+			tenant,
+			"api",
+			"credential.delete",
+			name,
+			"succeeded",
+		))
 	}
 
 	fn info(&self) -> Result<Value> {
@@ -3210,7 +4394,176 @@ fn resolve_snapshot_options(
 		readiness_probe: options.readiness_probe,
 		s3_mounts: options.s3_mounts,
 		command: options.command,
+		credentials: options.credentials.unwrap_or_default(),
+		owner_tenant: options.owner_tenant.unwrap_or_else(|| "default".to_owned()),
+		encryption_key_id: options
+			.encryption_key_id
+			.unwrap_or_else(|| "default".to_owned()),
+		ports: options.ports,
+		egress_allow: options.egress_allow,
+		egress_allow_domains: options.egress_allow_domains,
+		inbound_cidr_allowlist: options.inbound_cidr_allowlist,
 	})
+}
+
+const VOLUME_STAGING_MANIFEST: &str = "volume.json";
+
+fn encrypted_volume_archive(home: &Home, name: &str) -> PathBuf {
+	home
+		.security_dir()
+		.join("volumes")
+		.join(format!("{name}.venc"))
+}
+
+fn encrypted_volume_runtime_root(home: &Home) -> PathBuf {
+	home.security_dir().join("runtime").join("volumes")
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+	fs::create_dir_all(path)?;
+	let metadata = fs::symlink_metadata(path)?;
+	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		return Err(EngineError::invalid(format!(
+			"private runtime path {} is not a directory",
+			path.display()
+		)));
+	}
+	fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+	Ok(())
+}
+
+fn write_volume_staging_manifest(
+	slot_dir: &Path,
+	name: &str,
+	key_id: &str,
+	read_only: bool,
+) -> Result<()> {
+	let manifest = serde_json::to_vec(&json!({
+		"version": 1,
+		"name": name,
+		"key_id": key_id,
+		"read_only": read_only,
+	}))?;
+	let mut file = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(slot_dir.join(VOLUME_STAGING_MANIFEST))?;
+	file.write_all(&manifest)?;
+	file.sync_all()?;
+	Ok(())
+}
+
+fn load_staged_volume_mounts(home: &Home, sid: &str) -> Result<Vec<EncryptedVolumeMount>> {
+	let root = encrypted_volume_runtime_root(home).join(sid);
+	let metadata = match fs::symlink_metadata(&root) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error.into()),
+	};
+	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		return Err(EngineError::invalid(format!(
+			"encrypted volume runtime path {} is not a directory",
+			root.display()
+		)));
+	}
+	let mut slots = fs::read_dir(&root)?.collect::<io::Result<Vec<_>>>()?;
+	slots.sort_by_key(fs::DirEntry::file_name);
+	let mut mounts = Vec::with_capacity(slots.len());
+	for slot in slots {
+		let slot_dir = slot.path();
+		let metadata = slot.file_type()?;
+		if metadata.is_symlink() || !metadata.is_dir() {
+			return Err(EngineError::invalid(format!(
+				"encrypted volume staging entry {} is not a directory",
+				slot_dir.display()
+			)));
+		}
+		let manifest_path = slot_dir.join(VOLUME_STAGING_MANIFEST);
+		let manifest = match fs::read(&manifest_path) {
+			Ok(manifest) => manifest,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
+				fs::remove_dir_all(&slot_dir)?;
+				continue;
+			},
+			Err(error) => return Err(error.into()),
+		};
+		if manifest.len() > 4096 {
+			return Err(EngineError::invalid(format!(
+				"encrypted volume staging manifest {} is too large",
+				manifest_path.display()
+			)));
+		}
+		let value: Value = serde_json::from_slice(&manifest)?;
+		if value.get("version").and_then(Value::as_u64) != Some(1) {
+			return Err(EngineError::invalid("unsupported encrypted volume staging manifest"));
+		}
+		let name = value.get("name").and_then(Value::as_str).ok_or_else(|| {
+			EngineError::invalid("encrypted volume staging manifest is missing name")
+		})?;
+		let volume = Volume::new_in_home(home.root(), name)?;
+		if slot.file_name() != std::ffi::OsStr::new(name) {
+			return Err(EngineError::invalid(format!(
+				"encrypted volume staging directory {} does not match manifest name {name:?}",
+				slot_dir.display()
+			)));
+		}
+		let key_id = value
+			.get("key_id")
+			.and_then(Value::as_str)
+			.filter(|key| !key.is_empty())
+			.ok_or_else(|| {
+				EngineError::invalid("encrypted volume staging manifest is missing key_id")
+			})?;
+		let read_only = value
+			.get("read_only")
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+		let mount_dir = slot_dir.join(name);
+		let mount_metadata = fs::symlink_metadata(&mount_dir)?;
+		if mount_metadata.file_type().is_symlink() || !mount_metadata.is_dir() {
+			return Err(EngineError::invalid(format!(
+				"encrypted volume mount {} is not a directory",
+				mount_dir.display()
+			)));
+		}
+		mounts.push(EncryptedVolumeMount {
+			name: name.to_owned(),
+			mount_dir,
+			slot_dir,
+			archive: encrypted_volume_archive(home, volume.name()),
+			key_id: key_id.to_owned(),
+			read_only,
+			sealed: read_only,
+			preserve: false,
+		});
+	}
+	Ok(mounts)
+}
+
+fn volume_has_plaintext(path: &Path) -> Result<bool> {
+	for entry in fs::read_dir(path)? {
+		if entry?.file_name() != std::ffi::OsStr::new(".lock") {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+fn remove_legacy_volume_data(path: &Path) -> Result<()> {
+	for entry in fs::read_dir(path)? {
+		let entry = entry?;
+		if entry.file_name() == std::ffi::OsStr::new(".lock") {
+			continue;
+		}
+		let target = entry.path();
+		if entry.file_type()?.is_dir() {
+			fs::remove_dir_all(target)?;
+		} else {
+			fs::remove_file(target)?;
+		}
+	}
+	Ok(())
 }
 
 fn parse_volume_spec(value: &Value) -> Result<(String, bool)> {
@@ -3616,7 +4969,8 @@ fn writable_volume_names_from_detail(detail: &Value) -> Vec<String> {
 }
 
 fn capture_checkpoint_volumes(
-	home: &Home,
+	engine: &Engine,
+	sid: &str,
 	snapshot_dir: &Path,
 	volumes: Option<&Value>,
 ) -> Result<()> {
@@ -3624,7 +4978,7 @@ fn capture_checkpoint_volumes(
 		return Ok(());
 	};
 	let dest_root = snapshot_dir.join("volumes");
-	let mut seen = std::collections::HashSet::new();
+	let mut seen = HashSet::new();
 	for spec in volumes.values() {
 		let Some(name) = spec
 			.get("name")
@@ -3636,16 +4990,67 @@ fn capture_checkpoint_volumes(
 		if !seen.insert(name.to_owned()) {
 			continue;
 		}
-		let src = home.volumes_dir().join(name);
-		if !src.is_dir() {
-			return Err(EngineError::unsupported(format!(
-				"volume {name:?} has no host directory to checkpoint at {}",
-				src.display()
-			)));
-		}
-		copy_tree_without_locks(&src, &dest_root.join(name))?;
+		let active = engine.inner.runtimes.lock().get(sid).and_then(|runtime| {
+			runtime
+				.encrypted_volumes
+				.iter()
+				.find(|volume| volume.name == name)
+				.map(|volume| volume.mount_dir.clone())
+		});
+		let mut guard = None;
+		let source = if let Some(active) = active {
+			active
+		} else {
+			let archive = encrypted_volume_archive(engine.home(), name);
+			if !archive.is_file() {
+				return Err(EngineError::unsupported(format!(
+					"volume {name:?} has no encrypted archive at {}",
+					archive.display()
+				)));
+			}
+			let extract_root = encrypted_volume_runtime_root(engine.home())
+				.join(format!(".capture-{}", random_hex(16)));
+			let source = EncryptedArchive::open(&archive, &extract_root, &engine.inner.keyring)?;
+			guard = Some(TransientDir(extract_root));
+			source
+		};
+		copy_tree_without_locks(&source, &dest_root.join(name))?;
+		drop(guard);
 	}
 	Ok(())
+}
+
+struct VolumeArchiveBackup {
+	archive: PathBuf,
+	backup:  Option<PathBuf>,
+}
+
+impl VolumeArchiveBackup {
+	fn commit(self) {
+		if let Some(backup) = self.backup {
+			let _ = fs::remove_file(backup);
+		}
+	}
+
+	fn rollback(self) -> Result<()> {
+		match self.backup {
+			Some(backup) => fs::rename(backup, self.archive)?,
+			None => match fs::remove_file(self.archive) {
+				Ok(()) => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			},
+		}
+		Ok(())
+	}
+}
+
+fn remove_volume_artifact(path: &Path) {
+	if path.is_dir() {
+		let _ = fs::remove_dir_all(path);
+	} else {
+		let _ = fs::remove_file(path);
+	}
 }
 
 /// Restore checkpoint-carried volume data onto this node before create.
@@ -3657,15 +5062,18 @@ fn capture_checkpoint_volumes(
 /// validated BEFORE any copy so a rejection leaves no partial state behind.
 fn materialize_checkpoint_volumes(
 	home: &Home,
+	keyring: &Keyring,
+	key_id: &str,
 	snapshot_dir: &Path,
 	volumes: Option<&Map<String, Value>>,
 ) -> Result<Vec<PathBuf>> {
+	drop(keyring.load(key_id)?);
 	let Some(volumes) = volumes.filter(|volumes| !volumes.is_empty()) else {
 		return Ok(Vec::new());
 	};
 	let source_root = snapshot_dir.join("volumes");
 	let mut names = Vec::new();
-	let mut seen = std::collections::HashSet::new();
+	let mut seen = HashSet::new();
 	for spec in volumes.values() {
 		let Some(name) = spec
 			.get("name")
@@ -3679,34 +5087,113 @@ fn materialize_checkpoint_volumes(
 		}
 	}
 	for name in &names {
-		let dest = home.volumes_dir().join(name);
-		if dest.exists() || dest.is_symlink() {
+		let volume_dir = home.volumes_dir().join(name);
+		let archive = encrypted_volume_archive(home, name);
+		if volume_dir.exists() || volume_dir.is_symlink() || archive.exists() || archive.is_symlink()
+		{
 			return Err(EngineError::unsupported(format!(
 				"cannot restore volume {name:?}: a volume of that name already exists on this node \
 				 (no cluster-unique volume identity yet)"
 			)));
 		}
-		if !source_root.join(name).is_dir() {
-			return Err(EngineError::unsupported(format!(
-				"checkpoint is missing data for volume {name:?}"
+		let source = source_root.join(name);
+		let metadata = fs::symlink_metadata(&source).map_err(|_| {
+			EngineError::unsupported(format!("checkpoint is missing data for volume {name:?}"))
+		})?;
+		if metadata.file_type().is_symlink() || !metadata.is_dir() {
+			return Err(EngineError::invalid(format!(
+				"checkpoint volume {name:?} is not a regular directory"
 			)));
 		}
 	}
 	let mut created = Vec::new();
 	for name in &names {
-		let result: Result<()> = (|| {
+		let result = (|| {
 			let volume = Volume::new_in_home(home.root(), name)?;
 			created.push(volume.path());
-			copy_tree_without_locks(&source_root.join(name), &volume.path())
+			let archive = encrypted_volume_archive(home, name);
+			EncryptedArchive::seal(&source_root.join(name), &archive, keyring, key_id)?;
+			created.push(archive);
+			Ok(())
 		})();
-		if let Err(err) = result {
+		if let Err(error) = result {
 			for path in &created {
-				let _ = fs::remove_dir_all(path);
+				remove_volume_artifact(path);
 			}
-			return Err(err);
+			return Err(error);
 		}
 	}
 	Ok(created)
+}
+
+fn restore_checkpoint_volumes_in_place(
+	home: &Home,
+	keyring: &Keyring,
+	key_id: &str,
+	snapshot_dir: &Path,
+	volumes: Option<&Map<String, Value>>,
+) -> Result<Vec<VolumeArchiveBackup>> {
+	drop(keyring.load(key_id)?);
+	let Some(volumes) = volumes.filter(|volumes| !volumes.is_empty()) else {
+		return Ok(Vec::new());
+	};
+	let source_root = snapshot_dir.join("volumes");
+	let mut names = Vec::new();
+	let mut seen = HashSet::new();
+	for spec in volumes.values() {
+		let Some(name) = spec
+			.get("name")
+			.and_then(Value::as_str)
+			.filter(|name| !name.is_empty())
+		else {
+			continue;
+		};
+		validate_local_name("volume name", name)?;
+		if seen.insert(name.to_owned()) {
+			let source = source_root.join(name);
+			let metadata = fs::symlink_metadata(&source).map_err(|_| {
+				EngineError::unsupported(format!("checkpoint is missing data for volume {name:?}"))
+			})?;
+			if metadata.file_type().is_symlink() || !metadata.is_dir() {
+				return Err(EngineError::invalid(format!(
+					"checkpoint volume {name:?} is not a regular directory"
+				)));
+			}
+			names.push(name.to_owned());
+		}
+	}
+	let mut backups = Vec::new();
+	for name in names {
+		let result = (|| {
+			let volume = Volume::new_in_home(home.root(), &name)?;
+			let _lock = volume.acquire_write_lock()?;
+			let archive = encrypted_volume_archive(home, &name);
+			let backup = if archive.exists() || archive.is_symlink() {
+				let metadata = fs::symlink_metadata(&archive)?;
+				if metadata.file_type().is_symlink() || !metadata.is_file() {
+					return Err(EngineError::invalid(format!(
+						"encrypted volume archive {} is not a regular file",
+						archive.display()
+					)));
+				}
+				let backup = archive.with_file_name(format!(".{name}.{}.backup", random_hex(12)));
+				fs::copy(&archive, &backup)?;
+				fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))?;
+				Some(backup)
+			} else {
+				None
+			};
+			backups.push(VolumeArchiveBackup { archive: archive.clone(), backup });
+			EncryptedArchive::seal(&source_root.join(&name), &archive, keyring, key_id)
+		})();
+		if let Err(error) = result {
+			for backup in backups.into_iter().rev() {
+				backup.rollback()?;
+			}
+			return Err(error);
+		}
+	}
+	Ok(backups)
 }
 
 /// Refuse cross-platform network restores. Port of Python
@@ -3736,19 +5223,44 @@ fn validate_network_restore(params: &Map<String, Value>) -> Result<()> {
 }
 
 fn copy_tree_without_locks(src: &Path, dst: &Path) -> Result<()> {
-	fs::create_dir_all(dst)?;
+	let source_metadata = fs::symlink_metadata(src)?;
+	if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+		return Err(EngineError::invalid(format!(
+			"volume copy source {} must be a regular directory",
+			src.display()
+		)));
+	}
+	match fs::symlink_metadata(dst) {
+		Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+			return Err(EngineError::invalid(format!(
+				"volume copy destination {} must be a regular directory",
+				dst.display()
+			)));
+		},
+		Ok(_) => {},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(dst)?,
+		Err(error) => return Err(error.into()),
+	}
 	for entry in fs::read_dir(src)? {
 		let entry = entry?;
+		if entry.file_name() == ".lock" {
+			continue;
+		}
 		let path = entry.path();
 		let target = dst.join(entry.file_name());
-		if entry.file_type()?.is_dir() {
+		let file_type = entry.file_type()?;
+		if file_type.is_dir() {
 			copy_tree_without_locks(&path, &target)?;
-			continue;
+		} else if file_type.is_symlink() {
+			std::os::unix::fs::symlink(fs::read_link(&path)?, &target)?;
+		} else if file_type.is_file() {
+			fs::copy(&path, &target)?;
+		} else {
+			return Err(EngineError::unsupported(format!(
+				"volume entry {} is not a file, directory, or symlink",
+				path.display()
+			)));
 		}
-		if path.file_name().and_then(|name| name.to_str()) == Some(".lock") {
-			continue;
-		}
-		fs::copy(path, target)?;
 	}
 	Ok(())
 }
@@ -3820,6 +5332,17 @@ fn tunnels_json(tunnels: &BTreeMap<u16, (String, u16)>) -> Value {
 			})
 			.collect::<Map<_, _>>(),
 	)
+}
+
+fn credentials_requested(params: &SandboxCreate) -> bool {
+	params
+		.credentials
+		.as_ref()
+		.is_some_and(|names| !names.is_empty())
+}
+
+fn network_required(params: &SandboxCreate) -> bool {
+	!params.block_network || credentials_requested(params)
 }
 
 fn reject_macos_host_network_features(params: &SandboxCreate) -> Result<()> {
@@ -4040,21 +5563,6 @@ fn start_timeout_watchdog(name: String, secs: u64, runtime: Arc<dyn SandboxRunti
 	tx
 }
 
-fn list_child_dirs(root: &Path) -> Vec<String> {
-	let Ok(entries) = fs::read_dir(root) else {
-		return Vec::new();
-	};
-	let mut names = Vec::new();
-	for entry in entries.flatten() {
-		if entry.file_type().is_ok_and(|kind| kind.is_dir())
-			&& let Some(name) = entry.file_name().to_str()
-		{
-			names.push(name.to_owned());
-		}
-	}
-	names
-}
-
 fn random_hex(bytes: usize) -> String {
 	let mut out = String::with_capacity(bytes * 2);
 	while out.len() < bytes * 2 {
@@ -4127,6 +5635,119 @@ mod tests {
 	}
 
 	#[test]
+	fn persistent_volume_data_is_sealed_between_mounts() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let volume = Volume::new_in_home(temp.path(), "workspace").expect("volume");
+		fs::write(volume.path().join("legacy.txt"), b"legacy").expect("legacy data");
+
+		let mut mounted = engine
+			.materialize_encrypted_volume("sandbox", &volume, "default", false)
+			.expect("materialize");
+		assert_eq!(fs::read(mounted.mount_dir.join("legacy.txt")).expect("read"), b"legacy");
+		assert!(!volume.path().join("legacy.txt").exists());
+		fs::write(mounted.mount_dir.join("current.txt"), b"current").expect("guest write");
+		mounted.arm();
+		mounted.seal(&engine.inner.keyring).expect("seal");
+		drop(mounted);
+
+		let reopened = engine
+			.materialize_encrypted_volume("sandbox", &volume, "default", true)
+			.expect("reopen");
+		assert_eq!(
+			fs::read(reopened.mount_dir.join("current.txt")).expect("read current"),
+			b"current"
+		);
+		assert!(encrypted_volume_archive(engine.home(), "workspace").is_file());
+	}
+
+	#[test]
+	fn orphaned_volume_staging_is_resealed_on_startup_recovery() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let volume = Volume::new_in_home(temp.path(), "workspace").expect("volume");
+		let mut mounted = engine
+			.materialize_encrypted_volume("orphan", &volume, "default", false)
+			.expect("materialize");
+		fs::write(mounted.mount_dir.join("recovered.txt"), b"after crash").expect("guest write");
+		mounted.arm();
+		drop(mounted);
+
+		engine
+			.recover_orphaned_encrypted_volumes()
+			.expect("recover staging");
+		assert!(
+			!encrypted_volume_runtime_root(engine.home())
+				.join("orphan")
+				.exists()
+		);
+		let reopened = engine
+			.materialize_encrypted_volume("orphan", &volume, "default", true)
+			.expect("reopen");
+		assert_eq!(
+			fs::read(reopened.mount_dir.join("recovered.txt")).expect("read recovered"),
+			b"after crash"
+		);
+	}
+
+	#[test]
+	fn archived_volume_reopen_removes_leftover_plaintext() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let volume = Volume::new_in_home(temp.path(), "workspace").expect("volume");
+		let mut mounted = engine
+			.materialize_encrypted_volume("first", &volume, "default", false)
+			.expect("materialize");
+		fs::write(mounted.mount_dir.join("current.txt"), b"current").expect("guest write");
+		mounted.arm();
+		mounted.seal(&engine.inner.keyring).expect("seal");
+		drop(mounted);
+		fs::write(volume.path().join("leftover.txt"), b"plaintext").expect("leftover");
+
+		let reopened = engine
+			.materialize_encrypted_volume("second", &volume, "default", true)
+			.expect("reopen");
+		assert_eq!(fs::read(reopened.mount_dir.join("current.txt")).expect("read"), b"current");
+		assert!(!volume.path().join("leftover.txt").exists());
+	}
+
+	#[test]
+	fn recovery_pruning_never_deletes_the_protected_point() {
+		let temp = TempDir::new().expect("temp");
+		let mut config = config_for(&temp);
+		config.history_retention = 1;
+		let (engine, _home) = Engine::new_test(config);
+		let root = engine.recovery_root("sandbox").expect("root");
+		fs::create_dir_all(&root).expect("mkdir");
+		fs::write(root.join("00000000000000000001-disk-old.venc"), b"old").expect("old");
+		fs::write(root.join("00000000000000000000-disk-new.venc"), b"new").expect("new");
+
+		engine
+			.prune_recovery("sandbox", Some("00000000000000000000-disk-new"))
+			.expect("prune");
+		assert!(root.join("00000000000000000000-disk-new.venc").is_file());
+	}
+
+	#[test]
+	fn rehydrated_runtime_cannot_checkpoint_without_identity() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("stable-id", "vm-directory", "running");
+		record.detail = json!({"block_network": true});
+		engine.insert_test_record(record);
+		engine
+			.inner
+			.runtimes
+			.lock()
+			.insert("vm-directory".to_owned(), RuntimeState::default());
+
+		let error = engine
+			.mesh_checkpoint_params("stable-id")
+			.expect_err("rehydrated runtime rejected");
+		assert_eq!(error.code.as_str(), "unsupported");
+	}
+
+	#[test]
 	fn snapshot_metadata_must_be_a_bounded_regular_file() {
 		let temp = TempDir::new().expect("temp");
 		let regular = temp.path().join("regular.json");
@@ -4164,7 +5785,7 @@ mod tests {
 		record.detail = json!({"block_network": true});
 		engine.insert_test_record(record);
 
-		let mut runtime = RuntimeState::default();
+		let mut runtime = RuntimeState { identity_complete: true, ..RuntimeState::default() };
 		runtime
 			.secret_env
 			.insert("TOKEN".to_owned(), "sensitive".to_owned());
@@ -4276,6 +5897,21 @@ mod tests {
 			Engine::with_runtime(config_for(temp), runtime.clone()).expect("snapshot engine");
 		(engine, runtime, home)
 	}
+	fn seal_test_snapshot(engine: &Engine, name: &str) {
+		let source = engine.snapshot_dir(&format!(".{name}-source"));
+		fs::create_dir_all(&source).expect("snapshot source");
+		fs::write(source.join("snapshot.json"), b"{}").expect("snapshot metadata");
+		EncryptedArchive::seal(
+			&source,
+			&engine
+				.snapshot_archive(name)
+				.expect("snapshot archive path"),
+			&engine.inner.keyring,
+			"default",
+		)
+		.expect("seal test snapshot");
+		fs::remove_dir_all(source).expect("remove snapshot source");
+	}
 
 	#[test]
 	fn restore_requires_a_snapshot_and_returns_a_canonical_view() {
@@ -4300,9 +5936,14 @@ mod tests {
 		}
 		assert!(!temp.path().join("escape").exists());
 
-		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
-		std::os::unix::fs::symlink(temp.path(), engine.snapshot_dir("linked"))
-			.expect("snapshot symlink");
+		seal_test_snapshot(&engine, "base");
+		std::os::unix::fs::symlink(
+			temp.path(),
+			engine
+				.snapshot_archive("linked")
+				.expect("linked archive path"),
+		)
+		.expect("snapshot symlink");
 		let linked = engine
 			.restore("linked", RestoreBody::default())
 			.expect_err("snapshot symlinks must be rejected");
@@ -4347,7 +5988,7 @@ mod tests {
 	fn fork_rejects_invalid_counts_and_rolls_back_a_partial_batch() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, runtime, _home) = snapshot_engine(&temp, 2);
-		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
+		seal_test_snapshot(&engine, "base");
 
 		for count in [0, MAX_FORK_CLONES + 1] {
 			let error = engine
@@ -4373,7 +6014,7 @@ mod tests {
 	fn fork_returns_full_canonical_views() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
-		fs::create_dir_all(engine.snapshot_dir("base")).expect("snapshot");
+		seal_test_snapshot(&engine, "base");
 
 		let value = engine
 			.fork("base", ForkBody { count: 2, extra: HashMap::new() })
