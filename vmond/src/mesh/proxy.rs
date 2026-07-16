@@ -123,6 +123,19 @@ pub trait OwnerRouter: Send + Sync {
 	fn mesh_enabled(&self) -> bool;
 	fn local_node_id(&self) -> &str;
 	fn owner_of(&self, sandbox_id: &str) -> MeshResult<Option<String>>;
+	/// Read the authoritative durable ownership tuple before serving a locally
+	/// present sandbox.
+	fn authoritative_owner(&self, sandbox_id: &str) -> MeshResult<Option<OwnerRecord>>;
+	/// Epoch cached by the locally running sandbox supervisor.
+	fn local_epoch(&self, sandbox_id: &str) -> u64;
+	/// True while a local portable restore owns a staged, non-serving epoch.
+	fn local_restore_staging(&self, _sandbox_id: &str) -> bool {
+		false
+	}
+	/// Start teardown of a locally present sandbox if its cached
+	/// `local_epoch` remains current. Routing becomes non-local before this
+	/// best-effort teardown completes.
+	fn fence_local(&self, sandbox_id: &str, local_epoch: u64);
 	fn peer_url(&self, node_id: &str) -> Option<String>;
 	fn peers(&self) -> Vec<MeshPeer>;
 	fn record_owner(&self, sandbox_id: &str, owner: &str, epoch: u64);
@@ -295,12 +308,20 @@ where
 	Ok(None)
 }
 
+fn local_ownership_matches(
+	local_node_id: &str,
+	local_epoch: u64,
+	authoritative: &OwnerRecord,
+) -> bool {
+	authoritative.owner == local_node_id && authoritative.epoch == local_epoch
+}
+
 /// Decide whether a sandbox request should be served locally or forwarded to a
 /// remote owner.
 ///
-/// This mirrors the Python middleware's early exits exactly: disabled mesh,
-/// hop header, non-sandbox path, or local engine hit all fall through to local
-/// handling.
+/// Disabled mesh and non-sandbox paths fall through to local handling. For a
+/// present sandbox, even a mesh hop first validates the authoritative owner
+/// epoch so a fenced local VM cannot serve a forwarded request.
 pub async fn owner_proxy_decision<M, P, R>(
 	mesh: &M,
 	presence: &P,
@@ -315,18 +336,44 @@ where
 	P: SandboxPresence + ?Sized,
 	R: RecordOwnerLookup + ?Sized,
 {
-	if !mesh.mesh_enabled() || is_mesh_hop(headers) {
+	if !mesh.mesh_enabled() {
 		return Ok(OwnerProxyDecision::ServeLocal);
 	}
 	let Some(sandbox_id) = sandbox_id_in_path(path) else {
 		return Ok(OwnerProxyDecision::ServeLocal);
 	};
-	if presence.has_sandbox(&sandbox_id) {
-		return Ok(OwnerProxyDecision::ServeLocal);
+	if mesh.local_restore_staging(&sandbox_id) {
+		return Err(MeshError::unreachable(
+			"portable restore is staging a non-serving ownership epoch",
+		));
 	}
-	let owner = match mesh.owner_of(&sandbox_id)? {
-		Some(owner) => Some(owner),
-		None => scatter_locate(mesh, record_store, client, &sandbox_id, outbound_token).await?,
+	let authoritative = mesh.authoritative_owner(&sandbox_id)?;
+	if presence.has_sandbox(&sandbox_id) {
+		let local_epoch = mesh.local_epoch(&sandbox_id);
+		let Some(owner) = authoritative.as_ref() else {
+			mesh.fence_local(&sandbox_id, local_epoch);
+			return Err(MeshError::unreachable(
+				"locally present sandbox has no authoritative ownership record",
+			));
+		};
+		if local_ownership_matches(mesh.local_node_id(), local_epoch, owner) {
+			return Ok(OwnerProxyDecision::ServeLocal);
+		}
+		mesh.fence_local(&sandbox_id, local_epoch);
+		if owner.owner == mesh.local_node_id() || is_mesh_hop(headers) {
+			return Err(MeshError::unreachable("locally present sandbox is fenced"));
+		}
+		let Some(peer_url) = mesh.peer_url(&owner.owner) else {
+			return Err(MeshError::unreachable("sandbox owner unreachable"));
+		};
+		return Ok(OwnerProxyDecision::Forward { owner: owner.owner.clone(), peer_url });
+	}
+	let owner = match authoritative {
+		Some(record) => Some(record.owner),
+		None => match mesh.owner_of(&sandbox_id)? {
+			Some(owner) => Some(owner),
+			None => scatter_locate(mesh, record_store, client, &sandbox_id, outbound_token).await?,
+		},
 	};
 	let Some(owner) = owner else {
 		return Ok(OwnerProxyDecision::ServeLocal);
@@ -822,4 +869,176 @@ pub fn mesh_peer_headers(outbound_token: &str) -> HeaderMap {
 /// Utility for reconcilers/proxies that need a deduplicated exclusion set.
 pub fn singleton_exclusion(node_id: &str) -> HashSet<String> {
 	HashSet::from([node_id.to_owned()])
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Mutex;
+
+	use super::*;
+
+	struct Router {
+		local:         String,
+		authoritative: Option<OwnerRecord>,
+		local_epoch:   u64,
+		staging:       bool,
+		fenced:        Mutex<Vec<(String, u64)>>,
+	}
+
+	impl OwnerRouter for Router {
+		fn mesh_enabled(&self) -> bool {
+			true
+		}
+
+		fn local_node_id(&self) -> &str {
+			&self.local
+		}
+
+		fn owner_of(&self, _: &str) -> MeshResult<Option<String>> {
+			Ok(None)
+		}
+
+		fn authoritative_owner(&self, _: &str) -> MeshResult<Option<OwnerRecord>> {
+			Ok(self.authoritative.clone())
+		}
+
+		fn local_epoch(&self, _: &str) -> u64 {
+			self.local_epoch
+		}
+
+		fn local_restore_staging(&self, _: &str) -> bool {
+			self.staging
+		}
+
+		fn fence_local(&self, sandbox_id: &str, expected_epoch: u64) {
+			self
+				.fenced
+				.lock()
+				.expect("fence records")
+				.push((sandbox_id.to_owned(), expected_epoch));
+		}
+
+		fn peer_url(&self, node_id: &str) -> Option<String> {
+			(node_id == "node-a").then(|| "http://node-a.test".to_owned())
+		}
+
+		fn peers(&self) -> Vec<MeshPeer> {
+			Vec::new()
+		}
+
+		fn record_owner(&self, _: &str, _: &str, _: u64) {}
+	}
+
+	impl RecordOwnerLookup for Router {
+		fn owner_record(&self, _: &str) -> MeshResult<Option<OwnerRecord>> {
+			Ok(None)
+		}
+	}
+
+	struct Present;
+
+	impl SandboxPresence for Present {
+		fn has_sandbox(&self, _: &str) -> bool {
+			true
+		}
+	}
+
+	#[tokio::test]
+	async fn stale_local_presence_is_fenced_and_forwarded_to_authoritative_owner() {
+		let router = Router {
+			local:         "node-b".to_owned(),
+			authoritative: Some(OwnerRecord { owner: "node-a".to_owned(), epoch: 9 }),
+			local_epoch:   8,
+			staging:       false,
+			fenced:        Mutex::new(Vec::new()),
+		};
+		let decision = owner_proxy_decision::<_, _, Router>(
+			&router,
+			&Present,
+			None,
+			&Client::new(),
+			"/v1/sandboxes/sandbox-1",
+			&HeaderMap::new(),
+			"",
+		)
+		.await
+		.expect("stale local VM must not serve");
+		assert_eq!(decision, OwnerProxyDecision::Forward {
+			owner:    "node-a".to_owned(),
+			peer_url: "http://node-a.test".to_owned(),
+		});
+		assert_eq!(*router.fenced.lock().expect("fence records"), vec![("sandbox-1".to_owned(), 8)]);
+	}
+
+	#[tokio::test]
+	async fn staged_restore_is_unavailable_without_fencing() {
+		let router = Router {
+			local:         "node-a".to_owned(),
+			authoritative: Some(OwnerRecord { owner: "node-a".to_owned(), epoch: 9 }),
+			local_epoch:   9,
+			staging:       true,
+			fenced:        Mutex::new(Vec::new()),
+		};
+		let error = owner_proxy_decision::<_, _, Router>(
+			&router,
+			&Present,
+			None,
+			&Client::new(),
+			"/v1/sandboxes/sandbox-1",
+			&HeaderMap::new(),
+			"",
+		)
+		.await
+		.expect_err("staged restore must remain non-serving");
+		assert_eq!(error.code, "unreachable");
+		assert!(router.fenced.lock().expect("fence records").is_empty());
+	}
+
+	#[tokio::test]
+	async fn epoch_one_staged_retry_remains_non_serving_without_fence() {
+		let router = Router {
+			local:         "node-a".to_owned(),
+			authoritative: Some(OwnerRecord { owner: "node-a".to_owned(), epoch: 1 }),
+			local_epoch:   1,
+			staging:       true,
+			fenced:        Mutex::new(Vec::new()),
+		};
+		let error = owner_proxy_decision::<_, _, Router>(
+			&router,
+			&Present,
+			None,
+			&Client::new(),
+			"/v1/sandboxes/sandbox-1",
+			&HeaderMap::new(),
+			"",
+		)
+		.await
+		.expect_err("an epoch-one restore retry must not serve before commit");
+		assert_eq!(error.code, "unreachable");
+		assert!(router.fenced.lock().expect("fence records").is_empty());
+	}
+
+	#[tokio::test]
+	async fn matching_local_owner_epoch_serves_without_fence() {
+		let router = Router {
+			local:         "node-a".to_owned(),
+			authoritative: Some(OwnerRecord { owner: "node-a".to_owned(), epoch: 9 }),
+			local_epoch:   9,
+			staging:       false,
+			fenced:        Mutex::new(Vec::new()),
+		};
+		let decision = owner_proxy_decision::<_, _, Router>(
+			&router,
+			&Present,
+			None,
+			&Client::new(),
+			"/v1/sandboxes/sandbox-1",
+			&HeaderMap::new(),
+			"",
+		)
+		.await
+		.expect("matching owner may serve");
+		assert_eq!(decision, OwnerProxyDecision::ServeLocal);
+		assert!(router.fenced.lock().expect("fence records").is_empty());
+	}
 }

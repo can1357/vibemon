@@ -58,14 +58,16 @@ pub const RECORD_UNREPLICATED_CODE: &str = "record_unreplicated";
 /// Synchronous mesh metadata for an acknowledged create.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRecord {
-	pub sid:             String,
-	pub params:          Params,
-	pub owner:           String,
-	pub epoch:           i64,
-	pub idempotency_key: String,
-	pub ha:              String,
-	pub restart_policy:  String,
-	pub created_at:      f64,
+	pub sid:               String,
+	pub params:            Params,
+	pub owner:             String,
+	pub epoch:             i64,
+	/// Stable sandbox incarnation; owner epoch may advance during handoff.
+	pub incarnation_epoch: i64,
+	pub idempotency_key:   String,
+	pub ha:                String,
+	pub restart_policy:    String,
+	pub created_at:        f64,
 }
 
 impl CreateRecord {
@@ -94,7 +96,17 @@ impl CreateRecord {
 		} else {
 			unix_now()
 		};
-		Ok(Self { sid, params, owner, epoch, idempotency_key, ha, restart_policy, created_at })
+		Ok(Self {
+			sid,
+			params,
+			owner,
+			epoch,
+			incarnation_epoch: epoch,
+			idempotency_key,
+			ha,
+			restart_policy,
+			created_at,
+		})
 	}
 
 	/// Return a JSON-ready representation for disk and peer replication.
@@ -108,6 +120,10 @@ impl CreateRecord {
 		out.insert("params".to_owned(), JsonValue::Object(self.params.clone()));
 		out.insert("owner".to_owned(), JsonValue::String(self.owner.clone()));
 		out.insert("epoch".to_owned(), JsonValue::Number(JsonNumber::from(self.epoch)));
+		out.insert(
+			"incarnation_epoch".to_owned(),
+			JsonValue::Number(JsonNumber::from(self.incarnation_epoch)),
+		);
 		out.insert("idempotency_key".to_owned(), JsonValue::String(self.idempotency_key.clone()));
 		out.insert("ha".to_owned(), JsonValue::String(self.ha.clone()));
 		out.insert("restart_policy".to_owned(), JsonValue::String(self.restart_policy.clone()));
@@ -135,16 +151,25 @@ impl CreateRecord {
 			required_string(data, "idempotency_key", "record idempotency_key is required")?;
 		let ha = optional_string(data.get("ha"), "off");
 		let restart_policy = optional_string(data.get("restart_policy"), restart_policy_for_ha(&ha));
-		Self::new(
+		let epoch = data.get("epoch").and_then(JsonValue::as_i64).unwrap_or(0);
+		let mut record = Self::new(
 			sid,
 			params,
 			owner,
-			json_i64(data.get("epoch"), 0)?,
+			epoch,
 			idempotency_key,
 			ha,
 			restart_policy,
-			json_f64_field(data.get("created_at"), unix_now())?,
-		)
+			data
+				.get("created_at")
+				.and_then(JsonValue::as_f64)
+				.unwrap_or_default(),
+		)?;
+		record.incarnation_epoch = data
+			.get("incarnation_epoch")
+			.and_then(JsonValue::as_i64)
+			.unwrap_or(epoch);
+		Ok(record)
 	}
 }
 
@@ -385,41 +410,6 @@ fn optional_string(value: Option<&JsonValue>, default: &str) -> String {
 		Some(JsonValue::Bool(flag)) if *flag => "true".to_owned(),
 		_ => default.to_owned(),
 	}
-}
-
-fn json_i64(value: Option<&JsonValue>, default: i64) -> Result<i64> {
-	match value {
-		None | Some(JsonValue::Null) => Ok(default),
-		Some(JsonValue::Bool(false)) => Ok(default),
-		Some(JsonValue::Bool(true)) => Ok(1),
-		Some(JsonValue::Number(number)) => number
-			.as_i64()
-			.or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok()))
-			.or_else(|| number.as_f64().map(|value| value as i64))
-			.ok_or_else(|| EngineError::invalid("record epoch must be an integer")),
-		Some(JsonValue::String(text)) if text.is_empty() => Ok(default),
-		Some(JsonValue::String(text)) => text
-			.parse::<i64>()
-			.map_err(|_| EngineError::invalid("record epoch must be an integer")),
-		Some(_) => Err(EngineError::invalid("record epoch must be an integer")),
-	}
-}
-
-fn json_f64_field(value: Option<&JsonValue>, default: f64) -> Result<f64> {
-	let parsed = match value {
-		None | Some(JsonValue::Null) => default,
-		Some(JsonValue::Bool(false)) => default,
-		Some(JsonValue::Bool(true)) => 1.0,
-		Some(JsonValue::Number(number)) => number
-			.as_f64()
-			.ok_or_else(|| EngineError::invalid("record created_at must be a number"))?,
-		Some(JsonValue::String(text)) if text.is_empty() => default,
-		Some(JsonValue::String(text)) => text
-			.parse::<f64>()
-			.map_err(|_| EngineError::invalid("record created_at must be a number"))?,
-		Some(_) => return Err(EngineError::invalid("record created_at must be a number")),
-	};
-	Ok(if parsed.is_finite() { parsed } else { default })
 }
 
 fn json_f64(value: f64) -> JsonValue {

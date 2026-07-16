@@ -2,7 +2,7 @@
 //! registry.
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fs, io,
 	path::Path,
 	time::{SystemTime, UNIX_EPOCH},
@@ -12,57 +12,261 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::{EngineError, Result, home::Home};
+use crate::{EngineError, Result, engine::spawn::replace_meta_map, home::Home};
 
 /// Engine seam for re-acquiring writable volume locks after registry rehydrate.
 pub type VolumeLockRequests = Vec<(String, Vec<String>)>;
+
+/// A lifecycle state encoded as the historical lowercase JSON string.
+///
+/// Unknown values round-trip exactly so a newer control plane cannot be
+/// downgraded into a destructive state by an older monitor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LifecyclePhase {
+	Running,
+	#[default]
+	Stopped,
+	Suspended,
+	Paused,
+	Terminated,
+	Unknown(String),
+}
+
+impl LifecyclePhase {
+	/// Return the stable JSON spelling of this phase.
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Running => "running",
+			Self::Stopped => "stopped",
+			Self::Suspended => "suspended",
+			Self::Paused => "paused",
+			Self::Terminated => "terminated",
+			Self::Unknown(value) => value,
+		}
+	}
+
+	fn from_str(value: &str) -> Self {
+		match value {
+			"running" => Self::Running,
+			"stopped" => Self::Stopped,
+			"suspended" => Self::Suspended,
+			"paused" => Self::Paused,
+			"terminated" => Self::Terminated,
+			_ => Self::Unknown(value.to_owned()),
+		}
+	}
+}
+
+impl Serialize for LifecyclePhase {
+	fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_str(self.as_str())
+	}
+}
+
+impl<'de> Deserialize<'de> for LifecyclePhase {
+	fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		String::deserialize(deserializer).map(|value| Self::from_str(&value))
+	}
+}
+
+/// Monotonic lifecycle write version used to reject stale completers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateGeneration(pub u64);
+
+/// A durable operation that remains pending even when desired and observed
+/// phases happen to be equal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleOperation {
+	/// Materialize and switch to the exact durable recovery point.
+	Rollback { recovery_point: String },
+	/// Forward-compatible operation marker for non-state-changing work.
+	Other { kind: String },
+}
+
+impl LifecycleOperation {
+	/// Stable operation name for reconciliation logs and metrics.
+	pub fn kind(&self) -> &str {
+		match self {
+			Self::Rollback { .. } => "rollback",
+			Self::Other { kind } => kind,
+		}
+	}
+}
+
+/// Durable desired/observed lifecycle state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LifecycleState {
+	pub desired:    LifecyclePhase,
+	pub observed:   LifecyclePhase,
+	pub generation: StateGeneration,
+	pub operation:  Option<LifecycleOperation>,
+	pub failure:    Option<String>,
+}
+
+impl Default for LifecycleState {
+	fn default() -> Self {
+		Self {
+			desired:    LifecyclePhase::Stopped,
+			observed:   LifecyclePhase::Stopped,
+			generation: StateGeneration(0),
+			operation:  None,
+			failure:    None,
+		}
+	}
+}
+
+impl LifecycleState {
+	/// Whether an operation still needs lifecycle reconciliation.
+	pub fn is_converged(&self) -> bool {
+		self.operation.is_none() && self.failure.is_none() && self.desired == self.observed
+	}
+}
+
+/// The generation and target returned by a successful transition begin/retry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleTransition {
+	pub generation: StateGeneration,
+	pub desired:    LifecyclePhase,
+	pub observed:   LifecyclePhase,
+}
+
+/// Whether a caller owns the side effects for a requested transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransitionDisposition {
+	/// This call durably installed a new generation and owns execution.
+	Acquired,
+	/// Another caller already owns the same non-converged generation.
+	Joined,
+	/// The requested state has already converged.
+	AlreadyObserved,
+}
+
+/// Ownership-fenced result of starting a lifecycle transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionBegin {
+	pub disposition: TransitionDisposition,
+	pub generation:  StateGeneration,
+	pub desired:     LifecyclePhase,
+	pub observed:    LifecyclePhase,
+	pub operation:   Option<LifecycleOperation>,
+}
+
+/// Safe, restartable runtime inputs. This deliberately has no secret values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SafeRuntimeIdentity {
+	#[serde(alias = "env")]
+	pub environment:            BTreeMap<String, String>,
+	pub workdir:                Option<String>,
+	pub network_policy:         Option<Value>,
+	/// Complete non-secret network inputs retained for older persisted records.
+	#[serde(default)]
+	pub network:                Value,
+	pub tunnels:                Value,
+	pub mounts:                 Vec<Value>,
+	pub timeout_secs:           Option<f64>,
+	pub source:                 Option<String>,
+	pub template:               Option<String>,
+	pub pool:                   Option<String>,
+	pub secret_names:           BTreeSet<String>,
+	pub available_secret_names: BTreeSet<String>,
+	#[serde(default)]
+	pub version:                u32,
+	#[serde(default)]
+	pub identity_complete:      bool,
+}
+
+impl SafeRuntimeIdentity {
+	/// Remove values associated with a declared secret name before persistence.
+	pub fn without_secret_values(mut self) -> Self {
+		self
+			.environment
+			.retain(|name, _| !self.secret_names.contains(name));
+		self
+	}
+}
+
+/// A registry record requiring startup or background convergence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciliationInput {
+	pub record:    VmRecord,
+	pub lifecycle: LifecycleState,
+	pub pid_alive: bool,
+}
 
 /// One sandbox registry entry shared by API and engine layers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmRecord {
 	/// Stable sandbox id.
-	pub id:            String,
+	pub id:                String,
 	/// Human-facing sandbox name.
-	pub name:          String,
+	pub name:              String,
 	/// Lifecycle status.
-	pub status:        String,
+	pub status:            String,
 	/// Per-VM monitor process id.
-	pub pid:           Option<i32>,
+	pub pid:               Option<i32>,
 	/// Image, template, fork, or restore source.
-	pub source:        Option<String>,
+	pub source:            Option<String>,
 	/// Unix creation timestamp.
-	pub created_at:    f64,
+	pub created_at:        f64,
 	/// Timeout in seconds from last activity.
-	pub timeout:       Option<f64>,
+	pub timeout:           Option<f64>,
 	/// Raw metadata detail spread into API views.
-	pub detail:        Value,
+	pub detail:            Value,
 	/// String tags used for filtering.
-	pub tags:          HashMap<String, String>,
+	pub tags:              HashMap<String, String>,
 	/// Unix timestamp of last activity.
-	pub last_active:   f64,
+	pub last_active:       f64,
 	/// Unix termination timestamp.
-	pub terminated_at: Option<f64>,
+	pub terminated_at:     Option<f64>,
 	/// Terminal error string.
-	pub error:         Option<String>,
+	pub error:             Option<String>,
+	/// Desired/observed lifecycle state and its generation.
+	#[serde(default)]
+	pub lifecycle:         LifecycleState,
+	/// Stable production ownership incarnation, distinct from mutable owner
+	/// epoch.
+	#[serde(default)]
+	pub incarnation_epoch: i64,
+	/// The complete non-secret identity needed to rebuild runtime resources.
+	#[serde(default)]
+	pub runtime_identity:  SafeRuntimeIdentity,
 }
 
 impl VmRecord {
 	/// Build a record with Python's timestamp defaults.
 	pub fn new(id: impl Into<String>, name: impl Into<String>, status: impl Into<String>) -> Self {
 		let now = unix_time();
+		let status = status.into();
+		let phase = LifecyclePhase::from_str(&status);
 		Self {
-			id:            id.into(),
-			name:          name.into(),
-			status:        status.into(),
-			pid:           None,
-			source:        None,
-			created_at:    now,
-			timeout:       None,
-			detail:        Value::Object(Map::new()),
-			tags:          HashMap::new(),
-			last_active:   now,
+			id: id.into(),
+			name: name.into(),
+			status,
+			pid: None,
+			source: None,
+			created_at: now,
+			timeout: None,
+			detail: Value::Object(Map::new()),
+			tags: HashMap::new(),
+			last_active: now,
 			terminated_at: None,
-			error:         None,
+			error: None,
+			incarnation_epoch: 0,
+			lifecycle: LifecycleState {
+				desired: phase.clone(),
+				observed: phase,
+				..LifecycleState::default()
+			},
+			runtime_identity: SafeRuntimeIdentity::default(),
 		}
 	}
 
@@ -85,6 +289,10 @@ impl VmRecord {
 		out.insert("id".to_owned(), json!(self.id));
 		out.insert("name".to_owned(), json!(self.name));
 		out.insert("status".to_owned(), json!(self.status));
+		out.insert("desired_state".to_owned(), json!(self.lifecycle.desired));
+		out.insert("observed_state".to_owned(), json!(self.lifecycle.observed));
+		out.insert("state_generation".to_owned(), json!(self.lifecycle.generation));
+		out.insert("lifecycle_failure".to_owned(), json!(self.lifecycle.failure));
 		out.insert("pid".to_owned(), json!(self.pid));
 		out.insert("source".to_owned(), json!(self.source));
 		out.insert("created_at".to_owned(), json!(self.created_at));
@@ -149,18 +357,32 @@ impl Registry {
 			let saved_status = meta
 				.get("status")
 				.and_then(Value::as_str)
-				.unwrap_or("")
+				.unwrap_or("stopped")
 				.to_owned();
-			let status = if running {
-				"running".to_owned()
-			} else if matches!(saved_status.as_str(), "stopped" | "suspended" | "terminated") {
-				saved_status.clone()
-			} else {
-				"stopped".to_owned()
-			};
+			let has_persisted_lifecycle = meta.contains_key("lifecycle")
+				|| meta.contains_key("desired_state")
+				|| meta.contains_key("observed_state");
+			let mut lifecycle = lifecycle_of(&meta, &saved_status);
+			if !has_persisted_lifecycle {
+				let actual = if running {
+					LifecyclePhase::Running
+				} else {
+					match lifecycle.observed {
+						LifecyclePhase::Suspended | LifecyclePhase::Terminated => {
+							lifecycle.observed.clone()
+						},
+						_ => LifecyclePhase::Stopped,
+					}
+				};
+				lifecycle.desired = actual.clone();
+				lifecycle.observed = actual;
+			}
+			let lifecycle_changed = normalize_observed_for_pid(&mut lifecycle, running);
+			let status = status_for_observed(&lifecycle.observed).to_owned();
 			let now = unix_time();
 			let id = string_field(&meta, "sandbox_id").unwrap_or_else(|| name.clone());
 			let created_at = number_field(&meta, "created_at").unwrap_or(now);
+			let runtime_identity = runtime_identity_of(&meta, source_of(&meta), timeout_of(&meta));
 			let mut record = VmRecord {
 				id: id.clone(),
 				name: name.clone(),
@@ -174,6 +396,12 @@ impl Registry {
 				last_active: number_field(&meta, "last_active").unwrap_or(created_at),
 				terminated_at: number_field(&meta, "terminated_at"),
 				error: string_field(&meta, "error"),
+				incarnation_epoch: meta
+					.get("incarnation_epoch")
+					.and_then(Value::as_i64)
+					.unwrap_or_default(),
+				lifecycle,
+				runtime_identity,
 			};
 
 			if running {
@@ -185,12 +413,16 @@ impl Registry {
 					detail_object_mut(&mut record.detail)
 						.insert("tunnels_lost".to_owned(), Value::Bool(true));
 				}
-			} else if saved_status != status {
-				detail_object_mut(&mut record.detail).insert("status".to_owned(), json!(status));
+			}
+			if lifecycle_changed || saved_status != status {
+				set_lifecycle_meta(&mut meta, &record.lifecycle);
 				meta.insert("status".to_owned(), json!(status));
+				let detail = detail_object_mut(&mut record.detail);
+				set_lifecycle_detail(detail, &record.lifecycle);
+				detail.insert("status".to_owned(), json!(status));
 				if let Err(_err) = write_meta_map(&meta_path, &meta) {
-					// Python treats terminal-state persistence during rehydrate as
-					// best effort.
+					// Startup observes the current process even when a damaged
+					// filesystem prevents best-effort normalization persistence.
 				}
 			}
 			records.insert(id, record);
@@ -247,17 +479,350 @@ impl Registry {
 	}
 
 	/// Persist canonical identity fields, then insert the record.
-	pub fn insert_persisted(&self, home: &Home, record: VmRecord) -> Result<()> {
+	pub fn insert_persisted(&self, home: &Home, mut record: VmRecord) -> Result<()> {
 		let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+		if record.runtime_identity == SafeRuntimeIdentity::default() {
+			record.runtime_identity =
+				runtime_identity_of(&meta, record.source.clone(), record.timeout)
+					.without_secret_values();
+			if meta.contains_key("runtime_identity") {
+				// An already-written identity may contain future safe fields this
+				// binary does not understand, so do not replace that field.
+			} else {
+				meta.insert(
+					"runtime_identity".to_owned(),
+					serde_json::to_value(&record.runtime_identity)?,
+				);
+			}
+		} else {
+			record.runtime_identity = record.runtime_identity.without_secret_values();
+			meta
+				.insert("runtime_identity".to_owned(), serde_json::to_value(&record.runtime_identity)?);
+		}
 		meta.insert("sandbox_id".to_owned(), json!(record.id));
 		meta.insert("created_at".to_owned(), json!(record.created_at));
 		meta.insert("last_active".to_owned(), json!(record.last_active));
 		meta.insert("status".to_owned(), json!(record.status));
 		meta.insert("terminated_at".to_owned(), json!(record.terminated_at));
 		meta.insert("error".to_owned(), json!(record.error));
+		set_lifecycle_meta(&mut meta, &record.lifecycle);
 		write_meta_map(&home.meta_path(&record.name), &meta)?;
 		self.insert(record);
 		Ok(())
+	}
+
+	/// Atomically begin a generation-guarded transition.
+	///
+	/// Repeating a request that already installed the same pending target is
+	/// idempotent, including when its caller only knows the prior generation.
+	/// Begin a state-only transition. Operations that need execution despite an
+	/// equal desired/observed state must use [`Self::begin_operation`].
+	pub fn begin_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		expected: StateGeneration,
+		desired: LifecyclePhase,
+	) -> Result<TransitionBegin> {
+		self.begin_operation(home, id, expected, desired, None)
+	}
+
+	pub fn begin_operation(
+		&self,
+		home: &Home,
+		id: &str,
+		expected: StateGeneration,
+		desired: LifecyclePhase,
+		operation: Option<LifecycleOperation>,
+	) -> Result<TransitionBegin> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation == expected
+			&& record.lifecycle.desired == desired
+			&& record.lifecycle.operation == operation
+			&& record.lifecycle.failure.is_none()
+		{
+			return Ok(begin_of(
+				&record.lifecycle,
+				if record.lifecycle.is_converged() {
+					TransitionDisposition::AlreadyObserved
+				} else {
+					TransitionDisposition::Joined
+				},
+			));
+		}
+		if record.lifecycle.generation == StateGeneration(expected.0.saturating_add(1))
+			&& record.lifecycle.desired == desired
+			&& record.lifecycle.operation == operation
+			&& record.lifecycle.failure.is_none()
+			&& !record.lifecycle.is_converged()
+		{
+			return Ok(begin_of(&record.lifecycle, TransitionDisposition::Joined));
+		}
+		if record.lifecycle.generation != expected {
+			return Err(stale_generation(id, expected, record.lifecycle.generation));
+		}
+		if record.lifecycle.desired == desired
+			&& record.lifecycle.operation == operation
+			&& record.lifecycle.failure.is_some()
+		{
+			let next = expected.0.checked_add(1).ok_or_else(|| {
+				EngineError::invalid(format!("lifecycle generation exhausted for '{id}'"))
+			})?;
+			let mut updated = record.clone();
+			updated.lifecycle.generation = StateGeneration(next);
+			updated.lifecycle.failure = None;
+			persist_lifecycle_record(home, &mut updated)?;
+			let begin = begin_of(&updated.lifecycle, TransitionDisposition::Acquired);
+			*record = updated;
+			return Ok(begin);
+		}
+		if !record.lifecycle.is_converged() {
+			return Err(EngineError::invalid(format!(
+				"lifecycle transition for '{id}' is still pending"
+			)));
+		}
+		let next = expected.0.checked_add(1).ok_or_else(|| {
+			EngineError::invalid(format!("lifecycle generation exhausted for '{id}'"))
+		})?;
+		let mut updated = record.clone();
+		updated.lifecycle.generation = StateGeneration(next);
+		updated.lifecycle.desired = desired;
+		updated.lifecycle.operation = operation;
+		updated.lifecycle.failure = None;
+		persist_lifecycle_record(home, &mut updated)?;
+		let begin = begin_of(&updated.lifecycle, TransitionDisposition::Acquired);
+		*record = updated;
+		Ok(begin)
+	}
+
+	/// Record a generation-guarded observation. Duplicate completion is a no-op.
+	pub fn observe_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		generation: StateGeneration,
+		observed: LifecyclePhase,
+	) -> Result<LifecycleTransition> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation != generation {
+			return Err(stale_generation(id, generation, record.lifecycle.generation));
+		}
+		if record.lifecycle.observed == observed
+			&& record.lifecycle.failure.is_none()
+			&& record.lifecycle.operation.is_none()
+		{
+			return Ok(transition_of(&record.lifecycle));
+		}
+		let mut updated = record.clone();
+		updated.lifecycle.observed = observed;
+		updated.lifecycle.operation = None;
+		updated.lifecycle.failure = None;
+		status_for_observed(&updated.lifecycle.observed).clone_into(&mut updated.status);
+		persist_lifecycle_record(home, &mut updated)?;
+		let transition = transition_of(&updated.lifecycle);
+		*record = updated;
+		Ok(transition)
+	}
+
+	/// Record a failed attempt without losing the desired state that must retry.
+	pub fn fail_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		generation: StateGeneration,
+		error: impl Into<String>,
+	) -> Result<LifecycleTransition> {
+		let error = error.into();
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation != generation {
+			return Err(stale_generation(id, generation, record.lifecycle.generation));
+		}
+		if record.lifecycle.failure.as_deref() == Some(&error) {
+			return Ok(transition_of(&record.lifecycle));
+		}
+		let mut updated = record.clone();
+		updated.lifecycle.failure = Some(error);
+		persist_lifecycle_record(home, &mut updated)?;
+		let transition = transition_of(&updated.lifecycle);
+		*record = updated;
+		Ok(transition)
+	}
+
+	/// Cancel an interrupted transition after preserving the observed runtime.
+	///
+	/// This exact-generation CAS is idempotent for the same observed state and
+	/// reason, and leaves a durable non-secret explanation for reconciliation.
+	pub fn cancel_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		generation: StateGeneration,
+		observed: LifecyclePhase,
+		reason: impl Into<String>,
+	) -> Result<LifecycleTransition> {
+		let reason = reason.into();
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation != generation {
+			return Err(stale_generation(id, generation, record.lifecycle.generation));
+		}
+		if record.lifecycle.is_converged()
+			&& record.lifecycle.observed == observed
+			&& record.error.as_deref() == Some(&reason)
+		{
+			return Ok(transition_of(&record.lifecycle));
+		}
+		let mut updated = record.clone();
+		updated.lifecycle.desired = observed.clone();
+		updated.lifecycle.observed = observed;
+		updated.lifecycle.operation = None;
+		updated.lifecycle.failure = None;
+		status_for_observed(&updated.lifecycle.observed).clone_into(&mut updated.status);
+		updated.error = Some(reason);
+		persist_cancelled_record(home, &mut updated)?;
+		let transition = transition_of(&updated.lifecycle);
+		*record = updated;
+		Ok(transition)
+	}
+
+	/// Claim an interrupted persisted transition for reconciliation.
+	///
+	/// A resumed generation fences delayed completers from the crashed owner,
+	/// while retaining its desired state and pending operation payload.
+	pub fn resume_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		generation: StateGeneration,
+	) -> Result<TransitionBegin> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation != generation {
+			return Err(stale_generation(id, generation, record.lifecycle.generation));
+		}
+		if record.lifecycle.is_converged() {
+			return Ok(begin_of(&record.lifecycle, TransitionDisposition::AlreadyObserved));
+		}
+		let next = generation.0.checked_add(1).ok_or_else(|| {
+			EngineError::invalid(format!("lifecycle generation exhausted for '{id}'"))
+		})?;
+		let mut updated = record.clone();
+		updated.lifecycle.generation = StateGeneration(next);
+		updated.lifecycle.failure = None;
+		persist_lifecycle_record(home, &mut updated)?;
+		let begin = begin_of(&updated.lifecycle, TransitionDisposition::Acquired);
+		*record = updated;
+		Ok(begin)
+	}
+
+	/// Start the next generation for a previously failed desired transition.
+	pub fn retry_transition(
+		&self,
+		home: &Home,
+		id: &str,
+		generation: StateGeneration,
+	) -> Result<LifecycleTransition> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.lifecycle.generation != generation {
+			return Err(stale_generation(id, generation, record.lifecycle.generation));
+		}
+		if record.lifecycle.failure.is_none() {
+			return Ok(transition_of(&record.lifecycle));
+		}
+		let next = generation.0.checked_add(1).ok_or_else(|| {
+			EngineError::invalid(format!("lifecycle generation exhausted for '{id}'"))
+		})?;
+		let mut updated = record.clone();
+		updated.lifecycle.generation = StateGeneration(next);
+		updated.lifecycle.failure = None;
+		persist_lifecycle_record(home, &mut updated)?;
+		let transition = transition_of(&updated.lifecycle);
+		*record = updated;
+		Ok(transition)
+	}
+
+	/// Return every record whose desired state has not durably converged.
+	pub fn non_converged_transitions(&self) -> Vec<ReconciliationInput> {
+		self
+			.list()
+			.into_iter()
+			.filter_map(|record| {
+				let pid_alive = record.pid.is_some_and(pid_lives);
+				(!record.lifecycle.is_converged()).then(|| ReconciliationInput {
+					lifecycle: record.lifecycle.clone(),
+					record,
+					pid_alive,
+				})
+			})
+			.collect()
+	}
+
+	/// Inputs for startup reconciliation; deliberately identical to background
+	/// reconciliation so an interrupted operation follows one convergence path.
+	pub fn startup_reconciliation_inputs(&self) -> Vec<ReconciliationInput> {
+		self.non_converged_transitions()
+	}
+
+	/// Atomically persist restart-safe runtime identity, never secret values.
+	pub fn persist_runtime_identity(
+		&self,
+		home: &Home,
+		id: &str,
+		identity: SafeRuntimeIdentity,
+	) -> Result<()> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		let identity = identity.without_secret_values();
+		if record.runtime_identity == identity {
+			return Ok(());
+		}
+		let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+		meta.insert("runtime_identity".to_owned(), serde_json::to_value(&identity)?);
+		write_meta_map(&home.meta_path(&record.name), &meta)?;
+		record.runtime_identity = identity;
+		Ok(())
+	}
+
+	/// Atomically merge non-lifecycle metadata without allowing a concurrent
+	/// detail writer to erase the current lifecycle generation.
+	///
+	/// All facade metadata mutations must use this transaction rather than
+	/// independently writing `meta.json`.
+	pub fn update_detail_persisted<F>(&self, home: &Home, id: &str, update: F) -> Result<VmRecord>
+	where
+		F: FnOnce(&mut Map<String, Value>),
+	{
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+		update(&mut meta);
+		set_lifecycle_meta(&mut meta, &record.lifecycle);
+		meta.insert("status".to_owned(), json!(record.status));
+		write_meta_map(&home.meta_path(&record.name), &meta)?;
+		let mut updated = record.clone();
+		updated.detail = Value::Object(meta);
+		*record = updated.clone();
+		Ok(updated)
 	}
 
 	/// Remove one record by stable ID and clear its idempotency entries.
@@ -331,22 +896,24 @@ impl Registry {
 		returncode: Option<i64>,
 		terminated_at: Option<f64>,
 	) -> Result<()> {
-		let name = if let Some(record) = self.records.write().get_mut(id) {
-			status.clone_into(&mut record.status);
-			let detail = detail_object_mut(&mut record.detail);
-			detail.insert("status".to_owned(), json!(status));
+		let mut records = self.records.write();
+		let Some(record) = records.get_mut(id) else {
+			let mut meta = read_meta_map(&home.meta_path(id))?;
+			meta.insert("status".to_owned(), json!(status));
 			if let Some(code) = returncode {
-				detail.insert("returncode".to_owned(), json!(code));
+				meta.insert("returncode".to_owned(), json!(code));
 			}
 			if let Some(ts) = terminated_at {
-				record.terminated_at = Some(ts);
-				detail.insert("terminated_at".to_owned(), json!(ts));
+				meta.insert("terminated_at".to_owned(), json!(ts));
 			}
-			record.name.clone()
-		} else {
-			id.to_owned()
+			return write_meta_map(&home.meta_path(id), &meta);
 		};
-		let mut meta = read_meta_map(&home.meta_path(&name))?;
+		let mut updated = record.clone();
+		status.clone_into(&mut updated.status);
+		if let Some(ts) = terminated_at {
+			updated.terminated_at = Some(ts);
+		}
+		let mut meta = read_meta_map(&home.meta_path(&updated.name))?;
 		meta.insert("status".to_owned(), json!(status));
 		if let Some(code) = returncode {
 			meta.insert("returncode".to_owned(), json!(code));
@@ -354,7 +921,11 @@ impl Registry {
 		if let Some(ts) = terminated_at {
 			meta.insert("terminated_at".to_owned(), json!(ts));
 		}
-		write_meta_map(&home.meta_path(&name), &meta)
+		set_lifecycle_meta(&mut meta, &updated.lifecycle);
+		write_meta_map(&home.meta_path(&updated.name), &meta)?;
+		updated.detail = Value::Object(meta);
+		*record = updated;
+		Ok(())
 	}
 
 	fn replace(&self, records: HashMap<String, VmRecord>, idempotency: HashMap<String, String>) {
@@ -378,12 +949,206 @@ fn read_meta_map(path: &Path) -> Result<Map<String, Value>> {
 }
 
 fn write_meta_map(path: &Path, meta: &Map<String, Value>) -> Result<()> {
-	if let Some(parent) = path.parent() {
-		fs::create_dir_all(parent)?;
+	replace_meta_map(path, meta)
+}
+
+fn lifecycle_of(meta: &Map<String, Value>, legacy_status: &str) -> LifecycleState {
+	if let Some(value) = meta.get("lifecycle")
+		&& let Ok(lifecycle) = serde_json::from_value::<LifecycleState>(value.clone())
+	{
+		return lifecycle;
 	}
-	let text = serde_json::to_string_pretty(&Value::Object(meta.clone()))?;
-	fs::write(path, text)?;
+	let desired = string_field(meta, "desired_state").unwrap_or_else(|| legacy_status.to_owned());
+	let observed = string_field(meta, "observed_state").unwrap_or_else(|| legacy_status.to_owned());
+	LifecycleState {
+		desired:    LifecyclePhase::from_str(&desired),
+		observed:   LifecyclePhase::from_str(&observed),
+		generation: StateGeneration(
+			meta
+				.get("state_generation")
+				.and_then(Value::as_u64)
+				.unwrap_or(0),
+		),
+		operation:  None,
+		failure:    string_field(meta, "lifecycle_failure"),
+	}
+}
+
+fn normalize_observed_for_pid(lifecycle: &mut LifecycleState, pid_alive: bool) -> bool {
+	let normalized = if pid_alive {
+		match lifecycle.observed {
+			LifecyclePhase::Stopped | LifecyclePhase::Suspended | LifecyclePhase::Terminated => {
+				LifecyclePhase::Running
+			},
+			_ => return false,
+		}
+	} else {
+		match lifecycle.observed {
+			LifecyclePhase::Running | LifecyclePhase::Paused => LifecyclePhase::Stopped,
+			_ => return false,
+		}
+	};
+	lifecycle.observed = normalized;
+	true
+}
+
+fn status_for_observed(observed: &LifecyclePhase) -> &str {
+	match observed {
+		LifecyclePhase::Paused => LifecyclePhase::Running.as_str(),
+		phase => phase.as_str(),
+	}
+}
+
+fn set_lifecycle_meta(meta: &mut Map<String, Value>, lifecycle: &LifecycleState) {
+	meta.insert(
+		"lifecycle".to_owned(),
+		serde_json::to_value(lifecycle).expect("lifecycle state is serializable"),
+	);
+	set_lifecycle_detail(meta, lifecycle);
+}
+
+fn set_lifecycle_detail(detail: &mut Map<String, Value>, lifecycle: &LifecycleState) {
+	detail.insert("desired_state".to_owned(), json!(lifecycle.desired));
+	detail.insert("observed_state".to_owned(), json!(lifecycle.observed));
+	detail.insert("state_generation".to_owned(), json!(lifecycle.generation));
+	detail.insert("lifecycle_failure".to_owned(), json!(lifecycle.failure));
+}
+
+fn transition_of(lifecycle: &LifecycleState) -> LifecycleTransition {
+	LifecycleTransition {
+		generation: lifecycle.generation,
+		desired:    lifecycle.desired.clone(),
+		observed:   lifecycle.observed.clone(),
+	}
+}
+
+fn stale_generation(id: &str, expected: StateGeneration, actual: StateGeneration) -> EngineError {
+	EngineError::invalid(format!(
+		"stale lifecycle generation for '{id}': expected {}, found {}",
+		expected.0, actual.0
+	))
+}
+
+fn persist_lifecycle_record(home: &Home, record: &mut VmRecord) -> Result<()> {
+	let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+	set_lifecycle_meta(&mut meta, &record.lifecycle);
+	meta.insert("status".to_owned(), json!(record.status));
+	write_meta_map(&home.meta_path(&record.name), &meta)?;
+	let detail = detail_object_mut(&mut record.detail);
+	set_lifecycle_detail(detail, &record.lifecycle);
+	detail.insert("status".to_owned(), json!(record.status));
 	Ok(())
+}
+
+fn persist_cancelled_record(home: &Home, record: &mut VmRecord) -> Result<()> {
+	let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+	set_lifecycle_meta(&mut meta, &record.lifecycle);
+	meta.insert("status".to_owned(), json!(record.status));
+	meta.insert("error".to_owned(), json!(record.error));
+	write_meta_map(&home.meta_path(&record.name), &meta)?;
+	let detail = detail_object_mut(&mut record.detail);
+	set_lifecycle_detail(detail, &record.lifecycle);
+	detail.insert("status".to_owned(), json!(record.status));
+	detail.insert("error".to_owned(), json!(record.error));
+	Ok(())
+}
+
+fn runtime_identity_of(
+	meta: &Map<String, Value>,
+	source: Option<String>,
+	timeout_secs: Option<f64>,
+) -> SafeRuntimeIdentity {
+	if let Some(value) = meta.get("runtime_identity")
+		&& let Ok(mut identity) = serde_json::from_value::<SafeRuntimeIdentity>(value.clone())
+	{
+		if identity.timeout_secs.is_none() {
+			identity.timeout_secs = timeout_secs;
+		}
+		if identity.source.is_none() {
+			identity.source = source;
+		}
+		if identity.workdir.is_none() {
+			identity.workdir = string_field(meta, "workdir");
+		}
+		if identity.mounts.is_empty() {
+			identity.mounts = ["volumes", "s3_mounts"]
+				.into_iter()
+				.filter_map(|key| meta.get(key).cloned())
+				.collect();
+		}
+		return identity.without_secret_values();
+	}
+	let secret_names = string_set(meta.get("secret_names"));
+	let available_secret_names = available_secret_names_of(
+		meta.get("available_secret_names"),
+		meta.get("secret_availability"),
+	);
+	let environment = meta
+		.get("env")
+		.and_then(Value::as_object)
+		.map(|env| {
+			env.iter()
+				.filter_map(|(name, value)| {
+					(!secret_names.contains(name))
+						.then(|| value.as_str().map(|value| (name.clone(), value.to_owned())))
+						.flatten()
+				})
+				.collect()
+		})
+		.unwrap_or_default();
+	let network = meta.get("network").and_then(Value::as_object);
+	let mounts = ["volumes", "s3_mounts"]
+		.into_iter()
+		.filter_map(|key| meta.get(key).cloned())
+		.collect();
+	SafeRuntimeIdentity {
+		environment,
+		workdir: string_field(meta, "workdir"),
+		network_policy: network.and_then(|network| network.get("policy").cloned()),
+		network: network.map_or(Value::Null, |network| Value::Object(network.clone())),
+		tunnels: network
+			.and_then(|network| network.get("tunnels").cloned())
+			.unwrap_or(Value::Null),
+		mounts,
+		timeout_secs,
+		source,
+		template: string_field(meta, "template"),
+		pool: ["pool", "pool_id", "warm_pool"]
+			.into_iter()
+			.find_map(|key| string_field(meta, key)),
+		secret_names,
+		available_secret_names,
+		version: 1,
+		identity_complete: false,
+	}
+}
+fn available_secret_names_of(
+	names: Option<&Value>,
+	availability: Option<&Value>,
+) -> BTreeSet<String> {
+	let mut out = string_set(names);
+	if let Some(availability) = availability.and_then(Value::as_object) {
+		out.extend(
+			availability
+				.iter()
+				.filter_map(|(name, available)| json_truthy(available).then_some(name.clone())),
+		);
+	}
+	out
+}
+
+fn string_set(value: Option<&Value>) -> BTreeSet<String> {
+	value
+		.and_then(Value::as_array)
+		.map(|values| {
+			values
+				.iter()
+				.filter_map(Value::as_str)
+				.filter(|name| !name.is_empty())
+				.map(str::to_owned)
+				.collect()
+		})
+		.unwrap_or_default()
 }
 
 fn pid_of(meta: &Map<String, Value>) -> Option<i32> {
@@ -401,6 +1166,16 @@ fn string_field(meta: &Map<String, Value>, key: &str) -> Option<String> {
 		.and_then(Value::as_str)
 		.filter(|value| !value.is_empty())
 		.map(str::to_owned)
+}
+
+fn begin_of(lifecycle: &LifecycleState, disposition: TransitionDisposition) -> TransitionBegin {
+	TransitionBegin {
+		disposition,
+		generation: lifecycle.generation,
+		desired: lifecycle.desired.clone(),
+		observed: lifecycle.observed.clone(),
+		operation: lifecycle.operation.clone(),
+	}
 }
 
 fn number_field(meta: &Map<String, Value>, key: &str) -> Option<f64> {
@@ -591,6 +1366,8 @@ mod tests {
 		assert_eq!(dead.source.as_deref(), Some("alpine"));
 		assert_eq!(dead.timeout, Some(42.0));
 		assert_eq!(dead.tags, HashMap::from([("role".to_owned(), "test".to_owned())]));
+		assert_eq!(dead.lifecycle.desired, LifecyclePhase::Stopped);
+		assert_eq!(dead.lifecycle.observed, LifecyclePhase::Stopped);
 		assert_eq!(registry.find_by_idempotency_key("idem-dead"), Some("dead".to_owned()));
 		let dead_meta = read_meta_map(&home.meta_path("dead")).expect("dead meta");
 		assert_eq!(dead_meta.get("status"), Some(&json!("stopped")));
@@ -605,9 +1382,14 @@ mod tests {
 			}),
 		);
 		let suspended_registry = Registry::new();
-		suspended_registry.rehydrate(&home).expect("rehydrate suspended");
+		suspended_registry
+			.rehydrate(&home)
+			.expect("rehydrate suspended");
 		assert_eq!(
-			suspended_registry.get("suspended").expect("suspended record").status,
+			suspended_registry
+				.get("suspended")
+				.expect("suspended record")
+				.status,
 			"suspended"
 		);
 		assert_eq!(
@@ -650,6 +1432,321 @@ mod tests {
 		assert_eq!(restored.terminated_at, Some(13.0));
 		assert_eq!(restored.error.as_deref(), Some("guest exited"));
 		assert!(rehydrated.get("sandbox-directory").is_none());
+	}
+
+	#[test]
+	fn desired_write_survives_crash_before_observation() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		let record = VmRecord::new("sandbox", "sandbox", "stopped");
+		registry
+			.insert_persisted(&home, record)
+			.expect("persist initial record");
+
+		let transition = registry
+			.begin_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+			.expect("write desired state");
+		assert_eq!(transition.generation, StateGeneration(1));
+
+		let restarted = Registry::new();
+		restarted.rehydrate(&home).expect("rehydrate");
+		let restored = restarted.get("sandbox").expect("restored record");
+		assert_eq!(restored.lifecycle.desired, LifecyclePhase::Running);
+		assert_eq!(restored.lifecycle.observed, LifecyclePhase::Stopped);
+		assert_eq!(restored.lifecycle.generation, StateGeneration(1));
+		assert_eq!(restarted.startup_reconciliation_inputs().len(), 1);
+	}
+
+	#[test]
+	fn stale_generation_cannot_complete_newer_transition() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "stopped"))
+			.expect("persist initial record");
+		let transition = registry
+			.begin_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+			.expect("begin transition");
+
+		assert!(
+			registry
+				.observe_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Running,)
+				.is_err()
+		);
+		registry
+			.observe_transition(&home, "sandbox", transition.generation, LifecyclePhase::Running)
+			.expect("complete current generation");
+		assert_eq!(
+			registry.get("sandbox").expect("record").lifecycle.observed,
+			LifecyclePhase::Running
+		);
+	}
+
+	#[test]
+	fn rehydrate_normalizes_observed_state_from_live_pid() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		write_fixture(
+			&home,
+			"live",
+			json!({
+				"pid": i32::try_from(std::process::id()).expect("pid fits"),
+				"status": "stopped",
+				"lifecycle": {
+					"desired": "running",
+					"observed": "stopped",
+					"generation": 7,
+					"failure": null
+				}
+			}),
+		);
+		let registry = Registry::new();
+		registry.rehydrate(&home).expect("rehydrate");
+		let record = registry.get("live").expect("record");
+		assert_eq!(record.status, "running");
+		assert_eq!(record.lifecycle.desired, LifecyclePhase::Running);
+		assert_eq!(record.lifecycle.observed, LifecyclePhase::Running);
+		assert_eq!(record.lifecycle.generation, StateGeneration(7));
+	}
+
+	#[test]
+	fn safe_runtime_identity_round_trips_without_secret_values() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let mut record = VmRecord::new("sandbox", "sandbox", "stopped");
+		record.runtime_identity = SafeRuntimeIdentity {
+			environment:            BTreeMap::from([
+				("MODE".to_owned(), "production".to_owned()),
+				("TOKEN".to_owned(), "must-not-persist".to_owned()),
+			]),
+			workdir:                Some("/srv/app".to_owned()),
+			network_policy:         Some(json!({"block_network": false})),
+			network:                json!({"flavor": "user", "tunnels": {"ssh": 22}}),
+			tunnels:                json!({"ssh": 22}),
+			mounts:                 vec![json!({"name": "data", "path": "/data"})],
+			timeout_secs:           Some(30.0),
+			source:                 Some("oci:example/app".to_owned()),
+			template:               Some("/templates/app".to_owned()),
+			pool:                   Some("warm-app".to_owned()),
+			secret_names:           BTreeSet::from(["TOKEN".to_owned()]),
+			available_secret_names: BTreeSet::from(["TOKEN".to_owned()]),
+			version:                1,
+			identity_complete:      true,
+		};
+		let expected = record.runtime_identity.clone().without_secret_values();
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, record)
+			.expect("persist record");
+
+		let rehydrated = Registry::new();
+		rehydrated.rehydrate(&home).expect("rehydrate");
+		let restored = rehydrated.get("sandbox").expect("restored");
+		assert_eq!(restored.runtime_identity, expected);
+		let persisted = read_meta_map(&home.meta_path("sandbox")).expect("metadata");
+		assert!(
+			!serde_json::to_string(&persisted)
+				.expect("serialize metadata")
+				.contains("must-not-persist")
+		);
+	}
+
+	#[test]
+	fn failed_transition_retries_same_target_and_rejects_conflict() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "stopped"))
+			.expect("persist initial record");
+		let started = registry
+			.begin_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+			.expect("start");
+		registry
+			.fail_transition(&home, "sandbox", started.generation, "vmm unavailable")
+			.expect("fail");
+		assert!(
+			registry
+				.begin_transition(&home, "sandbox", started.generation, LifecyclePhase::Suspended,)
+				.is_err()
+		);
+		let retried = registry
+			.begin_transition(&home, "sandbox", started.generation, LifecyclePhase::Running)
+			.expect("retry matching target");
+		assert_eq!(retried.generation, StateGeneration(2));
+		assert!(
+			registry
+				.get("sandbox")
+				.expect("record")
+				.lifecycle
+				.failure
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn only_one_concurrent_duplicate_transition_acquires_side_effects() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = std::sync::Arc::new(Registry::new());
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "stopped"))
+			.expect("persist initial record");
+		let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+		let first_registry = std::sync::Arc::clone(&registry);
+		let first_home = home.clone();
+		let first_barrier = std::sync::Arc::clone(&barrier);
+		let first = std::thread::spawn(move || {
+			first_barrier.wait();
+			first_registry
+				.begin_transition(&first_home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+				.expect("first begin")
+				.disposition
+		});
+		let second_registry = std::sync::Arc::clone(&registry);
+		let second_home = home;
+		let second_barrier = std::sync::Arc::clone(&barrier);
+		let second = std::thread::spawn(move || {
+			second_barrier.wait();
+			second_registry
+				.begin_transition(&second_home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+				.expect("second begin")
+				.disposition
+		});
+		barrier.wait();
+		let dispositions = [first.join().expect("first join"), second.join().expect("second join")];
+		assert_eq!(
+			dispositions
+				.iter()
+				.filter(|&&disposition| disposition == TransitionDisposition::Acquired)
+				.count(),
+			1
+		);
+		assert_eq!(
+			dispositions
+				.iter()
+				.filter(|&&disposition| disposition == TransitionDisposition::Joined)
+				.count(),
+			1
+		);
+	}
+
+	#[test]
+	fn same_state_rollback_remains_pending_until_observed() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "running"))
+			.expect("persist running record");
+		let rollback = registry
+			.begin_operation(
+				&home,
+				"sandbox",
+				StateGeneration(0),
+				LifecyclePhase::Running,
+				Some(LifecycleOperation::Rollback { recovery_point: "point-17".to_owned() }),
+			)
+			.expect("acquire rollback");
+		assert_eq!(rollback.disposition, TransitionDisposition::Acquired);
+		assert_eq!(rollback.generation, StateGeneration(1));
+		let restarted = Registry::new();
+		restarted
+			.rehydrate(&home)
+			.expect("rehydrate pending rollback");
+		let inputs = restarted.startup_reconciliation_inputs();
+		assert_eq!(inputs.len(), 1);
+		assert_eq!(
+			inputs[0].lifecycle.operation,
+			Some(LifecycleOperation::Rollback { recovery_point: "point-17".to_owned() })
+		);
+		restarted
+			.observe_transition(&home, "sandbox", rollback.generation, LifecyclePhase::Running)
+			.expect("complete rollback");
+		assert!(restarted.startup_reconciliation_inputs().is_empty());
+		assert!(
+			restarted
+				.get("sandbox")
+				.expect("record")
+				.lifecycle
+				.operation
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn cancellation_converges_pending_suspend_and_rejects_stale_generation() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "running"))
+			.expect("persist running record");
+		let suspend = registry
+			.begin_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Suspended)
+			.expect("begin suspend");
+		assert_eq!(suspend.disposition, TransitionDisposition::Acquired);
+		let cancelled = registry
+			.cancel_transition(
+				&home,
+				"sandbox",
+				suspend.generation,
+				LifecyclePhase::Running,
+				"recovery publication failed",
+			)
+			.expect("cancel suspend");
+		assert_eq!(cancelled.desired, LifecyclePhase::Running);
+		assert_eq!(cancelled.observed, LifecyclePhase::Running);
+		assert!(registry.startup_reconciliation_inputs().is_empty());
+		assert_eq!(
+			registry.get("sandbox").expect("record").error.as_deref(),
+			Some("recovery publication failed")
+		);
+		registry
+			.cancel_transition(
+				&home,
+				"sandbox",
+				suspend.generation,
+				LifecyclePhase::Running,
+				"recovery publication failed",
+			)
+			.expect("duplicate cancellation");
+		assert!(
+			registry
+				.cancel_transition(
+					&home,
+					"sandbox",
+					StateGeneration(0),
+					LifecyclePhase::Running,
+					"stale",
+				)
+				.is_err()
+		);
+	}
+
+	#[test]
+	fn resuming_pending_transition_fences_crashed_generation() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		registry
+			.insert_persisted(&home, VmRecord::new("sandbox", "sandbox", "stopped"))
+			.expect("persist record");
+		let original = registry
+			.begin_transition(&home, "sandbox", StateGeneration(0), LifecyclePhase::Running)
+			.expect("begin");
+		let resumed = registry
+			.resume_transition(&home, "sandbox", original.generation)
+			.expect("resume");
+		assert_eq!(resumed.disposition, TransitionDisposition::Acquired);
+		assert_eq!(resumed.generation, StateGeneration(2));
+		assert!(
+			registry
+				.observe_transition(&home, "sandbox", original.generation, LifecyclePhase::Running)
+				.is_err()
+		);
 	}
 
 	fn write_fixture(home: &Home, name: &str, value: Value) {

@@ -11,39 +11,43 @@ arbiter. User-facing docs live in README.md.
 
 ```mermaid
 graph TD
-    C[Client: CLI / SDK via Transport] -->|HTTP + WS, bearer token| G1[gateway A]
-    C -.failover.-> G2[gateway B]
-    G1 <-->|gossip /v1/mesh/*| G2
-    G1 --> E1[Engine A] --> V1[vmm processes]
-    G2 --> E2[Engine B] --> V2[vmm processes]
+ C[CLI / SDK / UI] -->|gRPC; browser WS bridge| G1[vmond gateway A]
+ C -.failover.-> G2[vmond gateway B]
+ G1 <-->|gossip: liveness and capacity| G2
+ G1 --> E1[Engine A] --> V1[vmm processes]
+ G2 --> E2[Engine B] --> V2[vmm processes]
+ G1 & G2 --> PG[(PostgreSQL production authority)]
+ G1 & G2 --> S3[(S3 portable objects)]
 ```
 
-Every node runs `vmon serve`: one FastAPI gateway + one `Engine` (the only
-state owner on that node) + the local `vmond` Unix socket. Nodes gossip
-membership over `/v1/mesh/heartbeat`; there is no leader and no consensus
-store. Clients hold an ordered gateway roster (a *context*) and talk to any
-live gateway; the gateway proxies to the sandbox owner.
+Every node runs `vmon serve`: one Rust axum/tonic gateway, one `Engine`, a
+local gRPC Unix socket, and zero or more child `vmon vmm` processes. Clients
+hold an ordered gateway roster in a context and may enter through any live
+gateway; the gateway proxies owner-bound calls.
 
-A gossip mesh with asynchronous replicas cannot promise consensus-grade
-guarantees. This document states exactly what each tier buys and never
-pretends otherwise.
+Gossip carries membership, liveness, capacity, and development-mode
+anti-entropy. `cluster_mode=production` delegates ownership and lifecycle
+transactions to PostgreSQL and portable object bytes to S3.
+`cluster_mode=single-node` is the default and has only best-effort
+gossip/epoch fencing when multiple development nodes are joined.
 
-## Ownership and epochs
+## Ownership, epochs, and leases
 
-- Every sandbox has exactly one **owner node**. The owner runs the VMM process
-  and is the only node that mutates sandbox state.
-- Ownership carries an **epoch** (monotonic integer). Every owner claim is
-  resolved by highest `(epoch, node_id)` (`Mesh._consider_owner`). Migration
-  and crash restore claim ownership at `next_epoch()` and broadcast it
-  (`Mesh.broadcast_owner`).
-- Local epochs are persisted (`Engine.set_owner_epoch`) so a rebooted node
-  that lost a fencing race **self-fences**: `ha_reconcile_forever` stops local
-  sandboxes superseded by a higher authoritative epoch
-  (`Mesh.fenced_local_ids`).
-- Fencing is **best-effort**, bounded by the gossip convergence window. It
-  bounds split-brain to the partition window and converges on rejoin; it is
-  not mutual exclusion. Anything that needs true single-writer semantics
-  (writable volumes) must use quorum leases, not epochs alone.
+- Every sandbox has one owner node. The owner runs the VMM and is the only node
+  allowed to serve or mutate it.
+- Ownership carries a monotonic epoch. In production, PostgreSQL allocates and
+  compares epochs in the same transactions that mutate ownership. In
+  development mode, persisted local epochs converge through gossip.
+- Every production owner also holds a PostgreSQL TTL lease. Renewal returns
+  database-measured remaining TTL; the node arms a watchdog before expiry.
+  Missing that deadline stops the VMM and drops local routing authority.
+- Restore, rollback, and migration candidates cannot serve until the exact
+  ownership epoch and lease are committed. A stale candidate is torn down.
+- Production migration records source intent and a token before transfer,
+  commits the target owner transactionally, fences the source, then activates
+  the target. Retries converge on the committed owner.
+- Development gossip epochs are best-effort fencing, not mutual exclusion.
+  Writable shared state requires the lease mechanism below.
 
 ## Placement
 
@@ -57,74 +61,77 @@ Placement is **request-scoped, never ingress-scoped**.
 - Backend (`kvm`/`hvf`) and CPU-baseline gates are hard filters **only where
   existing state is reused**: snapshot/template restore, fork, migration,
   replica restore. Fresh boots gate on arch and capabilities only.
-- The ingress gateway proxies the create to a compatible owner; the same
-  proxy plumbing (`_mesh_router`, `_proxy_websocket`) serves every
-  post-create operation.
-- Scoring (`score_node`) biases toward warm pools and templates, free
-  capacity, locality, and region, and penalizes inflight work. Scores select
-  among *eligible* candidates; they never override a hard gate.
-- Rendezvous hashing (`_hrw_score`) deterministically picks idempotency
-  coordinators, replica targets, and restore owners. Rendezvous assignment is
-  *placement*, never mutual exclusion.
+- The ingress gateway proxies create and owner-bound calls to the selected node.
+- `score_node` biases toward warm pools and templates, free capacity, locality,
+  and region, and penalizes inflight work. Scores select among eligible
+  candidates; they never override a hard gate.
+- `hrw_score` deterministically picks idempotency coordinators, replica
+  targets, and restore owners. Rendezvous assignment is placement, never
+  mutual exclusion.
 
 ## Durability contract
 
 Durability is tiered and stated in RPO/RTO terms. Per-sandbox tier selector:
 `ha = off | async | rerun | async+rerun`.
 
-### Metadata — synchronous, guaranteed
+### Metadata and lifecycle authority
 
-The create record (sid, spec, owner, epoch, idempotency key) is replicated
-**before the create is acked** (201). On meshes with ≥3 expected members, a
-strict majority must hold the record. On a 2-node mesh the implemented tier is
-weaker: every live peer must ack, and with no live peer the local node accepts
-the record so the survivor can keep serving creates. Guarantee after ack:
-**no surviving gateway ever answers "unknown sid" for that create.** Every
-gateway resolves sids from the record store, not only from gossip, and
-anti-entropy re-pushes locally owned records to live peers.
+In production, PostgreSQL stores create records, idempotency keys, owners,
+epochs, owner leases, lifecycle state, suspend markers, rollback pins,
+migration intent, and deletion tombstones. Acknowledgement follows the
+transaction commit. PostgreSQL is therefore a hard serving dependency:
+failure to renew an owner lease self-fences the local VM rather than silently
+falling back to node-local authority.
+
+In development meshes, create records are copied before acknowledgement. With
+at least three expected members a strict majority is required. A two-node mesh
+requires every currently live peer but lets a lone survivor accept locally;
+this is explicitly weaker than majority authority.
 
 ### Guest state (`ha=async`) — explicit RPO/RTO
 
-- **RPO** = replication cadence: the owner checkpoints eligible sandboxes
-  non-destructively each cadence and pushes to the top-K rendezvous-ranked
-  peers. Surfaced per-sandbox as checkpoint age in `mesh status`.
-- **RTO** = failure-detection window (heartbeat interval × reap threshold)
-  plus restore time.
-- Never advertised as zero-loss. Work since the last checkpoint is lost on
-  owner crash, by contract.
+- Production publishes encrypted checkpoints/replicas to S3, verifies them,
+  then commits their PostgreSQL manifest. Uncommitted bytes are neither listed
+  nor restorable.
+- Development mode pushes non-destructive checkpoints to rendezvous-ranked
+  peers.
+- **RPO** is the checkpoint cadence. Work after the latest committed
+  checkpoint is lost on owner failure.
+- **RTO** is failure detection plus compatible-host restore time.
 
 ### Re-run (`ha=rerun`) — at-least-once compute
 
-If the owner dies with no usable checkpoint, a surviving node re-executes the
-create from the durable create record. Semantics: **at-least-once, never
-concurrent with a fenced predecessor** (the re-run claims a higher epoch
-first). This is the tier that makes "nothing acked evaporates" true for
-re-runnable compute without synchronous memory replication. `async+rerun`
-prefers checkpoint restore and falls back to re-run.
+If no usable checkpoint exists, a fenced successor re-executes the durable
+create record. Semantics are at-least-once: work must tolerate re-execution.
+`async+rerun` prefers checkpoint restore and falls back to rerun.
 
-### Writable volumes — quorum-fenced leases only
+### Durable lifecycle and recovery history
 
-Single-writer holds only when a lease is granted and renewed by a strict
-majority of expected members, epoch-fenced, with TTL self-fencing. For every
-grant or renewal, `renew_deadline = granted_at + ttl / 2`; a different holder
-cannot receive a vote until `successor_grant_allowed_at = granted_at + ttl`.
-The owner stops writers on renewal failure once the deadline is missed, before
-any successor can activate. Requires ≥3 nodes; on 2-node meshes, writable
-volumes are **rejected at create** on mesh contexts — no silent degradation.
-Read-only volumes are unrestricted (divergence-free by construction). The
-host-local `flock` in `Volume.acquire` protects same-host concurrency only and
-is not a cluster mechanism.
+- Pause is in-memory only. Suspend captures a full checkpoint, commits a
+  suspended marker, then removes the live VM. Resume restores the exact marker.
+  Failed publication or commit leaves the source authoritative.
+- Recovery history has independent `disk` and `checkpoint` tiers in
+  production. Disk capture quiesces only the block worker and rollback
+  cold-boots. Checkpoint capture preserves VM execution state.
+- Rollback pins its immutable target and stages a replacement before cutover.
+  Failure retains the current source. Delete uses a tombstone and replayable
+  object cleanup.
 
-### Quorum restore — majority of expected membership
+### Writable volumes — fenced leases only
 
-Auto-restore of an orphaned sandbox requires a strict majority of the
-*expected* cluster (high-water mark, never shrunk by reaping) to confirm the
-former owner unreachable (`GET /v1/mesh/reachable/{node}`). A 2-node mesh
-cannot form a post-failure majority and **defers** when quorum restore is on.
-If restore cannot safely complete (wrong electee, prior owner still reachable,
-missing replica, missing secrets, or quorum shortfall), the orphan is requeued
-for the next reconciliation pass. Best-effort epoch fencing remains available
-below quorum and is labeled best-effort everywhere it appears.
+Production grants volume leases in PostgreSQL. Development meshes use
+strict-majority peer voting. Both bind holder and epoch, require renewal before
+expiry, self-fence writers on missed renewal, and prevent a successor from
+activating while the prior lease remains valid. Writable mesh volumes require
+at least three expected members. Read-only volumes need no write lease.
+
+### Quorum restore
+
+Automatic restore requires a strict majority of expected membership to confirm
+the former owner unreachable when quorum protection is enabled. Expected
+membership is a high-water mark and is not reduced by reaping. Restore is
+deferred for quorum shortfall, a reachable owner, incompatible placement,
+missing object/key/secret, or stale ownership claim.
 
 ## Rejection over degradation
 
@@ -148,14 +155,17 @@ slirp with serialized guest-visible NAT state. Host-side TCP flows still reset.
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| Metadata commit | **Always on** for mesh contexts | Not configurable; it is the contract. |
-| Tier | `ha=async`, cadence auto-derived | Was opt-in via `VMON_REPLICATE_SEC`; a default deployment must have stated durability. |
-| Replica fan-out | K=1 | `replicas` config. |
-| Quorum restore | **On** at ≥3 expected members | At 2 nodes: off by default, with a warning in the mesh status payload. |
-| Placement `arch` | Derived from image manifest ∩ node capabilities | Never from ingress/client arch. |
+| Cluster mode | `single-node` | `production` must be explicit and requires PostgreSQL, S3, and a shared non-default key. |
+| Metadata commit | Always on for mesh creates | PostgreSQL transaction in production; peer record acknowledgement in development. |
+| Tier | Mesh `async`; local `off` | `async+rerun` adds the rerun fallback. |
+| Replica cadence | 60 seconds on mesh | Zero disables asynchronous replica capture. |
+| Replica fan-out | 1 | `replicas` config. |
+| History cadence | disk 300s; checkpoint 3600s | Independently configurable; zero disables that tier. |
+| Quorum restore | On at ≥3 expected members | Two-node default is off with a warning. |
+| Placement `arch` | Image manifest ∩ node capabilities | Never inferred from ingress/client architecture. |
 
-Configuration is one `vmon serve` config surface (flags + optional file);
-environment variables are overrides only.
+Configuration is one `vmon serve` surface: defaults, optional TOML, environment,
+then flags.
 
 ## Client plane
 
@@ -164,7 +174,7 @@ One `Transport` protocol, two implementations:
 - **local** — Unix socket to `vmond` (auto-started). No token.
 - **mesh** — ordered gateway roster from a named context + bearer token.
 
-Failover semantics (frozen; verified by `test_mesh_failover.py`):
+Failover semantics are shared by the CLI and all three SDK drivers:
 
 - Replay-safe calls (reads, idempotent writes, detached create/restore with
   idempotency keys) walk the roster and retry only on
@@ -182,13 +192,13 @@ the only non-local transport.
 
 ## Non-goals (recorded so they stay dead)
 
-- Multi-tenancy beyond the two token tiers (`VMON_API_TOKEN`,
-  `VMON_CLIENT_TOKEN`).
+- External identity-provider integration or general RBAC beyond the admin,
+  restricted-client, and tenant-token scopes.
 - GPU passthrough.
 - Autoscaling into clouds.
-- A consensus store. Leaderless gossip + rendezvous + majority probes/leases
-  is the right weight for 2–10 node meshes; this document states exactly what
-  that buys and what it does not.
+- An in-process consensus implementation. Production deliberately relies on
+  PostgreSQL transactions/leases; development meshes expose only their stated
+  gossip guarantees.
 - Built-in NAT traversal / overlay networking. Nodes and clients must reach
   advertise URLs; WireGuard/Tailscale is the documented answer for machines
   behind NAT.

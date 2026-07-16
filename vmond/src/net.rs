@@ -1539,7 +1539,9 @@ impl DomainRefresher {
 
 #[cfg(target_os = "linux")]
 fn disable_ipv6(name: &str) -> Result<()> {
-	let path = PathBuf::from("/proc/sys/net/ipv6/conf").join(name).join("disable_ipv6");
+	let path = PathBuf::from("/proc/sys/net/ipv6/conf")
+		.join(name)
+		.join("disable_ipv6");
 	fs::write(&path, "1\n").map_err(|error| {
 		EngineError::engine(format!("disabling IPv6 on sandbox TAP {name}: {error}"))
 	})

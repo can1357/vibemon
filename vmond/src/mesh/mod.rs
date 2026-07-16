@@ -13,7 +13,10 @@ pub mod proxy;
 pub mod reconciler;
 pub mod record;
 pub mod replica;
+pub mod replica_cache;
 pub mod routes;
 pub mod runtime;
+#[cfg(test)]
+mod runtime_acceptance;
 pub mod state;
 pub mod transfer;

@@ -19,6 +19,7 @@ use std::{
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::bundle;
 use crate::{EngineError, Result, home::state_dir, image::cas};
@@ -43,6 +44,25 @@ pub struct RemotePageMetadata {
 	pub peer_url: String,
 	pub digest:   String,
 	pub page_url: String,
+}
+
+/// Construct a streamable bundle for an actively exported replica snapshot.
+///
+/// Callers must retain their export guard for the duration of streaming.
+pub fn snapshot_bundle_for_path(dir: PathBuf, digest: &str) -> Result<TemplateBundle> {
+	validate_digest(digest)?;
+	if !dir.is_dir() {
+		return Err(EngineError::not_found("replica export is unavailable"));
+	}
+	if cas::snapshot_digest(&dir)? != digest {
+		return Err(EngineError::invalid("replica export digest mismatch"));
+	}
+	Ok(TemplateBundle {
+		dir,
+		metadata_only: false,
+		filename: format!("{digest}.vbundle"),
+		media_type: "application/octet-stream",
+	})
 }
 
 /// Compress `bundle` into `tx` chunks; run on a blocking thread. Errors are
@@ -130,6 +150,87 @@ pub async fn pull_template(
 	);
 	let _ = fs::remove_dir_all(&extract_root);
 	result
+}
+
+/// Fetch and install a replica checkpoint by its exact source identity.
+///
+/// Replica snapshots use `snapshot_digest` and a domain-separated local cache;
+/// they are never CAS-indexed as image templates.
+pub async fn pull_snapshot(
+	client: &Client,
+	peer_url: &str,
+	sid: &str,
+	object_key: &str,
+	digest: &str,
+	token: &str,
+) -> Result<PathBuf> {
+	validate_digest(digest)?;
+	if sid.is_empty() {
+		return Err(EngineError::invalid("replica snapshot sid is required"));
+	}
+	let mut url = reqwest::Url::parse(peer_url.trim_end_matches('/'))
+		.map_err(|_| EngineError::invalid("invalid peer URL"))?;
+	url.path_segments_mut()
+		.map_err(|()| EngineError::invalid("peer URL cannot accept a replica path"))?
+		.extend(["v1", "replicas", sid, digest]);
+	url.query_pairs_mut().append_pair("object_key", object_key);
+	let replicas = state_dir().join("replicas").join("objects");
+	fs::create_dir_all(&replicas)?;
+	let extract_root = temp_dir_in(&replicas, ".pull-snapshot-")?;
+	let pulled = pull_and_extract(client, url.as_str(), digest, token, extract_root.clone()).await;
+	let result = match pulled {
+		Ok(()) => {
+			let root = extract_root.clone();
+			let sid = sid.to_owned();
+			let object_key = object_key.to_owned();
+			let digest = digest.to_owned();
+			tokio::task::spawn_blocking(move || {
+				install_pulled_snapshot(&root, &sid, &object_key, &digest)
+			})
+			.await
+			.map_err(|error| EngineError::engine(format!("snapshot install task failed: {error}")))?
+		},
+		Err(error) => Err(error),
+	};
+	let _ = fs::remove_dir_all(&extract_root);
+	result
+}
+
+/// Verify and install an extracted replica snapshot under the authoritative
+/// replica-cache root without creating a template CAS pointer.
+pub fn install_pulled_snapshot(
+	extract_root: &Path,
+	sid: &str,
+	object_key: &str,
+	digest: &str,
+) -> Result<PathBuf> {
+	validate_digest(digest)?;
+	let source = extracted_template_root(extract_root)?;
+	if cas::snapshot_digest(&source)? != digest {
+		return Err(EngineError::invalid("pulled replica snapshot digest mismatch"));
+	}
+	let name = source
+		.file_name()
+		.and_then(|name| name.to_str())
+		.filter(|name| !name.is_empty() && *name != "." && *name != "..")
+		.ok_or_else(|| EngineError::invalid("replica snapshot has no valid root name"))?;
+	let cache_identity = if object_key.is_empty() {
+		digest
+	} else {
+		object_key
+	};
+	let cache_id = hex::encode(Sha256::digest(format!("{sid}\0{cache_identity}").as_bytes()));
+	let cache_root = state_dir().join("replicas").join("objects").join(cache_id);
+	fs::create_dir_all(&cache_root)?;
+	let target = cache_root.join(name);
+	if target.exists() {
+		if target.is_dir() && cas::snapshot_digest(&target).ok().as_deref() == Some(digest) {
+			return Ok(target);
+		}
+		remove_path(&target)?;
+	}
+	fs::rename(source, &target)?;
+	Ok(target)
 }
 
 /// Verify and install an extracted template tree, checking that its stable

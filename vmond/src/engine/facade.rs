@@ -6,27 +6,29 @@ use std::{
 	fs::{self, OpenOptions},
 	io::{self, Read, Seek, SeekFrom, Write as _},
 	net::IpAddr,
+	ops::Deref,
 	os::unix::fs::{OpenOptionsExt, PermissionsExt},
 	path::{Path, PathBuf},
 	sync::{
-		Arc,
-		atomic::{AtomicU64, Ordering},
+		Arc, Weak,
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use flume::{Receiver, Sender};
-use parking_lot::Mutex;
-use serde::Deserialize;
+use parking_lot::{Condvar, Mutex};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{runtime::Runtime, sync::broadcast, task::JoinHandle};
 use vmm::snapshot::is_safe_snapshot_name;
 
 use crate::{
-	config::{ServeConfig, WarmImage},
+	config::{ClusterMode, ServeConfig, WarmImage},
 	engine::{
-		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, RecoveryPoint, ShellSession,
+		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, OwnershipHandoff, RecoveryPoint,
+		ShellSession,
 		agent::{AgentConn, ExecHandle, GuestActivity},
 		control::ControlClient,
 		diskdelta,
@@ -36,12 +38,24 @@ use crate::{
 	error::{EngineError, Result},
 	home::Home,
 	image::{self, CachedTemplate, TemplateBooter, TemplateRequest, TemplateSpec},
+	mesh::{
+		cluster_store::{ProductionStore, RollbackDisposition, SuspensionMarker},
+		record::CreateRecord,
+		routes::MigrationCleanupWire,
+	},
 	models::{
 		ForkBody, MAX_FORK_CLONES, NetworkBody, PoolPutBody, RestoreBody, S3MountSpec, SandboxCreate,
 	},
 	net::{self, SandboxNetwork},
 	pools::{PoolRegistry, WarmPool, template_key},
-	registry::{Registry, VmRecord},
+	portable_history::{
+		PortableHistory, PortableOwnership, PortablePointInput, PortableSuspendIntent,
+		RetentionPolicy,
+	},
+	registry::{
+		LifecycleOperation, LifecyclePhase, LifecycleState, Registry, SafeRuntimeIdentity,
+		StateGeneration, TransitionBegin, TransitionDisposition, VmRecord,
+	},
 	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
 	security::{
 		AuditEvent, AuditLog, CREDENTIAL_GATEWAY_PORT, CredentialGateway, CredentialProvider,
@@ -71,43 +85,189 @@ const MAX_SNAPSHOT_METADATA_BYTES: u64 = 64 * 1024;
 pub struct Engine {
 	inner: Arc<EngineInner>,
 }
+/// An active replication export pins its directory until both publication
+/// cleanup and every in-flight serving stream release their references.
+/// Removes a checkpoint publication that failed before an owner accepted it.
+struct CheckpointCleanup {
+	digest: Option<String>,
+	path:   Option<PathBuf>,
+}
+
+impl CheckpointCleanup {
+	const fn new(digest: String, path: PathBuf) -> Self {
+		Self { digest: Some(digest), path: Some(path) }
+	}
+
+	fn disarm(&mut self) {
+		self.digest = None;
+		self.path = None;
+	}
+}
+
+impl Drop for CheckpointCleanup {
+	fn drop(&mut self) {
+		let digest = self.digest.take();
+		let path = self.path.take();
+		if let (Some(digest), Some(path)) = (digest, path) {
+			let _ = image::cas::drop_pointer_exact(&digest, &path);
+			let _ = fs::remove_dir_all(path);
+		}
+	}
+}
+
+pub struct ReplicaExport {
+	digest:       String,
+	snapshot_dir: PathBuf,
+	_cleanup:     CheckpointCleanup,
+	object_key:   Mutex<Option<String>>,
+}
+
+impl ReplicaExport {
+	pub(crate) fn path(&self) -> &Path {
+		&self.snapshot_dir
+	}
+}
+
+struct RuntimeOwner(Option<Runtime>);
+
+impl RuntimeOwner {
+	const fn new(runtime: Runtime) -> Self {
+		Self(Some(runtime))
+	}
+}
+
+impl Deref for RuntimeOwner {
+	type Target = Runtime;
+
+	fn deref(&self) -> &Self::Target {
+		self.0.as_ref().expect("live engine runtime")
+	}
+}
+
+impl Drop for RuntimeOwner {
+	fn drop(&mut self) {
+		let Some(runtime) = self.0.take() else {
+			return;
+		};
+		if tokio::runtime::Handle::try_current().is_err() {
+			drop(runtime);
+			return;
+		}
+		thread::scope(|scope| match scope.spawn(move || drop(runtime)).join() {
+			Ok(()) => {},
+			Err(payload) if thread::panicking() => {
+				tracing::error!("engine runtime destructor panicked during unwinding");
+				drop(payload);
+			},
+			Err(payload) => std::panic::resume_unwind(payload),
+		});
+	}
+}
+
+struct LifecycleOwnership {
+	handoff: Arc<dyn OwnershipHandoff>,
+	owner:   String,
+	epoch:   i64,
+}
 
 struct EngineInner {
-	config:           ServeConfig,
-	home:             Home,
-	registry:         Registry,
-	runtimes:         Mutex<HashMap<String, RuntimeState>>,
-	pools:            PoolRegistry,
-	events:           Mutex<Vec<Sender<Value>>>,
-	event_sequence:   AtomicU64,
-	counters:         Counters,
-	latency:          Mutex<CreateLatency>,
-	net_runtime:      Runtime,
-	sandbox_runtime:  Arc<dyn SandboxRuntime>,
-	keyring:          Arc<Keyring>,
-	credentials:      Arc<CredentialStore>,
+	config: ServeConfig,
+	home: Home,
+	registry: Registry,
+	runtimes: Mutex<HashMap<String, RuntimeState>>,
+	launch_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+	restore_handoff: Mutex<Option<Weak<dyn OwnershipHandoff>>>,
+	capture_locks: Mutex<HashMap<String, Arc<CaptureLock>>>,
+	pools: PoolRegistry,
+	events: Mutex<Vec<Sender<Value>>>,
+	event_sequence: AtomicU64,
+	counters: Counters,
+	latency: Mutex<CreateLatency>,
+	net_runtime: RuntimeOwner,
+	sandbox_runtime: Arc<dyn SandboxRuntime>,
+	keyring: Arc<Keyring>,
+	credentials: Arc<CredentialStore>,
+	portable_history: Option<Arc<PortableHistory>>,
+	portable_ownership: Mutex<Option<PortableOwnership>>,
 	maintenance_busy: Mutex<HashSet<String>>,
-	audit:            AuditLog,
+	pending_migration_staging: Mutex<HashMap<String, Arc<TransientDir>>>,
+	pending_replica_exports: Mutex<HashMap<String, Arc<ReplicaExport>>>,
+	portable_gc_last: Mutex<Instant>,
+	#[cfg(test)]
+	restore_executor: Mutex<Option<Arc<TestRestoreExecutor>>>,
+	#[cfg(test)]
+	capture_executor: Mutex<Option<Arc<TestCaptureExecutor>>>,
+	#[cfg(test)]
+	rollback_resume_executor: Mutex<Option<Arc<TestRollbackResumeExecutor>>>,
+	audit: AuditLog,
 }
 
 #[derive(Default)]
 struct RuntimeState {
-	agent:              Option<AgentConn>,
-	network:            Option<SandboxNetwork>,
-	volume_locks:       Vec<VolumeLock>,
-	encrypted_volumes:  Vec<EncryptedVolumeMount>,
-	secret_env:         BTreeMap<String, String>,
-	env:                BTreeMap<String, String>,
-	workdir:            Option<String>,
-	connect_token:      Option<String>,
-	network_policy:     NetworkPolicy,
-	network_spec:       Option<Value>,
-	timeout_stop:       Option<Sender<()>>,
-	s3_proxy:           Option<S3Proxy>,
-	credential_gateway: Option<CredentialGateway>,
-	snapshot_source:    Option<Arc<TransientDir>>,
-	guest_activity:     Option<GuestActivity>,
-	identity_complete:   bool,
+	agent:             Option<AgentConn>,
+	network:           Option<SandboxNetwork>,
+	volume_locks:      Vec<VolumeLock>,
+	encrypted_volumes: Vec<EncryptedVolumeMount>,
+	secret_env:        BTreeMap<String, String>,
+	env:               BTreeMap<String, String>,
+	workdir:           Option<String>,
+
+	connect_token:         Option<String>,
+	network_policy:        NetworkPolicy,
+	network_spec:          Option<Value>,
+	timeout_stop:          Option<Sender<()>>,
+	s3_proxy:              Option<S3Proxy>,
+	credential_gateway:    Option<CredentialGateway>,
+	snapshot_source:       Option<Arc<TransientDir>>,
+	guest_activity:        Option<GuestActivity>,
+	identity_complete:     bool,
+	restore_volume_leases: Option<RestoreVolumeLeases>,
+	/// Guest setup intentionally deferred while a mesh candidate is fenced
+	/// behind durable ownership. This is internal-only: public create requests
+	/// always complete setup before becoming visible.
+	pending_setup:         Option<Box<CreatePlan>>,
+}
+
+/// An owned per-sandbox capture permit. Unlike a borrowed mutex guard it can
+/// cross `MeshRuntime`'s async boundary while protecting the exact same gate as
+/// local suspend, rollback, history, and snapshot capture paths.
+pub struct LifecycleCaptureGuard {
+	lock: Arc<CaptureLock>,
+}
+
+struct CaptureLock {
+	held:    Mutex<bool>,
+	changed: Condvar,
+}
+
+impl CaptureLock {
+	fn acquire(self: &Arc<Self>) -> LifecycleCaptureGuard {
+		let mut held = self.held.lock();
+		while *held {
+			self.changed.wait(&mut held);
+		}
+		*held = true;
+		drop(held);
+		LifecycleCaptureGuard { lock: Arc::clone(self) }
+	}
+
+	fn try_acquire(self: &Arc<Self>) -> Option<LifecycleCaptureGuard> {
+		let mut held = self.held.try_lock()?;
+		if *held {
+			return None;
+		}
+		*held = true;
+		drop(held);
+		Some(LifecycleCaptureGuard { lock: Arc::clone(self) })
+	}
+}
+
+impl Drop for LifecycleCaptureGuard {
+	fn drop(&mut self) {
+		let mut held = self.lock.held.lock();
+		*held = false;
+		self.lock.changed.notify_one();
+	}
 }
 
 struct EncryptedVolumeMount {
@@ -164,10 +324,154 @@ impl Drop for TransientDir {
 		let _ = fs::remove_dir_all(&self.0);
 	}
 }
+/// Removes a production staging archive unless publication completed. Local
+/// recovery points deliberately keep their archive as the recovery authority.
+struct ArchiveCleanup {
+	path:     PathBuf,
+	preserve: bool,
+}
+
+impl Drop for ArchiveCleanup {
+	fn drop(&mut self) {
+		if !self.preserve {
+			let _ = fs::remove_file(&self.path);
+		}
+	}
+}
+/// Fresh distributed writable-volume votes held until the portable
+/// replacement is durably committed.  Failure paths drop the guard only
+/// after removing any candidate, so no new VM can outlive its votes.
+struct RestoreVolumeLeases {
+	handoff: Arc<dyn OwnershipHandoff>,
+	runtime: tokio::runtime::Handle,
+	leases:  Option<Vec<Value>>,
+}
+
+impl RestoreVolumeLeases {
+	fn acquire(
+		runtime: tokio::runtime::Handle,
+		handoff: Arc<dyn OwnershipHandoff>,
+		sid: &str,
+		owner: &str,
+		epoch: i64,
+		params: &mut Map<String, Value>,
+	) -> Result<Self> {
+		let leases =
+			runtime.block_on(handoff.acquire_restore_volume_leases(sid, owner, epoch, params))?;
+		Ok(Self { handoff, runtime, leases: Some(leases) })
+	}
+
+	fn persist(&self, sid: &str) -> Result<()> {
+		if let Some(leases) = self.leases.as_deref() {
+			self
+				.runtime
+				.block_on(self.handoff.persist_restore_volume_leases(sid, leases))?;
+		}
+		Ok(())
+	}
+
+	fn disarm(&mut self) {
+		self.leases = None;
+	}
+}
+
+impl Drop for RestoreVolumeLeases {
+	fn drop(&mut self) {
+		if let Some(leases) = self.leases.take() {
+			let _ = self
+				.runtime
+				.block_on(self.handoff.release_restore_volume_leases(leases));
+		}
+	}
+}
+/// Removes an uncommitted rollback-journal temp file and persists the
+/// directory removal so a crash cannot turn write residue into replay input.
+struct JournalTemp(PathBuf);
+
+impl JournalTemp {
+	fn disarm(&mut self) {
+		self.0.clear();
+	}
+}
+
+impl Drop for JournalTemp {
+	fn drop(&mut self) {
+		if self.0.as_os_str().is_empty() {
+			return;
+		}
+		if fs::remove_file(&self.0).is_ok()
+			&& let Some(parent) = self.0.parent()
+		{
+			let _ = OpenOptions::new()
+				.read(true)
+				.open(parent)
+				.and_then(|file| file.sync_all());
+		}
+	}
+}
 
 struct SnapshotSource {
 	path:  PathBuf,
 	guard: Option<Arc<TransientDir>>,
+}
+
+/// Releases a suspend's frozen source if any capture/publication step fails.
+/// A successful suspend disarms it immediately before lifecycle teardown takes
+/// ownership of the paused VM.
+struct ResumeOnError {
+	vm:              SandboxVm,
+	source_pid:      Option<i64>,
+	armed:           bool,
+	#[cfg(test)]
+	resume_executor: Option<Arc<TestRollbackResumeExecutor>>,
+}
+
+impl ResumeOnError {
+	fn new(vm: SandboxVm) -> Self {
+		Self {
+			source_pid: vm.pid().ok().flatten().map(i64::from),
+			vm,
+			armed: true,
+			#[cfg(test)]
+			resume_executor: None,
+		}
+	}
+
+	#[cfg(test)]
+	fn with_resume_executor(
+		vm: SandboxVm,
+		resume_executor: Option<Arc<TestRollbackResumeExecutor>>,
+	) -> Self {
+		let mut guard = Self::new(vm);
+		guard.resume_executor = resume_executor;
+		guard
+	}
+
+	const fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for ResumeOnError {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		let Some(source_pid) = self.source_pid else {
+			return;
+		};
+		if self.vm.pid().ok().flatten().map(i64::from) != Some(source_pid) {
+			return;
+		}
+		#[cfg(test)]
+		if let Some(resume) = &self.resume_executor {
+			resume(&self.vm);
+			return;
+		}
+		if let Ok(mut control) = control_for_vm(&self.vm) {
+			let _ = control.resume();
+		}
+	}
 }
 
 #[derive(Default, Clone)]
@@ -221,7 +525,15 @@ struct CreatePlan {
 	networked_warm:       bool,
 	networked_warm_linux: bool,
 }
-
+#[cfg(test)]
+type TestRestoreExecutor = dyn Fn(&Engine, Map<String, Value>, &Path, bool, Option<Arc<AtomicBool>>) -> Result<Value>
+	+ Send
+	+ Sync;
+#[cfg(test)]
+type TestCaptureExecutor =
+	dyn Fn(&Engine, &str, &str, bool, bool) -> Result<RecoveryPoint> + Send + Sync;
+#[cfg(test)]
+type TestRollbackResumeExecutor = dyn Fn(&SandboxVm) + Send + Sync;
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotOptions {
@@ -290,6 +602,63 @@ struct ResolvedS3Mount {
 	client:     Arc<S3Client>,
 	meta:       Value,
 }
+/// A rollback is destructive only after this journal and its safety point are
+/// durable outside the sandbox directory.  It deliberately contains no
+/// credentials or environment values.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RollbackJournal {
+	sandbox_id:            String,
+	target_recovery_point: String,
+	safety_recovery_point: String,
+	generation:            u64,
+	checkpoint_generation: u64,
+	source_token:          String,
+	portable_owner:        String,
+	portable_owner_epoch:  i64,
+}
+
+fn rollback_journal_matches_marker(
+	journal: &RollbackJournal,
+	sandbox_id: &str,
+	owner: &str,
+	epoch: i64,
+	operation_generation: u64,
+) -> bool {
+	journal.sandbox_id == sandbox_id
+		&& journal.portable_owner == owner
+		&& journal.portable_owner_epoch == epoch
+		&& journal.generation == operation_generation
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackReplayDecision {
+	AbortRetainSource,
+	FinalizeRetainTarget,
+	RecoverSafety,
+}
+
+const fn rollback_replay_decision(
+	source_is_live: bool,
+	local_candidate_is_running: bool,
+	disposition: Option<&RollbackDisposition>,
+) -> RollbackReplayDecision {
+	if source_is_live {
+		RollbackReplayDecision::AbortRetainSource
+	} else if local_candidate_is_running
+		&& matches!(disposition, Some(RollbackDisposition::CommittedRunning))
+	{
+		RollbackReplayDecision::FinalizeRetainTarget
+	} else {
+		RollbackReplayDecision::RecoverSafety
+	}
+}
+
+fn launch_spec_for_cluster(mode: ClusterMode, spec: &LaunchSpec) -> LaunchSpec {
+	match mode {
+		ClusterMode::Production => spec.clone().with_owner_lease_secs(15),
+		ClusterMode::SingleNode => spec.clone(),
+	}
+}
 
 impl Engine {
 	/// Construct the real engine with the built-in `vmon vmm` runtime.
@@ -308,7 +677,23 @@ impl Engine {
 		fs::create_dir_all(home.templates_dir())?;
 		fs::create_dir_all(home.volumes_dir())?;
 		let keyring = Arc::new(Keyring::open(&home)?);
-		let credentials = Arc::new(CredentialStore::open(&home, Arc::clone(&keyring))?);
+		let portable_history = PortableHistory::connect(&config, keyring.as_ref())?;
+		let credentials = match config.cluster_mode {
+			ClusterMode::SingleNode => Arc::new(CredentialStore::open(&home, Arc::clone(&keyring))?),
+			ClusterMode::Production => {
+				let postgres_url = config.postgres_url.as_deref().ok_or_else(|| {
+					EngineError::invalid("production credentials require postgres_url")
+				})?;
+				let fallback_key = config.portable_history_key_id.as_deref().ok_or_else(|| {
+					EngineError::invalid("production credentials require portable_history_key_id")
+				})?;
+				Arc::new(CredentialStore::open_production(
+					Arc::new(ProductionStore::connect(postgres_url)?),
+					Arc::clone(&keyring),
+					fallback_key,
+				)?)
+			},
+		};
 		let audit = AuditLog::open(&home)?;
 		let registry = Registry::new();
 		let lock_requests = registry.rehydrate(&home)?;
@@ -321,23 +706,152 @@ impl Engine {
 				home,
 				registry,
 				runtimes: Mutex::new(HashMap::new()),
+				launch_cancellations: Mutex::new(HashMap::new()),
+				capture_locks: Mutex::new(HashMap::new()),
+				restore_handoff: Mutex::new(None),
+				#[cfg(test)]
+				restore_executor: Mutex::new(None),
+				#[cfg(test)]
+				capture_executor: Mutex::new(None),
+				#[cfg(test)]
+				rollback_resume_executor: Mutex::new(None),
 				pools: PoolRegistry::new(),
 				events: Mutex::new(Vec::new()),
 				event_sequence: AtomicU64::new(0),
 				counters: Counters::default(),
 				latency: Mutex::new(CreateLatency::default()),
-				net_runtime,
+				net_runtime: RuntimeOwner::new(net_runtime),
 				sandbox_runtime,
 				keyring,
 				credentials,
 				audit,
 				maintenance_busy: Mutex::new(HashSet::new()),
+				portable_gc_last: Mutex::new(
+					Instant::now()
+						.checked_sub(Duration::from_mins(1))
+						.unwrap_or_else(Instant::now),
+				),
+				portable_history,
+				portable_ownership: Mutex::new(None),
+				pending_migration_staging: Mutex::new(HashMap::new()),
+				pending_replica_exports: Mutex::new(HashMap::new()),
 			}),
 		};
 		engine.reacquire_volume_locks(lock_requests)?;
 		engine.recover_orphaned_encrypted_volumes()?;
+		if engine.inner.portable_history.is_none() {
+			// A standalone Engine has no MeshRuntime handoff to wait for, so
+			// preserve its original restart recovery guarantees.
+			engine.recover_rollback_journals()?;
+			engine.reconcile_rollback_pins()?;
+		}
+		crate::security::crypto::cleanup_stale_temporary_files(&engine.home().security_dir())?;
+		reclaim_orphaned_disk_artifacts(engine.home())?;
+		let runtime_root = engine.home().security_dir().join("runtime");
+		let preserve_paths = engine.staging_preserve_paths();
+		crate::engine::staging_gc::reclaim_orphaned_staging(&runtime_root, &preserve_paths)?;
+		engine.rehydrate_runtime_identities()?;
+		if engine.inner.portable_history.is_none() {
+			engine.reconcile_lifecycle_transitions();
+		}
 		engine.start_configured_pools()?;
 		Ok(engine)
+	}
+
+	/// Attach mesh routing ownership adoption after `MeshRuntime` is
+	/// constructed. The callback is crate-internal: HTTP clients cannot observe
+	/// staging.
+	pub(crate) fn set_restore_handoff(&self, handoff: Arc<dyn OwnershipHandoff>) {
+		*self.inner.restore_handoff.lock() = Some(Arc::downgrade(&handoff));
+		// Durable suspend/rollback markers are non-serving until this
+		// ownership callback is installed. Reconcile only afterwards, so a
+		// fresh Engine cannot pause, resume, or claim them prematurely.
+		if let Err(error) = self.recover_rollback_journals() {
+			tracing::warn!(%error, "rollback journal reconciliation failed after ownership handoff installation");
+		}
+		if let Err(error) = self.reconcile_rollback_pins() {
+			tracing::warn!(%error, "rollback pin reconciliation failed after ownership handoff installation");
+		}
+		self.reconcile_lifecycle_transitions();
+	}
+
+	fn lifecycle_handoff_owner(&self, id: &str) -> Result<Option<LifecycleOwnership>> {
+		let handoff = self
+			.inner
+			.restore_handoff
+			.lock()
+			.as_ref()
+			.and_then(Weak::upgrade);
+		if self.inner.portable_history.is_some() {
+			let handoff = handoff.ok_or_else(|| {
+				EngineError::engine("production lifecycle requires an ownership handoff")
+			})?;
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			let (owner, epoch) = ownership
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("production ownership bridge disappeared"))?
+				.current(id)?;
+			return Ok(Some(LifecycleOwnership { handoff, owner, epoch }));
+		}
+		let Some(handoff) = handoff else {
+			return Ok(None);
+		};
+		let Some((owner, epoch)) = handoff.current_owner(id)? else {
+			return Ok(None);
+		};
+		Ok(Some(LifecycleOwnership { handoff, owner, epoch }))
+	}
+
+	/// Persisted records can reference a live restore/capture source across a
+	/// daemon restart.  Preserve only paths which the staging GC later
+	/// canonicalizes beneath the managed runtime root.
+	fn staging_preserve_paths(&self) -> Vec<PathBuf> {
+		self
+			.inner
+			.registry
+			.list()
+			.into_iter()
+			.filter(|record| record.status == "running" || !record.lifecycle.is_converged())
+			.flat_map(|record| {
+				[record.runtime_identity.source, record.runtime_identity.template, record.source]
+			})
+			.flatten()
+			.map(PathBuf::from)
+			.collect()
+	}
+
+	fn capture_lock(&self, id: &str) -> Arc<CaptureLock> {
+		let mut locks = self.inner.capture_locks.lock();
+		// The map owns one reference. Retain only active/waiting permits, whose
+		// guards or callers hold another reference, so historical sandbox IDs
+		// do not turn this coordination table into an unbounded cache.
+		locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+		locks
+			.entry(id.to_owned())
+			.or_insert_with(|| {
+				Arc::new(CaptureLock { held: Mutex::new(false), changed: Condvar::new() })
+			})
+			.clone()
+	}
+
+	/// Attempt to acquire the shared lifecycle/capture permit without blocking
+	/// an async mesh request. `Ok(None)` means another capture or lifecycle
+	/// operation owns this sandbox; callers must retry rather than overlap it.
+	pub(crate) fn try_acquire_running_capture(
+		&self,
+		id: &str,
+	) -> Result<Option<LifecycleCaptureGuard>> {
+		let Some(guard) = self.capture_lock(id).try_acquire() else {
+			return Ok(None);
+		};
+		let record = self.get_record(id, false)?;
+		if record.status != "running" || !record.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for capture"));
+		}
+		Ok(Some(guard))
 	}
 
 	/// Stop pool refillers and parked clones. User sandboxes are intentionally
@@ -385,6 +899,24 @@ impl Engine {
 	}
 
 	fn maintenance_once(&self) {
+		self.reconcile_lifecycle_transitions();
+		if let Err(error) = self.reconcile_rollback_pins() {
+			tracing::warn!(%error, "rollback pin reconciliation failed");
+		}
+		if let Some(history) = &self.inner.portable_history {
+			let should_gc = {
+				let mut last = self.inner.portable_gc_last.lock();
+				if last.elapsed() >= Duration::from_mins(1) {
+					*last = Instant::now();
+					true
+				} else {
+					false
+				}
+			};
+			if should_gc && let Err(error) = history.gc() {
+				tracing::warn!(%error, "portable history garbage collection failed");
+			}
+		}
 		for record in self.inner.registry.list() {
 			if record.status != "running" {
 				continue;
@@ -399,7 +931,760 @@ impl Engine {
 		}
 	}
 
+	fn reconcile_lifecycle_transitions(&self) {
+		if self.inner.portable_history.is_some()
+			&& self
+				.inner
+				.restore_handoff
+				.lock()
+				.as_ref()
+				.and_then(Weak::upgrade)
+				.is_none()
+		{
+			return;
+		}
+		for input in self.inner.registry.startup_reconciliation_inputs() {
+			let id = input.record.id.clone();
+			if !self.inner.maintenance_busy.lock().insert(id.clone()) {
+				continue;
+			}
+			if let Err(error) =
+				self.reconcile_lifecycle_transition(input.record, input.lifecycle, input.pid_alive)
+			{
+				tracing::warn!(%error, "sandbox lifecycle reconciliation failed");
+			}
+			self.inner.maintenance_busy.lock().remove(&id);
+		}
+		if let Err(error) = self.reconcile_unplaced_rollback_markers() {
+			tracing::warn!(%error, "unplaced portable rollback reconciliation failed");
+		}
+		if let Err(error) = self.reconcile_unplaced_suspend_markers() {
+			tracing::warn!(%error, "unplaced portable suspend reconciliation failed");
+		}
+	}
+
+	fn reconcile_unplaced_rollback_markers(&self) -> Result<()> {
+		let portable = {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			let Some(portable) = ownership.as_ref().cloned() else {
+				return Ok(());
+			};
+			portable
+		};
+		for marker in portable.rollback_markers()? {
+			// Only the original, still-live source of the exact rollback may
+			// keep this marker from being claimed. A stale placeholder from a
+			// former owner must not permanently block orphan recovery.
+			if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+				let journal = self
+					.rollback_journal_path(&marker.sid)
+					.ok()
+					.and_then(|path| fs::read(path).ok())
+					.and_then(|bytes| serde_json::from_slice::<RollbackJournal>(&bytes).ok());
+				let exact_live_source = journal.is_some_and(|journal| {
+					rollback_journal_matches_marker(
+						&journal,
+						&marker.sid,
+						&marker.owner,
+						marker.epoch,
+						marker.operation_generation,
+					) && candidate.status == "running"
+						&& candidate.lifecycle.generation.0 == marker.operation_generation
+						&& matches!(
+							candidate.lifecycle.operation.as_ref(),
+							Some(LifecycleOperation::Rollback { .. })
+						) && candidate
+						.detail
+						.get("rollback_source_token")
+						.and_then(Value::as_str)
+						.is_some_and(|token| token == journal.source_token)
+						&& self
+							.sandbox_is_running(&self.sandbox(&marker.sid))
+							.unwrap_or(false)
+				});
+				if exact_live_source {
+					if let Err(error) = portable.adopt_live_rollback(
+						&marker.sid,
+						marker.epoch,
+						marker.operation_generation,
+					) {
+						tracing::debug!(sandbox = %marker.sid, %error, "live rollback marker adoption deferred");
+					}
+					continue;
+				}
+				if let Err(error) = self.teardown(&candidate) {
+					tracing::warn!(sandbox = %marker.sid, %error, "unable to fence stale local rollback placeholder");
+					continue;
+				}
+				self.inner.registry.remove(&marker.sid);
+			}
+			let reconcile_result = (|| -> Result<()> {
+				let capture_lock = self.capture_lock(&marker.sid);
+				let _capture_guard = capture_lock.acquire();
+				let handoff = self
+					.inner
+					.restore_handoff
+					.lock()
+					.as_ref()
+					.and_then(Weak::upgrade)
+					.ok_or_else(|| {
+						EngineError::engine("portable rollback marker lacks ownership handoff")
+					})?;
+				let lease = portable.claim_expected(
+					&marker.sid,
+					&marker.owner,
+					marker.epoch,
+					marker.operation_generation,
+				)?;
+				if let Err(error) = handoff.begin_restore(&marker.sid, &lease.owner_node, lease.epoch) {
+					let _ = portable.abort(&lease);
+					return Err(error);
+				}
+				let heartbeat = match portable.start_restore_heartbeat(&lease) {
+					Ok(heartbeat) => heartbeat,
+					Err(error) => {
+						let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					},
+				};
+				self
+					.inner
+					.launch_cancellations
+					.lock()
+					.insert(marker.sid.clone(), heartbeat.lost_signal());
+				let restore = (|| -> Result<()> {
+					let (source, mut params) = self.open_recovery(&marker.sid, &marker.safety)?;
+					params.insert("name".to_owned(), json!(marker.sid));
+					params
+						.insert("checkpoint_generation".to_owned(), json!(marker.checkpoint_generation));
+					ensure_checkpoint_template_present(&source.path)?;
+					self.restore_from_template(params, &source.path, false)?;
+					if let Some(guard) = source.guard {
+						self
+							.inner
+							.runtimes
+							.lock()
+							.entry(marker.sid.clone())
+							.or_default()
+							.snapshot_source = Some(guard);
+					}
+					Ok(())
+				})();
+				self.inner.launch_cancellations.lock().remove(&marker.sid);
+				let authorized = self.inner.net_runtime.block_on(heartbeat.finish());
+				if let Err(error) = restore {
+					if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+						let _ = self.teardown(&candidate);
+						self.inner.registry.remove(&marker.sid);
+					}
+					let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+					let _ = portable.abort(&lease);
+					return Err(error);
+				}
+				match authorized {
+					Ok(true) => {},
+					Ok(false) => {
+						if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+							let _ = self.teardown(&candidate);
+							self.inner.registry.remove(&marker.sid);
+						}
+						let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(EngineError::busy(
+							"portable rollback lease was lost during recovery",
+						));
+					},
+					Err(error) => {
+						if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+							let _ = self.teardown(&candidate);
+							self.inner.registry.remove(&marker.sid);
+						}
+						let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					},
+				}
+				if let Err(error) = handoff.commit_rollback(&marker.sid, &lease.owner_node, lease.epoch)
+					&& handoff
+						.commit_rollback(&marker.sid, &lease.owner_node, lease.epoch)
+						.is_err()
+				{
+					return Err(error);
+				}
+				Ok(())
+			})();
+			if let Err(error) = reconcile_result {
+				tracing::debug!(sandbox = %marker.sid, %error, "portable rollback marker reconciliation deferred");
+			}
+		}
+		Ok(())
+	}
+
+	fn reconcile_unplaced_suspend_markers(&self) -> Result<()> {
+		let portable = {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			let Some(portable) = ownership.as_ref().cloned() else {
+				return Ok(());
+			};
+			portable
+		};
+		for marker in portable.suspend_markers()? {
+			if self.inner.registry.get(&marker.sid).is_some() {
+				continue;
+			}
+			if marker.state == "resuming" {
+				let result = (|| -> Result<()> {
+					let handoff = self
+						.inner
+						.restore_handoff
+						.lock()
+						.as_ref()
+						.and_then(Weak::upgrade)
+						.ok_or_else(|| {
+							EngineError::engine("portable resume marker lacks ownership handoff")
+						})?;
+					let claimed_identity = portable.claim_suspend_marker(&marker)?;
+					let lease = claimed_identity.lease;
+					let claimed = portable
+						.suspend_marker(&marker.sid)?
+						.ok_or_else(|| EngineError::engine("resuming marker disappeared after claim"))?;
+					if claimed.state != "resuming"
+						|| claimed.point != marker.point
+						|| claimed.generation != marker.generation
+						|| claimed.owner != lease.owner_node
+						|| claimed.epoch != lease.epoch
+					{
+						let _ = portable.abort(&lease);
+						return Err(EngineError::busy("resuming marker changed while being recovered"));
+					}
+					// The placeholder is non-serving and supplies only durable,
+					// non-secret identity to the exact recovery restore.
+					self.mesh_install_suspended_placeholder(&claimed_identity.record, &claimed)?;
+					if let Err(error) =
+						handoff.begin_restore(&marker.sid, &lease.owner_node, lease.epoch)
+					{
+						let _ = self.inner.registry.remove(&marker.sid);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					}
+					let heartbeat = match portable.start_restore_heartbeat(&lease) {
+						Ok(heartbeat) => heartbeat,
+						Err(error) => {
+							let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+							let _ = self.inner.registry.remove(&marker.sid);
+							let _ = portable.abort(&lease);
+							return Err(error);
+						},
+					};
+					self
+						.inner
+						.launch_cancellations
+						.lock()
+						.insert(marker.sid.clone(), heartbeat.lost_signal());
+					let restored = self.restore_recovery_identity(
+						&marker.sid,
+						&marker.point,
+						Some((Arc::clone(&handoff), lease.owner_node.clone(), lease.epoch)),
+					);
+					self.inner.launch_cancellations.lock().remove(&marker.sid);
+					let authorization_error = match self.inner.net_runtime.block_on(heartbeat.finish()) {
+						Ok(true) => None,
+						Ok(false) => {
+							Some(EngineError::busy("resuming marker lease was lost during recovery"))
+						},
+						Err(error) => Some(error),
+					};
+					if let Err(error) = restored {
+						if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+							let _ = self.teardown(&candidate);
+							self.inner.registry.remove(&marker.sid);
+						}
+						let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					}
+					if let Some(error) = authorization_error {
+						if let Some(candidate) = self.inner.registry.get(&marker.sid) {
+							let _ = self.teardown(&candidate);
+							self.inner.registry.remove(&marker.sid);
+						}
+						let _ = handoff.abort_restore(&marker.sid, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					}
+					if let Err(error) =
+						handoff.commit_restore(&marker.sid, &lease.owner_node, lease.epoch)
+						&& handoff
+							.commit_restore(&marker.sid, &lease.owner_node, lease.epoch)
+							.is_err()
+					{
+						// The first commit may already have atomically exposed
+						// Running. Retain the candidate, lease guard, and
+						// restoring marker for fenced reconciliation.
+						return Err(error);
+					}
+					self.disarm_restore_volume_leases(&marker.sid);
+					Ok(())
+				})();
+				if let Err(error) = result {
+					tracing::debug!(sandbox = %marker.sid, %error, "portable resuming marker reconciliation deferred");
+				}
+				continue;
+			}
+			if marker.state != "suspending" {
+				continue;
+			}
+			let result = (|| -> Result<()> {
+				let handoff = self
+					.inner
+					.restore_handoff
+					.lock()
+					.as_ref()
+					.and_then(Weak::upgrade)
+					.ok_or_else(|| {
+						EngineError::engine("portable suspend marker lacks ownership handoff")
+					})?;
+				let claimed_identity = portable.claim_suspend_marker(&marker)?;
+				let lease = claimed_identity.lease;
+				let claimed = portable
+					.suspend_marker(&marker.sid)?
+					.ok_or_else(|| EngineError::engine("suspending marker disappeared after claim"))?;
+				if claimed.state != "suspending"
+					|| claimed.point != marker.point
+					|| claimed.generation != marker.generation
+					|| claimed.owner != lease.owner_node
+					|| claimed.epoch != lease.epoch
+				{
+					return Err(EngineError::busy("suspending marker changed while being recovered"));
+				}
+				self
+					.inner
+					.net_runtime
+					.block_on(handoff.release_source_volume_leases(&marker.sid))?;
+				handoff.commit_suspend(&marker.sid, &lease.owner_node, lease.epoch)?;
+				let committed = SuspensionMarker {
+					owner: lease.owner_node.clone(),
+					epoch: lease.epoch,
+					state: "suspended".to_owned(),
+					..marker.clone()
+				};
+				self.mesh_install_suspended_placeholder(&claimed_identity.record, &committed)
+			})();
+			if let Err(error) = result {
+				tracing::debug!(sandbox = %marker.sid, %error, "portable suspending marker reconciliation deferred");
+			}
+		}
+		Ok(())
+	}
+
+	fn reconcile_lifecycle_transition(
+		&self,
+		record: VmRecord,
+		lifecycle: LifecycleState,
+		pid_alive: bool,
+	) -> Result<()> {
+		let capture_lock = self.capture_lock(&record.id);
+		let _capture_guard = capture_lock.acquire();
+		if lifecycle.desired == LifecyclePhase::Running
+			&& matches!(lifecycle.operation, Some(LifecycleOperation::Rollback { .. }))
+		{
+			let Some(LifecycleOperation::Rollback { recovery_point }) = lifecycle.operation.as_ref()
+			else {
+				unreachable!("rollback operation was matched above");
+			};
+			let portable = {
+				let mut ownership = self.inner.portable_ownership.lock();
+				if ownership.is_none() {
+					*ownership = PortableOwnership::connect(&self.inner.config)?;
+				}
+				ownership.as_ref().cloned()
+			};
+			if !self.rollback_journal_path(&record.id)?.is_file()
+				&& let Some(portable) = portable
+				&& let Some(marker) = portable.rollback_marker(&record.id)?
+			{
+				if marker.operation_generation != lifecycle.generation.0 {
+					let error =
+						EngineError::engine("rollback marker does not match local lifecycle generation");
+					self.fail_state_transition(&record.id, lifecycle.generation, &error);
+					return Err(error);
+				}
+				let handoff = self
+					.inner
+					.restore_handoff
+					.lock()
+					.as_ref()
+					.and_then(Weak::upgrade)
+					.ok_or_else(|| EngineError::engine("portable rollback lacks ownership handoff"))?;
+				let lease = portable.claim_expected(
+					&record.id,
+					&marker.owner,
+					marker.epoch,
+					marker.operation_generation,
+				)?;
+				if let Err(error) = handoff.begin_restore(&record.id, &lease.owner_node, lease.epoch) {
+					let _ = portable.abort(&lease);
+					return Err(error);
+				}
+				let heartbeat = match portable.start_restore_heartbeat(&lease) {
+					Ok(heartbeat) => heartbeat,
+					Err(error) => {
+						let _ = handoff.abort_restore(&record.id, &lease.owner_node, lease.epoch);
+						let _ = portable.abort(&lease);
+						return Err(error);
+					},
+				};
+				self
+					.inner
+					.launch_cancellations
+					.lock()
+					.insert(record.id.clone(), heartbeat.lost_signal());
+				let restored = self.restore_recovery_identity(
+					&record.id,
+					&marker.safety,
+					Some((Arc::clone(&handoff), lease.owner_node.clone(), lease.epoch)),
+				);
+				self.inner.launch_cancellations.lock().remove(&record.id);
+				let authorization_error = match self.inner.net_runtime.block_on(heartbeat.finish()) {
+					Ok(true) => None,
+					Ok(false) => Some(EngineError::busy("portable rollback lease was lost")),
+					Err(error) => Some(error),
+				};
+				if let Err(error) = restored {
+					if let Some(candidate) = self.inner.registry.get(&record.id) {
+						let _ = self.teardown(&candidate);
+						self.inner.registry.remove(&record.id);
+					}
+					let _ = handoff.abort_restore(&record.id, &lease.owner_node, lease.epoch);
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(&record.id, lifecycle.generation, &error);
+					return Err(error);
+				}
+				if let Some(error) = authorization_error {
+					if let Some(candidate) = self.inner.registry.get(&record.id) {
+						let _ = self.teardown(&candidate);
+						self.inner.registry.remove(&record.id);
+					}
+					let _ = handoff.abort_restore(&record.id, &lease.owner_node, lease.epoch);
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(&record.id, lifecycle.generation, &error);
+					return Err(error);
+				}
+				if let Err(error) = handoff.commit_rollback(&record.id, &lease.owner_node, lease.epoch)
+					&& handoff
+						.commit_rollback(&record.id, &lease.owner_node, lease.epoch)
+						.is_err()
+				{
+					// Commit outcome is ambiguous. Keep the replacement,
+					// fresh votes, and exact rolling-back marker for
+					// idempotent fenced convergence.
+					return Err(error);
+				}
+				self.disarm_restore_volume_leases(&record.id);
+				self.complete_state_transition(
+					&record.id,
+					lifecycle.generation,
+					LifecyclePhase::Running,
+				)?;
+				return Ok(());
+			}
+
+			// Once rollback created a durable journal, recovery must use the
+			// journal's safety point rather than blindly retrying a target that
+			// may already have destroyed the source. This same idempotent path
+			// is used at daemon startup and by live maintenance reconciliation.
+			if self.rollback_journal_path(&record.id)?.is_file() {
+				// A durable journal is written only after the target pin succeeds.
+				// Do not infer or reclaim another node's fencing identity here.
+				return self.recover_rollback_journals();
+			}
+			// A journal is the destructive rollback authorization. A crash
+			// before one exists must never retry the target: the original VM
+			// may only have been paused while a safety point was being made.
+			if pid_alive {
+				control_for_vm(&self.sandbox(&record.name))?.resume()?;
+				self.inner.registry.cancel_transition(
+					self.home(),
+					&record.id,
+					lifecycle.generation,
+					LifecyclePhase::Running,
+					"rollback interrupted before safety recovery was durable",
+				)?;
+				let owner = record.detail.get("rollback_owner").and_then(Value::as_str);
+				let epoch = record
+					.detail
+					.get("rollback_owner_epoch")
+					.and_then(Value::as_i64);
+				if let (Some(history), Some(owner), Some(epoch)) =
+					(&self.inner.portable_history, owner, epoch)
+				{
+					history.release_rollback_target(
+						&record.id,
+						recovery_point,
+						lifecycle.generation.0,
+						owner,
+						epoch,
+					)?;
+				}
+				self.clear_rollback_detail(&record.id);
+			} else {
+				let error = EngineError::engine(
+					"rollback interrupted before safety recovery; source availability is unknown",
+				);
+				self.fail_state_transition(&record.id, lifecycle.generation, &error);
+			}
+			return Ok(());
+		}
+
+		if lifecycle.desired == LifecyclePhase::Suspended {
+			let portable = {
+				let mut ownership = self.inner.portable_ownership.lock();
+				if ownership.is_none() {
+					*ownership = PortableOwnership::connect(&self.inner.config)?;
+				}
+				ownership.as_ref().cloned()
+			};
+			if let Some(portable) = portable
+				&& let Some(marker) = portable.suspend_marker(&record.id)?
+			{
+				if marker.generation != lifecycle.generation.0
+					|| !matches!(marker.state.as_str(), "suspending" | "suspended")
+				{
+					let error = EngineError::engine(
+						"suspend reconciliation marker does not match local lifecycle generation",
+					);
+					self.fail_state_transition(&record.id, lifecycle.generation, &error);
+					return Err(error);
+				}
+				let local_point = record
+					.detail
+					.get("suspend_recovery_point")
+					.and_then(Value::as_str)
+					.filter(|point| !point.is_empty());
+				if marker.state == "suspending" && local_point.is_none() {
+					if !pid_alive {
+						// The atomically published marker is authoritative:
+						// the source is gone, so complete its local
+						// non-serving projection from this exact point.
+						self.mesh_update_detail_fields(
+							&record.id,
+							Map::from_iter([("suspend_recovery_point".to_owned(), json!(marker.point))]),
+						)?;
+						self.persist_status(&record.id, "suspended", None, None)?;
+						let handoff = self
+							.inner
+							.restore_handoff
+							.lock()
+							.as_ref()
+							.and_then(Weak::upgrade)
+							.ok_or_else(|| {
+								EngineError::engine("portable suspend lacks ownership handoff")
+							})?;
+						self
+							.inner
+							.net_runtime
+							.block_on(handoff.release_source_volume_leases(&record.id))?;
+						handoff.commit_suspend(&record.id, &marker.owner, marker.epoch)?;
+						self.complete_state_transition(
+							&record.id,
+							lifecycle.generation,
+							LifecyclePhase::Suspended,
+						)?;
+						return Ok(());
+					}
+					let handoff = self
+						.inner
+						.restore_handoff
+						.lock()
+						.as_ref()
+						.and_then(Weak::upgrade)
+						.ok_or_else(|| EngineError::engine("portable suspend lacks ownership handoff"))?;
+					let owner = (marker.owner.clone(), marker.epoch);
+					self.abort_suspend_then_resume(&record.id, Some(&handoff), Some(&owner))?;
+					self.inner.registry.cancel_transition(
+						self.home(),
+						&record.id,
+						lifecycle.generation,
+						LifecyclePhase::Running,
+						"suspend publication was interrupted before local point persistence",
+					)?;
+					return Ok(());
+				}
+				if let Some(point) = local_point
+					&& point != marker.point
+				{
+					let error =
+						EngineError::engine("suspend reconciliation point does not match durable marker");
+					self.fail_state_transition(&record.id, lifecycle.generation, &error);
+					return Err(error);
+				}
+				if marker.state == "suspending" {
+					if pid_alive {
+						let returncode = self.teardown(&record)?;
+						self.persist_status(&record.id, "suspended", returncode, None)?;
+					} else {
+						self.persist_status(&record.id, "suspended", None, None)?;
+					}
+					let handoff = self
+						.inner
+						.restore_handoff
+						.lock()
+						.as_ref()
+						.and_then(Weak::upgrade)
+						.ok_or_else(|| EngineError::engine("portable suspend lacks ownership handoff"))?;
+					self
+						.inner
+						.net_runtime
+						.block_on(handoff.release_source_volume_leases(&record.id))?;
+					handoff.commit_suspend(&record.id, &marker.owner, marker.epoch)?;
+					self.complete_state_transition(
+						&record.id,
+						lifecycle.generation,
+						LifecyclePhase::Suspended,
+					)?;
+					return Ok(());
+				}
+				// PG already committed suspension: only reconstruct the
+				// local non-serving placeholder, never infer a point.
+				self.mesh_update_detail_fields(
+					&record.id,
+					Map::from_iter([("suspend_recovery_point".to_owned(), json!(marker.point))]),
+				)?;
+				self.persist_status(&record.id, "suspended", None, None)?;
+				self.complete_state_transition(
+					&record.id,
+					lifecycle.generation,
+					LifecyclePhase::Suspended,
+				)?;
+				return Ok(());
+			}
+		}
+
+		// A crash before a recovery point is committed is an aborted suspend,
+		// never a durable suspended state. Unpause and durably cancel the
+		// intent so reconciliation does not retry a stale generation forever.
+		if lifecycle.desired == LifecyclePhase::Suspended
+			&& pid_alive
+			&& record
+				.detail
+				.get("suspend_recovery_point")
+				.and_then(Value::as_str)
+				.is_none()
+		{
+			// Resume first: a crash after this point leaves the pending suspend
+			// replayable, never a paused VM recorded as steady Running.
+			control_for_vm(&self.sandbox(&record.name))?.resume()?;
+			self.inner.registry.cancel_transition(
+				self.home(),
+				&record.id,
+				lifecycle.generation,
+				LifecyclePhase::Running,
+				"suspend publication was interrupted before its recovery point committed",
+			)?;
+			return Ok(());
+		}
+		if lifecycle.desired == LifecyclePhase::Running
+			&& pid_alive
+			&& self.converge_pending_portable_resume(&record)?
+		{
+			return Ok(());
+		}
+		let transition = self.inner.registry.begin_transition(
+			self.home(),
+			&record.id,
+			lifecycle.generation,
+			lifecycle.desired.clone(),
+		)?;
+		let transition = match transition.disposition {
+			TransitionDisposition::Acquired => transition,
+			TransitionDisposition::Joined => {
+				self
+					.inner
+					.registry
+					.resume_transition(self.home(), &record.id, lifecycle.generation)?
+			},
+			TransitionDisposition::AlreadyObserved => return Ok(()),
+		};
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(());
+		}
+		let generation = transition.generation;
+		let vm = self.sandbox(&record.name);
+		let outcome = match lifecycle.desired {
+			LifecyclePhase::Paused if pid_alive => {
+				control_for_vm(&vm)?.pause()?;
+				Ok(LifecyclePhase::Paused)
+			},
+			LifecyclePhase::Running if pid_alive => {
+				let _ = control_for_vm(&vm)?.resume()?;
+				Ok(LifecyclePhase::Running)
+			},
+			LifecyclePhase::Stopped if pid_alive => {
+				let code = self.teardown(&record)?;
+				self.persist_status(&record.id, "stopped", code, None)?;
+				Ok(LifecyclePhase::Stopped)
+			},
+			LifecyclePhase::Suspended if pid_alive => {
+				if record
+					.detail
+					.get("suspend_recovery_point")
+					.and_then(Value::as_str)
+					.is_none()
+				{
+					// An interrupted pre-publication suspend must not strand a
+					// live VMM paused. Resume it and retain the failed desired
+					// state so a later retry gets a fresh generation.
+					control_for_vm(&vm)?.resume()?;
+					Err(EngineError::engine(
+						"suspend publication was interrupted before its recovery point committed",
+					))
+				} else {
+					let code = self.teardown(&record)?;
+					self.persist_status(&record.id, "suspended", code, None)?;
+					Ok(LifecyclePhase::Suspended)
+				}
+			},
+			LifecyclePhase::Suspended if !pid_alive => record
+				.detail
+				.get("suspend_recovery_point")
+				.and_then(Value::as_str)
+				.filter(|name| !name.is_empty())
+				.map(|_| LifecyclePhase::Suspended)
+				.ok_or_else(|| {
+					EngineError::engine(
+						"cannot acknowledge suspended sandbox without its committed recovery point",
+					)
+				}),
+			phase if !pid_alive && phase == LifecyclePhase::Stopped => Ok(LifecyclePhase::Stopped),
+			phase => Err(EngineError::engine(format!(
+				"cannot converge desired lifecycle state {} without a live sandbox",
+				phase.as_str()
+			))),
+		};
+		match outcome {
+			Ok(observed) => self
+				.inner
+				.registry
+				.observe_transition(self.home(), &record.id, generation, observed)
+				.map(|_| ()),
+			Err(error) => {
+				self.fail_state_transition(&record.id, generation, &error);
+				Err(error)
+			},
+		}
+	}
+
 	fn maintain_sandbox(&self, record: &VmRecord) -> Result<()> {
+		if !record.lifecycle.is_converged() {
+			return Ok(());
+		}
 		if record.detail.get("observed_state").and_then(Value::as_str) == Some("paused") {
 			return Ok(());
 		}
@@ -409,6 +1694,9 @@ impl Engine {
 			.registry
 			.get(&record.id)
 			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{}'", record.id)))?;
+		if !current.lifecycle.is_converged() || current.status != "running" {
+			return Ok(());
+		}
 		if active == Some(false)
 			&& self.inner.config.idle_timeout > 0.0
 			&& unix_time() - current.last_active >= self.inner.config.idle_timeout
@@ -472,10 +1760,16 @@ impl Engine {
 		};
 		if changed {
 			let now = unix_time();
-			self.inner.registry.update(id, |record| record.last_active = now);
-			let _ = self.sandbox(name).save_meta(Map::from_iter([
-				("last_active".to_owned(), json!(now)),
-			]));
+			self
+				.inner
+				.registry
+				.update(id, |record| record.last_active = now);
+			let _ = self
+				.inner
+				.registry
+				.update_detail_persisted(self.home(), id, |detail| {
+					detail.insert("last_active".to_owned(), json!(now));
+				});
 		}
 		Ok(Some(changed))
 	}
@@ -488,8 +1782,83 @@ impl Engine {
 		self.inner.sandbox_runtime.sandbox(name)
 	}
 
+	fn disarm_restore_volume_leases(&self, id: &str) {
+		if let Some(runtime) = self.inner.runtimes.lock().get_mut(id)
+			&& let Some(leases) = runtime.restore_volume_leases.as_mut()
+		{
+			leases.disarm();
+		}
+	}
+
+	/// Remove a not-yet-committed restore candidate before releasing its
+	/// distributed writable-volume votes. A teardown error is fail-closed.
+	fn remove_restore_candidate(&self, id: &str) -> Result<()> {
+		if let Some(record) = self.inner.registry.get(id) {
+			self.teardown(&record)?;
+			self.inner.registry.remove(id);
+		}
+		Ok(())
+	}
+
+	/// Finish an already-materialized portable resume after its commit response
+	/// was lost. This consumes only the exact locally-owned `resuming` epoch.
+	fn converge_pending_portable_resume(&self, record: &VmRecord) -> Result<bool> {
+		if record.status != "running"
+			|| record.lifecycle.desired != LifecyclePhase::Running
+			|| record.lifecycle.observed == LifecyclePhase::Running
+		{
+			return Ok(false);
+		}
+		let portable = {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			ownership.as_ref().cloned()
+		};
+		let Some(portable) = portable else {
+			return Ok(false);
+		};
+		let Some(marker) = portable.suspend_marker(&record.id)? else {
+			return Ok(false);
+		};
+		if marker.state != "resuming"
+			|| record.detail.get("recovery_point").and_then(Value::as_str)
+				!= Some(marker.point.as_str())
+		{
+			return Ok(false);
+		}
+		let handoff = self
+			.inner
+			.restore_handoff
+			.lock()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.ok_or_else(|| EngineError::busy("resuming marker lacks a local ownership handoff"))?;
+		let lease = portable.lease_for_resuming_marker(&marker)?.lease;
+		if let Err(error) = handoff.commit_restore(&record.id, &lease.owner_node, lease.epoch)
+			&& handoff
+				.commit_restore(&record.id, &lease.owner_node, lease.epoch)
+				.is_err()
+		{
+			return Err(error);
+		}
+		self.disarm_restore_volume_leases(&record.id);
+		self.complete_state_transition(
+			&record.id,
+			record.lifecycle.generation,
+			LifecyclePhase::Running,
+		)?;
+		Ok(true)
+	}
+
 	fn launch_sandbox(&self, vm: &SandboxVm, spec: &LaunchSpec) -> Result<()> {
-		self.inner.sandbox_runtime.launch(vm, spec)?;
+		// Every launch funnels through this method (including restores and
+		// rollback replacements), so production candidates always receive the
+		// VMM-side ownership watchdog. Single-node launches deliberately do
+		// not arm it.
+		let spec = launch_spec_for_cluster(self.inner.config.cluster_mode, spec);
+		self.inner.sandbox_runtime.launch(vm, &spec)?;
 		vm.save_meta(Map::from_iter([(
 			"runtime".to_owned(),
 			json!(self.inner.sandbox_runtime.name()),
@@ -502,6 +1871,46 @@ impl Engine {
 
 	fn remove_sandbox(&self, vm: &SandboxVm) -> Result<()> {
 		self.inner.sandbox_runtime.remove(vm)
+	}
+
+	/// Remove only this node's candidate.  Mesh migration/fencing uses this
+	/// path because the authoritative ownership/replica rows must remain
+	/// intact until its own protocol commits their deletion.
+	pub(crate) fn remove_local_candidate(&self, id: &str) -> Result<()> {
+		if let Some(record) = self.inner.registry.get(id) {
+			self.teardown(&record)?;
+		}
+		self.remove_sandbox(&self.sandbox(id))?;
+		self.inner.registry.remove(id);
+		Ok(())
+	}
+
+	/// Delete committed portable history only while the caller still holds the
+	/// exact durable deletion tombstone.  The history implementation makes a
+	/// completed retry a no-op after the ownership row has been finalized.
+	pub(crate) fn delete_portable_history(&self, sid: &str, owner: &str, epoch: i64) -> Result<()> {
+		if let Some(history) = &self.inner.portable_history {
+			history.delete_sandbox_history(sid, owner, epoch)?;
+		}
+		Ok(())
+	}
+
+	fn delete_local_recovery_history(&self, sid: &str) -> Result<()> {
+		match fs::remove_dir_all(self.recovery_root(sid)?) {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	/// History deletion is part of the portable deletion transaction: committing
+	/// its tombstone first would make failed history cleanup unrecoverable.
+	fn commit_portable_delete_after_history(
+		delete_history: impl FnOnce() -> Result<()>,
+		commit_delete: impl FnOnce() -> Result<()>,
+	) -> Result<()> {
+		delete_history()?;
+		commit_delete()
 	}
 
 	fn sandbox_is_running(&self, vm: &SandboxVm) -> Result<bool> {
@@ -529,6 +1938,31 @@ impl Engine {
 		let _ = self.remove_sandbox(vm);
 	}
 
+	/// Once production has atomically published a `suspending` marker, the
+	/// paused source may resume only after the exact marker abort succeeds.
+	/// Otherwise a newer owner could be serving while this stale VM resumes.
+	fn abort_suspend_then_resume(
+		&self,
+		id: &str,
+		handoff: Option<&Arc<dyn OwnershipHandoff>>,
+		owner: Option<&(String, i64)>,
+	) -> Result<()> {
+		let vm = self.sandbox(id);
+		if !self.sandbox_is_running(&vm)? {
+			return Ok(());
+		}
+		if let (Some(handoff), Some((owner, epoch))) = (handoff, owner)
+			&& handoff.abort_suspend(id, owner, *epoch).is_err()
+		{
+			// PostgreSQL can apply the first idempotent abort before its
+			// response is lost. Retry the exact fence before treating the
+			// source as unsafe to resume.
+			handoff.abort_suspend(id, owner, *epoch)?;
+		}
+		control_for_vm(&vm).and_then(|mut control| control.resume())?;
+		Ok(())
+	}
+
 	fn reacquire_volume_locks(&self, requests: Vec<(String, Vec<String>)>) -> Result<()> {
 		let mut requested = requests.into_iter().collect::<HashMap<_, _>>();
 		let running = self
@@ -541,10 +1975,12 @@ impl Engine {
 		let mut staged_by_name = HashMap::new();
 		for record in &running {
 			let mut staged = load_staged_volume_mounts(self.home(), &record.name)?;
-			requested
-				.entry(record.name.clone())
-				.or_default()
-				.extend(staged.iter().filter(|mount| !mount.read_only).map(|mount| mount.name.clone()));
+			requested.entry(record.name.clone()).or_default().extend(
+				staged
+					.iter()
+					.filter(|mount| !mount.read_only)
+					.map(|mount| mount.name.clone()),
+			);
 			for mount in &mut staged {
 				mount.arm();
 			}
@@ -561,6 +1997,126 @@ impl Engine {
 				state.volume_locks.push(volume.acquire_write_lock()?);
 			}
 			state.encrypted_volumes = staged_by_name.remove(&record.name).unwrap_or_default();
+		}
+		Ok(())
+	}
+
+	/// Rebuild only the durable, non-secret portion of a running sandbox's
+	/// runtime state. Agent connections and credential material deliberately
+	/// remain absent: they are re-established on first use.
+	fn rehydrate_runtime_identities(&self) -> Result<()> {
+		let records = self
+			.inner
+			.registry
+			.list()
+			.into_iter()
+			.filter(|record| record.status == "running")
+			.collect::<Vec<_>>();
+		for record in records {
+			let mut state = runtime_state_from_safe_identity(&record.runtime_identity);
+			if state
+				.network_spec
+				.as_ref()
+				.and_then(|spec| spec.get("flavor"))
+				.and_then(Value::as_str)
+				== Some("tap")
+			{
+				let ports = state
+					.network_spec
+					.as_ref()
+					.and_then(|spec| spec.get("ports"))
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter_map(Value::as_u64)
+					.filter_map(|port| u16::try_from(port).ok())
+					.collect::<Vec<_>>();
+				state.network = Some(self.inner.net_runtime.block_on(net::setup_sandbox_network(
+					&record.name,
+					&ports,
+					state.network_policy.egress_allow.as_deref(),
+					state.network_policy.egress_allow_domains.as_deref(),
+					state.network_policy.inbound_cidr_allowlist.as_deref(),
+				))?);
+			}
+			let services: Result<()> = (|| {
+				let requested = record
+					.detail
+					.get("s3_mounts")
+					.cloned()
+					.map(serde_json::from_value::<HashMap<String, S3MountSpec>>)
+					.transpose()?
+					.unwrap_or_default();
+				if !requested.is_empty() {
+					let mut used_tags = HashSet::new();
+					let mounts = self.resolve_s3_mounts(Some(requested), &mut used_tags)?;
+					let routes = mounts
+						.iter()
+						.map(|mount| (mount.tag.clone(), Arc::clone(&mount.client)))
+						.collect();
+					state.s3_proxy = Some(S3Proxy::start(
+						&self.inner.net_runtime,
+						&self.sandbox(&record.name).dir().join("s3.sock"),
+						routes,
+					)?);
+				}
+				let names = record
+					.detail
+					.get("credential_names")
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter_map(Value::as_str)
+					.map(ToOwned::to_owned)
+					.collect::<Vec<_>>();
+				if !names.is_empty() {
+					let network = state.network.as_ref().ok_or_else(|| {
+						EngineError::engine(
+							"credential gateway restart requires a reconstructed TAP network",
+						)
+					})?;
+					let host_ip = network.config.host_ip.parse().map_err(|error| {
+						EngineError::engine(format!(
+							"invalid persisted credential-gateway host IP: {error}"
+						))
+					})?;
+					let guest_ip = network.config.guest_ip.parse().map_err(|error| {
+						EngineError::engine(format!(
+							"invalid persisted credential-gateway guest IP: {error}"
+						))
+					})?;
+					let tenant = record
+						.detail
+						.get("owner_tenant")
+						.and_then(Value::as_str)
+						.unwrap_or("default");
+					self.start_credential_gateway_for(
+						tenant, &record.id, &names, &mut state, host_ip, guest_ip,
+					)?;
+				}
+				Ok(())
+			})();
+			if let Err(error) = services {
+				let _ = self.teardown(&record);
+				self.persist_status(&record.id, "stopped", None, None)?;
+				self
+					.inner
+					.registry
+					.update_detail_persisted(self.home(), &record.id, |detail| {
+						detail.insert("restart_non_runnable".to_owned(), json!(error.to_string()));
+					})?;
+				continue;
+			}
+			let mut runtimes = self.inner.runtimes.lock();
+			let existing = runtimes.entry(record.name).or_default();
+			existing.env = state.env;
+			existing.workdir = state.workdir;
+			existing.network_policy = state.network_policy;
+			existing.network_spec = state.network_spec;
+			existing.network = state.network;
+			existing.s3_proxy = state.s3_proxy;
+			existing.credential_gateway = state.credential_gateway;
+			existing.identity_complete = state.identity_complete;
 		}
 		Ok(())
 	}
@@ -660,6 +2216,56 @@ impl Engine {
 		Ok(())
 	}
 
+	fn resolve_ha_encryption_key(&self, params: &mut SandboxCreate, ha: &str) -> Result<()> {
+		if let Some(key_id) = Self::resolve_ha_key_id(
+			&self.inner.config,
+			ha,
+			&params.owner_tenant,
+			&params.encryption_key_id,
+		)? {
+			params.encryption_key_id = key_id;
+		}
+		Ok(())
+	}
+
+	fn resolve_ha_key_id(
+		config: &ServeConfig,
+		ha: &str,
+		owner_tenant: &str,
+		requested_key: &str,
+	) -> Result<Option<String>> {
+		if config.cluster_mode != ClusterMode::Production || ha == "off" {
+			return Ok(None);
+		}
+		let shared_key = config
+			.portable_history_key_id
+			.as_deref()
+			.filter(|key_id| !key_id.is_empty() && *key_id != "default");
+		let tenant_key = config
+			.tenant_keys
+			.get(owner_tenant)
+			.map(String::as_str)
+			.filter(|key_id| !key_id.is_empty() && *key_id != "default");
+		if !requested_key.is_empty() && requested_key != "default" {
+			if shared_key == Some(requested_key) || tenant_key == Some(requested_key) {
+				return Ok(Some(requested_key.to_owned()));
+			}
+			return Err(EngineError::invalid(
+				"production HA encryption_key_id must be the shared key or the owner's configured \
+				 tenant key",
+			));
+		}
+		tenant_key
+			.or(shared_key)
+			.map(str::to_owned)
+			.map(Some)
+			.ok_or_else(|| {
+				EngineError::invalid(
+					"production HA sandboxes require a non-default shared or tenant encryption key",
+				)
+			})
+	}
+
 	fn prepare_create(&self, mut params: SandboxCreate) -> Result<CreatePlan> {
 		Self::validate_create(&params)?;
 		let sid = params
@@ -677,6 +2283,7 @@ impl Engine {
 			None => self.inner.config.default_ha(false).to_owned(),
 		};
 		let restart_policy = restart_policy_for_ha(&ha).to_owned();
+		self.resolve_ha_encryption_key(&mut params, &ha)?;
 		let tags = params.tags.clone().unwrap_or_default();
 		let secrets = parse_secrets(params.secrets.take())?;
 		let secret_env = merge_secret_env(&secrets);
@@ -1104,7 +2711,43 @@ impl Engine {
 		Ok(())
 	}
 
-	fn launch_create(&self, plan: &mut CreatePlan) -> Result<(SandboxVm, RuntimeState)> {
+	/// Install a shared cancellation signal for a restore before any launch
+	/// work starts. Lease-loss reconciliation sets this signal; every launch
+	/// and readiness boundary observes the same atomic.
+	pub(crate) fn begin_restore_cancellation(&self, id: &str) -> Arc<AtomicBool> {
+		self
+			.inner
+			.launch_cancellations
+			.lock()
+			.entry(id.to_owned())
+			.or_insert_with(|| Arc::new(AtomicBool::new(false)))
+			.clone()
+	}
+
+	/// Remove the cancellation signal only after restore ownership has reached
+	/// a terminal outcome and all candidate cleanup has completed.
+	pub(crate) fn end_restore_cancellation(&self, id: &str) {
+		self.inner.launch_cancellations.lock().remove(id);
+	}
+
+	fn launch_cancellation(&self, sid: &str) -> Option<Arc<AtomicBool>> {
+		self.inner.launch_cancellations.lock().get(sid).cloned()
+	}
+
+	fn ensure_launch_not_cancelled(cancellation: Option<&AtomicBool>) -> Result<()> {
+		if cancellation.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+			return Err(EngineError::busy("sandbox launch fenced before readiness"));
+		}
+		Ok(())
+	}
+
+	fn launch_create(
+		&self,
+		plan: &mut CreatePlan,
+		start_paused: bool,
+	) -> Result<(SandboxVm, RuntimeState)> {
+		let cancellation = self.launch_cancellation(&plan.sid);
+		Self::ensure_launch_not_cancelled(cancellation.as_deref())?;
 		let mut runtime = RuntimeState {
 			secret_env: plan.secret_env.clone(),
 			env: image_env(plan.image_spec.as_ref(), plan.params.env.as_ref()),
@@ -1125,7 +2768,15 @@ impl Engine {
 			identity_complete: true,
 			..RuntimeState::default()
 		};
-		let vm = self.claim_or_launch_vm(plan, &mut runtime)?;
+		let vm = self.claim_or_launch_vm(plan, &mut runtime, start_paused)?;
+		// A lease-loss callback can install its signal while the runtime is
+		// creating VM state. Re-read after claim so that post-spawn window is
+		// fenced before any agent/network/volume registration.
+		let cancellation = self.launch_cancellation(&plan.sid).or(cancellation);
+		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
 		runtime.volume_locks = plan
 			.volume_specs
 			.iter_mut()
@@ -1139,107 +2790,145 @@ impl Engine {
 		for volume in &mut runtime.encrypted_volumes {
 			volume.arm();
 		}
+		if start_paused {
+			// The VMM has acknowledged its control socket but has executed no
+			// guest instructions. Keep the exact resolved plan in memory so
+			// activation can perform the ordinary setup once, after ownership
+			// becomes durable.
+			runtime.pending_setup = Some(Box::new(std::mem::replace(plan, CreatePlan {
+				params:               SandboxCreate::default(),
+				sid:                  String::new(),
+				ha:                   String::new(),
+				restart_policy:       String::new(),
+				tags:                 HashMap::new(),
+				secrets:              Vec::new(),
+				secret_env:           BTreeMap::new(),
+				timeout_secs:         None,
+				volume_specs:         Vec::new(),
+				s3_specs:             Vec::new(),
+				template_dir:         PathBuf::new(),
+				image_spec:           None,
+				image_ref:            None,
+				pool_key:             String::new(),
+				warm_volumes:         false,
+				host_slot:            false,
+				networked_warm:       false,
+				networked_warm_linux: false,
+			})));
+			return Ok((vm, runtime));
+		}
 		let setup_result = (|| {
-		let agent = Self::agent_for_vm(&vm, AGENT_CONNECT_TIMEOUT)?;
-		agent.ping(AGENT_CONNECT_TIMEOUT)?;
-		if let Some(timeout_secs) = plan.timeout_secs
-			&& runtime.timeout_stop.is_none()
-		{
-			runtime.timeout_stop = Some(start_timeout_watchdog(
-				vm.name().to_owned(),
-				timeout_secs,
-				Arc::clone(&self.inner.sandbox_runtime),
-			));
-		}
-		if runtime.timeout_stop.is_some() && plan.pool_key.is_empty() {
-			// no-op branch kept explicit: fresh launches pass --timeout-secs to
-			// the VMM.
-		}
-		for volume in &plan.volume_specs {
-			agent.mount(
-				&volume.tag,
-				Path::new(&volume.mountpoint),
-				volume.read_only,
-				"virtiofs",
-				AGENT_REQUEST_TIMEOUT,
-			)?;
-		}
-		Self::mount_s3_in_guest(&agent, &plan.s3_specs)?;
-		if let Some(network) = &runtime.network {
-			let gc = &network.guest_config;
-			agent.net_config(
-				&gc.guest_ip,
-				gc.prefix,
-				&gc.host_ip,
-				Some(&gc.dns),
-				AGENT_REQUEST_TIMEOUT,
-			)?;
-			runtime.network_spec = Some(json!({
-				"flavor": "tap",
-				"guest_config": network_guest_json(&network.guest_config),
-				"ports": sorted_ports(plan.params.ports.as_deref(), &network.tunnels()),
-				"tunnels": tunnels_json(&network.tunnels()),
-				"policy": policy_json(&runtime.network_policy),
-			}));
-		} else if network_required(&plan.params) {
-			let gc = user_net_guest_config();
-			let dns = net::USER_NET_DNS
-				.iter()
-				.map(|dns| (*dns).to_owned())
-				.collect::<Vec<_>>();
-			agent.net_config(
-				gc["guest_ip"].as_str().unwrap_or(net::USER_NET_GUEST_IP),
-				gc["prefix"]
-					.as_u64()
-					.unwrap_or_else(|| u64::from(net::USER_NET_PREFIX)) as u8,
-				gc["host_ip"].as_str().unwrap_or(net::USER_NET_GATEWAY),
-				Some(&dns),
-				AGENT_REQUEST_TIMEOUT,
-			)?;
-			runtime.network_spec = Some(json!({
-				"flavor": "user",
-				"guest_config": gc,
-				"ports": [],
-				"tunnels": {},
-				"policy": policy_json(&runtime.network_policy),
-			}));
-		}
-		if let Some(probe) = &plan.params.readiness_probe {
-			Self::wait_until_ready(&agent, &runtime, probe, plan.params.timeout.unwrap_or(300.0))?;
-		}
-		runtime.agent = Some(agent);
-		let mut meta = Map::new();
-		meta.insert("sandbox".to_owned(), json!(true));
-		meta.insert("image".to_owned(), json!(plan.image_ref));
-		meta.insert("template".to_owned(), json!(plan.template_dir.to_string_lossy()));
-		meta.insert("workdir".to_owned(), json!(runtime.workdir));
-		meta.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
-		meta.insert(
-			"secret_names".to_owned(),
-			json!(
-				plan
-					.secrets
+			let agent =
+				Self::agent_for_vm_cancellable(&vm, AGENT_CONNECT_TIMEOUT, cancellation.as_deref())?;
+			if let Some(timeout_secs) = plan.timeout_secs
+				&& runtime.timeout_stop.is_none()
+			{
+				runtime.timeout_stop = Some(start_timeout_watchdog(
+					vm.name().to_owned(),
+					timeout_secs,
+					Arc::clone(&self.inner.sandbox_runtime),
+				));
+			}
+			if runtime.timeout_stop.is_some() && plan.pool_key.is_empty() {
+				// no-op branch kept explicit: fresh launches pass --timeout-secs to
+				// the VMM.
+			}
+			for volume in &plan.volume_specs {
+				agent.mount(
+					&volume.tag,
+					Path::new(&volume.mountpoint),
+					volume.read_only,
+					"virtiofs",
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			}
+			Self::mount_s3_in_guest(&agent, &plan.s3_specs)?;
+			if let Some(network) = &runtime.network {
+				let gc = &network.guest_config;
+				agent.net_config(
+					&gc.guest_ip,
+					gc.prefix,
+					&gc.host_ip,
+					Some(&gc.dns),
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+				runtime.network_spec = Some(json!({
+					"flavor": "tap",
+					"guest_config": network_guest_json(&network.guest_config),
+					"ports": sorted_ports(plan.params.ports.as_deref(), &network.tunnels()),
+					"tunnels": tunnels_json(&network.tunnels()),
+					"policy": policy_json(&runtime.network_policy),
+				}));
+			} else if network_required(&plan.params) {
+				let gc = user_net_guest_config();
+				let dns = net::USER_NET_DNS
 					.iter()
-					.map(|secret| &secret.name)
-					.collect::<Vec<_>>()
-			),
-		);
-		meta.insert("credential_names".to_owned(), json!(plan.params.credentials));
-		meta.insert("owner_tenant".to_owned(), json!(plan.params.owner_tenant));
-		meta.insert("encryption_key_id".to_owned(), json!(plan.params.encryption_key_id));
-		meta.insert("desired_state".to_owned(), json!("running"));
-		meta.insert("observed_state".to_owned(), json!("running"));
-		meta.insert("state_generation".to_owned(), json!(1));
-		meta.insert("tags".to_owned(), json!(plan.tags));
-		meta.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
-		meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
-		meta.insert("block_network".to_owned(), json!(plan.params.block_network));
-		meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
-		meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
+					.map(|dns| (*dns).to_owned())
+					.collect::<Vec<_>>();
+				agent.net_config(
+					gc["guest_ip"].as_str().unwrap_or(net::USER_NET_GUEST_IP),
+					gc["prefix"]
+						.as_u64()
+						.unwrap_or_else(|| u64::from(net::USER_NET_PREFIX)) as u8,
+					gc["host_ip"].as_str().unwrap_or(net::USER_NET_GATEWAY),
+					Some(&dns),
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+				runtime.network_spec = Some(json!({
+					"flavor": "user",
+					"guest_config": gc,
+					"ports": [],
+					"tunnels": {},
+					"policy": policy_json(&runtime.network_policy),
+				}));
+			}
+			if let Some(probe) = &plan.params.readiness_probe {
+				Self::wait_until_ready(
+					&agent,
+					&runtime,
+					probe,
+					plan.params.timeout.unwrap_or(300.0),
+					cancellation.as_deref(),
+				)?;
+			}
+			runtime.agent = Some(agent);
+			let mut meta = Map::new();
+			meta.insert("sandbox".to_owned(), json!(true));
+			meta.insert("image".to_owned(), json!(plan.image_ref));
+			meta.insert("template".to_owned(), json!(plan.template_dir.to_string_lossy()));
+			meta.insert("workdir".to_owned(), json!(runtime.workdir));
+			meta.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
+			meta.insert(
+				"secret_names".to_owned(),
+				json!(
+					plan
+						.secrets
+						.iter()
+						.map(|secret| &secret.name)
+						.collect::<Vec<_>>()
+				),
+			);
+			meta.insert("credential_names".to_owned(), json!(plan.params.credentials));
+			meta.insert("owner_tenant".to_owned(), json!(plan.params.owner_tenant));
+			meta.insert("encryption_key_id".to_owned(), json!(plan.params.encryption_key_id));
+			meta.insert("desired_state".to_owned(), json!("running"));
+			meta.insert("observed_state".to_owned(), json!("running"));
+			meta.insert("state_generation".to_owned(), json!(1));
+			meta.insert("tags".to_owned(), json!(plan.tags));
+			meta.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
+			meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
+			meta.insert("block_network".to_owned(), json!(plan.params.block_network));
+			meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
+			meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
+			meta.insert("runtime_identity".to_owned(), runtime_identity(&runtime));
 			vm.save_meta(meta)?;
 			Ok(())
 		})();
 		if let Err(error) = setup_result {
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
+		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
 			self.rollback_uncommitted_runtime(&vm, &mut runtime);
 			return Err(error);
 		}
@@ -1250,6 +2939,7 @@ impl Engine {
 		&self,
 		plan: &CreatePlan,
 		runtime: &mut RuntimeState,
+		start_paused: bool,
 	) -> Result<SandboxVm> {
 		if cfg!(target_os = "macos") && credentials_requested(&plan.params) {
 			self.start_credential_gateway(
@@ -1307,11 +2997,12 @@ impl Engine {
 			&& plan.volume_specs.is_empty()
 			&& plan.s3_specs.is_empty()
 			&& !credentials_requested(&plan.params)
+			&& snapshot_state_present(&plan.template_dir)
 		{
-			return self.launch_restore_vm(plan, None, runtime);
+			return self.launch_restore_vm(plan, None, runtime, start_paused);
 		}
 		if plan.warm_volumes || plan.host_slot || plan.networked_warm {
-			return self.launch_restore_vm(plan, None, runtime);
+			return self.launch_restore_vm(plan, None, runtime, start_paused);
 		}
 		if (plan.networked_warm_linux
 			|| (network_required(&plan.params)
@@ -1328,7 +3019,7 @@ impl Engine {
 				.map_err(|_| EngineError::engine("allocated host gateway is not an IP address"))?;
 			runtime.network = Some(network);
 			self.start_credential_gateway(plan, runtime, host_ip, host_ip)?;
-			return self.launch_restore_vm(plan, Some(tap), runtime);
+			return self.launch_restore_vm(plan, Some(tap), runtime, start_paused);
 		}
 		if network_required(&plan.params)
 			&& plan.s3_specs.is_empty()
@@ -1336,9 +3027,9 @@ impl Engine {
 			&& snapshot_state_present(&plan.template_dir)
 		{
 			reject_macos_host_network_features(&plan.params)?;
-			return self.launch_restore_vm(plan, None, runtime);
+			return self.launch_restore_vm(plan, None, runtime, start_paused);
 		}
-		self.launch_cold_vm(plan, runtime)
+		self.launch_cold_vm(plan, runtime, start_paused)
 	}
 
 	fn launch_restore_vm(
@@ -1346,6 +3037,7 @@ impl Engine {
 		plan: &CreatePlan,
 		tap: Option<String>,
 		runtime: &mut RuntimeState,
+		start_paused: bool,
 	) -> Result<SandboxVm> {
 		let vm = self.sandbox(&plan.sid);
 		let mut spec = LaunchSpec::restore(vm.api_sock(), &plan.template_dir)
@@ -1394,6 +3086,9 @@ impl Engine {
 				plan.params.remote_page_digest.clone(),
 			);
 		}
+		if start_paused {
+			spec = spec.with_start_paused();
+		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		self.launch_sandbox(&vm, &spec)?;
 		runtime.s3_proxy = s3_proxy;
@@ -1409,7 +3104,12 @@ impl Engine {
 		Ok(vm)
 	}
 
-	fn launch_cold_vm(&self, plan: &CreatePlan, runtime: &mut RuntimeState) -> Result<SandboxVm> {
+	fn launch_cold_vm(
+		&self,
+		plan: &CreatePlan,
+		runtime: &mut RuntimeState,
+		start_paused: bool,
+	) -> Result<SandboxVm> {
 		let vm = self.sandbox(&plan.sid);
 		let base_disk = plan.template_dir.join("rootfs.img");
 		if !base_disk.is_file() {
@@ -1463,6 +3163,9 @@ impl Engine {
 				volume.read_only,
 			)?);
 		}
+		if start_paused {
+			spec = spec.with_start_paused();
+		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		self.launch_sandbox(&vm, &spec)?;
 		runtime.s3_proxy = s3_proxy;
@@ -1494,10 +3197,12 @@ impl Engine {
 		runtime: &RuntimeState,
 		probe: &Value,
 		timeout: f64,
+		cancellation: Option<&AtomicBool>,
 	) -> Result<()> {
 		let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
 		let mut last = None;
 		while Instant::now() < deadline {
+			Self::ensure_launch_not_cancelled(cancellation)?;
 			let remaining = deadline.saturating_duration_since(Instant::now());
 			let attempt = remaining.min(Duration::from_secs(5));
 			let result = if let Some(port) = probe.as_u64() {
@@ -1573,6 +3278,29 @@ impl Engine {
 
 	fn agent_for_vm(vm: &SandboxVm, timeout: Duration) -> Result<AgentConn> {
 		AgentConn::connect(&vm.agent_sock()?, timeout)
+	}
+
+	fn agent_for_vm_cancellable(
+		vm: &SandboxVm,
+		timeout: Duration,
+		cancellation: Option<&AtomicBool>,
+	) -> Result<AgentConn> {
+		let deadline = Instant::now() + timeout;
+		let mut last_error = None;
+		while Instant::now() < deadline {
+			Self::ensure_launch_not_cancelled(cancellation)?;
+			let attempt = deadline
+				.saturating_duration_since(Instant::now())
+				.min(Duration::from_millis(100));
+			match Self::agent_for_vm(vm, attempt) {
+				Ok(agent) => return Ok(agent),
+				Err(error) => last_error = Some(error),
+			}
+			Self::ensure_launch_not_cancelled(cancellation)?;
+			thread::sleep(Duration::from_millis(10));
+		}
+		Self::ensure_launch_not_cancelled(cancellation)?;
+		Err(last_error.unwrap_or_else(|| EngineError::engine("agent did not become reachable")))
 	}
 
 	fn start_entry_command(&self, name: String, cmd: Vec<String>) -> Result<()> {
@@ -1729,31 +3457,32 @@ impl Engine {
 		Ok(returncode)
 	}
 
-	fn begin_state_transition(&self, id: &str, desired: &str) -> Result<()> {
+	fn begin_state_transition(&self, id: &str, desired: LifecyclePhase) -> Result<TransitionBegin> {
 		let record = self.get_record(id, false)?;
-		let generation = record
-			.detail
-			.get("state_generation")
-			.and_then(Value::as_u64)
-			.unwrap_or(0)
-			.saturating_add(1);
-		self.mesh_update_detail_fields(
-			id,
-			Map::from_iter([
-				("desired_state".to_owned(), json!(desired)),
-				("state_generation".to_owned(), json!(generation)),
-			]),
-		)
+		self
+			.inner
+			.registry
+			.begin_transition(self.home(), id, record.lifecycle.generation, desired)
 	}
 
-	fn complete_state_transition(&self, id: &str, observed: &str) -> Result<()> {
-		self.mesh_update_detail_fields(
-			id,
-			Map::from_iter([
-				("observed_state".to_owned(), json!(observed)),
-				("state_changed_at_unix_millis".to_owned(), json!(unix_millis())),
-			]),
-		)
+	fn complete_state_transition(
+		&self,
+		id: &str,
+		generation: StateGeneration,
+		observed: LifecyclePhase,
+	) -> Result<()> {
+		self
+			.inner
+			.registry
+			.observe_transition(self.home(), id, generation, observed)?;
+		Ok(())
+	}
+
+	fn fail_state_transition(&self, id: &str, generation: StateGeneration, error: &EngineError) {
+		let _ = self
+			.inner
+			.registry
+			.fail_transition(self.home(), id, generation, error.to_string());
 	}
 
 	fn poll_returncode(name: &str) -> Option<i64> {
@@ -1839,6 +3568,20 @@ impl Engine {
 	}
 
 	fn recovery_points(&self, id: &str) -> Result<Vec<RecoveryPoint>> {
+		if let Some(history) = &self.inner.portable_history {
+			return history.history(id).map(|points| {
+				points
+					.into_iter()
+					.filter(|point| !point.name.contains("-rollback-safety-"))
+					.map(|point| RecoveryPoint {
+						name:                   point.name,
+						kind:                   point.kind,
+						created_at_unix_millis: point.created_at_unix_millis,
+						size_bytes:             point.size_bytes,
+					})
+					.collect()
+			});
+		}
 		let root = self.recovery_root(id)?;
 		let mut points = match fs::read_dir(root) {
 			Ok(entries) => entries
@@ -1851,6 +3594,9 @@ impl Engine {
 					let created_at_unix_millis = fields.next()?.parse().ok()?;
 					let kind = fields.next()?.to_owned();
 					let size_bytes = entry.metadata().ok()?.len();
+					if name.contains("-rollback-safety-") {
+						return None;
+					}
 					Some(RecoveryPoint {
 						name: name.to_owned(),
 						kind,
@@ -1886,15 +3632,83 @@ impl Engine {
 	}
 
 	fn capture_recovery(&self, id: &str, kind: &str, keep_running: bool) -> Result<RecoveryPoint> {
+		self.capture_recovery_with_portability(id, kind, keep_running, true)
+	}
+
+	fn capture_recovery_with_portability(
+		&self,
+		id: &str,
+		kind: &str,
+		keep_running: bool,
+		publish_portable: bool,
+	) -> Result<RecoveryPoint> {
+		let lock = self.capture_lock(id);
+		let _guard = lock.acquire();
+		let record = self.get_record(id, false)?;
+		if record.status != "running" || !record.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for recovery capture"));
+		}
+		self.capture_recovery_with_portability_unlocked(
+			id,
+			kind,
+			keep_running,
+			publish_portable,
+			None,
+		)
+	}
+
+	fn capture_recovery_with_portability_unlocked(
+		&self,
+		id: &str,
+		kind: &str,
+		keep_running: bool,
+		publish_portable: bool,
+		suspend_generation: Option<u64>,
+	) -> Result<RecoveryPoint> {
+		let recovery_kind = match kind {
+			"disk" | "checkpoint" => kind,
+			"rollback-safety" => "checkpoint",
+			_ => return Err(EngineError::invalid(format!("unknown recovery kind {kind:?}"))),
+		};
+		#[cfg(test)]
+		let capture_executor = self.inner.capture_executor.lock().clone();
+		#[cfg(test)]
+		if let Some(executor) = capture_executor {
+			return executor(self, id, kind, keep_running, publish_portable);
+		}
 		let (record, mut params) = self.mesh_checkpoint_params(id)?;
+		// This fences only the original live process. A safety/target
+		// replacement must receive the configuration, never the token.
+		params.remove("rollback_source_token");
 		let created_at_unix_millis = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
-		let recovery_point = format!("{created_at_unix_millis:020}-{kind}-{}", random_hex(8));
-		let archive = self.recovery_archive(id, &recovery_point)?;
-		let key_id = record
-			.detail
-			.get("encryption_key_id")
-			.and_then(Value::as_str)
-			.unwrap_or("default");
+		let key_id = if publish_portable && self.inner.portable_history.is_some() {
+			let record_key = record
+				.detail
+				.get("encryption_key_id")
+				.and_then(Value::as_str)
+				.filter(|key| *key != "default");
+			let owner_tenant = record.detail.get("owner_tenant").and_then(Value::as_str);
+			let tenant_key = owner_tenant
+				.and_then(|tenant| self.inner.config.tenant_keys.get(tenant))
+				.map(String::as_str);
+			let key_id = record_key
+				.filter(|key| tenant_key == Some(*key))
+				.or(self.inner.config.portable_history_key_id.as_deref())
+				.ok_or_else(|| {
+					EngineError::invalid("production recovery requires portable_history_key_id")
+				})?;
+			// A mapped tenant key is portable only after PortableHistory setup
+			// has verified its cluster-wide key fingerprint. An unmapped key
+			// deliberately falls back to the shared recovery key.
+			self.inner.keyring.load(key_id)?;
+			key_id
+		} else {
+			record
+				.detail
+				.get("encryption_key_id")
+				.and_then(Value::as_str)
+				.unwrap_or("default")
+		};
 		params.remove("secrets");
 		if let Some(credentials) = params.remove("credential_names") {
 			params.insert("credentials".to_owned(), credentials);
@@ -1906,43 +3720,181 @@ impl Engine {
 		let capture_root = runtime_root.join(format!("capture-{}", random_hex(24)));
 		let capture_guard = TransientDir(capture_root.clone());
 		let vm = self.sandbox(&record.name);
-		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
-		self.snapshot_machine_while_paused(
-			&vm,
-			"state",
-			keep_running,
-			disk.as_deref(),
-			&capture_root,
-			false,
-			|dir| {
-				stamp_checkpoint_rootfs(self.home(), dir, record.detail.as_object())?;
-				stamp_checkpoint_marker(dir, record.detail.as_object())?;
-				capture_checkpoint_volumes(
-					self,
-					&record.name,
-					dir,
-					record.detail.get("volumes"),
-				)?;
-				ensure_checkpoint_template_present(dir)?;
-				fs::write(
-					dir.join("recovery.json"),
-					serde_json::to_vec(&json!({
-						"version": 1,
-						"sandbox_id": id,
-						"kind": kind,
-						"created_at_unix_millis": created_at_unix_millis,
-						"params": params,
-					}))?,
-				)?;
-				EncryptedArchive::seal(dir, &archive, &self.inner.keyring, key_id)
+		let mut resume_on_error =
+			(recovery_kind == "checkpoint" && !keep_running && !publish_portable)
+				.then(|| ResumeOnError::new(vm.clone()));
+		let portable_owner = if publish_portable && self.inner.portable_history.is_some() {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			Some(
+				ownership
+					.as_ref()
+					.ok_or_else(|| {
+						EngineError::engine(
+							"production recovery publication requires ownership authority",
+						)
+					})?
+					.current(id)?,
+			)
+		} else {
+			None
+		};
+		let publication_generation = suspend_generation.unwrap_or(record.lifecycle.generation.0);
+		let capture_generation = if let Some((owner, epoch)) = portable_owner.as_ref() {
+			let ownership = self.inner.portable_ownership.lock();
+			ownership
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("production recovery ownership bridge disappeared"))?
+				.allocate_checkpoint_generation(id, owner, *epoch)?
+		} else {
+			self.next_checkpoint_generation(id)?
+		};
+		let recovery_point = format!(
+			"{created_at_unix_millis:020}-{kind}-{capture_generation:020}-{}{}",
+			random_hex(8),
+			if publish_portable {
+				""
+			} else {
+				"-rollback-safety-"
 			},
+		);
+		let archive = self.recovery_archive(id, &recovery_point)?;
+		let _archive_cleanup = ArchiveCleanup {
+			path:     archive.clone(),
+			// Local recovery and the rollback safety journal deliberately own
+			// their archive. Production uses it only as publish staging.
+			preserve: !(publish_portable && self.inner.portable_history.is_some()),
+		};
+		// The VMM owns this transient disk-only artifact. Arm cleanup before
+		// issuing control so a failed snapshot/copy never leaves an orphaned
+		// plaintext rootfs under the shared snapshot root.
+		let _disk_artifact_cleanup =
+			(recovery_kind == "disk").then(|| TransientDir(self.snapshot_dir(&recovery_point)));
+		if recovery_kind == "disk" {
+			// The VMM quiesces only the writable block worker around the rootfs
+			// clone. vCPUs and other devices remain live; disk points are
+			// crash-consistent storage captures, not process checkpoints.
+			let mut control = control_for_vm(&vm)?;
+			let reply = control.disk_snapshot(&recovery_point)?;
+			if reply.get("artifact").and_then(Value::as_str) != Some("disk")
+				|| reply.get("rootfs").and_then(Value::as_str) != Some("rootfs.img")
+			{
+				return Err(EngineError::engine("VMM returned an invalid disk-only snapshot reply"));
+			}
+			let artifact = self.snapshot_dir(&recovery_point).join("disk");
+			let rootfs = artifact.join("rootfs.img");
+			let manifest = artifact.join("manifest.json");
+			require_regular_file(&rootfs, "VMM disk rootfs")?;
+			require_regular_file(&manifest, "VMM disk manifest")?;
+			fs::create_dir_all(&capture_root)?;
+			move_or_copy_regular_file(&rootfs, &capture_root.join("rootfs.img"))?;
+			fs::copy(&manifest, capture_root.join("disk-manifest.json"))?;
+			stamp_checkpoint_marker(&capture_root, record.detail.as_object())?;
+			capture_checkpoint_volumes(
+				self,
+				&record.name,
+				&capture_root,
+				record.detail.get("volumes"),
+			)?;
+			ensure_checkpoint_template_present(&capture_root)?;
+			let _ = fs::remove_dir_all(self.snapshot_dir(&recovery_point));
+		} else {
+			let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
+			let snapshot_name = format!("recovery-{}", random_hex(12));
+			let snapshot_path = self.snapshot_dir(&snapshot_name);
+			let _snapshot_cleanup = TransientDir(snapshot_path);
+			let snapshot_path = self.snapshot_machine_while_paused(
+				&vm,
+				&snapshot_name,
+				keep_running,
+				disk.as_deref(),
+				&self.snapshot_root(),
+				false,
+				!keep_running,
+				|dir| {
+					stamp_checkpoint_rootfs(self.home(), dir, record.detail.as_object())?;
+					stamp_checkpoint_marker(dir, record.detail.as_object())?;
+					capture_checkpoint_volumes(self, &record.name, dir, record.detail.get("volumes"))?;
+					ensure_checkpoint_template_present(dir)
+				},
+			)?;
+			fs::create_dir_all(&capture_root)?;
+			fs::rename(snapshot_path, capture_root.join("state"))?;
+		}
+		fs::write(
+			capture_root.join("recovery.json"),
+			serde_json::to_vec(&json!({
+				"version": 1,
+				"sandbox_id": id,
+				"kind": recovery_kind,
+				"created_at_unix_millis": created_at_unix_millis,
+				"params": params,
+			}))?,
 		)?;
+		EncryptedArchive::seal(&capture_root, &archive, &self.inner.keyring, key_id)?;
+		let mut size_bytes = fs::metadata(&archive)?.len();
+		if publish_portable && let Some(history) = &self.inner.portable_history {
+			let (owner_node, owner_epoch) = portable_owner.as_ref().ok_or_else(|| {
+				EngineError::engine("portable publication ownership was not resolved")
+			})?;
+			let incarnation_epoch = self
+				.inner
+				.portable_ownership
+				.lock()
+				.as_ref()
+				.ok_or_else(|| {
+					EngineError::engine("portable publication ownership bridge disappeared")
+				})?
+				.current_incarnation(id, owner_node, *owner_epoch)?;
+			let prepared = history.prepare(PortablePointInput {
+				sid: id.to_owned(),
+				name: recovery_point.clone(),
+				kind: recovery_kind.to_owned(),
+				created_at_unix_millis,
+				archive: archive.clone(),
+				owner_node: owner_node.clone(),
+				owner_epoch: *owner_epoch,
+				incarnation_epoch,
+				lifecycle_generation: publication_generation,
+			})?;
+			let published = history.publish(&prepared)?;
+			let committed = match suspend_generation {
+				Some(lifecycle_generation) => history.commit_suspend(
+					&published,
+					RetentionPolicy::from_config(&self.inner.config),
+					&PortableSuspendIntent {
+						sid: id.to_owned(),
+						owner: owner_node.clone(),
+						epoch: *owner_epoch,
+						point: recovery_point.clone(),
+						lifecycle_generation,
+					},
+				),
+				None => history.commit(&published, RetentionPolicy::from_config(&self.inner.config)),
+			};
+			let committed = match committed {
+				Ok(committed) => committed,
+				Err(error) => {
+					let _ = history.abort(published);
+					return Err(error);
+				},
+			};
+			size_bytes = committed.size_bytes;
+			// PostgreSQL now names the exact verified object. Local bytes are a
+			// cache, not recovery authority in production.
+			let _ = fs::remove_file(&archive);
+		} else {
+			self.prune_recovery(id, Some(&recovery_point))?;
+		}
+		if let Some(guard) = &mut resume_on_error {
+			guard.disarm();
+		}
 		drop(capture_guard);
-		self.prune_recovery(id, Some(&recovery_point))?;
-		let size_bytes = fs::metadata(&archive)?.len();
 		Ok(RecoveryPoint {
 			name: recovery_point,
-			kind: kind.to_owned(),
+			kind: recovery_kind.to_owned(),
 			created_at_unix_millis,
 			size_bytes,
 		})
@@ -1954,6 +3906,18 @@ impl Engine {
 		recovery_point: &str,
 	) -> Result<(SnapshotSource, Map<String, Value>)> {
 		let archive = self.recovery_archive(id, recovery_point)?;
+		// Production recovery downloads are ephemeral staging bytes. The
+		// committed recovery authority is PostgreSQL/S3, never this cache.
+		let _download_cleanup = ArchiveCleanup {
+			path:     archive.clone(),
+			preserve: self.inner.portable_history.is_none(),
+		};
+		if let Some(history) = &self.inner.portable_history {
+			let point = history.lookup(id, recovery_point)?.ok_or_else(|| {
+				EngineError::not_found(format!("recovery point not found: {recovery_point}"))
+			})?;
+			history.download(&point, &archive)?;
+		}
 		let metadata = fs::symlink_metadata(&archive).map_err(|error| {
 			if error.kind() == io::ErrorKind::NotFound {
 				EngineError::not_found(format!("recovery point not found: {recovery_point}"))
@@ -1973,11 +3937,20 @@ impl Engine {
 		let path = EncryptedArchive::open(&archive, &extract_root, &self.inner.keyring)?;
 		let manifest =
 			serde_json::from_slice::<Value>(&read_snapshot_metadata(&path.join("recovery.json"))?)?;
+		let kind = manifest
+			.get("kind")
+			.and_then(Value::as_str)
+			.ok_or_else(|| EngineError::invalid("recovery manifest is missing its kind"))?;
 		if manifest.get("version").and_then(Value::as_u64) != Some(1)
 			|| manifest.get("sandbox_id").and_then(Value::as_str) != Some(id)
 		{
 			return Err(EngineError::invalid("recovery manifest does not match sandbox"));
 		}
+		let path = match kind {
+			"checkpoint" => path.join("state"),
+			"disk" => path,
+			_ => return Err(EngineError::invalid("recovery manifest has an invalid kind")),
+		};
 		let params = manifest
 			.get("params")
 			.and_then(Value::as_object)
@@ -1986,10 +3959,348 @@ impl Engine {
 		Ok((SnapshotSource { path, guard: Some(Arc::new(TransientDir(extract_root))) }, params))
 	}
 
-	fn restore_recovery_identity(&self, id: &str, recovery_point: &str) -> Result<Value> {
+	fn replacement_lifecycle(previous: &LifecycleState) -> LifecycleState {
+		previous.clone()
+	}
+
+	fn rollback_journal_path(&self, id: &str) -> Result<PathBuf> {
+		validate_local_name("sandbox name", id)?;
+		Ok(self
+			.home()
+			.root()
+			.join("rollback-journals")
+			.join(format!("{id}.json")))
+	}
+
+	fn write_rollback_journal(&self, journal: &RollbackJournal) -> Result<()> {
+		let path = self.rollback_journal_path(&journal.sandbox_id)?;
+		let parent = path
+			.parent()
+			.ok_or_else(|| EngineError::engine("rollback journal lacks parent"))?;
+		fs::create_dir_all(parent)?;
+		let temporary = parent.join(format!(".{}.{}.tmp", journal.sandbox_id, random_hex(8)));
+		let mut temp_guard = JournalTemp(temporary.clone());
+		let bytes = serde_json::to_vec(journal)
+			.map_err(|error| EngineError::engine(format!("serializing rollback journal: {error}")))?;
+		let mut file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(0o600)
+			.open(&temporary)?;
+		file.write_all(&bytes)?;
+		file.sync_all()?;
+		fs::rename(&temporary, &path)?;
+		temp_guard.disarm();
+		OpenOptions::new().read(true).open(parent)?.sync_all()?;
+		Ok(())
+	}
+
+	fn clear_rollback_journal(&self, id: &str) -> Result<()> {
+		let path = self.rollback_journal_path(id)?;
+		match fs::remove_file(&path) {
+			Ok(()) => {
+				let parent = path
+					.parent()
+					.ok_or_else(|| EngineError::engine("rollback journal lacks parent"))?;
+				OpenOptions::new().read(true).open(parent)?.sync_all()?;
+				Ok(())
+			},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	fn remove_safety_recovery(&self, id: &str, point: &str) -> Result<()> {
+		match fs::remove_file(self.recovery_archive(id, point)?) {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	fn clear_rollback_detail(&self, id: &str) {
+		let _ = self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), id, |detail| {
+				detail.remove("lifecycle_operation");
+				detail.remove("rollback_recovery_point");
+				detail.remove("rollback_generation");
+				detail.remove("rollback_source_token");
+			});
+	}
+
+	fn release_rollback_pin(&self, journal: &RollbackJournal) -> Result<()> {
+		if let Some(history) = &self.inner.portable_history {
+			history.release_rollback_target(
+				&journal.sandbox_id,
+				&journal.target_recovery_point,
+				journal.generation,
+				&journal.portable_owner,
+				journal.portable_owner_epoch,
+			)?;
+		}
+		Ok(())
+	}
+
+	fn reconcile_rollback_pins(&self) -> Result<()> {
+		if let Some(history) = &self.inner.portable_history {
+			// A node cannot prove another owner's journal converged from its
+			// local registry view. Pins are released only by that journal's
+			// fenced success path; retention may safely clean up tombstones.
+			let _ = history.list_rollback_pins()?;
+		}
+		Ok(())
+	}
+
+	fn finalize_rollback_journal(&self, journal: &RollbackJournal) -> Result<()> {
+		self.remove_safety_recovery(&journal.sandbox_id, &journal.safety_recovery_point)?;
+		self.release_rollback_pin(journal)?;
+		self.clear_rollback_journal(&journal.sandbox_id)
+	}
+
+	fn recover_rollback_journals(&self) -> Result<()> {
+		let directory = self.home().root().join("rollback-journals");
+		let entries = match fs::read_dir(&directory) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+			Err(error) => return Err(error.into()),
+		};
+		for entry in entries {
+			let entry = entry?;
+			if !entry.file_type()?.is_file() {
+				continue;
+			}
+			let path = entry.path();
+			let name = entry.file_name();
+			let Some(name) = name.to_str() else {
+				continue;
+			};
+			let Some(sandbox_id) = name.strip_suffix(".json") else {
+				if name.starts_with('.')
+					&& Path::new(name)
+						.extension()
+						.is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+					&& fs::remove_file(&path).is_ok()
+				{
+					let _ = OpenOptions::new()
+						.read(true)
+						.open(&directory)
+						.and_then(|file| file.sync_all());
+				}
+				continue;
+			};
+			if validate_local_name("sandbox name", sandbox_id).is_err() {
+				continue;
+			}
+			let journal: RollbackJournal = serde_json::from_slice(&fs::read(&path)?)
+				.map_err(|error| EngineError::engine(format!("reading rollback journal: {error}")))?;
+			if journal.sandbox_id != sandbox_id {
+				continue;
+			}
+			if let Some(record) = self.inner.registry.get(&journal.sandbox_id) {
+				let source_is_live = record.status == "running"
+					&& record
+						.detail
+						.get("rollback_source_token")
+						.and_then(Value::as_str)
+						.is_some_and(|token| token == journal.source_token)
+					&& self.sandbox_is_running(&self.sandbox(&journal.sandbox_id))?;
+				if rollback_replay_decision(source_is_live, false, None)
+					== RollbackReplayDecision::AbortRetainSource
+				{
+					// The original process survived, but it may only resume
+					// after the exact durable operation abort proves this
+					// owner/epoch still controls the source.
+					let handoff = self
+						.inner
+						.restore_handoff
+						.lock()
+						.as_ref()
+						.and_then(Weak::upgrade);
+					if self.inner.portable_history.is_some() && handoff.is_none() {
+						return Err(EngineError::engine(
+							"portable rollback replay requires an ownership handoff",
+						));
+					}
+					if let Some(handoff) = handoff {
+						handoff.abort_rollback(
+							&journal.sandbox_id,
+							&journal.portable_owner,
+							journal.portable_owner_epoch,
+						)?;
+					}
+					control_for_vm(&self.sandbox(&journal.sandbox_id))?.resume()?;
+					self.inner.registry.cancel_transition(
+						self.home(),
+						&journal.sandbox_id,
+						StateGeneration(journal.generation),
+						LifecyclePhase::Running,
+						"rollback replay retained original source",
+					)?;
+					self.finalize_rollback_journal(&journal)?;
+					continue;
+				}
+				if self.inner.portable_history.is_some() {
+					let ownership = {
+						let mut ownership = self.inner.portable_ownership.lock();
+						if ownership.is_none() {
+							*ownership = PortableOwnership::connect(&self.inner.config)?;
+						}
+						ownership.as_ref().cloned().ok_or_else(|| {
+							EngineError::engine("portable rollback ownership bridge disappeared")
+						})?
+					};
+					let disposition = ownership.rollback_disposition(
+						&journal.sandbox_id,
+						&journal.portable_owner,
+						journal.portable_owner_epoch,
+					)?;
+					let candidate_is_running = record.status == "running"
+						&& self.sandbox_is_running(&self.sandbox(&journal.sandbox_id))?;
+					if rollback_replay_decision(false, candidate_is_running, Some(&disposition))
+						== RollbackReplayDecision::FinalizeRetainTarget
+					{
+						// PostgreSQL already atomically committed the replacement
+						// as Running. This journal is only post-commit cleanup;
+						// never tear a successful target down to restore safety.
+						self.finalize_rollback_journal(&journal)?;
+						continue;
+					}
+				}
+				// Any other local candidate might be a target that launched
+				// before durable finish. It is never proof of rollback success.
+				if record.status == "running" {
+					let _ = self.teardown(&record);
+				}
+				self.inner.registry.remove(&journal.sandbox_id);
+			}
+			// No matching original source remains. Recover the exact safety
+			// point, never the requested target or a guessed newer history row.
+			let recover = |point: &str| -> Result<()> {
+				let cancellation = self.launch_cancellation(&journal.sandbox_id);
+				Self::ensure_launch_not_cancelled(cancellation.as_deref())?;
+				let (source, mut params) = self.open_recovery(&journal.sandbox_id, point)?;
+				params.insert("name".to_owned(), json!(journal.sandbox_id));
+				params.insert(
+					"checkpoint_generation".to_owned(),
+					json!(
+						journal.checkpoint_generation.max(
+							params
+								.get("checkpoint_generation")
+								.and_then(Value::as_u64)
+								.unwrap_or(0),
+						)
+					),
+				);
+				ensure_checkpoint_template_present(&source.path)?;
+				self
+					.restore_from_template(params, &source.path, false)
+					.map(|_| ())?;
+				if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
+					if let Some(candidate) = self.inner.registry.get(&journal.sandbox_id) {
+						let _ = self.teardown(&candidate);
+						self.inner.registry.remove(&journal.sandbox_id);
+					}
+					return Err(error);
+				}
+				Ok(())
+			};
+			recover(&journal.safety_recovery_point)?;
+			let mut record = self
+				.inner
+				.registry
+				.get(&journal.sandbox_id)
+				.ok_or_else(|| EngineError::engine("rollback replay restored no registry record"))?;
+			if !record.detail.is_object() {
+				record.detail = Value::Object(Map::new());
+			}
+			record
+				.detail
+				.as_object_mut()
+				.expect("detail was materialized as an object")
+				.insert("checkpoint_generation".to_owned(), json!(journal.checkpoint_generation));
+			record.lifecycle = LifecycleState {
+				desired:    LifecyclePhase::Running,
+				observed:   LifecyclePhase::Running,
+				generation: StateGeneration(journal.generation),
+				failure:    None,
+				operation:  Some(LifecycleOperation::Rollback {
+					recovery_point: journal.target_recovery_point.clone(),
+				}),
+			};
+			self.inner.registry.insert_persisted(self.home(), record)?;
+			if let Some(handoff) = self
+				.inner
+				.restore_handoff
+				.lock()
+				.as_ref()
+				.and_then(Weak::upgrade)
+			{
+				handoff.commit_rollback(
+					&journal.sandbox_id,
+					&journal.portable_owner,
+					journal.portable_owner_epoch,
+				)?;
+			}
+			self.complete_state_transition(
+				&journal.sandbox_id,
+				StateGeneration(journal.generation),
+				LifecyclePhase::Running,
+			)?;
+			self.finalize_rollback_journal(&journal)?;
+			self.clear_rollback_detail(&journal.sandbox_id);
+		}
+		Ok(())
+	}
+
+	fn replacement_checkpoint_generation(previous: &Value, restored: &Map<String, Value>) -> u64 {
+		previous
+			.get("checkpoint_generation")
+			.and_then(Value::as_u64)
+			.unwrap_or(0)
+			.max(
+				restored
+					.get("checkpoint_generation")
+					.and_then(Value::as_u64)
+					.unwrap_or(0),
+			)
+	}
+
+	fn restore_recovery_identity(
+		&self,
+		id: &str,
+		recovery_point: &str,
+		lease_owner: Option<(Arc<dyn OwnershipHandoff>, String, i64)>,
+	) -> Result<Value> {
 		let previous = self.get_record(id, false)?;
 		let (source, mut params) = self.open_recovery(id, recovery_point)?;
 		params.insert("name".to_owned(), json!(id));
+		// Snapshot params predate the durable capture allocation. Carry the
+		// live monotonic counter into the *first* replacement record so a
+		// crash after the new VM is inserted cannot rewind replica ordering.
+		let checkpoint_generation =
+			Self::replacement_checkpoint_generation(&previous.detail, &params);
+		params.insert("checkpoint_generation".to_owned(), json!(checkpoint_generation));
+		// Fully materialize and validate the selected replacement before any
+		// destructive action against the currently runnable identity.
+		ensure_checkpoint_template_present(&source.path)?;
+		validate_network_restore(&params)?;
+		// Acquire a newer fenced vote before destroying the old runtime. The
+		// guard survives in RuntimeState until the caller's exact durable
+		// Running commit succeeds.
+		let mut volume_leases = lease_owner
+			.map(|(handoff, owner, epoch)| {
+				RestoreVolumeLeases::acquire(
+					self.inner.net_runtime.handle().clone(),
+					handoff,
+					id,
+					&owner,
+					epoch,
+					&mut params,
+				)
+			})
+			.transpose()?;
 		if previous.status == "running" {
 			self.teardown(&previous)?;
 		}
@@ -2000,24 +4311,46 @@ impl Engine {
 		let result = self.restore_from_template(params, &source.path, true);
 		match result {
 			Ok(_) => {
-				if let Some(guard) = source.guard {
+				if let Some(leases) = volume_leases.as_ref()
+					&& let Err(error) = leases.persist(id)
+				{
+					// If candidate teardown cannot be proved, retain the guard
+					// in RuntimeState; dropping it would release a vote while
+					// this VMM may still be writing.
 					self
 						.inner
 						.runtimes
 						.lock()
 						.entry(id.to_owned())
 						.or_default()
-						.snapshot_source = Some(guard);
+						.restore_volume_leases = volume_leases.take();
+					self.remove_restore_candidate(id)?;
+					return Err(error);
+				}
+				let mut runtime = self.inner.runtimes.lock();
+				let runtime = runtime.entry(id.to_owned()).or_default();
+				runtime.restore_volume_leases = volume_leases.take();
+				if let Some(guard) = source.guard {
+					runtime.snapshot_source = Some(guard);
 				}
 				let mut restored = self.inner.registry.get(id).ok_or_else(|| {
 					EngineError::engine("recovery restore completed without a registry record")
 				})?;
 				restored.created_at = previous.created_at;
 				restored.source = previous.source;
+				// Replacement launch starts at generation one, but it must not
+				// erase an acquired lifecycle operation. Preserve the exact
+				// pending generation/operation so its caller can observe (and
+				// clear) that same transaction after the new VM is runnable.
+				restored.lifecycle = Self::replacement_lifecycle(&previous.lifecycle);
 				if let Some(detail) = restored.detail.as_object_mut() {
 					detail.insert("status".to_owned(), json!("running"));
 					detail.insert("desired_state".to_owned(), json!("running"));
 					detail.insert("observed_state".to_owned(), json!("running"));
+					detail.insert("state_generation".to_owned(), json!(restored.lifecycle.generation.0));
+					let checkpoint_generation =
+						Self::replacement_checkpoint_generation(&previous.detail, detail);
+					detail.insert("checkpoint_generation".to_owned(), json!(checkpoint_generation));
 					detail.insert("recovery_point".to_owned(), json!(recovery_point));
 				}
 				self
@@ -2199,6 +4532,7 @@ impl Engine {
 						&runtime,
 						probe,
 						options.timeout_secs.map_or(300.0, |secs| secs as f64),
+						None,
 					)?;
 				}
 				runtime.agent = Some(agent);
@@ -2224,6 +4558,16 @@ impl Engine {
 			}
 			vm.save_meta(detail.clone())?;
 
+			let runtime_identity = safe_runtime_identity(
+				&runtime,
+				std::iter::empty(),
+				options.timeout_secs.map(|secs| secs as f64),
+				Some(format!("{}:{snapshot}", match mode {
+					SnapshotLaunchMode::Restore => "restore",
+					SnapshotLaunchMode::Fork => "fork",
+				})),
+				Some(snapshot_dir.to_string_lossy().into_owned()),
+			);
 			self.inner.runtimes.lock().insert(name.clone(), runtime);
 			if let Some(command) = options
 				.command
@@ -2234,24 +4578,36 @@ impl Engine {
 			}
 			let now = unix_time();
 			let record = VmRecord {
-				id:            name.clone(),
-				name:          name.clone(),
-				status:        "running".to_owned(),
-				pid:           detail
+				id: name.clone(),
+				name: name.clone(),
+				status: "running".to_owned(),
+				pid: detail
 					.get("pid")
 					.and_then(Value::as_i64)
 					.and_then(|pid| i32::try_from(pid).ok()),
-				source:        Some(format!("{}:{snapshot}", match mode {
+				source: Some(format!("{}:{snapshot}", match mode {
 					SnapshotLaunchMode::Restore => "restore",
 					SnapshotLaunchMode::Fork => "fork",
 				})),
-				created_at:    now,
-				timeout:       options.timeout_secs.map(|secs| secs as f64),
-				detail:        Value::Object(detail),
-				tags:          options.tags.clone(),
-				last_active:   now,
+				incarnation_epoch: detail
+					.get("incarnation_epoch")
+					.and_then(Value::as_i64)
+					.unwrap_or(0),
+				created_at: now,
+				timeout: options.timeout_secs.map(|secs| secs as f64),
+				detail: Value::Object(detail),
+				tags: options.tags.clone(),
+				last_active: now,
 				terminated_at: None,
-				error:         None,
+				error: None,
+				lifecycle: LifecycleState {
+					desired:    LifecyclePhase::Running,
+					observed:   LifecyclePhase::Running,
+					generation: StateGeneration(1),
+					failure:    None,
+					operation:  None,
+				},
+				runtime_identity,
 			};
 			self
 				.inner
@@ -2281,6 +4637,7 @@ impl Engine {
 			disk_src,
 			snapshot_root,
 			track,
+			false,
 			|_| Ok(()),
 		)
 	}
@@ -2293,6 +4650,7 @@ impl Engine {
 		disk_src: Option<&Path>,
 		snapshot_root: &Path,
 		track: bool,
+		hold_paused: bool,
 		while_paused: F,
 	) -> Result<PathBuf>
 	where
@@ -2327,7 +4685,10 @@ impl Engine {
 			let _ = control.resume();
 			return Err(error);
 		}
-		if keep_running {
+		if hold_paused {
+			// A production suspend keeps the precise captured state frozen until
+			// its portable recovery point is committed.
+		} else if keep_running {
 			control.resume()?;
 		} else {
 			let _ = self.stop_sandbox(vm, true);
@@ -2447,6 +4808,91 @@ impl Engine {
 			.collect())
 	}
 
+	/// Claim an expired exact durable suspended marker and project it locally
+	/// without serving it. The ordinary `resume` path then continues the exact
+	/// `resuming` epoch and performs the recovery launch.
+	pub(crate) fn mesh_adopt_suspended_marker(&self, sid: &str) -> Result<()> {
+		let portable = {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			ownership.as_ref().cloned().ok_or_else(|| {
+				EngineError::unsupported("portable suspended-marker adoption is unavailable")
+			})?
+		};
+		let marker = portable.suspend_marker(sid)?.ok_or_else(|| {
+			EngineError::not_found("suspended sandbox has no durable recovery point")
+		})?;
+		if marker.state != "suspended" {
+			return Err(EngineError::busy(format!("suspended sandbox '{sid}' is {}", marker.state)));
+		}
+		let handoff = self
+			.inner
+			.restore_handoff
+			.lock()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.ok_or_else(|| EngineError::engine("portable resume requires an ownership handoff"))?;
+		let claimed = portable.claim_suspend_marker(&marker)?;
+		let lease = claimed.lease;
+		let current = portable
+			.suspend_marker(sid)?
+			.ok_or_else(|| EngineError::busy("suspended marker disappeared after claim"))?;
+		if current.state != "suspended"
+			|| current.point != marker.point
+			|| current.generation != marker.generation
+			|| current.owner != lease.owner_node
+			|| current.epoch != lease.epoch
+		{
+			let _ = portable.abort(&lease);
+			return Err(EngineError::busy("suspended marker changed while being claimed"));
+		}
+		let begin_result = handoff.begin_restore(sid, &lease.owner_node, lease.epoch);
+		let current = portable.suspend_marker(sid)?;
+		match (begin_result, current) {
+			(_, Some(current))
+				if current.state == "resuming"
+					&& current.point == marker.point
+					&& current.generation == marker.generation
+					&& current.owner == lease.owner_node
+					&& current.epoch == lease.epoch =>
+			{
+				// The server can commit before losing the response. The exact
+				// durable resuming row is authoritative and safely continues.
+				if let Some(existing) = self.inner.registry.get(sid) {
+					if existing.status != "suspended"
+						|| existing
+							.detail
+							.get("_mesh_suspended_projection")
+							.and_then(Value::as_bool)
+							!= Some(true)
+					{
+						return Err(EngineError::busy(
+							"cannot replace a serving sandbox with a suspended projection",
+						));
+					}
+					self.inner.registry.remove(sid);
+				}
+				self.mesh_install_suspended_placeholder(&claimed.record, &current)
+			},
+			(Err(error), Some(current))
+				if current.state == "suspended"
+					&& current.point == marker.point
+					&& current.generation == marker.generation
+					&& current.owner == lease.owner_node
+					&& current.epoch == lease.epoch =>
+			{
+				let _ = portable.abort(&lease);
+				Err(error)
+			},
+			(Err(error), _) => Err(error),
+			(Ok(()), _) => {
+				Err(EngineError::busy("suspended marker changed while entering resuming state"))
+			},
+		}
+	}
+
 	pub(crate) fn mesh_list_views(&self) -> Result<Vec<Value>> {
 		<Self as EngineApi>::list(self, None)
 	}
@@ -2461,6 +4907,57 @@ impl Engine {
 
 	pub(crate) fn mesh_get_view(&self, sid: &str) -> Result<Value> {
 		Ok(self.get_record(sid, false)?.view())
+	}
+
+	/// Project a durable cluster suspension into this node's local registry
+	/// without creating a VM or trusting host-local history metadata.
+	pub(crate) fn mesh_install_suspended_placeholder(
+		&self,
+		record: &CreateRecord,
+		marker: &SuspensionMarker,
+	) -> Result<()> {
+		if self.inner.registry.get(&record.sid).is_some() {
+			return Ok(());
+		}
+		let mut detail = record.params.clone();
+		for key in ["secrets", "secret", "password", "token", "access_key", "secret_key"] {
+			detail.remove(key);
+		}
+		detail.insert("name".to_owned(), json!(record.sid));
+		detail.insert("status".to_owned(), json!("suspended"));
+		detail.insert("suspend_recovery_point".to_owned(), json!(marker.point));
+		detail.insert("suspend_generation".to_owned(), json!(marker.generation));
+		detail.insert("suspend_owner".to_owned(), json!(marker.owner));
+		detail.insert("_mesh_suspended_projection".to_owned(), Value::Bool(true));
+		detail.insert("suspend_owner_epoch".to_owned(), json!(marker.epoch));
+		let mut local = VmRecord::new(&record.sid, &record.sid, "suspended");
+		local.source = detail
+			.get("image")
+			.and_then(Value::as_str)
+			.map(str::to_owned);
+		local.created_at = record.created_at;
+		local.timeout = detail.get("timeout").and_then(Value::as_f64);
+		local.tags = detail
+			.get("tags")
+			.and_then(Value::as_object)
+			.map(|tags| {
+				tags
+					.iter()
+					.filter_map(|(key, value)| {
+						value.as_str().map(|value| (key.clone(), value.to_owned()))
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		local.detail = Value::Object(detail);
+		local.lifecycle = LifecycleState {
+			desired:    LifecyclePhase::Suspended,
+			observed:   LifecyclePhase::Suspended,
+			generation: StateGeneration(marker.generation),
+			operation:  None,
+			failure:    None,
+		};
+		self.inner.registry.insert_persisted(self.home(), local)
 	}
 
 	pub(crate) fn mesh_checkpoint_age_sec(&self, sid: &str) -> Option<f64> {
@@ -2485,6 +4982,13 @@ impl Engine {
 		self.mesh_update_detail_fields(
 			sid,
 			Map::from_iter([("idempotency_key".to_owned(), json!(key))]),
+		)
+	}
+
+	pub(crate) fn mesh_record_create_epoch(&self, sid: &str, epoch: i64) -> Result<()> {
+		self.mesh_update_detail_fields(
+			sid,
+			Map::from_iter([("_mesh_create_epoch".to_owned(), json!(epoch))]),
 		)
 	}
 
@@ -2525,6 +5029,25 @@ impl Engine {
 		)
 	}
 
+	/// Fail closed when runtime lease reconciliation cannot prove a local
+	/// candidate is still alive.
+	pub(crate) fn candidate_is_running(&self, sid: &str) -> bool {
+		self.sandbox_is_running(&self.sandbox(sid)).unwrap_or(false)
+	}
+
+	/// Rearm the VMM owner watchdog after a mesh ownership renewal without
+	/// counting the renewal as guest activity.
+	pub(crate) fn mesh_rearm_owner_lease(&self, sid: &str, secs: u64) -> Result<()> {
+		let record = self.get_record(sid, false)?;
+		if record.status != "running" || !self.sandbox_is_running(&self.sandbox(sid))? {
+			return Err(EngineError::busy(format!(
+				"sandbox '{sid}' is not a running local candidate"
+			)));
+		}
+		control_for_vm(&self.sandbox(sid))?.rearm_owner_lease(secs)?;
+		Ok(())
+	}
+
 	/// Forget lease metadata after all matching votes have been released.
 	/// A no-op for already-removed records (fencing removes before releasing).
 	#[allow(
@@ -2535,14 +5058,193 @@ impl Engine {
 		if self.inner.registry.get(sid).is_none() {
 			return Ok(());
 		}
-		self.inner.registry.update(sid, |record| {
-			if let Some(detail) = record.detail.as_object_mut() {
-				detail.remove("volume_leases");
-			}
-		});
 		let _ = self
-			.sandbox(sid)
-			.save_meta(Map::from_iter([("volume_leases".to_owned(), Value::Object(Map::new()))]));
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), sid, |detail| {
+				detail.remove("volume_leases");
+			});
+		Ok(())
+	}
+
+	/// Create a mesh migration candidate with its VMM paused before any guest
+	/// instruction or guest-agent request. It remains a local, non-serving
+	/// record until `mesh_activate_candidate` completes after the caller's
+	/// durable ownership commit.
+	pub(crate) fn mesh_create_from_params_paused(
+		&self,
+		mut params: Map<String, Value>,
+	) -> Result<Value> {
+		let s3_restore_tags = restore_s3_mount_params(&mut params)?;
+		let mut request = crate::mesh::runtime::sandbox_create_from_mesh_params(params)?;
+		request.s3_restore_tags = s3_restore_tags;
+		let mut plan = self.prepare_create(request)?;
+		let sid = plan.sid.clone();
+		let source = plan
+			.params
+			.image
+			.clone()
+			.or_else(|| Some(plan.template_dir.to_string_lossy().into_owned()));
+		let detail = serde_json::to_value(&plan.params)
+			.ok()
+			.and_then(|value| value.as_object().cloned())
+			.unwrap_or_default();
+		let (vm, runtime) = self.launch_create(&mut plan, true)?;
+		let meta = vm.meta()?;
+		let now = unix_time();
+		let record = VmRecord {
+			id: sid.clone(),
+			name: sid.clone(),
+			status: "paused".to_owned(),
+			pid: meta
+				.get("pid")
+				.and_then(Value::as_i64)
+				.and_then(|pid| i32::try_from(pid).ok()),
+			source,
+			incarnation_epoch: detail
+				.get("incarnation_epoch")
+				.and_then(Value::as_i64)
+				.unwrap_or(0),
+			created_at: now,
+			timeout: None,
+			detail: Value::Object(detail),
+			tags: HashMap::new(),
+			last_active: now,
+			terminated_at: None,
+			error: None,
+			lifecycle: LifecycleState {
+				desired:    LifecyclePhase::Running,
+				observed:   LifecyclePhase::Paused,
+				generation: StateGeneration(1),
+				failure:    None,
+				operation:  None,
+			},
+			runtime_identity: SafeRuntimeIdentity::default(),
+		};
+		if let Err(error) = self
+			.inner
+			.registry
+			.insert_persisted(self.home(), record.clone())
+		{
+			let mut runtime = runtime;
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
+		self.inner.runtimes.lock().insert(sid, runtime);
+		Ok(record.view())
+	}
+
+	/// Resume and finish exactly one locally staged candidate. The persisted PID
+	/// fences both a reused sandbox directory and a stale reconciliation retry.
+	pub(crate) fn mesh_activate_candidate(&self, sid: &str) -> Result<()> {
+		let mut record = self.inner.registry.get(sid).ok_or_else(|| {
+			EngineError::not_found(format!("sandbox '{sid}' has no local candidate"))
+		})?;
+		if record.status == "running" {
+			return Ok(());
+		}
+		if record.status != "paused" {
+			return Err(EngineError::busy(format!("sandbox '{sid}' is not a paused local candidate")));
+		}
+		let vm = self.sandbox(sid);
+		let actual_pid = vm
+			.meta()?
+			.get("pid")
+			.and_then(Value::as_i64)
+			.and_then(|pid| i32::try_from(pid).ok());
+		if record.pid.is_none() || record.pid != actual_pid {
+			return Err(EngineError::busy(format!(
+				"sandbox '{sid}' candidate PID no longer matches its durable fence"
+			)));
+		}
+		let mut runtime = self
+			.inner
+			.runtimes
+			.lock()
+			.remove(sid)
+			.ok_or_else(|| EngineError::busy("paused candidate lost its pending runtime setup"))?;
+		let plan = runtime
+			.pending_setup
+			.take()
+			.ok_or_else(|| EngineError::busy("paused candidate has already been activated"))?;
+		let result = (|| -> Result<()> {
+			control_for_vm(&vm)?.resume()?;
+			let cancellation = self.launch_cancellation(sid);
+			let agent =
+				Self::agent_for_vm_cancellable(&vm, AGENT_CONNECT_TIMEOUT, cancellation.as_deref())?;
+			if let Some(timeout_secs) = plan.timeout_secs
+				&& runtime.timeout_stop.is_none()
+			{
+				runtime.timeout_stop = Some(start_timeout_watchdog(
+					vm.name().to_owned(),
+					timeout_secs,
+					Arc::clone(&self.inner.sandbox_runtime),
+				));
+			}
+			for volume in &plan.volume_specs {
+				agent.mount(
+					&volume.tag,
+					Path::new(&volume.mountpoint),
+					volume.read_only,
+					"virtiofs",
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			}
+			Self::mount_s3_in_guest(&agent, &plan.s3_specs)?;
+			if let Some(network) = &runtime.network {
+				let gc = &network.guest_config;
+				agent.net_config(
+					&gc.guest_ip,
+					gc.prefix,
+					&gc.host_ip,
+					Some(&gc.dns),
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			} else if network_required(&plan.params) {
+				let gc = user_net_guest_config();
+				let dns = net::USER_NET_DNS
+					.iter()
+					.map(|dns| (*dns).to_owned())
+					.collect::<Vec<_>>();
+				agent.net_config(
+					gc["guest_ip"].as_str().unwrap_or(net::USER_NET_GUEST_IP),
+					gc["prefix"]
+						.as_u64()
+						.unwrap_or_else(|| u64::from(net::USER_NET_PREFIX)) as u8,
+					gc["host_ip"].as_str().unwrap_or(net::USER_NET_GATEWAY),
+					Some(&dns),
+					AGENT_REQUEST_TIMEOUT,
+				)?;
+			}
+			if let Some(probe) = &plan.params.readiness_probe {
+				Self::wait_until_ready(
+					&agent,
+					&runtime,
+					probe,
+					plan.params.timeout.unwrap_or(300.0),
+					cancellation.as_deref(),
+				)?;
+			}
+			runtime.agent = Some(agent);
+			Ok(())
+		})();
+		if let Err(error) = result {
+			runtime.pending_setup = Some(plan);
+			self.inner.runtimes.lock().insert(sid.to_owned(), runtime);
+			return Err(error);
+		}
+		"running".clone_into(&mut record.status);
+		record.lifecycle.observed = LifecyclePhase::Running;
+		record.lifecycle.desired = LifecyclePhase::Running;
+		record.runtime_identity = safe_runtime_identity(
+			&runtime,
+			plan.secrets.iter().map(|secret| secret.name.clone()),
+			plan.timeout_secs.map(|secs| secs as f64),
+			plan.params.image.clone(),
+			Some(plan.template_dir.to_string_lossy().into_owned()),
+		);
+		self.inner.registry.insert_persisted(self.home(), record)?;
+		self.inner.runtimes.lock().insert(sid.to_owned(), runtime);
 		Ok(())
 	}
 
@@ -2642,6 +5344,7 @@ impl Engine {
 			)
 		};
 		let mut params = detail;
+		params.insert("state_generation".to_owned(), json!(record.lifecycle.generation.0));
 		params.insert("name".to_owned(), json!(sid));
 		params.insert("env".to_owned(), json!(env));
 		if let Some(workdir) = workdir {
@@ -2690,6 +5393,28 @@ impl Engine {
 		Ok((record, params))
 	}
 
+	/// Allocate a durable monotonic checkpoint sequence. Replica metadata uses
+	/// this instead of wall-clock ordering so a late transfer cannot overwrite
+	/// a newer recovery generation.
+	fn next_checkpoint_generation(&self, sid: &str) -> Result<u64> {
+		let record = self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), sid, |detail| {
+				let next = detail
+					.get("checkpoint_generation")
+					.and_then(Value::as_u64)
+					.unwrap_or(0)
+					.saturating_add(1);
+				detail.insert("checkpoint_generation".to_owned(), json!(next));
+			})?;
+		Ok(record
+			.detail
+			.get("checkpoint_generation")
+			.and_then(Value::as_u64)
+			.unwrap_or(0))
+	}
+
 	/// Build a peer-pullable checkpoint + restore params for replication and
 	/// migration pre-copy. The source VM keeps running (it pauses only for
 	/// the dump); volume data is captured into the checkpoint before the
@@ -2700,6 +5425,12 @@ impl Engine {
 		kind: &str,
 		track: bool,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+		let capture_lock = self.capture_lock(sid);
+		let _capture_guard = capture_lock.acquire();
+		let lifecycle = self.get_record(sid, false)?;
+		if lifecycle.status != "running" || !lifecycle.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for mesh checkpoint"));
+		}
 		let t0 = std::time::Instant::now();
 		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let snapshot = format!("{kind}-{sid}-{}", unix_millis());
@@ -2713,21 +5444,19 @@ impl Engine {
 			disk.as_deref(),
 			&self.snapshot_root(),
 			track,
+			false,
 			|snapshot_dir| {
 				snapshot_ms = t0.elapsed().as_millis();
 				stamp_checkpoint_rootfs(self.home(), snapshot_dir, record.detail.as_object())?;
 				stamp_checkpoint_marker(snapshot_dir, record.detail.as_object())?;
-				capture_checkpoint_volumes(
-					self,
-					sid,
-					snapshot_dir,
-					record.detail.get("volumes"),
-				)?;
+				capture_checkpoint_volumes(self, sid, snapshot_dir, record.detail.get("volumes"))?;
 				ensure_checkpoint_template_present(snapshot_dir)
 			},
 		)?;
 		let stamp_ms = t0.elapsed().as_millis() - snapshot_ms;
-		let digest = image::cas::index_template(&snapshot_dir, None)?;
+		let digest = image::cas::snapshot_digest(&snapshot_dir)?;
+		image::cas::index_template(&snapshot_dir, Some(&digest))?;
+		let mut cleanup = CheckpointCleanup::new(digest.clone(), snapshot_dir.clone());
 		tracing::info!(
 			sid,
 			kind,
@@ -2736,10 +5465,13 @@ impl Engine {
 			index_ms = (t0.elapsed().as_millis() - snapshot_ms - stamp_ms) as u64,
 			"checkpoint timings"
 		);
+		let checkpoint_generation = self.next_checkpoint_generation(sid)?;
+		cleanup.disarm();
 		Ok(crate::mesh::reconciler::ReplicatePreparation {
 			digest,
 			snapshot_dir,
 			params: Value::Object(params),
+			checkpoint_generation,
 		})
 	}
 
@@ -2750,10 +5482,20 @@ impl Engine {
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
 		let prep = self.mesh_checkpoint_for(sid, "replica", false)?;
+		let cleanup = CheckpointCleanup::new(prep.digest.clone(), prep.snapshot_dir.clone());
 		self.mesh_update_detail_fields(
 			sid,
 			Map::from_iter([("checkpoint_ts".to_owned(), json!(unix_time()))]),
 		)?;
+		self.inner.pending_replica_exports.lock().insert(
+			sid.to_owned(),
+			Arc::new(ReplicaExport {
+				digest:       prep.digest.clone(),
+				snapshot_dir: prep.snapshot_dir.clone(),
+				_cleanup:     cleanup,
+				object_key:   Mutex::new(None),
+			}),
+		);
 		Ok(prep)
 	}
 
@@ -2765,6 +5507,49 @@ impl Engine {
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
 		self.mesh_checkpoint_for(sid, "migrate", true)
+	}
+
+	/// Atomically persist the source-side migration recovery journal.  The
+	/// final delta must be recoverable before its paused source is stopped.
+	pub(crate) fn mesh_migration_cleanup_persist(
+		&self,
+		cleanup: &MigrationCleanupWire,
+	) -> Result<()> {
+		if cleanup.sid.is_empty()
+			|| cleanup.base_dir.is_empty()
+			|| cleanup.base_digest.is_empty()
+			|| cleanup.delta_dir.is_empty()
+			|| cleanup.delta_digest.is_empty()
+		{
+			return Err(EngineError::invalid("incomplete migration cleanup journal"));
+		}
+		let dir = self
+			.home()
+			.security_dir()
+			.join("runtime")
+			.join("migration-cleanup");
+		fs::create_dir_all(&dir)?;
+		let path = dir.join(format!("{}.json", cleanup.sid));
+		let temporary = dir.join(format!(".{}.{}.tmp", cleanup.sid, uuid::Uuid::new_v4()));
+		let bytes = serde_json::to_vec(cleanup)
+			.map_err(|error| EngineError::engine(format!("serializing migration cleanup: {error}")))?;
+		let result = (|| -> Result<()> {
+			let mut file = OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.mode(0o600)
+				.open(&temporary)?;
+			file.write_all(&bytes)?;
+			file.write_all(b"\n")?;
+			file.sync_all()?;
+			fs::rename(&temporary, &path)?;
+			OpenOptions::new().read(true).open(&dir)?.sync_all()?;
+			Ok(())
+		})();
+		if result.is_err() {
+			let _ = fs::remove_file(&temporary);
+		}
+		result
 	}
 
 	/// Live-migration phase 2: pause the source and capture a delta
@@ -2782,7 +5567,14 @@ impl Engine {
 		&self,
 		sid: &str,
 		base_dir: &Path,
-	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
+		mut cleanup: MigrationCleanupWire,
+	) -> Result<(crate::mesh::reconciler::ReplicatePreparation, MigrationCleanupWire)> {
+		let capture_lock = self.capture_lock(sid);
+		let _capture_guard = capture_lock.acquire();
+		let lifecycle = self.get_record(sid, false)?;
+		if lifecycle.status != "running" || !lifecycle.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for migration checkpoint"));
+		}
 		let (record, params) = self.mesh_checkpoint_params(sid)?;
 		let base_name = base_dir
 			.file_name()
@@ -2813,7 +5605,9 @@ impl Engine {
 			}
 			capture_checkpoint_volumes(self, sid, &dir, record.detail.get("volumes"))?;
 			stamp_checkpoint_marker(&dir, record.detail.as_object())?;
-			image::cas::index_template(&dir, None)
+			let digest = image::cas::snapshot_digest(&dir)?;
+			image::cas::index_template(&dir, Some(&digest))?;
+			Ok(digest)
 		})();
 		let digest = match captured {
 			Ok(digest) => digest,
@@ -2825,17 +5619,30 @@ impl Engine {
 				return Err(err);
 			},
 		};
+		cleanup.delta_dir = dir.to_string_lossy().into_owned();
+		cleanup.delta_digest.clone_from(&digest);
+		if let Err(error) = self.mesh_migration_cleanup_persist(&cleanup) {
+			// The journal is the recovery authority for a stopped source.  A
+			// failed write therefore leaves the source running and drops the
+			// unusable final checkpoint.
+			let _ = control.resume();
+			let _ = fs::remove_dir_all(&dir);
+			return Err(error);
+		}
 		drop(control);
-		// Point of no return: the delta checkpoint is durable, so stop the
-		// source exactly at it. Route the stop through engine teardown so
-		// TAP/lease and volume locks are released, not just the VMM process.
+		// The journal is fsynced before this teardown, so a process death can
+		// always abort/recover the exact paused delta.
 		let rc = self.teardown(&record)?;
 		self.persist_status(sid, "stopped", rc, None)?;
-		Ok(crate::mesh::reconciler::ReplicatePreparation {
-			digest,
-			snapshot_dir: dir,
-			params: Value::Object(params),
-		})
+		Ok((
+			crate::mesh::reconciler::ReplicatePreparation {
+				digest,
+				snapshot_dir: dir,
+				params: Value::Object(params),
+				checkpoint_generation: self.next_checkpoint_generation(sid)?,
+			},
+			cleanup,
+		))
 	}
 
 	/// Finalize a successful migration: drop the stopped source, its local
@@ -2843,6 +5650,14 @@ impl Engine {
 	/// The local record MUST go — the mesh router treats any local record as
 	/// owned-here and would refuse to proxy to the new owner — so the
 	/// registry entry is force-dropped even if teardown was partial.
+	pub(crate) fn mesh_migrate_activate_target(
+		&self,
+		sid: &str,
+		_expected_epoch: i64,
+	) -> Result<()> {
+		self.mesh_activate_candidate(sid)
+	}
+
 	pub(crate) fn mesh_migrate_commit(
 		&self,
 		sid: &str,
@@ -2851,7 +5666,7 @@ impl Engine {
 		delta_dir: &Path,
 		delta_digest: &str,
 	) -> Result<()> {
-		if <Self as EngineApi>::remove(self, sid).is_err() {
+		if self.remove_local_candidate(sid).is_err() {
 			self.inner.registry.remove(sid);
 		}
 		self.mesh_drop_checkpoint(delta_digest, delta_dir, true)?;
@@ -2888,9 +5703,15 @@ impl Engine {
 					delta_dir.display()
 				)));
 			};
-			fs::copy(live, &rootfs)?;
+			drop(vmm::create_cow_overlay(&live, &rootfs).map_err(|error| {
+				EngineError::engine(format!(
+					"adopting live rootfs {} -> {}: {error}",
+					live.display(),
+					rootfs.display()
+				))
+			})?);
 		}
-		if <Self as EngineApi>::remove(self, sid).is_err() {
+		if self.remove_local_candidate(sid).is_err() {
 			// The re-create below must not self-conflict with a half-removed
 			// record of the same sid.
 			self.inner.registry.remove(sid);
@@ -2902,12 +5723,185 @@ impl Engine {
 		Ok(view)
 	}
 
-	/// Drop a local replication checkpoint after peers pulled it: un-advertise
-	/// the CAS pointer and delete the transient snapshot directory. Peer pulls
-	/// happen synchronously inside the receive route, so once a replication
-	/// cycle finishes the bundle is no longer needed locally.
+	/// Converge a durable target-side migration intent. Repeated calls are
+	/// idempotent after a target has reached running; otherwise the staged
+	/// final checkpoint is restored using the authoritative safe parameters.
+	pub(crate) fn mesh_migrate_adopt_target(
+		&self,
+		sid: &str,
+		delta_dir: &Path,
+		mut params: Map<String, Value>,
+	) -> Result<Value> {
+		if let Some(record) = self.inner.registry.get(sid)
+			&& matches!(record.status.as_str(), "running" | "paused")
+		{
+			return Ok(record.view());
+		}
+		params.insert("name".to_owned(), json!(sid));
+		params.insert("template".to_owned(), json!(delta_dir.to_string_lossy()));
+		let guard = self.inner.pending_migration_staging.lock().remove(sid);
+		let result = self.mesh_create_from_params_paused(params);
+		if let (Ok(_), Some(guard)) = (&result, guard) {
+			self
+				.inner
+				.runtimes
+				.lock()
+				.entry(sid.to_owned())
+				.or_default()
+				.snapshot_source = Some(guard);
+		}
+		result
+	}
+
+	/// Retry only source-side post-commit cleanup. This never invokes the
+	/// migration abort/restore path: target commitment remains authoritative.
+	/// Materialize a verified migration delta outside CAS.  The returned path
+	/// is retained by an engine-owned guard until the target runtime adopts it.
+	pub(crate) fn mesh_stage_migration_delta(
+		&self,
+		sid: &str,
+		verified_cache_path: &Path,
+		base_path: &Path,
+	) -> Result<PathBuf> {
+		fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+			copy_checkpoint_tree_cow(source, destination)
+		}
+		let runtime_root = self.inner.home.security_dir().join("runtime");
+		fs::create_dir_all(&runtime_root)?;
+		let base_name = base_path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.filter(|name| !name.is_empty() && *name != "." && *name != "..")
+			.ok_or_else(|| EngineError::invalid("migration base has no valid directory name"))?;
+		let delta_name = verified_cache_path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.filter(|name| !name.is_empty() && *name != "." && *name != "..")
+			.ok_or_else(|| EngineError::invalid("migration delta has no valid directory name"))?;
+		let stage_root = runtime_root.join(format!("migration-{}", uuid::Uuid::new_v4()));
+		let stage_base = stage_root.join(base_name);
+		let stage_delta = stage_root.join(delta_name);
+		let staged = (|| -> Result<()> {
+			fs::create_dir(&stage_root)?;
+			copy_tree(base_path, &stage_base)?;
+			copy_tree(verified_cache_path, &stage_delta)?;
+			let snapshot = vmm::snapshot::read_state(&stage_delta).map_err(|error| {
+				EngineError::invalid(format!("unreadable migration delta: {error}"))
+			})?;
+			let delta = snapshot
+				.delta
+				.ok_or_else(|| EngineError::invalid("migration checkpoint carries no memory delta"))?;
+			if delta.base != base_name {
+				return Err(EngineError::invalid("migration delta base does not match staged base"));
+			}
+			let rootfs = stage_delta.join("rootfs.img");
+			let base_rootfs = stage_base.join("rootfs.img");
+			if !base_rootfs.is_file() {
+				return Err(EngineError::invalid("migration base carries no rootfs.img"));
+			}
+			drop(vmm::create_cow_overlay(&base_rootfs, &rootfs).map_err(|error| {
+				EngineError::engine(format!(
+					"materializing staged rootfs {} -> {}: {error}",
+					base_rootfs.display(),
+					rootfs.display()
+				))
+			})?);
+			let disk_delta = stage_delta.join(diskdelta::DISK_DELTA_FILE);
+			if disk_delta.is_file() {
+				diskdelta::apply_disk_delta(&disk_delta, &rootfs)?;
+				fs::remove_file(disk_delta)?;
+			}
+			fs::File::open(&rootfs)?.sync_all()?;
+			Ok(())
+		})();
+		if let Err(error) = staged {
+			let _ = fs::remove_dir_all(&stage_root);
+			return Err(error);
+		}
+		self
+			.inner
+			.pending_migration_staging
+			.lock()
+			.insert(sid.to_owned(), Arc::new(TransientDir(stage_root)));
+		Ok(stage_delta)
+	}
+
+	pub(crate) fn mesh_migrate_cleanup_committed(
+		&self,
+		sid: &str,
+		base_dir: &Path,
+		base_digest: &str,
+		delta_dir: &Path,
+		delta_digest: &str,
+	) -> Result<()> {
+		self.mesh_migrate_commit(sid, base_dir, base_digest, delta_dir, delta_digest)
+	}
+
+	/// Un-advertise an exact active export. Directory deletion is deferred to
+	/// `ReplicaExport`'s last `Arc` drop so in-flight stream readers remain
+	/// valid after publication cleanup.
 	pub(crate) fn mesh_replicate_cleanup(&self, digest: &str, snapshot_dir: &Path) -> Result<()> {
-		self.mesh_drop_checkpoint(digest, snapshot_dir, true)
+		let mut exports = self.inner.pending_replica_exports.lock();
+		let Some(sid) = exports.iter().find_map(|(sid, export)| {
+			(export.digest == digest && export.path() == snapshot_dir).then(|| sid.clone())
+		}) else {
+			return Err(EngineError::busy("replica export is no longer the active exact checkpoint"));
+		};
+		self.mesh_drop_checkpoint(digest, snapshot_dir, false)?;
+		drop(exports.remove(&sid));
+		Ok(())
+	}
+
+	/// Bind the storage publication key to this exact in-memory export.
+	pub(crate) fn mesh_bind_replica_export(
+		&self,
+		sid: &str,
+		digest: &str,
+		object_key: &str,
+	) -> Result<()> {
+		let export = self
+			.inner
+			.pending_replica_exports
+			.lock()
+			.get(sid)
+			.cloned()
+			.ok_or_else(|| EngineError::not_found("no active replica export for sandbox"))?;
+		if export.digest != digest || !export.path().is_dir() {
+			return Err(EngineError::busy("replica export does not match the requested digest"));
+		}
+		let mut bound = export.object_key.lock();
+		match bound.as_deref() {
+			None => *bound = Some(object_key.to_owned()),
+			Some(existing) if existing == object_key => {},
+			Some(_) => {
+				return Err(EngineError::busy("replica export is already bound to another object"));
+			},
+		}
+		Ok(())
+	}
+
+	/// Borrow the exact bound export for a peer stream. The returned `Arc`
+	/// pins its directory independently of subsequent cleanup.
+	pub(crate) fn mesh_replica_export(
+		&self,
+		sid: &str,
+		digest: &str,
+		object_key: &str,
+	) -> Result<Arc<ReplicaExport>> {
+		let export = self
+			.inner
+			.pending_replica_exports
+			.lock()
+			.get(sid)
+			.cloned()
+			.ok_or_else(|| EngineError::not_found("no active replica export for sandbox"))?;
+		if export.digest != digest
+			|| !export.path().is_dir()
+			|| export.object_key.lock().as_deref() != Some(object_key)
+		{
+			return Err(EngineError::not_found("replica export does not match the requested object"));
+		}
+		Ok(export)
 	}
 
 	/// Un-advertise a checkpoint's CAS pointer; optionally delete its directory.
@@ -2932,8 +5926,7 @@ impl Engine {
 	/// checkpoint. Port of Python `Engine.restore_from_template`: validates the
 	/// checkpoint's network flavor against this host, refuses volume-name
 	/// collisions, and rolls back freshly-materialized volume directories if
-	/// the create fails so a transient restore error neither leaks host state
-	/// nor poisons the collision guard on the next attempt.
+	/// sandbox creation fails.
 	pub(crate) fn mesh_restore_from_template(
 		&self,
 		params: Map<String, Value>,
@@ -2950,6 +5943,16 @@ impl Engine {
 		replace_volumes: bool,
 	) -> Result<Value> {
 		validate_network_restore(&params)?;
+		#[cfg(test)]
+		let restore_executor = self.inner.restore_executor.lock().clone();
+		#[cfg(test)]
+		if let Some(executor) = restore_executor {
+			let cancellation = params
+				.get("name")
+				.and_then(Value::as_str)
+				.and_then(|id| self.launch_cancellation(id));
+			return executor(self, params, template_dir, replace_volumes, cancellation);
+		}
 		let key_id = params
 			.get("encryption_key_id")
 			.and_then(Value::as_str)
@@ -2974,6 +5977,7 @@ impl Engine {
 			)?
 		};
 		params.insert("template".to_owned(), json!(template_dir.to_string_lossy()));
+
 		match self.mesh_create_from_params(params) {
 			Ok(view) => {
 				for backup in backups {
@@ -2988,25 +5992,51 @@ impl Engine {
 				for backup in backups.into_iter().rev() {
 					backup.rollback()?;
 				}
+
+				Err(error)
+			},
+		}
+	}
+
+	/// Restore a portable checkpoint into a locally fenced, paused candidate.
+	/// This is mesh-internal and deliberately bypasses public create JSON.
+	pub(crate) fn mesh_restore_from_template_paused(
+		&self,
+		mut params: Map<String, Value>,
+		template_dir: &Path,
+		_quorum_ok: bool,
+	) -> Result<Value> {
+		validate_network_restore(&params)?;
+		let key_id = params
+			.get("encryption_key_id")
+			.and_then(Value::as_str)
+			.unwrap_or("default");
+		let created = materialize_checkpoint_volumes(
+			self.home(),
+			&self.inner.keyring,
+			key_id,
+			template_dir,
+			params.get("volumes").and_then(Value::as_object),
+		)?;
+		params.insert("template".to_owned(), json!(template_dir.to_string_lossy()));
+		match self.mesh_create_from_params_paused(params) {
+			Ok(view) => Ok(view),
+			Err(error) => {
+				for path in created {
+					remove_volume_artifact(&path);
+				}
 				Err(error)
 			},
 		}
 	}
 
 	fn mesh_update_detail_fields(&self, sid: &str, fields: Map<String, Value>) -> Result<()> {
-		self.get_record(sid, false)?;
-		let vm = self.sandbox(sid);
-		vm.save_meta(fields.clone())?;
-		self.inner.registry.update(sid, |record| {
-			if !record.detail.is_object() {
-				record.detail = Value::Object(Map::new());
-			}
-			if let Some(detail) = record.detail.as_object_mut() {
-				for (key, value) in fields {
-					detail.insert(key, value);
-				}
-			}
-		});
+		self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), sid, move |detail| {
+				detail.extend(fields);
+			})?;
 		Ok(())
 	}
 
@@ -3023,6 +6053,107 @@ impl Engine {
 	#[cfg(test)]
 	fn insert_test_record(&self, record: VmRecord) {
 		self.inner.registry.insert(record);
+	}
+
+	#[cfg(test)]
+	fn test_capture_lock_count(&self) -> usize {
+		self.inner.capture_locks.lock().len()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_set_restore_executor(&self, executor: Arc<TestRestoreExecutor>) {
+		*self.inner.restore_executor.lock() = Some(executor);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_set_capture_executor(&self, executor: Arc<TestCaptureExecutor>) {
+		*self.inner.capture_executor.lock() = Some(executor);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_set_rollback_resume_executor(
+		&self,
+		executor: Arc<TestRollbackResumeExecutor>,
+	) {
+		*self.inner.rollback_resume_executor.lock() = Some(executor);
+	}
+
+	fn rollback_resume_guard(&self, id: &str) -> ResumeOnError {
+		#[cfg(test)]
+		{
+			return ResumeOnError::with_resume_executor(
+				self.sandbox(id),
+				self.inner.rollback_resume_executor.lock().clone(),
+			);
+		}
+		#[cfg(not(test))]
+		ResumeOnError::new(self.sandbox(id))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_clear_restore_executor(&self) {
+		*self.inner.restore_executor.lock() = None;
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_restore_cancellation_token(&self, id: &str) -> Arc<AtomicBool> {
+		self
+			.inner
+			.launch_cancellations
+			.lock()
+			.entry(id.to_owned())
+			.or_insert_with(|| Arc::new(AtomicBool::new(false)))
+			.clone()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_clear_restore_cancellation(&self, id: &str) {
+		self.inner.launch_cancellations.lock().remove(id);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_recover_rollback_journals_after_durable(&self) -> Result<()> {
+		self.recover_rollback_journals()
+	}
+
+	/// Drives the crash-sensitive half of suspended-state reconciliation with
+	/// injected control callbacks. This keeps the production ordering (resume
+	/// before the generation-fenced cancellation) directly testable without a
+	/// VMM control socket.
+	#[cfg(test)]
+	pub(crate) fn test_resume_unpublished_suspend<F, G>(
+		&self,
+		id: &str,
+		resume: F,
+		after_resume: G,
+	) -> Result<()>
+	where
+		F: FnOnce() -> Result<()>,
+		G: FnOnce() -> Result<()>,
+	{
+		let record = self.get_record(id, false)?;
+		let lifecycle = record.lifecycle.clone();
+		if lifecycle.desired != LifecyclePhase::Suspended
+			|| record
+				.detail
+				.get("suspend_recovery_point")
+				.and_then(Value::as_str)
+				.is_some()
+		{
+			return Err(EngineError::invalid(
+				"test record is not an unpublished suspended transition",
+			));
+		}
+		resume()?;
+		after_resume()?;
+		self.inner.registry.cancel_transition(
+			self.home(),
+			id,
+			lifecycle.generation,
+			LifecyclePhase::Running,
+			"suspend publication was interrupted before its recovery point committed",
+		)?;
+		Ok(())
 	}
 }
 
@@ -3103,6 +6234,10 @@ impl TemplateBooter for Engine {
 }
 
 impl EngineApi for Engine {
+	fn adopt_suspended_marker(&self, id: &str) -> Result<()> {
+		self.mesh_adopt_suspended_marker(id)
+	}
+
 	fn create(&self, params: SandboxCreate) -> Result<Value> {
 		if let Some(key) = params
 			.idempotency_key
@@ -3127,7 +6262,7 @@ impl EngineApi for Engine {
 				("tags".to_owned(), json!(plan.tags)),
 			]),
 		);
-		let (vm, runtime) = match self.launch_create(&mut plan) {
+		let (vm, runtime) = match self.launch_create(&mut plan, false) {
 			Ok(result) => result,
 			Err(err) => {
 				self.publish_event(
@@ -3193,28 +6328,55 @@ impl EngineApi for Engine {
 			update.insert("idempotency_key".to_owned(), json!(key));
 			let _ = vm.save_meta(update);
 		}
-		let record = VmRecord {
-			id:            plan.sid.clone(),
-			name:          plan.sid.clone(),
-			status:        "running".to_owned(),
-			pid:           meta
-				.get("pid")
-				.and_then(Value::as_i64)
-				.and_then(|pid| i32::try_from(pid).ok()),
-			source:        plan
+		let runtime_identity = safe_runtime_identity(
+			&runtime,
+			plan.secrets.iter().map(|secret| secret.name.clone()),
+			plan.timeout_secs.map(|secs| secs as f64),
+			plan
 				.params
 				.image
 				.clone()
 				.or_else(|| Some(plan.template_dir.to_string_lossy().into_owned())),
-			created_at:    now,
-			timeout:       plan.timeout_secs.map(|secs| secs as f64),
-			detail:        Value::Object(detail),
-			tags:          plan.tags.clone(),
-			last_active:   now,
+			Some(plan.template_dir.to_string_lossy().into_owned()),
+		);
+		let record = VmRecord {
+			id: plan.sid.clone(),
+			name: plan.sid.clone(),
+			status: "running".to_owned(),
+			pid: meta
+				.get("pid")
+				.and_then(Value::as_i64)
+				.and_then(|pid| i32::try_from(pid).ok()),
+			source: plan
+				.params
+				.image
+				.clone()
+				.or_else(|| Some(plan.template_dir.to_string_lossy().into_owned())),
+			incarnation_epoch: detail
+				.get("incarnation_epoch")
+				.and_then(Value::as_i64)
+				.unwrap_or(0),
+			created_at: now,
+			timeout: plan.timeout_secs.map(|secs| secs as f64),
+			detail: Value::Object(detail),
+			tags: plan.tags.clone(),
+			last_active: now,
 			terminated_at: None,
-			error:         None,
+			error: None,
+			lifecycle: LifecycleState {
+				desired:    LifecyclePhase::Running,
+				observed:   LifecyclePhase::Running,
+				generation: StateGeneration(1),
+				failure:    None,
+				operation:  None,
+			},
+			runtime_identity,
 		};
-		if let Err(error) = self.inner.registry.insert_persisted(self.home(), record.clone()) {
+		if let Err(error) = self
+			.inner
+			.registry
+			.insert_persisted(self.home(), record.clone())
+		{
 			let mut runtime = runtime;
 			self.rollback_uncommitted_runtime(&vm, &mut runtime);
 			return Err(error);
@@ -3291,46 +6453,50 @@ impl EngineApi for Engine {
 	}
 
 	fn stop_with_returncode(&self, id: &str, returncode: Option<i64>) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, false)?;
 		if record.status == "terminated" {
 			return Ok(json!({ "name": id, "status": record.status }));
 		}
-		self.begin_state_transition(id, "stopped")?;
-		let teardown_rc = self.teardown(&record)?;
-		self.persist_status(id, "stopped", returncode.or(teardown_rc), None)?;
-		self.complete_state_transition(id, "stopped")?;
+		let transition = self.begin_state_transition(id, LifecyclePhase::Stopped)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let teardown_rc = match self.teardown(&record) {
+			Ok(code) => code,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		if let Err(error) = self.persist_status(id, "stopped", returncode.or(teardown_rc), None) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		self.complete_state_transition(id, generation, LifecyclePhase::Stopped)?;
 		let record = self.inner.registry.get(id).unwrap_or(record);
 		self.publish_record_event("stopped", &record);
 		Ok(json!({ "name": id, "status": "stopped" }))
 	}
 
-	fn remove(&self, id: &str) -> Result<Value> {
-		let record = self.get_record(id, false)?;
-		self.teardown(&record)?;
-		self.remove_sandbox(&self.sandbox(id))?;
-		self.inner.registry.remove(id);
-		self.publish_record_event("removed", &record);
-		Ok(json!({ "name": id, "removed": true }))
-	}
-
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
 		let returncode = self.teardown(&record)?;
 		let terminated_at = unix_time();
 		self.persist_status(id, "terminated", returncode, Some(terminated_at))?;
 		let oom = detect_oom(id);
 		let actual_reason = if oom { "oom" } else { reason };
-		let mut update = Map::new();
-		update.insert("terminated_reason".to_owned(), json!(actual_reason));
-		update.insert("oom".to_owned(), json!(oom));
-		let _ = self.sandbox(id).save_meta(update);
-		self
+		let _ = self
 			.inner
 			.registry
-			.set_detail_field(id, "terminated_reason", json!(actual_reason));
-		if oom {
-			self.inner.registry.set_detail_field(id, "oom", json!(true));
-		}
+			.update_detail_persisted(self.home(), id, |detail| {
+				detail.insert("terminated_reason".to_owned(), json!(actual_reason));
+				detail.insert("oom".to_owned(), json!(oom));
+			});
 		let record = self
 			.inner
 			.registry
@@ -3341,11 +6507,55 @@ impl EngineApi for Engine {
 		Ok(record.view())
 	}
 
+	fn remove(&self, id: &str) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
+		let record = self.get_record(id, false)?;
+		let delete = self.lifecycle_handoff_owner(id)?;
+		if let Some(delete) = &delete {
+			delete
+				.handoff
+				.begin_delete(id, &delete.owner, delete.epoch)?;
+		}
+		self.teardown(&record)?;
+		if let Some(delete) = delete {
+			Self::commit_portable_delete_after_history(
+				|| {
+					self.delete_portable_history(id, &delete.owner, delete.epoch)?;
+					self.delete_local_recovery_history(id)
+				},
+				|| {
+					delete
+						.handoff
+						.commit_delete(id, &delete.owner, delete.epoch)
+				},
+			)?;
+		} else {
+			self.delete_local_recovery_history(id)?;
+		}
+		self.inner.registry.remove(id);
+		Ok(json!({ "name": id, "removed": true }))
+	}
+
 	fn pause(&self, id: &str) -> Result<Value> {
-		self.get_record(id, true)?;
-		self.begin_state_transition(id, "paused")?;
-		let result = control_for_vm(&self.sandbox(id))?.pause()?;
-		self.complete_state_transition(id, "paused")?;
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
+		let transition = self.begin_state_transition(id, LifecyclePhase::Paused)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let result = match control_for_vm(&self.sandbox(id)).and_then(|mut control| control.pause()) {
+			Ok(result) => result,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		if let Err(error) = self.complete_state_transition(id, generation, LifecyclePhase::Paused) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
 		let record = self
 			.inner
 			.registry
@@ -3356,34 +6566,312 @@ impl EngineApi for Engine {
 	}
 
 	fn resume(&self, id: &str) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, false)?;
+		if self.converge_pending_portable_resume(&record)? {
+			let record = self.get_record(id, false)?;
+			self.publish_record_event("resumed", &record);
+			return Ok(record.view());
+		}
+		// A response may be lost after the database atomically commits the
+		// replacement. Resume converges that exact already-running candidate;
+		// it never claims a new epoch or relaunches it.
+		if record.status == "running" {
+			let portable = {
+				let mut ownership = self.inner.portable_ownership.lock();
+				if ownership.is_none() {
+					*ownership = PortableOwnership::connect(&self.inner.config)?;
+				}
+				ownership.as_ref().cloned()
+			};
+			if let Some(portable) = portable
+				&& let Some(marker) = portable.suspend_marker(id)?
+				&& marker.state == "resuming"
+			{
+				if record.lifecycle.desired != LifecyclePhase::Running
+					|| record.lifecycle.observed == LifecyclePhase::Running
+					|| record.detail.get("recovery_point").and_then(Value::as_str)
+						!= Some(marker.point.as_str())
+				{
+					return Err(EngineError::busy(
+						"resuming marker does not match the retained local replacement",
+					));
+				}
+				let handoff = self
+					.inner
+					.restore_handoff
+					.lock()
+					.as_ref()
+					.and_then(Weak::upgrade)
+					.ok_or_else(|| {
+						EngineError::busy("resuming marker lacks a local ownership handoff")
+					})?;
+				let lease = portable.lease_for_resuming_marker(&marker)?.lease;
+				if let Err(error) = handoff.commit_restore(id, &lease.owner_node, lease.epoch)
+					&& handoff
+						.commit_restore(id, &lease.owner_node, lease.epoch)
+						.is_err()
+				{
+					return Err(error);
+				}
+				self.disarm_restore_volume_leases(id);
+				self.complete_state_transition(
+					id,
+					record.lifecycle.generation,
+					LifecyclePhase::Running,
+				)?;
+				let record = self.get_record(id, false)?;
+				self.publish_record_event("resumed", &record);
+				return Ok(record.view());
+			}
+		}
 		if record.status == "suspended" {
-			let recovery_point = record
-				.detail
-				.get("suspend_recovery_point")
-				.and_then(Value::as_str)
-				.map(str::to_owned)
-				.or_else(|| {
-					self
-						.recovery_points(id)
-						.ok()?
-						.last()
-						.map(|point| point.name.clone())
-				})
-				.ok_or_else(|| EngineError::not_found("suspended sandbox has no recovery point"))?;
-			self.begin_state_transition(id, "running")?;
-			let view = self.restore_recovery_identity(id, &recovery_point)?;
+			// Production suspension is recovered only from the cluster marker:
+			// local detail is a placeholder and must never choose a newer
+			// history point after ownership moved to another node.
+			let portable = {
+				let mut ownership = self.inner.portable_ownership.lock();
+				if ownership.is_none() {
+					*ownership = PortableOwnership::connect(&self.inner.config)?;
+				}
+				ownership.as_ref().cloned()
+			};
+			let Some(portable) = portable else {
+				let recovery_point = record
+					.detail
+					.get("suspend_recovery_point")
+					.and_then(Value::as_str)
+					.ok_or_else(|| EngineError::not_found("suspended sandbox has no recovery point"))?;
+				let transition = self.begin_state_transition(id, LifecyclePhase::Running)?;
+				if transition.disposition != TransitionDisposition::Acquired {
+					return Ok(self.get_record(id, false)?.view());
+				}
+				let generation = transition.generation;
+				let view = self
+					.restore_recovery_identity(id, recovery_point, None)
+					.inspect_err(|error| {
+						self.fail_state_transition(id, generation, error);
+					})?;
+				self.complete_state_transition(id, generation, LifecyclePhase::Running)?;
+				if let Some(record) = self.inner.registry.get(id) {
+					self.publish_record_event("resumed", &record);
+				}
+				return Ok(view);
+			};
+			let marker = portable.suspend_marker(id)?.ok_or_else(|| {
+				EngineError::not_found("suspended sandbox has no durable recovery point")
+			})?;
+			let continuing_adopted_resume = marker.state == "resuming";
+			if marker.state != "suspended" && !continuing_adopted_resume {
+				return Err(EngineError::busy(format!("suspended sandbox '{id}' is {}", marker.state)));
+			}
+			let handoff = Some(
+				self
+					.inner
+					.restore_handoff
+					.lock()
+					.as_ref()
+					.and_then(Weak::upgrade)
+					.ok_or_else(|| {
+						EngineError::engine("portable resume requires an ownership handoff")
+					})?,
+			);
+			if continuing_adopted_resume {
+				let detail = record.detail.as_object().ok_or_else(|| {
+					EngineError::busy("adopted suspended projection has invalid metadata")
+				})?;
+				if detail
+					.get("_mesh_suspended_projection")
+					.and_then(Value::as_bool)
+					!= Some(true)
+					|| detail.get("suspend_recovery_point").and_then(Value::as_str)
+						!= Some(marker.point.as_str())
+					|| detail.get("suspend_generation").and_then(Value::as_u64)
+						!= Some(marker.generation)
+					|| detail.get("suspend_owner").and_then(Value::as_str) != Some(marker.owner.as_str())
+					|| detail.get("suspend_owner_epoch").and_then(Value::as_i64) != Some(marker.epoch)
+				{
+					return Err(EngineError::busy(
+						"adopted resuming marker does not match local projection",
+					));
+				}
+			}
+			let transition = self.begin_state_transition(id, LifecyclePhase::Running)?;
+			if transition.disposition != TransitionDisposition::Acquired {
+				return Ok(self.get_record(id, false)?.view());
+			}
+			let generation = transition.generation;
+			let lease = if continuing_adopted_resume {
+				match portable.lease_for_resuming_marker(&marker) {
+					Ok(claimed) => claimed.lease,
+					Err(error) => {
+						self.fail_state_transition(id, generation, &error);
+						return Err(error);
+					},
+				}
+			} else {
+				match portable.claim_expected(id, &marker.owner, marker.epoch, marker.generation) {
+					Ok(lease) => lease,
+					Err(error) => {
+						self.fail_state_transition(id, generation, &error);
+						return Err(error);
+					},
+				}
+			};
+			if !continuing_adopted_resume {
+				let verified = match portable.verify(id, &lease.owner_node, lease.epoch) {
+					Ok(verified) => verified,
+					Err(error) => {
+						let _ = portable.abort(&lease);
+						self.fail_state_transition(id, generation, &error);
+						return Err(error);
+					},
+				};
+				if !verified {
+					let _ = portable.abort(&lease);
+					let error = EngineError::busy("suspended resume ownership was superseded");
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				}
+				if let Some(handoff) = &handoff
+					&& let Err(error) = handoff.begin_restore(id, &lease.owner_node, lease.epoch)
+				{
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				}
+			}
+			let heartbeat = match portable.start_restore_heartbeat(&lease) {
+				Ok(heartbeat) => heartbeat,
+				Err(error) => {
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				},
+			};
+			self
+				.inner
+				.launch_cancellations
+				.lock()
+				.insert(id.to_owned(), heartbeat.lost_signal());
+			let restore_engine = self.clone();
+			let restore_id = id.to_owned();
+			let recovery_point = marker.point;
+			let restore_lease = handoff
+				.as_ref()
+				.map(|handoff| (Arc::clone(handoff), lease.owner_node.clone(), lease.epoch));
+			let launch = match thread::Builder::new()
+				.name(format!("suspended-resume-{id}"))
+				.spawn(move || {
+					restore_engine.restore_recovery_identity(&restore_id, &recovery_point, restore_lease)
+				}) {
+				Ok(launch) => launch,
+				Err(error) => {
+					self.inner.launch_cancellations.lock().remove(id);
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let _ = portable.abort(&lease);
+					let error = EngineError::engine(format!("starting suspended resume: {error}"));
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				},
+			};
+			let Ok(launch_result) = launch.join() else {
+				self.inner.launch_cancellations.lock().remove(id);
+				self.remove_restore_candidate(id)?;
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let _ = portable.abort(&lease);
+				let error = EngineError::engine("suspended resume worker panicked");
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			};
+			self.inner.launch_cancellations.lock().remove(id);
+			let authorized = match self.inner.net_runtime.block_on(heartbeat.finish()) {
+				Ok(authorized) => authorized,
+				Err(error) => {
+					if launch_result.is_ok() {
+						self.remove_restore_candidate(id)?;
+					}
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				},
+			};
+			let view = match launch_result {
+				Ok(view) if authorized => view,
+				Ok(_) => {
+					self.remove_restore_candidate(id)?;
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let _ = portable.abort(&lease);
+					let error = EngineError::busy("suspended resume lease was lost during restore");
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				},
+				Err(error) => {
+					self.remove_restore_candidate(id)?;
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let _ = portable.abort(&lease);
+					self.fail_state_transition(id, generation, &error);
+					return Err(error);
+				},
+			};
+			if let Err(error) = portable.finalize(&lease) {
+				self.remove_restore_candidate(id)?;
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let _ = portable.abort(&lease);
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			}
+			if let Some(handoff) = &handoff
+				&& let Err(error) = handoff.commit_restore(id, &lease.owner_node, lease.epoch)
+				&& handoff
+					.commit_restore(id, &lease.owner_node, lease.epoch)
+					.is_err()
+			{
+				// The commit can have won before its response was lost.
+				// Do not release fresh votes or resume/abort the marker.
+				return Err(error);
+			}
+			self.disarm_restore_volume_leases(id);
+			self.complete_state_transition(id, generation, LifecyclePhase::Running)?;
 			if let Some(record) = self.inner.registry.get(id) {
 				self.publish_record_event("resumed", &record);
 			}
 			return Ok(view);
 		}
-		if record.status != "running" {
+		if record.status != "running" && record.status != "paused" {
 			return Err(EngineError::not_running(format!("sandbox '{id}' is not running")));
 		}
-		self.begin_state_transition(id, "running")?;
-		let result = control_for_vm(&self.sandbox(id))?.resume()?;
-		self.complete_state_transition(id, "running")?;
+		let transition = self.begin_state_transition(id, LifecyclePhase::Running)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let result = match control_for_vm(&self.sandbox(id)).and_then(|mut control| control.resume())
+		{
+			Ok(result) => result,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		self.complete_state_transition(id, generation, LifecyclePhase::Running)?;
 		if let Some(record) = self.inner.registry.get(id) {
 			self.publish_record_event("resumed", &record);
 		}
@@ -3391,16 +6879,142 @@ impl EngineApi for Engine {
 	}
 
 	fn suspend(&self, id: &str) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
-		self.begin_state_transition(id, "suspended")?;
-		let recovery_point = self.capture_recovery(id, "checkpoint", false)?;
-		let returncode = self.teardown(&record)?;
-		self.persist_status(id, "suspended", returncode, None)?;
-		self.mesh_update_detail_fields(
+		let transition = self.begin_state_transition(id, LifecyclePhase::Suspended)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let suspend = match self.lifecycle_handoff_owner(id) {
+			Ok(suspend) => suspend,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		let suspend_handoff = suspend.as_ref().map(|suspend| Arc::clone(&suspend.handoff));
+		let capture_owner = self.inner.portable_history.as_ref().and_then(|_| {
+			suspend
+				.as_ref()
+				.map(|suspend| (suspend.owner.clone(), suspend.epoch))
+		});
+		let recovery_point = match self.capture_recovery_with_portability_unlocked(
 			id,
-			Map::from_iter([("suspend_recovery_point".to_owned(), json!(recovery_point.name))]),
-		)?;
-		self.complete_state_transition(id, "suspended")?;
+			"checkpoint",
+			false,
+			true,
+			Some(generation.0),
+		) {
+			Ok(point) => point,
+			Err(error) => {
+				let may_resume = if let Some((_owner, _epoch)) = &capture_owner {
+					let ownership = self.inner.portable_ownership.lock();
+					matches!(
+						ownership
+							.as_ref()
+							.ok_or_else(|| EngineError::engine(
+								"portable suspend ownership bridge disappeared"
+							))
+							.and_then(|portable| portable.suspend_marker(id)),
+						Ok(None)
+					)
+				} else {
+					true
+				};
+				if may_resume
+					&& let Err(abort_error) = self.abort_suspend_then_resume(
+						id,
+						suspend_handoff.as_ref(),
+						capture_owner.as_ref(),
+					) {
+					self.fail_state_transition(id, generation, &abort_error);
+					return Err(abort_error);
+				}
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		let suspend_owner = if let Some(suspend) = &suspend {
+			if let Err(error) = suspend.handoff.prepare_suspend(
+				id,
+				&suspend.owner,
+				suspend.epoch,
+				&recovery_point.name,
+				generation.0,
+			) {
+				let owner_identity = (suspend.owner.clone(), suspend.epoch);
+				if let Err(abort_error) =
+					self.abort_suspend_then_resume(id, Some(&suspend.handoff), Some(&owner_identity))
+				{
+					self.fail_state_transition(id, generation, &abort_error);
+					return Err(abort_error);
+				}
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			}
+			Some((suspend.owner.clone(), suspend.epoch))
+		} else {
+			None
+		};
+		// The full checkpoint remains paused until this exact name is durable
+		// in local/portable history. Record the name before source teardown so
+		// a restart never has to guess among concurrent history captures.
+		if let Err(error) = self.mesh_update_detail_fields(
+			id,
+			Map::from_iter([
+				("suspend_recovery_point".to_owned(), json!(recovery_point.name)),
+				("suspend_recovery_generation".to_owned(), json!(generation.0)),
+			]),
+		) {
+			if let Err(abort_error) =
+				self.abort_suspend_then_resume(id, suspend_handoff.as_ref(), suspend_owner.as_ref())
+			{
+				self.fail_state_transition(id, generation, &abort_error);
+				return Err(abort_error);
+			}
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		let returncode = match self.teardown(&record) {
+			Ok(code) => code,
+			Err(error) => {
+				// Teardown can have killed the VMM before a later cleanup
+				// failure. The helper probes liveness and only aborts/resumes a
+				// demonstrably live source.
+				if let Err(abort_error) =
+					self.abort_suspend_then_resume(id, suspend_handoff.as_ref(), suspend_owner.as_ref())
+				{
+					self.fail_state_transition(id, generation, &abort_error);
+					return Err(abort_error);
+				}
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		if let Some(handoff) = &suspend_handoff
+			&& let Err(error) = self
+				.inner
+				.net_runtime
+				.block_on(handoff.release_source_volume_leases(id))
+		{
+			// The durable suspending marker remains the recovery authority; do
+			// not falsely commit suspension while the old writable votes remain.
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		if let Err(error) = self.persist_status(id, "suspended", returncode, None) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		if let (Some(handoff), Some((owner, epoch))) = (&suspend_handoff, &suspend_owner)
+			&& let Err(error) = handoff.commit_suspend(id, owner, *epoch)
+		{
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		self.complete_state_transition(id, generation, LifecyclePhase::Suspended)?;
 		let record = self
 			.inner
 			.registry
@@ -3411,17 +7025,553 @@ impl EngineApi for Engine {
 	}
 
 	fn history(&self, id: &str) -> Result<Vec<RecoveryPoint>> {
+		if self.inner.portable_history.is_some() {
+			return self.recovery_points(id);
+		}
 		self.get_record(id, false)?;
 		self.prune_recovery(id, None)?;
 		self.recovery_points(id)
 	}
 
 	fn rollback(&self, id: &str, recovery_point: &str) -> Result<Value> {
-		self.get_record(id, false)?;
-		let (source, _) = self.open_recovery(id, recovery_point)?;
-		drop(source);
-		self.begin_state_transition(id, "running")?;
-		let view = self.restore_recovery_identity(id, recovery_point)?;
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
+		if self.inner.registry.get(id).is_none() {
+			let handoff = self
+				.inner
+				.restore_handoff
+				.lock()
+				.as_ref()
+				.and_then(Weak::upgrade);
+			if self.inner.portable_history.is_some() && handoff.is_none() {
+				return Err(EngineError::engine("portable rollback requires an ownership handoff"));
+			}
+			// Download and validate bytes before atomically fencing the observed
+			// owner into a durable `rolling_back` intent for this exact target.
+			// The marker remains recoverable if this process dies before its
+			// replacement reaches `commit_rollback`.
+			let (source, mut params) = self.open_recovery(id, recovery_point)?;
+			let lifecycle_generation = params
+				.get("state_generation")
+				.and_then(Value::as_u64)
+				.ok_or_else(|| {
+					EngineError::engine("portable recovery manifest has no lifecycle generation")
+				})?;
+			let checkpoint_generation = params
+				.get("checkpoint_generation")
+				.and_then(Value::as_u64)
+				.unwrap_or(lifecycle_generation);
+			let lease = {
+				let mut ownership = self.inner.portable_ownership.lock();
+				if ownership.is_none() {
+					*ownership = PortableOwnership::connect(&self.inner.config)?;
+				}
+				let ownership = ownership
+					.as_ref()
+					.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+				let (owner, epoch) = ownership.current(id)?;
+				ownership.claim_expected_rollback(
+					id,
+					&owner,
+					epoch,
+					recovery_point,
+					lifecycle_generation,
+					checkpoint_generation,
+				)?
+			};
+			let owns_lease = {
+				let ownership = self.inner.portable_ownership.lock();
+				match ownership
+					.as_ref()
+					.ok_or_else(|| EngineError::engine("portable ownership bridge disappeared"))
+					.and_then(|ownership| ownership.verify(id, &lease.owner_node, lease.epoch))
+				{
+					Ok(verified) => verified,
+					Err(error) => {
+						let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+						return Err(error);
+					},
+				}
+			};
+			if !owns_lease {
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(EngineError::busy("portable rollback ownership was superseded"));
+			}
+			if let Some(handoff) = &handoff
+				&& let Err(error) = handoff.begin_restore(id, &lease.owner_node, lease.epoch)
+			{
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(error);
+			}
+			params.insert("name".to_owned(), json!(id));
+			let mut volume_leases = match handoff.as_ref() {
+				Some(handoff) => match RestoreVolumeLeases::acquire(
+					self.inner.net_runtime.handle().clone(),
+					Arc::clone(handoff),
+					id,
+					&lease.owner_node,
+					lease.epoch,
+					&mut params,
+				) {
+					Ok(leases) => Some(leases),
+					Err(error) => {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+						let ownership = self.inner.portable_ownership.lock();
+						let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+						return Err(error);
+					},
+				},
+				None => None,
+			};
+			let heartbeat = {
+				let ownership = self.inner.portable_ownership.lock();
+				match ownership
+					.as_ref()
+					.ok_or_else(|| EngineError::engine("portable ownership bridge disappeared"))
+					.and_then(|ownership| ownership.start_restore_heartbeat(&lease))
+				{
+					Ok(heartbeat) => heartbeat,
+					Err(error) => {
+						if let Some(handoff) = &handoff {
+							let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+						}
+						let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+						return Err(error);
+					},
+				}
+			};
+			self
+				.inner
+				.launch_cancellations
+				.lock()
+				.insert(id.to_owned(), heartbeat.lost_signal());
+			let restore_engine = self.clone();
+			let restore_path = source.path.clone();
+			let launch = match thread::Builder::new()
+				.name(format!("portable-restore-{id}"))
+				.spawn(move || restore_engine.restore_from_template(params, &restore_path, false))
+			{
+				Ok(launch) => launch,
+				Err(error) => {
+					self.inner.launch_cancellations.lock().remove(id);
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let ownership = self.inner.portable_ownership.lock();
+					let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+					return Err(EngineError::engine(format!("starting portable restore: {error}")));
+				},
+			};
+			// Always join the launch before consuming the authority result. A
+			// heartbeat may report loss while the synchronous materialization is
+			// unwinding, but it must never leave an unobserved worker behind.
+			let Ok(launch_result) = launch.join() else {
+				self.inner.launch_cancellations.lock().remove(id);
+				self.remove_restore_candidate(id)?;
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(EngineError::engine("portable restore worker panicked"));
+			};
+			self.inner.launch_cancellations.lock().remove(id);
+			let authorized = match self.inner.net_runtime.block_on(heartbeat.finish()) {
+				Ok(authorized) => authorized,
+				Err(error) => {
+					self.remove_restore_candidate(id)?;
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let ownership = self.inner.portable_ownership.lock();
+					let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+					return Err(error);
+				},
+			};
+			let view = match launch_result {
+				Ok(view) if authorized => view,
+				Ok(_) => {
+					self.remove_restore_candidate(id)?;
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let ownership = self.inner.portable_ownership.lock();
+					let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+					return Err(EngineError::busy("portable rollback lease was lost during restore"));
+				},
+				Err(error) => {
+					self.remove_restore_candidate(id)?;
+					if let Some(handoff) = &handoff {
+						let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+					}
+					let ownership = self.inner.portable_ownership.lock();
+					let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+					return Err(error);
+				},
+			};
+			// `restore_from_template` constructs a fresh local record. Before
+			// finalizing PostgreSQL ownership, restore the recovery point's
+			// generation as a steady Running state so a new owner never rewinds
+			// lifecycle CAS state back to the constructor's generation one.
+			let Some(mut restored) = self.inner.registry.get(id) else {
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(EngineError::engine("portable restore created no registry record"));
+			};
+			restored.lifecycle = LifecycleState {
+				desired:    LifecyclePhase::Running,
+				observed:   LifecyclePhase::Running,
+				generation: StateGeneration(lifecycle_generation),
+				operation:  None,
+				failure:    None,
+			};
+			if !restored.detail.is_object() {
+				restored.detail = Value::Object(Map::new());
+			}
+			let Some(detail) = restored.detail.as_object_mut() else {
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(EngineError::engine("restored record detail cannot be materialized"));
+			};
+			detail.insert("state_generation".to_owned(), json!(lifecycle_generation));
+			if let Err(error) = self.inner.registry.insert_persisted(self.home(), restored) {
+				if let Err(teardown_error) = self.remove_restore_candidate(id) {
+					self
+						.inner
+						.runtimes
+						.lock()
+						.entry(id.to_owned())
+						.or_default()
+						.restore_volume_leases = volume_leases.take();
+					return Err(teardown_error);
+				}
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(error);
+			}
+			if let Some(leases) = volume_leases.as_ref()
+				&& let Err(error) = leases.persist(id)
+			{
+				self
+					.inner
+					.runtimes
+					.lock()
+					.entry(id.to_owned())
+					.or_default()
+					.restore_volume_leases = volume_leases.take();
+				self.remove_restore_candidate(id)?;
+				if let Some(handoff) = &handoff {
+					let _ = handoff.abort_restore(id, &lease.owner_node, lease.epoch);
+				}
+				let ownership = self.inner.portable_ownership.lock();
+				let _ = ownership.as_ref().map(|ownership| ownership.abort(&lease));
+				return Err(error);
+			}
+			if let Some(handoff) = &handoff
+				&& let Err(error) = handoff.commit_rollback(id, &lease.owner_node, lease.epoch)
+				&& handoff
+					.commit_rollback(id, &lease.owner_node, lease.epoch)
+					.is_err()
+			{
+				if let Some(leases) = volume_leases.take() {
+					self
+						.inner
+						.runtimes
+						.lock()
+						.entry(id.to_owned())
+						.or_default()
+						.restore_volume_leases = Some(leases);
+				}
+				// Preserve candidate, fenced votes, and marker for
+				// recovery; the first commit may have succeeded.
+				return Err(error);
+			}
+			if let Some(volume_leases) = &mut volume_leases {
+				volume_leases.disarm();
+			}
+			if let Some(guard) = source.guard {
+				self
+					.inner
+					.runtimes
+					.lock()
+					.entry(id.to_owned())
+					.or_default()
+					.snapshot_source = Some(guard);
+			}
+			self.mesh_update_detail_fields(
+				id,
+				Map::from_iter([
+					("portable_owner".to_owned(), json!(lease.owner_node)),
+					("portable_owner_epoch".to_owned(), json!(lease.epoch)),
+					("recovery_point".to_owned(), json!(recovery_point)),
+				]),
+			)?;
+			return Ok(view);
+		}
+		// Validate the selected replacement before claiming an operation, but
+		// never create a hidden safety checkpoint for a joined duplicate.
+		self.open_recovery(id, recovery_point)?;
+		let record = self.get_record(id, false)?;
+		let transition = self.inner.registry.begin_operation(
+			self.home(),
+			id,
+			record.lifecycle.generation,
+			LifecyclePhase::Running,
+			Some(LifecycleOperation::Rollback { recovery_point: recovery_point.to_owned() }),
+		)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let rollback_handoff = self.inner.portable_history.as_ref().and_then(|_| {
+			self
+				.inner
+				.restore_handoff
+				.lock()
+				.as_ref()
+				.and_then(Weak::upgrade)
+		});
+		let rollback_owner = if self.inner.portable_history.is_some() {
+			let mut ownership = self.inner.portable_ownership.lock();
+			if ownership.is_none() {
+				*ownership = PortableOwnership::connect(&self.inner.config)?;
+			}
+			ownership
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("portable rollback ownership bridge disappeared"))?
+				.current(id)?
+		} else {
+			("local".to_owned(), 0)
+		};
+		let rollback_source_token = random_hex(16);
+		if let Err(error) = self.mesh_update_detail_fields(
+			id,
+			Map::from_iter([
+				("lifecycle_operation".to_owned(), json!("rollback")),
+				("rollback_recovery_point".to_owned(), json!(recovery_point)),
+				("rollback_generation".to_owned(), json!(generation.0)),
+				("rollback_owner".to_owned(), json!(rollback_owner.0)),
+				("rollback_owner_epoch".to_owned(), json!(rollback_owner.1)),
+				("rollback_source_token".to_owned(), json!(rollback_source_token)),
+			]),
+		) {
+			let _ = self.inner.registry.cancel_transition(
+				self.home(),
+				id,
+				generation,
+				LifecyclePhase::Running,
+				error.to_string(),
+			);
+			self.clear_rollback_detail(id);
+			return Err(error);
+		}
+		if self.inner.portable_history.is_some() && rollback_handoff.is_none() {
+			let error = EngineError::engine("portable rollback requires an ownership handoff");
+			let _ = self.inner.registry.cancel_transition(
+				self.home(),
+				id,
+				generation,
+				LifecyclePhase::Running,
+				error.to_string(),
+			);
+			self.clear_rollback_detail(id);
+			return Err(error);
+		}
+		if let Some(history) = &self.inner.portable_history
+			&& let Err(error) = history.pin_rollback_target(
+				id,
+				recovery_point,
+				generation.0,
+				&rollback_owner.0,
+				rollback_owner.1,
+			) {
+			let _ = self.inner.registry.cancel_transition(
+				self.home(),
+				id,
+				generation,
+				LifecyclePhase::Running,
+				error.to_string(),
+			);
+			self.clear_rollback_detail(id);
+			return Err(error);
+		}
+		// Own the only rollback failure-resume path before capture begins.
+		// It is fenced to the source PID, so a later replacement cannot be
+		// resumed accidentally.
+		let mut rollback_resume_on_error = self.rollback_resume_guard(id);
+		let safety_recovery_point = match self.capture_recovery_with_portability_unlocked(
+			id,
+			"rollback-safety",
+			false,
+			self.inner.portable_history.is_some(),
+			None,
+		) {
+			Ok(point) => point.name,
+			Err(error) => {
+				// `rollback_resume_on_error` resumes the still-original source.
+				if let Some(history) = &self.inner.portable_history {
+					let _ = history.release_rollback_target(
+						id,
+						recovery_point,
+						generation.0,
+						&rollback_owner.0,
+						rollback_owner.1,
+					);
+				}
+				let _ = self.inner.registry.cancel_transition(
+					self.home(),
+					id,
+					generation,
+					LifecyclePhase::Running,
+					error.to_string(),
+				);
+				self.clear_rollback_detail(id);
+				return Err(error);
+			},
+		};
+		let current = self.get_record(id, false)?;
+		let journal = RollbackJournal {
+			sandbox_id: id.to_owned(),
+			target_recovery_point: recovery_point.to_owned(),
+			safety_recovery_point,
+			generation: generation.0,
+			checkpoint_generation: current
+				.detail
+				.get("checkpoint_generation")
+				.and_then(Value::as_u64)
+				.unwrap_or(0),
+			portable_owner: rollback_owner.0.clone(),
+			portable_owner_epoch: rollback_owner.1,
+			source_token: rollback_source_token,
+		};
+		if let Err(error) = self.write_rollback_journal(&journal) {
+			let _ = self.remove_safety_recovery(id, &journal.safety_recovery_point);
+			if let Some(history) = &self.inner.portable_history {
+				let _ = history.release_rollback_target(
+					id,
+					recovery_point,
+					generation.0,
+					&rollback_owner.0,
+					rollback_owner.1,
+				);
+			}
+			let _ = self.inner.registry.cancel_transition(
+				self.home(),
+				id,
+				generation,
+				LifecyclePhase::Running,
+				error.to_string(),
+			);
+			self.clear_rollback_detail(id);
+			return Err(error);
+		}
+		if let Some(handoff) = &rollback_handoff
+			&& let Err(error) = handoff.prepare_rollback(
+				id,
+				&journal.portable_owner,
+				journal.portable_owner_epoch,
+				&journal.target_recovery_point,
+				&journal.safety_recovery_point,
+				journal.generation,
+				journal.checkpoint_generation,
+			) {
+			let _ = self.clear_rollback_journal(id);
+			let _ = self.release_rollback_pin(&journal);
+			let _ = self.inner.registry.cancel_transition(
+				self.home(),
+				id,
+				generation,
+				LifecyclePhase::Running,
+				error.to_string(),
+			);
+			self.clear_rollback_detail(id);
+			return Err(error);
+		}
+		let view = match self.restore_recovery_identity(
+			id,
+			recovery_point,
+			rollback_handoff.as_ref().map(|handoff| {
+				(Arc::clone(handoff), journal.portable_owner.clone(), journal.portable_owner_epoch)
+			}),
+		) {
+			Ok(view) => view,
+			Err(target_error) => {
+				// The target was validated before teardown, but launch can still
+				// fail. Restore the independently durable safety point before
+				// admitting failure so the caller never loses a runnable
+				// identity to a failed rollback.
+				if self
+					.restore_recovery_identity(
+						id,
+						&journal.safety_recovery_point,
+						rollback_handoff.as_ref().map(|handoff| {
+							(
+								Arc::clone(handoff),
+								journal.portable_owner.clone(),
+								journal.portable_owner_epoch,
+							)
+						}),
+					)
+					.is_ok()
+				{
+					if let Some(handoff) = &rollback_handoff
+						&& let Err(error) = handoff.commit_rollback(
+							id,
+							&journal.portable_owner,
+							journal.portable_owner_epoch,
+						) && handoff
+						.commit_rollback(id, &journal.portable_owner, journal.portable_owner_epoch)
+						.is_err()
+					{
+						self.fail_state_transition(id, generation, &error);
+						return Err(error);
+					}
+					self.disarm_restore_volume_leases(id);
+					self.inner.registry.cancel_transition(
+						self.home(),
+						id,
+						generation,
+						LifecyclePhase::Running,
+						"rollback target failed; safety recovery restored",
+					)?;
+					self.finalize_rollback_journal(&journal)?;
+					self.clear_rollback_detail(id);
+					return Err(target_error);
+				}
+				self.fail_state_transition(id, generation, &target_error);
+				return Err(target_error);
+			},
+		};
+		// The replacement is now running. It must never be resumed through the
+		// old source's guard, even if the following durable commit is ambiguous.
+		rollback_resume_on_error.disarm();
+		if let Some(handoff) = &rollback_handoff
+			&& let Err(error) =
+				handoff.commit_rollback(id, &journal.portable_owner, journal.portable_owner_epoch)
+			&& handoff
+				.commit_rollback(id, &journal.portable_owner, journal.portable_owner_epoch)
+				.is_err()
+		{
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		self.disarm_restore_volume_leases(id);
+		self.complete_state_transition(id, generation, LifecyclePhase::Running)?;
+		self.remove_safety_recovery(id, &journal.safety_recovery_point)?;
+		self.release_rollback_pin(&journal)?;
+		self.clear_rollback_journal(id)?;
+		self.clear_rollback_detail(id);
 		if let Some(record) = self.inner.registry.get(id) {
 			self.publish_record_event("rollback", &record);
 		}
@@ -3435,9 +7585,12 @@ impl EngineApi for Engine {
 			record.timeout = Some(secs as f64);
 			record.touch();
 		});
-		let mut update = Map::new();
-		update.insert("timeout_secs".to_owned(), json!(secs));
-		let _ = self.sandbox(id).save_meta(update);
+		let _ = self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), id, |detail| {
+				detail.insert("timeout_secs".to_owned(), json!(secs));
+			});
 		if let Some(state) = self.inner.runtimes.lock().get_mut(id) {
 			if let Some(stop) = state.timeout_stop.take() {
 				let _ = stop.send(());
@@ -3605,20 +7758,15 @@ impl EngineApi for Engine {
 							"sandbox {ref_name:?} does not exist"
 						)));
 					}
-					let stream = self.exec_stream(
-						&record.id,
-						ExecRequest { cmd, tty: true, ..ExecRequest::default() },
-					)?;
-					return Ok(ShellSession {
-						name: record.name,
-						stream,
-						ephemeral: false,
-					});
+					let stream = self.exec_stream(&record.id, ExecRequest {
+						cmd,
+						tty: true,
+						..ExecRequest::default()
+					})?;
+					return Ok(ShellSession { name: record.name, stream, ephemeral: false });
 				},
 				Err(_) if required_owner.is_some() => {
-					return Err(EngineError::not_found(format!(
-						"sandbox {ref_name:?} does not exist"
-					)));
+					return Err(EngineError::not_found(format!("sandbox {ref_name:?} does not exist")));
 				},
 				Err(_) => {},
 			}
@@ -3775,7 +7923,10 @@ impl EngineApi for Engine {
 				.registry
 				.set_detail_field(id, "block_network", json!(value));
 			if value {
-				self.inner.registry.set_detail_field(id, "egress_allow", json!([]));
+				self
+					.inner
+					.registry
+					.set_detail_field(id, "egress_allow", json!([]));
 				self
 					.inner
 					.registry
@@ -3825,7 +7976,12 @@ impl EngineApi for Engine {
 	}
 
 	fn snapshot(&self, id: &str, name: Option<String>, stop: bool) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
+		if !record.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for snapshot"));
+		}
 		let snapshot = name.unwrap_or_else(|| format!("{}-{}", id, unix_millis()));
 		let archive = self.snapshot_archive(&snapshot)?;
 		if archive.exists() {
@@ -3847,6 +8003,7 @@ impl EngineApi for Engine {
 			!stop,
 			disk.as_deref(),
 			&snapshot_root,
+			false,
 			false,
 			|dir| {
 				if let Some(s3_mounts) = record
@@ -3877,7 +8034,12 @@ impl EngineApi for Engine {
 	}
 
 	fn snapshot_fs(&self, id: &str, name: Option<String>) -> Result<Value> {
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
+		if !record.lifecycle.is_converged() {
+			return Err(EngineError::busy("sandbox lifecycle is not steady for filesystem snapshot"));
+		}
 		let image = name.unwrap_or_else(|| format!("{id}-img-{}", unix_time() as u64));
 		let vm = self.sandbox(id);
 		let disk = vm.rootfs_img().ok().filter(|path| path.is_file());
@@ -5222,6 +9384,168 @@ fn validate_network_restore(params: &Map<String, Value>) -> Result<()> {
 	}
 }
 
+fn require_regular_file(path: &Path, label: &str) -> Result<()> {
+	let metadata = fs::symlink_metadata(path)?;
+	if metadata.file_type().is_symlink() || !metadata.is_file() {
+		return Err(EngineError::invalid(format!(
+			"{label} {} must be a regular file",
+			path.display()
+		)));
+	}
+	Ok(())
+}
+
+fn move_or_copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
+	require_regular_file(source, "capture source")?;
+	match fs::rename(source, destination) {
+		Ok(()) => Ok(()),
+		Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+			fs::copy(source, destination)?;
+			Ok(())
+		},
+		Err(error) => Err(error.into()),
+	}
+}
+
+fn reclaim_orphaned_disk_artifacts(home: &Home) -> Result<()> {
+	let root = home.root().join("snapshots");
+	let entries = match fs::read_dir(&root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(error.into()),
+	};
+	for entry in entries {
+		let entry = entry?;
+		let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+			continue;
+		};
+		if !is_safe_snapshot_name(&name) {
+			continue;
+		}
+		let point = entry.path();
+		let metadata = fs::symlink_metadata(&point)?;
+		if metadata.file_type().is_symlink() || !metadata.is_dir() {
+			continue;
+		}
+
+		let mut removable = Vec::new();
+		let mut managed_only = true;
+		for child in fs::read_dir(&point)? {
+			let child = child?;
+			let child_name = child.file_name();
+			let child_name = child_name.to_string_lossy();
+			let child_path = child.path();
+			if (child_name == "disk" && is_published_disk_artifact(&child_path))
+				|| (is_disk_staging_name(&child_name) && is_regular_directory(&child_path)?)
+			{
+				removable.push(child_path);
+			} else {
+				managed_only = false;
+				break;
+			}
+		}
+		if managed_only {
+			for path in removable {
+				fs::remove_dir_all(path)?;
+			}
+		}
+	}
+	Ok(())
+}
+
+fn is_regular_directory(path: &Path) -> Result<bool> {
+	let metadata = fs::symlink_metadata(path)?;
+	Ok(!metadata.file_type().is_symlink() && metadata.is_dir())
+}
+
+fn is_disk_staging_name(name: &str) -> bool {
+	let Some(stem) = name
+		.strip_prefix(".disk.")
+		.and_then(|name| name.strip_suffix(".tmp"))
+	else {
+		return false;
+	};
+	let mut parts = stem.split('.');
+	matches!(
+		(parts.next(), parts.next(), parts.next()),
+		(Some(pid), Some(sequence), None)
+			if !pid.is_empty()
+				&& !sequence.is_empty()
+				&& pid.bytes().all(|byte| byte.is_ascii_digit())
+				&& sequence.bytes().all(|byte| byte.is_ascii_digit())
+	)
+}
+
+fn is_published_disk_artifact(path: &Path) -> bool {
+	if !is_regular_directory(path).unwrap_or(false) {
+		return false;
+	}
+	let Ok(mut entries) = fs::read_dir(path) else {
+		return false;
+	};
+	let Some(Ok(first)) = entries.next() else {
+		return false;
+	};
+	let Some(Ok(second)) = entries.next() else {
+		return false;
+	};
+	if entries.next().is_some() {
+		return false;
+	}
+	let paths = [first.path(), second.path()];
+	let rootfs = path.join("rootfs.img");
+	let manifest = path.join("manifest.json");
+	if !paths.contains(&rootfs)
+		|| !paths.contains(&manifest)
+		|| require_regular_file(&rootfs, "disk rootfs").is_err()
+		|| require_regular_file(&manifest, "disk manifest").is_err()
+	{
+		return false;
+	}
+	let Ok(bytes) = fs::read(&manifest) else {
+		return false;
+	};
+	serde_json::from_slice::<Value>(&bytes).is_ok_and(|manifest| {
+		manifest.get("version").and_then(Value::as_u64) == Some(1)
+			&& manifest.get("rootfs").and_then(Value::as_str) == Some("rootfs.img")
+			&& manifest.get("boot").and_then(Value::as_str) == Some("cold")
+	})
+}
+
+fn copy_checkpoint_tree_cow(source: &Path, destination: &Path) -> Result<()> {
+	let source_metadata = fs::symlink_metadata(source)?;
+	if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+		return Err(EngineError::invalid(format!(
+			"migration checkpoint {} must be a regular directory",
+			source.display()
+		)));
+	}
+	fs::create_dir(destination)?;
+	for entry in fs::read_dir(source)? {
+		let entry = entry?;
+		let from = entry.path();
+		let to = destination.join(entry.file_name());
+		let metadata = fs::symlink_metadata(&from)?;
+		if metadata.file_type().is_symlink() {
+			return Err(EngineError::invalid("migration checkpoint contains symlink"));
+		}
+		if metadata.is_dir() {
+			copy_checkpoint_tree_cow(&from, &to)?;
+		} else if metadata.is_file() {
+			drop(vmm::create_cow_overlay(&from, &to).map_err(|error| {
+				EngineError::engine(format!(
+					"staging migration file {} -> {}: {error}",
+					from.display(),
+					to.display()
+				))
+			})?);
+		} else {
+			return Err(EngineError::invalid("migration checkpoint contains unsupported entry"));
+		}
+	}
+	Ok(())
+}
+
 fn copy_tree_without_locks(src: &Path, dst: &Path) -> Result<()> {
 	let source_metadata = fs::symlink_metadata(src)?;
 	if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
@@ -5291,7 +9615,6 @@ fn s3_mounts_meta(mounts: &[ResolvedS3Mount]) -> Value {
 fn network_guest_json(config: &net::GuestNetworkConfig) -> Value {
 	json!({
 		"tap": config.tap,
-		"guest_ip": config.guest_ip,
 		"prefix": config.prefix,
 		"host_ip": config.host_ip,
 		"dns": config.dns,
@@ -5314,6 +9637,72 @@ fn policy_json(policy: &NetworkPolicy) -> Value {
 		"egress_allow_domains": policy.egress_allow_domains,
 		"inbound_cidr_allowlist": policy.inbound_cidr_allowlist,
 	})
+}
+
+/// Build the exact durable identity that may cross a daemon boundary. Runtime
+/// capabilities and secret values are intentionally absent.
+fn safe_runtime_identity(
+	state: &RuntimeState,
+	secret_names: impl IntoIterator<Item = String>,
+	timeout_secs: Option<f64>,
+	source: Option<String>,
+	template: Option<String>,
+) -> SafeRuntimeIdentity {
+	let secret_names: std::collections::BTreeSet<String> = secret_names.into_iter().collect();
+	let identity_complete = secret_names.is_empty();
+	SafeRuntimeIdentity {
+		version: 1,
+		identity_complete,
+		environment: state.env.clone(),
+		workdir: state.workdir.clone(),
+		network_policy: Some(policy_json(&state.network_policy)),
+		network: state.network_spec.clone().unwrap_or(Value::Null),
+		tunnels: state.network_spec.clone().unwrap_or(Value::Null),
+		mounts: Vec::new(),
+		timeout_secs,
+		source,
+		template,
+		pool: None,
+		available_secret_names: Default::default(),
+		secret_names,
+	}
+}
+fn runtime_identity(state: &RuntimeState) -> Value {
+	serde_json::to_value(safe_runtime_identity(state, std::iter::empty(), None, None, None))
+		.expect("safe runtime identity serializes")
+}
+
+fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
+	value.and_then(Value::as_array).map(|items| {
+		items
+			.iter()
+			.filter_map(Value::as_str)
+			.map(ToOwned::to_owned)
+			.collect()
+	})
+}
+
+fn runtime_state_from_safe_identity(identity: &SafeRuntimeIdentity) -> RuntimeState {
+	let policy = identity.network_policy.as_ref().and_then(Value::as_object);
+	RuntimeState {
+		env: identity.environment.clone(),
+		workdir: identity.workdir.clone(),
+		network_policy: NetworkPolicy {
+			block_network:          policy
+				.and_then(|policy| policy.get("block_network"))
+				.and_then(Value::as_bool),
+			egress_allow:           string_list(policy.and_then(|policy| policy.get("egress_allow"))),
+			egress_allow_domains:   string_list(
+				policy.and_then(|policy| policy.get("egress_allow_domains")),
+			),
+			inbound_cidr_allowlist: string_list(
+				policy.and_then(|policy| policy.get("inbound_cidr_allowlist")),
+			),
+		},
+		network_spec: (!identity.tunnels.is_null()).then(|| identity.tunnels.clone()),
+		identity_complete: identity.identity_complete && identity.secret_names.is_empty(),
+		..RuntimeState::default()
+	}
 }
 
 fn sorted_ports(ports: Option<&[u16]>, tunnels: &BTreeMap<u16, (String, u16)>) -> Vec<u16> {
@@ -5595,6 +9984,10 @@ const fn backend_name() -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "rollback_acceptance.rs"]
+mod rollback_acceptance;
+
+#[cfg(test)]
 mod tests {
 	use tempfile::TempDir;
 
@@ -5628,6 +10021,105 @@ mod tests {
 		fs::create_dir_all(&dir).expect("vm dir");
 		fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta).expect("json"))
 			.expect("meta");
+	}
+
+	#[test]
+	fn startup_reclaims_only_orphaned_disk_artifacts() {
+		let temp = TempDir::new().expect("temp");
+		let snapshots = temp.path().join("snapshots");
+		let orphan = snapshots.join("orphan");
+		let disk = orphan.join("disk");
+		fs::create_dir_all(&disk).expect("disk artifact");
+		fs::write(disk.join("rootfs.img"), b"disk payload").expect("rootfs");
+		fs::write(
+			disk.join("manifest.json"),
+			serde_json::to_vec(&json!({
+				"version": 1,
+				"rootfs": "rootfs.img",
+				"boot": "cold",
+			}))
+			.expect("manifest json"),
+		)
+		.expect("manifest");
+		fs::create_dir(orphan.join(".disk.123.0.tmp")).expect("staging");
+
+		let active = snapshots.join("active");
+		fs::create_dir_all(&active).expect("active snapshot");
+		fs::write(active.join("state"), b"referenced snapshot state").expect("state");
+
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		assert!(!engine.snapshot_dir("orphan").join("disk").exists());
+		assert!(
+			!engine
+				.snapshot_dir("orphan")
+				.join(".disk.123.0.tmp")
+				.exists()
+		);
+		assert!(engine.snapshot_dir("active").join("state").is_file());
+	}
+
+	#[test]
+	fn disk_capture_tree_has_one_rootfs_payload() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let artifact = temp.path().join("artifact");
+		let capture = temp.path().join("capture");
+		fs::create_dir(&artifact).expect("artifact");
+		fs::create_dir(&capture).expect("capture");
+		let source = artifact.join("rootfs.img");
+		fs::write(&source, b"disk payload").expect("rootfs");
+		move_or_copy_regular_file(&source, &capture.join("rootfs.img")).expect("move rootfs");
+		fs::write(artifact.join("manifest.json"), b"{}").expect("manifest");
+		fs::copy(artifact.join("manifest.json"), capture.join("disk-manifest.json"))
+			.expect("copy manifest");
+
+		let archive = temp.path().join("capture.venc");
+		EncryptedArchive::seal(&capture, &archive, &engine.inner.keyring, "default").expect("seal");
+		let opened =
+			EncryptedArchive::open(&archive, &temp.path().join("opened"), &engine.inner.keyring)
+				.expect("open");
+		assert!(opened.join("rootfs.img").is_file());
+		assert!(opened.join("disk-manifest.json").is_file());
+		assert!(!opened.join("disk").exists());
+		assert!(!artifact.join("rootfs.img").exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn migration_stage_cow_copy_preserves_sparse_regular_files_and_rejects_symlinks() {
+		use std::os::unix::fs::{FileExt, MetadataExt};
+
+		let temp = TempDir::new().expect("temp");
+		let source = temp.path().join("source");
+		let destination = temp.path().join("destination");
+		fs::create_dir(&source).expect("source");
+		let sparse = fs::File::create(source.join("rootfs.img")).expect("sparse source");
+		sparse
+			.set_len(64 * 1024 * 1024)
+			.expect("set logical length");
+		sparse.write_at(b"first", 0).expect("write first extent");
+		sparse
+			.write_at(b"last", 64 * 1024 * 1024 - 4)
+			.expect("write last extent");
+		sparse.sync_all().expect("sync sparse source");
+
+		copy_checkpoint_tree_cow(&source, &destination).expect("stage sparse checkpoint");
+		let staged = fs::File::open(destination.join("rootfs.img")).expect("open staged rootfs");
+		assert_eq!(staged.metadata().expect("staged metadata").len(), 64 * 1024 * 1024);
+		assert!(
+			staged.metadata().expect("staged allocation").blocks() < 2048,
+			"staged sparse image must not be densely materialized"
+		);
+		let mut tail = [0; 4];
+		staged
+			.read_at(&mut tail, 64 * 1024 * 1024 - 4)
+			.expect("read staged tail");
+		assert_eq!(&tail, b"last");
+
+		let linked = temp.path().join("linked");
+		fs::create_dir(&linked).expect("linked source");
+		std::os::unix::fs::symlink(temp.path(), linked.join("escape")).expect("symlink");
+		assert!(copy_checkpoint_tree_cow(&linked, &temp.path().join("rejected")).is_err());
 	}
 
 	fn valid_create() -> SandboxCreate {
@@ -5726,6 +10218,21 @@ mod tests {
 			.prune_recovery("sandbox", Some("00000000000000000000-disk-new"))
 			.expect("prune");
 		assert!(root.join("00000000000000000000-disk-new.venc").is_file());
+	}
+
+	#[test]
+	fn removing_a_sandbox_deletes_its_local_recovery_history() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "running"));
+		fs::create_dir_all(engine.sandbox("sandbox").dir()).expect("runtime directory");
+		let recovery = engine.recovery_root("sandbox").expect("recovery root");
+		fs::create_dir_all(&recovery).expect("recovery directory");
+		fs::write(recovery.join("point.venc"), b"point").expect("recovery point");
+
+		engine.remove("sandbox").expect("remove sandbox");
+
+		assert!(!recovery.exists(), "sandbox removal retained local recovery history");
 	}
 
 	#[test]
@@ -5911,6 +10418,146 @@ mod tests {
 		)
 		.expect("seal test snapshot");
 		fs::remove_dir_all(source).expect("remove snapshot source");
+	}
+
+	#[test]
+	fn replacement_lifecycle_preserves_nonzero_resume_and_rollback_generations() {
+		let resume = LifecycleState {
+			desired:    LifecyclePhase::Running,
+			observed:   LifecyclePhase::Suspended,
+			generation: StateGeneration(3),
+			failure:    None,
+			operation:  None,
+		};
+		let restored_resume = Engine::replacement_lifecycle(&resume);
+		assert_eq!(restored_resume.generation, StateGeneration(3));
+		assert_eq!(restored_resume.operation, None);
+
+		let rollback = LifecycleState {
+			desired:    LifecyclePhase::Running,
+			observed:   LifecyclePhase::Running,
+			generation: StateGeneration(7),
+			failure:    None,
+			operation:  Some(LifecycleOperation::Rollback { recovery_point: "point-7".to_owned() }),
+		};
+		let mut restored_rollback = Engine::replacement_lifecycle(&rollback);
+		assert_eq!(restored_rollback.generation, StateGeneration(7));
+		assert_eq!(restored_rollback.operation, rollback.operation);
+		restored_rollback.operation = None;
+		assert!(restored_rollback.is_converged());
+	}
+	#[test]
+	fn replacement_never_rewinds_checkpoint_generation() {
+		let previous = json!({ "checkpoint_generation": 19 });
+		let restored = Map::from_iter([("checkpoint_generation".to_owned(), json!(4))]);
+		assert_eq!(Engine::replacement_checkpoint_generation(&previous, &restored), 19);
+	}
+	#[test]
+	fn rollback_journal_is_durable_and_contains_preteardown_counter() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let journal = RollbackJournal {
+			sandbox_id:            "rollback".to_owned(),
+			target_recovery_point: "target".to_owned(),
+			safety_recovery_point: "safety".to_owned(),
+			generation:            7,
+			checkpoint_generation: 19,
+			portable_owner:        "node-a".to_owned(),
+			portable_owner_epoch:  3,
+			source_token:          "e634f1ac918b7513ebec28b04f425a9d".to_owned(),
+		};
+		engine
+			.write_rollback_journal(&journal)
+			.expect("write journal");
+		let bytes = fs::read(
+			engine
+				.rollback_journal_path("rollback")
+				.expect("journal path"),
+		)
+		.expect("read journal");
+		assert_eq!(
+			serde_json::from_slice::<RollbackJournal>(&bytes)
+				.expect("decode durable journal")
+				.checkpoint_generation,
+			19
+		);
+		engine
+			.clear_rollback_journal("rollback")
+			.expect("clear journal");
+		assert!(
+			!engine
+				.rollback_journal_path("rollback")
+				.expect("journal path")
+				.exists()
+		);
+	}
+
+	#[test]
+	fn rollback_replay_retains_only_exact_committed_target_or_live_source() {
+		assert_eq!(
+			rollback_replay_decision(true, true, Some(&RollbackDisposition::CommittedRunning)),
+			RollbackReplayDecision::AbortRetainSource,
+		);
+		assert_eq!(
+			rollback_replay_decision(false, true, Some(&RollbackDisposition::CommittedRunning)),
+			RollbackReplayDecision::FinalizeRetainTarget,
+		);
+		assert_eq!(
+			rollback_replay_decision(false, true, Some(&RollbackDisposition::Other)),
+			RollbackReplayDecision::RecoverSafety,
+		);
+		assert_eq!(
+			rollback_replay_decision(false, false, Some(&RollbackDisposition::CommittedRunning)),
+			RollbackReplayDecision::RecoverSafety,
+		);
+	}
+
+	#[test]
+	fn stale_placeholder_journal_does_not_block_a_newer_orphan_marker() {
+		let journal = RollbackJournal {
+			sandbox_id:            "sandbox".to_owned(),
+			target_recovery_point: "target".to_owned(),
+			safety_recovery_point: "safety".to_owned(),
+			generation:            4,
+			checkpoint_generation: 9,
+			portable_owner:        "former-owner".to_owned(),
+			portable_owner_epoch:  2,
+			source_token:          "e634f1ac918b7513ebec28b04f425a9d".to_owned(),
+		};
+		assert!(!rollback_journal_matches_marker(&journal, "sandbox", "new-owner", 3, 5,));
+		assert!(rollback_journal_matches_marker(&journal, "sandbox", "former-owner", 2, 4,));
+	}
+
+	#[test]
+	fn internal_safety_recovery_is_hidden_and_cleaned_up() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let safety = "00000000000000000001-checkpoint-00000000000000000001-token-rollback-safety-";
+		let normal = "00000000000000000002-checkpoint-00000000000000000002-token";
+		for point in [safety, normal] {
+			let archive = engine
+				.recovery_archive("sandbox", point)
+				.expect("archive path");
+			fs::create_dir_all(archive.parent().expect("archive parent")).expect("recovery root");
+			fs::write(archive, b"internal").expect("archive");
+		}
+		let points = engine.recovery_points("sandbox").expect("list history");
+		assert_eq!(
+			points
+				.iter()
+				.map(|point| point.name.as_str())
+				.collect::<Vec<_>>(),
+			[normal]
+		);
+		engine
+			.remove_safety_recovery("sandbox", safety)
+			.expect("cleanup safety");
+		assert!(
+			!engine
+				.recovery_archive("sandbox", safety)
+				.expect("archive path")
+				.exists()
+		);
 	}
 
 	#[test]
@@ -6127,17 +10774,125 @@ mod tests {
 	}
 
 	#[test]
-	fn mesh_replicate_cleanup_drops_cas_pointer_and_deletes_checkpoint_dir() {
+	fn mesh_replicate_cleanup_drops_cas_pointer_after_export_handles_release() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _home) = Engine::new_test(config_for(&temp));
 		let (snapshot_dir, digest) = indexed_checkpoint(&temp, "replica-checkpoint");
+		engine.inner.pending_replica_exports.lock().insert(
+			"replica".to_owned(),
+			Arc::new(ReplicaExport {
+				digest:       digest.clone(),
+				snapshot_dir: snapshot_dir.clone(),
+				_cleanup:     CheckpointCleanup::new(digest.clone(), snapshot_dir.clone()),
+				object_key:   Mutex::new(None),
+			}),
+		);
+		engine
+			.mesh_bind_replica_export("replica", &digest, "replicas/replica/object")
+			.expect("bind active export");
+		engine
+			.mesh_bind_replica_export("replica", &digest, "replicas/replica/object")
+			.expect("same object binding is idempotent");
+		assert!(
+			engine
+				.mesh_bind_replica_export("replica", &digest, "replicas/replica/other")
+				.is_err(),
+			"an export cannot be rebound to another object"
+		);
+		let stream_export = engine
+			.mesh_replica_export("replica", &digest, "replicas/replica/object")
+			.expect("active export");
 
 		engine
 			.mesh_replicate_cleanup(&digest, &snapshot_dir)
 			.expect("replica cleanup succeeds");
 
 		assert_eq!(cas::lookup(&digest).expect("lookup after cleanup"), None);
-		assert!(!snapshot_dir.exists(), "replication cleanup must delete the checkpoint");
+		assert!(snapshot_dir.exists(), "active stream handle must pin export directory");
+		drop(stream_export);
+		assert!(!snapshot_dir.exists(), "last export handle deletes the checkpoint");
+		assert!(
+			engine
+				.mesh_replica_export("replica", &digest, "replicas/replica/object")
+				.is_err(),
+			"cleanup makes the export unavailable to new streams"
+		);
+	}
+	#[test]
+	fn abandoned_indexed_checkpoint_removes_cas_pointer_and_directory() {
+		let temp = TempDir::new().expect("temp");
+		let (snapshot_dir, digest) = indexed_checkpoint(&temp, "abandoned-checkpoint");
+		drop(CheckpointCleanup::new(digest.clone(), snapshot_dir.clone()));
+		assert_eq!(cas::lookup(&digest).expect("CAS lookup"), None);
+		assert!(!snapshot_dir.exists(), "abandoned checkpoint directory is removed");
+	}
+	#[test]
+	fn checkpoint_cleanup_does_not_unpublish_newer_same_digest_pointer() {
+		let temp = TempDir::new().expect("temp");
+		let (_engine, _home) = Engine::new_test(config_for(&temp));
+		let first = checkpoint_fixture(&temp, "same-digest-a");
+		let second = checkpoint_fixture(&temp, "same-digest-b");
+		for dir in [&first, &second] {
+			fs::write(dir.join("rootfs.img"), b"identical rootfs").expect("rootfs");
+		}
+		let digest = cas::index_template(&first, None).expect("index first");
+		assert_eq!(cas::index_template(&second, Some(&digest)).expect("index second"), digest);
+		assert_eq!(cas::lookup(&digest).expect("lookup"), Some(second.clone()));
+
+		drop(CheckpointCleanup::new(digest.clone(), first.clone()));
+		assert_eq!(
+			cas::lookup(&digest).expect("first exact cleanup"),
+			Some(second.clone()),
+			"cleanup of the superseded checkpoint must preserve the newer pointer"
+		);
+		assert!(!first.exists());
+
+		drop(CheckpointCleanup::new(digest.clone(), second.clone()));
+		assert_eq!(cas::lookup(&digest).expect("second exact cleanup"), None);
+		assert!(!second.exists());
+	}
+	#[test]
+	fn portable_delete_commits_history_before_tombstone() {
+		let events = Arc::new(Mutex::new(Vec::new()));
+		Engine::commit_portable_delete_after_history(
+			{
+				let events = Arc::clone(&events);
+				move || {
+					events.lock().push("history");
+					Ok(())
+				}
+			},
+			{
+				let events = Arc::clone(&events);
+				move || {
+					events.lock().push("commit");
+					Ok(())
+				}
+			},
+		)
+		.expect("delete transaction");
+		assert_eq!(*events.lock(), ["history", "commit"]);
+	}
+
+	#[test]
+	fn portable_delete_history_failure_retains_tombstone_for_retry() {
+		let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let error = Engine::commit_portable_delete_after_history(
+			|| Err(EngineError::engine("history delete failed")),
+			{
+				let committed = Arc::clone(&committed);
+				move || {
+					committed.store(true, Ordering::Relaxed);
+					Ok(())
+				}
+			},
+		)
+		.expect_err("history failure must prevent tombstone commit");
+		assert_eq!(error.message, "history delete failed");
+		assert!(
+			!committed.load(Ordering::Relaxed),
+			"uncommitted tombstone remains available for retry"
+		);
 	}
 
 	#[test]
@@ -6234,5 +10989,294 @@ mod tests {
 		assert!(params["s3_mounts"]["/mnt/data"].get("tag").is_none());
 		assert!(params["s3_mounts"]["/mnt/data"].get("auth").is_none());
 		assert!(params["s3_mounts"]["/mnt/data"].get("access_key").is_none());
+	}
+
+	#[test]
+	fn same_sandbox_capture_lock_blocks_suspend_until_maintenance_releases() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let lock = engine.capture_lock("sandbox");
+		let held = lock.acquire();
+		let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+		let waiting = Arc::clone(&lock);
+		let worker = std::thread::spawn(move || {
+			let _guard = waiting.acquire();
+			entered_tx.send(()).expect("report suspend entry");
+		});
+
+		assert!(
+			entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+			"suspend entered while a keep-running maintenance capture owned the sandbox lock"
+		);
+		drop(held);
+		entered_rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("suspend enters after maintenance resumes and releases its lock");
+		worker.join().expect("suspend waiter");
+	}
+
+	#[test]
+	fn capture_locks_allow_different_sandboxes_to_progress_independently() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let first = engine.capture_lock("first");
+		let held = first.acquire();
+		let second = engine.capture_lock("second");
+		let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+		let worker = std::thread::spawn(move || {
+			let _guard = second.acquire();
+			entered_tx.send(()).expect("report second capture entry");
+		});
+
+		entered_rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("a capture for another sandbox must not wait on the first sandbox");
+		drop(held);
+		worker.join().expect("independent capture waiter");
+	}
+
+	#[test]
+	fn maintenance_skips_a_sandbox_with_a_pending_lifecycle_transition() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let record = VmRecord::new("pending", "pending", "running");
+		engine.insert_test_record(record);
+		let transition = engine
+			.begin_state_transition("pending", LifecyclePhase::Suspended)
+			.expect("begin pending suspend");
+		assert_eq!(transition.disposition, TransitionDisposition::Acquired);
+		assert!(
+			engine
+				.inner
+				.maintenance_busy
+				.lock()
+				.insert("pending".to_owned())
+		);
+
+		engine.maintenance_once();
+
+		let record = engine.get_record("pending", false).expect("pending record");
+		assert_eq!(record.lifecycle.desired, LifecyclePhase::Suspended);
+		assert_eq!(record.lifecycle.observed, LifecyclePhase::Running);
+		assert_eq!(record.lifecycle.generation, transition.generation);
+		assert!(
+			engine.inner.maintenance_busy.lock().contains("pending"),
+			"maintenance must leave the pending operation owned by its transition"
+		);
+		engine.inner.maintenance_busy.lock().remove("pending");
+	}
+
+	#[test]
+	fn rehydration_service_resolution_failure_stops_and_marks_non_runnable() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("rehydrate-failure", "rehydrate-failure", "running");
+		// Names, not secret values, are the only durable credential identity.
+		// Without a persisted TAP identity, gateway reconstruction must fail
+		// closed instead of leaving a falsely-running sandbox.
+		record.detail = json!({ "credential_names": ["tenant-token"] });
+		engine.insert_test_record(record);
+
+		engine
+			.rehydrate_runtime_identities()
+			.expect("rehydration failure is recorded rather than propagated");
+
+		let record = engine
+			.get_record("rehydrate-failure", false)
+			.expect("record");
+		assert_eq!(
+			record.status, "stopped",
+			"failed service reconstruction left a false running state"
+		);
+		assert!(
+			record
+				.detail
+				.get("restart_non_runnable")
+				.and_then(Value::as_str)
+				.is_some(),
+			"missing durable failure explanation: {}",
+			record.detail
+		);
+		assert!(
+			!engine
+				.inner
+				.runtimes
+				.lock()
+				.contains_key("rehydrate-failure"),
+			"failed rehydration retained a live runtime candidate"
+		);
+	}
+
+	fn assert_capture_permit_blocks_destructive_mutation(
+		operation: impl FnOnce(&Engine) -> Result<Value> + Send + 'static,
+	) {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let engine = Arc::new(engine);
+		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "running"));
+		fs::create_dir_all(engine.sandbox("sandbox").dir()).expect("runtime directory");
+		let lock = engine.capture_lock("sandbox");
+		let held = lock.acquire();
+		let (result_tx, result_rx) = std::sync::mpsc::channel();
+		let worker_engine = Arc::clone(&engine);
+		let worker = std::thread::spawn(move || {
+			result_tx
+				.send(operation(&worker_engine))
+				.expect("report public mutation result");
+		});
+
+		assert!(
+			result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+			"public lifecycle mutation bypassed the active maintenance-capture permit"
+		);
+		drop(held);
+		result_rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("public lifecycle mutation proceeds after capture release")
+			.expect("immediate fake runtime operation succeeds");
+		worker.join().expect("public mutation waiter");
+	}
+
+	#[test]
+	fn capture_permit_blocks_stop_and_remove_until_maintenance_releases() {
+		assert_capture_permit_blocks_destructive_mutation(|engine| engine.stop("sandbox"));
+		assert_capture_permit_blocks_destructive_mutation(|engine| engine.remove("sandbox"));
+	}
+
+	#[test]
+	fn capture_lock_map_reclaims_released_sandboxes() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		for index in 0..64 {
+			drop(engine.capture_lock(&format!("sandbox-{index}")).acquire());
+		}
+		drop(engine.capture_lock("final").acquire());
+		assert!(
+			engine.test_capture_lock_count() <= 1,
+			"released per-sandbox capture locks must not grow without bound"
+		);
+	}
+
+	#[test]
+	fn unpublished_suspend_crash_resumes_before_cancelling_the_transition() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		engine.insert_test_record(VmRecord::new("suspend-crash", "suspend-crash", "running"));
+		let transition = engine
+			.begin_state_transition("suspend-crash", LifecyclePhase::Suspended)
+			.expect("begin suspend");
+		assert_eq!(transition.disposition, TransitionDisposition::Acquired);
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let resumed = Arc::clone(&events);
+		let cancelled = Arc::clone(&events);
+		engine
+			.test_resume_unpublished_suspend(
+				"suspend-crash",
+				move || {
+					resumed.lock().push("resume");
+					Ok(())
+				},
+				move || {
+					cancelled.lock().push("cancel");
+					Ok(())
+				},
+			)
+			.expect("resume and cancel unpublished suspend");
+
+		assert_eq!(*events.lock(), vec!["resume", "cancel"]);
+		let record = engine.get_record("suspend-crash", false).expect("record");
+		assert_eq!(record.lifecycle.desired, LifecyclePhase::Running);
+		assert_eq!(record.lifecycle.observed, LifecyclePhase::Running);
+		assert_eq!(record.lifecycle.generation, transition.generation);
+	}
+	#[test]
+	fn production_launch_specs_arm_only_the_owner_watchdog() {
+		let spec = LaunchSpec::boot_rootfs("control.sock", "vmlinux", "rootfs.ext4");
+		assert_eq!(
+			launch_spec_for_cluster(ClusterMode::Production, &spec).owner_lease_secs,
+			Some(15)
+		);
+		assert_eq!(launch_spec_for_cluster(ClusterMode::SingleNode, &spec).owner_lease_secs, None);
+	}
+	#[test]
+	fn owner_lease_rearm_does_not_refresh_last_activity() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let mut record = VmRecord::new("lease", "lease", "running");
+		record.last_active = 123.0;
+		engine.insert_test_record(record);
+		fs::create_dir_all(engine.sandbox("lease").dir()).expect("candidate runtime");
+
+		assert!(engine.mesh_rearm_owner_lease("lease", 15).is_err());
+		assert_eq!(
+			engine
+				.get_record("lease", false)
+				.expect("record")
+				.last_active,
+			123.0
+		);
+	}
+
+	#[test]
+	fn production_ha_key_resolution_accepts_only_shared_or_owner_tenant_key() {
+		let mut config = ServeConfig::default();
+		config.cluster_mode = ClusterMode::Production;
+		config.portable_history_key_id = Some("shared-key".to_owned());
+		config.tenant_keys = std::collections::HashMap::from([
+			("tenant-a".to_owned(), "tenant-a-key".to_owned()),
+			("tenant-b".to_owned(), "tenant-b-key".to_owned()),
+		]);
+
+		assert_eq!(
+			Engine::resolve_ha_key_id(&config, "async", "tenant-a", "default").unwrap(),
+			Some("tenant-a-key".to_owned())
+		);
+		assert_eq!(
+			Engine::resolve_ha_key_id(&config, "async", "unmapped", "").unwrap(),
+			Some("shared-key".to_owned())
+		);
+		assert_eq!(
+			Engine::resolve_ha_key_id(&config, "async", "tenant-a", "shared-key").unwrap(),
+			Some("shared-key".to_owned())
+		);
+		assert_eq!(
+			Engine::resolve_ha_key_id(&config, "async", "tenant-a", "tenant-a-key").unwrap(),
+			Some("tenant-a-key".to_owned())
+		);
+		assert!(Engine::resolve_ha_key_id(&config, "async", "tenant-a", "host-local-key").is_err());
+		assert!(Engine::resolve_ha_key_id(&config, "async", "tenant-a", "tenant-b-key").is_err());
+		assert_eq!(
+			Engine::resolve_ha_key_id(&config, "off", "tenant-a", "host-local-key").unwrap(),
+			None
+		);
+	}
+	#[test]
+	fn paused_candidate_activation_rejects_pid_mismatch_before_resume() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("paused-candidate", "paused-candidate", "paused");
+		record.pid = Some(7);
+		engine.insert_test_record(record);
+		write_meta(temp.path(), "paused-candidate", json!({ "pid": 8, "status": "paused" }));
+
+		let error = engine
+			.mesh_activate_candidate("paused-candidate")
+			.expect_err("a stale PID must never resume a candidate");
+		assert_eq!(error.code.as_str(), "busy");
+		assert!(
+			error.message.contains("PID no longer matches"),
+			"unexpected fencing error: {}",
+			error.message
+		);
+		assert_eq!(
+			engine
+				.inner
+				.registry
+				.get("paused-candidate")
+				.expect("candidate record")
+				.status,
+			"paused",
+			"PID fencing must retain the paused candidate for reconciliation"
+		);
 	}
 }

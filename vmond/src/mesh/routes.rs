@@ -6,8 +6,6 @@
 //! stores are provided by sibling modules through the traits below.
 
 use std::{
-	ffi::OsStr,
-	fs,
 	path::{Path as FsPath, PathBuf},
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,7 +14,7 @@ use std::{
 use axum::{
 	Json, Router,
 	body::{Body, to_bytes},
-	extract::{Path, Request, State},
+	extract::{Path, Query, Request, State},
 	http::{HeaderMap, HeaderValue, StatusCode, header},
 	response::{IntoResponse, Response},
 	routing::{get, post},
@@ -27,10 +25,16 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::gossip::{self, JsonObject, MeshError, MeshResult, PeerHttpClient};
-use crate::{engine::diskdelta, error::EngineError, image::cas};
+use crate::image::cas;
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
 const ALLOWED_HA: &[&str] = &["async", "async+rerun", "off", "rerun"];
+const MIGRATION_ID_FIELD: &str = "_mesh_migration_id";
+const MIGRATION_BASE_DIGEST_FIELD: &str = "_mesh_migration_base_digest";
+const MIGRATION_DELTA_DIGEST_FIELD: &str = "_mesh_migration_delta_digest";
+const MIGRATION_SOURCE_URL_FIELD: &str = "_mesh_migration_source_url";
+const MIGRATION_DELTA_DIR_FIELD: &str = "_mesh_migration_delta_dir";
+const MIGRATION_COMMITTED_FIELD: &str = "_mesh_migration_committed";
 
 pub type RouteResult<T> = std::result::Result<T, MeshRouteError>;
 
@@ -66,6 +70,36 @@ pub struct MigratePrepareWire {
 	pub digest:       String,
 	pub snapshot_dir: String,
 	pub params:       JsonObject,
+	pub cleanup:      Option<MigrationCleanupWire>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MigrationCleanupWire {
+	pub sid:            String,
+	pub base_dir:       String,
+	pub base_digest:    String,
+	pub delta_dir:      String,
+	pub delta_digest:   String,
+	#[serde(default)]
+	pub target_url:     String,
+	#[serde(default)]
+	pub migration_id:   String,
+	#[serde(default)]
+	pub epoch:          i64,
+	#[serde(default)]
+	pub schema_version: u8,
+	#[serde(default)]
+	pub source_owner:   String,
+	#[serde(default)]
+	pub source_epoch:   i64,
+	#[serde(default)]
+	pub target_owner:   String,
+	#[serde(default)]
+	pub target_epoch:   i64,
+	#[serde(default)]
+	pub token:          String,
+	#[serde(default)]
+	pub phase:          String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,7 +198,6 @@ pub struct MeshRouteState {
 	pub transfer:       Arc<dyn MeshTemplateTransfer>,
 	pub config:         MeshRouteConfig,
 }
-
 impl MeshRouteState {
 	#[allow(clippy::too_many_arguments, reason = "explicit service wiring keeps mesh seams visible")]
 	pub fn new(
@@ -272,6 +305,20 @@ pub trait MeshControl: Send + Sync {
 	fn worker_end(&self, key: &str);
 }
 
+/// Keeps an actively exported replica checkpoint alive while its peer bundle
+/// response is streamed.
+pub trait ReplicaExport: Send {
+	fn path(&self) -> &FsPath;
+}
+
+/// Held exclusively from migration pre-copy through the terminal source
+/// outcome, preventing two targets from pausing or aborting the same VM.
+pub trait MigrationLifecycleGuard: Send {}
+
+struct NoopMigrationLifecycleGuard;
+
+impl MigrationLifecycleGuard for NoopMigrationLifecycleGuard {}
+
 /// Engine seam used by peer routes.  Implementations may block internally;
 /// route code awaits the returned futures so callers can wrap sync work in
 /// `spawn_blocking`.
@@ -279,11 +326,47 @@ pub trait MeshEngine: Send + Sync {
 	fn owned_ids(&self) -> MeshResult<Vec<String>>;
 	fn list_views(&self) -> MeshResult<Vec<Value>>;
 	fn has_sandbox(&self, sid: &str) -> bool;
+	/// True only when the VMM reports a live local candidate. Implementations
+	/// must fail closed; registry presence is not liveness.
+	fn candidate_is_running(&self, _sid: &str) -> bool {
+		false
+	}
+	/// Return an actively exported replica checkpoint only after validating its
+	/// exact durable sid, digest, and scoped object key.
+	fn replica_export_path(
+		&self,
+		_sid: &str,
+		_digest: &str,
+		_object_key: &str,
+	) -> MeshResult<Box<dyn ReplicaExport>> {
+		Err(MeshError::invalid("replica export is unavailable"))
+	}
 	fn get_view(&self, sid: &str) -> MeshResult<Value>;
 	fn checkpoint_age_sec(&self, sid: &str) -> Option<f64>;
 	fn find_by_idempotency_key(&self, key: &str) -> MeshResult<Option<Value>>;
 	fn record_idempotency(&self, sid: &str, key: &str) -> MeshResult<()>;
+	fn record_create_epoch(&self, _sid: &str, _epoch: i64) -> MeshResult<()> {
+		Ok(())
+	}
+	/// Non-blocking per-sandbox migration lifecycle guard. A concurrent target
+	fn stage_migration_delta(
+		&self,
+		sid: String,
+		verified_cache_path: String,
+		base_dir: String,
+	) -> BoxFuture<'_, MeshResult<String>>;
+	/// must fail before it begins pre-copy or can affect the winner's journal.
+	fn try_begin_migration(&self, _sid: &str) -> MeshResult<Box<dyn MigrationLifecycleGuard>> {
+		Ok(Box::new(NoopMigrationLifecycleGuard))
+	}
 	fn record_volume_leases(&self, sid: &str, leases: Vec<Value>) -> MeshResult<()>;
+	fn teardown_candidate(&self, sid: String, expected_epoch: i64) -> BoxFuture<'_, MeshResult<()>>;
+	fn delete_portable_history(
+		&self,
+		sid: String,
+		owner: String,
+		epoch: i64,
+	) -> BoxFuture<'_, MeshResult<()>>;
 
 	fn create_sandbox(&self, params: JsonObject) -> BoxFuture<'_, MeshResult<Value>>;
 	fn run_detached(&self, params: JsonObject) -> BoxFuture<'_, MeshResult<Value>>;
@@ -299,6 +382,7 @@ pub trait MeshEngine: Send + Sync {
 		&self,
 		sid: String,
 		base_dir: String,
+		cleanup: MigrationCleanupWire,
 	) -> BoxFuture<'_, MeshResult<MigratePrepareWire>>;
 	fn checkpoint_discard(
 		&self,
@@ -321,6 +405,38 @@ pub trait MeshEngine: Send + Sync {
 		delta_dir: String,
 		delta_digest: String,
 	) -> BoxFuture<'_, MeshResult<()>>;
+	fn migrate_adopt_target(
+		&self,
+		sid: String,
+		delta_dir: String,
+		params: JsonObject,
+	) -> BoxFuture<'_, MeshResult<Value>>;
+	/// Start the exact paused migration candidate only after its target
+	/// ownership record and writable-volume grants have committed.
+	fn migrate_activate_target(
+		&self,
+		sid: String,
+		expected_epoch: i64,
+	) -> BoxFuture<'_, MeshResult<()>>;
+	fn migration_cleanup_persist(&self, _cleanup: MigrationCleanupWire) -> MeshResult<()> {
+		Ok(())
+	}
+	fn migration_cleanup_pending(&self) -> MeshResult<Vec<MigrationCleanupWire>> {
+		Ok(Vec::new())
+	}
+	fn migration_cleanup_remove(&self, _sid: String) -> MeshResult<()> {
+		Ok(())
+	}
+	fn migrate_cleanup_committed(
+		&self,
+		sid: String,
+		base_dir: String,
+		base_digest: String,
+		delta_dir: String,
+		delta_digest: String,
+	) -> BoxFuture<'_, MeshResult<()>> {
+		self.migrate_commit(sid, base_dir, base_digest, delta_dir, delta_digest)
+	}
 }
 
 pub trait MeshLeaseManager: Send + Sync {
@@ -356,9 +472,100 @@ pub trait MeshLeaseManager: Send + Sync {
 
 pub trait MeshRecordStore: Send + Sync {
 	fn get(&self, sid: &str) -> MeshResult<Option<CreateRecordWire>>;
-	fn put(&self, record: CreateRecordWire) -> MeshResult<()>;
-	fn remove(&self, sid: &str, owner: &str, epoch: i64) -> MeshResult<()>;
+	fn reserve_create_epoch(
+		&self,
+		_sid: &str,
+		_owner: &str,
+		_idempotency_key: &str,
+	) -> MeshResult<i64> {
+		Ok(0)
+	}
+	fn put(&self, record: CreateRecordWire) -> MeshResult<CreateRecordWire>;
+	fn commit_delete(&self, sid: &str, owner: &str, epoch: i64) -> MeshResult<()>;
 	fn list(&self) -> MeshResult<Vec<CreateRecordWire>>;
+	fn update_exact(&self, record: CreateRecordWire) -> MeshResult<CreateRecordWire> {
+		self.put(record)
+	}
+	fn claim_expected_with_intent(
+		&self,
+		_expected_owner: String,
+		_expected_epoch: i64,
+		record: CreateRecordWire,
+	) -> MeshResult<CreateRecordWire> {
+		self.put(record)
+	}
+
+	/// Pre-commit source-deletion authorization before a target can consume a
+	/// live migration token. The default rejects the operation rather than
+	/// accidentally turning an unfenced test/store implementation into a
+	/// successful live migration.
+	fn begin_migration_handoff(
+		&self,
+		_sid: &str,
+		_source_owner: &str,
+		_source_epoch: i64,
+		_target_owner: &str,
+		_token: &str,
+	) -> MeshResult<()> {
+		Err(MeshError::with_code(
+			"live migration handoff is unsupported by this record store",
+			"busy",
+		))
+	}
+
+	/// Revoke an unclaimed source authorization and install a fresh source
+	/// epoch. `None` is fenced: a target may already have consumed the token.
+	fn abort_migration_handoff(
+		&self,
+		_sid: &str,
+		_source_owner: &str,
+		_source_epoch: i64,
+		_target_owner: &str,
+		_token: &str,
+	) -> MeshResult<Option<CreateRecordWire>> {
+		Err(MeshError::with_code(
+			"live migration handoff abort is unsupported by this record store",
+			"busy",
+		))
+	}
+
+	/// Clear a completed migration-abort disposition only for the exact source
+	/// generation that durably recorded the token.
+	fn complete_migration_abort(
+		&self,
+		_sid: &str,
+		_token: &str,
+		_owner: &str,
+		_fresh_epoch: i64,
+	) -> MeshResult<CreateRecordWire> {
+		Err(MeshError::with_code(
+			"migration abort completion is unsupported by this record store",
+			"busy",
+		))
+	}
+
+	/// Consume the exact source-authorized migration token.  A different token
+	/// or a missing source marker is always fenced.
+	fn claim_migration_handoff(
+		&self,
+		_source_owner: String,
+		_source_epoch: i64,
+		_token: String,
+		_record: CreateRecordWire,
+	) -> MeshResult<CreateRecordWire> {
+		Err(MeshError::with_code(
+			"live migration handoff is unsupported by this record store",
+			"busy",
+		))
+	}
+
+	fn try_begin_target_migration(
+		&self,
+		_sid: &str,
+		_migration_id: &str,
+	) -> MeshResult<Box<dyn MigrationLifecycleGuard>> {
+		Ok(Box::new(NoopMigrationLifecycleGuard))
+	}
 
 	fn put_if_newer(&self, record: CreateRecordWire) -> MeshResult<bool> {
 		let should_put = match self.get(&record.sid)? {
@@ -374,12 +581,15 @@ pub trait MeshRecordStore: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct ReplicaRecordWire {
-	pub sid:           String,
-	pub digest:        String,
-	pub source_node:   String,
-	pub snapshot_dir:  String,
-	pub params:        JsonObject,
-	pub needs_secrets: bool,
+	pub sid:                   String,
+	pub digest:                String,
+	pub object_key:            String,
+	pub source_node:           String,
+	pub source_epoch:          u64,
+	pub checkpoint_generation: u64,
+	pub snapshot_dir:          String,
+	pub params:                JsonObject,
+	pub needs_secrets:         bool,
 }
 
 pub trait MeshReplicaStore: Send + Sync {
@@ -387,13 +597,22 @@ pub trait MeshReplicaStore: Send + Sync {
 	fn put(
 		&self,
 		sid: String,
+		object_key: String,
 		digest: String,
 		source_node: String,
+		source_epoch: u64,
+		checkpoint_generation: u64,
 		snapshot_dir: String,
 		params: JsonObject,
 	) -> BoxFuture<'_, MeshResult<()>>;
 	fn list(&self) -> MeshResult<Vec<String>>;
 	fn remove(&self, sid: &str) -> MeshResult<()>;
+	/// Return the root for one active local replica only after validating the
+	/// exact immutable object identity. The route streams this root as a
+	/// bundle; callers must not substitute a digest-only template lookup.
+	fn snapshot_export(&self, _sid: &str, _object_key: &str, _digest: &str) -> MeshResult<PathBuf> {
+		Err(MeshError::invalid("replica snapshot export is unavailable"))
+	}
 }
 
 pub trait MeshTemplateTransfer: Send + Sync {
@@ -401,6 +620,18 @@ pub trait MeshTemplateTransfer: Send + Sync {
 		&'a self,
 		client: &'a reqwest::Client,
 		peer_url: String,
+		digest: String,
+		token: String,
+	) -> BoxFuture<'a, MeshResult<String>>;
+
+	/// Pull one exact replica checkpoint object. Digest is an integrity check,
+	/// never an object-identity lookup.
+	fn pull_snapshot<'a>(
+		&'a self,
+		client: &'a reqwest::Client,
+		peer_url: String,
+		sid: String,
+		object_key: String,
 		digest: String,
 		token: String,
 	) -> BoxFuture<'a, MeshResult<String>>;
@@ -482,10 +713,12 @@ pub fn router(state: MeshRouteState) -> Router {
 		.route("/v1/mesh/lease/release", post(mesh_lease_release))
 		.route("/v1/mesh/migrate/precopy", post(mesh_migrate_precopy))
 		.route("/v1/mesh/migrate/receive", post(mesh_migrate_receive))
+		.route("/v1/mesh/migrate/status", post(mesh_migrate_status))
 		.route("/v1/mesh/replica/receive", post(mesh_replica_receive))
 		.route("/v1/mesh/replica/list", get(mesh_replica_list))
+		.route("/v1/replicas/{sid}/{digest}", get(mesh_replica_snapshot))
 		.route("/v1/mesh/record/put", post(mesh_record_put))
-		.route("/v1/mesh/record/remove", post(mesh_record_remove))
+		.route("/v1/mesh/candidate/teardown", post(mesh_candidate_teardown))
 		.route("/v1/mesh/idem/sandboxes/coordinate", post(mesh_idem_sandbox_coordinate))
 		.route("/v1/mesh/idem/sandboxes/work", post(mesh_idem_sandbox_work))
 		.route("/v1/mesh/idem/run/coordinate", post(mesh_idem_run_coordinate))
@@ -750,6 +983,46 @@ async fn mesh_migrate_precopy(
 	Ok(Json(json!({"ok": true})))
 }
 
+pub(crate) async fn commit_target_migration(
+	records: &dyn MeshRecordStore,
+	engine: &dyn MeshEngine,
+	leases: &dyn MeshLeaseManager,
+	sid: String,
+	epoch: i64,
+	record: &mut CreateRecordWire,
+	lease_records: Vec<Value>,
+) -> MeshResult<()> {
+	record
+		.params
+		.insert(MIGRATION_COMMITTED_FIELD.to_owned(), Value::Bool(true));
+	if let Err(error) = records.update_exact(record.clone()) {
+		// A target claim is not reversible by releasing writable volumes first:
+		// the old candidate must be confirmed stopped before another owner can
+		// use them.
+		engine.teardown_candidate(sid, epoch).await?;
+		leases.release_leases(lease_records).await?;
+		return Err(error);
+	}
+	Ok(())
+}
+
+pub(crate) async fn persist_target_migration_leases(
+	engine: &dyn MeshEngine,
+	leases: &dyn MeshLeaseManager,
+	sid: String,
+	epoch: i64,
+	lease_records: Vec<Value>,
+) -> MeshResult<()> {
+	if let Err(error) = engine.record_volume_leases(&sid, lease_records.clone()) {
+		// A serving target without persisted leases cannot renew its ownership.
+		// Tear down this uncommitted candidate before letting any retry proceed.
+		let teardown = engine.teardown_candidate(sid, epoch).await;
+		let release = leases.release_leases(lease_records).await;
+		return Err(lease_persistence_error(error, teardown, release));
+	}
+	Ok(())
+}
+
 /// Live-migration phase 2 receiver: pull the final delta checkpoint, splice
 /// it onto the locally installed pre-copy base, then restore and take
 /// ownership of the sandbox.
@@ -761,12 +1034,15 @@ async fn mesh_migrate_receive(
 	require_mesh_auth(&state, &headers, true)?;
 	let mut body = json_object(request).await?;
 	let digest = take_string(&mut body, "digest");
+	let migration_id = take_string(&mut body, "migration_id");
 	let base_digest = take_string(&mut body, "base_digest");
 	let source_url = take_string(&mut body, "source_url");
+	let source_owner = take_string(&mut body, "source_owner");
+	let source_epoch = to_i64(body.remove("source_epoch")).unwrap_or(-1);
 	let record = body
 		.remove("record")
 		.ok_or_else(|| MeshRouteError::invalid("migration record is required"))?;
-	let record = CreateRecordWire::from_value(record).map_err(MeshRouteError::from)?;
+	let mut record = CreateRecordWire::from_value(record).map_err(MeshRouteError::from)?;
 	let params = match body.remove("params") {
 		Some(Value::Object(params)) => params,
 		_ => JsonObject::new(),
@@ -779,18 +1055,59 @@ async fn mesh_migrate_receive(
 			"migration record does not match the target owner and epoch",
 		));
 	}
-	if digest.is_empty() || base_digest.is_empty() || source_url.is_empty() || name.is_empty() {
+	if digest.is_empty()
+		|| migration_id.is_empty()
+		|| base_digest.is_empty()
+		|| source_url.is_empty()
+		|| name.is_empty()
+		|| source_owner.is_empty()
+		|| source_epoch < 0
+	{
 		return Err(MeshRouteError::detail(
 			StatusCode::UNPROCESSABLE_ENTITY,
-			"digest, base_digest, source_url, and params.name are required",
+			"digest, migration_id, base_digest, source_url, source_owner, source_epoch, and \
+			 params.name are required",
 		));
 	}
-	if state.engine.has_sandbox(&name) {
-		return Err(MeshRouteError::coded(
-			StatusCode::CONFLICT,
-			"conflict",
-			format!("sandbox {} already exists on the target node", py_repr(&name)),
-		));
+	if record
+		.params
+		.get("_mesh_migration_token")
+		.and_then(Value::as_str)
+		!= Some(migration_id.as_str())
+	{
+		return Err(MeshRouteError::invalid("migration token does not match the target record"));
+	}
+	// This guard is shared with background intent convergence.  A duplicate
+	// receive returns a deterministic busy/pending response while the exact
+	// token is being materialized; another token is fenced by the claim.
+	let _receive_gate = map_mesh(
+		state
+			.records
+			.try_begin_target_migration(&name, &migration_id),
+	)?;
+	record = map_mesh(state.records.claim_migration_handoff(
+		source_owner,
+		source_epoch,
+		migration_id,
+		record,
+	))?;
+	if state.engine.has_sandbox(&name)
+		&& record
+			.params
+			.get(MIGRATION_COMMITTED_FIELD)
+			.and_then(Value::as_bool)
+			== Some(true)
+	{
+		state
+			.engine
+			.migrate_activate_target(name.clone(), record.epoch)
+			.await
+			.map_err(MeshRouteError::from)?;
+		return state
+			.engine
+			.get_view(&name)
+			.map(Json)
+			.map_err(MeshRouteError::from);
 	}
 	let base_dir = cas::lookup(&base_digest).ok().flatten().ok_or_else(|| {
 		MeshRouteError::coded(
@@ -799,104 +1116,187 @@ async fn mesh_migrate_receive(
 			"pre-copy checkpoint is not installed on this node; restart the migration",
 		)
 	})?;
-	let installed = state
-		.transfer
-		.pull_template(
-			state.transport.bulk_client(),
-			source_url,
-			digest.clone(),
-			state.outbound_token.to_string(),
-		)
-		.await
-		.map_err(|err| {
-			MeshRouteError::coded(
-				StatusCode::BAD_GATEWAY,
-				"unreachable",
-				format!("failed to pull migration delta checkpoint: {err}"),
+	let delta_dir = if let Some(path) = record
+		.params
+		.get(MIGRATION_DELTA_DIR_FIELD)
+		.and_then(Value::as_str)
+		.filter(|path| FsPath::new(path).is_dir())
+	{
+		PathBuf::from(path)
+	} else {
+		let installed = state
+			.transfer
+			.pull_template(
+				state.transport.bulk_client(),
+				source_url,
+				digest.clone(),
+				state.outbound_token.to_string(),
 			)
-		})?;
-	let delta_dir = PathBuf::from(&installed);
-	tokio::task::spawn_blocking(move || splice_delta_checkpoint(&delta_dir, &base_dir))
-		.await
-		.map_err(|err| {
-			MeshRouteError::coded(
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"internal",
-				format!("delta splice task failed: {err}"),
-			)
-		})?
-		.map_err(|err| MeshRouteError::coded(StatusCode::CONFLICT, "bad_delta", err.to_string()))?;
-	// The installed delta dir gained the materialized rootfs, so its CAS
-	// pointer no longer matches the directory content.
-	let _ = cas::drop_pointer(&digest);
+			.await
+			.map_err(|err| {
+				MeshRouteError::coded(
+					StatusCode::BAD_GATEWAY,
+					"unreachable",
+					format!("failed to pull migration delta checkpoint: {err}"),
+				)
+			})?;
+		let delta_dir = PathBuf::from(
+			state
+				.engine
+				.stage_migration_delta(
+					record.sid.clone(),
+					installed,
+					base_dir.to_string_lossy().into_owned(),
+				)
+				.await
+				.map_err(MeshRouteError::from)?,
+		);
+		record.params.insert(
+			MIGRATION_DELTA_DIR_FIELD.to_owned(),
+			Value::String(delta_dir.to_string_lossy().into_owned()),
+		);
+		// This is the durable target intent. It is written only after all
+		// artifacts needed for a retry exist, and before lease/restore side effects.
+		record = map_mesh(state.records.put(record))?;
+		state
+			.mesh
+			.record_owner(&record.sid, &record.owner, record.epoch);
+		delta_dir
+	};
+
+	let sid = record.sid.clone();
+	let adopt_params = migration_restore_params(&record.params);
 	let lease_records = map_mesh(
 		state
 			.leases
-			.acquire_writable_volume_leases(params.clone(), epoch)
+			.acquire_writable_volume_leases(adopt_params.clone(), record.epoch)
 			.await,
 	)?;
 	let restored = match state
 		.engine
-		.restore_from_template(params, installed, true)
+		.migrate_adopt_target(sid.clone(), delta_dir.to_string_lossy().into_owned(), adopt_params)
 		.await
 	{
 		Ok(view) => view,
 		Err(err) => {
+			let _ = state.engine.teardown_candidate(sid, record.epoch).await;
 			let _ = state.leases.release_leases(lease_records).await;
 			return Err(MeshRouteError::from(err));
 		},
 	};
-	let sid = record.sid.clone();
-	map_mesh(state.engine.record_volume_leases(&sid, lease_records))?;
-	let restored = apply_view_detail(restored, &record);
-	// Commit local ownership before acknowledging the restore; the source's
-	// follow-up replication is best-effort.
-	map_mesh(state.records.put(record))?;
-	state.mesh.record_owner(&sid, &owner, epoch);
-	Ok(Json(restored))
+	persist_target_migration_leases(
+		&*state.engine,
+		&*state.leases,
+		sid.clone(),
+		record.epoch,
+		lease_records.clone(),
+	)
+	.await
+	.map_err(MeshRouteError::from)?;
+	map_mesh(
+		commit_target_migration(
+			&*state.records,
+			&*state.engine,
+			&*state.leases,
+			sid.clone(),
+			record.epoch,
+			&mut record,
+			lease_records,
+		)
+		.await,
+	)?;
+	state
+		.engine
+		.migrate_activate_target(sid, record.epoch)
+		.await
+		.map_err(MeshRouteError::from)?;
+	Ok(Json(apply_view_detail(restored, &record)))
 }
 
-/// Validate a pulled delta checkpoint against its locally installed pre-copy
-/// base and materialize the final `rootfs.img` (base image + block delta).
-///
-/// The RAM delta needs no splicing: the VMM restore walks the delta's `base`
-/// chain, which resolves to the installed base as a sibling of the delta
-/// directory.
-fn splice_delta_checkpoint(delta_dir: &FsPath, base_dir: &FsPath) -> Result<(), EngineError> {
-	let snapshot = vmm::snapshot::read_state(delta_dir)
-		.map_err(|err| EngineError::invalid(format!("unreadable delta checkpoint: {err}")))?;
-	let Some(delta) = snapshot.delta else {
-		return Err(EngineError::invalid("migration checkpoint carries no memory delta"));
+/// Return whether this exact migration token committed on the target.  The
+/// source uses this after an ambiguous receive response and must not revive
+/// its paused VM unless this endpoint proves the target did not commit.
+async fn mesh_migrate_status(
+	State(state): State<MeshRouteState>,
+	request: Request<Body>,
+) -> RouteResult<Json<Value>> {
+	let headers = request.headers().clone();
+	require_mesh_auth(&state, &headers, true)?;
+	let mut body = json_object(request).await?;
+	let sid = take_string(&mut body, "sid");
+	let migration_id = take_string(&mut body, "migration_id");
+	let epoch = to_i64(body.remove("epoch")).unwrap_or(-1);
+	if sid.is_empty() || migration_id.is_empty() || epoch < 0 {
+		return Err(MeshRouteError::invalid("sid, migration_id, and epoch are required"));
+	}
+	let intent = state
+		.records
+		.get(&sid)
+		.map_err(MeshRouteError::from)?
+		.is_some_and(|record| {
+			record.owner == state.mesh.node_id()
+				&& record.epoch == epoch
+				&& record
+					.params
+					.get(MIGRATION_ID_FIELD)
+					.and_then(Value::as_str)
+					== Some(migration_id.as_str())
+		});
+	let committed = intent
+		&& state.engine.has_sandbox(&sid)
+		&& state
+			.records
+			.get(&sid)
+			.map_err(MeshRouteError::from)?
+			.is_some_and(|record| {
+				record
+					.params
+					.get(MIGRATION_COMMITTED_FIELD)
+					.and_then(Value::as_bool)
+					== Some(true)
+			});
+	let view = committed
+		.then(|| state.engine.get_view(&sid))
+		.transpose()
+		.map_err(MeshRouteError::from)?;
+	let state_name = if committed {
+		"committed"
+	} else if intent {
+		"pending"
+	} else {
+		"absent"
 	};
-	let base_name = base_dir.file_name().and_then(OsStr::to_str).unwrap_or("");
-	if delta.base != base_name {
-		return Err(EngineError::invalid(format!(
-			"delta checkpoint chains to {:?} but the installed pre-copy base is {base_name:?}",
-			delta.base
-		)));
+	Ok(Json(json!({"state": state_name, "committed": committed, "view": view})))
+}
+
+fn lease_persistence_error(
+	primary: MeshError,
+	teardown: MeshResult<()>,
+	release: MeshResult<()>,
+) -> MeshError {
+	let mut diagnostics = Vec::new();
+	if let Err(error) = teardown {
+		diagnostics.push(format!("candidate teardown failed: {}", error.message));
 	}
-	if delta_dir.parent() != base_dir.parent() {
-		return Err(EngineError::invalid(
-			"delta checkpoint and pre-copy base are not installed side by side",
-		));
+	if let Err(error) = release {
+		diagnostics.push(format!("lease release failed: {}", error.message));
 	}
-	let rootfs = delta_dir.join("rootfs.img");
-	let base_rootfs = base_dir.join("rootfs.img");
-	if !rootfs.is_file() {
-		if !base_rootfs.is_file() {
-			return Err(EngineError::invalid(format!(
-				"pre-copy base {} carries no rootfs.img",
-				base_dir.display()
-			)));
-		}
-		fs::copy(&base_rootfs, &rootfs)?;
+	if diagnostics.is_empty() {
+		primary
+	} else {
+		MeshError::with_code(
+			format!("{}; cleanup: {}", primary.message, diagnostics.join("; ")),
+			primary.code,
+		)
 	}
-	let block_delta = delta_dir.join(diskdelta::DISK_DELTA_FILE);
-	if block_delta.is_file() {
-		diskdelta::apply_disk_delta(&block_delta, &rootfs)?;
-		fs::remove_file(&block_delta)?;
-	}
-	Ok(())
+}
+
+fn migration_restore_params(params: &JsonObject) -> JsonObject {
+	params
+		.iter()
+		.filter(|(key, _)| !key.starts_with("_mesh_migration_"))
+		.map(|(key, value)| (key.clone(), value.clone()))
+		.collect()
 }
 
 async fn mesh_replica_receive(
@@ -907,32 +1307,54 @@ async fn mesh_replica_receive(
 	require_mesh_auth(&state, &headers, true)?;
 	let mut body = json_object(request).await?;
 	let digest = take_string(&mut body, "digest");
+	let object_key = take_string(&mut body, "object_key");
 	let source_url = take_string(&mut body, "source_url");
 	let source_node = take_string(&mut body, "source_node");
+	let source_epoch = body.remove("source_epoch").and_then(|value| value.as_u64());
+	let checkpoint_generation = body
+		.remove("checkpoint_generation")
+		.and_then(|value| value.as_u64());
 	let params = match body.remove("params") {
 		Some(Value::Object(params)) => params,
 		_ => JsonObject::new(),
 	};
 	let name = string_or(params.get("name"), String::new());
-	if digest.is_empty() || source_url.is_empty() || source_node.is_empty() || name.is_empty() {
+	if digest.is_empty()
+		|| object_key.is_empty()
+		|| source_url.is_empty()
+		|| source_node.is_empty()
+		|| source_epoch.is_none()
+		|| checkpoint_generation.is_none()
+		|| name.is_empty()
+	{
 		return Err(MeshRouteError::detail(
 			StatusCode::UNPROCESSABLE_ENTITY,
-			"digest, source_url, source_node, and params.name are required",
+			"digest, object_key, source_url, source_node, source_epoch, checkpoint_generation, and \
+			 params.name are required",
 		));
 	}
 	if state.engine.has_sandbox(&name) {
 		return Ok(Json(json!({"ok": true, "skipped": "owner"})));
 	}
 	if let Some(current) = map_mesh(state.replicas.get(&name))?
-		&& current.digest == digest
-	{
+		&& replica_metadata_matches(
+			&current,
+			&digest,
+			&object_key,
+			&source_node,
+			source_epoch.expect("validated source epoch"),
+			checkpoint_generation.expect("validated checkpoint generation"),
+			&params,
+		) {
 		return Ok(Json(json!({"ok": true, "skipped": "current"})));
 	}
 	let installed = state
 		.transfer
-		.pull_template(
+		.pull_snapshot(
 			state.transport.bulk_client(),
 			source_url,
+			name.clone(),
+			object_key.clone(),
 			digest.clone(),
 			state.outbound_token.to_string(),
 		)
@@ -947,12 +1369,68 @@ async fn mesh_replica_receive(
 	map_mesh(
 		state
 			.replicas
-			.put(name, digest, source_node, installed, params)
+			.put(
+				name,
+				object_key,
+				digest,
+				source_node,
+				source_epoch.expect("validated source epoch"),
+				checkpoint_generation.expect("validated checkpoint generation"),
+				installed,
+				params,
+			)
 			.await,
 	)?;
 	Ok(Json(json!({"ok": true})))
 }
 
+fn replica_metadata_matches(
+	current: &ReplicaRecordWire,
+	digest: &str,
+	object_key: &str,
+	source_node: &str,
+	source_epoch: u64,
+	checkpoint_generation: u64,
+	params: &JsonObject,
+) -> bool {
+	current.digest == digest
+		&& current.object_key == object_key
+		&& current.source_node == source_node
+		&& current.source_epoch == source_epoch
+		&& current.checkpoint_generation == checkpoint_generation
+		&& current.params == *params
+}
+#[derive(Deserialize)]
+struct ReplicaSnapshotQuery {
+	object_key: String,
+}
+
+async fn mesh_replica_snapshot(
+	State(state): State<MeshRouteState>,
+	Path((sid, digest)): Path<(String, String)>,
+	Query(query): Query<ReplicaSnapshotQuery>,
+	headers: HeaderMap,
+) -> RouteResult<Response> {
+	require_mesh_auth(&state, &headers, true)?;
+	let export = map_mesh(
+		state
+			.engine
+			.replica_export_path(&sid, &digest, &query.object_key),
+	)?;
+	let bundle = super::transfer::snapshot_bundle_for_path(export.path().to_path_buf(), &digest)
+		.map_err(|error| MeshRouteError::coded(StatusCode::CONFLICT, "fenced", error.to_string()))?;
+	let (tx, rx) = tokio::sync::mpsc::channel(16);
+	tokio::task::spawn_blocking(move || {
+		let _export = export;
+		super::transfer::stream_bundle(&bundle, tx);
+	});
+	Response::builder()
+		.header(header::CONTENT_TYPE, "application/octet-stream")
+		.body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+		.map_err(|error| {
+			MeshRouteError::coded(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", error.to_string())
+		})
+}
 async fn mesh_replica_list(
 	State(state): State<MeshRouteState>,
 	headers: HeaderMap,
@@ -978,7 +1456,10 @@ async fn mesh_record_put(
 	Ok(Json(json!({"ok": true})))
 }
 
-async fn mesh_record_remove(
+/// Remove only the candidate created by one exact owner/epoch/idempotency
+/// reservation. This is peer-authenticated because it is a compensating
+/// action for a coordinator that could not durably consume that reservation.
+async fn mesh_candidate_teardown(
 	State(state): State<MeshRouteState>,
 	request: Request<Body>,
 ) -> RouteResult<Json<Value>> {
@@ -987,13 +1468,43 @@ async fn mesh_record_remove(
 	let mut body = json_object(request).await?;
 	let sid = take_string(&mut body, "sid");
 	let owner = take_string(&mut body, "owner");
-	let epoch = to_i64(body.remove("epoch"))
-		.ok_or_else(|| MeshRouteError::invalid("record removal requires an epoch"))?;
-	if sid.is_empty() || owner.is_empty() {
-		return Err(MeshRouteError::invalid("record removal requires a sandbox id and owner"));
+	let idempotency_key = take_string(&mut body, "idempotency_key");
+	let epoch = to_i64(body.remove("epoch")).unwrap_or(-1);
+	if sid.is_empty() || owner != state.mesh.node_id() || idempotency_key.is_empty() || epoch < 0 {
+		return Err(MeshRouteError::invalid(
+			"sid, local owner, non-negative epoch, and idempotency_key are required",
+		));
 	}
-	map_mesh(state.records.remove(&sid, &owner, epoch))?;
-	state.mesh.forget_owner(&sid);
+	let candidate = state
+		.engine
+		.find_by_idempotency_key(&idempotency_key)
+		.map_err(MeshRouteError::from)?;
+	let exact_candidate = candidate.as_ref().is_some_and(|view| {
+		sid_from_view(view).as_deref() == Some(sid.as_str())
+			&& view
+				.get("detail")
+				.and_then(Value::as_object)
+				.and_then(|detail| detail.get("_mesh_create_epoch"))
+				.and_then(Value::as_i64)
+				== Some(epoch)
+	});
+	if !exact_candidate {
+		return Err(MeshRouteError::coded(
+			StatusCode::CONFLICT,
+			"conflict",
+			"candidate does not match the requested idempotency reservation",
+		));
+	}
+	state
+		.engine
+		.teardown_candidate(sid.clone(), epoch)
+		.await
+		.map_err(MeshRouteError::from)?;
+	state
+		.leases
+		.release_record_volume_leases(sid)
+		.await
+		.map_err(MeshRouteError::from)?;
 	Ok(Json(json!({"ok": true})))
 }
 
@@ -1181,15 +1692,7 @@ async fn idempotent_create(
 		.post(&peer_url, kind.coordinate_path(), &payload, Some(state.config.create_timeout))
 		.await
 	{
-		Ok(view) => {
-			let value = Value::Object(view);
-			if let Some(sid) = sid_from_view(&value)
-				&& scatter_locate(state, &sid).await?.is_none()
-			{
-				state.mesh.record_owner(&sid, &coordinator, 0);
-			}
-			Ok(value)
-		},
+		Ok(view) => Ok(Value::Object(view)),
 		Err(err) if err.code == "unreachable" => {
 			state.mesh.mark_unhealthy(&coordinator);
 			coordinate_create(state, kind, &idem_key, value_object(payload["params"].clone())?).await
@@ -1219,12 +1722,7 @@ async fn coordinate_create(
 		.await;
 	}
 	for _ in 0..std::cmp::max(1, state.mesh.peers().len() + 1) {
-		let pinned = state.mesh.idem_owner(idem_key);
-		let owner = match pinned {
-			Some(owner) => owner,
-			None => state.mesh.place(&params)?,
-		};
-		let owner = state.mesh.idem_pin(idem_key, &owner);
+		let owner = state.mesh.idem_pin(idem_key, &state.mesh.place(&params)?);
 		if owner == state.mesh.node_id() {
 			let view = worker_create(state, kind, idem_key, params.clone()).await?;
 			return commit_create_record(state, kind, view, owner, 0, idem_key.to_owned(), params)
@@ -1274,20 +1772,9 @@ async fn worker_create(
 		return Ok(existing);
 	}
 	if !state.mesh.worker_begin(idem_key) {
-		let deadline =
-			Instant::now() + std::cmp::min(Duration::from_secs(5), state.config.create_timeout);
-		while Instant::now() < deadline {
-			tokio::time::sleep(Duration::from_millis(50)).await;
-			if let Some(existing) = state.engine.find_by_idempotency_key(idem_key)? {
-				return Ok(existing);
-			}
-		}
 		return Err(MeshError::conflict("idempotent create already in progress"));
 	}
 	let result = async {
-		if let Some(existing) = state.engine.find_by_idempotency_key(idem_key)? {
-			return Ok(existing);
-		}
 		let name = string_or(params.get("name"), String::new());
 		if !name.is_empty()
 			&& (state.engine.has_sandbox(&name)
@@ -1296,10 +1783,31 @@ async fn worker_create(
 		{
 			return Err(MeshError::conflict(format!("sandbox {} already exists", py_repr(&name))));
 		}
-		let view = local_create_view(state, kind, params.clone()).await?;
+		let epoch = state
+			.records
+			.reserve_create_epoch(&name, &state.mesh.node_id(), idem_key)?;
+		let view = local_create_view(state, kind, params.clone(), epoch).await?;
 		if let Some(sid) = sid_from_view(&view) {
-			state.engine.record_idempotency(&sid, idem_key)?;
-			return Ok(view_with_ha(state.engine.get_view(&sid)?, &params));
+			if let Err(error) = state.engine.record_create_epoch(&sid, epoch) {
+				cleanup_uncommitted_create(state, sid, epoch).await;
+				return Err(error);
+			}
+			if let Err(error) = state.engine.record_idempotency(&sid, idem_key) {
+				cleanup_uncommitted_create(state, sid, epoch).await;
+				return Err(error);
+			}
+			let current = match state.engine.get_view(&sid) {
+				Ok(current) => current,
+				Err(error) => {
+					cleanup_uncommitted_create(state, sid, epoch).await;
+					return Err(error);
+				},
+			};
+			let mut view = view_with_ha(current, &params);
+			if let Some(object) = view.as_object_mut() {
+				object.insert("_mesh_create_epoch".to_owned(), Value::from(epoch));
+			}
+			return Ok(view);
 		}
 		Ok(view)
 	}
@@ -1312,6 +1820,7 @@ async fn local_create_view(
 	state: &MeshRouteState,
 	kind: CreateKind,
 	mut params: JsonObject,
+	epoch: i64,
 ) -> MeshResult<Value> {
 	match kind {
 		CreateKind::Sandbox => {
@@ -1360,7 +1869,7 @@ async fn local_create_view(
 			}
 			let lease_records = state
 				.leases
-				.acquire_writable_volume_leases(params.clone(), 0)
+				.acquire_writable_volume_leases(params.clone(), epoch)
 				.await?;
 			let record = match state.engine.create_sandbox(params).await {
 				Ok(view) => view,
@@ -1370,7 +1879,14 @@ async fn local_create_view(
 				},
 			};
 			if let Some(sid) = sid_from_view(&record) {
-				state.engine.record_volume_leases(&sid, lease_records)?;
+				if let Err(error) = state
+					.engine
+					.record_volume_leases(&sid, lease_records.clone())
+				{
+					let teardown = state.engine.teardown_candidate(sid, epoch).await;
+					let release = state.leases.release_leases(lease_records).await;
+					return Err(lease_persistence_error(error, teardown, release));
+				}
 				state.mesh.request_replication();
 			}
 			Ok(record)
@@ -1388,23 +1904,115 @@ async fn local_create_view(
 	}
 }
 
+/// A local candidate is never allowed to outlive a failed reservation consume
+/// or local idempotency publication. Teardown precedes releasing its persisted
+/// lease records so another owner cannot race a still-live guest.
+async fn cleanup_uncommitted_create(state: &MeshRouteState, sid: String, epoch: i64) {
+	let _ = state.engine.teardown_candidate(sid.clone(), epoch).await;
+	let _ = state.leases.release_record_volume_leases(sid).await;
+}
+
+fn matches_create_record(
+	record: Option<CreateRecordWire>,
+	sid: &str,
+	owner: &str,
+	epoch: i64,
+	idempotency_key: &str,
+) -> bool {
+	record.is_some_and(|record| {
+		record.sid == sid
+			&& record.owner == owner
+			&& record.epoch == epoch
+			&& record.idempotency_key == idempotency_key
+	})
+}
+
+async fn cleanup_failed_create_commit(
+	state: &MeshRouteState,
+	sid: String,
+	owner: String,
+	epoch: i64,
+	idempotency_key: String,
+) -> MeshResult<()> {
+	if owner != state.mesh.node_id() {
+		let peer_url = state.mesh.peer_url(&owner).ok_or_else(|| {
+			MeshError::unreachable("create owner is unreachable for candidate teardown")
+		})?;
+		state
+			.transport
+			.post(
+				&peer_url,
+				"/v1/mesh/candidate/teardown",
+				&json!({
+					"sid": sid,
+					"owner": owner,
+					"epoch": epoch,
+					"idempotency_key": idempotency_key,
+				}),
+				Some(state.config.create_timeout),
+			)
+			.await?;
+		return Ok(());
+	}
+
+	let candidate = state.engine.find_by_idempotency_key(&idempotency_key)?;
+	let exact_candidate = candidate.as_ref().is_some_and(|view| {
+		sid_from_view(view).as_deref() == Some(sid.as_str())
+			&& view
+				.get("detail")
+				.and_then(Value::as_object)
+				.and_then(|detail| detail.get("_mesh_create_epoch"))
+				.and_then(Value::as_i64)
+				== Some(epoch)
+	});
+	if !exact_candidate {
+		return Err(MeshError::conflict("candidate does not match failed create reservation"));
+	}
+	state.engine.teardown_candidate(sid.clone(), epoch).await?;
+	state.leases.release_record_volume_leases(sid).await
+}
+
 async fn commit_create_record(
 	state: &MeshRouteState,
 	kind: CreateKind,
-	view: Value,
+	mut view: Value,
 	owner: String,
 	epoch: i64,
 	idem_key: String,
 	params: JsonObject,
 ) -> MeshResult<Value> {
+	let reserved_epoch = view
+		.as_object_mut()
+		.and_then(|object| object.remove("_mesh_create_epoch"))
+		.and_then(|value| value.as_i64())
+		.unwrap_or(epoch);
 	let Some(sid) = sid_from_view(&view) else {
 		return Ok(view);
 	};
 	if !state.mesh.enabled() {
 		return Ok(view_with_ha(view, &params));
 	}
-	let record = make_create_record(sid, owner, epoch, idem_key, params, kind);
-	replicate_record(state, record.clone(), true).await?;
+	let record = make_create_record(
+		sid.clone(),
+		owner.clone(),
+		reserved_epoch,
+		idem_key.clone(),
+		params,
+		kind,
+	);
+	let record = match replicate_record(state, record, true).await {
+		Ok(record) => record,
+		Err(error) => {
+			let Ok(current) = state.records.get(&sid) else {
+				return Err(error);
+			};
+			if matches_create_record(current, &sid, &owner, reserved_epoch, &idem_key) {
+				return Err(error);
+			}
+			let _ = cleanup_failed_create_commit(state, sid, owner, reserved_epoch, idem_key).await;
+			return Err(error);
+		},
+	};
 	state.mesh.request_replication();
 	Ok(apply_view_detail(view, &record))
 }
@@ -1413,8 +2021,8 @@ async fn replicate_record(
 	state: &MeshRouteState,
 	record: CreateRecordWire,
 	require_quorum: bool,
-) -> MeshResult<()> {
-	state.records.put(record.clone())?;
+) -> MeshResult<CreateRecordWire> {
+	let record = state.records.put(record)?;
 	state
 		.mesh
 		.record_owner(&record.sid, &record.owner, record.epoch);
@@ -1452,7 +2060,7 @@ async fn replicate_record(
 			"record_unreplicated",
 		));
 	}
-	Ok(())
+	Ok(record)
 }
 
 /// Live ("teleport") migration: stream the bulk checkpoint while the source
@@ -1467,6 +2075,10 @@ pub(crate) async fn migrate_sandbox_to(
 	sandbox_id: String,
 	target: String,
 ) -> RouteResult<Value> {
+	// This permit spans both pre-copy and the blackout/journal terminal path.
+	// A second target therefore fails before it can pause, journal, or abort
+	// the first migration.
+	let _migration_guard = map_mesh(state.engine.try_begin_migration(&sandbox_id))?;
 	let started = Instant::now();
 	let peer = map_mesh(state.mesh.migration_target(&target))?;
 	let mut record = map_mesh(state.records.get(&sandbox_id))?
@@ -1506,25 +2118,110 @@ pub(crate) async fn migrate_sandbox_to(
 	// Phase 2 (suspend + delta): pause the source, capture what changed since
 	// the pre-copy, and stop it exactly at the delta. A finalize failure
 	// leaves the source running.
+	let source_owner = record.owner.clone();
+	let source_epoch = record.epoch;
+	let epoch =
+		map_mesh(state.mesh.authoritative_owner(&sandbox_id))?.map_or(0, |(_, epoch)| epoch) + 1;
+	let migration_id = uuid::Uuid::new_v4().simple().to_string();
+	let cleanup_context = MigrationCleanupWire {
+		sid: sandbox_id.clone(),
+		base_dir: precopy.snapshot_dir.clone(),
+		base_digest: precopy.digest.clone(),
+		delta_dir: String::new(),
+		delta_digest: String::new(),
+		target_url: peer.advertise.clone(),
+		migration_id: migration_id.clone(),
+		epoch,
+		schema_version: 1,
+		source_owner: source_owner.clone(),
+		source_epoch,
+		target_owner: target.clone(),
+		target_epoch: epoch,
+		token: migration_id.clone(),
+		phase: "prepared".to_owned(),
+	};
 	let fin = match state
 		.engine
-		.migrate_finalize(sandbox_id.clone(), precopy.snapshot_dir.clone())
+		.migrate_finalize(sandbox_id.clone(), precopy.snapshot_dir.clone(), cleanup_context)
 		.await
 	{
 		Ok(fin) => fin,
 		Err(err) => {
-			let _ = state
-				.engine
-				.checkpoint_discard(precopy.snapshot_dir.clone(), precopy.digest.clone())
-				.await;
+			// Finalization may have durably journaled the paused delta before a
+			// later teardown/status failure.  Retaining the pre-copy base is
+			// therefore the only safe response; startup recovery will either
+			// consume the journal or staging GC will reclaim both artifacts.
 			return Err(MeshRouteError::from(err));
 		},
 	};
-	let epoch =
-		map_mesh(state.mesh.authoritative_owner(&sandbox_id))?.map_or(0, |(_, epoch)| epoch) + 1;
+	let cleanup = fin.cleanup.clone().ok_or_else(|| {
+		MeshRouteError::invalid("migration finalizer did not persist recovery journal")
+	})?;
 	record.params.clone_from(&fin.params);
+	record
+		.params
+		.insert(MIGRATION_ID_FIELD.to_owned(), Value::String(migration_id.clone()));
+	record
+		.params
+		.insert(MIGRATION_BASE_DIGEST_FIELD.to_owned(), Value::String(precopy.digest.clone()));
+	record
+		.params
+		.insert(MIGRATION_DELTA_DIGEST_FIELD.to_owned(), Value::String(fin.digest.clone()));
+	record
+		.params
+		.insert(MIGRATION_SOURCE_URL_FIELD.to_owned(), Value::String(state.mesh.advertise()));
+	record
+		.params
+		.insert("_mesh_migration_token".to_owned(), Value::String(migration_id.clone()));
 	record.owner.clone_from(&target);
 	record.epoch = epoch;
+	if let Err(error) = state.records.begin_migration_handoff(
+		&sandbox_id,
+		&source_owner,
+		source_epoch,
+		&target,
+		&migration_id,
+	) {
+		// A begin error is ambiguous.  Only the exact abort CAS can prove this
+		// token remains unclaimed and install the fresh source epoch.
+		match state.records.abort_migration_handoff(
+			&sandbox_id,
+			&source_owner,
+			source_epoch,
+			&target,
+			&migration_id,
+		) {
+			Ok(Some(fresh)) => {
+				state
+					.engine
+					.migrate_abort(
+						sandbox_id.clone(),
+						precopy.digest.clone(),
+						fin.snapshot_dir.clone(),
+						fin.digest.clone(),
+						fin.params.clone(),
+					)
+					.await
+					.map_err(MeshRouteError::from)?;
+				state
+					.mesh
+					.record_owner(&sandbox_id, &fresh.owner, fresh.epoch);
+				map_mesh(state.engine.migration_cleanup_remove(cleanup.sid.clone()))?;
+				return Err(MeshRouteError::from(error));
+			},
+			Ok(None) => {
+				state.mesh.forget_owner(&sandbox_id);
+				return Err(MeshRouteError::from(error));
+			},
+			Err(abort) => {
+				state.mesh.forget_owner(&sandbox_id);
+				return Err(MeshRouteError::from(abort));
+			},
+		}
+	}
+	// Only a durable authorization marker makes the paused source
+	// non-serving; the target may now consume the exact token.
+	state.mesh.forget_owner(&sandbox_id);
 	let receive = json!({
 		"digest": fin.digest,
 		"base_digest": precopy.digest,
@@ -1532,6 +2229,9 @@ pub(crate) async fn migrate_sandbox_to(
 		"params": fin.params.clone(),
 		"record": record.to_value(),
 		"epoch": epoch,
+		"migration_id": migration_id.clone(),
+		"source_owner": source_owner,
+		"source_epoch": source_epoch,
 	});
 	let mut view = match state
 		.transport
@@ -1545,43 +2245,159 @@ pub(crate) async fn migrate_sandbox_to(
 	{
 		Ok(view) => Value::Object(view),
 		Err(err) => {
-			let _ = state
-				.engine
-				.migrate_abort(
-					sandbox_id.clone(),
-					precopy.digest.clone(),
-					fin.snapshot_dir.clone(),
-					fin.digest.clone(),
-					fin.params.clone(),
+			let status = state
+				.transport
+				.post(
+					&peer.advertise,
+					"/v1/mesh/migrate/status",
+					&json!({
+						"sid": sandbox_id.clone(),
+						"epoch": epoch,
+						"migration_id": migration_id.clone(),
+					}),
+					Some(state.config.create_timeout),
 				)
 				.await;
-			return Err(MeshRouteError::coded(
-				StatusCode::BAD_GATEWAY,
-				"unreachable",
-				format!("migration to {target} failed (source restored): {}", err.message),
-			));
+			match status {
+				Ok(mut status) if status.get("committed").and_then(Value::as_bool) == Some(true) => {
+					status
+						.remove("view")
+						.unwrap_or_else(|| Value::Object(JsonObject::new()))
+				},
+				Ok(status) if status.get("state").and_then(Value::as_str) == Some("absent") => {
+					// The target explicitly denies this token.  Persist the
+					// recovery phase before changing ownership, then let the
+					// exact CAS prove the target never consumed it.
+					let mut abort_cleanup = cleanup.clone();
+					"abort_pending".clone_into(&mut abort_cleanup.phase);
+					map_mesh(state.engine.migration_cleanup_persist(abort_cleanup))?;
+					let fresh = match state.records.abort_migration_handoff(
+						&sandbox_id,
+						&cleanup.source_owner,
+						cleanup.source_epoch,
+						&cleanup.target_owner,
+						&cleanup.migration_id,
+					) {
+						Ok(Some(fresh)) => fresh,
+						Ok(None) => {
+							return Err(MeshRouteError::coded(
+								StatusCode::BAD_GATEWAY,
+								"unreachable",
+								"target migration status changed while recovering source",
+							));
+						},
+						Err(error) => return Err(MeshRouteError::from(error)),
+					};
+					let mut restore_cleanup = cleanup.clone();
+					"restore_pending".clone_into(&mut restore_cleanup.phase);
+					map_mesh(state.engine.migration_cleanup_persist(restore_cleanup))?;
+					state
+						.engine
+						.migrate_abort(
+							sandbox_id.clone(),
+							precopy.digest.clone(),
+							fin.snapshot_dir.clone(),
+							fin.digest.clone(),
+							fin.params.clone(),
+						)
+						.await
+						.map_err(MeshRouteError::from)?;
+					state
+						.mesh
+						.record_owner(&sandbox_id, &fresh.owner, fresh.epoch);
+					map_mesh(state.engine.migration_cleanup_remove(cleanup.sid.clone()))?;
+					return Err(MeshRouteError::coded(
+						StatusCode::BAD_GATEWAY,
+						"unreachable",
+						format!(
+							"migration to {target} was rejected before target intent: {}",
+							err.message
+						),
+					));
+				},
+				Ok(_) => {
+					// The target durably accepted this exact token but had not
+					// acknowledged its restore. Retry the same receive (never a
+					// fresh migration) so a restarted target can adopt the intent.
+					let mut adopted = None;
+					for _ in 0..3 {
+						tokio::time::sleep(Duration::from_millis(100)).await;
+						if let Ok(view) = state
+							.transport
+							.post(
+								&peer.advertise,
+								"/v1/mesh/migrate/receive",
+								&receive,
+								Some(state.config.create_timeout),
+							)
+							.await
+						{
+							adopted = Some(view);
+							break;
+						}
+					}
+					let Some(view) = adopted else {
+						return Err(MeshRouteError::coded(
+							StatusCode::BAD_GATEWAY,
+							"ambiguous",
+							format!(
+								"migration to {target} has durable target intent but no confirmation yet: \
+								 {}",
+								err.message
+							),
+						));
+					};
+					Value::Object(view)
+				},
+				Err(status_err) => {
+					return Err(MeshRouteError::coded(
+						StatusCode::BAD_GATEWAY,
+						"ambiguous",
+						format!(
+							"migration to {target} receive response was ambiguous and target commit \
+							 could not be resolved: {}; status: {}",
+							err.message, status_err.message
+						),
+					));
+				},
+			}
 		},
 	};
 	let downtime_ms = blackout.elapsed().as_millis() as u64;
-	map_mesh(replicate_record(state, record, false).await)?;
-	map_mesh(
-		state
-			.leases
-			.release_record_volume_leases(sandbox_id.clone())
-			.await,
-	)?;
-	map_mesh(
-		state
-			.engine
-			.migrate_commit(
-				sandbox_id,
-				precopy.snapshot_dir,
-				precopy.digest,
-				fin.snapshot_dir,
-				fin.digest,
-			)
-			.await,
-	)?;
+	if let Err(err) = replicate_record(state, record, false).await {
+		tracing::warn!(error = %err, "target migration record replication deferred after commit");
+	}
+	// The pre-receive record is now a committed-cleanup record. Rewriting it is
+	// harmless and keeps retry metadata durable if a prior write was interrupted.
+	let leases_clean = state
+		.leases
+		.release_record_volume_leases(sandbox_id)
+		.await
+		.map_err(MeshRouteError::from);
+	let artifacts_clean = state
+		.engine
+		.migrate_cleanup_committed(
+			cleanup.sid.clone(),
+			cleanup.base_dir.clone(),
+			cleanup.base_digest.clone(),
+			cleanup.delta_dir.clone(),
+			cleanup.delta_digest.clone(),
+		)
+		.await;
+	if leases_clean.is_ok() && artifacts_clean.is_ok() {
+		if let Err(err) = state.engine.migration_cleanup_remove(cleanup.sid.clone()) {
+			tracing::warn!(sid = %cleanup.sid, error = %err, "retaining completed migration cleanup");
+		} else {
+			state.mesh.forget_owner(&cleanup.sid);
+		}
+	} else {
+		tracing::warn!(
+			sid = %cleanup.sid,
+			lease_error = ?leases_clean.err(),
+			artifact_error = ?artifacts_clean.err(),
+			"deferring committed migration cleanup"
+		);
+	}
 	if let Value::Object(map) = &mut view {
 		map.insert(
 			"migration".to_owned(),
@@ -1686,6 +2502,15 @@ fn prepare_create_params(
 	kind: CreateKind,
 ) -> MeshResult<JsonObject> {
 	params.remove("idempotency_key");
+	if params
+		.get("name")
+		.and_then(value_string)
+		.unwrap_or_default()
+		.is_empty()
+	{
+		params
+			.insert("name".to_owned(), Value::String(format!("sb-{}", uuid::Uuid::new_v4().simple())));
+	}
 	if state.mesh.enabled() && py_truthy(params.get("fs_dir")) {
 		return Err(MeshError::invalid(
 			"host-local fs_dir cannot be placed or protected; use a volume",
@@ -1949,4 +2774,59 @@ fn unix_now() -> f64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	fn current_replica() -> ReplicaRecordWire {
+		ReplicaRecordWire {
+			sid:                   "sandbox".to_owned(),
+			digest:                "digest-a".to_owned(),
+			object_key:            "object-a".to_owned(),
+			source_node:           "source-a".to_owned(),
+			source_epoch:          4,
+			checkpoint_generation: 7,
+			snapshot_dir:          "/snapshots/a".to_owned(),
+			params:                serde_json::Map::from_iter([("revision".to_owned(), json!(7))]),
+			needs_secrets:         false,
+		}
+	}
+
+	#[test]
+	fn replica_current_skip_requires_exact_metadata() {
+		let current = current_replica();
+		let params = current.params.clone();
+		assert!(replica_metadata_matches(
+			&current, "digest-a", "object-a", "source-a", 4, 7, &params,
+		));
+		assert!(!replica_metadata_matches(
+			&current, "digest-b", "object-a", "source-a", 4, 7, &params,
+		));
+		assert!(!replica_metadata_matches(
+			&current, "digest-a", "object-b", "source-a", 4, 7, &params,
+		));
+		assert!(!replica_metadata_matches(
+			&current, "digest-a", "object-a", "source-b", 4, 7, &params,
+		));
+		assert!(!replica_metadata_matches(
+			&current, "digest-a", "object-a", "source-a", 5, 7, &params,
+		));
+		assert!(!replica_metadata_matches(
+			&current, "digest-a", "object-a", "source-a", 4, 8, &params,
+		));
+		let changed_params = serde_json::Map::from_iter([("revision".to_owned(), json!(8))]);
+		assert!(!replica_metadata_matches(
+			&current,
+			"digest-a",
+			"object-a",
+			"source-a",
+			4,
+			7,
+			&changed_params,
+		));
+	}
 }

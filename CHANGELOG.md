@@ -42,9 +42,13 @@ All notable changes to this project are recorded here.
 - Added `sandbox.suspend()` for durable checkpointing while preserving identity
 - Added `sandbox.history()` to list retained sandbox recovery points
 - Added `sandbox.rollback()` for restoring to retained recovery points
+- Added generation-tracked desired/observed sandbox lifecycle state, transactional durable suspend/resume, and non-destructive rollback cutover
+- Added tiered `disk` and `checkpoint` recovery history with encrypted S3 publication, retention pins, and restart-safe garbage collection
+- Added PostgreSQL-fenced owner leases, convergent migration handoff, and expiry-triggered VMM self-fencing in production clusters
+- Added typed lifecycle, HA, and restart-policy fields to Python, TypeScript, and Go sandbox models
 - Added host-brokered credentials support for sandbox creation
 - Added `SnapshotAPI.delete()` for removing snapshots in TypeScript SDK
-- Added production cluster mode with `PostgreSQL` ownership and leases, S3-backed
+- Added production cluster mode with PostgreSQL ownership and lifecycle authority plus S3-backed portable recovery, replicas, and function artifacts
 - Added idempotent single-node install and uninstall scripts plus a self-contained
 - Added focused performance tests for create-to-first-exec latency and 32-clone
 - Added real-guest compatibility workloads for headless Chromium and rootful

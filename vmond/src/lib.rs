@@ -21,6 +21,7 @@ pub mod mesh;
 pub mod models;
 pub mod net;
 pub mod pools;
+pub mod portable_history;
 mod postgres;
 pub mod registry;
 pub mod s3;

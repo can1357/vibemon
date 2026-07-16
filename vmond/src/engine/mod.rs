@@ -12,17 +12,91 @@ pub(crate) mod diskdelta;
 mod facade;
 pub mod s3proxy;
 pub mod spawn;
+pub(crate) mod staging_gc;
 
 use std::collections::HashMap;
 
 pub use facade::Engine;
-use serde_json::Value;
+pub(crate) use facade::{LifecycleCaptureGuard, ReplicaExport};
+use futures_util::future::BoxFuture;
+use serde_json::{Map, Value};
 
 use crate::{
+	EngineError,
 	error::Result,
 	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
 	security::credentials::{Credential, CredentialMetadata},
 };
+/// Mesh-routing handoff for a portable restore. The staged epoch is
+/// deliberately non-serving until the VM is ready and `PostgreSQL` finalizes
+/// it.
+pub(crate) trait OwnershipHandoff: Send + Sync {
+	/// Return this runtime's current development-mode owner, if the sandbox is
+	/// mesh-managed. Production lifecycle code reads `PostgreSQL` directly.
+	fn current_owner(&self, _sid: &str) -> Result<Option<(String, i64)>> {
+		Ok(None)
+	}
+	fn begin_restore(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	fn commit_restore(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	fn abort_restore(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Acquire fresh quorum writable-volume votes for a staged portable
+	/// restore. Implementations remove archived lease metadata from `params`;
+	/// callers must persist only these returned epoch-fenced values.
+	fn acquire_restore_volume_leases<'a>(
+		&'a self,
+		sid: &'a str,
+		owner: &'a str,
+		epoch: i64,
+		params: &'a mut Map<String, Value>,
+	) -> BoxFuture<'a, Result<Vec<Value>>>;
+	fn persist_restore_volume_leases<'a>(
+		&'a self,
+		sid: &'a str,
+		leases: &'a [Value],
+	) -> BoxFuture<'a, Result<()>>;
+	fn release_restore_volume_leases(&self, leases: Vec<Value>) -> BoxFuture<'_, Result<()>>;
+	fn release_source_volume_leases<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<()>>;
+	/// Fence and durably mark the exact portable recovery point before the
+	/// source VM is torn down. While prepared the sandbox is non-serving.
+	fn prepare_suspend(
+		&self,
+		sid: &str,
+		owner: &str,
+		epoch: i64,
+		point: &str,
+		generation: u64,
+	) -> Result<()>;
+	/// Commit the previously prepared suspension only after the source's local
+	/// registry has durably become suspended.
+	fn commit_suspend(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Cancel an uncommitted suspend marker while the paused source is resumed.
+	fn abort_suspend(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Fence a rollback's immutable target and its portable safety point before
+	/// the existing candidate is destructively replaced.
+	fn prepare_rollback(
+		&self,
+		sid: &str,
+		owner: &str,
+		epoch: i64,
+		target: &str,
+		safety: &str,
+		operation_generation: u64,
+		checkpoint_generation: u64,
+	) -> Result<()>;
+	/// Atomically publish authoritative Running metadata and clear the exact
+	/// rollback marker only after the replacement is ready.
+	fn commit_rollback(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Clear only an uncommitted rollback marker after the original/safety
+	/// candidate has been restored.
+	fn abort_rollback(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Route the instance away and durably tombstone this exact owner before
+	/// its local VM can be destroyed.
+	fn begin_delete(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+	/// Delete authoritative ownership/idempotency/replica rows only after the
+	/// local candidate is confirmed gone. A failed commit leaves the tombstone
+	/// for mesh maintenance replay.
+	fn commit_delete(&self, sid: &str, owner: &str, epoch: i64) -> Result<()>;
+}
 
 /// A non-interactive or streaming exec request (shared by `POST /exec`, the
 /// exec WebSocket, and the shell gateway; §2.4 of the migration contract).
@@ -109,6 +183,13 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value>;
 	fn pause(&self, id: &str) -> Result<Value>;
 	fn resume(&self, id: &str) -> Result<Value>;
+	/// Atomically claim an expired durable suspended marker and install only its
+	/// non-serving local projection. Callers must invoke this solely after
+	/// owner routing proves the recorded owner unavailable, then call `resume`
+	/// to perform the ordinary fenced materialization.
+	fn adopt_suspended_marker(&self, _id: &str) -> Result<()> {
+		Err(EngineError::unsupported("durable suspended-marker adoption is unavailable"))
+	}
 	/// Durably checkpoint and stop a sandbox while preserving its identity.
 	fn suspend(&self, id: &str) -> Result<Value>;
 	/// Return retained rolling recovery points for one sandbox.

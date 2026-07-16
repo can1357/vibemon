@@ -63,25 +63,38 @@ pub struct CreateRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaRecord {
-	pub sid:           String,
-	pub digest:        String,
-	pub source_node:   String,
-	pub snapshot_dir:  PathBuf,
-	pub params:        Value,
-	pub needs_secrets: bool,
+	pub sid:                   String,
+	pub digest:                String,
+	pub object_key:            String,
+	pub source_node:           String,
+	pub source_epoch:          u64,
+	pub checkpoint_generation: u64,
+	pub snapshot_dir:          PathBuf,
+	pub params:                Value,
+	pub needs_secrets:         bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicatePreparation {
-	pub digest:       String,
-	pub snapshot_dir: PathBuf,
-	pub params:       Value,
+	pub digest:                String,
+	pub checkpoint_generation: u64,
+	pub snapshot_dir:          PathBuf,
+	pub params:                Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRecord {
 	pub name:   String,
 	pub detail: Map<String, Value>,
+}
+
+/// The exact locally adopted ownership generation of a running VM. Lease
+/// renewal is forbidden for a generation that this node has not adopted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalOwnerEpoch {
+	pub sid:   String,
+	pub owner: String,
+	pub epoch: u64,
 }
 
 pub trait MeshReconcileState: Send + Sync {
@@ -100,19 +113,83 @@ pub trait MeshReconcileState: Send + Sync {
 	fn quorum_needed(&self) -> usize;
 	fn drain_orphans(&self) -> Vec<(String, String)>;
 	fn requeue_orphan(&self, sid: &str, dead: &str);
-	fn next_epoch(&self, sid: &str) -> Result<u64>;
-	fn update_record_owner(
+	/// Durable suspension is non-serving by contract and must not be repaired
+	/// by the generic HA/orphan loop.
+	fn is_nonserving_lifecycle(&self, _sid: &str) -> Result<bool> {
+		Ok(false)
+	}
+	/// A durable local owner survived restart but has no local VM candidate.
+	/// This is proof of local loss, so recovery must not wait on a health
+	/// probe of this same process.
+	fn local_candidate_missing(&self, _sid: &str) -> Result<bool> {
+		Ok(false)
+	}
+	/// Claim the next epoch before a restore starts. This must atomically make
+	/// `owner` authoritative for the returned generation.
+	fn claim_restore_epoch(&self, sid: &str, owner: &str) -> Result<u64>;
+	/// Claim only the ownership lineage examined for this restore. The default
+	/// preserves in-memory test stores; durable stores must CAS owner+epoch.
+	fn claim_restore_epoch_observed(
 		&self,
 		sid: &str,
-		node_id: &str,
+		owner: &str,
+		_previous: &CreateRecord,
+		_pending: &Value,
+	) -> Result<u64> {
+		self.claim_restore_epoch(sid, owner)
+	}
+	/// Return true only while the exact claimed generation is authoritative.
+	fn owns_epoch(&self, sid: &str, owner: &str, epoch: u64) -> Result<bool>;
+	/// Finalize a restore only if its exact ownership generation still holds.
+	fn finalize_restore_epoch(&self, sid: &str, owner: &str, epoch: u64) -> Result<()>;
+	/// Renew the exact claimed generation while a candidate is being restored.
+	/// `false` means the PostgreSQL-clock lease has expired or was superseded.
+	/// Implementations without a durable lease retain the conservative exact
+	/// ownership check for compatibility.
+	fn renew_restore_epoch(&self, sid: &str, owner: &str, epoch: u64) -> Result<bool> {
+		self.owns_epoch(sid, owner, epoch)
+	}
+	/// Return a failed claim to its observed prior lineage only when this exact
+	/// candidate still owns it. A stale claimant must never undo a winner.
+	fn abort_restore_epoch(
+		&self,
+		_sid: &str,
+		_owner: &str,
+		_epoch: u64,
+		_previous_owner: &str,
+		_previous_epoch: u64,
+	) -> Result<()> {
+		Ok(())
+	}
+	/// Make the recovered runtime parameters durable under the exact unexpired
+	/// claim before routing may serve the candidate.
+	fn commit_restore_epoch(
+		&self,
+		sid: &str,
+		owner: &str,
 		epoch: u64,
-		require_quorum: bool,
-	) -> Result<()>;
+		_params: &Value,
+		_ha: &str,
+		_restart_policy: &str,
+	) -> Result<()> {
+		self.finalize_restore_epoch(sid, owner, epoch)
+	}
+	/// Resolve a potentially ambiguous restore commit without relying on the
+	/// response path. Durable implementations inspect the exact owner epoch.
+	fn restore_commit_applied(&self, _sid: &str, _owner: &str, _epoch: u64) -> Result<bool> {
+		Ok(false)
+	}
 	fn worker_begin(&self, key: &str) -> bool;
 	fn worker_end(&self, key: &str);
 	fn note_event(&self, event: &str);
 	fn replica_targets(&self, sid: &str, replicas: usize) -> Vec<String>;
 	fn fenced_local_ids(&self, owned_ids: &[String]) -> Result<Vec<String>>;
+	/// Return the exact ownership generations local routing adopted for these
+	/// running VMs. Missing entries must be fenced, never rebound implicitly.
+	fn local_owner_epochs(&self, owned_ids: &[String]) -> Result<Vec<LocalOwnerEpoch>>;
+	/// Renew only these exact locally adopted owner/epoch tuples; return VMs
+	/// that lost authority or could not be verified before their deadline.
+	fn renew_owner_leases(&self, local: &[LocalOwnerEpoch]) -> Result<Vec<String>>;
 	fn forget_local_owner(&self, sid: &str);
 }
 
@@ -122,18 +199,33 @@ pub trait ReconcileEngine: Send + Sync {
 	fn remove(&self, sid: &str) -> Result<()>;
 	fn replicate_prepare<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<ReplicatePreparation>>;
 	fn replicate_cleanup(&self, digest: &str, snapshot_dir: &Path) -> Result<()>;
-	fn restore_from_template(
-		&self,
-		params: &Value,
-		snapshot_dir: &Path,
+	fn restore_from_template<'a>(
+		&'a self,
+		params: &'a Value,
+		snapshot_dir: &'a Path,
 		quorum_ok: bool,
-	) -> Result<SandboxRecord>;
+	) -> BoxFuture<'a, Result<SandboxRecord>>;
+	/// Activate an exact paused restore candidate only after its ownership
+	/// record is durably committed. Implementations must be idempotent so a
+	/// reconciler retry can finish an interrupted post-commit activation.
+	fn activate_candidate<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<()>>;
 	fn record_volume_leases(&self, sid: &str, leases: &[LeaseRecord]) -> Result<()>;
 	fn record_idempotency(&self, sid: &str, key: &str) -> Result<()>;
 	fn set_ha_metadata(&self, sid: &str, ha: &str, restart_policy: &str) -> Result<()>;
 	fn create_from_record(&self, params: &Value) -> Result<SandboxRecord>;
 	fn run_from_record(&self, params: &Value) -> Result<Value>;
 	fn restore_from_record(&self, params: &Value) -> Result<Value>;
+	/// Install a launch/readiness cancellation signal for an uncommitted
+	/// restore. Implementations may use a no-op when no cancellable runtime is
+	/// available.
+	fn begin_restore_cancellation(&self, _sid: &str) {}
+	fn cancel_restore(&self, _sid: &str) {}
+	fn end_restore_cancellation(&self, _sid: &str) {}
+	/// Report only a live, locally managed restore candidate. Registry
+	/// presence alone is insufficient and implementations must fail closed.
+	fn candidate_is_running(&self, _sid: &str) -> bool {
+		false
+	}
 }
 
 pub trait CreateRecordStore: Send + Sync {
@@ -145,7 +237,17 @@ pub trait ReplicaStore: Send + Sync {
 	fn get<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<Option<ReplicaRecord>>>;
 	fn holds(&self, sid: &str) -> Result<bool>;
 	fn secrets_ready(&self, sid: &str) -> Result<bool>;
-	fn drop_replica(&self, sid: &str) -> Result<()>;
+	fn drop_replica(&self, record: &ReplicaRecord) -> Result<()>;
+	/// Derive and bind the durable shared-object identity to the active export.
+	/// Non-production local replicas deliberately bind an empty identity.
+	fn publication_key(&self, _sid: &str, _prep: &ReplicatePreparation) -> Result<String> {
+		Ok(String::new())
+	}
+	/// Pin the local materialized cache root while this replica is consumed.
+	/// Implementations without a local cache may return no guard.
+	fn acquire_cache_root(&self, _record: &ReplicaRecord) -> Option<Box<dyn Send>> {
+		None
+	}
 }
 
 pub trait LeaseManager: Send + Sync {
@@ -176,6 +278,90 @@ pub struct Reconciler<'a> {
 	pub leases:           &'a dyn LeaseManager,
 	pub client:           &'a Client,
 	pub checkpoint_times: Mutex<HashMap<String, f64>>,
+}
+
+/// A restore claim stays non-serving until its candidate, writable-volume
+/// leases, durable record, and local routing have all crossed the commit
+/// boundary. Every failure after `claim_restore_epoch` must consume this
+/// guard, rather than leaking a live candidate or detaching side effects.
+struct ClaimGuard<'r, 'a> {
+	reconciler:     &'r Reconciler<'a>,
+	sid:            String,
+	owner:          String,
+	epoch:          u64,
+	previous_owner: String,
+	previous_epoch: u64,
+	lease_records:  Vec<LeaseRecord>,
+	restored:       Option<SandboxRecord>,
+	committed:      bool,
+}
+
+impl<'r, 'a> ClaimGuard<'r, 'a> {
+	fn new(
+		reconciler: &'r Reconciler<'a>,
+		sid: &str,
+		owner: &str,
+		epoch: u64,
+		previous: &CreateRecord,
+	) -> Self {
+		reconciler.engine.begin_restore_cancellation(sid);
+		Self {
+			reconciler,
+			sid: sid.to_owned(),
+			owner: owner.to_owned(),
+			epoch,
+			previous_owner: previous.owner.clone(),
+			previous_epoch: previous.epoch,
+			lease_records: Vec::new(),
+			restored: None,
+			committed: false,
+		}
+	}
+
+	/// Tear down before releasing the exact claim. If teardown cannot be
+	/// confirmed, retain the claim and fence local routing: another claimant
+	/// must not race a possibly-running candidate.
+	async fn abort(&self) {
+		if self.committed {
+			return;
+		}
+		self.reconciler.engine.cancel_restore(&self.sid);
+		self.reconciler.mesh.forget_local_owner(&self.sid);
+		let record = self
+			.restored
+			.clone()
+			.or_else(|| self.reconciler.engine.get(&self.sid).ok());
+		let torn_down = match record {
+			Some(record) => {
+				if self.reconciler.engine.remove(&record.name).is_err() {
+					false
+				} else {
+					let _ = self
+						.reconciler
+						.leases
+						.release_record_volume_leases(&record)
+						.await;
+					true
+				}
+			},
+			None => true,
+		};
+		let _ = self
+			.reconciler
+			.leases
+			.release_leases(&self.lease_records)
+			.await;
+		if torn_down {
+			let _ = self.reconciler.mesh.abort_restore_epoch(
+				&self.sid,
+				&self.owner,
+				self.epoch,
+				&self.previous_owner,
+				self.previous_epoch,
+			);
+		}
+		self.reconciler.engine.end_restore_cancellation(&self.sid);
+	}
 }
 
 impl<'a> Reconciler<'a> {
@@ -216,6 +402,32 @@ impl<'a> Reconciler<'a> {
 		Ok(())
 	}
 
+	/// Clears cadence bookkeeping for deterministic module tests without
+	/// altering production scheduling or checkpoint state.
+	#[cfg(test)]
+	pub(crate) fn reset_replication_cadence_for_test(&self, sid: &str) {
+		self.checkpoint_times.lock().remove(sid);
+	}
+
+	/// Renew and fence owner leases without waiting for migration, orphan, or
+	/// replication work. Runtime should schedule this independently at a cadence
+	/// shorter than the owner lease TTL.
+	pub async fn renew_owner_leases_once(&self) -> Result<()> {
+		if !self.mesh.enabled() {
+			return Ok(());
+		}
+		let owned_ids = self.engine.owned_ids()?;
+		let local = self.mesh.local_owner_epochs(&owned_ids)?;
+		let mut fence = self.mesh.fenced_local_ids(&owned_ids)?;
+		fence.extend(self.mesh.renew_owner_leases(&local)?);
+		fence.sort();
+		fence.dedup();
+		for sid in fence {
+			self.fence_local(&sid).await;
+		}
+		Ok(())
+	}
+
 	/// One HA reconciliation cadence: renew leases, reconcile durable records,
 	/// drain orphan queue, then fence local VMs superseded by higher-epoch
 	/// owners.
@@ -233,7 +445,19 @@ impl<'a> Reconciler<'a> {
 			self.reconcile_orphan(&sid, &dead).await;
 		}
 		let owned_ids = self.engine.owned_ids()?;
-		for sid in self.mesh.fenced_local_ids(&owned_ids)? {
+		let local = self.mesh.local_owner_epochs(&owned_ids)?;
+		let mut fence = self.mesh.fenced_local_ids(&owned_ids)?;
+		match self.mesh.renew_owner_leases(&local) {
+			Ok(expired_or_fenced) => fence.extend(expired_or_fenced),
+			Err(err) => {
+				error!("failed to renew owner leases: {err}");
+				// Runtime tracks each locally held deadline and must return
+				// every expired/unverifiable VM on the next successful check.
+			},
+		}
+		fence.sort();
+		fence.dedup();
+		for sid in fence {
 			self.fence_local(&sid).await;
 		}
 		Ok(())
@@ -243,8 +467,18 @@ impl<'a> Reconciler<'a> {
 		let mut digest = String::new();
 		let mut snapshot_dir = PathBuf::new();
 		let result: Result<()> = async {
-			let ha = self.ha_for_sid(sid)?;
-			if ha == "off" {
+			let Some(owner_record) = self.records.get(sid)? else {
+				return Err(EngineError::not_found(format!(
+					"cannot replicate {sid} without an authoritative ownership record"
+				)));
+			};
+			if owner_record.owner != self.mesh.node_id() {
+				return Err(EngineError::invalid(format!(
+					"cannot replicate {sid}: owner {} is not this node",
+					owner_record.owner
+				)));
+			}
+			if owner_record.ha == "off" {
 				last.remove(sid);
 				self.checkpoint_times.lock().remove(sid);
 				return Ok(());
@@ -266,25 +500,35 @@ impl<'a> Reconciler<'a> {
 					return Ok(());
 				},
 			};
+			// A matching content digest does not identify the checkpoint
+			// lifecycle. Its generation and launch parameters may have changed,
+			// and peers must durably observe that newer metadata even when their
+			// immutable object upload is a no-op.
+			let object_key = self.replicas.publication_key(sid, &prep)?;
 			digest.clone_from(&prep.digest);
 			snapshot_dir.clone_from(&prep.snapshot_dir);
-			if Some(&prep.digest) == last.get(sid) {
-				return Ok(());
-			}
 			let targets = self.mesh.replica_targets(sid, self.config.replicas);
 			info!("replicate {sid} digest={} targets={targets:?}", digest_prefix(&prep.digest));
 			if targets.is_empty() {
 				return Ok(());
 			}
-			let any_success = self.push_replica_to_targets(targets, &prep).await;
-			if any_success.any {
+			let summary = self
+				.push_replica_to_targets(
+					targets,
+					&prep,
+					&object_key,
+					&owner_record.owner,
+					owner_record.epoch,
+				)
+				.await;
+			if summary.any {
 				self.mesh.note_event("replication");
 				self
 					.checkpoint_times
 					.lock()
 					.insert(sid.to_owned(), unix_time());
 			}
-			if any_success.all {
+			if summary.all {
 				last.insert(sid.to_owned(), prep.digest);
 			}
 			Ok(())
@@ -305,6 +549,9 @@ impl<'a> Reconciler<'a> {
 		&self,
 		targets: Vec<String>,
 		prep: &ReplicatePreparation,
+		object_key: &str,
+		source_node: &str,
+		source_epoch: u64,
 	) -> PushSummary {
 		let concurrency = self.config.replicate_concurrency.max(1);
 		let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
@@ -315,7 +562,11 @@ impl<'a> Reconciler<'a> {
 				self.mesh,
 				semaphore.clone(),
 				peer_id,
+				object_key.to_owned(),
 				prep.digest.clone(),
+				prep.checkpoint_generation,
+				source_node.to_owned(),
+				source_epoch,
 				prep.params.clone(),
 				self.config.outbound_token.clone(),
 			));
@@ -347,39 +598,29 @@ impl<'a> Reconciler<'a> {
 		}
 	}
 
-	fn ha_for_sid(&self, sid: &str) -> Result<String> {
-		if let Some(record) = self.records.get(sid)? {
-			return Ok(record.ha);
-		}
-		Ok(self
-			.engine
-			.get(sid)
-			.ok()
-			.and_then(|record| {
-				record
-					.detail
-					.get("ha")
-					.and_then(Value::as_str)
-					.map(str::to_owned)
-			})
-			.unwrap_or_else(|| "async".to_owned()))
-	}
-
 	async fn reconcile_orphan(&self, sid: &str, dead: &str) {
 		let result = async {
-			if let Some(owner) = self.mesh.owner_of(sid)?
+			let restore_pending = self.records.get(sid)?.is_some_and(|record| {
+				record
+					.params
+					.as_object()
+					.is_some_and(|params| params.contains_key("_mesh_restore_pending"))
+			});
+			let local_candidate_missing = self.mesh.local_candidate_missing(sid)?;
+			if !restore_pending
+				&& !local_candidate_missing
+				&& let Some(owner) = self.mesh.owner_of(sid)?
 				&& owner != dead
 				&& (owner == self.mesh.node_id() || self.mesh.is_peer_healthy(&owner))
 			{
 				return Ok(false);
 			}
-			if self.mesh.is_peer_healthy(dead) {
+			if !restore_pending && !local_candidate_missing && self.mesh.is_peer_healthy(dead) {
 				warn!("deferring restore of {sid}: prior owner {dead} is still reachable");
 				return Ok(true);
 			}
-			let exclude = HashSet::from([dead.to_owned()]);
-			if self.mesh.restore_owner(sid, &exclude).as_deref() != Some(self.mesh.node_id()) {
-				return Ok(true);
+			if self.mesh.is_nonserving_lifecycle(sid)? {
+				return Ok(false);
 			}
 			let create_record = self.records.get(sid)?;
 			let ha = create_record
@@ -389,10 +630,35 @@ impl<'a> Reconciler<'a> {
 			if ha == "off" {
 				return Ok(false);
 			}
+			let allow_checkpoint = matches!(ha, "async" | "async+rerun");
+			let replica = if allow_checkpoint {
+				self.replicas.get(sid).await?
+			} else {
+				None
+			};
+			let replica_held = replica.is_some();
+			let replica_needs_secrets = replica.as_ref().is_some_and(|record| record.needs_secrets);
+			let replica_secrets_ready =
+				replica_held && (!replica_needs_secrets || self.replicas.secrets_ready(sid)?);
+			if replica_needs_secrets && !replica_secrets_ready {
+				warn!("cannot auto-restore {sid}: replica secrets unavailable on this node");
+				return Ok(true);
+			}
+			if !replica_needs_secrets {
+				let exclude = if local_candidate_missing {
+					HashSet::new()
+				} else {
+					HashSet::from([dead.to_owned()])
+				};
+				if self.mesh.restore_owner(sid, &exclude).as_deref() != Some(self.mesh.node_id()) {
+					return Ok(true);
+				}
+			}
 			let restore_quorum = self
 				.config
 				.restore_quorum_enabled(self.mesh.expected_members());
-			if restore_quorum && !self.restore_quorum_confirmed(dead).await {
+			if restore_quorum && !local_candidate_missing && !self.restore_quorum_confirmed(dead).await
+			{
 				warn!(
 					"deferring restore of {sid}: quorum not met ({}/{})",
 					self.last_quorum_confirmations(dead).await,
@@ -400,25 +666,16 @@ impl<'a> Reconciler<'a> {
 				);
 				return Ok(true);
 			}
-			if self.engine.get(sid).is_ok() {
-				return Ok(false);
-			}
-			let allow_checkpoint = matches!(ha, "async" | "async+rerun");
-			let replica_held = self.replicas.holds(sid)?;
-			let replica_ready =
-				allow_checkpoint && replica_held && self.replicas.secrets_ready(sid)?;
-			if replica_ready {
+			if replica_secrets_ready {
 				return self
 					.restore_from_replica(sid, dead, create_record.as_ref(), restore_quorum)
 					.await;
 			}
-			if can_rerun && self.rerun_from_record(sid, dead)? {
+			if can_rerun && self.rerun_from_record(sid, dead).await? {
 				return Ok(false);
 			}
 			if !replica_held {
 				warn!("cannot auto-restore {sid}: no local replica (will retry)");
-			} else if !self.replicas.secrets_ready(sid)? {
-				warn!("cannot auto-restore {sid}: replica secrets unavailable after restart");
 			}
 			Ok(true)
 		}
@@ -488,34 +745,171 @@ impl<'a> Reconciler<'a> {
 				.get(sid)
 				.await?
 				.ok_or_else(|| EngineError::not_found("no local replica"))?;
-			let epoch = self.mesh.next_epoch(sid)?;
-			let lease_records = self
-				.leases
-				.acquire_writable_volume_leases(&rec.params, epoch)
-				.await?;
-			let restored =
-				match self
-					.engine
-					.restore_from_template(&rec.params, &rec.snapshot_dir, restore_quorum)
-				{
-					Ok(restored) => restored,
-					Err(err) => {
-						let _ = self.leases.release_leases(&lease_records).await;
-						return Err(err);
+			let _cache_root = self.replicas.acquire_cache_root(&rec);
+			let Some(lineage) = create_record else {
+				self.replicas.drop_replica(&rec)?;
+				return Err(EngineError::invalid(format!(
+					"restore of {sid} has no authoritative ownership lineage"
+				)));
+			};
+			let pending = replica_restore_pending(&rec, lineage);
+			let valid_lineage = if lineage
+				.params
+				.as_object()
+				.is_some_and(|params| params.contains_key("_mesh_restore_pending"))
+			{
+				replica_matches_restore_pending(&rec, &pending)
+			} else {
+				replica_lineage_matches(&rec, lineage)
+			};
+			if !valid_lineage {
+				self.replicas.drop_replica(&rec)?;
+				return Err(EngineError::invalid(format!(
+					"restore of {sid} rejected replica inconsistent with its durable restore intent"
+				)));
+			}
+			let owner = self.mesh.node_id();
+			let epoch = self
+				.mesh
+				.claim_restore_epoch_observed(sid, owner, lineage, &pending)?;
+			let mut claim = ClaimGuard::new(self, sid, owner, epoch, lineage);
+			// A response-path failure after the durable commit can leave the
+			// exact candidate alive under this still-pending claim. Never
+			// launch a second VM with the same name: re-validate the observed
+			// claim and retry the idempotent CAS against that live candidate.
+			if self.engine.candidate_is_running(sid) {
+				let restored = match self.engine.get(sid) {
+					Ok(restored) if restored.name == sid => restored,
+					Ok(_) | Err(_) => {
+						claim.abort().await;
+						return Err(EngineError::busy(format!(
+							"restore of {sid} has an unverifiable retained candidate"
+						)));
 					},
 				};
-			if let Some(record) = create_record {
+				claim.restored = Some(restored.clone());
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					claim.abort().await;
+					return Err(EngineError::busy(format!(
+						"restore of {sid} lost ownership epoch {epoch} before retained commit"
+					)));
+				}
+				if let Err(error) =
+					self
+						.engine
+						.set_ha_metadata(&restored.name, &lineage.ha, &lineage.restart_policy)
+				{
+					claim.abort().await;
+					return Err(error);
+				}
+				if let Err(error) = self.mesh.commit_restore_epoch(
+					sid,
+					owner,
+					epoch,
+					&rec.params,
+					&lineage.ha,
+					&lineage.restart_policy,
+				) && !self.mesh.restore_commit_applied(sid, owner, epoch)?
+				{
+					claim.committed = true;
+					self.engine.end_restore_cancellation(sid);
+					return Err(error);
+				}
+				claim.committed = true;
+				self.engine.end_restore_cancellation(sid);
+				self.engine.activate_candidate(sid).await?;
+				if let Err(error) = self.replicas.drop_replica(&rec) {
+					warn!(sid, %error, "restored replica remains cached after retained commit");
+				}
+				self.mesh.note_event("restore");
+				return Ok(false);
+			}
+			let attempt = async {
+				claim.lease_records = self
+					.leases
+					.acquire_writable_volume_leases(&rec.params, epoch)
+					.await?;
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					return Err(EngineError::busy(format!(
+						"restore of {sid} lost ownership epoch {epoch} before launch"
+					)));
+				}
+				let launch =
+					self
+						.engine
+						.restore_from_template(&rec.params, &rec.snapshot_dir, restore_quorum);
+				tokio::pin!(launch);
+				let mut renewal = tokio::time::interval(Duration::from_millis(250));
+				renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				let mut lease_lost = false;
+				let restored = loop {
+					tokio::select! {
+						result = &mut launch => break result?,
+						_ = renewal.tick(), if !lease_lost => {
+							if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+								lease_lost = true;
+								self.engine.cancel_restore(sid);
+							}
+						},
+					}
+				};
+				if lease_lost {
+					return Err(EngineError::busy(format!(
+						"restore of {sid} lost ownership epoch {epoch} during launch"
+					)));
+				}
+				claim.restored = Some(restored.clone());
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					return Err(EngineError::busy(format!(
+						"restore of {sid} lost ownership epoch {epoch} after launch"
+					)));
+				}
 				self
 					.engine
-					.set_ha_metadata(&restored.name, &record.ha, &record.restart_policy)?;
+					.set_ha_metadata(&restored.name, &lineage.ha, &lineage.restart_policy)?;
+				self
+					.engine
+					.record_volume_leases(&restored.name, &claim.lease_records)?;
+				// A commit error may be a response-path failure after PostgreSQL
+				// applied the exact CAS. Retry the idempotent operation once;
+				// if its outcome remains ambiguous, retain the fenced candidate
+				// rather than tearing down a potentially serving VM.
+				if let Err(first_error) = self.mesh.commit_restore_epoch(
+					sid,
+					owner,
+					epoch,
+					&rec.params,
+					&lineage.ha,
+					&lineage.restart_policy,
+				) && self
+					.mesh
+					.commit_restore_epoch(
+						sid,
+						owner,
+						epoch,
+						&rec.params,
+						&lineage.ha,
+						&lineage.restart_policy,
+					)
+					.is_err() && !self.mesh.restore_commit_applied(sid, owner, epoch)?
+				{
+					claim.committed = true;
+					self.engine.end_restore_cancellation(sid);
+					return Err(first_error);
+				}
+				claim.committed = true;
+				self.engine.end_restore_cancellation(sid);
+				self.engine.activate_candidate(sid).await?;
+				Ok::<_, EngineError>(())
 			}
-			self
-				.engine
-				.record_volume_leases(&restored.name, &lease_records)?;
-			self
-				.mesh
-				.update_record_owner(sid, self.mesh.node_id(), epoch, false)?;
-			self.replicas.drop_replica(sid)?;
+			.await;
+			if let Err(error) = attempt {
+				claim.abort().await;
+				return Err(error);
+			}
+			if let Err(error) = self.replicas.drop_replica(&rec) {
+				warn!(sid, %error, "restored replica remains cached after serving commit");
+			}
 			self.mesh.note_event("restore");
 			info!("restored orphaned sandbox {sid} from replica after {dead} died");
 			Ok(false)
@@ -525,7 +919,24 @@ impl<'a> Reconciler<'a> {
 		result
 	}
 
-	fn rerun_from_record(&self, sid: &str, dead: &str) -> Result<bool> {
+	#[cfg(test)]
+	/// Shared best-effort cleanup used by focused failure tests and callers
+	/// that have not yet obtained an exact [`ClaimGuard`].
+	async fn cleanup_failed_restore(
+		&self,
+		sid: &str,
+		restored: Option<&SandboxRecord>,
+		lease_records: &[LeaseRecord],
+	) {
+		let record = restored.cloned().or_else(|| self.engine.get(sid).ok());
+		if let Some(record) = record {
+			let _ = self.engine.remove(&record.name);
+			let _ = self.leases.release_record_volume_leases(&record).await;
+		}
+		let _ = self.leases.release_leases(lease_records).await;
+	}
+
+	async fn rerun_from_record(&self, sid: &str, dead: &str) -> Result<bool> {
 		let Some(record) = self.records.get(sid)? else {
 			return Ok(false);
 		};
@@ -536,38 +947,78 @@ impl<'a> Reconciler<'a> {
 		if !self.mesh.worker_begin(&key) {
 			return Ok(true);
 		}
-		let result = (|| {
-			let epoch = self.mesh.next_epoch(sid)?;
-			let mut params = params_object(record.params.clone())?;
-			let kind = params
-				.remove("_kind")
-				.and_then(|value| value.as_str().map(str::to_owned))
-				.unwrap_or_else(|| "sandbox".to_owned());
-			params.insert("name".to_owned(), Value::String(sid.to_owned()));
-			params.insert("ha".to_owned(), Value::String(record.ha.clone()));
-			params.insert("restart_policy".to_owned(), Value::String(record.restart_policy.clone()));
-			if kind == "run" || kind == "restore" {
-				params.insert("detach".to_owned(), Value::Bool(true));
+		let result = async {
+			let pending = rerun_restore_pending(&record);
+			if pending.get("kind").and_then(Value::as_str) != Some("rerun") {
+				return Err(EngineError::invalid(format!(
+					"rerun of {sid} found an incompatible durable restore intent"
+				)));
 			}
-			let params = Value::Object(params);
-			let created_sid = match kind.as_str() {
-				"run" => created_name_from_value(&self.engine.run_from_record(&params)?, sid),
-				"restore" => created_name_from_value(&self.engine.restore_from_record(&params)?, sid),
-				_ => self.engine.create_from_record(&params)?.name,
-			};
-			self
-				.engine
-				.set_ha_metadata(&created_sid, &record.ha, &record.restart_policy)?;
-			self
-				.engine
-				.record_idempotency(&created_sid, &record.idempotency_key)?;
-			self
+			let owner = self.mesh.node_id();
+			let epoch = self
 				.mesh
-				.update_record_owner(&created_sid, self.mesh.node_id(), epoch, false)?;
+				.claim_restore_epoch_observed(sid, owner, &record, &pending)?;
+			let mut claim = ClaimGuard::new(self, sid, owner, epoch, &record);
+			let attempt = async {
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					return Err(EngineError::busy(format!(
+						"rerun of {sid} lost ownership epoch {epoch} before launch"
+					)));
+				}
+				let mut params = params_object(record.params.clone())?;
+				let kind = params
+					.remove("_kind")
+					.and_then(|value| value.as_str().map(str::to_owned))
+					.unwrap_or_else(|| "sandbox".to_owned());
+				params.insert("name".to_owned(), Value::String(sid.to_owned()));
+				params.insert("ha".to_owned(), Value::String(record.ha.clone()));
+				params
+					.insert("restart_policy".to_owned(), Value::String(record.restart_policy.clone()));
+				if kind == "run" || kind == "restore" {
+					params.insert("detach".to_owned(), Value::Bool(true));
+				}
+				let params = Value::Object(params);
+				let created_sid = match kind.as_str() {
+					"run" => created_name_from_value(&self.engine.run_from_record(&params)?, sid),
+					"restore" => {
+						created_name_from_value(&self.engine.restore_from_record(&params)?, sid)
+					},
+					_ => self.engine.create_from_record(&params)?.name,
+				};
+				claim.restored = self.engine.get(&created_sid).ok();
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					return Err(EngineError::busy(format!(
+						"rerun of {sid} lost ownership epoch {epoch} after launch"
+					)));
+				}
+				self
+					.engine
+					.set_ha_metadata(&created_sid, &record.ha, &record.restart_policy)?;
+				self
+					.engine
+					.record_idempotency(&created_sid, &record.idempotency_key)?;
+				self.mesh.commit_restore_epoch(
+					sid,
+					owner,
+					epoch,
+					&record.params,
+					&record.ha,
+					&record.restart_policy,
+				)?;
+				claim.committed = true;
+				self.engine.end_restore_cancellation(sid);
+				Ok::<_, EngineError>(true)
+			}
+			.await;
+			if let Err(error) = attempt {
+				claim.abort().await;
+				return Err(error);
+			}
 			self.mesh.note_event("restore");
 			info!("re-ran orphaned sandbox {sid} from create record after {dead} died");
 			Ok(true)
-		})();
+		}
+		.await;
 		self.mesh.worker_end(&key);
 		result
 	}
@@ -622,7 +1073,11 @@ async fn push_replica(
 	mesh: &dyn MeshReconcileState,
 	semaphore: std::sync::Arc<Semaphore>,
 	peer_id: String,
+	object_key: String,
 	digest: String,
+	checkpoint_generation: u64,
+	source_node: String,
+	source_epoch: u64,
 	params: Value,
 	outbound_token: String,
 ) -> bool {
@@ -634,9 +1089,12 @@ async fn push_replica(
 	};
 	let target = format!("{}/v1/mesh/replica/receive", url.trim_end_matches('/'));
 	let body = json!({
+		"object_key": object_key,
 		"digest": digest,
 		"source_url": mesh.advertise(),
-		"source_node": mesh.node_id(),
+		"source_node": source_node,
+		"source_epoch": source_epoch,
+		"checkpoint_generation": checkpoint_generation,
 		"params": params,
 	});
 	let result = client
@@ -654,6 +1112,43 @@ async fn push_replica(
 	} else {
 		true
 	}
+}
+
+fn replica_lineage_matches(replica: &ReplicaRecord, owner: &CreateRecord) -> bool {
+	replica.source_node == owner.owner && replica.source_epoch == owner.epoch
+}
+
+fn replica_restore_pending(replica: &ReplicaRecord, owner: &CreateRecord) -> Value {
+	let mut pending = Map::new();
+	pending.insert("kind".to_owned(), Value::String("replica".to_owned()));
+	pending.insert("source_owner".to_owned(), Value::String(replica.source_node.clone()));
+	pending.insert("source_epoch".to_owned(), Value::from(replica.source_epoch));
+	pending.insert("digest".to_owned(), Value::String(replica.digest.clone()));
+	pending.insert("checkpoint_generation".to_owned(), Value::from(replica.checkpoint_generation));
+	if owner.params.get("_mesh_restore_pending").is_some() {
+		return owner.params["_mesh_restore_pending"].clone();
+	}
+	Value::Object(pending)
+}
+
+fn rerun_restore_pending(owner: &CreateRecord) -> Value {
+	if let Some(pending) = owner.params.get("_mesh_restore_pending") {
+		return pending.clone();
+	}
+	let mut pending = Map::new();
+	pending.insert("kind".to_owned(), Value::String("rerun".to_owned()));
+	pending.insert("source_owner".to_owned(), Value::String(owner.owner.clone()));
+	pending.insert("source_epoch".to_owned(), Value::from(owner.epoch));
+	Value::Object(pending)
+}
+
+fn replica_matches_restore_pending(replica: &ReplicaRecord, pending: &Value) -> bool {
+	pending.get("kind").and_then(Value::as_str) == Some("replica")
+		&& pending.get("source_owner").and_then(Value::as_str) == Some(&replica.source_node)
+		&& pending.get("source_epoch").and_then(Value::as_u64) == Some(replica.source_epoch)
+		&& pending.get("digest").and_then(Value::as_str) == Some(&replica.digest)
+		&& pending.get("checkpoint_generation").and_then(Value::as_u64)
+			== Some(replica.checkpoint_generation)
 }
 
 fn record_can_rerun(record: &CreateRecord) -> bool {
@@ -684,4 +1179,865 @@ fn unix_time() -> f64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	};
+
+	use super::*;
+
+	struct Mesh {
+		suspended:       bool,
+		retain_owner:    bool,
+		commit_failures: AtomicUsize,
+	}
+
+	impl MeshReconcileState for Mesh {
+		fn enabled(&self) -> bool {
+			true
+		}
+
+		fn interval(&self) -> f64 {
+			1.0
+		}
+
+		fn node_id(&self) -> &'static str {
+			"node-b"
+		}
+
+		fn advertise(&self) -> String {
+			String::new()
+		}
+
+		fn create_timeout(&self) -> Duration {
+			Duration::from_secs(1)
+		}
+
+		fn expected_members(&self) -> usize {
+			1
+		}
+
+		fn live_member_ids(&self) -> Vec<String> {
+			vec![]
+		}
+
+		fn peer_url(&self, _: &str) -> Option<String> {
+			None
+		}
+
+		fn is_peer_healthy(&self, _: &str) -> bool {
+			false
+		}
+
+		fn owner_of(&self, _: &str) -> Result<Option<String>> {
+			Ok(None)
+		}
+
+		fn restore_owner(&self, _: &str, _: &HashSet<String>) -> Option<String> {
+			None
+		}
+
+		fn restore_quorum_met(&self, _: usize) -> bool {
+			true
+		}
+
+		fn quorum_needed(&self) -> usize {
+			1
+		}
+
+		fn drain_orphans(&self) -> Vec<(String, String)> {
+			vec![]
+		}
+
+		fn is_nonserving_lifecycle(&self, _: &str) -> Result<bool> {
+			Ok(self.suspended)
+		}
+
+		fn requeue_orphan(&self, _: &str, _: &str) {}
+
+		fn claim_restore_epoch(&self, _: &str, _: &str) -> Result<u64> {
+			Ok(1)
+		}
+
+		fn owns_epoch(&self, _: &str, _: &str, _: u64) -> Result<bool> {
+			Ok(self.retain_owner)
+		}
+
+		fn finalize_restore_epoch(&self, _: &str, _: &str, _: u64) -> Result<()> {
+			Ok(())
+		}
+
+		fn commit_restore_epoch(
+			&self,
+			_: &str,
+			_: &str,
+			_: u64,
+			_: &Value,
+			_: &str,
+			_: &str,
+		) -> Result<()> {
+			if self
+				.commit_failures
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| failures.checked_sub(1))
+				.is_ok()
+			{
+				return Err(EngineError::engine("ambiguous commit response"));
+			}
+			Ok(())
+		}
+
+		fn worker_begin(&self, _: &str) -> bool {
+			true
+		}
+
+		fn worker_end(&self, _: &str) {}
+
+		fn note_event(&self, _: &str) {}
+
+		fn replica_targets(&self, _: &str, _: usize) -> Vec<String> {
+			vec![]
+		}
+
+		fn fenced_local_ids(&self, _: &[String]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn local_owner_epochs(&self, _: &[String]) -> Result<Vec<LocalOwnerEpoch>> {
+			Ok(vec![])
+		}
+
+		fn renew_owner_leases(&self, _: &[LocalOwnerEpoch]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn forget_local_owner(&self, _: &str) {}
+	}
+
+	struct SecretMesh {
+		node:   &'static str,
+		claims: Arc<AtomicUsize>,
+		winner: Arc<AtomicBool>,
+	}
+	impl MeshReconcileState for SecretMesh {
+		fn enabled(&self) -> bool {
+			true
+		}
+
+		fn interval(&self) -> f64 {
+			1.0
+		}
+
+		fn node_id(&self) -> &str {
+			self.node
+		}
+
+		fn advertise(&self) -> String {
+			String::new()
+		}
+
+		fn create_timeout(&self) -> Duration {
+			Duration::from_secs(1)
+		}
+
+		fn expected_members(&self) -> usize {
+			1
+		}
+
+		fn live_member_ids(&self) -> Vec<String> {
+			vec![]
+		}
+
+		fn peer_url(&self, _: &str) -> Option<String> {
+			None
+		}
+
+		fn is_peer_healthy(&self, _: &str) -> bool {
+			false
+		}
+
+		fn owner_of(&self, _: &str) -> Result<Option<String>> {
+			Ok(None)
+		}
+
+		fn restore_owner(&self, _: &str, _: &HashSet<String>) -> Option<String> {
+			Some("node-b".to_owned())
+		}
+
+		fn restore_quorum_met(&self, _: usize) -> bool {
+			true
+		}
+
+		fn quorum_needed(&self) -> usize {
+			1
+		}
+
+		fn drain_orphans(&self) -> Vec<(String, String)> {
+			vec![]
+		}
+
+		fn requeue_orphan(&self, _: &str, _: &str) {}
+
+		fn claim_restore_epoch(&self, _: &str, _: &str) -> Result<u64> {
+			self.claims.fetch_add(1, Ordering::SeqCst);
+			if self.winner.swap(true, Ordering::SeqCst) {
+				Err(EngineError::busy("restore claim fenced"))
+			} else {
+				Ok(7)
+			}
+		}
+
+		fn owns_epoch(&self, _: &str, _: &str, _: u64) -> Result<bool> {
+			Ok(true)
+		}
+
+		fn finalize_restore_epoch(&self, _: &str, _: &str, _: u64) -> Result<()> {
+			Ok(())
+		}
+
+		fn worker_begin(&self, _: &str) -> bool {
+			true
+		}
+
+		fn worker_end(&self, _: &str) {}
+
+		fn note_event(&self, _: &str) {}
+
+		fn replica_targets(&self, _: &str, _: usize) -> Vec<String> {
+			vec![]
+		}
+
+		fn fenced_local_ids(&self, _: &[String]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn local_owner_epochs(&self, _: &[String]) -> Result<Vec<LocalOwnerEpoch>> {
+			Ok(vec![])
+		}
+
+		fn renew_owner_leases(&self, _: &[LocalOwnerEpoch]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn forget_local_owner(&self, _: &str) {}
+	}
+
+	struct Engine {
+		record:   SandboxRecord,
+		removes:  AtomicUsize,
+		restores: AtomicUsize,
+	}
+
+	impl ReconcileEngine for Engine {
+		fn owned_ids(&self) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn get(&self, _: &str) -> Result<SandboxRecord> {
+			Ok(self.record.clone())
+		}
+
+		fn remove(&self, _: &str) -> Result<()> {
+			self.removes.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		}
+
+		fn replicate_prepare<'a>(
+			&'a self,
+			_: &'a str,
+		) -> BoxFuture<'a, Result<ReplicatePreparation>> {
+			Box::pin(async { Err(EngineError::engine("unused")) })
+		}
+
+		fn replicate_cleanup(&self, _: &str, _: &Path) -> Result<()> {
+			Ok(())
+		}
+
+		fn restore_from_template<'a>(
+			&'a self,
+			_: &'a Value,
+			_: &'a Path,
+			_: bool,
+		) -> BoxFuture<'a, Result<SandboxRecord>> {
+			self.restores.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async move { Ok(self.record.clone()) })
+		}
+
+		fn activate_candidate<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn record_volume_leases(&self, _: &str, _: &[LeaseRecord]) -> Result<()> {
+			Ok(())
+		}
+
+		fn record_idempotency(&self, _: &str, _: &str) -> Result<()> {
+			Ok(())
+		}
+
+		fn set_ha_metadata(&self, _: &str, _: &str, _: &str) -> Result<()> {
+			Ok(())
+		}
+
+		fn create_from_record(&self, _: &Value) -> Result<SandboxRecord> {
+			Ok(self.record.clone())
+		}
+
+		fn run_from_record(&self, _: &Value) -> Result<Value> {
+			Ok(Value::Null)
+		}
+
+		fn restore_from_record(&self, _: &Value) -> Result<Value> {
+			Ok(Value::Null)
+		}
+
+		fn candidate_is_running(&self, _: &str) -> bool {
+			self.restores.load(Ordering::SeqCst) > 0
+		}
+	}
+
+	struct Records;
+	impl CreateRecordStore for Records {
+		fn get(&self, _: &str) -> Result<Option<CreateRecord>> {
+			Ok(Some(CreateRecord {
+				sid:             "sandbox".to_owned(),
+				params:          Value::Object(Map::new()),
+				owner:           "node-a".to_owned(),
+				epoch:           6,
+				idempotency_key: "restore-test".to_owned(),
+				ha:              "async".to_owned(),
+				restart_policy:  "none".to_owned(),
+			}))
+		}
+
+		fn reconcile_records(&self) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	struct Replicas {
+		held: bool,
+	}
+	impl ReplicaStore for Replicas {
+		fn get<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<ReplicaRecord>>> {
+			Box::pin(async {
+				Ok(Some(ReplicaRecord {
+					sid:                   "sandbox".to_owned(),
+					digest:                "digest".to_owned(),
+					object_key:            "replicas/sandbox/digest".to_owned(),
+					source_node:           "node-a".to_owned(),
+					source_epoch:          6,
+					checkpoint_generation: 1,
+					snapshot_dir:          PathBuf::from("/checkpoint"),
+					params:                Value::Object(Map::new()),
+					needs_secrets:         false,
+				}))
+			})
+		}
+
+		fn holds(&self, _: &str) -> Result<bool> {
+			Ok(self.held)
+		}
+
+		fn secrets_ready(&self, _: &str) -> Result<bool> {
+			Ok(self.held)
+		}
+
+		fn drop_replica(&self, _: &ReplicaRecord) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	struct SecretReplicas {
+		ready: bool,
+	}
+	impl ReplicaStore for SecretReplicas {
+		fn get<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<ReplicaRecord>>> {
+			Box::pin(async {
+				Ok(Some(ReplicaRecord {
+					sid:                   "sandbox".to_owned(),
+					digest:                "secret-digest".to_owned(),
+					object_key:            "replicas/sandbox/secret-digest".to_owned(),
+					source_node:           "node-a".to_owned(),
+					source_epoch:          6,
+					checkpoint_generation: 1,
+					snapshot_dir:          PathBuf::from("/checkpoint"),
+					params:                Value::Object(Map::new()),
+					needs_secrets:         true,
+				}))
+			})
+		}
+
+		fn holds(&self, _: &str) -> Result<bool> {
+			Ok(true)
+		}
+
+		fn secrets_ready(&self, _: &str) -> Result<bool> {
+			Ok(self.ready)
+		}
+
+		fn drop_replica(&self, _: &ReplicaRecord) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	struct Leases {
+		record_releases:  AtomicUsize,
+		granted_releases: AtomicUsize,
+	}
+
+	impl LeaseManager for Leases {
+		fn renew_writable_volume_leases_once(&self) -> BoxFuture<'_, Result<()>> {
+			Box::pin(async { Ok(()) })
+		}
+
+		fn acquire_writable_volume_leases<'a>(
+			&'a self,
+			_: &'a Value,
+			_: u64,
+		) -> BoxFuture<'a, Result<Vec<LeaseRecord>>> {
+			Box::pin(async { Ok(vec![]) })
+		}
+
+		fn release_leases<'a>(&'a self, _: &'a [LeaseRecord]) -> BoxFuture<'a, Result<()>> {
+			self.granted_releases.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async { Ok(()) })
+		}
+
+		fn release_record_volume_leases<'a>(
+			&'a self,
+			_: &'a SandboxRecord,
+		) -> BoxFuture<'a, Result<()>> {
+			self.record_releases.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async { Ok(()) })
+		}
+	}
+
+	struct LossMesh {
+		renewals: AtomicUsize,
+		aborts:   AtomicUsize,
+		commits:  AtomicUsize,
+	}
+
+	impl MeshReconcileState for LossMesh {
+		fn enabled(&self) -> bool {
+			true
+		}
+
+		fn interval(&self) -> f64 {
+			1.0
+		}
+
+		fn node_id(&self) -> &'static str {
+			"node-b"
+		}
+
+		fn advertise(&self) -> String {
+			String::new()
+		}
+
+		fn create_timeout(&self) -> Duration {
+			Duration::from_secs(1)
+		}
+
+		fn expected_members(&self) -> usize {
+			1
+		}
+
+		fn live_member_ids(&self) -> Vec<String> {
+			vec![]
+		}
+
+		fn peer_url(&self, _: &str) -> Option<String> {
+			None
+		}
+
+		fn is_peer_healthy(&self, _: &str) -> bool {
+			false
+		}
+
+		fn owner_of(&self, _: &str) -> Result<Option<String>> {
+			Ok(None)
+		}
+
+		fn restore_owner(&self, _: &str, _: &HashSet<String>) -> Option<String> {
+			None
+		}
+
+		fn restore_quorum_met(&self, _: usize) -> bool {
+			true
+		}
+
+		fn quorum_needed(&self) -> usize {
+			1
+		}
+
+		fn drain_orphans(&self) -> Vec<(String, String)> {
+			vec![]
+		}
+
+		fn requeue_orphan(&self, _: &str, _: &str) {}
+
+		fn claim_restore_epoch(&self, _: &str, _: &str) -> Result<u64> {
+			Ok(7)
+		}
+
+		fn owns_epoch(&self, _: &str, _: &str, _: u64) -> Result<bool> {
+			Ok(true)
+		}
+
+		fn finalize_restore_epoch(&self, _: &str, _: &str, _: u64) -> Result<()> {
+			Ok(())
+		}
+
+		fn renew_restore_epoch(&self, _: &str, _: &str, _: u64) -> Result<bool> {
+			Ok(self.renewals.fetch_add(1, Ordering::SeqCst) == 0)
+		}
+
+		fn abort_restore_epoch(&self, _: &str, _: &str, _: u64, _: &str, _: u64) -> Result<()> {
+			self.aborts.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		}
+
+		fn commit_restore_epoch(
+			&self,
+			_: &str,
+			_: &str,
+			_: u64,
+			_: &Value,
+			_: &str,
+			_: &str,
+		) -> Result<()> {
+			self.commits.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		}
+
+		fn worker_begin(&self, _: &str) -> bool {
+			true
+		}
+
+		fn worker_end(&self, _: &str) {}
+
+		fn note_event(&self, _: &str) {}
+
+		fn replica_targets(&self, _: &str, _: usize) -> Vec<String> {
+			vec![]
+		}
+
+		fn fenced_local_ids(&self, _: &[String]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn local_owner_epochs(&self, _: &[String]) -> Result<Vec<LocalOwnerEpoch>> {
+			Ok(vec![])
+		}
+
+		fn renew_owner_leases(&self, _: &[LocalOwnerEpoch]) -> Result<Vec<String>> {
+			Ok(vec![])
+		}
+
+		fn forget_local_owner(&self, _: &str) {}
+	}
+
+	fn test_config() -> ReconcileConfig {
+		ReconcileConfig {
+			replicate_sec:         1.0,
+			replicas:              1,
+			replicate_concurrency: 1,
+			restore_quorum:        None,
+			outbound_token:        String::new(),
+		}
+	}
+
+	fn test_engine() -> Engine {
+		Engine {
+			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
+			removes:  AtomicUsize::new(0),
+			restores: AtomicUsize::new(0),
+		}
+	}
+
+	fn test_leases() -> Leases {
+		Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) }
+	}
+
+	#[tokio::test]
+	async fn secret_ready_holder_bypasses_unready_hrw_winner() {
+		let claims = Arc::new(AtomicUsize::new(0));
+		let winner = Arc::new(AtomicBool::new(false));
+		let records = Records;
+		let client = Client::new();
+		let unready_mesh =
+			SecretMesh { node: "node-b", claims: Arc::clone(&claims), winner: Arc::clone(&winner) };
+		let unready_engine = test_engine();
+		let unready_replicas = SecretReplicas { ready: false };
+		let unready_leases = test_leases();
+		Reconciler::new(
+			test_config(),
+			&unready_mesh,
+			&unready_engine,
+			&records,
+			&unready_replicas,
+			&unready_leases,
+			&client,
+		)
+		.reconcile_orphan("sandbox", "node-a")
+		.await;
+		assert_eq!(claims.load(Ordering::SeqCst), 0, "unready HRW winner must not claim");
+		assert_eq!(unready_engine.restores.load(Ordering::SeqCst), 0);
+
+		let ready_mesh = SecretMesh { node: "node-c", claims: Arc::clone(&claims), winner };
+		let ready_engine = test_engine();
+		let ready_replicas = SecretReplicas { ready: true };
+		let ready_leases = test_leases();
+		Reconciler::new(
+			test_config(),
+			&ready_mesh,
+			&ready_engine,
+			&records,
+			&ready_replicas,
+			&ready_leases,
+			&client,
+		)
+		.reconcile_orphan("sandbox", "node-a")
+		.await;
+		assert_eq!(claims.load(Ordering::SeqCst), 1);
+		assert_eq!(ready_engine.restores.load(Ordering::SeqCst), 1, "ready holder must restore");
+	}
+
+	#[tokio::test]
+	async fn two_secret_ready_holders_only_launch_the_cas_winner() {
+		let claims = Arc::new(AtomicUsize::new(0));
+		let winner = Arc::new(AtomicBool::new(false));
+		let records = Records;
+		let client = Client::new();
+		let first_mesh =
+			SecretMesh { node: "node-b", claims: Arc::clone(&claims), winner: Arc::clone(&winner) };
+		let first_engine = test_engine();
+		let first_replicas = SecretReplicas { ready: true };
+		let first_leases = test_leases();
+		Reconciler::new(
+			test_config(),
+			&first_mesh,
+			&first_engine,
+			&records,
+			&first_replicas,
+			&first_leases,
+			&client,
+		)
+		.reconcile_orphan("sandbox", "node-a")
+		.await;
+
+		let second_mesh = SecretMesh { node: "node-c", claims: Arc::clone(&claims), winner };
+		let second_engine = test_engine();
+		let second_replicas = SecretReplicas { ready: true };
+		let second_leases = test_leases();
+		Reconciler::new(
+			test_config(),
+			&second_mesh,
+			&second_engine,
+			&records,
+			&second_replicas,
+			&second_leases,
+			&client,
+		)
+		.reconcile_orphan("sandbox", "node-a")
+		.await;
+		assert_eq!(claims.load(Ordering::SeqCst), 2, "both ready holders may contend");
+		assert_eq!(first_engine.restores.load(Ordering::SeqCst), 1);
+		assert_eq!(second_engine.restores.load(Ordering::SeqCst), 0, "fenced loser must not launch");
+	}
+
+	#[tokio::test]
+	async fn fence_loss_cleanup_removes_vm_and_releases_every_lease() {
+		let mesh = Mesh {
+			suspended:       false,
+			retain_owner:    false,
+			commit_failures: AtomicUsize::new(0),
+		};
+		let engine = Engine {
+			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
+			removes:  AtomicUsize::new(0),
+			restores: AtomicUsize::new(0),
+		};
+		let records = Records;
+		let replicas = Replicas { held: false };
+		let leases =
+			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let client = Client::new();
+		let reconciler = Reconciler::new(
+			ReconcileConfig {
+				replicate_sec:         1.0,
+				replicas:              1,
+				replicate_concurrency: 1,
+				restore_quorum:        None,
+				outbound_token:        String::new(),
+			},
+			&mesh,
+			&engine,
+			&records,
+			&replicas,
+			&leases,
+			&client,
+		);
+		let lease = LeaseRecord::new("data", "node-b", 1, 1.0, 1.0).unwrap();
+
+		reconciler
+			.cleanup_failed_restore("sandbox", None, &[lease])
+			.await;
+
+		assert_eq!(engine.removes.load(Ordering::SeqCst), 1);
+		assert_eq!(leases.record_releases.load(Ordering::SeqCst), 1);
+		assert_eq!(leases.granted_releases.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn suspended_orphan_never_launches_replica_restore() {
+		let mesh = Mesh {
+			suspended:       true,
+			retain_owner:    false,
+			commit_failures: AtomicUsize::new(0),
+		};
+		let engine = Engine {
+			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
+			removes:  AtomicUsize::new(0),
+			restores: AtomicUsize::new(0),
+		};
+		let records = Records;
+		let replicas = Replicas { held: true };
+		let leases =
+			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let client = Client::new();
+		let reconciler = Reconciler::new(
+			ReconcileConfig {
+				replicate_sec:         1.0,
+				replicas:              1,
+				replicate_concurrency: 1,
+				restore_quorum:        None,
+				outbound_token:        String::new(),
+			},
+			&mesh,
+			&engine,
+			&records,
+			&replicas,
+			&leases,
+			&client,
+		);
+
+		reconciler.reconcile_orphan("sandbox", "node-a").await;
+
+		assert_eq!(engine.restores.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn ambiguous_commit_reconcile_reuses_retained_candidate_without_relaunching() {
+		let mesh = Mesh {
+			suspended:       false,
+			retain_owner:    true,
+			commit_failures: AtomicUsize::new(2),
+		};
+		let engine = test_engine();
+		let records = Records;
+		let replicas = Replicas { held: false };
+		let leases = test_leases();
+		let client = Client::new();
+		let reconciler =
+			Reconciler::new(test_config(), &mesh, &engine, &records, &replicas, &leases, &client);
+		let lineage = records.get("sandbox").unwrap().unwrap();
+
+		assert!(
+			reconciler
+				.restore_from_replica("sandbox", "node-a", Some(&lineage), true)
+				.await
+				.is_err()
+		);
+		assert_eq!(engine.restores.load(Ordering::SeqCst), 1);
+
+		assert!(
+			!reconciler
+				.restore_from_replica("sandbox", "node-a", Some(&lineage), true)
+				.await
+				.unwrap()
+		);
+		assert_eq!(engine.restores.load(Ordering::SeqCst), 1);
+		assert_eq!(engine.removes.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn replica_from_a_epoch_one_is_rejected_after_b_epoch_two_is_authoritative() {
+		let replica = ReplicaRecord {
+			sid:                   "sandbox".to_owned(),
+			digest:                "digest-a".to_owned(),
+			object_key:            "replicas/sandbox/digest-a".to_owned(),
+			source_node:           "node-a".to_owned(),
+			source_epoch:          1,
+			checkpoint_generation: 9,
+			snapshot_dir:          PathBuf::from("/checkpoint"),
+			params:                Value::Object(Map::new()),
+			needs_secrets:         false,
+		};
+		let authoritative = CreateRecord {
+			sid:             "sandbox".to_owned(),
+			params:          Value::Object(Map::new()),
+			owner:           "node-b".to_owned(),
+			epoch:           2,
+			idempotency_key: String::new(),
+			ha:              "async".to_owned(),
+			restart_policy:  "none".to_owned(),
+		};
+
+		assert!(
+			!replica_lineage_matches(&replica, &authoritative),
+			"claimant C must reject A/1 after B/2 became authoritative"
+		);
+	}
+
+	#[tokio::test]
+	async fn slow_restore_renewal_loss_tears_candidate_down_without_commit() {
+		let mesh = LossMesh {
+			renewals: AtomicUsize::new(0),
+			aborts:   AtomicUsize::new(0),
+			commits:  AtomicUsize::new(0),
+		};
+		let engine = Engine {
+			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
+			removes:  AtomicUsize::new(0),
+			restores: AtomicUsize::new(0),
+		};
+		let records = Records;
+		let replicas = Replicas { held: false };
+		let leases =
+			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let client = Client::new();
+		let reconciler = Reconciler::new(
+			ReconcileConfig {
+				replicate_sec:         1.0,
+				replicas:              1,
+				replicate_concurrency: 1,
+				restore_quorum:        None,
+				outbound_token:        String::new(),
+			},
+			&mesh,
+			&engine,
+			&records,
+			&replicas,
+			&leases,
+			&client,
+		);
+		let lineage = records.get("sandbox").unwrap().unwrap();
+
+		assert!(
+			reconciler
+				.restore_from_replica("sandbox", "node-a", Some(&lineage), true)
+				.await
+				.is_err()
+		);
+		assert_eq!(mesh.commits.load(Ordering::SeqCst), 0);
+		assert_eq!(mesh.aborts.load(Ordering::SeqCst), 1);
+		assert_eq!(engine.removes.load(Ordering::SeqCst), 1);
+		assert_eq!(leases.record_releases.load(Ordering::SeqCst), 1);
+	}
 }

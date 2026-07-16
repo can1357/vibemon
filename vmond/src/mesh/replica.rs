@@ -26,15 +26,20 @@ const REPLICA_DIR_MODE: u32 = 0o700;
 /// Metadata for one held replica checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaRecord {
-	pub sid:           String,
-	pub digest:        String,
-	pub source_node:   String,
-	pub snapshot_dir:  String,
-	pub params:        Params,
-	pub needs_secrets: bool,
+	pub sid:                   String,
+	pub digest:                String,
+	pub object_key:            String,
+	pub source_node:           String,
+	pub source_epoch:          u64,
+	pub checkpoint_generation: u64,
+	pub snapshot_dir:          String,
+	pub params:                Params,
+	pub needs_secrets:         bool,
 }
 
 impl ReplicaRecord {
+	/// Construct a legacy/local replica record. Network and durable callers
+	/// must provide a fenced generation through [`Self::new_fenced`].
 	pub fn new(
 		sid: impl Into<String>,
 		digest: impl Into<String>,
@@ -43,11 +48,48 @@ impl ReplicaRecord {
 		params: Params,
 		needs_secrets: bool,
 	) -> Result<Self> {
+		Self::new_fenced(sid, digest, source_node, 0, 0, snapshot_dir, params, needs_secrets)
+	}
+
+	pub fn new_fenced(
+		sid: impl Into<String>,
+		digest: impl Into<String>,
+		source_node: impl Into<String>,
+		source_epoch: u64,
+		checkpoint_generation: u64,
+		snapshot_dir: impl Into<String>,
+		params: Params,
+		needs_secrets: bool,
+	) -> Result<Self> {
 		let sid = non_empty_string("replica sid is required", sid.into())?;
 		let digest = non_empty_string("replica digest is required", digest.into())?;
 		let source_node = non_empty_string("replica source_node is required", source_node.into())?;
 		let snapshot_dir = non_empty_string("replica snapshot_dir is required", snapshot_dir.into())?;
-		Ok(Self { sid, digest, source_node, snapshot_dir, params, needs_secrets })
+		Ok(Self {
+			sid,
+			digest,
+			source_node,
+			object_key: String::new(),
+			source_epoch,
+			checkpoint_generation,
+			snapshot_dir,
+			params,
+			needs_secrets,
+		})
+	}
+
+	/// Bind this record to one exact immutable shared-object identity.
+	pub fn with_object_key(mut self, object_key: impl Into<String>) -> Result<Self> {
+		let object_key = non_empty_string("replica object_key is required", object_key.into())?;
+		if object_key.starts_with('/')
+			|| object_key
+				.split('/')
+				.any(|part| part == ".." || part.is_empty())
+		{
+			return Err(EngineError::invalid("replica object_key is not a safe relative path"));
+		}
+		self.object_key = object_key;
+		Ok(self)
 	}
 
 	pub fn to_wire(&self) -> JsonValue {
@@ -59,9 +101,12 @@ impl ReplicaRecord {
 		out.insert("sid".to_owned(), JsonValue::String(self.sid.clone()));
 		out.insert("digest".to_owned(), JsonValue::String(self.digest.clone()));
 		out.insert("source_node".to_owned(), JsonValue::String(self.source_node.clone()));
+		out.insert("source_epoch".to_owned(), JsonValue::from(self.source_epoch));
+		out.insert("checkpoint_generation".to_owned(), JsonValue::from(self.checkpoint_generation));
 		out.insert("snapshot_dir".to_owned(), JsonValue::String(self.snapshot_dir.clone()));
 		out.insert("params".to_owned(), JsonValue::Object(self.params.clone()));
 		out.insert("needs_secrets".to_owned(), JsonValue::Bool(self.needs_secrets));
+		out.insert("object_key".to_owned(), JsonValue::String(self.object_key.clone()));
 		out
 	}
 
@@ -72,6 +117,14 @@ impl ReplicaRecord {
 		let sid = required_string(object, "sid", "replica sid is required")?;
 		let digest = required_string(object, "digest", "replica digest is required")?;
 		let source_node = required_string(object, "source_node", "replica source_node is required")?;
+		let source_epoch = object
+			.get("source_epoch")
+			.and_then(JsonValue::as_u64)
+			.unwrap_or(0);
+		let checkpoint_generation = object
+			.get("checkpoint_generation")
+			.and_then(JsonValue::as_u64)
+			.unwrap_or(0);
 		let snapshot_dir =
 			required_string(object, "snapshot_dir", "replica snapshot_dir is required")?;
 		let params = object
@@ -83,7 +136,26 @@ impl ReplicaRecord {
 			.get("needs_secrets")
 			.and_then(JsonValue::as_bool)
 			.unwrap_or(false);
-		Self::new(sid, digest, source_node, snapshot_dir, params, needs_secrets)
+		let object_key = object
+			.get("object_key")
+			.and_then(JsonValue::as_str)
+			.unwrap_or_default()
+			.to_owned();
+		let record = Self::new_fenced(
+			sid,
+			digest,
+			source_node,
+			source_epoch,
+			checkpoint_generation,
+			snapshot_dir,
+			params,
+			needs_secrets,
+		)?;
+		if object_key.is_empty() {
+			Ok(record)
+		} else {
+			record.with_object_key(object_key)
+		}
 	}
 }
 
@@ -164,14 +236,37 @@ impl ReplicaStore {
 		snapshot_dir: impl Into<String>,
 		params: Params,
 	) -> Result<()> {
+		self.put_fenced(sid, digest, source_node, 0, 0, snapshot_dir, params)
+	}
+
+	/// Persist a replica tagged with the exact ownership and checkpoint
+	/// generations that produced it.
+	pub fn put_fenced(
+		&self,
+		sid: impl Into<String>,
+		digest: impl Into<String>,
+		source_node: impl Into<String>,
+		source_epoch: u64,
+		checkpoint_generation: u64,
+		snapshot_dir: impl Into<String>,
+		params: Params,
+	) -> Result<()> {
 		let sid = sid.into();
 		let digest = digest.into();
 		let source_node = source_node.into();
 		let snapshot_dir = snapshot_dir.into();
 		let (clean, secrets) = split_secrets(&params);
 		let needs_secrets = secrets.is_some();
-		let record =
-			ReplicaRecord::new(sid, digest, source_node, snapshot_dir, clean, needs_secrets)?;
+		let record = ReplicaRecord::new_fenced(
+			sid,
+			digest,
+			source_node,
+			source_epoch,
+			checkpoint_generation,
+			snapshot_dir,
+			clean,
+			needs_secrets,
+		)?;
 		self.put_clean(record, secrets)
 	}
 
@@ -224,6 +319,12 @@ impl ReplicaStore {
 		self.inner.read().meta.keys().cloned().collect()
 	}
 
+	/// Return all persisted replica records without reattaching ephemeral
+	/// restore secrets.
+	pub fn records(&self) -> Vec<ReplicaRecord> {
+		self.inner.read().meta.values().cloned().collect()
+	}
+
 	/// Remove held metadata for `sid` while leaving its snapshot directory.
 	pub fn remove(&self, sid: &str) -> Result<()> {
 		{
@@ -237,6 +338,28 @@ impl ReplicaStore {
 			Err(err) => return Err(err.into()),
 		}
 		Ok(())
+	}
+
+	/// Remove a record only when it still names the expected immutable object.
+	/// This prevents a late cleanup from deleting a newer same-sid checkpoint.
+	pub fn remove_if_object_key(&self, sid: &str, object_key: &str) -> Result<bool> {
+		{
+			let mut inner = self.inner.write();
+			if inner
+				.meta
+				.get(sid)
+				.is_none_or(|record| record.object_key != object_key)
+			{
+				return Ok(false);
+			}
+			inner.meta.remove(sid);
+			inner.secrets.remove(sid);
+		}
+		match fs::remove_file(self.root.join(format!("{sid}.json"))) {
+			Ok(()) => Ok(true),
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+			Err(error) => Err(error.into()),
+		}
 	}
 
 	pub fn drop_replica(&self, sid: &str) -> Result<()> {
@@ -293,4 +416,56 @@ fn temp_path_for(path: &Path) -> PathBuf {
 		.and_then(|name| name.to_str())
 		.unwrap_or("replica.json");
 	path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn local_fenced_replica_survives_restart_without_shared_object_key() {
+		let root = tempfile::tempdir().expect("temporary replica root");
+		let store = ReplicaStore::new(root.path());
+		store
+			.put_fenced("sandbox", "digest", "node-a", 3, 7, "checkpoint", JsonMap::new())
+			.expect("persist local replica");
+
+		let restarted = ReplicaStore::new(root.path());
+		restarted.load();
+		let record = restarted.get("sandbox").expect("reload local replica");
+		assert_eq!(record.object_key, "");
+		assert_eq!((record.source_epoch, record.checkpoint_generation), (3, 7));
+	}
+
+	#[test]
+	fn stale_cleanup_cannot_remove_rotated_object_metadata() {
+		let root = tempfile::tempdir().expect("temporary replica root");
+		let store = ReplicaStore::new(root.path());
+		let old = ReplicaRecord::new_fenced(
+			"sandbox",
+			"digest",
+			"node-a",
+			3,
+			7,
+			"checkpoint",
+			JsonMap::new(),
+			false,
+		)
+		.unwrap()
+		.with_object_key("old-scoped-object")
+		.unwrap();
+		let current = old
+			.clone()
+			.with_object_key("current-scoped-object")
+			.unwrap();
+		store.put_record(old).unwrap();
+		store.put_record(current).unwrap();
+
+		assert!(
+			!store
+				.remove_if_object_key("sandbox", "old-scoped-object")
+				.unwrap()
+		);
+		assert_eq!(store.get("sandbox").unwrap().object_key, "current-scoped-object");
+	}
 }
