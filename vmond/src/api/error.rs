@@ -74,11 +74,11 @@ impl ApiError {
 	pub fn message(&self) -> &str {
 		&self.body.message
 	}
+
 	/// Return the HTTP status used by non-gRPC transports.
 	pub const fn status(&self) -> StatusCode {
 		self.status
 	}
-
 
 	/// Return whether the same operation can succeed without new input.
 	pub const fn retryable(&self) -> bool {

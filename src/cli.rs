@@ -88,6 +88,12 @@ enum Commands {
 	Pause(NameArg),
 	/// Resume a paused sandbox.
 	Resume(NameArg),
+	/// Durably checkpoint a sandbox and release its live VM.
+	Suspend(NameArg),
+	/// List retained recovery points for a sandbox.
+	History(NameArg),
+	/// Restore a sandbox identity to a retained recovery point.
+	Rollback(RollbackArgs),
 	/// Reset a sandbox timeout deadline.
 	Extend(ExtendArgs),
 	/// Snapshot machine state into a named template.
@@ -122,7 +128,7 @@ enum Commands {
 		#[command(subcommand)]
 		command: DaemonCommands,
 	},
-	/// Serve the HTTP sandbox API.
+	/// Serve the gRPC control plane and web/HTTP endpoints.
 	Serve(ServeArgs),
 	/// Run the narrow privileged Linux network broker.
 	NetBroker(NetBrokerArgs),
@@ -262,6 +268,12 @@ struct LogsArgs {
 #[derive(Args)]
 struct NameArg {
 	name: String,
+}
+
+#[derive(Args)]
+struct RollbackArgs {
+	name:           String,
+	recovery_point: String,
 }
 
 #[derive(Args)]
@@ -573,6 +585,11 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Resume(args) => {
 			lifecycle(transport_options, &args.name, LifecycleVerb::Resume, "resumed")
 		},
+		Commands::Suspend(args) => {
+			lifecycle(transport_options, &args.name, LifecycleVerb::Suspend, "suspended")
+		},
+		Commands::History(args) => cmd_history(args, transport_options),
+		Commands::Rollback(args) => cmd_rollback(args, transport_options),
 		Commands::Extend(args) => cmd_extend(args, transport_options),
 		Commands::Snapshot(args) => cmd_snapshot(args, transport_options),
 		Commands::Restore(args) => cmd_restore(args, transport_options),
@@ -1680,6 +1697,7 @@ enum LifecycleVerb {
 	Stop,
 	Pause,
 	Resume,
+	Suspend,
 }
 
 fn lifecycle(
@@ -1709,10 +1727,51 @@ fn lifecycle(
 						.resume(pb::SandboxRef { id: name.to_owned() })
 						.await
 				},
+				LifecycleVerb::Suspend => {
+					sandboxes
+						.suspend(pb::SandboxRef { id: name.to_owned() })
+						.await
+				},
 			}
 		})
 		.map_err(status_error)?;
 	println!("{label} {name}");
+	Ok(0)
+}
+
+fn cmd_history(args: NameArg, options: &TransportOptions) -> Result<i32> {
+	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	let response = grpc
+		.block_on(sandboxes.history(pb::SandboxRef { id: args.name.clone() }))
+		.map_err(status_error)?
+		.into_inner();
+	if response.points.is_empty() {
+		println!("no recovery points for {}", args.name);
+		return Ok(0);
+	}
+	println!("{:<32} {:<12} {:>16} {:>12}", "POINT", "KIND", "CREATED_MS", "SIZE_BYTES");
+	for point in response.points {
+		println!(
+			"{:<32} {:<12} {:>16} {:>12}",
+			point.name, point.kind, point.created_at_unix_millis, point.size_bytes
+		);
+	}
+	Ok(0)
+}
+
+fn cmd_rollback(args: RollbackArgs, options: &TransportOptions) -> Result<i32> {
+	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let mut sandboxes = grpc.sandboxes();
+	grpc
+		.block_on(sandboxes.rollback(pb::RollbackSandboxRequest {
+			id:             args.name.clone(),
+			recovery_point: args.recovery_point.clone(),
+		}))
+		.map_err(status_error)?;
+	println!("rolled back {} to {}", args.name, args.recovery_point);
 	Ok(0)
 }
 
@@ -2714,6 +2773,25 @@ mod durable_cli_tests {
 			run.command,
 			Commands::Run(RunArgs { image: Some(target), cmd, .. })
 				if target == "app.py::embed" && cmd == ["1", "{\"x\":2}"]
+		));
+	}
+
+	#[test]
+	fn durable_lifecycle_command_shapes_parse() {
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "suspend", "box"]).unwrap().command,
+			Commands::Suspend(NameArg { name }) if name == "box"
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "history", "box"]).unwrap().command,
+			Commands::History(NameArg { name }) if name == "box"
+		));
+		assert!(matches!(
+			Cli::try_parse_from(["vmon", "rollback", "box", "checkpoint-7"])
+				.unwrap()
+				.command,
+			Commands::Rollback(RollbackArgs { name, recovery_point })
+				if name == "box" && recovery_point == "checkpoint-7"
 		));
 	}
 

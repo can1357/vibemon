@@ -254,6 +254,7 @@ pub struct GrpcApi {
 
 /// Resolved mesh owner hop: a lazy tonic channel plus the peer credential.
 struct ForwardTarget {
+	owner:     String,
 	channel:   Channel,
 	token:     Arc<str>,
 	principal: Principal,
@@ -322,9 +323,7 @@ fn metadata_principal(metadata: &MetadataMap) -> Result<Principal, Status> {
 				status_from(&ApiError::unauthorized("authenticated principal metadata is invalid"))
 			})
 		},
-		_ => Err(status_from(&ApiError::unauthorized(
-			"authenticated principal metadata is missing",
-		))),
+		_ => Err(status_from(&ApiError::unauthorized("authenticated principal metadata is missing"))),
 	}
 }
 
@@ -342,8 +341,14 @@ fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Resu
 	if body.template.is_some()
 		|| body.dockerfile.is_some()
 		|| body.fs_dir.is_some()
-		|| body.volumes.as_ref().is_some_and(|volumes| !volumes.is_empty())
-		|| body.s3_mounts.as_ref().is_some_and(|mounts| !mounts.is_empty())
+		|| body
+			.volumes
+			.as_ref()
+			.is_some_and(|volumes| !volumes.is_empty())
+		|| body
+			.s3_mounts
+			.as_ref()
+			.is_some_and(|mounts| !mounts.is_empty())
 		|| body.pool_size != 0
 	{
 		return Err(status_from(&ApiError::forbidden(
@@ -367,7 +372,6 @@ fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Resu
 	Ok(())
 }
 
-
 fn is_mesh_hop(metadata: &MetadataMap) -> bool {
 	metadata.contains_key(MESH_HOP_KEY)
 }
@@ -378,6 +382,7 @@ fn is_mesh_hop(metadata: &MetadataMap) -> bool {
 struct MeshView {
 	state:   MeshRouteState,
 	node_id: String,
+	runtime: Arc<crate::mesh::runtime::MeshRuntime>,
 }
 
 impl proxy::OwnerRouter for MeshView {
@@ -395,6 +400,34 @@ impl proxy::OwnerRouter for MeshView {
 			.mesh
 			.owner_of(sandbox_id)
 			.map_err(|err| proxy::MeshError::new(err.code, err.message))
+	}
+
+	fn authoritative_owner(&self, sandbox_id: &str) -> proxy::MeshResult<Option<OwnerRecord>> {
+		self
+			.state
+			.mesh
+			.authoritative_owner(sandbox_id)
+			.map_err(|err| proxy::MeshError::new(err.code, err.message))
+			.map(|owner| {
+				owner.map(|(owner, epoch)| OwnerRecord {
+					owner,
+					epoch: u64::try_from(epoch).unwrap_or(0),
+				})
+			})
+	}
+
+	fn local_epoch(&self, sandbox_id: &str) -> u64 {
+		u64::try_from(self.state.mesh.local_epoch(sandbox_id)).unwrap_or(0)
+	}
+
+	fn local_restore_staging(&self, sandbox_id: &str) -> bool {
+		self.runtime.restoring_epoch(sandbox_id).is_some()
+	}
+
+	fn fence_local(&self, sandbox_id: &str, expected_epoch: u64) {
+		self
+			.runtime
+			.schedule_fence(sandbox_id.to_owned(), expected_epoch);
 	}
 
 	fn peer_url(&self, node_id: &str) -> Option<String> {
@@ -543,6 +576,82 @@ macro_rules! forward_to_owner {
 	};
 }
 
+/// Whether portable history should be served here, forwarded to its owner, or
+/// adopted after owner resolution conclusively reports that the owner is gone.
+enum PortableOwnerRoute<T> {
+	ServeLocal,
+	Forward(T),
+	Adopt,
+}
+
+/// Keep normal owner forwarding for portable history operations, but permit
+/// adoption only when owner resolution conclusively reports that the owner is
+/// unreachable.
+fn portable_owner_route<T>(
+	result: Result<Option<T>, Status>,
+) -> Result<PortableOwnerRoute<T>, Status> {
+	match result {
+		Ok(Some(target)) => Ok(PortableOwnerRoute::Forward(target)),
+		Ok(None) => Ok(PortableOwnerRoute::ServeLocal),
+		Err(status)
+			if status
+				.metadata()
+				.get("vmon-code")
+				.and_then(|value| value.to_str().ok())
+				== Some("unreachable") =>
+		{
+			Ok(PortableOwnerRoute::Adopt)
+		},
+		Err(status) => Err(status),
+	}
+}
+
+/// A peer connection failure produces tonic `Unavailable` before any response
+/// metadata exists. Responses produced by this API always carry `vmon-code`;
+/// preserve those application errors because a mutation may have committed.
+fn portable_peer_response<T>(response: Result<T, Status>) -> Result<Option<T>, Status> {
+	match response {
+		Ok(response) => Ok(Some(response)),
+		Err(status)
+			if status.code() == Code::Unavailable && !status.metadata().contains_key("vmon-code") =>
+		{
+			Ok(None)
+		},
+		Err(status) => Err(status),
+	}
+}
+
+/// A projected suspended marker is non-serving, but its designated local
+/// claimant must receive exactly Resume to begin the fenced materialization.
+const fn resume_forwards_to_owner(passive_suspend_marker: bool) -> bool {
+	!passive_suspend_marker
+}
+
+/// Only an owner-resolution failure tagged `unreachable` proves no peer RPC
+/// was attempted and may begin suspended-marker adoption.
+fn resume_owner_resolution_lost(status: &Status) -> bool {
+	status
+		.metadata()
+		.get("vmon-code")
+		.and_then(|value| value.to_str().ok())
+		== Some("unreachable")
+}
+
+fn portable_restore_proof(
+	owner_matches: bool,
+	owner_healthy: bool,
+	confirmations: usize,
+	quorum_needed: usize,
+) -> Result<(), Status> {
+	if !owner_matches || owner_healthy || confirmations < quorum_needed {
+		return Err(status_from(&ApiError::function(
+			"ha_unavailable",
+			"portable rollback requires a fenced dead-owner restore quorum",
+		)));
+	}
+	Ok(())
+}
+
 impl GrpcApi {
 	pub const fn new(state: ApiState) -> Self {
 		Self { state }
@@ -625,6 +734,48 @@ impl GrpcApi {
 		}
 	}
 
+	/// A durable suspended marker projected on this node is intentionally
+	/// non-serving, except that Resume must reach the local Engine to claim and
+	/// materialize it. Active restore staging remains blocked by normal routing.
+	async fn local_passive_resume(
+		&self,
+		metadata: &MetadataMap,
+		sandbox_id: &str,
+	) -> Result<bool, Status> {
+		let principal = metadata_principal(metadata)?;
+		self.authorize_sandbox(&principal, sandbox_id).await?;
+		let Some(mesh) = self.state.mesh.as_ref() else {
+			return Ok(false);
+		};
+		let mesh = Arc::clone(mesh);
+		let sandbox_id = sandbox_id.to_owned();
+		tokio::task::spawn_blocking(move || mesh.passive_suspend_marker(&sandbox_id))
+			.await
+			.map_err(|error| status_from(&join_error(error)))?
+			.map_err(|error| status_from(&ApiError::from(error)))
+	}
+
+	/// Query only the durable suspended marker state; unlike
+	/// `local_passive_resume`, this works before a local placeholder exists.
+	async fn has_durable_suspended_marker(&self, sandbox_id: &str) -> Result<bool, Status> {
+		let Some(mesh) = self.state.mesh.as_ref() else {
+			return Ok(false);
+		};
+		let mesh = Arc::clone(mesh);
+		let sandbox_id = sandbox_id.to_owned();
+		tokio::task::spawn_blocking(move || mesh.has_suspended_marker(&sandbox_id))
+			.await
+			.map_err(|error| status_from(&join_error(error)))?
+			.map_err(|error| status_from(&ApiError::from(error)))
+	}
+
+	async fn adopt_suspended_marker(&self, sandbox_id: &str) -> Result<(), Status> {
+		let sandbox_id = sandbox_id.to_owned();
+		self
+			.engine_call(move |engine| engine.adopt_suspended_marker(&sandbox_id))
+			.await
+	}
+
 	fn credential_scope(
 		&self,
 		principal: &Principal,
@@ -671,7 +822,7 @@ impl GrpcApi {
 			return Ok(None);
 		}
 		let state = mesh.route_state();
-		let view = MeshView { node_id: state.mesh.node_id(), state };
+		let view = MeshView { node_id: state.mesh.node_id(), state, runtime: Arc::clone(mesh) };
 		let path = format!("/v1/sandboxes/{sandbox_id}");
 		let decision = proxy::owner_proxy_decision(
 			&view,
@@ -686,19 +837,72 @@ impl GrpcApi {
 		.map_err(|err| status_from(&mesh_api_error(err)))?;
 		match decision {
 			OwnerProxyDecision::ServeLocal => Ok(None),
-			OwnerProxyDecision::Forward { peer_url, .. } => {
+			OwnerProxyDecision::Forward { owner, peer_url } => {
 				let endpoint = Endpoint::from_shared(peer_url).map_err(|err| {
-					status_from(&mesh_api_error(MeshError::unreachable(format!(
-						"invalid peer URL: {err}"
-					))))
+					status_from(&mesh_api_error(MeshError::invalid(format!("invalid peer URL: {err}"))))
 				})?;
 				Ok(Some(ForwardTarget {
+					owner,
 					channel: endpoint.connect_lazy(),
 					token: view.state.outbound_token.clone(),
 					principal,
 				}))
 			},
 		}
+	}
+
+	/// Portable history may be adopted after a source node is definitively
+	/// unavailable. Do not apply this exception to other sandbox operations.
+	async fn portable_history_target(
+		&self,
+		metadata: &MetadataMap,
+		sandbox_id: &str,
+	) -> Result<PortableOwnerRoute<ForwardTarget>, Status> {
+		portable_owner_route(self.forward_target(metadata, sandbox_id).await)
+	}
+
+	/// Admit an owner-loss rollback only when the ownership record still names
+	/// the failed peer and the surviving membership has restore quorum.
+	fn portable_rollback_admission(
+		&self,
+		sandbox_id: &str,
+		expected_owner: Option<&str>,
+	) -> Result<(), Status> {
+		let Some(mesh) = self.state.mesh.as_ref() else {
+			return Err(status_from(&ApiError::function(
+				"ha_unavailable",
+				"portable rollback requires mesh restore quorum",
+			)));
+		};
+		let state = mesh.route_state();
+		let (owner, _) = state
+			.mesh
+			.authoritative_owner(sandbox_id)
+			.map_err(|_| {
+				status_from(&ApiError::function(
+					"ha_unavailable",
+					"portable rollback could not verify the authoritative owner",
+				))
+			})?
+			.ok_or_else(|| {
+				status_from(&ApiError::function(
+					"ha_unavailable",
+					"portable rollback has no authoritative owner record",
+				))
+			})?;
+		let confirmations = 1
+			+ state
+				.mesh
+				.peers()
+				.into_iter()
+				.filter(|peer| peer.healthy)
+				.count();
+		portable_restore_proof(
+			expected_owner.is_none_or(|expected| expected == owner),
+			state.mesh.is_peer_healthy(&owner),
+			confirmations,
+			state.mesh.quorum_needed(),
+		)
 	}
 }
 
@@ -1023,17 +1227,11 @@ impl pb::artifact_service_server::ArtifactService for GrpcApi {
 				}
 			}
 			let stored = writer.finalize()?;
-			let path = stored
-				.path
-				.to_str()
-				.ok_or_else(|| crate::EngineError::engine("artifact path is not valid UTF-8"))?;
 			let created_at = function_now_millis();
 			let expires_at = ttl_millis.map(|ttl| created_at.saturating_add(ttl));
-			domain.store().record_artifact(
-				&stored.digest,
-				stored.size,
+			domain.store().record_stored_artifact(
+				&stored,
 				media_type.as_deref(),
-				path,
 				created_at,
 				expires_at,
 			)?;
@@ -2026,9 +2224,52 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		request: Request<pb::SandboxRef>,
 	) -> Result<Response<pb::JsonView>, Status> {
 		let (metadata, _, message) = request.into_parts();
-		forward_to_owner!(self, metadata, &message.id, message, resume);
+		if resume_forwards_to_owner(self.local_passive_resume(&metadata, &message.id).await?) {
+			let adopt = match self.forward_target(&metadata, &message.id).await {
+				Ok(Some(target)) => match target
+					.sandbox_client()
+					.resume(target.request(message.clone()))
+					.await
+				{
+					Ok(response) => return Ok(response),
+					Err(status) => return Err(status),
+				},
+				Ok(None) => self.has_durable_suspended_marker(&message.id).await?,
+				Err(status) if resume_owner_resolution_lost(&status) => {
+					self.has_durable_suspended_marker(&message.id).await?
+				},
+				Err(status) => return Err(status),
+			};
+			if adopt && let Err(status) = self.adopt_suspended_marker(&message.id).await {
+				if status.code() == Code::Aborted
+					&& let Some(target) = self.forward_target(&metadata, &message.id).await?
+				{
+					return target
+						.sandbox_client()
+						.resume(target.request(message))
+						.await;
+				}
+				return Err(status);
+			}
+		}
 		let id = message.id;
-		let view = self.engine_call(move |engine| engine.resume(&id)).await?;
+		let view = match self
+			.engine_call({
+				let id = id.clone();
+				move |engine| engine.resume(&id)
+			})
+			.await
+		{
+			Ok(view) => view,
+			Err(status)
+				if matches!(status.code(), Code::NotFound | Code::Aborted)
+					&& self.has_durable_suspended_marker(&id).await? =>
+			{
+				self.adopt_suspended_marker(&id).await?;
+				self.engine_call(move |engine| engine.resume(&id)).await?
+			},
+			Err(status) => return Err(status),
+		};
 		Ok(Response::new(json_view(&view)))
 	}
 
@@ -2381,7 +2622,16 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		request: Request<pb::SandboxRef>,
 	) -> Result<Response<pb::RecoveryPointList>, Status> {
 		let (metadata, _, message) = request.into_parts();
-		forward_to_owner!(self, metadata, &message.id, message, history);
+		if let PortableOwnerRoute::Forward(target) =
+			self.portable_history_target(&metadata, &message.id).await?
+			&& let Some(response) = portable_peer_response(
+				target
+					.sandbox_client()
+					.history(target.request(message.clone()))
+					.await,
+			)? {
+			return Ok(response);
+		}
 		let id = message.id;
 		let points = self
 			.engine_call(move |engine| engine.history(&id))
@@ -2402,7 +2652,24 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		request: Request<pb::RollbackSandboxRequest>,
 	) -> Result<Response<pb::JsonView>, Status> {
 		let (metadata, _, message) = request.into_parts();
-		forward_to_owner!(self, metadata, &message.id, message, rollback);
+		let admission_owner = match self.portable_history_target(&metadata, &message.id).await? {
+			PortableOwnerRoute::ServeLocal => None,
+			PortableOwnerRoute::Adopt => Some(None),
+			PortableOwnerRoute::Forward(target) => {
+				match portable_peer_response(
+					target
+						.sandbox_client()
+						.rollback(target.request(message.clone()))
+						.await,
+				)? {
+					Some(response) => return Ok(response),
+					None => Some(Some(target.owner)),
+				}
+			},
+		};
+		if let Some(owner) = admission_owner {
+			self.portable_rollback_admission(&message.id, owner.as_deref())?;
+		}
 		let pb::RollbackSandboxRequest { id, recovery_point } = message;
 		let view = self
 			.engine_call(move |engine| engine.rollback(&id, &recovery_point))
@@ -2796,6 +3063,149 @@ mod tests {
 		);
 		let conflict = status_from(&mesh_api_error(MeshError::conflict("taken")));
 		assert_eq!(conflict.code(), Code::Aborted);
+	}
+
+	#[test]
+	fn projected_suspended_marker_bypasses_owner_forwarding_only_for_resume() {
+		assert!(resume_forwards_to_owner(false), "ordinary sandboxes retain owner forwarding");
+		assert!(
+			!resume_forwards_to_owner(true),
+			"the projected suspended claimant receives local Resume"
+		);
+	}
+
+	#[test]
+	fn cross_node_resume_adopts_only_before_a_peer_rpc() {
+		let resolution_loss =
+			status_from(&mesh_api_error(MeshError::unreachable("source A is gone")));
+		assert!(resume_owner_resolution_lost(&resolution_loss));
+
+		// A transport status after forwarding may mean the owner already
+		// committed Resume. It is never safe to replay locally.
+		let dead_peer = Status::unavailable("connection lost after send");
+		assert!(!resume_owner_resolution_lost(&dead_peer));
+
+		let ambiguous =
+			status_from(&mesh_api_error(MeshError::ambiguous("source A may have accepted Resume")));
+		assert!(!resume_owner_resolution_lost(&ambiguous));
+
+		let application =
+			status_from(&ApiError::from(EngineError::engine("source A storage failed during Resume")));
+		assert!(!resume_owner_resolution_lost(&application));
+	}
+
+	#[test]
+	fn portable_history_keeps_healthy_owner_forwarding() {
+		let route = portable_owner_route(Ok(Some("https://healthy-owner")));
+		assert!(matches!(
+			route.expect("healthy owner must remain forwarded"),
+			PortableOwnerRoute::Forward("https://healthy-owner")
+		));
+	}
+
+	#[test]
+	fn portable_history_adopts_locally_only_after_definitive_owner_loss() {
+		let route = portable_owner_route::<&str>(Err(status_from(&mesh_api_error(
+			MeshError::unreachable("owner gone"),
+		))));
+		assert!(matches!(
+			route.expect("unavailable owner permits adoption"),
+			PortableOwnerRoute::Adopt
+		));
+	}
+
+	#[tokio::test]
+	async fn portable_history_adopts_after_known_peer_transport_failure() {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("reserve local port");
+		let address = listener.local_addr().expect("local address");
+		drop(listener);
+		let channel = Endpoint::from_shared(format!("http://{address}"))
+			.expect("valid dead-peer endpoint")
+			.connect_lazy();
+		let error = pb::sandbox_service_client::SandboxServiceClient::new(channel)
+			.history(Request::new(pb::SandboxRef { id: "portable-sandbox".to_owned() }))
+			.await
+			.expect_err("dead known peer must fail before producing an application response");
+		assert_eq!(error.code(), Code::Unavailable);
+		assert!(
+			portable_peer_response::<Response<pb::RecoveryPointList>>(Err(error))
+				.expect("dead peer permits fenced local adoption")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn portable_rollback_requires_dead_owner_and_restore_quorum() {
+		portable_restore_proof(true, false, 2, 2)
+			.expect("dead owner with quorum permits fenced claim");
+
+		let healthy_owner = portable_restore_proof(true, true, 2, 2)
+			.expect_err("a partitioned but healthy owner must not be adopted");
+		assert_eq!(healthy_owner.code(), Code::FailedPrecondition);
+
+		let no_quorum = portable_restore_proof(true, false, 1, 2)
+			.expect_err("dead owner without quorum must not be adopted");
+		assert_eq!(no_quorum.code(), Code::FailedPrecondition);
+
+		let stale_owner = portable_restore_proof(false, false, 2, 2)
+			.expect_err("a changed owner record must fence the claimant");
+		assert_eq!(stale_owner.code(), Code::FailedPrecondition);
+	}
+
+	#[test]
+	fn portable_history_does_not_adopt_after_ambiguous_owner_response() {
+		let error = portable_peer_response::<()>(Err(status_from(&mesh_api_error(
+			MeshError::ambiguous("owner may have committed rollback"),
+		))))
+		.expect_err("ambiguous owner response must not be replayed locally");
+		assert_eq!(error.code(), Code::Unavailable);
+		assert_eq!(
+			error
+				.metadata()
+				.get("vmon-code")
+				.and_then(|value| value.to_str().ok()),
+			Some("ambiguous")
+		);
+	}
+
+	#[test]
+	fn portable_history_does_not_adopt_after_application_unavailable() {
+		let error = portable_peer_response::<()>(Err(status_from(&ApiError::from(
+			EngineError::engine("peer could not read its storage"),
+		))))
+		.expect_err("application errors must not be replayed locally");
+		assert_eq!(error.code(), Code::Unavailable);
+		assert_eq!(
+			error
+				.metadata()
+				.get("vmon-code")
+				.and_then(|value| value.to_str().ok()),
+			Some("engine_error")
+		);
+	}
+
+	#[test]
+	fn portable_history_missing_point_and_competing_claim_have_stable_statuses() {
+		let missing = status_from(&ApiError::from(EngineError::not_found(
+			"portable recovery point not committed",
+		)));
+		assert_eq!(missing.code(), Code::NotFound);
+
+		let competing_claim = status_from(&ApiError::new(
+			axum::http::StatusCode::CONFLICT,
+			"conflict",
+			"portable restore ownership epoch changed",
+		));
+		assert_eq!(competing_claim.code(), Code::Aborted);
+		assert_eq!(
+			competing_claim
+				.metadata()
+				.get("vmon-code")
+				.and_then(|value| value.to_str().ok()),
+			Some("conflict")
+		);
 	}
 
 	#[test]

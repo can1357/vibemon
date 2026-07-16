@@ -876,7 +876,8 @@ fn inspect_prepared_image(
 	})
 }
 
-/// Return whether a reference pulls from a registry rather than a host-local transport.
+/// Return whether a reference pulls from a registry rather than a host-local
+/// transport.
 pub fn is_registry_reference(reference: &str) -> bool {
 	reference.starts_with("docker://")
 		|| !IMAGE_TRANSPORT_PREFIXES

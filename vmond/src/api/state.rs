@@ -156,7 +156,9 @@ pub async fn auth_middleware(
 	}
 	match state.transport {
 		Transport::Unix => {
-			request.extensions_mut().insert(Principal::local_admin());
+			let principal = Principal::local_admin();
+			set_principal_headers(request.headers_mut(), &principal);
+			request.extensions_mut().insert(principal);
 			Ok(next.run(request).await)
 		},
 		Transport::Tcp => authorize_tcp(&state, request, next).await,
@@ -263,7 +265,8 @@ fn is_static_web_path(path: &str) -> bool {
 		|| path == "/grpc")
 }
 
-/// Require administrator authority for every API without explicit tenant scoping.
+/// Require administrator authority for every API without explicit tenant
+/// scoping.
 pub fn is_admin_path(path: &str) -> bool {
 	if path == "/metrics"
 		|| path.starts_with("/v1/mesh/")

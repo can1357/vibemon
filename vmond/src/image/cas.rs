@@ -4,7 +4,9 @@ use std::{
 	collections::BTreeMap,
 	fs::{self, File},
 	io::{Read, Write},
+	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
+	sync::{LazyLock, Mutex},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +20,14 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const MARKER_NAME: &str = "agent-ready.json";
 const VOLATILE_MARKER_FIELD: &str = "content_digest";
 
+/// Serializes pointer publication with exact-pointer cleanup in this process.
+static POINTER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn pointer_lock() -> std::sync::MutexGuard<'static, ()> {
+	POINTER_LOCK
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 /// CAS pointer payload stored under `$VMON_HOME/cas/<digest>.json`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CasPointer {
@@ -33,18 +43,16 @@ pub fn cas_root() -> Result<PathBuf> {
 	Ok(root)
 }
 
-/// Return a stable SHA-256 digest for a template's bootable content.
+/// Return the stable legacy SHA-256 digest for a template's bootable files.
 ///
-/// All-zero 64 KiB blocks are folded into run-length markers instead of being
-/// hashed byte-by-byte, so digesting a mostly-sparse multi-GiB checkpoint
-/// costs a memory scan rather than a full-length hash. The encoding is
-/// injective (tagged zero-run / data-run records), purely content-defined,
-/// and therefore independent of the file's physical hole layout.
+/// This content-only digest identifies template CAS pointers and deliberately
+/// remains compatible with existing pointer names. Zero runs are encoded
+/// independently of physical holes.
 pub fn template_digest(template_dir: &Path) -> Result<String> {
 	const ZERO_BLOCK: usize = 64 * 1024;
 	let mut digest = Sha256::new();
 	for path in regular_files(template_dir)? {
-		let rel = rel_path(template_dir, &path)?;
+		let rel = template_rel_path(template_dir, &path)?;
 		digest.update(rel.as_bytes());
 		digest.update(b"\0");
 		if path.file_name().and_then(|name| name.to_str()) == Some(MARKER_NAME)
@@ -57,8 +65,6 @@ pub fn template_digest(template_dir: &Path) -> Result<String> {
 		let mut buf = vec![0_u8; CHUNK_SIZE];
 		let mut zero_run = 0u64;
 		loop {
-			// Fill the whole chunk (short reads would shift 64 KiB block
-			// boundaries and make the digest depend on read sizes).
 			let mut n = 0usize;
 			while n < buf.len() {
 				let got = file.read(&mut buf[n..])?;
@@ -96,6 +102,43 @@ pub fn template_digest(template_dir: &Path) -> Result<String> {
 	Ok(hex::encode(digest.finalize()))
 }
 
+/// Return a canonical SHA-256 digest for the complete transfer bundle tree.
+///
+/// The digest covers every directory (including empty ones), regular file, and
+/// symlink. Entry records are length- and type-framed so distinct trees cannot
+/// be concatenated into the same hash input. File data encodes zero runs
+/// independently of physical holes, keeping sparse and dense copies equal.
+pub fn snapshot_digest(template_dir: &Path) -> Result<String> {
+	let mut digest = Sha256::new();
+	for entry in template_entries(template_dir)? {
+		digest.update([b'E', entry.kind.tag()]);
+		hash_field(&mut digest, entry.rel.as_bytes());
+
+		match entry.kind {
+			EntryKind::Directory => {
+				digest.update(b"M");
+				digest.update(entry.meta.permissions().mode().to_le_bytes());
+			},
+			EntryKind::Symlink => {
+				let target = fs::read_link(&entry.path)?;
+				let target = target
+					.to_str()
+					.ok_or_else(|| EngineError::invalid("template symlink target is not utf-8"))?;
+				digest.update(b"T");
+				hash_field(&mut digest, target.as_bytes());
+			},
+			EntryKind::File => {
+				digest.update(b"M");
+				digest.update(entry.meta.permissions().mode().to_le_bytes());
+				digest.update(b"L");
+				digest.update(entry.meta.len().to_le_bytes());
+				hash_file_bytes(&mut digest, &entry.path)?;
+			},
+		}
+	}
+	Ok(hex::encode(digest.finalize()))
+}
+
 /// Record a digest-to-template pointer and return the digest.
 pub fn index_template(template_dir: &Path, digest: Option<&str>) -> Result<String> {
 	let digest = match digest {
@@ -103,6 +146,7 @@ pub fn index_template(template_dir: &Path, digest: Option<&str>) -> Result<Strin
 		None => template_digest(template_dir)?,
 	};
 	let pointer = pointer_path(&digest)?;
+	let _guard = pointer_lock();
 	let mut created_unix = unix_now();
 	let existing = read_pointer_file(&pointer).ok();
 	if let Some(existing) = &existing {
@@ -144,9 +188,32 @@ pub fn drop_pointer(digest: &str) -> Result<()> {
 	let Ok(pointer) = pointer_path(digest) else {
 		return Ok(());
 	};
+	let _guard = pointer_lock();
 	match fs::remove_file(pointer) {
 		Ok(()) => Ok(()),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(e) => Err(e.into()),
+	}
+}
+
+/// Remove a pointer only when it still names `template_dir`.
+///
+/// This prevents an abandoned duplicate checkpoint from unpublishing a newer
+/// identical-content checkpoint that has reused the same digest pointer.
+pub fn drop_pointer_exact(digest: &str, template_dir: &Path) -> Result<bool> {
+	let Ok(pointer) = pointer_path(digest) else {
+		return Ok(false);
+	};
+	let _guard = pointer_lock();
+	let Ok(payload) = read_pointer_file(&pointer) else {
+		return Ok(false);
+	};
+	if Path::new(&payload.template_dir) != template_dir {
+		return Ok(false);
+	}
+	match fs::remove_file(pointer) {
+		Ok(()) => Ok(true),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
 		Err(e) => Err(e.into()),
 	}
 }
@@ -189,14 +256,13 @@ fn pointer_path(digest: &str) -> Result<PathBuf> {
 fn regular_files(template_dir: &Path) -> Result<Vec<PathBuf>> {
 	let mut out = Vec::new();
 	collect_regular_files(template_dir, &mut out)?;
-	out.sort_by_key(|path| rel_path(template_dir, path).unwrap_or_default());
+	out.sort_by_key(|path| template_rel_path(template_dir, path).unwrap_or_default());
 	Ok(out)
 }
 
 fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 	for entry in fs::read_dir(dir)? {
-		let entry = entry?;
-		let path = entry.path();
+		let path = entry?.path();
 		let meta = fs::symlink_metadata(&path)?;
 		if meta.file_type().is_dir() {
 			collect_regular_files(&path, out)?;
@@ -207,7 +273,7 @@ fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 	Ok(())
 }
 
-fn rel_path(root: &Path, path: &Path) -> Result<String> {
+fn template_rel_path(root: &Path, path: &Path) -> Result<String> {
 	let rel = path
 		.strip_prefix(root)
 		.map_err(|e| EngineError::engine(e.to_string()))?;
@@ -218,6 +284,129 @@ fn rel_path(root: &Path, path: &Path) -> Result<String> {
 		.join("/"))
 }
 
+#[derive(Clone, Copy)]
+enum EntryKind {
+	Directory,
+	File,
+	Symlink,
+}
+
+impl EntryKind {
+	const fn tag(self) -> u8 {
+		match self {
+			Self::Directory => 1,
+			Self::File => 2,
+			Self::Symlink => 3,
+		}
+	}
+}
+
+struct TemplateEntry {
+	path: PathBuf,
+	rel:  String,
+	meta: fs::Metadata,
+	kind: EntryKind,
+}
+
+fn template_entries(template_dir: &Path) -> Result<Vec<TemplateEntry>> {
+	let mut out = Vec::new();
+	collect_template_entries(template_dir, template_dir, &mut out)?;
+	out.sort_by(|left, right| left.rel.cmp(&right.rel));
+	Ok(out)
+}
+
+fn collect_template_entries(root: &Path, path: &Path, out: &mut Vec<TemplateEntry>) -> Result<()> {
+	let meta = fs::symlink_metadata(path)?;
+	let kind = if meta.file_type().is_dir() {
+		EntryKind::Directory
+	} else if meta.file_type().is_file() {
+		EntryKind::File
+	} else if meta.file_type().is_symlink() {
+		EntryKind::Symlink
+	} else {
+		return Ok(());
+	};
+	out.push(TemplateEntry {
+		path: path.to_owned(),
+		rel: snapshot_rel_path(root, path)?,
+		meta,
+		kind,
+	});
+	if matches!(kind, EntryKind::Directory) {
+		for entry in fs::read_dir(path)? {
+			collect_template_entries(root, &entry?.path(), out)?;
+		}
+	}
+	Ok(())
+}
+
+fn hash_field(digest: &mut Sha256, bytes: &[u8]) {
+	digest.update((bytes.len() as u64).to_le_bytes());
+	digest.update(bytes);
+}
+
+fn hash_file_bytes(digest: &mut Sha256, path: &Path) -> Result<()> {
+	let mut file = File::open(path)?;
+	let mut buf = vec![0_u8; CHUNK_SIZE];
+	loop {
+		let mut n = 0usize;
+		while n < buf.len() {
+			let got = file.read(&mut buf[n..])?;
+			if got == 0 {
+				break;
+			}
+			n += got;
+		}
+		if n == 0 {
+			break;
+		}
+		hash_logical_bytes(digest, &buf[..n]);
+	}
+	digest.update(b"X");
+	Ok(())
+}
+
+fn hash_logical_bytes(digest: &mut Sha256, bytes: &[u8]) {
+	const ZERO_BLOCK: usize = 64 * 1024;
+	let mut cursor = 0usize;
+	let mut zero_run = 0u64;
+	while cursor < bytes.len() {
+		let end = bytes.len().min(cursor + ZERO_BLOCK);
+		if crate::mesh::bundle::is_zero(&bytes[cursor..end]) {
+			zero_run += (end - cursor) as u64;
+		} else {
+			if zero_run > 0 {
+				digest.update(b"Z");
+				digest.update(zero_run.to_le_bytes());
+				zero_run = 0;
+			}
+			digest.update(b"D");
+			digest.update(((end - cursor) as u64).to_le_bytes());
+			digest.update(&bytes[cursor..end]);
+		}
+		cursor = end;
+	}
+	if zero_run > 0 {
+		digest.update(b"Z");
+		digest.update(zero_run.to_le_bytes());
+	}
+}
+
+fn snapshot_rel_path(root: &Path, path: &Path) -> Result<String> {
+	let rel = path
+		.strip_prefix(root)
+		.map_err(|e| EngineError::engine(e.to_string()))?;
+	let mut components = Vec::new();
+	for component in rel.components() {
+		components.push(
+			component
+				.as_os_str()
+				.to_str()
+				.ok_or_else(|| EngineError::invalid("template path is not utf-8"))?,
+		);
+	}
+	Ok(components.join("/"))
+}
 fn marker_bytes(path: &Path) -> Result<Vec<u8>> {
 	let bytes = fs::read(path)?;
 	let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
@@ -280,9 +469,13 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-	use std::fs;
+	use std::{
+		fs,
+		os::unix::fs::{PermissionsExt, symlink},
+	};
 
 	use sha2::{Digest, Sha256};
+
 	type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 	use super::*;
@@ -301,12 +494,15 @@ mod tests {
 		)?;
 
 		let digest_a = template_digest(&tpl)?;
+		let snapshot_a = snapshot_digest(&tpl)?;
 		fs::write(
 			tpl.join(MARKER_NAME),
 			br#"{"boot_version":6,"content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memory":512}"#,
 		)?;
 		let digest_b = template_digest(&tpl)?;
+		let snapshot_b = snapshot_digest(&tpl)?;
 		assert_eq!(digest_a, digest_b);
+		assert_ne!(snapshot_a, snapshot_b);
 
 		let mut expected = Sha256::new();
 		expected.update(b"agent-ready.json\0");
@@ -320,6 +516,7 @@ mod tests {
 		expected.update(4u64.to_le_bytes());
 		expected.update(b"root");
 		assert_eq!(digest_a, hex::encode(expected.finalize()));
+
 		Ok(())
 	}
 
@@ -344,7 +541,53 @@ mod tests {
 		holey.set_len(8 * 1024 * 1024)?;
 		drop(holey);
 
+		assert_eq!(snapshot_digest(&dense)?, snapshot_digest(&sparse)?);
 		assert_eq!(template_digest(&dense)?, template_digest(&sparse)?);
+		Ok(())
+	}
+
+	#[test]
+	fn snapshot_digest_reflects_all_bundle_entry_attributes() -> TestResult {
+		let tmp = tempfile::tempdir()?;
+		let tpl = tmp.path().join("tpl");
+		fs::create_dir(&tpl)?;
+		let file = tpl.join("file");
+		fs::write(&file, b"same bytes")?;
+
+		let initial = snapshot_digest(&tpl)?;
+		fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
+		assert_ne!(initial, snapshot_digest(&tpl)?);
+		fs::set_permissions(&file, fs::Permissions::from_mode(0o644))?;
+
+		fs::create_dir(tpl.join("empty"))?;
+		let with_empty_dir = snapshot_digest(&tpl)?;
+		assert_ne!(initial, with_empty_dir);
+		fs::set_permissions(tpl.join("empty"), fs::Permissions::from_mode(0o700))?;
+		assert_ne!(with_empty_dir, snapshot_digest(&tpl)?);
+		fs::remove_dir(tpl.join("empty"))?;
+
+		symlink("first-target", tpl.join("link"))?;
+		let first_target = snapshot_digest(&tpl)?;
+		fs::remove_file(tpl.join("link"))?;
+		symlink("second-target", tpl.join("link"))?;
+		assert_ne!(first_target, snapshot_digest(&tpl)?);
+		fs::remove_file(tpl.join("link"))?;
+
+		let file_tree = tmp.path().join("file-tree");
+		let dir_tree = tmp.path().join("dir-tree");
+		fs::create_dir(&file_tree)?;
+		fs::create_dir(&dir_tree)?;
+		fs::write(file_tree.join("entry"), b"")?;
+		fs::create_dir(dir_tree.join("entry"))?;
+		assert_ne!(snapshot_digest(&file_tree)?, snapshot_digest(&dir_tree)?);
+
+		let left_path = tmp.path().join("left-path");
+		let right_path = tmp.path().join("right-path");
+		fs::create_dir(&left_path)?;
+		fs::create_dir(&right_path)?;
+		fs::write(left_path.join("left"), b"same bytes")?;
+		fs::write(right_path.join("right"), b"same bytes")?;
+		assert_ne!(snapshot_digest(&left_path)?, snapshot_digest(&right_path)?);
 		Ok(())
 	}
 

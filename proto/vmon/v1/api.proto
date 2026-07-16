@@ -81,15 +81,17 @@ service SandboxService {
   //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
   rpc Pause(SandboxRef) returns (JsonView);
 
-  // Resumes vCPU execution for a paused sandbox.
+  // Resumes a paused sandbox in place, or restores a durably suspended sandbox.
+  // A suspended resume restores the exact committed suspend checkpoint and preserves the sandbox ID.
   //
   // Replaces: POST /v1/sandboxes/{id}/resume
   // Errors:
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is neither paused nor suspended.
   rpc Resume(SandboxRef) returns (JsonView);
 
   // Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+  // A failed checkpoint leaves the prior live VM and lifecycle state intact.
   rpc Suspend(SandboxRef) returns (JsonView);
 
   // Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
@@ -231,10 +233,11 @@ service SandboxService {
   //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
   rpc SnapshotFs(SnapshotFsRequest) returns (JsonView);
 
-  // Lists rolling disk and full-checkpoint recovery points for a sandbox.
+  // Lists rolling `disk` and `checkpoint` recovery points from oldest to newest.
   rpc History(SandboxRef) returns (RecoveryPointList);
 
-  // Restores a sandbox identity to one retained recovery point.
+  // Restores this sandbox identity to one immutable retained recovery point.
+  // The current VM remains authoritative until the replacement is ready to cut over.
   rpc Rollback(RollbackSandboxRequest) returns (JsonView);
 }
 
@@ -606,11 +609,15 @@ message SnapshotRef {
   string name = 1;
 }
 
-// RecoveryPoint describes one retained disk or full-checkpoint capture.
+// RecoveryPoint describes one immutable retained disk or checkpoint capture.
 message RecoveryPoint {
+  // Server-assigned recovery-point identifier accepted by Rollback.
   string name = 1;
+  // Capture type: `disk` cold-boots from durable disk state; `checkpoint` restores VM execution state.
   string kind = 2;
+  // Server commit time in Unix milliseconds.
   uint64 created_at_unix_millis = 3;
+  // Stored recovery archive size in bytes.
   uint64 size_bytes = 4;
 }
 

@@ -2,13 +2,13 @@
 //! escalation. Port of python/vmon/vmm.py.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, HashMap},
 	fs::{self, OpenOptions},
-	io,
+	io::{self, Write},
 	os::unix::{fs::PermissionsExt, process::CommandExt},
 	path::{Path, PathBuf},
 	process::{Child, Command, Stdio},
-	sync::LazyLock,
+	sync::{Arc, LazyLock, Mutex},
 	thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +33,152 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
 const READY_SLEEP: Duration = Duration::from_millis(2);
 const WAIT_POLL: Duration = Duration::from_millis(20);
 
+/// Process-wide locks for every shared sandbox metadata path.
+static META_PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Atomically replace one metadata object while serializing all in-process
+/// writers for its path.
+pub(crate) fn replace_meta_map(path: &Path, metadata: &Map<String, Value>) -> Result<()> {
+	let lock = meta_path_lock(path)?;
+	let _guard = lock
+		.lock()
+		.map_err(|_| EngineError::engine(format!("metadata lock poisoned: {}", path.display())))?;
+	write_meta_map_atomically(path, metadata)
+}
+
+/// Merge metadata updates without allowing legacy VMM writers to overwrite an
+/// already durable lifecycle/status generation.
+pub(crate) fn merge_meta_map(path: &Path, updates: Map<String, Value>) -> Result<()> {
+	let lock = meta_path_lock(path)?;
+	let _guard = lock
+		.lock()
+		.map_err(|_| EngineError::engine(format!("metadata lock poisoned: {}", path.display())))?;
+	let mut metadata = read_meta_map(path)?;
+	let lifecycle_managed = metadata.contains_key("lifecycle")
+		|| metadata.contains_key("desired_state")
+		|| metadata.contains_key("observed_state")
+		|| metadata.contains_key("state_generation");
+	for (key, value) in updates {
+		if lifecycle_managed
+			&& matches!(
+				key.as_str(),
+				"lifecycle"
+					| "desired_state"
+					| "observed_state"
+					| "state_generation"
+					| "lifecycle_failure"
+					| "status"
+			) {
+			continue;
+		}
+		metadata.insert(key, value);
+	}
+	write_meta_map_atomically(path, &metadata)
+}
+
+fn meta_path_lock(path: &Path) -> Result<Arc<Mutex<()>>> {
+	let canonical = path.to_path_buf();
+	let mut locks = META_PATH_LOCKS.lock().map_err(|_| {
+		EngineError::engine(format!("metadata lock registry poisoned: {}", path.display()))
+	})?;
+	Ok(locks.entry(canonical).or_default().clone())
+}
+
+fn read_meta_map(path: &Path) -> Result<Map<String, Value>> {
+	match fs::read_to_string(path) {
+		Ok(text) => match serde_json::from_str::<Value>(&text)? {
+			Value::Object(map) => Ok(map),
+			_ => {
+				Err(EngineError::invalid(format!("metadata {} is not a JSON object", path.display())))
+			},
+		},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+		Err(error) => Err(error.into()),
+	}
+}
+
+fn write_meta_map_atomically(path: &Path, metadata: &Map<String, Value>) -> Result<()> {
+	let parent = path.parent().ok_or_else(|| {
+		EngineError::invalid(format!("metadata path {} has no parent", path.display()))
+	})?;
+	fs::create_dir_all(parent)?;
+	let temporary = parent.join(format!(
+		".{}.{}.{}.tmp",
+		path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or("meta"),
+		std::process::id(),
+		SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_nanos(),
+	));
+	let mut file = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&temporary)?;
+	let result = (|| -> Result<()> {
+		file.write_all(&serde_json::to_vec_pretty(&Value::Object(metadata.clone()))?)?;
+		file.sync_all()?;
+		replace_file_atomically(&temporary, path)?;
+		sync_parent_directory(parent)?;
+		Ok(())
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temporary);
+	}
+	result
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
+	fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
+	use std::os::windows::ffi::OsStrExt;
+
+	unsafe extern "system" {
+		fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+	}
+
+	const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+	const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+	let temporary = temporary
+		.as_os_str()
+		.encode_wide()
+		.chain(Some(0))
+		.collect::<Vec<_>>();
+	let destination = destination
+		.as_os_str()
+		.encode_wide()
+		.chain(Some(0))
+		.collect::<Vec<_>>();
+	if unsafe {
+		MoveFileExW(
+			temporary.as_ptr(),
+			destination.as_ptr(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+		)
+	} == 0
+	{
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+	fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+	Ok(())
+}
 /// Kind of VMM launch to construct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchMode {
@@ -111,6 +257,10 @@ pub struct LaunchSpec {
 	pub mode: LaunchMode,
 	/// Control socket path passed as `--api-sock`.
 	pub api_sock: PathBuf,
+	/// Keep the VMM paused until a later internal control-plane resume.
+	///
+	/// This is a daemon lifecycle primitive, not a public sandbox-create field.
+	pub start_paused: bool,
 	/// Kernel image for fresh boots.
 	pub kernel: Option<PathBuf>,
 	/// Guest kernel command line.
@@ -148,6 +298,10 @@ pub struct LaunchSpec {
 	pub remote_fs: Vec<RemoteFsShare>,
 	/// Optional wall-clock timeout in seconds.
 	pub timeout_secs: Option<u64>,
+	/// Optional production ownership watchdog initial grace in seconds.
+	///
+	/// This is intentionally absent for single-node launches.
+	pub owner_lease_secs: Option<u64>,
 	/// Snapshot root passed to the VMM.
 	pub snapshot_root: Option<PathBuf>,
 	/// Mesh lazy-page HTTP source.
@@ -172,6 +326,7 @@ impl LaunchSpec {
 		Self {
 			mode: LaunchMode::Boot,
 			api_sock: api_sock.into(),
+			start_paused: false,
 			kernel: Some(kernel.into()),
 			cmdline: Some(default_cmdline(false)),
 			rootfs: Some(rootfs.into()),
@@ -189,6 +344,7 @@ impl LaunchSpec {
 			volumes: Vec::new(),
 			remote_fs: Vec::new(),
 			timeout_secs: None,
+			owner_lease_secs: None,
 			snapshot_root: None,
 			remote_page_url: None,
 			remote_page_token: None,
@@ -212,6 +368,7 @@ impl LaunchSpec {
 		Self {
 			mode,
 			api_sock: api_sock.into(),
+			start_paused: false,
 			kernel: None,
 			cmdline: None,
 			rootfs: None,
@@ -229,6 +386,7 @@ impl LaunchSpec {
 			volumes: Vec::new(),
 			remote_fs: Vec::new(),
 			timeout_secs: None,
+			owner_lease_secs: None,
 			snapshot_root: None,
 			remote_page_url: None,
 			remote_page_token: None,
@@ -256,6 +414,12 @@ impl LaunchSpec {
 	/// Set vCPU count.
 	pub const fn with_cpus(mut self, cpus: u64) -> Self {
 		self.cpus = Some(cpus);
+		self
+	}
+
+	/// Keep the launched VMM paused until an internal resume command.
+	pub const fn with_start_paused(mut self) -> Self {
+		self.start_paused = true;
 		self
 	}
 
@@ -335,6 +499,12 @@ impl LaunchSpec {
 		self
 	}
 
+	/// Set the production ownership watchdog initial grace seconds.
+	pub const fn with_owner_lease_secs(mut self, owner_lease_secs: u64) -> Self {
+		self.owner_lease_secs = Some(owner_lease_secs);
+		self
+	}
+
 	/// Set the snapshot root directory.
 	pub fn with_snapshot_root(mut self, snapshot_root: impl Into<PathBuf>) -> Self {
 		self.snapshot_root = Some(snapshot_root.into());
@@ -401,6 +571,9 @@ impl LaunchSpec {
 		if let Some(timeout_secs) = self.timeout_secs {
 			validate_range(timeout_secs, "timeout_secs", MAX_TIMEOUT_SECS, "")?;
 		}
+		if let Some(owner_lease_secs) = self.owner_lease_secs {
+			validate_range(owner_lease_secs, "owner_lease_secs", MAX_TIMEOUT_SECS, "")?;
+		}
 		for volume in &self.volumes {
 			validate_volume_mount(volume)?;
 		}
@@ -455,6 +628,7 @@ pub fn build_launch_args(spec: &LaunchSpec) -> Vec<String> {
 				fs:     true,
 				remote: true,
 			});
+			append_start_paused_arg(&mut args, spec);
 			return args;
 		},
 		LaunchMode::Fork { snapshot } => {
@@ -467,6 +641,7 @@ pub fn build_launch_args(spec: &LaunchSpec) -> Vec<String> {
 				fs:     false,
 				remote: false,
 			});
+			append_start_paused_arg(&mut args, spec);
 			return args;
 		},
 	}
@@ -477,7 +652,14 @@ pub fn build_launch_args(spec: &LaunchSpec) -> Vec<String> {
 		fs:     true,
 		remote: false,
 	});
+	append_start_paused_arg(&mut args, spec);
 	args
+}
+
+fn append_start_paused_arg(args: &mut Vec<String>, spec: &LaunchSpec) {
+	if spec.start_paused {
+		args.push("--start-paused".to_owned());
+	}
 }
 
 fn append_rootfs_args(args: &mut Vec<String>, spec: &LaunchSpec, allow_direct_read_only: bool) {
@@ -540,6 +722,9 @@ fn append_after_disk_args(args: &mut Vec<String>, spec: &LaunchSpec, flags: Afte
 	args.extend(remote_fs_args(&spec.remote_fs));
 	if let Some(timeout_secs) = spec.timeout_secs {
 		push_arg(args, "--timeout-secs", timeout_secs.to_string());
+	}
+	if let Some(owner_lease_secs) = spec.owner_lease_secs {
+		push_arg(args, "--owner-lease-secs", owner_lease_secs.to_string());
 	}
 	if let Some(snapshot_root) = &spec.snapshot_root {
 		push_arg(args, "--snapshot-root", snapshot_root);
@@ -747,14 +932,7 @@ impl SandboxVm {
 
 	/// Merge updates into `meta.json` using Python-compatible field names.
 	pub fn save_meta(&self, updates: Map<String, Value>) -> Result<()> {
-		fs::create_dir_all(&self.dir)?;
-		let mut meta = self.meta()?;
-		for (key, value) in updates {
-			meta.insert(key, value);
-		}
-		let text = serde_json::to_string_pretty(&Value::Object(meta))?;
-		fs::write(&self.meta_path, text)?;
-		Ok(())
+		merge_meta_map(&self.meta_path, updates)
 	}
 
 	/// Return the pid recorded in metadata, if any.
@@ -1376,6 +1554,31 @@ mod tests {
 	}
 
 	#[test]
+	fn start_paused_builder_emits_flag_for_every_launch_mode() {
+		let boot =
+			LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img").with_start_paused();
+		let restore = LaunchSpec::restore("/vm/api.sock", snapshot("snap")).with_start_paused();
+		let fork = LaunchSpec::fork_from("/vm/api.sock", snapshot("snap")).with_start_paused();
+
+		let default_boot = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img");
+		assert!(
+			!build_launch_args(&default_boot)
+				.iter()
+				.any(|arg| arg == "--start-paused"),
+			"ordinary launches must remain runnable"
+		);
+
+		for spec in [&boot, &restore, &fork] {
+			assert!(spec.start_paused);
+			assert!(
+				build_launch_args(spec)
+					.iter()
+					.any(|arg| arg == "--start-paused"),
+				"start-paused launch must emit --start-paused"
+			);
+		}
+	}
+	#[test]
 	fn spawn_restore_rejects_invalid_resource_args_before_launch() {
 		assert!(
 			LaunchSpec::restore("/api.sock", snapshot("snap"))
@@ -1585,6 +1788,23 @@ mod tests {
 	}
 
 	#[test]
+	fn owner_watchdog_flag_is_opt_in() {
+		let single = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img");
+		assert!(
+			!build_launch_args(&single)
+				.iter()
+				.any(|arg| arg == "--owner-lease-secs")
+		);
+		let production = single.with_owner_lease_secs(15);
+		let args = production.try_build_args().unwrap();
+		let index = args
+			.iter()
+			.position(|arg| arg == "--owner-lease-secs")
+			.unwrap();
+		assert_eq!(args[index + 1], "15");
+	}
+
+	#[test]
 	fn spawn_list_in_sorts_vm_directories() {
 		let tmp = tempfile::tempdir().unwrap();
 		fs::create_dir(tmp.path().join("b")).unwrap();
@@ -1618,5 +1838,52 @@ mod tests {
 		vm.save_meta(meta).unwrap();
 		assert_eq!(vm.control_sock().unwrap(), p("/jail/root/run/vmon/control.sock"));
 		assert_eq!(vm.agent_sock().unwrap(), p("/jail/root/run/vmon/agent.sock"));
+	}
+	#[test]
+	fn concurrent_stale_metadata_writer_cannot_revert_lifecycle_generation() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let vm = SandboxVm::from_dir("vm", tmp.path().join("vm"));
+		let mut generation_one = Map::new();
+		generation_one.insert(
+			"lifecycle".to_owned(),
+			json!({"desired": "running", "observed": "stopped", "generation": 1}),
+		);
+		generation_one.insert("status".to_owned(), json!("stopped"));
+		replace_meta_map(vm.meta_path(), &generation_one).expect("seed metadata");
+
+		let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+		let stale_vm = vm.clone();
+		let stale_barrier = std::sync::Arc::clone(&barrier);
+		let stale = std::thread::spawn(move || {
+			stale_barrier.wait();
+			stale_vm
+				.save_meta(Map::from_iter([
+					("state_generation".to_owned(), json!(1)),
+					("desired_state".to_owned(), json!("stopped")),
+					("observed_state".to_owned(), json!("stopped")),
+					("status".to_owned(), json!("stopped")),
+					("last_active".to_owned(), json!(42)),
+				]))
+				.expect("stale writer");
+		});
+		let current_path = vm.meta_path().to_path_buf();
+		let current_barrier = std::sync::Arc::clone(&barrier);
+		let current = std::thread::spawn(move || {
+			current_barrier.wait();
+			let mut generation_two = Map::new();
+			generation_two.insert(
+				"lifecycle".to_owned(),
+				json!({"desired": "running", "observed": "running", "generation": 2}),
+			);
+			generation_two.insert("status".to_owned(), json!("running"));
+			replace_meta_map(&current_path, &generation_two).expect("current writer");
+		});
+		barrier.wait();
+		stale.join().expect("stale join");
+		current.join().expect("current join");
+
+		let metadata = vm.meta().expect("read metadata");
+		assert_eq!(metadata["lifecycle"]["generation"], 2);
+		assert_eq!(metadata["status"], "running");
 	}
 }

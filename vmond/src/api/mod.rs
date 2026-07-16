@@ -459,14 +459,7 @@ mod tests {
 				.expect("store test package");
 			functions
 				.store()
-				.record_artifact(
-					&package.digest,
-					package.size,
-					Some("application/octet-stream"),
-					package.path.to_str().expect("test package path"),
-					0,
-					None,
-				)
+				.record_stored_artifact(&package, Some("application/octet-stream"), 0, None)
 				.expect("register test package");
 			let state = ApiState::new(engine, functions.clone(), config, Transport::Tcp);
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1921,23 +1914,13 @@ mod tests {
 		assert_eq!(captures.rollbacks, vec![("sandbox-1".to_owned(), "checkpoint-1".to_owned())]);
 		assert_eq!(captures.snapshot_deletes, vec!["snapshot-1"]);
 		assert_eq!(captures.credential_lists, vec!["tenant-a"]);
-		assert_eq!(
-			captures.credential_puts,
-			vec![
-				(
-					"tenant-a".to_owned(),
-					"default".to_owned(),
-					"service-token".to_owned()
-				),
-				("default".to_owned(), "default".to_owned(), "own-token".to_owned()),
-			]
-		);
-		assert_eq!(
-			captures.credential_deletes,
-			vec![
-				("tenant-a".to_owned(), "service-token".to_owned()),
-				("default".to_owned(), "own-token".to_owned()),
-			]
-		);
+		assert_eq!(captures.credential_puts, vec![
+			("tenant-a".to_owned(), "default".to_owned(), "service-token".to_owned()),
+			("default".to_owned(), "default".to_owned(), "own-token".to_owned()),
+		]);
+		assert_eq!(captures.credential_deletes, vec![
+			("tenant-a".to_owned(), "service-token".to_owned()),
+			("default".to_owned(), "own-token".to_owned()),
+		]);
 	}
 }
