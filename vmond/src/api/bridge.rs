@@ -39,6 +39,7 @@ use vmon_proto::{
 };
 
 use super::grpc::MAX_MESSAGE_SIZE;
+use crate::security::Principal;
 
 /// Request headers a bridge client must not override.
 const RESTRICTED_METADATA: &[&str] =
@@ -46,17 +47,17 @@ const RESTRICTED_METADATA: &[&str] =
 
 type BodyChunk = Result<Bytes, Infallible>;
 
-pub(super) async fn serve_bridge(routes: Routes, restricted: bool, socket: WebSocket) {
+pub(super) async fn serve_bridge(routes: Routes, principal: Principal, socket: WebSocket) {
 	let (sender, receiver) = socket.split();
 	let (out_tx, out_rx) = mpsc::channel::<pb::BridgeFrame>(16);
 	let writer = write_frames(sender, out_rx);
-	let session = run_session(routes, restricted, receiver, out_tx);
+	let session = run_session(routes, principal, receiver, out_tx);
 	tokio::join!(writer, session);
 }
 
 async fn run_session(
 	mut routes: Routes,
-	restricted: bool,
+	principal: Principal,
 	mut receiver: SplitStream<WebSocket>,
 	out_tx: mpsc::Sender<pb::BridgeFrame>,
 ) {
@@ -73,13 +74,15 @@ async fn run_session(
 			Some(Ok(Message::Close(_)) | Err(_)) | None => return,
 		}
 	};
-	if restricted && super::state::is_admin_path(&call.method) {
+	if !principal.is_admin() && super::state::is_admin_path(&call.method) {
 		return send_frame(&out_tx, forbidden_end()).await;
 	}
-	let (request, body_tx) = match build_request(call) {
+	let (mut request, body_tx) = match build_request(call) {
 		Ok(parts) => parts,
 		Err(end) => return send_frame(&out_tx, end).await,
 	};
+	super::state::set_principal_headers(request.headers_mut(), &principal);
+	request.extensions_mut().insert(principal);
 	// `Routes` is infallibly ready (`Error = Infallible`).
 	let _ =
 		std::future::poll_fn(|cx| Service::<Request<AxumBody>>::poll_ready(&mut routes, cx)).await;

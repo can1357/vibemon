@@ -119,11 +119,11 @@ async fn bridge_ws(
 	uri: Uri,
 	ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-	let restricted = super::state::bridge_restricted(&state, &headers, uri.query());
+	let principal = super::state::bridge_principal(&state, &headers, uri.query());
 	let routes = super::grpc::service(state);
 	ws.max_message_size(BODY_LIMIT + 1024)
 		.max_frame_size(BODY_LIMIT + 1024)
-		.on_upgrade(move |socket| super::bridge::serve_bridge(routes, restricted, socket))
+		.on_upgrade(move |socket| super::bridge::serve_bridge(routes, principal, socket))
 }
 
 async fn template_archive(

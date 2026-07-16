@@ -1,13 +1,14 @@
 //! gRPC surface of the v1 API (proto/vmon/v1/api.proto).
 //!
-//! Five tonic services implemented against [`EngineApi`], mounted into the
-//! axum router next to the kept HTTP routes (healthz, metrics, SSE, WS, ports
-//! proxy, static web). Every RPC failure is a gRPC status carrying the stable
-//! vmond error code in `vmon-code` response metadata. Requests for sandboxes
-//! owned by a mesh peer are re-issued over a tonic channel to the owner.
+//! Ten tonic services implemented against [`EngineApi`] or their dedicated
+//! domains, mounted into the axum router next to the kept HTTP routes (healthz,
+//! metrics, SSE, WS, ports proxy, static web). Every RPC failure is a gRPC
+//! status carrying the stable vmond error code in `vmon-code` response
+//! metadata. Requests for sandboxes owned by a mesh peer are re-issued over a
+//! tonic channel to the owner.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	io::{Read as _, Seek as _, SeekFrom},
 	pin::Pin,
 	sync::Arc,
@@ -26,20 +27,25 @@ use tonic::{
 };
 use vmon_proto::v1 as pb;
 
-use super::{
-	error::{ApiError, ApiResult, join_error},
-	routes::compact_json,
-	state::ApiState,
-	validation,
-};
 use crate::{
+	ErrorCode,
+	api::{
+		error::{ApiError, ApiResult, join_error},
+		routes::compact_json,
+		state::{ApiState, PRINCIPAL_KEY_HEADER, PRINCIPAL_ROLE_HEADER, PRINCIPAL_TENANT_HEADER},
+		validation,
+	},
 	engine::{EngineApi, ExecExit, ExecStream as EngineExecStream},
-	image::normalize_oci_arch,
+	image::{self, normalize_oci_arch},
 	mesh::{
 		proxy::{self, MeshError, MeshPeer, OwnerProxyDecision, OwnerRecord},
 		routes::{CreateRecordWire, MeshControl, MeshRecordStore, MeshRouteState, apply_view_detail},
 	},
 	models::{ExecBody, ExtendBody, ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
+	security::{
+		Principal,
+		credentials::{Credential, CredentialMetadata},
+	},
 };
 
 /// Mirror of the old REST `BODY_LIMIT`, applied to encode and decode on the
@@ -147,6 +153,7 @@ pub fn status_from(err: &ApiError) -> Status {
 	let code = match err.code() {
 		"not_found" => Code::NotFound,
 		"invalid" => Code::InvalidArgument,
+		"unauthorized" if err.status() == axum::http::StatusCode::FORBIDDEN => Code::PermissionDenied,
 		"unauthorized" => Code::Unauthenticated,
 		"not_running" | "actor_lost" | "unavailable_secret" | "ha_unavailable" => {
 			Code::FailedPrecondition
@@ -190,6 +197,11 @@ pub(super) fn service(state: ApiState) -> Routes {
 		)
 		.add_service(
 			pb::snapshot_service_server::SnapshotServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::credential_service_server::CredentialServiceServer::new(api.clone())
 				.max_decoding_message_size(MAX_MESSAGE_SIZE)
 				.max_encoding_message_size(MAX_MESSAGE_SIZE),
 		)
@@ -242,14 +254,15 @@ pub struct GrpcApi {
 
 /// Resolved mesh owner hop: a lazy tonic channel plus the peer credential.
 struct ForwardTarget {
-	channel: Channel,
-	token:   Arc<str>,
+	channel:   Channel,
+	token:     Arc<str>,
+	principal: Principal,
 }
 
 impl ForwardTarget {
 	fn request<T>(&self, message: T) -> Request<T> {
 		let mut request = Request::new(message);
-		forward_metadata(request.metadata_mut(), &self.token);
+		forward_metadata(request.metadata_mut(), &self.token, &self.principal);
 		request
 	}
 
@@ -260,14 +273,100 @@ impl ForwardTarget {
 	}
 }
 
-fn forward_metadata(metadata: &mut MetadataMap, token: &str) {
+fn forward_metadata(metadata: &mut MetadataMap, token: &str, principal: &Principal) {
 	if !token.is_empty()
 		&& let Ok(value) = MetadataValue::try_from(format!("Bearer {token}"))
 	{
 		metadata.insert("authorization", value);
 	}
 	metadata.insert(MESH_HOP_KEY, MetadataValue::from_static("1"));
+	insert_principal_metadata(metadata, principal);
 }
+
+fn insert_principal_metadata(metadata: &mut MetadataMap, principal: &Principal) {
+	let role = if principal.is_admin() {
+		"admin"
+	} else {
+		"client"
+	};
+	for (name, value) in [
+		(PRINCIPAL_TENANT_HEADER, principal.tenant.as_str()),
+		(PRINCIPAL_ROLE_HEADER, role),
+		(PRINCIPAL_KEY_HEADER, principal.key_id.as_str()),
+	] {
+		if let Ok(value) = MetadataValue::try_from(value) {
+			metadata.insert(name, value);
+		}
+	}
+}
+
+fn metadata_principal(metadata: &MetadataMap) -> Result<Principal, Status> {
+	let role = metadata
+		.get(PRINCIPAL_ROLE_HEADER)
+		.and_then(|value| value.to_str().ok());
+	match role {
+		Some("admin") => Ok(Principal::local_admin()),
+		Some("client") => {
+			let tenant = metadata
+				.get(PRINCIPAL_TENANT_HEADER)
+				.and_then(|value| value.to_str().ok());
+			let key_id = metadata
+				.get(PRINCIPAL_KEY_HEADER)
+				.and_then(|value| value.to_str().ok());
+			let (Some(tenant), Some(key_id)) = (tenant, key_id) else {
+				return Err(status_from(&ApiError::unauthorized(
+					"authenticated principal metadata is incomplete",
+				)));
+			};
+			Principal::client(tenant, key_id).map_err(|_| {
+				status_from(&ApiError::unauthorized("authenticated principal metadata is invalid"))
+			})
+		},
+		_ => Err(status_from(&ApiError::unauthorized(
+			"authenticated principal metadata is missing",
+		))),
+	}
+}
+
+fn request_principal<T>(request: &Request<T>) -> Result<Principal, Status> {
+	request
+		.extensions()
+		.get::<Principal>()
+		.cloned()
+		.map_or_else(|| metadata_principal(request.metadata()), Ok)
+}
+fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Result<(), Status> {
+	if principal.is_admin() {
+		return Ok(());
+	}
+	if body.template.is_some()
+		|| body.dockerfile.is_some()
+		|| body.fs_dir.is_some()
+		|| body.volumes.as_ref().is_some_and(|volumes| !volumes.is_empty())
+		|| body.s3_mounts.as_ref().is_some_and(|mounts| !mounts.is_empty())
+		|| body.pool_size != 0
+	{
+		return Err(status_from(&ApiError::forbidden(
+			"tenant sandboxes cannot use host-local templates, builds, mounts, volumes, or pools",
+		)));
+	}
+	if body
+		.image
+		.as_deref()
+		.is_some_and(|reference| !image::is_registry_reference(reference))
+	{
+		return Err(status_from(&ApiError::forbidden(
+			"tenant sandboxes require a registry image reference",
+		)));
+	}
+	body.owner_tenant.clone_from(&principal.tenant);
+	body.encryption_key_id.clone_from(&principal.key_id);
+	if let Some(key) = body.idempotency_key.as_mut().filter(|key| !key.is_empty()) {
+		*key = format!("tenant:{}:{key}", principal.tenant);
+	}
+	Ok(())
+}
+
 
 fn is_mesh_hop(metadata: &MetadataMap) -> bool {
 	metadata.contains_key(MESH_HOP_KEY)
@@ -484,6 +583,77 @@ impl GrpcApi {
 			.map_err(|err| status_from(&ApiError::from(err)))
 	}
 
+	async fn authorize_sandbox(
+		&self,
+		principal: &Principal,
+		sandbox_id: &str,
+	) -> Result<(), Status> {
+		if principal.is_admin() || sandbox_id.is_empty() {
+			return Ok(());
+		}
+		if let Some(mesh) = self.state.mesh.as_ref() {
+			let record = MeshRecordStore::get(mesh.as_ref(), sandbox_id)
+				.map_err(|error| status_from(&gossip_mesh_api_error(error)))?;
+			if let Some(record) = record {
+				let owner = record
+					.params
+					.get("owner_tenant")
+					.and_then(Value::as_str)
+					.unwrap_or("default");
+				return principal
+					.require_tenant(owner)
+					.map_err(|error| status_from(&ApiError::from(error)));
+			}
+		}
+		let engine = self.state.engine.clone();
+		let sandbox_id = sandbox_id.to_owned();
+		let result = tokio::task::spawn_blocking(move || engine.get(&sandbox_id))
+			.await
+			.map_err(|error| status_from(&join_error(error)))?;
+		match result {
+			Ok(view) => {
+				let owner = view
+					.get("owner_tenant")
+					.and_then(Value::as_str)
+					.unwrap_or("default");
+				principal
+					.require_tenant(owner)
+					.map_err(|error| status_from(&ApiError::from(error)))
+			},
+			Err(error) if error.code == ErrorCode::NotFound => Ok(()),
+			Err(error) => Err(status_from(&ApiError::from(error))),
+		}
+	}
+
+	fn credential_scope(
+		&self,
+		principal: &Principal,
+		requested: Option<String>,
+	) -> Result<(String, String), Status> {
+		if principal.is_admin() {
+			let tenant = requested
+				.filter(|tenant| !tenant.is_empty())
+				.unwrap_or_else(|| "default".to_owned());
+			let key_id = self
+				.state
+				.config
+				.tenant_keys
+				.get(&tenant)
+				.cloned()
+				.unwrap_or_else(|| "default".to_owned());
+			let principal = Principal::client(tenant, key_id)
+				.map_err(|error| status_from(&ApiError::from(error)))?;
+			return Ok((principal.tenant, principal.key_id));
+		}
+		if requested
+			.as_deref()
+			.is_some_and(|tenant| !tenant.is_empty() && tenant != principal.tenant)
+		{
+			return Err(status_from(&ApiError::forbidden("credential tenant does not match caller")));
+		}
+		Ok((principal.tenant.clone(), principal.key_id.clone()))
+	}
+
 	/// Resolve the mesh owner hop for a sandbox-scoped RPC. `None` means serve
 	/// locally: mesh disabled, request already a hop, sandbox present here, or
 	/// no owner known anywhere.
@@ -492,6 +662,8 @@ impl GrpcApi {
 		metadata: &MetadataMap,
 		sandbox_id: &str,
 	) -> Result<Option<ForwardTarget>, Status> {
+		let principal = metadata_principal(metadata)?;
+		self.authorize_sandbox(&principal, sandbox_id).await?;
 		let Some(mesh) = self.state.mesh.as_ref() else {
 			return Ok(None);
 		};
@@ -522,7 +694,8 @@ impl GrpcApi {
 				})?;
 				Ok(Some(ForwardTarget {
 					channel: endpoint.connect_lazy(),
-					token:   view.state.outbound_token.clone(),
+					token: view.state.outbound_token.clone(),
+					principal,
 				}))
 			},
 		}
@@ -1673,6 +1846,17 @@ fn record_matches_tags(record: &CreateRecordWire, tags: Option<&HashMap<String, 
 	true
 }
 
+fn credential_record(metadata: CredentialMetadata) -> pb::CredentialRecord {
+	pb::CredentialRecord {
+		name:                   metadata.name,
+		allowed_domains:        metadata.allowed_domains,
+		header_names:           metadata.header_names,
+		expires_at_unix_millis: metadata.expires_at_unix_millis,
+		requests_per_minute:    metadata.requests_per_minute,
+		version:                metadata.version,
+	}
+}
+
 #[tonic::async_trait]
 impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	type AttachStream = BoxStream<pb::ExecOutput>;
@@ -1684,12 +1868,16 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		&self,
 		request: Request<pb::CreateSandboxRequest>,
 	) -> Result<Response<pb::JsonView>, Status> {
+		let principal = request_principal(&request)?;
 		let (metadata, _, message) = request.into_parts();
 		let value: Value = serde_json::from_str(&message.spec_json)
 			.map_err(|_| Status::from(ApiError::invalid("invalid request")))?;
 		validation::validate_create_value(&value)?;
-		let body: SandboxCreate = validation::from_value(value.clone())?;
+		let mut body: SandboxCreate = validation::from_value(value)?;
+		scope_sandbox_create(&principal, &mut body)?;
 		validation::validate_create(&body)?;
+		let value = serde_json::to_value(&body)
+			.map_err(|error| Status::internal(format!("serializing sandbox create: {error}")))?;
 		let view = if let Some(mesh) = self.state.mesh.clone().filter(|mesh| mesh.mesh_enabled())
 			&& !is_mesh_hop(&metadata)
 		{
@@ -1707,9 +1895,10 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		&self,
 		request: Request<pb::ListSandboxesRequest>,
 	) -> Result<Response<pb::ListSandboxesResponse>, Status> {
+		let principal = request_principal(&request)?;
 		let message = request.into_inner();
 		let tags = validation::parse_tag_filters(&message.tags)?;
-		let rows = if let Some(mesh) = self.state.mesh.clone()
+		let mut rows = if let Some(mesh) = self.state.mesh.clone()
 			&& mesh.mesh_enabled()
 		{
 			let records = MeshRecordStore::list(&*mesh)
@@ -1717,6 +1906,14 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 			let mut views = Vec::new();
 			let local_node = MeshControl::node_id(&*mesh);
 			for rec in records {
+				let owner_tenant = rec
+					.params
+					.get("owner_tenant")
+					.and_then(Value::as_str)
+					.unwrap_or("default");
+				if principal.require_tenant(owner_tenant).is_err() {
+					continue;
+				}
 				if !record_matches_tags(&rec, tags.as_ref()) {
 					continue;
 				}
@@ -1735,6 +1932,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 							"restart_policy": rec.restart_policy,
 							"created_at": rec.created_at,
 							"status": "running",
+							"owner_tenant": owner_tenant,
 						}));
 					}
 				} else {
@@ -1746,6 +1944,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 						"restart_policy": rec.restart_policy,
 						"created_at": rec.created_at,
 						"status": "running",
+						"owner_tenant": owner_tenant,
 					}));
 				}
 			}
@@ -1753,6 +1952,15 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		} else {
 			self.engine_call(move |engine| engine.list(tags)).await?
 		};
+		if !principal.is_admin() {
+			rows.retain(|view| {
+				view
+					.get("owner_tenant")
+					.and_then(Value::as_str)
+					.unwrap_or("default")
+					== principal.tenant
+			});
+		}
 		let sandboxes_json = rows.into_iter().map(|row| compact_json(&row)).collect();
 		Ok(Response::new(pb::ListSandboxesResponse { sandboxes_json }))
 	}
@@ -1821,6 +2029,17 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		forward_to_owner!(self, metadata, &message.id, message, resume);
 		let id = message.id;
 		let view = self.engine_call(move |engine| engine.resume(&id)).await?;
+		Ok(Response::new(json_view(&view)))
+	}
+
+	async fn suspend(
+		&self,
+		request: Request<pb::SandboxRef>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let (metadata, _, message) = request.into_parts();
+		forward_to_owner!(self, metadata, &message.id, message, suspend);
+		let id = message.id;
+		let view = self.engine_call(move |engine| engine.suspend(&id)).await?;
 		Ok(Response::new(json_view(&view)))
 	}
 
@@ -1941,8 +2160,25 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		&self,
 		request: Request<Streaming<pb::ExecInput>>,
 	) -> Result<Response<Self::ShellStream>, Status> {
+		let principal = request_principal(&request)?;
 		let mut inbound = request.into_inner();
-		let params = require_shell_params(inbound.message().await?)?;
+		let mut params = require_shell_params(inbound.message().await?)?;
+		if !principal.is_admin() {
+			let sandbox_id = params
+				.get("ref")
+				.and_then(Value::as_str)
+				.filter(|sandbox_id| !sandbox_id.is_empty())
+				.ok_or_else(|| {
+					status_from(&ApiError::forbidden(
+						"tenant shell sessions must reference an owned sandbox",
+					))
+				})?;
+			self.authorize_sandbox(&principal, sandbox_id).await?;
+			params
+				.as_object_mut()
+				.expect("validated shell params object")
+				.insert("_vmon_owner_tenant".to_owned(), json!(principal.tenant));
+		}
 		let engine = self.state.engine.clone();
 		let session = tokio::task::spawn_blocking(move || engine.shell_start(params))
 			.await
@@ -2139,6 +2375,40 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 			.await?;
 		Ok(Response::new(json_view(&value)))
 	}
+
+	async fn history(
+		&self,
+		request: Request<pb::SandboxRef>,
+	) -> Result<Response<pb::RecoveryPointList>, Status> {
+		let (metadata, _, message) = request.into_parts();
+		forward_to_owner!(self, metadata, &message.id, message, history);
+		let id = message.id;
+		let points = self
+			.engine_call(move |engine| engine.history(&id))
+			.await?
+			.into_iter()
+			.map(|point| pb::RecoveryPoint {
+				name:                   point.name,
+				kind:                   point.kind,
+				created_at_unix_millis: point.created_at_unix_millis,
+				size_bytes:             point.size_bytes,
+			})
+			.collect();
+		Ok(Response::new(pb::RecoveryPointList { points }))
+	}
+
+	async fn rollback(
+		&self,
+		request: Request<pb::RollbackSandboxRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let (metadata, _, message) = request.into_parts();
+		forward_to_owner!(self, metadata, &message.id, message, rollback);
+		let pb::RollbackSandboxRequest { id, recovery_point } = message;
+		let view = self
+			.engine_call(move |engine| engine.rollback(&id, &recovery_point))
+			.await?;
+		Ok(Response::new(json_view(&view)))
+	}
 }
 
 #[tonic::async_trait]
@@ -2174,6 +2444,86 @@ impl pb::snapshot_service_server::SnapshotService for GrpcApi {
 			.engine_call(move |engine| engine.fork(&name, body))
 			.await?;
 		Ok(Response::new(json_view(&value)))
+	}
+
+	async fn delete(&self, request: Request<pb::SnapshotRef>) -> Result<Response<pb::Ok>, Status> {
+		let name = request.into_inner().name;
+		self
+			.engine_call(move |engine| engine.snapshot_delete(&name))
+			.await?;
+		Ok(Response::new(pb::Ok {}))
+	}
+}
+
+#[tonic::async_trait]
+impl pb::credential_service_server::CredentialService for GrpcApi {
+	async fn list(
+		&self,
+		request: Request<pb::ListCredentialsRequest>,
+	) -> Result<Response<pb::CredentialList>, Status> {
+		let principal = request_principal(&request)?;
+		let requested = request.into_inner().tenant;
+		let (tenant, _) = self.credential_scope(&principal, requested)?;
+		let credentials = self
+			.engine_call(move |engine| engine.credential_list(&tenant))
+			.await?
+			.into_iter()
+			.map(credential_record)
+			.collect();
+		Ok(Response::new(pb::CredentialList { credentials }))
+	}
+
+	async fn put(
+		&self,
+		request: Request<pb::PutCredentialRequest>,
+	) -> Result<Response<pb::CredentialRecord>, Status> {
+		let principal = request_principal(&request)?;
+		let pb::PutCredentialRequest {
+			name,
+			allowed_domains,
+			headers,
+			expires_at_unix_millis,
+			requests_per_minute,
+			tenant: requested,
+		} = request.into_inner();
+		let (tenant, key_id) = self.credential_scope(&principal, requested)?;
+		let mut injected = BTreeMap::new();
+		for header in headers {
+			if injected.insert(header.name.clone(), header.value).is_some() {
+				return Err(status_from(&ApiError::invalid(format!(
+					"duplicate credential header {:?}",
+					header.name
+				))));
+			}
+		}
+		let credential = Credential {
+			name,
+			allowed_domains,
+			headers: injected,
+			expires_at_unix_millis,
+			requests_per_minute,
+			version: String::new(),
+		};
+		let metadata = self
+			.engine_call(move |engine| engine.credential_put(&tenant, &key_id, credential))
+			.await?;
+		Ok(Response::new(credential_record(metadata)))
+	}
+
+	async fn delete(
+		&self,
+		request: Request<pb::DeleteCredentialRequest>,
+	) -> Result<Response<pb::Ok>, Status> {
+		let principal = request_principal(&request)?;
+		let pb::DeleteCredentialRequest { credential, tenant: requested } = request.into_inner();
+		let name = credential
+			.ok_or_else(|| status_from(&ApiError::invalid("credential reference is required")))?
+			.name;
+		let (tenant, _) = self.credential_scope(&principal, requested)?;
+		self
+			.engine_call(move |engine| engine.credential_delete(&tenant, &name))
+			.await?;
+		Ok(Response::new(pb::Ok {}))
 	}
 }
 

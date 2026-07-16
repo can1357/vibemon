@@ -64,11 +64,18 @@ mod tests {
 
 	#[derive(Default)]
 	struct CapturedInputs {
-		creates:    Vec<SandboxCreate>,
-		list_tags:  Vec<Option<HashMap<String, String>>>,
-		gets:       Vec<String>,
-		pool_sets:  Vec<(String, PoolPutBody)>,
-		migrations: Vec<(String, String)>,
+		creates:            Vec<SandboxCreate>,
+		list_tags:          Vec<Option<HashMap<String, String>>>,
+		gets:               Vec<String>,
+		suspends:           Vec<String>,
+		histories:          Vec<String>,
+		rollbacks:          Vec<(String, String)>,
+		snapshot_deletes:   Vec<String>,
+		credential_lists:   Vec<String>,
+		credential_puts:    Vec<(String, String, String)>,
+		credential_deletes: Vec<(String, String)>,
+		pool_sets:          Vec<(String, PoolPutBody)>,
+		migrations:         Vec<(String, String)>,
 	}
 
 	struct ScriptedEngine {
@@ -117,11 +124,18 @@ mod tests {
 	impl Clone for CapturedInputs {
 		fn clone(&self) -> Self {
 			Self {
-				creates:    self.creates.clone(),
-				list_tags:  self.list_tags.clone(),
-				gets:       self.gets.clone(),
-				pool_sets:  self.pool_sets.clone(),
-				migrations: self.migrations.clone(),
+				creates:            self.creates.clone(),
+				list_tags:          self.list_tags.clone(),
+				gets:               self.gets.clone(),
+				suspends:           self.suspends.clone(),
+				histories:          self.histories.clone(),
+				rollbacks:          self.rollbacks.clone(),
+				snapshot_deletes:   self.snapshot_deletes.clone(),
+				credential_lists:   self.credential_lists.clone(),
+				credential_puts:    self.credential_puts.clone(),
+				credential_deletes: self.credential_deletes.clone(),
+				pool_sets:          self.pool_sets.clone(),
+				migrations:         self.migrations.clone(),
 			}
 		}
 	}
@@ -179,6 +193,41 @@ mod tests {
 
 		fn resume(&self, _id: &str) -> Result<Value> {
 			Self::unexpected("resume")
+		}
+
+		fn suspend(&self, id: &str) -> Result<Value> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.suspends
+				.push(id.to_owned());
+			Ok(json!({"id": id, "status": "suspended"}))
+		}
+
+		fn history(&self, id: &str) -> Result<Vec<crate::engine::RecoveryPoint>> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.histories
+				.push(id.to_owned());
+			Ok(vec![crate::engine::RecoveryPoint {
+				name:                   "checkpoint-1".to_owned(),
+				kind:                   "checkpoint".to_owned(),
+				created_at_unix_millis: 1,
+				size_bytes:             2,
+			}])
+		}
+
+		fn rollback(&self, id: &str, recovery_point: &str) -> Result<Value> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.rollbacks
+				.push((id.to_owned(), recovery_point.to_owned()));
+			Ok(json!({"id": id, "recovery_point": recovery_point}))
 		}
 
 		fn extend(&self, _id: &str, _secs: u64) -> Result<Value> {
@@ -275,6 +324,16 @@ mod tests {
 			Self::unexpected("volume_create")
 		}
 
+		fn snapshot_delete(&self, snapshot: &str) -> Result<()> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.snapshot_deletes
+				.push(snapshot.to_owned());
+			Ok(())
+		}
+
 		fn volume_delete(&self, _name: &str) -> Result<()> {
 			Self::unexpected("volume_delete")
 		}
@@ -295,6 +354,44 @@ mod tests {
 
 		fn pool_delete(&self, _reference: &str) -> Result<()> {
 			Self::unexpected("pool_delete")
+		}
+
+		fn credential_list(
+			&self,
+			tenant: &str,
+		) -> Result<Vec<crate::security::credentials::CredentialMetadata>> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.credential_lists
+				.push(tenant.to_owned());
+			Ok(Vec::new())
+		}
+
+		fn credential_put(
+			&self,
+			tenant: &str,
+			key_id: &str,
+			credential: crate::security::credentials::Credential,
+		) -> Result<crate::security::credentials::CredentialMetadata> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.credential_puts
+				.push((tenant.to_owned(), key_id.to_owned(), credential.name.clone()));
+			Ok(credential.metadata())
+		}
+
+		fn credential_delete(&self, tenant: &str, name: &str) -> Result<()> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.credential_deletes
+				.push((tenant.to_owned(), name.to_owned()));
+			Ok(())
 		}
 
 		fn info(&self) -> Result<Value> {
@@ -597,6 +694,51 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn api_tenant_create_scopes_identity_and_rejects_host_resources() {
+		let engine = Arc::new(ScriptedEngine::new());
+		engine.set_create_response(json!({"id": "tenant-sandbox", "status": "running"}));
+		let api = ApiHarness::start(engine.clone()).await;
+		let mut sandboxes = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
+
+		sandboxes
+			.create(authed(
+				pb::CreateSandboxRequest {
+					spec_json: json!({
+						"image": "alpine:latest",
+						"owner_tenant": "victim",
+						"encryption_key_id": "victim-key",
+						"idempotency_key": "create-once"
+					})
+					.to_string(),
+				},
+				"client-token",
+			))
+			.await
+			.expect("tenant registry-image create");
+
+		let captures = engine.captures();
+		assert_eq!(captures.creates.len(), 1);
+		assert_eq!(captures.creates[0].owner_tenant, "default");
+		assert_eq!(captures.creates[0].encryption_key_id, "default");
+		assert_eq!(
+			captures.creates[0].idempotency_key.as_deref(),
+			Some("tenant:default:create-once")
+		);
+
+		let status = sandboxes
+			.create(authed(
+				pb::CreateSandboxRequest {
+					spec_json: json!({"template": "/host/template"}).to_string(),
+				},
+				"client-token",
+			))
+			.await
+			.expect_err("tenant host template rejected");
+		assert_eq!(status.code(), Code::PermissionDenied);
+		assert_eq!(engine.captures().creates.len(), 1);
+	}
+
+	#[tokio::test]
 	async fn api_create_validation_rejects_python_compatible_bad_ports_cidrs_and_ha() {
 		let engine = Arc::new(ScriptedEngine::new());
 		let api = ApiHarness::start(engine.clone()).await;
@@ -671,7 +813,8 @@ mod tests {
 		let response = client
 			.create(authed(
 				pb::CreateSandboxRequest {
-					spec_json: json!({"name": "sb-1", "ports": [8080]}).to_string(),
+					spec_json: json!({"name": "sb-1", "block_network": false, "ports": [8080]})
+						.to_string(),
 				},
 				"admin-token",
 			))
@@ -865,7 +1008,7 @@ mod tests {
 						)),
 					}),
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("get active function")
@@ -884,7 +1027,7 @@ mod tests {
 							)),
 						}),
 					},
-					"client-token",
+					"admin-token",
 				))
 				.await
 				.expect_err("pinned revision identity mismatch")
@@ -892,7 +1035,7 @@ mod tests {
 			Code::NotFound
 		);
 		let listed = functions
-			.list(authed(pb::ListFunctionsRequest::default(), "client-token"))
+			.list(authed(pb::ListFunctionsRequest::default(), "admin-token"))
 			.await
 			.expect("list functions")
 			.into_inner();
@@ -956,7 +1099,7 @@ mod tests {
 						selection: Some(pb::app_selector::Selection::Current(app.clone())),
 					}),
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("get app")
@@ -973,7 +1116,7 @@ mod tests {
 							selection: Some(pb::app_selector::Selection::Pinned(wrong_app_revision)),
 						}),
 					},
-					"client-token",
+					"admin-token",
 				))
 				.await
 				.expect_err("pinned app revision identity mismatch")
@@ -1023,12 +1166,12 @@ mod tests {
 			.into_inner();
 		let schedule_ref = schedule.r#ref.expect("schedule ref");
 		functions
-			.get_schedule(authed(schedule_ref.clone(), "client-token"))
+			.get_schedule(authed(schedule_ref.clone(), "admin-token"))
 			.await
 			.expect("get schedule");
 		assert_eq!(
 			functions
-				.list_schedules(authed(pb::ListSchedulesRequest::default(), "client-token"))
+				.list_schedules(authed(pb::ListSchedulesRequest::default(), "admin-token"))
 				.await
 				.expect("list schedules")
 				.into_inner()
@@ -1051,7 +1194,7 @@ mod tests {
 					request_id: "open-call".to_owned(),
 					..Default::default()
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("create call")
@@ -1066,7 +1209,7 @@ mod tests {
 					}),
 					follow: true,
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("follow pending call")
@@ -1089,7 +1232,7 @@ mod tests {
 			})),
 		};
 		let status = calls
-			.stream_inputs(authed(tokio_stream::iter([malformed]), "client-token"))
+			.stream_inputs(authed(tokio_stream::iter([malformed]), "admin-token"))
 			.await
 			.expect_err("input before call opener rejected");
 		assert_eq!(status.code(), Code::InvalidArgument);
@@ -1107,7 +1250,7 @@ mod tests {
 			})),
 		};
 		let mut acknowledgements = calls
-			.stream_inputs(authed(tokio_stream::iter([opener, input]), "client-token"))
+			.stream_inputs(authed(tokio_stream::iter([opener, input]), "admin-token"))
 			.await
 			.expect("stream input")
 			.into_inner();
@@ -1139,7 +1282,7 @@ mod tests {
 					call:                 Some(call_ref.clone()),
 					expected_input_count: 1,
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("close call inputs");
@@ -1151,7 +1294,7 @@ mod tests {
 		assert!(matches!(input_closed.payload, Some(pb::call_event::Payload::InputClosed(_))));
 		assert_eq!(
 			calls
-				.list(authed(pb::ListCallsRequest::default(), "client-token"))
+				.list(authed(pb::ListCallsRequest::default(), "admin-token"))
 				.await
 				.expect("list calls")
 				.into_inner()
@@ -1168,7 +1311,7 @@ mod tests {
 					}),
 					follow: false,
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("watch replay")
@@ -1184,18 +1327,18 @@ mod tests {
 					reason:     "test".to_owned(),
 					request_id: "cancel".to_owned(),
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("cancel call");
 		calls
-			.get(authed(call_ref.clone(), "client-token"))
+			.get(authed(call_ref.clone(), "admin-token"))
 			.await
 			.expect("get call");
 		let missing = calls
 			.get_result(authed(
 				pb::GetCallResultRequest { call: Some(call_ref.clone()), index: 99 },
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect_err("missing result");
@@ -1209,7 +1352,7 @@ mod tests {
 					}),
 					page_size: 10,
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("list empty results")
@@ -1220,7 +1363,7 @@ mod tests {
 		let response = api
 			.client
 			.post(api.url("/v1/functions/tests/echo/invoke"))
-			.header(reqwest::header::AUTHORIZATION, "Bearer client-token")
+			.header(reqwest::header::AUTHORIZATION, "Bearer admin-token")
 			.header(reqwest::header::CONTENT_TYPE, "application/x-python-cloudpickle")
 			.body(vec![0_u8; 8])
 			.send()
@@ -1270,7 +1413,7 @@ mod tests {
 						selection: Some(pb::function_selector::Selection::Pinned(revision)),
 					}),
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("get secret-dependent revision")
@@ -1344,7 +1487,7 @@ mod tests {
 					cursor: Some(pb::EventCursor { call: Some(call_ref), after_sequence: 0 }),
 					follow: true,
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("watch running call")
@@ -1404,14 +1547,14 @@ mod tests {
 					request_id: "create-missing".to_owned(),
 					..Default::default()
 				},
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect_err("missing actor revision");
 		assert_eq!(create.code(), Code::NotFound);
 		assert_eq!(
 			actors
-				.get(authed(missing_actor.clone(), "client-token"))
+				.get(authed(missing_actor.clone(), "admin-token"))
 				.await
 				.expect_err("missing actor")
 				.code(),
@@ -1424,7 +1567,7 @@ mod tests {
 						actor:      Some(missing_actor.clone()),
 						request_id: "checkpoint".to_owned(),
 					},
-					"client-token",
+					"admin-token",
 				))
 				.await
 				.expect_err("missing checkpoint actor")
@@ -1439,7 +1582,7 @@ mod tests {
 						checkpoint: Some(missing_checkpoint.clone()),
 						request_id: "restore".to_owned(),
 					},
-					"client-token",
+					"admin-token",
 				))
 				.await
 				.expect_err("missing restore actor")
@@ -1454,7 +1597,7 @@ mod tests {
 						request_id: "fork".to_owned(),
 						labels:     Default::default(),
 					},
-					"client-token",
+					"admin-token",
 				))
 				.await
 				.expect_err("missing fork checkpoint")
@@ -1463,7 +1606,7 @@ mod tests {
 		);
 		assert_eq!(
 			actors
-				.delete(authed(missing_actor, "client-token"))
+				.delete(authed(missing_actor, "admin-token"))
 				.await
 				.expect_err("missing actor delete")
 				.code(),
@@ -1579,7 +1722,7 @@ mod tests {
 
 		let reference = pb::ArtifactRef { digest: Some(digest) };
 		let stat = client
-			.stat(authed(reference.clone(), "client-token"))
+			.stat(authed(reference.clone(), "admin-token"))
 			.await
 			.expect("client token may stat")
 			.into_inner();
@@ -1593,7 +1736,7 @@ mod tests {
 		let mut download = client
 			.get(authed(
 				pb::GetArtifactRequest { artifact: Some(reference), range_presence: None },
-				"client-token",
+				"admin-token",
 			))
 			.await
 			.expect("artifact download")
@@ -1639,7 +1782,7 @@ mod tests {
 			.expect_err("interrupted upload rejected");
 		assert_eq!(status.code(), Code::InvalidArgument);
 		let missing = client
-			.stat(authed(pb::ArtifactRef { digest: Some(large_digest.clone()) }, "client-token"))
+			.stat(authed(pb::ArtifactRef { digest: Some(large_digest.clone()) }, "admin-token"))
 			.await
 			.expect_err("interrupted upload is not committed");
 		assert_eq!(missing.code(), Code::NotFound);
@@ -1662,5 +1805,139 @@ mod tests {
 			.expect("multi-message upload larger than one gRPC message")
 			.into_inner();
 		assert_eq!(large.size_bytes, chunk_count * chunk_size as u64);
+	}
+	#[tokio::test]
+	async fn added_lifecycle_snapshot_and_credential_rpcs_dispatch_to_engine() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine.clone()).await;
+		let mut sandboxes = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
+		let mut snapshots = pb::snapshot_service_client::SnapshotServiceClient::new(api.channel());
+		let mut credentials =
+			pb::credential_service_client::CredentialServiceClient::new(api.channel());
+
+		let suspended = sandboxes
+			.suspend(authed(pb::SandboxRef { id: "sandbox-1".to_owned() }, "admin-token"))
+			.await
+			.expect("suspend is implemented")
+			.into_inner();
+		assert_eq!(suspended.json, r#"{"id":"sandbox-1","status":"suspended"}"#);
+		let history = sandboxes
+			.history(authed(pb::SandboxRef { id: "sandbox-1".to_owned() }, "admin-token"))
+			.await
+			.expect("history is implemented")
+			.into_inner();
+		assert_eq!(history.points[0].name, "checkpoint-1");
+		sandboxes
+			.rollback(authed(
+				pb::RollbackSandboxRequest {
+					id:             "sandbox-1".to_owned(),
+					recovery_point: "checkpoint-1".to_owned(),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("rollback is implemented");
+		snapshots
+			.delete(authed(pb::SnapshotRef { name: "snapshot-1".to_owned() }, "admin-token"))
+			.await
+			.expect("snapshot delete is implemented");
+
+		credentials
+			.list(authed(
+				pb::ListCredentialsRequest { tenant: Some("tenant-a".to_owned()) },
+				"admin-token",
+			))
+			.await
+			.expect("credential list is implemented");
+		let credential = credentials
+			.put(authed(
+				pb::PutCredentialRequest {
+					name:                   "service-token".to_owned(),
+					allowed_domains:        vec!["api.example.test".to_owned()],
+					headers:                vec![pb::CredentialHeader {
+						name:  "Authorization".to_owned(),
+						value: b"Bearer secret".to_vec(),
+					}],
+					expires_at_unix_millis: None,
+					requests_per_minute:    10,
+					tenant:                 Some("tenant-a".to_owned()),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("credential put is implemented")
+			.into_inner();
+		assert_eq!(credential.name, "service-token");
+		credentials
+			.delete(authed(
+				pb::DeleteCredentialRequest {
+					credential: Some(pb::CredentialRef { name: "service-token".to_owned() }),
+					tenant:     Some("tenant-a".to_owned()),
+				},
+				"admin-token",
+			))
+			.await
+			.expect("credential delete is implemented");
+		let status = credentials
+			.list(authed(
+				pb::ListCredentialsRequest { tenant: Some("tenant-a".to_owned()) },
+				"client-token",
+			))
+			.await
+			.expect_err("tenant caller cannot select a different credential namespace");
+		assert_eq!(status.code(), Code::PermissionDenied);
+		assert_eq!(vmon_code(&status).as_deref(), Some("unauthorized"));
+		credentials
+			.put(authed(
+				pb::PutCredentialRequest {
+					name:                   "own-token".to_owned(),
+					allowed_domains:        vec!["api.example.test".to_owned()],
+					headers:                vec![pb::CredentialHeader {
+						name:  "Authorization".to_owned(),
+						value: b"Bearer own".to_vec(),
+					}],
+					expires_at_unix_millis: None,
+					requests_per_minute:    10,
+					tenant:                 None,
+				},
+				"client-token",
+			))
+			.await
+			.expect("tenant credential put is scoped to caller");
+		credentials
+			.delete(authed(
+				pb::DeleteCredentialRequest {
+					credential: Some(pb::CredentialRef { name: "own-token".to_owned() }),
+					tenant:     None,
+				},
+				"client-token",
+			))
+			.await
+			.expect("tenant credential delete is scoped to caller");
+
+		let captures = engine.captures();
+		assert_eq!(captures.suspends, vec!["sandbox-1"]);
+		assert_eq!(captures.histories, vec!["sandbox-1"]);
+		assert_eq!(captures.rollbacks, vec![("sandbox-1".to_owned(), "checkpoint-1".to_owned())]);
+		assert_eq!(captures.snapshot_deletes, vec!["snapshot-1"]);
+		assert_eq!(captures.credential_lists, vec!["tenant-a"]);
+		assert_eq!(
+			captures.credential_puts,
+			vec![
+				(
+					"tenant-a".to_owned(),
+					"default".to_owned(),
+					"service-token".to_owned()
+				),
+				("default".to_owned(), "default".to_owned(), "own-token".to_owned()),
+			]
+		);
+		assert_eq!(
+			captures.credential_deletes,
+			vec![
+				("tenant-a".to_owned(), "service-token".to_owned()),
+				("default".to_owned(), "own-token".to_owned()),
+			]
+		);
 	}
 }

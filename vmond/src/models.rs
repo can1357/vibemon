@@ -12,7 +12,7 @@ use serde_json::Value;
 /// `POST /v1/sandboxes` body: today's `SandboxCreate` field set plus
 /// `command` (foreground entrypoint override composed by the CLI).
 /// External `remote_page_*` fields are rejected by validation.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCreate {
 	pub image:                  Option<String>,
@@ -34,13 +34,15 @@ pub struct SandboxCreate {
 	pub env:                    Option<HashMap<String, String>>,
 	/// Request-scoped secrets: `[{name, values}]`; never persisted.
 	pub secrets:                Option<Vec<Value>>,
+	/// Host-brokered credential names; secret values never enter this document.
+	pub credentials:            Option<Vec<String>>,
 	/// Mountpoint -> volume name or `{name, read_only}`.
 	pub volumes:                Option<HashMap<String, Value>>,
 	/// Mountpoint -> lazy S3 mount specification.
 	pub s3_mounts:              Option<HashMap<String, S3MountSpec>>,
 	pub tags:                   Option<HashMap<String, String>>,
 	pub fs_dir:                 Option<String>,
-	#[serde(default)]
+	#[serde(default = "default_block_network")]
 	pub block_network:          bool,
 	pub ports:                  Option<Vec<u16>>,
 	pub egress_allow:           Option<Vec<String>>,
@@ -61,6 +63,66 @@ pub struct SandboxCreate {
 	/// Mesh-only tag preservation for restored remote virtio-fs snapshots.
 	#[serde(skip)]
 	pub(crate) s3_restore_tags: Option<HashMap<String, String>>,
+	/// Owning tenant injected by the authenticated API boundary.
+	#[serde(default = "default_tenant")]
+	pub owner_tenant:           String,
+	/// Customer-managed encryption key injected by the API boundary.
+	#[serde(default = "default_encryption_key")]
+	pub encryption_key_id:      String,
+}
+
+impl Default for SandboxCreate {
+	fn default() -> Self {
+		Self {
+			image:                  None,
+			template:               None,
+			dockerfile:             None,
+			context:                default_context(),
+			name:                   None,
+			cpus:                   default_cpus(),
+			memory:                 default_memory(),
+			disk_mb:                default_disk_mb(),
+			timeout:                default_timeout(),
+			timeout_secs:           None,
+			workdir:                None,
+			env:                    None,
+			secrets:                None,
+			credentials:            None,
+			volumes:                None,
+			s3_mounts:              None,
+			tags:                   None,
+			fs_dir:                 None,
+			block_network:          default_block_network(),
+			ports:                  None,
+			egress_allow:           None,
+			egress_allow_domains:   None,
+			inbound_cidr_allowlist: None,
+			readiness_probe:        None,
+			pool_size:              0,
+			remote_page_url:        None,
+			remote_page_token:      None,
+			remote_page_digest:     None,
+			ha:                     None,
+			arch:                   None,
+			idempotency_key:        None,
+			command:                None,
+			s3_restore_tags:        None,
+			owner_tenant:           default_tenant(),
+			encryption_key_id:      default_encryption_key(),
+		}
+	}
+}
+
+const fn default_block_network() -> bool {
+	true
+}
+
+fn default_tenant() -> String {
+	"default".to_owned()
+}
+
+fn default_encryption_key() -> String {
+	"default".to_owned()
 }
 
 /// Create-time settings for one lazy S3 mount.

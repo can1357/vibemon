@@ -11,7 +11,7 @@ use std::{
 use axum::{
 	body::Body,
 	extract::State,
-	http::{Method, Request, header},
+	http::{HeaderMap, HeaderValue, Method, Request, header},
 	middleware::Next,
 	response::Response,
 	serve::Listener,
@@ -20,8 +20,17 @@ use tokio::net::{UnixListener, UnixStream};
 
 use super::error::ApiError;
 use crate::{
-	config::ServeConfig, engine::EngineApi, function::FunctionDomain, mesh::runtime::MeshRuntime,
+	config::ServeConfig,
+	engine::EngineApi,
+	function::FunctionDomain,
+	mesh::runtime::MeshRuntime,
+	security::{Principal, TenantDirectory, tenant::Role},
 };
+
+pub(super) const PRINCIPAL_TENANT_HEADER: &str = "x-vmon-principal-tenant";
+pub(super) const PRINCIPAL_ROLE_HEADER: &str = "x-vmon-principal-role";
+pub(super) const PRINCIPAL_KEY_HEADER: &str = "x-vmon-principal-key";
+const MESH_HOP_HEADER: &str = "x-vmon-mesh-hop";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
@@ -71,6 +80,28 @@ impl ApiState {
 	pub fn auth_failure_count(&self) -> u64 {
 		self.auth_failures.load(Ordering::Relaxed)
 	}
+
+	/// Resolve an API bearer into its tenant identity.
+	pub fn principal_for_token(&self, supplied: Option<&str>) -> crate::Result<Option<Principal>> {
+		Ok(TenantDirectory::new(
+			self.config.token.clone(),
+			self.config.client_token.clone(),
+			self.config.tenant_tokens.clone(),
+			self.config.tenant_keys.clone(),
+		)?
+		.authenticate(supplied))
+	}
+
+	/// Whether TCP requests require a configured bearer credential.
+	pub fn tokens_configured(&self) -> crate::Result<bool> {
+		Ok(TenantDirectory::new(
+			self.config.token.clone(),
+			self.config.client_token.clone(),
+			self.config.tenant_tokens.clone(),
+			self.config.tenant_keys.clone(),
+		)?
+		.tokens_configured())
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -117,42 +148,94 @@ impl Listener for UdsPeerListener {
 
 pub async fn auth_middleware(
 	State(state): State<ApiState>,
-	request: Request<Body>,
+	mut request: Request<Body>,
 	next: Next,
 ) -> Result<Response, ApiError> {
 	if is_public_path(request.method(), request.uri().path()) {
 		return Ok(next.run(request).await);
 	}
 	match state.transport {
-		Transport::Unix => Ok(next.run(request).await),
+		Transport::Unix => {
+			request.extensions_mut().insert(Principal::local_admin());
+			Ok(next.run(request).await)
+		},
 		Transport::Tcp => authorize_tcp(&state, request, next).await,
 	}
 }
 
 async fn authorize_tcp(
 	state: &ApiState,
-	request: Request<Body>,
+	mut request: Request<Body>,
 	next: Next,
 ) -> Result<Response, ApiError> {
 	let supplied = request_bearer_token(&request);
-	let admin = token_matches_any(supplied.as_deref(), state.config.token.as_deref());
-	let client = token_matches_any(supplied.as_deref(), state.config.client_token.as_deref());
-	let tokens_configured = token_configured(state.config.token.as_deref())
-		|| token_configured(state.config.client_token.as_deref());
-	if tokens_configured && !(admin || client) {
+	let configured = state.tokens_configured()?;
+	let principal = state.principal_for_token(supplied.as_deref())?;
+	if configured && principal.is_none() {
 		state.count_auth_failure();
 		if request.uri().path().starts_with("/vmon.v1.") {
 			return Ok(grpc_auth_error("16", "unauthorized", true));
 		}
 		return Err(ApiError::unauthorized("unauthorized"));
 	}
-	if client && !admin && is_admin_path(request.uri().path()) {
+	let authenticated = principal.unwrap_or_else(Principal::local_admin);
+	let principal = forwarded_principal(&request, &authenticated).unwrap_or(authenticated);
+	if !principal.is_admin() && is_admin_path(request.uri().path()) {
 		if request.uri().path().starts_with("/vmon.v1.") {
 			return Ok(grpc_auth_error("7", "forbidden", false));
 		}
 		return Err(ApiError::forbidden("forbidden"));
 	}
+	set_principal_headers(request.headers_mut(), &principal);
+	request.extensions_mut().insert(principal);
 	Ok(next.run(request).await)
+}
+
+fn forwarded_principal(request: &Request<Body>, authenticated: &Principal) -> Option<Principal> {
+	if !authenticated.is_admin()
+		|| request
+			.headers()
+			.get(MESH_HOP_HEADER)
+			.and_then(|value| value.to_str().ok())
+			!= Some("1")
+	{
+		return None;
+	}
+	let role = request
+		.headers()
+		.get(PRINCIPAL_ROLE_HEADER)
+		.and_then(|value| value.to_str().ok())?;
+	if role == "admin" {
+		return Some(Principal::local_admin());
+	}
+	if role != "client" {
+		return None;
+	}
+	let tenant = request
+		.headers()
+		.get(PRINCIPAL_TENANT_HEADER)
+		.and_then(|value| value.to_str().ok())?;
+	let key_id = request
+		.headers()
+		.get(PRINCIPAL_KEY_HEADER)
+		.and_then(|value| value.to_str().ok())?;
+	Principal::client(tenant, key_id).ok()
+}
+
+pub(super) fn set_principal_headers(headers: &mut HeaderMap, principal: &Principal) {
+	let role = match principal.role {
+		Role::Admin => "admin",
+		Role::Client => "client",
+	};
+	for (name, value) in [
+		(PRINCIPAL_TENANT_HEADER, principal.tenant.as_str()),
+		(PRINCIPAL_ROLE_HEADER, role),
+		(PRINCIPAL_KEY_HEADER, principal.key_id.as_str()),
+	] {
+		if let Ok(value) = HeaderValue::try_from(value) {
+			headers.insert(name, value);
+		}
+	}
 }
 
 fn grpc_auth_error(status: &'static str, message: &'static str, authenticate: bool) -> Response {
@@ -180,49 +263,46 @@ fn is_static_web_path(path: &str) -> bool {
 		|| path == "/grpc")
 }
 
+/// Require administrator authority for every API without explicit tenant scoping.
 pub fn is_admin_path(path: &str) -> bool {
-	if path.starts_with("/v1/mesh/") {
+	if path == "/metrics"
+		|| path.starts_with("/v1/mesh/")
+		|| path.starts_with("/v1/templates/")
+		|| path.starts_with("/v1/functions/")
+		|| path.starts_with("/v1/apps/")
+	{
 		return true;
 	}
-	// Client credentials may invoke functions and observe/cancel calls, but
-	// deployment, secret-bearing registration, artifact upload, and durable
-	// schedule mutations require an administrator credential.
-	if let Some(rest) = path.strip_prefix("/vmon.v1.") {
-		return matches!(
-			rest,
-			"VolumeService/Create"
-				| "VolumeService/Delete"
-				| "PoolService/Set"
-				| "PoolService/Delete"
-				| "SandboxService/Migrate"
-				| "ArtifactService/Put"
-				| "FunctionService/Register"
-				| "FunctionService/Activate"
-				| "FunctionService/Delete"
-				| "FunctionService/ActivateApp"
-				| "FunctionService/RollbackApp"
-				| "FunctionService/CreateSchedule"
-				| "FunctionService/DeleteSchedule"
-		);
+	let Some(rpc) = path.strip_prefix("/vmon.v1.") else {
+		return false;
+	};
+	let Some((service, method)) = rpc.split_once('/') else {
+		return true;
+	};
+	match service {
+		"SandboxService" => matches!(method, "Migrate" | "Snapshot" | "SnapshotFs"),
+		"CredentialService" => false,
+		_ => true,
 	}
-	false
 }
 
 /// Whether a `/grpc` bridge connection is limited to non-admin RPCs: a TCP
 /// connection authenticated with the client token only. UDS peer-cred
 /// connections and admin bearers get the full surface.
-pub(super) fn bridge_restricted(
+pub(super) fn bridge_principal(
 	state: &ApiState,
 	headers: &axum::http::HeaderMap,
 	query: Option<&str>,
-) -> bool {
+) -> Principal {
 	if state.transport == Transport::Unix {
-		return false;
+		return Principal::local_admin();
 	}
 	let supplied = bearer_token(headers.get(header::AUTHORIZATION)).or_else(|| query_token(query));
-	let admin = token_matches_any(supplied.as_deref(), state.config.token.as_deref());
-	let client = token_matches_any(supplied.as_deref(), state.config.client_token.as_deref());
-	client && !admin
+	state
+		.principal_for_token(supplied.as_deref())
+		.ok()
+		.flatten()
+		.unwrap_or_else(Principal::local_admin)
 }
 
 pub fn bearer_token(header: Option<&axum::http::HeaderValue>) -> Option<String> {
@@ -322,26 +402,6 @@ const fn hex_value(byte: u8) -> Option<u8> {
 	}
 }
 
-pub fn token_matches_any(supplied: Option<&str>, expected: Option<&str>) -> bool {
-	let Some(supplied) = supplied else {
-		return false;
-	};
-	expected
-		.unwrap_or_default()
-		.split(',')
-		.map(str::trim)
-		.filter(|token| !token.is_empty())
-		.any(|token| token == supplied)
-}
-
-fn token_configured(expected: Option<&str>) -> bool {
-	expected
-		.unwrap_or_default()
-		.split(',')
-		.map(str::trim)
-		.any(|token| !token.is_empty())
-}
-
 #[cfg(test)]
 #[allow(
 	clippy::items_after_test_module,
@@ -380,36 +440,34 @@ mod tests {
 	}
 
 	#[test]
-	fn function_admin_policy_preserves_client_invocation_access() {
+	fn unscoped_apis_are_admin_only_by_default() {
 		for path in [
-			"/vmon.v1.ArtifactService/Put",
-			"/vmon.v1.FunctionService/Register",
-			"/vmon.v1.FunctionService/Activate",
-			"/vmon.v1.FunctionService/Delete",
-			"/vmon.v1.FunctionService/ActivateApp",
-			"/vmon.v1.FunctionService/RollbackApp",
-			"/vmon.v1.FunctionService/CreateSchedule",
-			"/vmon.v1.FunctionService/DeleteSchedule",
+			"/metrics",
+			"/v1/functions/acme/run/invoke",
+			"/v1/apps/acme/app/functions/run/invoke",
+			"/vmon.v1.ArtifactService/Get",
+			"/vmon.v1.FunctionService/Get",
+			"/vmon.v1.CallService/Create",
+			"/vmon.v1.ActorService/Create",
+			"/vmon.v1.SnapshotService/List",
+			"/vmon.v1.VolumeService/List",
+			"/vmon.v1.PoolService/List",
+			"/vmon.v1.SystemService/Info",
+			"/vmon.v1.SandboxService/Migrate",
+			"/vmon.v1.SandboxService/Snapshot",
+			"/vmon.v1.SandboxService/SnapshotFs",
+			"/vmon.v1.FutureService/NewMethod",
 		] {
 			assert!(is_admin_path(path), "{path}");
 		}
 		for path in [
-			"/vmon.v1.ArtifactService/Get",
-			"/vmon.v1.ArtifactService/Stat",
-			"/vmon.v1.FunctionService/Get",
-			"/vmon.v1.FunctionService/List",
-			"/vmon.v1.FunctionService/GetApp",
-			"/vmon.v1.FunctionService/GetSchedule",
-			"/vmon.v1.FunctionService/ListSchedules",
-			"/vmon.v1.CallService/Create",
-			"/vmon.v1.CallService/Get",
-			"/vmon.v1.CallService/Watch",
-			"/vmon.v1.CallService/Cancel",
-			"/vmon.v1.ActorService/Create",
-			"/vmon.v1.ActorService/Checkpoint",
-			"/vmon.v1.ActorService/Restore",
-			"/vmon.v1.ActorService/Fork",
-			"/vmon.v1.ActorService/Delete",
+			"/vmon.v1.SandboxService/Create",
+			"/vmon.v1.SandboxService/Get",
+			"/vmon.v1.SandboxService/History",
+			"/vmon.v1.CredentialService/List",
+			"/vmon.v1.CredentialService/Put",
+			"/vmon.v1.CredentialService/Delete",
+			"/v1/sandboxes/sb/ports/8080",
 		] {
 			assert!(!is_admin_path(path), "{path}");
 		}

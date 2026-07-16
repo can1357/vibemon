@@ -24,6 +24,7 @@ pub mod pools;
 mod postgres;
 pub mod registry;
 pub mod s3;
+pub mod security;
 pub mod volumes;
 
 pub use error::{EngineError, ErrorCode, Result};

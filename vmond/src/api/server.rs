@@ -16,6 +16,7 @@ use crate::{
 	function::FunctionDomain,
 	home::{Home, OwnerLock},
 	mesh::runtime::MeshRuntime,
+	net,
 };
 
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> Result<()>
@@ -26,6 +27,7 @@ where
 	init_logging();
 	let config = resolve_serve_config(&overrides)?;
 	validate_tcp_auth(&config)?;
+	net::configure_broker_socket(config.network_broker_socket.clone());
 	let home = Home::new(config.home.clone());
 	let owner = OwnerLock::acquire(&home)?;
 	let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -35,11 +37,10 @@ where
 	let engine = Arc::new(Engine::new(config.clone())?);
 	let mesh = MeshRuntime::new(config.clone(), home.clone(), engine.clone())?;
 	runtime.block_on(mesh.verify_storage())?;
-	let engine_api: Arc<dyn EngineApi> = engine.clone();
 	let result = runtime.block_on(async {
 		prepare_home(&home)?;
 		write_pid(&home)?;
-		let result = run_listeners(home.clone(), config.clone(), engine_api, mesh).await;
+		let result = run_listeners(home.clone(), config.clone(), engine.clone(), mesh).await;
 		cleanup_files(&home);
 		result
 	});
@@ -51,7 +52,7 @@ where
 async fn run_listeners(
 	home: Home,
 	config: ServeConfig,
-	engine: Arc<dyn EngineApi>,
+	engine: Arc<Engine>,
 	mesh: Arc<MeshRuntime>,
 ) -> Result<()> {
 	let uds = bind_uds(&home)?;
@@ -63,8 +64,9 @@ async fn run_listeners(
 	};
 	let server_uid = current_uid();
 	let uds_listener = UdsPeerListener::new(uds, server_uid);
-	let functions = FunctionDomain::open(home.clone(), engine.clone(), &config)?;
-	let base_state = ApiState::new(engine, functions.clone(), config.clone(), Transport::Unix)
+	let engine_api: Arc<dyn EngineApi> = engine.clone();
+	let functions = FunctionDomain::open(home.clone(), engine_api.clone(), &config)?;
+	let base_state = ApiState::new(engine_api, functions.clone(), config.clone(), Transport::Unix)
 		.with_mesh(mesh.clone());
 	let uds_router = routes::router(base_state.with_transport(Transport::Unix));
 	let (shutdown_tx, _) = broadcast::channel::<()>(4);
@@ -74,6 +76,7 @@ async fn run_listeners(
 		let _ = signal_tx.send(());
 	});
 	let _background_tasks = mesh.start_background(&shutdown_tx);
+	let _maintenance_task = engine.start_maintenance(shutdown_tx.subscribe());
 	let mut tasks = Vec::new();
 	let mut uds_shutdown = shutdown_tx.subscribe();
 	tasks.push(tokio::spawn(async move {
