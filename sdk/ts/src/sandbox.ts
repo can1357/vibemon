@@ -18,6 +18,7 @@ import type {
   NetworkPolicy,
   SandboxInfo,
   SandboxMetrics,
+  RecoveryPoint,
   TunnelSet,
 } from "./models";
 import type { ProcessOptions } from "./process";
@@ -194,6 +195,43 @@ export class Sandbox {
       this.#info,
       parseResponseJson(
         (await channelFor(this).call(SandboxService.method.resume, { id: this.id })).json,
+      ),
+    );
+    return this.#info;
+  }
+
+  /** Durably checkpoint this sandbox while preserving its identity. */
+  async suspend(): Promise<SandboxInfo> {
+    this.#info = mergeInfo(
+      this.#info,
+      parseResponseJson(
+        (await channelFor(this).call(SandboxService.method.suspend, { id: this.id })).json,
+      ),
+    );
+    return this.#info;
+  }
+  /** List retained recovery points from oldest to newest. */
+  async history(): Promise<RecoveryPoint[]> {
+    const response = await channelFor(this).call(SandboxService.method.history, { id: this.id });
+    return response.points.map((point) => ({
+      name: point.name,
+      kind: point.kind,
+      created_at_unix_millis: point.createdAtUnixMillis,
+      size_bytes: point.sizeBytes,
+    }));
+  }
+  /** Restore this sandbox identity to a retained recovery point. */
+  async rollback(recoveryPoint: string): Promise<SandboxInfo> {
+    if (!recoveryPoint) throw new TypeError("recovery point is required");
+    this.#info = mergeInfo(
+      this.#info,
+      parseResponseJson(
+        (
+          await channelFor(this).call(SandboxService.method.rollback, {
+            id: this.id,
+            recoveryPoint,
+          })
+        ).json,
       ),
     );
     return this.#info;

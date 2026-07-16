@@ -27,6 +27,7 @@ const (
 	SandboxService_Terminate_FullMethodName   = "/vmon.v1.SandboxService/Terminate"
 	SandboxService_Pause_FullMethodName       = "/vmon.v1.SandboxService/Pause"
 	SandboxService_Resume_FullMethodName      = "/vmon.v1.SandboxService/Resume"
+	SandboxService_Suspend_FullMethodName     = "/vmon.v1.SandboxService/Suspend"
 	SandboxService_Extend_FullMethodName      = "/vmon.v1.SandboxService/Extend"
 	SandboxService_Metrics_FullMethodName     = "/vmon.v1.SandboxService/Metrics"
 	SandboxService_Logs_FullMethodName        = "/vmon.v1.SandboxService/Logs"
@@ -45,6 +46,8 @@ const (
 	SandboxService_Migrate_FullMethodName     = "/vmon.v1.SandboxService/Migrate"
 	SandboxService_Snapshot_FullMethodName    = "/vmon.v1.SandboxService/Snapshot"
 	SandboxService_SnapshotFs_FullMethodName  = "/vmon.v1.SandboxService/SnapshotFs"
+	SandboxService_History_FullMethodName     = "/vmon.v1.SandboxService/History"
+	SandboxService_Rollback_FullMethodName    = "/vmon.v1.SandboxService/Rollback"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -109,6 +112,8 @@ type SandboxServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
 	Resume(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
+	// Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+	Suspend(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
 	// Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
 	//
 	// Replaces: POST /v1/sandboxes/{id}/extend
@@ -231,6 +236,10 @@ type SandboxServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	SnapshotFs(ctx context.Context, in *SnapshotFsRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Lists rolling disk and full-checkpoint recovery points for a sandbox.
+	History(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*RecoveryPointList, error)
+	// Restores a sandbox identity to one retained recovery point.
+	Rollback(ctx context.Context, in *RollbackSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
 }
 
 type sandboxServiceClient struct {
@@ -315,6 +324,16 @@ func (c *sandboxServiceClient) Resume(ctx context.Context, in *SandboxRef, opts 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(JsonView)
 	err := c.cc.Invoke(ctx, SandboxService_Resume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) Suspend(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonView)
+	err := c.cc.Invoke(ctx, SandboxService_Suspend_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -525,6 +544,26 @@ func (c *sandboxServiceClient) SnapshotFs(ctx context.Context, in *SnapshotFsReq
 	return out, nil
 }
 
+func (c *sandboxServiceClient) History(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*RecoveryPointList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecoveryPointList)
+	err := c.cc.Invoke(ctx, SandboxService_History_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) Rollback(ctx context.Context, in *RollbackSandboxRequest, opts ...grpc.CallOption) (*JsonView, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonView)
+	err := c.cc.Invoke(ctx, SandboxService_Rollback_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SandboxServiceServer is the server API for SandboxService service.
 // All implementations must embed UnimplementedSandboxServiceServer
 // for forward compatibility.
@@ -587,6 +626,8 @@ type SandboxServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
 	Resume(context.Context, *SandboxRef) (*JsonView, error)
+	// Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+	Suspend(context.Context, *SandboxRef) (*JsonView, error)
 	// Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
 	//
 	// Replaces: POST /v1/sandboxes/{id}/extend
@@ -709,6 +750,10 @@ type SandboxServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	SnapshotFs(context.Context, *SnapshotFsRequest) (*JsonView, error)
+	// Lists rolling disk and full-checkpoint recovery points for a sandbox.
+	History(context.Context, *SandboxRef) (*RecoveryPointList, error)
+	// Restores a sandbox identity to one retained recovery point.
+	Rollback(context.Context, *RollbackSandboxRequest) (*JsonView, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }
 
@@ -742,6 +787,9 @@ func (UnimplementedSandboxServiceServer) Pause(context.Context, *SandboxRef) (*J
 }
 func (UnimplementedSandboxServiceServer) Resume(context.Context, *SandboxRef) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Resume not implemented")
+}
+func (UnimplementedSandboxServiceServer) Suspend(context.Context, *SandboxRef) (*JsonView, error) {
+	return nil, status.Error(codes.Unimplemented, "method Suspend not implemented")
 }
 func (UnimplementedSandboxServiceServer) Extend(context.Context, *ExtendSandboxRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Extend not implemented")
@@ -796,6 +844,12 @@ func (UnimplementedSandboxServiceServer) Snapshot(context.Context, *SnapshotRequ
 }
 func (UnimplementedSandboxServiceServer) SnapshotFs(context.Context, *SnapshotFsRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method SnapshotFs not implemented")
+}
+func (UnimplementedSandboxServiceServer) History(context.Context, *SandboxRef) (*RecoveryPointList, error) {
+	return nil, status.Error(codes.Unimplemented, "method History not implemented")
+}
+func (UnimplementedSandboxServiceServer) Rollback(context.Context, *RollbackSandboxRequest) (*JsonView, error) {
+	return nil, status.Error(codes.Unimplemented, "method Rollback not implemented")
 }
 func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
 func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
@@ -958,6 +1012,24 @@ func _SandboxService_Resume_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Resume(ctx, req.(*SandboxRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_Suspend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Suspend(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Suspend_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Suspend(ctx, req.(*SandboxRef))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1250,6 +1322,42 @@ func _SandboxService_SnapshotFs_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_History_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).History(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_History_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).History(ctx, req.(*SandboxRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_Rollback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RollbackSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Rollback(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Rollback_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Rollback(ctx, req.(*RollbackSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1288,6 +1396,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Resume",
 			Handler:    _SandboxService_Resume_Handler,
+		},
+		{
+			MethodName: "Suspend",
+			Handler:    _SandboxService_Suspend_Handler,
 		},
 		{
 			MethodName: "Extend",
@@ -1345,6 +1457,14 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "SnapshotFs",
 			Handler:    _SandboxService_SnapshotFs_Handler,
 		},
+		{
+			MethodName: "History",
+			Handler:    _SandboxService_History_Handler,
+		},
+		{
+			MethodName: "Rollback",
+			Handler:    _SandboxService_Rollback_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -1377,6 +1497,7 @@ const (
 	SnapshotService_List_FullMethodName    = "/vmon.v1.SnapshotService/List"
 	SnapshotService_Restore_FullMethodName = "/vmon.v1.SnapshotService/Restore"
 	SnapshotService_Fork_FullMethodName    = "/vmon.v1.SnapshotService/Fork"
+	SnapshotService_Delete_FullMethodName  = "/vmon.v1.SnapshotService/Delete"
 )
 
 // SnapshotServiceClient is the client API for SnapshotService service.
@@ -1404,6 +1525,8 @@ type SnapshotServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified snapshot name does not exist.
 	//   - `invalid` (INVALID_ARGUMENT): Invalid count or target configuration.
 	Fork(ctx context.Context, in *ForkSnapshotRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Deletes an immutable snapshot and its encrypted storage.
+	Delete(ctx context.Context, in *SnapshotRef, opts ...grpc.CallOption) (*Ok, error)
 }
 
 type snapshotServiceClient struct {
@@ -1444,6 +1567,16 @@ func (c *snapshotServiceClient) Fork(ctx context.Context, in *ForkSnapshotReques
 	return out, nil
 }
 
+func (c *snapshotServiceClient) Delete(ctx context.Context, in *SnapshotRef, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, SnapshotService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SnapshotServiceServer is the server API for SnapshotService service.
 // All implementations must embed UnimplementedSnapshotServiceServer
 // for forward compatibility.
@@ -1469,6 +1602,8 @@ type SnapshotServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified snapshot name does not exist.
 	//   - `invalid` (INVALID_ARGUMENT): Invalid count or target configuration.
 	Fork(context.Context, *ForkSnapshotRequest) (*JsonView, error)
+	// Deletes an immutable snapshot and its encrypted storage.
+	Delete(context.Context, *SnapshotRef) (*Ok, error)
 	mustEmbedUnimplementedSnapshotServiceServer()
 }
 
@@ -1487,6 +1622,9 @@ func (UnimplementedSnapshotServiceServer) Restore(context.Context, *RestoreSnaps
 }
 func (UnimplementedSnapshotServiceServer) Fork(context.Context, *ForkSnapshotRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Fork not implemented")
+}
+func (UnimplementedSnapshotServiceServer) Delete(context.Context, *SnapshotRef) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
 }
 func (UnimplementedSnapshotServiceServer) mustEmbedUnimplementedSnapshotServiceServer() {}
 func (UnimplementedSnapshotServiceServer) testEmbeddedByValue()                         {}
@@ -1563,6 +1701,24 @@ func _SnapshotService_Fork_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SnapshotService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SnapshotRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotServiceServer).Delete(ctx, req.(*SnapshotRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SnapshotService_ServiceDesc is the grpc.ServiceDesc for SnapshotService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1581,6 +1737,198 @@ var SnapshotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Fork",
 			Handler:    _SnapshotService_Fork_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _SnapshotService_Delete_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "vmon/v1/api.proto",
+}
+
+const (
+	CredentialService_List_FullMethodName   = "/vmon.v1.CredentialService/List"
+	CredentialService_Put_FullMethodName    = "/vmon.v1.CredentialService/Put"
+	CredentialService_Delete_FullMethodName = "/vmon.v1.CredentialService/Delete"
+)
+
+// CredentialServiceClient is the client API for CredentialService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// CredentialService stores scoped credentials that only host gateways may resolve.
+type CredentialServiceClient interface {
+	// Lists non-secret metadata for credentials owned by the authenticated tenant.
+	List(ctx context.Context, in *ListCredentialsRequest, opts ...grpc.CallOption) (*CredentialList, error)
+	// Creates or atomically rotates one encrypted credential.
+	Put(ctx context.Context, in *PutCredentialRequest, opts ...grpc.CallOption) (*CredentialRecord, error)
+	// Revokes one credential immediately.
+	Delete(ctx context.Context, in *DeleteCredentialRequest, opts ...grpc.CallOption) (*Ok, error)
+}
+
+type credentialServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCredentialServiceClient(cc grpc.ClientConnInterface) CredentialServiceClient {
+	return &credentialServiceClient{cc}
+}
+
+func (c *credentialServiceClient) List(ctx context.Context, in *ListCredentialsRequest, opts ...grpc.CallOption) (*CredentialList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CredentialList)
+	err := c.cc.Invoke(ctx, CredentialService_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *credentialServiceClient) Put(ctx context.Context, in *PutCredentialRequest, opts ...grpc.CallOption) (*CredentialRecord, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CredentialRecord)
+	err := c.cc.Invoke(ctx, CredentialService_Put_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *credentialServiceClient) Delete(ctx context.Context, in *DeleteCredentialRequest, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, CredentialService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CredentialServiceServer is the server API for CredentialService service.
+// All implementations must embed UnimplementedCredentialServiceServer
+// for forward compatibility.
+//
+// CredentialService stores scoped credentials that only host gateways may resolve.
+type CredentialServiceServer interface {
+	// Lists non-secret metadata for credentials owned by the authenticated tenant.
+	List(context.Context, *ListCredentialsRequest) (*CredentialList, error)
+	// Creates or atomically rotates one encrypted credential.
+	Put(context.Context, *PutCredentialRequest) (*CredentialRecord, error)
+	// Revokes one credential immediately.
+	Delete(context.Context, *DeleteCredentialRequest) (*Ok, error)
+	mustEmbedUnimplementedCredentialServiceServer()
+}
+
+// UnimplementedCredentialServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedCredentialServiceServer struct{}
+
+func (UnimplementedCredentialServiceServer) List(context.Context, *ListCredentialsRequest) (*CredentialList, error) {
+	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedCredentialServiceServer) Put(context.Context, *PutCredentialRequest) (*CredentialRecord, error) {
+	return nil, status.Error(codes.Unimplemented, "method Put not implemented")
+}
+func (UnimplementedCredentialServiceServer) Delete(context.Context, *DeleteCredentialRequest) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedCredentialServiceServer) mustEmbedUnimplementedCredentialServiceServer() {}
+func (UnimplementedCredentialServiceServer) testEmbeddedByValue()                           {}
+
+// UnsafeCredentialServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CredentialServiceServer will
+// result in compilation errors.
+type UnsafeCredentialServiceServer interface {
+	mustEmbedUnimplementedCredentialServiceServer()
+}
+
+func RegisterCredentialServiceServer(s grpc.ServiceRegistrar, srv CredentialServiceServer) {
+	// If the following call panics, it indicates UnimplementedCredentialServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&CredentialService_ServiceDesc, srv)
+}
+
+func _CredentialService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CredentialServiceServer).List(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CredentialService_List_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CredentialServiceServer).List(ctx, req.(*ListCredentialsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CredentialService_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CredentialServiceServer).Put(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CredentialService_Put_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CredentialServiceServer).Put(ctx, req.(*PutCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CredentialService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CredentialServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CredentialService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CredentialServiceServer).Delete(ctx, req.(*DeleteCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// CredentialService_ServiceDesc is the grpc.ServiceDesc for CredentialService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var CredentialService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.CredentialService",
+	HandlerType: (*CredentialServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "List",
+			Handler:    _CredentialService_List_Handler,
+		},
+		{
+			MethodName: "Put",
+			Handler:    _CredentialService_Put_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _CredentialService_Delete_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -69,6 +69,7 @@ export type {
   NetworkPolicy,
   PoolSetRequest,
   PoolStats,
+  RecoveryPoint,
   RestoreRequest,
   SandboxCreateRequest,
   S3MountSpec,

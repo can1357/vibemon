@@ -197,6 +197,8 @@ type SandboxCreateRequest struct {
 	Env map[string]string `json:"env,omitempty"`
 	// Secrets contains request-scoped secret bundles.
 	Secrets []Secret `json:"secrets,omitempty"`
+	// Credentials contains host-brokered credential names; credential values never enter this request.
+	Credentials []string `json:"credentials,omitempty"`
 	// Volumes maps guest mountpoints to named volume mounts.
 	Volumes map[string]VolumeMount `json:"volumes,omitempty"`
 	// S3Mounts maps guest mountpoints to S3 bucket or prefix mounts.
@@ -227,6 +229,18 @@ type SandboxCreateRequest struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// Command overrides the foreground entrypoint.
 	Command []string `json:"command,omitempty"`
+}
+
+// RecoveryPoint describes one retained sandbox checkpoint.
+type RecoveryPoint struct {
+	// Name is the server-assigned recovery-point identifier.
+	Name string
+	// Kind identifies the retained capture type.
+	Kind string
+	// CreatedAtUnixMillis is the creation time in Unix milliseconds.
+	CreatedAtUnixMillis uint64
+	// SizeBytes is the encrypted capture size in bytes.
+	SizeBytes uint64
 }
 
 // S3Mount configures one S3 bucket or prefix mount for a sandbox.

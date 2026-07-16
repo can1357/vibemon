@@ -297,6 +297,47 @@ func (sandbox *Sandbox) Resume(ctx context.Context) (*Sandbox, error) {
 	})
 }
 
+// Suspend durably checkpoints the sandbox while preserving its identity.
+func (sandbox *Sandbox) Suspend(ctx context.Context) (*Sandbox, error) {
+	return sandbox.action(ctx, "suspend sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Suspend(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+	})
+}
+
+// History lists retained recovery points from oldest to newest.
+func (sandbox *Sandbox) History(ctx context.Context) ([]RecoveryPoint, error) {
+	var response *pb.RecoveryPointList
+	err := sandbox.invoke(ctx, "sandbox history", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
+		var callErr error
+		response, callErr = service.History(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	points := response.GetPoints()
+	out := make([]RecoveryPoint, 0, len(points))
+	for _, point := range points {
+		out = append(out, RecoveryPoint{
+			Name:                point.GetName(),
+			Kind:                point.GetKind(),
+			CreatedAtUnixMillis: point.GetCreatedAtUnixMillis(),
+			SizeBytes:           point.GetSizeBytes(),
+		})
+	}
+	return out, nil
+}
+
+// Rollback restores this sandbox identity to a retained recovery point.
+func (sandbox *Sandbox) Rollback(ctx context.Context, recoveryPoint string) (*Sandbox, error) {
+	if recoveryPoint == "" {
+		return nil, errors.New("vmon: recovery point is required")
+	}
+	return sandbox.action(ctx, "rollback sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.Rollback(ctx, &pb.RollbackSandboxRequest{Id: sandbox.ID, RecoveryPoint: recoveryPoint}, opts...)
+	})
+}
+
 // Extend increases the lease duration of the sandbox by the specified seconds.
 func (sandbox *Sandbox) Extend(ctx context.Context, seconds uint64) (*Sandbox, error) {
 	return sandbox.action(ctx, "extend sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {

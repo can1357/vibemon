@@ -33,6 +33,9 @@ type sandboxServiceStub struct {
 	terminate   func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	tunnels     func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	migrate     func(context.Context, *pb.MigrateRequest) (*pb.JsonView, error)
+	suspend     func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
+	history     func(context.Context, *pb.SandboxRef) (*pb.RecoveryPointList, error)
+	rollback    func(context.Context, *pb.RollbackSandboxRequest) (*pb.JsonView, error)
 	execCapture func(context.Context, *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error)
 	fileRead    func(context.Context, *pb.FilePathRequest) (*pb.FileContent, error)
 	fileWrite   func(context.Context, *pb.FileWriteRequest) (*pb.Ok, error)
@@ -90,6 +93,25 @@ func (stub *sandboxServiceStub) Migrate(ctx context.Context, request *pb.Migrate
 		return nil, status.Error(codes.Unimplemented, "migrate not stubbed")
 	}
 	return stub.migrate(ctx, request)
+}
+
+func (stub *sandboxServiceStub) Suspend(ctx context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+	if stub.suspend == nil {
+		return nil, status.Error(codes.Unimplemented, "suspend not stubbed")
+	}
+	return stub.suspend(ctx, ref)
+}
+func (stub *sandboxServiceStub) History(ctx context.Context, ref *pb.SandboxRef) (*pb.RecoveryPointList, error) {
+	if stub.history == nil {
+		return nil, status.Error(codes.Unimplemented, "history not stubbed")
+	}
+	return stub.history(ctx, ref)
+}
+func (stub *sandboxServiceStub) Rollback(ctx context.Context, request *pb.RollbackSandboxRequest) (*pb.JsonView, error) {
+	if stub.rollback == nil {
+		return nil, status.Error(codes.Unimplemented, "rollback not stubbed")
+	}
+	return stub.rollback(ctx, request)
 }
 func (stub *sandboxServiceStub) ExecCapture(ctx context.Context, request *pb.ExecCaptureRequest) (*pb.ExecCaptureResponse, error) {
 	if stub.execCapture == nil {

@@ -330,6 +330,18 @@ func (s *SnapshotService) Fork(ctx context.Context, name string, request ForkReq
 	return rows, nil
 }
 
+// Delete permanently removes a named snapshot.
+func (s *SnapshotService) Delete(ctx context.Context, name string) error {
+	if err := requireIdentifier("snapshot name", name); err != nil {
+		return err
+	}
+	_, err := s.client.unary(ctx, "", "delete snapshot", func(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) error {
+		_, callErr := pb.NewSnapshotServiceClient(conn).Delete(ctx, &pb.SnapshotRef{Name: name}, opts...)
+		return callErr
+	})
+	return err
+}
+
 // VolumeService manages persistent storage volumes.
 type VolumeService struct{ client *Client }
 

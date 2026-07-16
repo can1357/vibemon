@@ -40,6 +40,8 @@ export interface SandboxCreateRequest {
   ports?: number[] | null;
   readiness_probe?: number | string | { port: number } | null;
   secrets?: SecretWire[] | null;
+  /** Host-brokered credential names; credential values never enter this request. */
+  credentials?: string[] | null;
   s3_mounts?: Record<string, S3MountSpec | string> | null;
   tags?: Record<string, string> | null;
   template?: string | null;
@@ -105,6 +107,14 @@ export interface RestoreRequest extends SnapshotRuntimeOptions {
 /** Atomic snapshot fork request for 1 through 32 clones. */
 export interface ForkRequest extends SnapshotRuntimeOptions {
   count: number;
+}
+
+/** An immutable recovery point retained for a sandbox. */
+export interface RecoveryPoint {
+  name: string;
+  kind: string;
+  created_at_unix_millis: bigint;
+  size_bytes: bigint;
 }
 
 /** Warm-pool update request. */

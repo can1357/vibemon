@@ -89,6 +89,9 @@ service SandboxService {
   //   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
   rpc Resume(SandboxRef) returns (JsonView);
 
+  // Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+  rpc Suspend(SandboxRef) returns (JsonView);
+
   // Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
   //
   // Replaces: POST /v1/sandboxes/{id}/extend
@@ -227,6 +230,12 @@ service SandboxService {
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
   //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
   rpc SnapshotFs(SnapshotFsRequest) returns (JsonView);
+
+  // Lists rolling disk and full-checkpoint recovery points for a sandbox.
+  rpc History(SandboxRef) returns (RecoveryPointList);
+
+  // Restores a sandbox identity to one retained recovery point.
+  rpc Rollback(RollbackSandboxRequest) returns (JsonView);
 }
 
 // SnapshotService manages saved microVM snapshots, enabling restorations and high-density forks.
@@ -252,6 +261,21 @@ service SnapshotService {
   //   - `not_found` (NOT_FOUND): The specified snapshot name does not exist.
   //   - `invalid` (INVALID_ARGUMENT): Invalid count or target configuration.
   rpc Fork(ForkSnapshotRequest) returns (JsonView);
+
+  // Deletes an immutable snapshot and its encrypted storage.
+  rpc Delete(SnapshotRef) returns (Ok);
+}
+
+// CredentialService stores scoped credentials that only host gateways may resolve.
+service CredentialService {
+  // Lists non-secret metadata for credentials owned by the authenticated tenant.
+  rpc List(ListCredentialsRequest) returns (CredentialList);
+
+  // Creates or atomically rotates one encrypted credential.
+  rpc Put(PutCredentialRequest) returns (CredentialRecord);
+
+  // Revokes one credential immediately.
+  rpc Delete(DeleteCredentialRequest) returns (Ok);
 }
 
 // VolumeService provides RPCs for managing persistent block storage volumes.
@@ -360,6 +384,12 @@ message StopSandboxRequest {
 
   // Optional exit/return code of the foreground CLI process to preserve in metrics and logs.
   optional int64 returncode = 2;
+}
+
+// RollbackSandboxRequest selects an immutable retained recovery point.
+message RollbackSandboxRequest {
+  string id = 1;
+  string recovery_point = 2;
 }
 
 // ExtendSandboxRequest represents parameters to extend the TTL of a sandbox.
@@ -569,6 +599,74 @@ message ListSnapshotsRequest {}
 message SnapshotList {
   // The list of snapshot names.
   repeated string snapshots = 1;
+}
+
+// SnapshotRef identifies an immutable machine snapshot.
+message SnapshotRef {
+  string name = 1;
+}
+
+// RecoveryPoint describes one retained disk or full-checkpoint capture.
+message RecoveryPoint {
+  string name = 1;
+  string kind = 2;
+  uint64 created_at_unix_millis = 3;
+  uint64 size_bytes = 4;
+}
+
+// RecoveryPointList contains oldest-to-newest retained sandbox history.
+message RecoveryPointList {
+  repeated RecoveryPoint points = 1;
+}
+
+// ListCredentialsRequest selects the caller's tenant credential namespace.
+message ListCredentialsRequest {
+  // Tenant is admin-only; tenant callers are always confined to their identity.
+  optional string tenant = 1;
+}
+
+// CredentialHeader contains one secret header injected only by the host gateway.
+message CredentialHeader {
+  string name = 1;
+  bytes value = 2;
+}
+
+// PutCredentialRequest defines service scope, rotation, expiry, and request limits.
+message PutCredentialRequest {
+  string name = 1;
+  repeated string allowed_domains = 2;
+  repeated CredentialHeader headers = 3;
+  optional uint64 expires_at_unix_millis = 4;
+  // Tenant is admin-only; tenant callers are always confined to their identity.
+  optional string tenant = 6;
+  uint32 requests_per_minute = 5;
+}
+
+// CredentialRef identifies one tenant-local credential.
+message CredentialRef {
+  string name = 1;
+}
+
+// DeleteCredentialRequest revokes a tenant-local credential.
+message DeleteCredentialRequest {
+  CredentialRef credential = 1;
+  // Tenant is admin-only; tenant callers are always confined to their identity.
+  optional string tenant = 2;
+}
+
+// CredentialRecord contains only metadata safe to expose to workloads and users.
+message CredentialRecord {
+  string name = 1;
+  repeated string allowed_domains = 2;
+  repeated string header_names = 3;
+  optional uint64 expires_at_unix_millis = 4;
+  uint32 requests_per_minute = 5;
+  string version = 6;
+}
+
+// CredentialList contains non-secret metadata for one tenant.
+message CredentialList {
+  repeated CredentialRecord credentials = 1;
 }
 
 // RestoreSnapshotRequest represents parameters to restore a sandbox from a snapshot.

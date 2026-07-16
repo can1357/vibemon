@@ -56,6 +56,21 @@ function fakeVmon() {
       pause: (req) => view("Pause", req),
       resume: (req) => view("Resume", req),
       extend: (req) => view("Extend", req),
+      suspend: (req) => view("Suspend", req),
+      history: (req) => {
+        rpcs.push({ method: "History", input: req });
+        return {
+          points: [
+            {
+              name: "recovery-s1",
+              kind: "full",
+              createdAtUnixMillis: 1_700_000_000_000n,
+              sizeBytes: 1024n,
+            },
+          ],
+        };
+      },
+      rollback: (req) => view("Rollback", req),
       metrics: (req) => view("Metrics", req),
       execCapture: (req) => {
         rpcs.push({ method: "ExecCapture", input: req });
@@ -84,6 +99,7 @@ function fakeVmon() {
       list: () => ({ snapshots: state.snapshots }),
       restore: (req) => view("Restore", req),
       fork: (req) => view("Fork", req),
+      delete: (req) => record("SnapshotDelete", req),
     });
     service(VolumeService, {
       list: () => ({ volumes: state.volumes }),
@@ -126,12 +142,17 @@ test("resource hierarchy maps RPCs and views", async () => {
   );
 
   state.view = { id: "s1", node: "n1" };
-  const sandbox = await client.sandboxes.create({ image: "alpine" });
+  const sandbox = await client.sandboxes.create({
+    image: "alpine",
+    credentials: ["github-api"],
+  });
   expect(sandbox.id).toBe("s1");
   const created = rpcs.at(-1);
   expect(created?.method).toBe("Create");
-  expect(JSON.parse(String(inputField(created, "specJson")))).toEqual({ image: "alpine" });
-
+  expect(JSON.parse(String(inputField(created, "specJson")))).toEqual({
+    image: "alpine",
+    credentials: ["github-api"],
+  });
   await sandbox.run(["echo", "ok"]);
   expect(rpcs.at(-1)).toMatchObject({ method: "ExecCapture", input: { id: "s1" } });
 
@@ -183,9 +204,27 @@ test("resource hierarchy maps RPCs and views", async () => {
   expect(await sandbox.snapshot()).toBe("vm-snapshot");
   state.view = { image: "fs-image" };
   expect(await sandbox.snapshotFilesystem()).toBe("fs-image");
+  await client.snapshots.delete("snap");
+  expect(rpcs.at(-1)).toMatchObject({ method: "SnapshotDelete", input: { name: "snap" } });
   state.view = { expires_at: 123 };
   expect((await sandbox.extend(30)).id).toBe("s1");
   expect(rpcs.at(-1)).toMatchObject({ method: "Extend", input: { id: "s1", secs: 30n } });
+  state.view = { id: "s1", status: "suspended" };
+  expect((await sandbox.suspend()).status).toBe("suspended");
+  expect(await sandbox.history()).toEqual([
+    {
+      name: "recovery-s1",
+      kind: "full",
+      created_at_unix_millis: 1_700_000_000_000n,
+      size_bytes: 1024n,
+    },
+  ]);
+  state.view = { id: "s1", status: "running" };
+  expect((await sandbox.rollback("recovery-s1")).status).toBe("running");
+  expect(rpcs.at(-1)).toMatchObject({
+    method: "Rollback",
+    input: { id: "s1", recoveryPoint: "recovery-s1" },
+  });
   state.view = { id: "s1", node: "node-b" };
   expect((await sandbox.migrate("node-b")).node).toBe("node-b");
   expect(sandbox.node).toBe("node-b");

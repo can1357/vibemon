@@ -260,6 +260,11 @@ export class SnapshotAPI {
   async list(): Promise<string[]> {
     return (await this.#client.driver.call(SnapshotService.method.list, {})).message.snapshots;
   }
+
+  /** Permanently delete one named snapshot. */
+  async delete(name: string): Promise<void> {
+    await this.#client.driver.call(SnapshotService.method.delete, { name });
+  }
   /** Restore one snapshot into a sandbox. */
   async restore(name: string, request: RestoreRequest = {}): Promise<Sandbox> {
     const { message, endpoint } = await this.#client.driver.call(SnapshotService.method.restore, {

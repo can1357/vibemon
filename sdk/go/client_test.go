@@ -59,7 +59,8 @@ func routingDialer(routes map[string]*bufconn.Listener) func(context.Context, st
 
 type snapshotServiceStub struct {
 	pb.UnimplementedSnapshotServiceServer
-	fork func(context.Context, *pb.ForkSnapshotRequest) (*pb.JsonView, error)
+	fork   func(context.Context, *pb.ForkSnapshotRequest) (*pb.JsonView, error)
+	delete func(context.Context, *pb.SnapshotRef) (*pb.Ok, error)
 }
 
 func (stub *snapshotServiceStub) Fork(ctx context.Context, request *pb.ForkSnapshotRequest) (*pb.JsonView, error) {
@@ -67,6 +68,13 @@ func (stub *snapshotServiceStub) Fork(ctx context.Context, request *pb.ForkSnaps
 		return nil, status.Error(codes.Unimplemented, "fork not stubbed")
 	}
 	return stub.fork(ctx, request)
+}
+
+func (stub *snapshotServiceStub) Delete(ctx context.Context, ref *pb.SnapshotRef) (*pb.Ok, error) {
+	if stub.delete == nil {
+		return nil, status.Error(codes.Unimplemented, "delete not stubbed")
+	}
+	return stub.delete(ctx, ref)
 }
 
 type poolServiceStub struct {
@@ -80,6 +88,7 @@ func (stub *poolServiceStub) List(ctx context.Context, request *pb.ListPoolsRequ
 		return nil, status.Error(codes.Unimplemented, "list not stubbed")
 	}
 	return stub.list(ctx, request)
+
 }
 func (stub *poolServiceStub) Delete(ctx context.Context, ref *pb.PoolRef) (*pb.Ok, error) {
 	if stub.delete == nil {
@@ -88,12 +97,69 @@ func (stub *poolServiceStub) Delete(ctx context.Context, ref *pb.PoolRef) (*pb.O
 	return stub.delete(ctx, ref)
 }
 
+func TestSandboxRecoveryAndSnapshotDelete(t *testing.T) {
+	var deleted string
+	sandbox := &sandboxServiceStub{
+		suspend: func(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+			if ref.GetId() != "box" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected sandbox")
+			}
+			return &pb.JsonView{Json: `{"id":"box","status":"suspended"}`}, nil
+		},
+		history: func(_ context.Context, ref *pb.SandboxRef) (*pb.RecoveryPointList, error) {
+			if ref.GetId() != "box" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected sandbox")
+			}
+			return &pb.RecoveryPointList{Points: []*pb.RecoveryPoint{{
+				Name: "point-1", Kind: "full", CreatedAtUnixMillis: 123, SizeBytes: 456,
+			}}}, nil
+		},
+		rollback: func(_ context.Context, request *pb.RollbackSandboxRequest) (*pb.JsonView, error) {
+			if request.GetId() != "box" || request.GetRecoveryPoint() != "point-1" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected rollback")
+			}
+			return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+		},
+	}
+	snapshots := &snapshotServiceStub{
+		delete: func(_ context.Context, ref *pb.SnapshotRef) (*pb.Ok, error) {
+			deleted = ref.GetName()
+			return &pb.Ok{}, nil
+		},
+	}
+	client := bufconnClient(t, startGRPCServices(t, func(server *grpc.Server) {
+		pb.RegisterSandboxServiceServer(server, sandbox)
+		pb.RegisterSnapshotServiceServer(server, snapshots)
+	}))
+	box := client.Sandboxes.Ref("box")
+	if updated, err := box.Suspend(context.Background()); err != nil || updated.Status != "suspended" {
+		t.Fatalf("Suspend() = %#v, %v", updated, err)
+	}
+	points, err := box.History(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := points; len(got) != 1 || got[0] != (RecoveryPoint{Name: "point-1", Kind: "full", CreatedAtUnixMillis: 123, SizeBytes: 456}) {
+		t.Fatalf("History() = %#v", got)
+	}
+	if updated, err := box.Rollback(context.Background(), "point-1"); err != nil || updated.Status != "running" {
+		t.Fatalf("Rollback() = %#v, %v", updated, err)
+	}
+	if err := client.Snapshots.Delete(context.Background(), "snapshot-1"); err != nil {
+		t.Fatal(err)
+	}
+	if deleted != "snapshot-1" {
+		t.Fatalf("Delete() sent %q", deleted)
+	}
+}
+
 func TestClientServicesAndBoundSandbox(t *testing.T) {
 	var metricsID string
 	stub := &sandboxServiceStub{
 		create: func(_ context.Context, request *pb.CreateSandboxRequest) (*pb.JsonView, error) {
 			var spec SandboxCreateRequest
-			if err := json.Unmarshal([]byte(request.GetSpecJson()), &spec); err != nil || spec.Image != "alpine" {
+			if err := json.Unmarshal([]byte(request.GetSpecJson()), &spec); err != nil ||
+				spec.Image != "alpine" || len(spec.Credentials) != 1 || spec.Credentials[0] != "github-api" {
 				return nil, status.Error(codes.InvalidArgument, "unexpected create spec")
 			}
 			return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
@@ -107,7 +173,10 @@ func TestClientServicesAndBoundSandbox(t *testing.T) {
 	if client.Sandboxes == nil || client.Snapshots == nil || client.Volumes == nil || client.Pools == nil || client.Mesh == nil {
 		t.Fatal("client services were not initialized")
 	}
-	sandbox, err := client.Sandboxes.Create(context.Background(), SandboxCreateRequest{Image: "alpine"})
+	sandbox, err := client.Sandboxes.Create(
+		context.Background(),
+		SandboxCreateRequest{Image: "alpine", Credentials: []string{"github-api"}},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
