@@ -326,6 +326,7 @@ class SandboxAPI:
         workdir: str | None = None,
         env: dict[str, str] | None = None,
         secrets: Iterable[Secret | Mapping[str, object]] | None = None,
+        credentials: Sequence[str] | None = None,
         volumes: Mapping[str, Any] | None = None,
         s3_mounts: Mapping[str, S3Mount | str] | None = None,
         tags: dict[str, str] | None = None,
@@ -343,6 +344,7 @@ class SandboxAPI:
         command: Sequence[str] | None = None,
     ) -> Sandbox:
         """Create a sandbox using the stable ``SandboxCreate`` request fields."""
+        credential_names = _credential_names(credentials)
         secret_items = builtins.list(secrets) if secrets is not None else None
         body = _drop_none(
             {
@@ -361,6 +363,7 @@ class SandboxAPI:
                 if env is not None
                 else None,
                 "secrets": _secret_wire(secret_items),
+                "credentials": credential_names,
                 "volumes": _volume_wire(volumes),
                 "s3_mounts": _s3_mount_wire(s3_mounts),
                 "tags": {str(key): str(value) for key, value in (tags or {}).items()}
@@ -491,6 +494,12 @@ class SnapshotAPI:
             lambda stubs: stubs.snapshots.List(api_pb2.ListSnapshotsRequest())
         )
         return list(response.snapshots)
+
+    def delete(self, snapshot: str) -> None:
+        """Permanently delete one named snapshot."""
+        self._client.driver.call(
+            lambda stubs: stubs.snapshots.Delete(api_pb2.SnapshotRef(name=snapshot))
+        )
 
     def restore(self, snapshot: str, **kwargs: Any) -> Sandbox:
         """Restore one sandbox from a named snapshot."""
@@ -698,6 +707,14 @@ class MeshAPI:
         """Return the self node followed by advertised peers."""
         status = self.status()
         return [status.self_node, *status.peers]
+
+
+def _credential_names(credentials: Sequence[str] | None) -> list[str] | None:
+    if credentials is None:
+        return None
+    if any(not isinstance(name, str) or not name for name in credentials):
+        raise TypeError("credentials must contain non-empty credential names")
+    return list(credentials)
 
 
 def connect(

@@ -121,12 +121,18 @@ characters and must match:
 ^[a-z0-9_][a-z0-9_.-]{0,63}$
 ```
 
-Vibemon creates the volume root and directory with mode `0700`; it rejects
-symlinks and non-directory volume paths. The gRPC `VolumeService` lists,
-creates, and deletes volume names. A delete is refused while its volume is
-attached. Although the protobuf service description uses the broad term
-"persistent storage," the current implementation backing a named volume is a
-host directory, not a portable block-volume format.
+The daemon creates the live volume root and directory with mode `0700`; it
+rejects symlinks and non-directory volume paths. When a writable tenant volume
+is detached, the daemon seals its archive with that tenant's customer key ID.
+The next attachment decrypts it into a private live directory. A missing,
+malformed, or revoked key fails the attachment; the daemon does not create an
+empty replacement volume or fall back to plaintext.
+
+The gRPC `VolumeService` lists, creates, and deletes names visible to the
+authenticated tenant. A delete is refused while its volume is attached.
+Although the protobuf service description uses the broad term "persistent
+storage," the current implementation backing a named volume is a host
+directory plus an encrypted archive, not a portable block-volume format.
 
 The low-level VMM syntax demonstrates writable and read-only volume exports:
 

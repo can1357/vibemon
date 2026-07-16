@@ -263,6 +263,14 @@ class StopSandboxRequest(_message.Message):
     returncode: int
     def __init__(self, id: _Optional[str] = ..., returncode: _Optional[int] = ...) -> None: ...
 
+class RollbackSandboxRequest(_message.Message):
+    __slots__ = ("id", "recovery_point")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    RECOVERY_POINT_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    recovery_point: str
+    def __init__(self, id: _Optional[str] = ..., recovery_point: _Optional[str] = ...) -> None: ...
+
 class ExtendSandboxRequest(_message.Message):
     __slots__ = ("id", "secs")
     ID_FIELD_NUMBER: _ClassVar[int]
@@ -441,6 +449,96 @@ class SnapshotList(_message.Message):
     SNAPSHOTS_FIELD_NUMBER: _ClassVar[int]
     snapshots: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, snapshots: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class SnapshotRef(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class RecoveryPoint(_message.Message):
+    __slots__ = ("name", "kind", "created_at_unix_millis", "size_bytes")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    kind: str
+    created_at_unix_millis: int
+    size_bytes: int
+    def __init__(self, name: _Optional[str] = ..., kind: _Optional[str] = ..., created_at_unix_millis: _Optional[int] = ..., size_bytes: _Optional[int] = ...) -> None: ...
+
+class RecoveryPointList(_message.Message):
+    __slots__ = ("points",)
+    POINTS_FIELD_NUMBER: _ClassVar[int]
+    points: _containers.RepeatedCompositeFieldContainer[RecoveryPoint]
+    def __init__(self, points: _Optional[_Iterable[_Union[RecoveryPoint, _Mapping]]] = ...) -> None: ...
+
+class ListCredentialsRequest(_message.Message):
+    __slots__ = ("tenant",)
+    TENANT_FIELD_NUMBER: _ClassVar[int]
+    tenant: str
+    def __init__(self, tenant: _Optional[str] = ...) -> None: ...
+
+class CredentialHeader(_message.Message):
+    __slots__ = ("name", "value")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    value: bytes
+    def __init__(self, name: _Optional[str] = ..., value: _Optional[bytes] = ...) -> None: ...
+
+class PutCredentialRequest(_message.Message):
+    __slots__ = ("name", "allowed_domains", "headers", "expires_at_unix_millis", "tenant", "requests_per_minute")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_DOMAINS_FIELD_NUMBER: _ClassVar[int]
+    HEADERS_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    TENANT_FIELD_NUMBER: _ClassVar[int]
+    REQUESTS_PER_MINUTE_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    allowed_domains: _containers.RepeatedScalarFieldContainer[str]
+    headers: _containers.RepeatedCompositeFieldContainer[CredentialHeader]
+    expires_at_unix_millis: int
+    tenant: str
+    requests_per_minute: int
+    def __init__(self, name: _Optional[str] = ..., allowed_domains: _Optional[_Iterable[str]] = ..., headers: _Optional[_Iterable[_Union[CredentialHeader, _Mapping]]] = ..., expires_at_unix_millis: _Optional[int] = ..., tenant: _Optional[str] = ..., requests_per_minute: _Optional[int] = ...) -> None: ...
+
+class CredentialRef(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class DeleteCredentialRequest(_message.Message):
+    __slots__ = ("credential", "tenant")
+    CREDENTIAL_FIELD_NUMBER: _ClassVar[int]
+    TENANT_FIELD_NUMBER: _ClassVar[int]
+    credential: CredentialRef
+    tenant: str
+    def __init__(self, credential: _Optional[_Union[CredentialRef, _Mapping]] = ..., tenant: _Optional[str] = ...) -> None: ...
+
+class CredentialRecord(_message.Message):
+    __slots__ = ("name", "allowed_domains", "header_names", "expires_at_unix_millis", "requests_per_minute", "version")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_DOMAINS_FIELD_NUMBER: _ClassVar[int]
+    HEADER_NAMES_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    REQUESTS_PER_MINUTE_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    allowed_domains: _containers.RepeatedScalarFieldContainer[str]
+    header_names: _containers.RepeatedScalarFieldContainer[str]
+    expires_at_unix_millis: int
+    requests_per_minute: int
+    version: str
+    def __init__(self, name: _Optional[str] = ..., allowed_domains: _Optional[_Iterable[str]] = ..., header_names: _Optional[_Iterable[str]] = ..., expires_at_unix_millis: _Optional[int] = ..., requests_per_minute: _Optional[int] = ..., version: _Optional[str] = ...) -> None: ...
+
+class CredentialList(_message.Message):
+    __slots__ = ("credentials",)
+    CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    credentials: _containers.RepeatedCompositeFieldContainer[CredentialRecord]
+    def __init__(self, credentials: _Optional[_Iterable[_Union[CredentialRecord, _Mapping]]] = ...) -> None: ...
 
 class RestoreSnapshotRequest(_message.Message):
     __slots__ = ("name", "body_json")

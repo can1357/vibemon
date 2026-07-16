@@ -42,6 +42,47 @@ To enter an operator-supplied network namespace, use a jail rather than adding
 and `--jail` requires `--id <name>`; the jail setup also determines which host
 paths and sockets are available inside the namespace.
 
+
+### Linux daemon network broker
+
+For daemon-managed Linux TAP networking, run the narrow privileged broker
+separately. The daemon does not invoke privileged host networking commands.
+
+```sh
+# `vmon` is the unprivileged daemon service account.
+sudo vmon net-broker \
+  --socket /run/vmon/network-broker.sock \
+  --owner-uid "$(id -u vmon)"
+```
+
+Configure the same absolute socket path with
+`network_broker_socket = "/run/vmon/network-broker.sock"` or
+`VMON_NETWORK_BROKER_SOCKET=/run/vmon/network-broker.sock`. The broker requires
+root or `CAP_NET_ADMIN`. It creates the socket mode `0600`, changes its owner to
+`--owner-uid`, and checks the Linux `SO_PEERCRED` UID against that owner. The
+daemon also rejects a group- or world-accessible socket. `--owner-uid` accepts
+only a numeric UID; use the daemon's service UID, not a shared administrator
+account.
+
+As an alternative, give a *dedicated copy* of the broker executable
+`CAP_NET_ADMIN` and run it as the same service account as the daemon:
+
+```sh
+sudo install -m 0755 "$(command -v vmon)" /usr/local/libexec/vmon-net-broker
+sudo setcap cap_net_admin=ep /usr/local/libexec/vmon-net-broker
+sudo -u vmon /usr/local/libexec/vmon-net-broker \
+  net-broker --socket /run/vmon/network-broker.sock
+```
+
+Do not set capabilities on the executable used to start `vmon serve`; that
+would give the long-running daemon the privilege this boundary removes.
+
+If no broker is configured, the broker cannot be reached, or it rejects a
+request, daemon-managed TAP creation fails. The daemon does not fall back to
+direct privileged operations or unrestricted user-mode networking. Operators
+must start the broker before accepting workloads that need Linux TAP
+connectivity.
+
 ### macOS and Windows user-mode NAT example
 
 ```sh
@@ -75,6 +116,13 @@ Conceptually, use the layers as follows:
 leaves that allowlist unchanged. Supply valid CIDRs; invalid rule formats are
 rejected by the gRPC API. Authentication and server binding are described in
 [Server Operation](server.md).
+
+Egress policy fails closed. The daemon validates CIDRs and domains before it
+allocates a TAP or exposes a tunnel. Domain allowlists are resolved during
+admission, and the configured DNS servers must themselves be permitted. A
+malformed rule, DNS failure, unapproved resolved address, TAP setup failure, or
+firewall programming failure rejects sandbox creation and releases the partial
+network allocation. It does not start a sandbox with unrestricted networking.
 
 ## Snapshot interaction
 

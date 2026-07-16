@@ -75,6 +75,11 @@ class SandboxServiceStub:
                 request_serializer=vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
                 _registered_method=True)
+        self.Suspend = channel.unary_unary(
+                '/vmon.v1.SandboxService/Suspend',
+                request_serializer=vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
         self.Extend = channel.unary_unary(
                 '/vmon.v1.SandboxService/Extend',
                 request_serializer=vmon_dot_v1_dot_api__pb2.ExtendSandboxRequest.SerializeToString,
@@ -163,6 +168,16 @@ class SandboxServiceStub:
         self.SnapshotFs = channel.unary_unary(
                 '/vmon.v1.SandboxService/SnapshotFs',
                 request_serializer=vmon_dot_v1_dot_api__pb2.SnapshotFsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
+        self.History = channel.unary_unary(
+                '/vmon.v1.SandboxService/History',
+                request_serializer=vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.RecoveryPointList.FromString,
+                _registered_method=True)
+        self.Rollback = channel.unary_unary(
+                '/vmon.v1.SandboxService/Rollback',
+                request_serializer=vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
                 _registered_method=True)
 
@@ -281,6 +296,13 @@ class SandboxServiceServicer:
         Errors:
         - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
         - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Suspend(self, request, context):
+        """Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -498,6 +520,20 @@ class SandboxServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def History(self, request, context):
+        """Lists rolling disk and full-checkpoint recovery points for a sandbox.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Rollback(self, request, context):
+        """Restores a sandbox identity to one retained recovery point.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SandboxServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -538,6 +574,11 @@ def add_SandboxServiceServicer_to_server(servicer, server):
             ),
             'Resume': grpc.unary_unary_rpc_method_handler(
                     servicer.Resume,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.SandboxRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'Suspend': grpc.unary_unary_rpc_method_handler(
+                    servicer.Suspend,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.SandboxRef.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
             ),
@@ -629,6 +670,16 @@ def add_SandboxServiceServicer_to_server(servicer, server):
             'SnapshotFs': grpc.unary_unary_rpc_method_handler(
                     servicer.SnapshotFs,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.SnapshotFsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'History': grpc.unary_unary_rpc_method_handler(
+                    servicer.History,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.SandboxRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.RecoveryPointList.SerializeToString,
+            ),
+            'Rollback': grpc.unary_unary_rpc_method_handler(
+                    servicer.Rollback,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
             ),
     }
@@ -867,6 +918,33 @@ class SandboxService:
             request,
             target,
             '/vmon.v1.SandboxService/Resume',
+            vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Suspend(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/Suspend',
             vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
             vmon_dot_v1_dot_api__pb2.JsonView.FromString,
             options,
@@ -1365,6 +1443,60 @@ class SandboxService:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def History(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/History',
+            vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.RecoveryPointList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Rollback(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/Rollback',
+            vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class SnapshotServiceStub:
     """SnapshotService manages saved microVM snapshots, enabling restorations and high-density forks.
@@ -1390,6 +1522,11 @@ class SnapshotServiceStub:
                 '/vmon.v1.SnapshotService/Fork',
                 request_serializer=vmon_dot_v1_dot_api__pb2.ForkSnapshotRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/vmon.v1.SnapshotService/Delete',
+                request_serializer=vmon_dot_v1_dot_api__pb2.SnapshotRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
                 _registered_method=True)
 
 
@@ -1431,6 +1568,13 @@ class SnapshotServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Delete(self, request, context):
+        """Deletes an immutable snapshot and its encrypted storage.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SnapshotServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -1448,6 +1592,11 @@ def add_SnapshotServiceServicer_to_server(servicer, server):
                     servicer.Fork,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.ForkSnapshotRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.SnapshotRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1532,6 +1681,197 @@ class SnapshotService:
             '/vmon.v1.SnapshotService/Fork',
             vmon_dot_v1_dot_api__pb2.ForkSnapshotRequest.SerializeToString,
             vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SnapshotService/Delete',
+            vmon_dot_v1_dot_api__pb2.SnapshotRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class CredentialServiceStub:
+    """CredentialService stores scoped credentials that only host gateways may resolve.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.List = channel.unary_unary(
+                '/vmon.v1.CredentialService/List',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListCredentialsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CredentialList.FromString,
+                _registered_method=True)
+        self.Put = channel.unary_unary(
+                '/vmon.v1.CredentialService/Put',
+                request_serializer=vmon_dot_v1_dot_api__pb2.PutCredentialRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.CredentialRecord.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/vmon.v1.CredentialService/Delete',
+                request_serializer=vmon_dot_v1_dot_api__pb2.DeleteCredentialRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
+                _registered_method=True)
+
+
+class CredentialServiceServicer:
+    """CredentialService stores scoped credentials that only host gateways may resolve.
+    """
+
+    def List(self, request, context):
+        """Lists non-secret metadata for credentials owned by the authenticated tenant.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Put(self, request, context):
+        """Creates or atomically rotates one encrypted credential.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Delete(self, request, context):
+        """Revokes one credential immediately.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_CredentialServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'List': grpc.unary_unary_rpc_method_handler(
+                    servicer.List,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListCredentialsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CredentialList.SerializeToString,
+            ),
+            'Put': grpc.unary_unary_rpc_method_handler(
+                    servicer.Put,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.PutCredentialRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.CredentialRecord.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.DeleteCredentialRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.CredentialService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.CredentialService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class CredentialService:
+    """CredentialService stores scoped credentials that only host gateways may resolve.
+    """
+
+    @staticmethod
+    def List(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CredentialService/List',
+            vmon_dot_v1_dot_api__pb2.ListCredentialsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CredentialList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Put(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CredentialService/Put',
+            vmon_dot_v1_dot_api__pb2.PutCredentialRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.CredentialRecord.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.CredentialService/Delete',
+            vmon_dot_v1_dot_api__pb2.DeleteCredentialRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
             options,
             channel_credentials,
             insecure,

@@ -20,9 +20,10 @@ The table is a navigation map, not a replacement for `proto/vmon/v1/api.proto`. 
 
 | Service | Primary operations | Streaming / notable contract |
 | --- | --- | --- |
-| `SandboxService` | Create, list, get, stop, remove, terminate, pause, resume, extend, metrics; network, tunnels, migration, snapshots; guest files | `Logs` is server-streaming; `Exec` and `Shell` are bidirectional; `Attach` is server-streaming. `Exec` must begin with `ExecStart`; `Shell` begins with shell parameters and emits a resolved sandbox ID in `Ready`. Sandbox views and several engine-owned documents are JSON carried in `JsonView` strings. |
-| `SnapshotService` | List saved snapshots; restore; fork | Restore and fork return a sandbox JSON view. |
-| `VolumeService` | List, create, and delete named persistent volumes | Create/delete return an empty `Ok`. |
+| `SandboxService` | Create, list, get, stop, remove, terminate, pause, resume, suspend, extend, metrics; network, tunnels, migration, snapshots, recovery history and rollback; guest files | `Logs` is server-streaming; `Exec` and `Shell` are bidirectional; `Attach` is server-streaming. `Exec` must begin with `ExecStart`; `Shell` begins with shell parameters and emits a resolved sandbox ID in `Ready`. Sandbox views and several engine-owned documents are JSON carried in `JsonView` strings. |
+| `SnapshotService` | List, restore, fork, and permanently delete saved snapshots | Restore and fork return a sandbox JSON view. Delete removes the encrypted snapshot storage. |
+| `CredentialService` | List non-secret credential metadata; create or atomically rotate a credential; revoke a credential | Credential values are accepted only in `Put` headers and are never returned. Tenant callers are confined to their own namespace; optional tenant selectors are administrator-only. |
+| `VolumeService` | List, create, and delete named persistent volumes | Create/delete return an empty `Ok`; volumes remain tenant-owned and delete is refused while attached. |
 | `PoolService` | List, set, and delete warm pools | Pool documents are engine-owned JSON views. |
 | `SystemService` | Engine info, events, and mesh status | `Events` is server-streaming. `MeshStatus` supplies the roster used for optional SDK discovery. |
 | `ArtifactService` | Put, get, and stat immutable content-addressed artifacts | `Put` is client-streaming and verifies the digest; `Get` is server-streaming. |
@@ -33,8 +34,7 @@ The table is a navigation map, not a replacement for `proto/vmon/v1/api.proto`. 
 The resource guides explain lifecycle semantics: [Sandboxes](../sdk/shared-concepts.md), [Snapshots](../platform/snapshots.md), [Storage and Volumes](../platform/storage.md), and [Mesh and High Availability](../platform/mesh.md).
 
 ## Authentication and errors
-
-Clients authenticate with bearer credentials. An operator token has full control; a configured client token is restricted from mesh administration and sandbox migration. The server accepts token rotation lists; keep tokens out of DSNs, source control, logs, and shell history. See [Security](../platform/security.md).
+Clients authenticate with bearer credentials. An operator token has full control; a configured client token is restricted from mesh administration and sandbox migration. A tenant token maps to one tenant ID and cannot read or mutate another tenant's resources. The selected customer key ID encrypts that tenant's new snapshots, credential records, and persistent volume archives. The server accepts token rotation lists; keep tokens out of DSNs, source control, logs, and shell history. See [Security](../platform/security.md).
 
 Every RPC reports ordinary gRPC status. On failures, the stable daemon error code is carried in response metadata/trailers named `vmon-code`.
 

@@ -631,6 +631,32 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
         self._enter(context, "Resume", {"id": request.id})
         return self._set_status(context, request.id, "running", kill=False)
 
+    def Suspend(self, request: api_pb2.SandboxRef, context: Any) -> api_pb2.JsonView:
+        self._enter(context, "Suspend", {"id": request.id})
+        return self._set_status(context, request.id, "suspended", kill=True)
+
+    def History(self, request: api_pb2.SandboxRef, context: Any) -> api_pb2.RecoveryPointList:
+        self._enter(context, "History", {"id": request.id})
+        self._sandbox(context, request.id)
+        return api_pb2.RecoveryPointList(
+            points=[
+                api_pb2.RecoveryPoint(
+                    name=f"recovery-{request.id}",
+                    kind="full",
+                    created_at_unix_millis=1_700_000_000_000,
+                    size_bytes=1_024,
+                )
+            ]
+        )
+
+    def Rollback(self, request: api_pb2.RollbackSandboxRequest, context: Any) -> api_pb2.JsonView:
+        self._enter(
+            context,
+            "Rollback",
+            {"id": request.id, "recovery_point": request.recovery_point},
+        )
+        return self._set_status(context, request.id, "running", kill=False)
+
     def _set_status(
         self, context: Any, sandbox_id: str, status: str, *, kill: bool
     ) -> api_pb2.JsonView:
@@ -888,6 +914,11 @@ class _SnapshotService(api_pb2_grpc.SnapshotServiceServicer):
             view = self._stub._create_sandbox(payload)
             clones.append({**view, "reconstruct_ms": 1})
         return _view_json({"clones": clones})
+
+    def Delete(self, request: api_pb2.SnapshotRef, context: Any) -> api_pb2.Ok:
+        self._enter(context, "Delete", {"name": request.name})
+        self._stub.snapshots.discard(request.name)
+        return api_pb2.Ok()
 
 
 class _VolumeService(api_pb2_grpc.VolumeServiceServicer):

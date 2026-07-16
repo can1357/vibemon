@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .client import Client
     from .models import (
         FileInfo,
+        RecoveryPoint,
         SandboxInfo,
         SandboxMetrics,
         SandboxNetworkPolicy,
@@ -762,6 +763,47 @@ class Sandbox:
         )
         return self.info
 
+    def suspend(self) -> SandboxInfo:
+        """Durably checkpoint this sandbox while preserving its identity."""
+        self._update(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Suspend(api_pb2.SandboxRef(id=self.id)),
+                error="suspend returned invalid data",
+            ),
+            "suspend returned invalid data",
+        )
+        return self.info
+
+    def history(self) -> list[RecoveryPoint]:
+        """Return retained recovery points from oldest to newest."""
+        from .models import RecoveryPoint
+
+        response = self._rpc(lambda stubs: stubs.sandbox.History(api_pb2.SandboxRef(id=self.id)))
+        return [
+            RecoveryPoint(
+                name=point.name,
+                kind=point.kind,
+                created_at_unix_millis=point.created_at_unix_millis,
+                size_bytes=point.size_bytes,
+            )
+            for point in response.points
+        ]
+
+    def rollback(self, recovery_point: str) -> SandboxInfo:
+        """Restore this sandbox identity to one retained recovery point."""
+        if not recovery_point:
+            raise ValueError("recovery point is required")
+        self._update(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Rollback(
+                    api_pb2.RollbackSandboxRequest(id=self.id, recovery_point=recovery_point)
+                ),
+                error="rollback returned invalid data",
+            ),
+            "rollback returned invalid data",
+        )
+        return self.info
+
     def extend(self, secs: int) -> SandboxInfo:
         """Extend the sandbox deadline by a non-negative number of seconds."""
         secs = int(secs)
@@ -1030,6 +1072,15 @@ class _AsyncSandbox:
 
     async def pause(self) -> SandboxInfo:
         return await asyncio.to_thread(self._sandbox.pause)
+
+    async def suspend(self) -> SandboxInfo:
+        return await asyncio.to_thread(self._sandbox.suspend)
+
+    async def history(self) -> list[RecoveryPoint]:
+        return await asyncio.to_thread(self._sandbox.history)
+
+    async def rollback(self, recovery_point: str) -> SandboxInfo:
+        return await asyncio.to_thread(self._sandbox.rollback, recovery_point)
 
     async def resume(self) -> SandboxInfo:
         return await asyncio.to_thread(self._sandbox.resume)

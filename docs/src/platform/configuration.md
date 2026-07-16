@@ -24,6 +24,13 @@ home = "/var/lib/vmon"
 token = "replace-with-a-secret"
 idle_timeout = 300
 warm_pool_size = 1
+tenant_tokens = { "tenant-token-from-secret-store" = "acme" }
+tenant_keys = { acme = "acme-kms-2026-07" }
+history_disk_sec = 300
+history_checkpoint_sec = 3600
+history_retention = 24
+history_max_age_sec = 604800
+network_broker_socket = "/run/vmon/network-broker.sock"
 warm_images = ["alpine:latest=2"]
 ```
 
@@ -44,6 +51,14 @@ The following table gives the TOML key, environment variable, and flag. String v
 | `port` | `VMON_SERVE_PORT` | `--port` | TCP bind port; default `8000`. |
 | `token` | `VMON_API_TOKEN` | `--token` | Admin bearer token. |
 | `client_token` | `VMON_CLIENT_TOKEN` | `--client-token` | Restricted client bearer token. |
+| `tenant_tokens` | `VMON_TENANT_TOKENS` | `--tenant-tokens` | JSON map from bearer token to tenant ID. Tenant IDs are limited to `[A-Za-z0-9_-]{1,64}`. |
+| `tenant_keys` | `VMON_TENANT_KEYS` | `--tenant-keys` | JSON map from tenant ID to customer-managed key ID; missing entries use `default`. |
+| `network_broker_socket` | `VMON_NETWORK_BROKER_SOCKET` | — | Absolute Linux network-broker socket path. Start the broker separately with `vmon net-broker --socket PATH --owner-uid "$(id -u vmon)"` when it runs as root, or run a dedicated `CAP_NET_ADMIN` broker copy as the daemon service UID. There is no `vmon serve` flag. |
+| `history_disk_sec` | `VMON_HISTORY_DISK_SEC` | `--history-disk-sec` | Rolling disk recovery-point cadence in seconds; zero disables it; default 300. |
+| `history_checkpoint_sec` | `VMON_HISTORY_CHECKPOINT_SEC` | `--history-checkpoint-sec` | Full-checkpoint recovery-point cadence in seconds; zero disables it; default 3600. |
+| `history_retention` | `VMON_HISTORY_RETENTION` | `--history-retention` | Maximum retained recovery points per sandbox; default 24. |
+| `history_max_age_sec` | `VMON_HISTORY_MAX_AGE_SEC` | `--history-max-age-sec` | Recovery-point maximum age in seconds; zero disables age pruning; default 604800. |
+| `template_ttl_sec` | `VMON_TEMPLATE_TTL_SEC` | `--template-ttl-sec` | Maximum age for unused image templates in seconds; default 2592000. |
 | `function_artifact_max_bytes` | `VMON_FUNCTION_ARTIFACT_MAX_BYTES` | `--function-artifact-max-bytes` | Maximum uncompressed streamed function artifact, from 1 through 2^50 bytes; default 4 GiB. |
 | `tls_cert` | `VMON_TLS_CERT` | `--tls-cert` | TLS certificate path. |
 | `tls_key` | `VMON_TLS_KEY` | `--tls-key` | TLS private-key path. |

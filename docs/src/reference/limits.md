@@ -31,6 +31,19 @@ does not define global numeric caps for those fields.
 Fork batches are atomic. A failed clone causes the server to remove the other
 clones created by that request.
 
+## Recovery history
+
+| Setting | Default | Limit behavior |
+| --- | --- | --- |
+| Disk recovery cadence | 300 seconds | `0` disables disk recovery-point capture. |
+| Full checkpoint cadence | 3600 seconds | `0` disables full checkpoint capture. |
+| Retained recovery points | 24 per sandbox | Older points are pruned after capture. |
+| Recovery-point maximum age | 604800 seconds (7 days) | `0` disables age pruning. |
+
+Rollback can select only a retained point. Retention is not a backup guarantee:
+capture can fail when storage, the selected customer key, or an external
+dependency is unavailable.
+
 ## S3 mount admission
 
 A sandbox create request supports at most **8** S3 mounts. At creation, the

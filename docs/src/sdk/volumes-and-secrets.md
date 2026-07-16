@@ -72,6 +72,12 @@ await client.volumes.delete("build-cache");
 
 A volume's lifecycle is separate from any sandbox that mounts it. Terminating or removing a sandbox does not delete the volume. Delete it explicitly only after its retained data is no longer needed, and do not delete a volume that another sandbox still requires. The SDK does not track usage or garbage-collect volumes.
 
+Volumes are tenant-scoped. A tenant cannot list, attach, or delete another
+tenant's volume. Detached persistent volume data is encrypted with the owning
+tenant's customer key ID. If that key is unavailable when the volume is
+attached, the daemon returns an error rather than mounting a new empty or
+plaintext volume.
+
 ## Mount a volume at creation
 
 A volume mount belongs to the sandbox creation request. Map each absolute guest path to the SDK's accepted mount value; read-only and writable mappings can refer to the same persistent volume.
@@ -228,6 +234,56 @@ The structured endpoint selects an S3-compatible path-style endpoint, and the re
 Inline credentials are request-only, and snapshot mount metadata excludes them. Restoring a snapshot that used inline or environment credentials requires usable daemon environment credentials again; anonymous mounts do not.
 
 A read-only mount exposes remote data without guest writes. When read-only is omitted or false, the daemon presents a writable **volatile overlay**: guest writes are not synchronized to S3 and do not survive sandbox removal or snapshotting as S3 objects. Do not use that overlay as persistent storage. S3 mounts have no named-volume lifecycle.
+
+## Host-brokered credential names
+
+The `credentials` creation field contains tenant-local credential names only.
+The daemon resolves those names through its host gateway and injects the
+credential's configured headers only for allowed domains. The SDK request,
+guest environment, sandbox metadata, logs, and snapshots do not receive the
+header values. An unknown, expired, revoked, rate-limited, or domain-mismatched
+credential fails at the gateway rather than becoming a direct guest secret.
+
+Credential records are administered by the gRPC `CredentialService`; its
+`List` and `Put` responses expose metadata, never header values. The
+convenience SDKs intentionally expose only names here.
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+```python
+sandbox = client.sandboxes.create(
+    image="alpine",
+    credentials=["github-api"],
+)
+```
+
+</div>
+<div data-sdk-language="go">
+
+```go
+sandbox, err := client.Sandboxes.Create(ctx, vmon.SandboxCreateRequest{
+    Image:       "alpine:3.21",
+    Credentials: []string{"github-api"},
+})
+if err != nil {
+    return err
+}
+fmt.Println(sandbox.ID)
+```
+
+</div>
+<div data-sdk-language="typescript">
+
+```ts
+const sandbox = await client.sandboxes.create({
+  image: "alpine",
+  credentials: ["github-api"],
+});
+```
+
+</div>
+</div>
 
 ## In-memory secret environment
 

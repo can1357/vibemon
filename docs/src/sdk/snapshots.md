@@ -173,17 +173,52 @@ The optional `RestoreRequest` body accepts `name`, `agent`, and the runtime-only
 </div>
 </div>
 
+## Delete a full snapshot
+
+`delete()` permanently removes a full snapshot and its encrypted daemon
+storage. It does not remove a sandbox restored or forked from that snapshot.
+Delete a delta's descendants before deleting its base; otherwise those
+descendants cannot be restored. An unknown name returns `not_found`.
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+```python
+client.snapshots.delete("worker-checkpoint")
+```
+
+</div>
+<div data-sdk-language="go">
+
+```go
+if err := client.Snapshots.Delete(ctx, "worker-checkpoint"); err != nil {
+    return err
+}
+```
+
+</div>
+<div data-sdk-language="typescript">
+
+```ts
+await client.snapshots.delete("worker-checkpoint");
+```
+
+</div>
+</div>
+
 ### External resources and S3 mounts
 
 A full VM snapshot does not copy arbitrary host resources. Named volumes, ordinary host shares, network backends, and managed S3 storage remain external dependencies. The restoring or forking host must satisfy the requirements documented in the [platform snapshot guide](../platform/snapshots.md).
 
 Sandboxes configured with secrets can be captured, restored, forked, and
 migrated. A full VM snapshot preserves raw guest RAM, including secret bytes
-that remain after a process exits, so protect snapshot and replica artifacts as
-secret-bearing data. Local restore and fork do not infer the host-side secret
-binding from guest memory. Go and TypeScript callers can use the runtime-only
-`secrets` override when future exec calls need that binding; live mesh migration
-carries the source sandbox's active binding to the destination.
+that remain after a process exits. The daemon encrypts snapshot storage with
+the owning tenant's customer key ID. Restore, fork, and rollback fail if that
+key is unavailable; protect the artifact and its key as secret-bearing data.
+Local restore and fork do not infer the host-side secret binding from guest
+memory. Go and TypeScript callers can use the runtime-only `secrets` override
+when future exec calls need that binding; live mesh migration carries the
+source sandbox's active binding to the destination.
 
 For a sandbox created with managed S3 mounts, the daemon records credential-free mount metadata beside the snapshot. Restore and fork reconstruct those recorded mounts using credentials available to the destination daemon. The snapshot never contains access keys, secret keys, session tokens, or the remote S3 objects themselves. A mount that originally used inline credentials or daemon environment credentials therefore requires suitable `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values at the destination, plus `AWS_SESSION_TOKEN` when applicable; anonymous mounts require no credentials.
 

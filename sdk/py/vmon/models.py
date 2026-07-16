@@ -91,6 +91,16 @@ class SandboxInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryPoint:
+    """An immutable recovery point retained for a sandbox."""
+
+    name: str
+    kind: str
+    created_at_unix_millis: int
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class ExecExit:
     """The terminal code and optional signal from a streaming process."""
 

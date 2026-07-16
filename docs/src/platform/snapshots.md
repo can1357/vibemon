@@ -13,6 +13,28 @@ and a `stop` flag; setting `stop` stops the microVM immediately after capture.
 `SnapshotFs` also accepts an optional name. The gRPC API is authoritative;
 these operations replace older HTTP lifecycle routes.
 
+`SnapshotService.Delete` permanently removes one named full snapshot and its
+encrypted storage. Delete is irreversible. It rejects an unknown name and can
+also make delta descendants unrestorable if they depend on the deleted base, so
+delete dependent snapshots first or retain the base.
+
+## Suspend, recovery history, and rollback
+
+`SandboxService.Suspend` creates a durable checkpoint, removes the live VM,
+and retains the sandbox ID. `History` lists the retained disk and full
+checkpoint recovery points from oldest to newest. `Rollback` restores that
+same sandbox identity to the selected immutable recovery point. It does not
+create a second sandbox or change the owning tenant.
+
+The daemon captures disk history every 300 seconds and full checkpoints every
+3600 seconds by default. It retains at most 24 points and prunes points older
+than seven days. Configure the cadences, retention, and age limits in
+[Configuration](configuration.md). A zero cadence disables that capture type;
+a zero maximum age disables age pruning. A checkpoint can fail because storage,
+the selected encryption key, or an external dependency is unavailable. The
+sandbox remains in its prior state when that happens; inspect the returned
+gRPC error and do not assume a recovery point exists.
+
 ## VMM snapshot contents
 
 On disk, a VMM snapshot directory has a `current-generation` manifest that

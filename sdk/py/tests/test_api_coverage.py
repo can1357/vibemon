@@ -110,12 +110,14 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
                 image="python:3.14-slim",
                 context=".",
                 name="box/name",
+                credentials=["github-api"],
                 tags={"suite": "coverage"},
             )
             create_request = server.last_rpc("SandboxService/Create")
             assert create_request.json["context"] == "."
             assert create_request.json["name"] == "box/name"
 
+            assert create_request.json["credentials"] == ["github-api"]
             policy = sandbox.network()
             assert policy.block_network is False
             assert policy.cidr_allow == ()
@@ -132,6 +134,11 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             assert updated_policy.domain_allow == ("example.com",)
             assert sandbox.pause().status == "paused"
             assert sandbox.resume().status == "running"
+            assert sandbox.suspend().status == "suspended"
+            points = sandbox.history()
+            assert points[0].name == "recovery-box/name"
+            assert points[0].created_at_unix_millis == 1_700_000_000_000
+            assert sandbox.rollback(points[0].name).status == "running"
             assert sandbox.extend(15).raw["deadline_unix"] == 1_800_000_000
             assert sandbox.metrics()["vcpu_exits"] == 7
             assert sandbox.node == server.node_id
@@ -141,6 +148,8 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
 
             assert sandbox.snapshot("base-snapshot") == "base-snapshot"
             assert client.snapshots.list() == ["base-snapshot"]
+            client.snapshots.delete("base-snapshot")
+            assert client.snapshots.list() == []
             assert sandbox.snapshot_filesystem("filesystem-image") == "filesystem-image"
 
             restored = client.snapshots.restore("base-snapshot", name="restored")

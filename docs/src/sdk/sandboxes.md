@@ -11,7 +11,7 @@ Creation sends a request to the daemon and returns a stable-ID handle whose mesh
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
 
-Select one creation source with `image`, `template`, or `dockerfile` plus `context`, as appropriate for the daemon. Python accepts optional `name`, `cpus`, `memory`, `disk_mb`, `timeout`, `workdir`, `env`, secrets, volume mounts, tags, and a startup command.
+Select one creation source with `image`, `template`, or `dockerfile` plus `context`, as appropriate for the daemon. Python accepts optional `name`, `cpus`, `memory`, `disk_mb`, `timeout`, `workdir`, `env`, `secrets`, `credentials`, volume mounts, tags, and a startup command. `credentials` contains host-brokered names only; see [Volumes and Secrets](volumes-and-secrets.md#host-brokered-credential-names).
 
 ```python
 from vmon import Secret
@@ -41,7 +41,7 @@ The request also supports `timeout_secs`, `fs_dir`, `block_network`, `egress_all
 </div>
 <div data-sdk-language="go">
 
-`SandboxCreateRequest` carries the image or template choice and optional resource, environment, network, port, and storage settings. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create-request timeout in seconds. Use `Secrets` for secret bundles and `S3Mounts` for S3-backed guest filesystems.
+`SandboxCreateRequest` carries the image or template choice and optional resource, environment, network, port, and storage settings. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create-request timeout in seconds. Use `Secrets` for secret bundles, `Credentials` for host-brokered credential names, and `S3Mounts` for S3-backed guest filesystems.
 
 ```go
 idleTimeout := uint64(900)
@@ -70,7 +70,7 @@ All Go operations take a `context.Context`. Cancellation or expiry ends the in-f
 </div>
 <div data-sdk-language="typescript">
 
-TypeScript sends a `SandboxCreateRequestWithSecrets`. It accepts fields including `image`, `command`, `env`, `workdir`, resource values, `ports`, `volumes`, tags, and creation-time network fields such as `block_network`, `egress_allow`, and `egress_allow_domains`.
+TypeScript sends a `SandboxCreateRequestWithSecrets`. It accepts fields including `image`, `command`, `env`, `workdir`, resource values, `ports`, `volumes`, `credentials`, tags, and creation-time network fields such as `block_network`, `egress_allow`, and `egress_allow_domains`.
 
 ```ts
 import { connect } from "@vmon/sdk";
@@ -149,7 +149,14 @@ await deferred.stop();
 
 Lifecycle operations act on the identified server sandbox. Stopping execution, immediately terminating resources, and removing the server record are distinct operations. Use the least destructive action that matches the intent. Named volumes have their own lifecycle and are not removed with the sandbox.
 
-Pause and resume suspend and reactivate execution. Extend increases the sandbox lease by a number of seconds. Migrate moves a running sandbox to a compatible mesh node, updates its view, and privately re-resolves the serving endpoint. Migration requires an operator token; snapshot backend, architecture, network, storage, and host-resource compatibility still apply. When another actor may have changed state, refresh before relying on cached metadata.
+Pause and resume suspend and reactivate execution in memory. `suspend()` is
+different: it creates a durable checkpoint, releases the live VM, and keeps
+the sandbox identity for `history()` and `rollback()`. An idle timeout uses the
+same suspend path rather than deleting the sandbox. A later rollback restores
+the selected retained recovery point to that identity. A missing recovery
+point, unavailable customer key, incompatible host dependency, or failed
+checkpoint returns a daemon error; do not treat a suspended sandbox as a
+running VM.
 
 <div class="sdk-snippets" data-sdk-snippets>
 <div data-sdk-language="python">
@@ -161,6 +168,9 @@ Pause and resume suspend and reactivate execution. Extend increases the sandbox 
 | `terminate()` | Terminate the sandbox; repeated calls on the same handle are idempotent. |
 | `remove()` | Delete the record; repeated calls on the same handle are idempotent. |
 | `pause()` / `resume()` | Pause or resume virtual CPUs and return updated `SandboxInfo`. |
+| `suspend()` | Checkpoint durably, release the live VM, and retain the sandbox ID. |
+| `history()` | List retained recovery points from oldest to newest. |
+| `rollback(recovery_point)` | Restore this ID to the named recovery point and return updated `SandboxInfo`. |
 | `extend(secs)` | Extend the deadline by a non-negative number of seconds and return updated `SandboxInfo`. |
 | `migrate(target)` | Move to a non-empty mesh-node target, rebind the handle, and return updated `SandboxInfo`. |
 
@@ -170,6 +180,11 @@ The `wait` argument on `stop()` and `terminate()` remains in the Python signatur
 sandbox.stop()
 sandbox.refresh()
 print(sandbox.info.status)
+
+checkpoint = sandbox.suspend()
+point = sandbox.history()[-1]
+restored = sandbox.rollback(point.name)
+print(checkpoint.status, restored.status)
 
 
 updated = sandbox.migrate("node-b")
@@ -189,11 +204,24 @@ sandbox.remove()
 | `Terminate(ctx)` | Immediately halt and release sandbox resources. | `error` |
 | `Remove(ctx)` | Remove the sandbox record. | `error` |
 | `Pause(ctx)` / `Resume(ctx)` | Suspend or reactivate execution. | Updated `*Sandbox` |
+| `Suspend(ctx)` | Checkpoint durably and release the live VM. | Updated `*Sandbox` |
+| `History(ctx)` | List retained recovery points from oldest to newest. | `[]RecoveryPoint`, `error` |
+| `Rollback(ctx, recoveryPoint)` | Restore this ID to one retained recovery point. | Updated `*Sandbox` |
 | `Extend(ctx, seconds)` | Increase the lease duration. | Updated `*Sandbox` |
 | `Migrate(ctx, target)` | Relocate and rebind to the resolved endpoint. | Updated `*Sandbox` |
 
 ```go
-if _, err := sandbox.Stop(ctx); err != nil {
+if _, err := sandbox.Suspend(ctx); err != nil {
+    return err
+}
+points, err := sandbox.History(ctx)
+if err != nil {
+    return err
+}
+if len(points) == 0 {
+    return fmt.Errorf("no recovery point retained")
+}
+if _, err := sandbox.Rollback(ctx, points[len(points)-1].Name); err != nil {
     return err
 }
 if _, err := sandbox.Extend(ctx, 600); err != nil {
@@ -219,6 +247,9 @@ if err := sandbox.Terminate(ctx); err != nil {
 | `terminate(wait = true)` | Force termination and, by default, wait for `terminated`, `stopped`, or `exited`. | `Promise<void>` |
 | `remove()` | Remove the sandbox record. | `Promise<void>` |
 | `pause()` / `resume()` | Pause or resume execution. | `Promise<SandboxInfo>` |
+| `suspend()` | Checkpoint durably and release the live VM. | `Promise<SandboxInfo>` |
+| `history()` | List retained recovery points from oldest to newest. | `Promise<RecoveryPoint[]>` |
+| `rollback(recoveryPoint)` | Restore this ID to one retained recovery point. | `Promise<SandboxInfo>` |
 | `extend(secs)` | Extend the lease in seconds. | `Promise<SandboxInfo>` |
 | `migrate(target)` | Migrate and re-resolve the serving endpoint. | `Promise<SandboxInfo>` |
 
@@ -227,6 +258,10 @@ The implicit state wait in `stop()` and `terminate()` is bounded at five minutes
 ```ts
 await sandbox.stop();
 await sandbox.extend(600);
+const suspended = await sandbox.suspend();
+const [point] = await sandbox.history();
+const restored = await sandbox.rollback(point.name);
+console.log(suspended.status, restored.status);
 const moved = await sandbox.migrate("node-b");
 console.log(moved.node);
 await sandbox.terminate(false);
@@ -289,7 +324,7 @@ await sandbox.waitReady({ probe: "test -f /tmp/ready", timeout: 30 });
 
 ## Network policy and tunnels
 
-Network policy is daemon state. Reading returns the current policy; updating is presence-aware. Omitted fields remain unchanged, while an explicitly supplied empty allowlist replaces that allowlist with an empty list. These settings do not make ports public and do not mean the SDK itself performs filtering; the daemon's policy and deployment controls define the effective boundary. See [Networking](../platform/networking.md).
+Network policy is daemon state. Reading returns the current policy; updating is presence-aware. Omitted fields remain unchanged, while an explicitly supplied empty allowlist replaces that allowlist with an empty list. These settings do not make ports public and do not mean the SDK itself performs filtering; the daemon's policy and deployment controls define the effective boundary. Invalid CIDRs or domains, unapproved domain resolution, and host policy setup failures reject the operation rather than allowing unrestricted egress. See [Networking](../platform/networking.md).
 
 Tunnel discovery returns exposed guest-port targets and may supply a short-lived connect token. Applications normally use the sandbox's HTTP or WebSocket port service, which obtains and caches the token as needed. Expose the port in the creation request and configure it on the server. See [Files and Ports](files-and-ports.md).
 

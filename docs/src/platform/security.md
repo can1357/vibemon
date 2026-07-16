@@ -8,6 +8,65 @@ Treat guests, guest-controlled virtqueue data, and restored snapshot files as un
 
 Do not expose control endpoints, agent endpoints, host filesystem shares, TAP devices, vmnet attachments, or forwarded ports across trust boundaries. Unix control and agent sockets are operator-owned and mode `0600`. Windows named pipes use a local-only owner/SYSTEM ACL and reject remote clients. Apply external host network policy around gateways and exposed guest ports.
 
+## Tenant boundary and encryption
+
+Each authenticated tenant token resolves to one tenant ID. Tenant requests are confined to resources owned by that ID, including sandboxes, snapshots, volumes, recovery history, and credentials. A tenant cannot select another tenant in an RPC; the optional tenant fields on credential RPCs are for administrators only. Administrators and local Unix-socket callers can cross this boundary.
+
+Configure the tenant-token and customer-key mappings as JSON maps. Tenant IDs must match `[A-Za-z0-9_-]{1,64}`. A tenant without an entry in `tenant_keys` uses the host `default` key.
+
+```toml
+[serve]
+tenant_tokens = { "tenant-token-from-secret-store" = "acme" }
+tenant_keys = { acme = "acme-kms-2026-07" }
+```
+
+The key ID identifies a 32-byte hex key file at `$VMON_HOME/keys/<key-id>.key`. The file must be a regular file, mode `0600` or stricter, and not group- or world-readable. The daemon rejects a request that needs an unavailable or malformed key rather than writing unencrypted data.
+
+New snapshot archives, credential records, and persistent volume archives are authenticated and encrypted with the owning tenant's key ID. Existing encrypted data retains its recorded key ID: keep that key available for restore, rollback, volume attachment, or credential resolution. Deleting or replacing a key before its encrypted data is deleted makes that data unavailable; key-ID assignment is not a key-management service or a data re-encryption operation.
+
+## Credential broker
+
+Credentials are tenant-local names. A sandbox creation request may reference a name through `credentials`, but it never carries credential values. The host-only gateway resolves the encrypted record and injects its configured HTTP headers only for a permitted domain, subject to expiry and the configured requests-per-minute limit. The guest receives neither the header values nor a reusable credential.
+
+The `CredentialService` stores a credential's allowed domains, header names, expiry, request limit, and version as non-secret metadata. `Put` creates or atomically rotates a record; `Delete` revokes it immediately. The service rejects empty names, records without both an allowed domain and an injected header, invalid domains, and cross-tenant access. Gateway requests with an invalid capability, unknown credential name, expired record, target domain outside the allowlist, or exhausted rate limit fail closed.
+
+Use a generated gRPC client to administer credentials. The convenience SDKs expose credential *references* on sandbox creation; they do not expose a second secret store. The wire request is `CredentialService.Put(PutCredentialRequest)`, with `name`, `allowed_domains`, `headers`, optional `expires_at_unix_millis`, and `requests_per_minute`. Its response and `List` contain metadata only; header values are never returned.
+
+For example, an operator can create a record with a reflection-enabled gRPC
+client. `value` is protobuf JSON bytes, so it is base64-encoded:
+
+```sh
+grpcurl -plaintext \
+  -H "authorization: Bearer $VMON_API_TOKEN" \
+  -d '{"name":"github-api","allowedDomains":["api.github.com"],"headers":[{"name":"Authorization","value":"QmVhcmVyIHRva2VuLWZyb20tc2VjdXJlLXN0b3Jl"}],"requestsPerMinute":60}' \
+  127.0.0.1:8000 vmon.v1.CredentialService/Put
+```
+
+Replace the sample header value with a base64-encoded value from a secure
+source. This command's response contains the credential name, header name,
+domain, limit, and version, never the value.
+
+A sandbox that attaches credential names receives
+`VMON_CREDENTIAL_GATEWAY`, an opaque per-sandbox URL. Send a `POST` to that
+exact URL with the credential name and an HTTPS target; do not derive, log, or
+persist a replacement URL. The capability in the path authorizes access to
+that sandbox's attached names only.
+
+```sh
+curl --fail-with-body --request POST "$VMON_CREDENTIAL_GATEWAY" \
+  --header 'content-type: application/json' \
+  --data '{"credential":"github-api","method":"GET","url":"https://api.github.com/user","headers":{},"body_base64":""}'
+```
+
+The response is JSON with `status`, non-secret response `headers`, and
+base64-encoded `body_base64`. The gateway accepts HTTPS targets without
+embedded credentials, rejects `CONNECT` and `TRACE`, refuses private target
+resolution, and limits a request or response body to 16 MiB. On Linux,
+credential brokering requires the sandbox TAP path and its broker rule; on
+macOS it uses restricted user-mode networking. Gateway, policy, upstream, and
+rate-limit failures are returned to the guest request without exposing the
+stored header values.
+
 ## Gateway authentication and TLS
 
 The mesh operator bearer token is shared by every node and grants full control. Set it using `--token` or `VMON_API_TOKEN`, keep it out of logs and shell history, and limit access to its configuration file. A non-loopback gateway must have an operator token; `vmon doctor --serve --config <path>` reports a missing token as a failure.
@@ -64,9 +123,11 @@ that proxy access, a guest overlay, or a snapshot gives the guest S3
 credentials or permission to write S3 objects.
 
 Machine snapshots capture arbitrary bytes from guest RAM. A sandbox that has
-received secrets can therefore write those values into snapshot and replica
-artifacts; Vibemon does not encrypt those files. Protect them as secret-bearing
-data. Live mesh migration also carries the runtime secret environment over the
+received secrets can therefore place those values in snapshot and replica
+artifacts. Daemon-managed snapshots are encrypted with the owning tenant's key
+ID, but encryption does not reduce who can read a key or restore an artifact.
+Protect snapshot storage and key files as secret-bearing data. Live mesh
+migration also carries the runtime secret environment over the
 bearer-authenticated cluster channel so the destination retains the binding.
 
 ## Linux jail
