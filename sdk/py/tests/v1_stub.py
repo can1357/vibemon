@@ -481,18 +481,25 @@ class V1StubServer:
             sandbox_id = str(payload.get("name") or f"sb-{self._next_id}")
             self._next_id += 1
             tags = {str(k): str(v) for k, v in (payload.get("tags") or {}).items()}
+            ha = str(payload.get("ha") or "off")
             view = {
                 "id": sandbox_id,
                 "name": sandbox_id,
                 "status": "running",
-                "created_at": "2026-07-06T00:00:00Z",
-                "last_active": "2026-07-06T00:00:00Z",
+                "desired_state": "running",
+                "observed_state": "running",
+                "state_generation": 1,
+                "lifecycle_failure": None,
+                "created_at": 1_783_296_000.0,
+                "last_active": 1_783_296_000.0,
                 "terminated_at": None,
                 "error": None,
                 "tags": tags,
                 "returncode": None,
                 "workdir": payload.get("workdir") or "/work",
                 "node": self.node_id,
+                "ha": ha,
+                "restart_policy": "rerun" if "rerun" in ha else "none",
             }
             secret_env: dict[str, str] = {}
             for item in payload.get("secrets") or []:
@@ -642,7 +649,7 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
             points=[
                 api_pb2.RecoveryPoint(
                     name=f"recovery-{request.id}",
-                    kind="full",
+                    kind="checkpoint",
                     created_at_unix_millis=1_700_000_000_000,
                     size_bytes=1_024,
                 )
@@ -662,10 +669,15 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
     ) -> api_pb2.JsonView:
         sandbox = self._sandbox(context, sandbox_id)
         with self._stub._lock:
-            sandbox["view"]["status"] = status
+            view = sandbox["view"]
+            view["status"] = status
+            view["desired_state"] = status
+            view["observed_state"] = status
+            view["state_generation"] = int(view.get("state_generation") or 0) + 1
+            view["lifecycle_failure"] = None
         if kill:
             self._stub._kill_procs(sandbox)
-        return _view_json(dict(sandbox["view"]))
+        return _view_json(dict(view))
 
     def Remove(self, request: api_pb2.SandboxRef, context: Any) -> api_pb2.JsonView:
         self._enter(context, "Remove", {"id": request.id})

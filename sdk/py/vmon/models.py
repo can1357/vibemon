@@ -46,6 +46,10 @@ class SandboxInfo:
     id: str
     name: str = ""
     status: str = ""
+    desired_state: str = ""
+    observed_state: str = ""
+    state_generation: int = 0
+    lifecycle_failure: str | None = None
     pid: int | None = None
     source: str | None = None
     created_at: float = 0.0
@@ -56,6 +60,8 @@ class SandboxInfo:
     tags: dict[str, str] = field(default_factory=dict)
     returncode: int | None = None
     node: str | None = None
+    ha: str = ""
+    restart_policy: str = ""
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
@@ -76,6 +82,10 @@ class SandboxInfo:
             id=identifier,
             name=_string(data.get("name"), identifier),
             status=_string(data.get("status")),
+            desired_state=_string(data.get("desired_state")),
+            observed_state=_string(data.get("observed_state")),
+            state_generation=_int(data.get("state_generation")),
+            lifecycle_failure=_optional_string(data.get("lifecycle_failure")),
             pid=_optional_int(data.get("pid")),
             source=_optional_string(data.get("source")),
             created_at=_float(data.get("created_at")),
@@ -86,13 +96,15 @@ class SandboxInfo:
             tags=tags,
             returncode=_optional_int(data.get("returncode")),
             node=_optional_string(data.get("node")),
+            ha=_string(data.get("ha")),
+            restart_policy=_string(data.get("restart_policy")),
             raw=_raw(data),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class RecoveryPoint:
-    """An immutable recovery point retained for a sandbox."""
+    """An immutable ``disk`` or ``checkpoint`` recovery point."""
 
     name: str
     kind: str

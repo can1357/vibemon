@@ -193,7 +193,7 @@ test("unary RPCs round-trip messages and vmon-code trailers over the bridge", as
         conn.sendMessage(
           toBinary(
             JsonViewSchema,
-            create(JsonViewSchema, { json: JSON.stringify({ id: ref.id, state: "running" }) }),
+            create(JsonViewSchema, { json: JSON.stringify({ id: ref.id, status: "running" }) }),
           ),
         );
         conn.end();
@@ -202,7 +202,7 @@ test("unary RPCs round-trip messages and vmon-code trailers over the bridge", as
   });
   const client = clientFor(server);
   const sandbox = await client.sandboxes.get("s1");
-  expect(sandbox.info).toEqual({ id: "s1", state: "running" });
+  expect(sandbox.info).toEqual({ id: "s1", status: "running" });
   await expect(client.sandboxes.get("missing")).rejects.toMatchObject({
     name: "APIError",
     code: "not_found",

@@ -290,12 +290,13 @@ class SandboxServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Resume(self, request, context):
-        """Resumes vCPU execution for a paused sandbox.
+        """Resumes a paused sandbox in place, or restores a durably suspended sandbox.
+        A suspended resume restores the exact committed suspend checkpoint and preserves the sandbox ID.
 
         Replaces: POST /v1/sandboxes/{id}/resume
         Errors:
         - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-        - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+        - `not_running` (FAILED_PRECONDITION): The sandbox is neither paused nor suspended.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -303,6 +304,7 @@ class SandboxServiceServicer:
 
     def Suspend(self, request, context):
         """Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+        A failed checkpoint leaves the prior live VM and lifecycle state intact.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -521,14 +523,15 @@ class SandboxServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def History(self, request, context):
-        """Lists rolling disk and full-checkpoint recovery points for a sandbox.
+        """Lists rolling `disk` and `checkpoint` recovery points from oldest to newest.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Rollback(self, request, context):
-        """Restores a sandbox identity to one retained recovery point.
+        """Restores this sandbox identity to one immutable retained recovery point.
+        The current VM remains authoritative until the replacement is ready to cut over.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

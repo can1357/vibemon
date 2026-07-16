@@ -147,7 +147,7 @@ test("sandbox transparently relocates once after pinned not_found", async () => 
   const serving = createRouterTransport(({ service }) => {
     service(SandboxService, {
       get(req) {
-        if (req.id === id) return { json: JSON.stringify({ id, node: "b", state: "running" }) };
+        if (req.id === id) return { json: JSON.stringify({ id, node: "b", status: "running" }) };
         throw new ConnectError("missing", Code.NotFound, { "vmon-code": "not_found" });
       },
     });

@@ -834,27 +834,35 @@ export const SnapshotRefSchema: GenMessage<SnapshotRef> = /*@__PURE__*/
   messageDesc(file_vmon_v1_api, 27);
 
 /**
- * RecoveryPoint describes one retained disk or full-checkpoint capture.
+ * RecoveryPoint describes one immutable retained disk or checkpoint capture.
  *
  * @generated from message vmon.v1.RecoveryPoint
  */
 export type RecoveryPoint = Message<"vmon.v1.RecoveryPoint"> & {
   /**
+   * Server-assigned recovery-point identifier accepted by Rollback.
+   *
    * @generated from field: string name = 1;
    */
   name: string;
 
   /**
+   * Capture type: `disk` cold-boots from durable disk state; `checkpoint` restores VM execution state.
+   *
    * @generated from field: string kind = 2;
    */
   kind: string;
 
   /**
+   * Server commit time in Unix milliseconds.
+   *
    * @generated from field: uint64 created_at_unix_millis = 3;
    */
   createdAtUnixMillis: bigint;
 
   /**
+   * Stored recovery archive size in bytes.
+   *
    * @generated from field: uint64 size_bytes = 4;
    */
   sizeBytes: bigint;
@@ -7094,12 +7102,13 @@ export const SandboxService: GenService<{
     output: typeof JsonViewSchema;
   },
   /**
-   * Resumes vCPU execution for a paused sandbox.
+   * Resumes a paused sandbox in place, or restores a durably suspended sandbox.
+   * A suspended resume restores the exact committed suspend checkpoint and preserves the sandbox ID.
    *
    * Replaces: POST /v1/sandboxes/{id}/resume
    * Errors:
    *   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-   *   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+   *   - `not_running` (FAILED_PRECONDITION): The sandbox is neither paused nor suspended.
    *
    * @generated from rpc vmon.v1.SandboxService.Resume
    */
@@ -7110,6 +7119,7 @@ export const SandboxService: GenService<{
   },
   /**
    * Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+   * A failed checkpoint leaves the prior live VM and lifecycle state intact.
    *
    * @generated from rpc vmon.v1.SandboxService.Suspend
    */
@@ -7385,7 +7395,7 @@ export const SandboxService: GenService<{
     output: typeof JsonViewSchema;
   },
   /**
-   * Lists rolling disk and full-checkpoint recovery points for a sandbox.
+   * Lists rolling `disk` and `checkpoint` recovery points from oldest to newest.
    *
    * @generated from rpc vmon.v1.SandboxService.History
    */
@@ -7395,7 +7405,8 @@ export const SandboxService: GenService<{
     output: typeof RecoveryPointListSchema;
   },
   /**
-   * Restores a sandbox identity to one retained recovery point.
+   * Restores this sandbox identity to one immutable retained recovery point.
+   * The current VM remains authoritative until the replacement is ready to cut over.
    *
    * @generated from rpc vmon.v1.SandboxService.Rollback
    */

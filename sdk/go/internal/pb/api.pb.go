@@ -2735,15 +2735,19 @@ func (x *SnapshotRef) GetName() string {
 	return ""
 }
 
-// RecoveryPoint describes one retained disk or full-checkpoint capture.
+// RecoveryPoint describes one immutable retained disk or checkpoint capture.
 type RecoveryPoint struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	Name                string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Kind                string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
-	CreatedAtUnixMillis uint64                 `protobuf:"varint,3,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
-	SizeBytes           uint64                 `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Server-assigned recovery-point identifier accepted by Rollback.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Capture type: `disk` cold-boots from durable disk state; `checkpoint` restores VM execution state.
+	Kind string `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	// Server commit time in Unix milliseconds.
+	CreatedAtUnixMillis uint64 `protobuf:"varint,3,opt,name=created_at_unix_millis,json=createdAtUnixMillis,proto3" json:"created_at_unix_millis,omitempty"`
+	// Stored recovery archive size in bytes.
+	SizeBytes     uint64 `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RecoveryPoint) Reset() {

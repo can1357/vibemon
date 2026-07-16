@@ -4,7 +4,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	sync::{
 		Arc,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -19,8 +19,8 @@ use vmond::mesh::{
 	routes::{
 		CreateRecordWire, MeshControl, MeshEngine, MeshLeaseManager, MeshRecordStore,
 		MeshReplicaStore, MeshRouteConfig, MeshRouteState, MeshSetupResult, MeshTemplateTransfer,
-		MetadataPull, MigratePrepareWire, NodeCapsWire, PeerMember, ReplicaRecordWire,
-		router as mesh_router,
+		MetadataPull, MigratePrepareWire, MigrationCleanupWire, NodeCapsWire, PeerMember,
+		ReplicaRecordWire, router as mesh_router,
 	},
 };
 
@@ -47,6 +47,8 @@ struct FakeMesh {
 	advertise: String,
 	healthy:   Mutex<BTreeSet<String>>,
 	owners:    Mutex<BTreeMap<String, (String, i64)>>,
+	placement: Mutex<Option<String>>,
+	peer_urls: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeMesh {
@@ -56,11 +58,21 @@ impl FakeMesh {
 			advertise: advertise.to_owned(),
 			healthy:   Mutex::new(BTreeSet::new()),
 			owners:    Mutex::new(BTreeMap::new()),
+			placement: Mutex::new(None),
+			peer_urls: Mutex::new(BTreeMap::new()),
 		}
 	}
 
 	fn mark_healthy(&self, node_id: &str) {
 		self.healthy.lock().insert(node_id.to_owned());
+	}
+
+	fn route_to(&self, node_id: &str, url: String) {
+		self.peer_urls.lock().insert(node_id.to_owned(), url);
+	}
+
+	fn place_on(&self, node_id: &str) {
+		*self.placement.lock() = Some(node_id.to_owned());
 	}
 }
 
@@ -151,7 +163,12 @@ impl MeshControl for FakeMesh {
 	}
 
 	fn peer_url(&self, node_id: &str) -> Option<String> {
-		Some(format!("http://{node_id}"))
+		self
+			.peer_urls
+			.lock()
+			.get(node_id)
+			.cloned()
+			.or_else(|| Some(format!("http://{node_id}")))
 	}
 
 	fn find_template_provider(&self, _key: &str) -> Option<(String, String)> {
@@ -202,7 +219,11 @@ impl MeshControl for FakeMesh {
 	}
 
 	fn place(&self, _params: &JsonObject) -> MeshResult<String> {
-		Ok(self.node_id.clone())
+		Ok(self
+			.placement
+			.lock()
+			.clone()
+			.unwrap_or_else(|| self.node_id.clone()))
 	}
 
 	fn coordinator_for(&self, _key: &str) -> String {
@@ -227,7 +248,10 @@ impl MeshControl for FakeMesh {
 }
 
 #[derive(Default)]
-struct FakeEngine;
+struct FakeEngine {
+	candidate: Mutex<Option<Value>>,
+	teardowns: Mutex<Vec<(String, i64)>>,
+}
 
 impl MeshEngine for FakeEngine {
 	fn owned_ids(&self) -> MeshResult<Vec<String>> {
@@ -238,23 +262,57 @@ impl MeshEngine for FakeEngine {
 		Ok(Vec::new())
 	}
 
-	fn has_sandbox(&self, _sid: &str) -> bool {
-		false
+	fn has_sandbox(&self, sid: &str) -> bool {
+		self
+			.candidate
+			.lock()
+			.as_ref()
+			.and_then(|candidate| candidate.get("id"))
+			.and_then(Value::as_str)
+			== Some(sid)
 	}
 
 	fn get_view(&self, sid: &str) -> MeshResult<Value> {
-		Err(MeshError::invalid(format!("unknown sandbox {sid}")))
+		self
+			.candidate
+			.lock()
+			.as_ref()
+			.filter(|candidate| candidate.get("id").and_then(Value::as_str) == Some(sid))
+			.cloned()
+			.ok_or_else(|| MeshError::invalid(format!("unknown sandbox {sid}")))
 	}
 
 	fn checkpoint_age_sec(&self, _sid: &str) -> Option<f64> {
 		None
 	}
 
-	fn find_by_idempotency_key(&self, _key: &str) -> MeshResult<Option<Value>> {
-		Ok(None)
+	fn find_by_idempotency_key(&self, key: &str) -> MeshResult<Option<Value>> {
+		Ok(self
+			.candidate
+			.lock()
+			.as_ref()
+			.filter(|candidate| {
+				candidate
+					.get("detail")
+					.and_then(Value::as_object)
+					.and_then(|detail| detail.get("idempotency_key"))
+					.and_then(Value::as_str)
+					== Some(key)
+			})
+			.cloned())
 	}
 
-	fn record_idempotency(&self, _sid: &str, _key: &str) -> MeshResult<()> {
+	fn record_idempotency(&self, _sid: &str, key: &str) -> MeshResult<()> {
+		if let Some(candidate) = self.candidate.lock().as_mut() {
+			candidate["detail"]["idempotency_key"] = json!(key);
+		}
+		Ok(())
+	}
+
+	fn record_create_epoch(&self, _sid: &str, epoch: i64) -> MeshResult<()> {
+		if let Some(candidate) = self.candidate.lock().as_mut() {
+			candidate["detail"]["_mesh_create_epoch"] = json!(epoch);
+		}
 		Ok(())
 	}
 
@@ -262,14 +320,37 @@ impl MeshEngine for FakeEngine {
 		Ok(())
 	}
 
+	fn teardown_candidate(&self, sid: String, expected_epoch: i64) -> BoxFuture<'_, MeshResult<()>> {
+		self.teardowns.lock().push((sid, expected_epoch));
+		self.candidate.lock().take();
+		Box::pin(async { Ok(()) })
+	}
+
+	fn delete_portable_history(
+		&self,
+		_sid: String,
+		_owner: String,
+		_epoch: i64,
+	) -> BoxFuture<'_, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
+	}
+
+	fn stage_migration_delta(
+		&self,
+		_sid: String,
+		verified_cache_path: String,
+		_base_dir: String,
+	) -> BoxFuture<'_, MeshResult<String>> {
+		Box::pin(async move { Ok(verified_cache_path) })
+	}
+
 	fn create_sandbox(&self, mut params: JsonObject) -> BoxFuture<'_, MeshResult<Value>> {
-		Box::pin(async move {
-			let id = params
-				.remove("name")
-				.and_then(|v| v.as_str().map(str::to_owned))
-				.unwrap_or_else(|| "created".to_owned());
-			Ok(json!({"id": id}))
-		})
+		let id = params
+			.remove("name")
+			.and_then(|v| v.as_str().map(str::to_owned))
+			.unwrap_or_else(|| "created".to_owned());
+		*self.candidate.lock() = Some(json!({"id": id, "detail": {}}));
+		Box::pin(async move { Ok(json!({"id": id})) })
 	}
 
 	fn run_detached(&self, params: JsonObject) -> BoxFuture<'_, MeshResult<Value>> {
@@ -297,6 +378,7 @@ impl MeshEngine for FakeEngine {
 		&self,
 		sid: String,
 		_base_dir: String,
+		_cleanup: MigrationCleanupWire,
 	) -> BoxFuture<'_, MeshResult<MigratePrepareWire>> {
 		Box::pin(async move { Err(MeshError::invalid(format!("no checkpoint for {sid}"))) })
 	}
@@ -330,16 +412,33 @@ impl MeshEngine for FakeEngine {
 	) -> BoxFuture<'_, MeshResult<()>> {
 		Box::pin(async { Ok(()) })
 	}
+
+	fn migrate_adopt_target(
+		&self,
+		_sid: String,
+		_delta_dir: String,
+		_params: JsonObject,
+	) -> BoxFuture<'_, MeshResult<Value>> {
+		Box::pin(async { Err(MeshError::invalid("no staged migration")) })
+	}
+
+	fn migrate_activate_target(&self, _sid: String, _epoch: i64) -> BoxFuture<'_, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
+	}
 }
 
 struct FakeLease {
-	manager: LeaseManager,
+	manager:  LeaseManager,
+	released: Mutex<Vec<String>>,
 }
 
 impl FakeLease {
 	fn new(clock: ManualClock) -> Self {
 		let root = tempfile::tempdir().unwrap().keep().join("leases");
-		Self { manager: LeaseManager::with_clock(root, move || clock.now()) }
+		Self {
+			manager:  LeaseManager::with_clock(root, move || clock.now()),
+			released: Mutex::new(Vec::new()),
+		}
 	}
 
 	fn wire(decision: vmond::mesh::lease::LeaseDecision) -> MeshResult<JsonObject> {
@@ -408,30 +507,71 @@ impl MeshLeaseManager for FakeLease {
 		Box::pin(async { Ok(()) })
 	}
 
-	fn release_record_volume_leases(&self, _sid: String) -> BoxFuture<'_, MeshResult<()>> {
+	fn release_record_volume_leases(&self, sid: String) -> BoxFuture<'_, MeshResult<()>> {
+		self.released.lock().push(sid);
 		Box::pin(async { Ok(()) })
 	}
 }
 
 #[derive(Default)]
-struct FakeRecords(Mutex<BTreeMap<String, CreateRecordWire>>);
+struct FakeRecords {
+	records:               Mutex<BTreeMap<String, CreateRecordWire>>,
+	reservations:          Mutex<BTreeMap<String, (String, String, i64)>>,
+	put_error_after_store: AtomicBool,
+	put_fails:             AtomicBool,
+}
 
 impl MeshRecordStore for FakeRecords {
 	fn get(&self, sid: &str) -> MeshResult<Option<CreateRecordWire>> {
-		Ok(self.0.lock().get(sid).cloned())
+		Ok(self.records.lock().get(sid).cloned())
 	}
 
-	fn put(&self, record: CreateRecordWire) -> MeshResult<()> {
-		self.0.lock().insert(record.sid.clone(), record);
-		Ok(())
+	fn reserve_create_epoch(
+		&self,
+		sid: &str,
+		owner: &str,
+		idempotency_key: &str,
+	) -> MeshResult<i64> {
+		let mut reservations = self.reservations.lock();
+		if let Some((reserved_owner, reserved_key, epoch)) = reservations.get(sid) {
+			return if reserved_owner == owner && reserved_key == idempotency_key {
+				Ok(*epoch)
+			} else {
+				Err(MeshError::conflict("sandbox creation is reserved by another request"))
+			};
+		}
+		let epoch = 1;
+		reservations.insert(sid.to_owned(), (owner.to_owned(), idempotency_key.to_owned(), epoch));
+		Ok(epoch)
+	}
+
+	fn put(&self, record: CreateRecordWire) -> MeshResult<CreateRecordWire> {
+		let mut reservations = self.reservations.lock();
+		if let Some((owner, key, epoch)) = reservations.get(&record.sid)
+			&& (owner != &record.owner || key != &record.idempotency_key || *epoch != record.epoch)
+		{
+			return Err(MeshError::conflict("sandbox creation reservation does not match record"));
+		}
+		if self.put_fails.load(Ordering::SeqCst) {
+			return Err(MeshError::new("record put failed"));
+		}
+		self
+			.records
+			.lock()
+			.insert(record.sid.clone(), record.clone());
+		if self.put_error_after_store.swap(false, Ordering::SeqCst) {
+			return Err(MeshError::new("record response lost after commit"));
+		}
+		reservations.remove(&record.sid);
+		Ok(record)
 	}
 
 	fn list(&self) -> MeshResult<Vec<CreateRecordWire>> {
-		Ok(self.0.lock().values().cloned().collect())
+		Ok(self.records.lock().values().cloned().collect())
 	}
 
-	fn remove(&self, sid: &str, _owner: &str, _epoch: i64) -> MeshResult<()> {
-		self.0.lock().remove(sid);
+	fn commit_delete(&self, sid: &str, _owner: &str, _epoch: i64) -> MeshResult<()> {
+		self.records.lock().remove(sid);
 		Ok(())
 	}
 }
@@ -447,8 +587,11 @@ impl MeshReplicaStore for FakeReplicas {
 	fn put(
 		&self,
 		_sid: String,
+		_object_key: String,
 		_digest: String,
 		_source_node: String,
+		_source_epoch: u64,
+		_checkpoint_generation: u64,
 		_snapshot_dir: String,
 		_params: JsonObject,
 	) -> BoxFuture<'_, MeshResult<()>> {
@@ -478,6 +621,18 @@ impl MeshTemplateTransfer for FakeTransfer {
 		Box::pin(async { Err(MeshError::unreachable("template pull not configured")) })
 	}
 
+	fn pull_snapshot<'a>(
+		&'a self,
+		_client: &'a reqwest::Client,
+		_peer_url: String,
+		_sid: String,
+		_object_key: String,
+		_digest: String,
+		_token: String,
+	) -> BoxFuture<'a, MeshResult<String>> {
+		Box::pin(async { Err(MeshError::unreachable("snapshot pull not configured")) })
+	}
+
 	fn pull_template_metadata<'a>(
 		&'a self,
 		_client: &'a reqwest::Client,
@@ -490,14 +645,30 @@ impl MeshTemplateTransfer for FakeTransfer {
 }
 
 fn route_state(mesh: Arc<FakeMesh>, lease: Arc<FakeLease>, token: &str) -> MeshRouteState {
+	route_state_with(
+		mesh,
+		Arc::new(FakeEngine::default()),
+		lease,
+		Arc::new(FakeRecords::default()),
+		token,
+	)
+}
+
+fn route_state_with(
+	mesh: Arc<FakeMesh>,
+	engine: Arc<FakeEngine>,
+	lease: Arc<FakeLease>,
+	records: Arc<FakeRecords>,
+	token: &str,
+) -> MeshRouteState {
 	MeshRouteState::new(
 		token,
 		token,
 		PeerHttpClient::new(token).unwrap(),
 		mesh,
-		Arc::new(FakeEngine),
+		engine,
 		lease,
-		Arc::new(FakeRecords::default()),
+		records,
 		Arc::new(FakeReplicas),
 		Arc::new(FakeTransfer),
 		MeshRouteConfig::default(),
@@ -514,6 +685,142 @@ async fn json_body(response: reqwest::Response) -> Value {
 	serde_json::from_slice(&bytes).unwrap_or_else(|err| {
 		panic!("HTTP {status} did not return JSON: {err}; body={}", String::from_utf8_lossy(&bytes))
 	})
+}
+
+#[test]
+fn create_reservation_rejoins_same_token_and_rejects_competing_token() {
+	let records = FakeRecords::default();
+
+	assert_eq!(
+		records
+			.reserve_create_epoch("sandbox", "node-a", "token-a")
+			.unwrap(),
+		1
+	);
+	assert_eq!(
+		records
+			.reserve_create_epoch("sandbox", "node-a", "token-a")
+			.unwrap(),
+		1
+	);
+	let error = records
+		.reserve_create_epoch("sandbox", "node-a", "token-b")
+		.unwrap_err();
+	assert_eq!(error.code, "conflict");
+}
+
+#[tokio::test]
+async fn candidate_teardown_route_rejects_stale_epoch_before_releasing_leases() {
+	let token = "secret";
+	let engine = Arc::new(FakeEngine::default());
+	*engine.candidate.lock() = Some(json!({
+		"id": "sandbox",
+		"detail": {"_mesh_create_epoch": 7, "idempotency_key": "token-a"}
+	}));
+	let lease = Arc::new(FakeLease::new(ManualClock::new(100.0)));
+	let state = route_state_with(
+		Arc::new(FakeMesh::new("A", "http://a")),
+		engine.clone(),
+		lease.clone(),
+		Arc::new(FakeRecords::default()),
+		token,
+	);
+	let node = spawn_mesh_node("A", token, state).await;
+
+	let stale = node
+		.post_json(
+			"/v1/mesh/candidate/teardown",
+			&json!({"sid": "sandbox", "owner": "A", "epoch": 6, "idempotency_key": "token-a"}),
+		)
+		.await;
+	assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+	assert!(engine.teardowns.lock().is_empty());
+	assert!(lease.released.lock().is_empty());
+
+	let exact = node
+		.post_json(
+			"/v1/mesh/candidate/teardown",
+			&json!({"sid": "sandbox", "owner": "A", "epoch": 7, "idempotency_key": "token-a"}),
+		)
+		.await;
+	assert_eq!(exact.status(), reqwest::StatusCode::OK);
+	assert_eq!(*engine.teardowns.lock(), vec![("sandbox".to_owned(), 7)]);
+	assert_eq!(*lease.released.lock(), vec!["sandbox".to_owned()]);
+	node.stop().await;
+}
+
+#[tokio::test]
+async fn durable_create_record_after_response_error_preserves_local_candidate() {
+	let token = "secret";
+	let engine = Arc::new(FakeEngine::default());
+	let lease = Arc::new(FakeLease::new(ManualClock::new(100.0)));
+	let records = Arc::new(FakeRecords::default());
+	records.put_error_after_store.store(true, Ordering::SeqCst);
+	let state = route_state_with(
+		Arc::new(FakeMesh::new("A", "http://a")),
+		engine.clone(),
+		lease.clone(),
+		records.clone(),
+		token,
+	);
+	let node = spawn_mesh_node("A", token, state).await;
+
+	let response = node
+		.post_json(
+			"/v1/mesh/idem/sandboxes/coordinate",
+			&json!({"key": "token-a", "params": {"name": "sandbox"}}),
+		)
+		.await;
+	assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+	assert!(engine.has_sandbox("sandbox"));
+	assert!(engine.teardowns.lock().is_empty());
+	assert!(lease.released.lock().is_empty());
+	assert!(records.get("sandbox").unwrap().is_some());
+	node.stop().await;
+}
+
+#[tokio::test]
+async fn failed_remote_create_record_tears_down_exact_peer_candidate_after_put_failure() {
+	let token = "secret";
+	let peer_engine = Arc::new(FakeEngine::default());
+	let peer_lease = Arc::new(FakeLease::new(ManualClock::new(100.0)));
+	let peer_state = route_state_with(
+		Arc::new(FakeMesh::new("B", "http://b")),
+		peer_engine.clone(),
+		peer_lease.clone(),
+		Arc::new(FakeRecords::default()),
+		token,
+	);
+	let peer = spawn_mesh_node("B", token, peer_state).await;
+
+	let coordinator_mesh = Arc::new(FakeMesh::new("A", "http://a"));
+	coordinator_mesh.place_on("B");
+	coordinator_mesh.route_to("B", peer.url());
+	let coordinator_records = Arc::new(FakeRecords::default());
+	coordinator_records.put_fails.store(true, Ordering::SeqCst);
+	let coordinator_state = route_state_with(
+		coordinator_mesh,
+		Arc::new(FakeEngine::default()),
+		Arc::new(FakeLease::new(ManualClock::new(100.0))),
+		coordinator_records.clone(),
+		token,
+	);
+	let coordinator = spawn_mesh_node("A", token, coordinator_state).await;
+
+	let response = coordinator
+		.post_json(
+			"/v1/mesh/idem/sandboxes/coordinate",
+			&json!({"key": "token-a", "params": {"name": "sandbox"}}),
+		)
+		.await;
+	assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+	assert!(!peer_engine.has_sandbox("sandbox"));
+	assert_eq!(*peer_engine.teardowns.lock(), vec![("sandbox".to_owned(), 1)]);
+	assert_eq!(*peer_lease.released.lock(), vec!["sandbox".to_owned()]);
+	assert!(coordinator_records.get("sandbox").unwrap().is_none());
+
+	coordinator.stop().await;
+	peer.stop().await;
 }
 
 #[tokio::test]
@@ -619,4 +926,22 @@ async fn fault_proxy_drops_matching_request_once_then_forwards_after_reset() {
 
 	proxy.close();
 	backend.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_record_remove_route_is_not_registered() {
+	let token = "secret";
+	let state = route_state(
+		Arc::new(FakeMesh::new("A", "http://a")),
+		Arc::new(FakeLease::new(ManualClock::new(100.0))),
+		token,
+	);
+	let node = spawn_mesh_node("A", token, state).await;
+
+	let response = node
+		.post_json("/v1/mesh/record/remove", &json!({"sid": "sandbox", "owner": "A", "epoch": 1}))
+		.await;
+	assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+	node.stop().await;
 }

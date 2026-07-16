@@ -109,9 +109,10 @@ export interface ForkRequest extends SnapshotRuntimeOptions {
   count: number;
 }
 
-/** An immutable recovery point retained for a sandbox. */
+/** An immutable retained `disk` or `checkpoint` recovery point. */
 export interface RecoveryPoint {
   name: string;
+  /** `disk` cold-boots; `checkpoint` restores VM execution state. */
   kind: string;
   created_at_unix_millis: bigint;
   size_bytes: bigint;
@@ -125,11 +126,25 @@ export type PoolSetRequest = Partial<SandboxCreateRequest> & {
 /** Tolerant sandbox view returned by the daemon. */
 export interface SandboxInfo {
   id: string;
-  state?: string;
-  status?: string;
   name?: string | null;
+  /** Serving status summary; use desired/observed state for lifecycle progress. */
+  status?: string;
+  desired_state?: string;
+  observed_state?: string;
+  state_generation?: number;
+  lifecycle_failure?: string | null;
+  pid?: number | null;
+  source?: string | null;
+  created_at?: number;
+  last_active?: number;
+  expires_at?: number | null;
+  terminated_at?: number | null;
+  error?: string | null;
   tags?: Record<string, string> | null;
+  returncode?: number | null;
   node?: string | null;
+  ha?: string;
+  restart_policy?: string;
   [key: string]: unknown;
 }
 

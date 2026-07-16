@@ -33,6 +33,7 @@ type sandboxServiceStub struct {
 	terminate   func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	tunnels     func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	migrate     func(context.Context, *pb.MigrateRequest) (*pb.JsonView, error)
+	resume      func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	suspend     func(context.Context, *pb.SandboxRef) (*pb.JsonView, error)
 	history     func(context.Context, *pb.SandboxRef) (*pb.RecoveryPointList, error)
 	rollback    func(context.Context, *pb.RollbackSandboxRequest) (*pb.JsonView, error)
@@ -93,6 +94,13 @@ func (stub *sandboxServiceStub) Migrate(ctx context.Context, request *pb.Migrate
 		return nil, status.Error(codes.Unimplemented, "migrate not stubbed")
 	}
 	return stub.migrate(ctx, request)
+}
+
+func (stub *sandboxServiceStub) Resume(ctx context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+	if stub.resume == nil {
+		return nil, status.Error(codes.Unimplemented, "resume not stubbed")
+	}
+	return stub.resume(ctx, ref)
 }
 
 func (stub *sandboxServiceStub) Suspend(ctx context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {

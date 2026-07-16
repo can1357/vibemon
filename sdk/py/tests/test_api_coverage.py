@@ -112,12 +112,19 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
                 name="box/name",
                 credentials=["github-api"],
                 tags={"suite": "coverage"},
+                ha="async+rerun",
             )
             create_request = server.last_rpc("SandboxService/Create")
             assert create_request.json["context"] == "."
             assert create_request.json["name"] == "box/name"
 
             assert create_request.json["credentials"] == ["github-api"]
+            assert sandbox.info.desired_state == "running"
+            assert sandbox.info.observed_state == "running"
+            assert sandbox.info.state_generation == 1
+            assert sandbox.info.lifecycle_failure is None
+            assert sandbox.info.ha == "async+rerun"
+            assert sandbox.info.restart_policy == "rerun"
             policy = sandbox.network()
             assert policy.block_network is False
             assert policy.cidr_allow == ()
@@ -132,13 +139,19 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             assert updated_policy.block_network is True
             assert updated_policy.cidr_allow == ("10.0.0.0/8",)
             assert updated_policy.domain_allow == ("example.com",)
-            assert sandbox.pause().status == "paused"
-            assert sandbox.resume().status == "running"
-            assert sandbox.suspend().status == "suspended"
+            assert sandbox.pause().observed_state == "paused"
+            assert sandbox.resume().observed_state == "running"
+            suspended = sandbox.suspend()
+            assert suspended.desired_state == "suspended"
+            assert suspended.observed_state == "suspended"
+            assert suspended.state_generation == 4
+            assert suspended.lifecycle_failure is None
+            assert sandbox.resume().observed_state == "running"
             points = sandbox.history()
             assert points[0].name == "recovery-box/name"
+            assert points[0].kind == "checkpoint"
             assert points[0].created_at_unix_millis == 1_700_000_000_000
-            assert sandbox.rollback(points[0].name).status == "running"
+            assert sandbox.rollback(points[0].name).observed_state == "running"
             assert sandbox.extend(15).raw["deadline_unix"] == 1_800_000_000
             assert sandbox.metrics()["vcpu_exits"] == 7
             assert sandbox.node == server.node_id

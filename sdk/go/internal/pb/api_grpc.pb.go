@@ -105,14 +105,16 @@ type SandboxServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	Pause(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
-	// Resumes vCPU execution for a paused sandbox.
+	// Resumes a paused sandbox in place, or restores a durably suspended sandbox.
+	// A suspended resume restores the exact committed suspend checkpoint and preserves the sandbox ID.
 	//
 	// Replaces: POST /v1/sandboxes/{id}/resume
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is neither paused nor suspended.
 	Resume(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
 	// Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+	// A failed checkpoint leaves the prior live VM and lifecycle state intact.
 	Suspend(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*JsonView, error)
 	// Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
 	//
@@ -236,9 +238,10 @@ type SandboxServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	SnapshotFs(ctx context.Context, in *SnapshotFsRequest, opts ...grpc.CallOption) (*JsonView, error)
-	// Lists rolling disk and full-checkpoint recovery points for a sandbox.
+	// Lists rolling `disk` and `checkpoint` recovery points from oldest to newest.
 	History(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*RecoveryPointList, error)
-	// Restores a sandbox identity to one retained recovery point.
+	// Restores this sandbox identity to one immutable retained recovery point.
+	// The current VM remains authoritative until the replacement is ready to cut over.
 	Rollback(ctx context.Context, in *RollbackSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
 }
 
@@ -619,14 +622,16 @@ type SandboxServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	Pause(context.Context, *SandboxRef) (*JsonView, error)
-	// Resumes vCPU execution for a paused sandbox.
+	// Resumes a paused sandbox in place, or restores a durably suspended sandbox.
+	// A suspended resume restores the exact committed suspend checkpoint and preserves the sandbox ID.
 	//
 	// Replaces: POST /v1/sandboxes/{id}/resume
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
-	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not in a paused state.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is neither paused nor suspended.
 	Resume(context.Context, *SandboxRef) (*JsonView, error)
 	// Durably checkpoints a sandbox, removes its live VM, and preserves its identity.
+	// A failed checkpoint leaves the prior live VM and lifecycle state intact.
 	Suspend(context.Context, *SandboxRef) (*JsonView, error)
 	// Extends the sandbox's remaining wall-clock time-to-live (TTL) by the specified duration.
 	//
@@ -750,9 +755,10 @@ type SandboxServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
 	SnapshotFs(context.Context, *SnapshotFsRequest) (*JsonView, error)
-	// Lists rolling disk and full-checkpoint recovery points for a sandbox.
+	// Lists rolling `disk` and `checkpoint` recovery points from oldest to newest.
 	History(context.Context, *SandboxRef) (*RecoveryPointList, error)
-	// Restores a sandbox identity to one retained recovery point.
+	// Restores this sandbox identity to one immutable retained recovery point.
+	// The current VM remains authoritative until the replacement is ready to cut over.
 	Rollback(context.Context, *RollbackSandboxRequest) (*JsonView, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }

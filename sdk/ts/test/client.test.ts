@@ -63,7 +63,7 @@ function fakeVmon() {
           points: [
             {
               name: "recovery-s1",
-              kind: "full",
+              kind: "checkpoint",
               createdAtUnixMillis: 1_700_000_000_000n,
               sizeBytes: 1024n,
             },
@@ -209,18 +209,48 @@ test("resource hierarchy maps RPCs and views", async () => {
   state.view = { expires_at: 123 };
   expect((await sandbox.extend(30)).id).toBe("s1");
   expect(rpcs.at(-1)).toMatchObject({ method: "Extend", input: { id: "s1", secs: 30n } });
-  state.view = { id: "s1", status: "suspended" };
-  expect((await sandbox.suspend()).status).toBe("suspended");
+  state.view = {
+    id: "s1",
+    status: "suspended",
+    desired_state: "suspended",
+    observed_state: "suspended",
+    state_generation: 2,
+    lifecycle_failure: null,
+    ha: "async",
+    restart_policy: "none",
+  };
+  expect(await sandbox.suspend()).toMatchObject({
+    observed_state: "suspended",
+    state_generation: 2,
+    ha: "async",
+  });
+  state.view = {
+    id: "s1",
+    status: "running",
+    desired_state: "running",
+    observed_state: "running",
+    state_generation: 3,
+    lifecycle_failure: null,
+  };
+  expect((await sandbox.resume()).observed_state).toBe("running");
+  expect(rpcs.at(-1)).toMatchObject({ method: "Resume", input: { id: "s1" } });
   expect(await sandbox.history()).toEqual([
     {
       name: "recovery-s1",
-      kind: "full",
+      kind: "checkpoint",
       created_at_unix_millis: 1_700_000_000_000n,
       size_bytes: 1024n,
     },
   ]);
-  state.view = { id: "s1", status: "running" };
-  expect((await sandbox.rollback("recovery-s1")).status).toBe("running");
+  state.view = {
+    id: "s1",
+    status: "running",
+    desired_state: "running",
+    observed_state: "running",
+    state_generation: 4,
+    lifecycle_failure: null,
+  };
+  expect((await sandbox.rollback("recovery-s1")).observed_state).toBe("running");
   expect(rpcs.at(-1)).toMatchObject({
     method: "Rollback",
     input: { id: "s1", recoveryPoint: "recovery-s1" },

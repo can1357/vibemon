@@ -92,8 +92,16 @@ type Sandbox struct {
 	ID string `json:"id"`
 	// Name is the human-facing sandbox name.
 	Name string `json:"name"`
-	// Status is the current lifecycle state.
+	// Status is the serving status summary.
 	Status string `json:"status"`
+	// DesiredState is the durable lifecycle target.
+	DesiredState string `json:"desired_state"`
+	// ObservedState is the lifecycle state materialized by the owner.
+	ObservedState string `json:"observed_state"`
+	// StateGeneration identifies the accepted lifecycle transition.
+	StateGeneration uint64 `json:"state_generation"`
+	// LifecycleFailure describes the latest failed transition.
+	LifecycleFailure *string `json:"lifecycle_failure"`
 	// PID is the monitor process identifier when one is available.
 	PID *int32 `json:"pid,omitempty"`
 	// Source is the image, template, fork, or restore source.
@@ -114,6 +122,10 @@ type Sandbox struct {
 	ReturnCode *int64 `json:"returncode"`
 	// Node is the mesh node that reported the latest sandbox view.
 	Node string `json:"node,omitempty"`
+	// HA is the selected durability tier.
+	HA string `json:"ha,omitempty"`
+	// RestartPolicy is the server-derived owner-loss behavior.
+	RestartPolicy string `json:"restart_policy,omitempty"`
 	// Details retains non-canonical response fields as raw JSON.
 	Details map[string]json.RawMessage `json:"-"`
 
@@ -136,8 +148,9 @@ func (sandbox *Sandbox) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, key := range []string{
-		"id", "name", "status", "pid", "source", "created_at", "last_active",
-		"expires_at", "terminated_at", "error", "tags", "returncode", "node",
+		"id", "name", "status", "desired_state", "observed_state", "state_generation",
+		"lifecycle_failure", "pid", "source", "created_at", "last_active", "expires_at",
+		"terminated_at", "error", "tags", "returncode", "node", "ha", "restart_policy",
 	} {
 		delete(details, key)
 	}
@@ -231,15 +244,15 @@ type SandboxCreateRequest struct {
 	Command []string `json:"command,omitempty"`
 }
 
-// RecoveryPoint describes one retained sandbox checkpoint.
+// RecoveryPoint describes one immutable disk or checkpoint capture.
 type RecoveryPoint struct {
 	// Name is the server-assigned recovery-point identifier.
 	Name string
-	// Kind identifies the retained capture type.
+	// Kind is "disk" for a cold-boot disk capture or "checkpoint" for saved VM execution state.
 	Kind string
 	// CreatedAtUnixMillis is the creation time in Unix milliseconds.
 	CreatedAtUnixMillis uint64
-	// SizeBytes is the encrypted capture size in bytes.
+	// SizeBytes is the stored recovery archive size in bytes.
 	SizeBytes uint64
 }
 

@@ -189,7 +189,7 @@ export class Sandbox {
     );
     return this.#info;
   }
-  /** Resume sandbox execution. */
+  /** Resume a paused sandbox or restore a durably suspended sandbox. */
   async resume(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
@@ -200,7 +200,7 @@ export class Sandbox {
     return this.#info;
   }
 
-  /** Durably checkpoint this sandbox while preserving its identity. */
+  /** Durably checkpoint and release the live VM while preserving its identity. */
   async suspend(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
@@ -335,7 +335,7 @@ export class Sandbox {
     const deadline = Date.now() + 300_000;
     while (Date.now() < deadline) {
       const info = await this.refresh();
-      const state = typeof info.state === "string" ? info.state : info.status;
+      const state = typeof info.observed_state === "string" ? info.observed_state : info.status;
       if (state && states.has(state)) return;
       await sleep(250);
     }

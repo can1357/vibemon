@@ -753,7 +753,7 @@ class Sandbox:
         return self.info
 
     def resume(self) -> SandboxInfo:
-        """Resume virtual CPUs and return the updated view."""
+        """Resume a paused sandbox or restore a durably suspended sandbox."""
         self._update(
             self._view_rpc(
                 lambda stubs: stubs.sandbox.Resume(api_pb2.SandboxRef(id=self.id)),
@@ -764,7 +764,7 @@ class Sandbox:
         return self.info
 
     def suspend(self) -> SandboxInfo:
-        """Durably checkpoint this sandbox while preserving its identity."""
+        """Durably checkpoint and release the live VM while preserving its identity."""
         self._update(
             self._view_rpc(
                 lambda stubs: stubs.sandbox.Suspend(api_pb2.SandboxRef(id=self.id)),

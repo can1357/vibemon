@@ -104,21 +104,27 @@ func TestSandboxRecoveryAndSnapshotDelete(t *testing.T) {
 			if ref.GetId() != "box" {
 				return nil, status.Error(codes.InvalidArgument, "unexpected sandbox")
 			}
-			return &pb.JsonView{Json: `{"id":"box","status":"suspended"}`}, nil
+			return &pb.JsonView{Json: `{"id":"box","status":"suspended","desired_state":"suspended","observed_state":"suspended","state_generation":2,"lifecycle_failure":null,"ha":"async","restart_policy":"none"}`}, nil
+		},
+		resume: func(_ context.Context, ref *pb.SandboxRef) (*pb.JsonView, error) {
+			if ref.GetId() != "box" {
+				return nil, status.Error(codes.InvalidArgument, "unexpected sandbox")
+			}
+			return &pb.JsonView{Json: `{"id":"box","status":"running","desired_state":"running","observed_state":"running","state_generation":3,"lifecycle_failure":null,"ha":"async","restart_policy":"none"}`}, nil
 		},
 		history: func(_ context.Context, ref *pb.SandboxRef) (*pb.RecoveryPointList, error) {
 			if ref.GetId() != "box" {
 				return nil, status.Error(codes.InvalidArgument, "unexpected sandbox")
 			}
 			return &pb.RecoveryPointList{Points: []*pb.RecoveryPoint{{
-				Name: "point-1", Kind: "full", CreatedAtUnixMillis: 123, SizeBytes: 456,
+				Name: "point-1", Kind: "checkpoint", CreatedAtUnixMillis: 123, SizeBytes: 456,
 			}}}, nil
 		},
 		rollback: func(_ context.Context, request *pb.RollbackSandboxRequest) (*pb.JsonView, error) {
 			if request.GetId() != "box" || request.GetRecoveryPoint() != "point-1" {
 				return nil, status.Error(codes.InvalidArgument, "unexpected rollback")
 			}
-			return &pb.JsonView{Json: `{"id":"box","status":"running"}`}, nil
+			return &pb.JsonView{Json: `{"id":"box","status":"running","desired_state":"running","observed_state":"running","state_generation":4,"lifecycle_failure":null,"ha":"async","restart_policy":"none"}`}, nil
 		},
 	}
 	snapshots := &snapshotServiceStub{
@@ -135,14 +141,22 @@ func TestSandboxRecoveryAndSnapshotDelete(t *testing.T) {
 	if updated, err := box.Suspend(context.Background()); err != nil || updated.Status != "suspended" {
 		t.Fatalf("Suspend() = %#v, %v", updated, err)
 	}
+	if box.DesiredState != "suspended" || box.ObservedState != "suspended" ||
+		box.StateGeneration != 2 || box.LifecycleFailure != nil ||
+		box.HA != "async" || box.RestartPolicy != "none" {
+		t.Fatalf("Suspend() lifecycle = %#v", box)
+	}
+	if updated, err := box.Resume(context.Background()); err != nil || updated.ObservedState != "running" || updated.StateGeneration != 3 {
+		t.Fatalf("Resume() = %#v, %v", updated, err)
+	}
 	points, err := box.History(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := points; len(got) != 1 || got[0] != (RecoveryPoint{Name: "point-1", Kind: "full", CreatedAtUnixMillis: 123, SizeBytes: 456}) {
+	if got := points; len(got) != 1 || got[0] != (RecoveryPoint{Name: "point-1", Kind: "checkpoint", CreatedAtUnixMillis: 123, SizeBytes: 456}) {
 		t.Fatalf("History() = %#v", got)
 	}
-	if updated, err := box.Rollback(context.Background(), "point-1"); err != nil || updated.Status != "running" {
+	if updated, err := box.Rollback(context.Background(), "point-1"); err != nil || updated.ObservedState != "running" || updated.StateGeneration != 4 {
 		t.Fatalf("Rollback() = %#v, %v", updated, err)
 	}
 	if err := client.Snapshots.Delete(context.Background(), "snapshot-1"); err != nil {

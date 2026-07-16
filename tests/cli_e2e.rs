@@ -114,6 +114,7 @@ fn phase3_cli_contract() {
 	t_cp(&mut h);
 	t_logs(&mut h);
 	t_pause_resume(&mut h);
+	t_durable_lifecycle(&mut h);
 	t_snapshot_restore(&mut h);
 	t_fork(&mut h);
 	t_daemon_stop(&mut h);
@@ -639,6 +640,44 @@ fn t_pause_resume(h: &mut CliHarness) {
 		out.stdout,
 		out.stderr
 	);
+	h.remove_if_tracked(&name);
+}
+
+fn t_durable_lifecycle(h: &mut CliHarness) {
+	let name = h.uid("lifecycle");
+	let initial = format!("before-{}", h.run_id);
+	let changed = format!("after-{}", h.run_id);
+	h.start_detached(&name);
+	h.cli(
+		["exec", name.as_str(), "--", "sh", "-lc", &format!("echo {initial} > /root/state")],
+		FAST_TIMEOUT,
+	)
+	.assert_success();
+	h.cli(["suspend", name.as_str()], BOOT_TIMEOUT)
+		.assert_success();
+
+	let history = h.cli(["history", name.as_str()], FAST_TIMEOUT);
+	assert_eq!(history.status, 0, "history failed: {:?}", history.stderr);
+	let point = history
+		.stdout
+		.lines()
+		.nth(1)
+		.and_then(|line| line.split_whitespace().next())
+		.expect("suspend should publish one recovery point")
+		.to_owned();
+	assert!(history.stdout.contains("checkpoint"), "unexpected history: {}", history.stdout);
+
+	h.cli(["resume", name.as_str()], BOOT_TIMEOUT)
+		.assert_success();
+	h.exec_until(&name, &["cat", "/root/state"], &initial, Duration::from_secs(40));
+	h.cli(
+		["exec", name.as_str(), "--", "sh", "-lc", &format!("echo {changed} > /root/state")],
+		FAST_TIMEOUT,
+	)
+	.assert_success();
+	h.cli(["rollback", name.as_str(), point.as_str()], BOOT_TIMEOUT)
+		.assert_success();
+	h.exec_until(&name, &["cat", "/root/state"], &initial, Duration::from_secs(40));
 	h.remove_if_tracked(&name);
 }
 

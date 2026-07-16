@@ -275,7 +275,7 @@ func (sandbox *Sandbox) Terminate(ctx context.Context) error {
 	})
 }
 
-// Remove deletes the sandbox and any persistent filesystems.
+// Remove deletes the sandbox record; separately managed volumes remain.
 func (sandbox *Sandbox) Remove(ctx context.Context) error {
 	return sandbox.invoke(ctx, "remove sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
 		_, err := service.Remove(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
@@ -283,28 +283,28 @@ func (sandbox *Sandbox) Remove(ctx context.Context) error {
 	})
 }
 
-// Pause suspends all active processes in the sandbox.
+// Pause quiesces the sandbox's virtual CPUs in memory.
 func (sandbox *Sandbox) Pause(ctx context.Context) (*Sandbox, error) {
 	return sandbox.action(ctx, "pause sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Pause(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
 	})
 }
 
-// Resume reactivates previously paused processes in the sandbox.
+// Resume reactivates a paused sandbox or restores a durably suspended sandbox.
 func (sandbox *Sandbox) Resume(ctx context.Context) (*Sandbox, error) {
 	return sandbox.action(ctx, "resume sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Resume(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
 	})
 }
 
-// Suspend durably checkpoints the sandbox while preserving its identity.
+// Suspend durably checkpoints and releases the live VM while preserving its identity.
 func (sandbox *Sandbox) Suspend(ctx context.Context) (*Sandbox, error) {
 	return sandbox.action(ctx, "suspend sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Suspend(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
 	})
 }
 
-// History lists retained recovery points from oldest to newest.
+// History lists immutable disk and checkpoint recovery points from oldest to newest.
 func (sandbox *Sandbox) History(ctx context.Context) ([]RecoveryPoint, error) {
 	var response *pb.RecoveryPointList
 	err := sandbox.invoke(ctx, "sandbox history", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) error {
@@ -328,7 +328,7 @@ func (sandbox *Sandbox) History(ctx context.Context) ([]RecoveryPoint, error) {
 	return out, nil
 }
 
-// Rollback restores this sandbox identity to a retained recovery point.
+// Rollback restores this sandbox identity after its replacement is ready to cut over.
 func (sandbox *Sandbox) Rollback(ctx context.Context, recoveryPoint string) (*Sandbox, error) {
 	if recoveryPoint == "" {
 		return nil, errors.New("vmon: recovery point is required")
