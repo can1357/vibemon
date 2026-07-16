@@ -77,14 +77,30 @@ pub struct ServeConfig {
 	pub token: Option<String>,
 	/// Restricted client bearer token.
 	pub client_token: Option<String>,
+	/// JSON map from tenant bearer tokens to stable tenant IDs.
+	pub tenant_tokens: HashMap<String, String>,
+	/// JSON map from tenant IDs to customer-managed key IDs.
+	pub tenant_keys: HashMap<String, String>,
 	/// Maximum accepted size of one streamed function artifact.
 	pub function_artifact_max_bytes: u64,
 	/// TLS certificate path.
 	pub tls_cert: Option<String>,
 	/// TLS private-key path.
 	pub tls_key: Option<String>,
+	/// Unix socket for the externally managed privileged network broker.
+	pub network_broker_socket: Option<PathBuf>,
 	/// Idle sandbox timeout in seconds.
 	pub idle_timeout: f64,
+	/// Live disk-history capture cadence in seconds; zero disables it.
+	pub history_disk_sec: f64,
+	/// Full checkpoint-history cadence in seconds; zero disables it.
+	pub history_checkpoint_sec: f64,
+	/// Maximum retained recovery points per sandbox.
+	pub history_retention: usize,
+	/// Maximum recovery-point age in seconds; zero disables age pruning.
+	pub history_max_age_sec: f64,
+	/// Maximum age for unused image templates in seconds.
+	pub template_ttl_sec: f64,
 	/// Replica checkpoint cadence override.
 	pub replicate_sec: Option<f64>,
 	/// Desired async replica count.
@@ -194,10 +210,18 @@ impl Default for ServeConfig {
 			port: 8000,
 			token: None,
 			client_token: None,
+			tenant_tokens: HashMap::new(),
+			tenant_keys: HashMap::new(),
 			function_artifact_max_bytes: 4 * 1024 * 1024 * 1024,
 			tls_cert: None,
 			tls_key: None,
+			network_broker_socket: None,
 			idle_timeout: 300.0,
+			history_disk_sec: 300.0,
+			history_checkpoint_sec: 3600.0,
+			history_retention: 24,
+			history_max_age_sec: 7.0 * 24.0 * 3600.0,
+			template_ttl_sec: 30.0 * 24.0 * 3600.0,
 			replicate_sec: None,
 			replicas: 1,
 			replicate_concurrency: 2,
@@ -233,10 +257,18 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"port",
 	"token",
 	"client_token",
+	"tenant_tokens",
+	"tenant_keys",
 	"function_artifact_max_bytes",
 	"tls_cert",
 	"tls_key",
+	"network_broker_socket",
 	"idle_timeout",
+	"history_disk_sec",
+	"history_checkpoint_sec",
+	"history_retention",
+	"history_max_age_sec",
+	"template_ttl_sec",
 	"replicate_sec",
 	"replicas",
 	"replicate_concurrency",
@@ -269,10 +301,18 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("port", "VMON_SERVE_PORT"),
 	("token", "VMON_API_TOKEN"),
 	("client_token", "VMON_CLIENT_TOKEN"),
+	("tenant_tokens", "VMON_TENANT_TOKENS"),
+	("tenant_keys", "VMON_TENANT_KEYS"),
 	("function_artifact_max_bytes", "VMON_FUNCTION_ARTIFACT_MAX_BYTES"),
 	("tls_cert", "VMON_TLS_CERT"),
 	("tls_key", "VMON_TLS_KEY"),
+	("network_broker_socket", "VMON_NETWORK_BROKER_SOCKET"),
 	("idle_timeout", "VMON_IDLE_TIMEOUT"),
+	("history_disk_sec", "VMON_HISTORY_DISK_SEC"),
+	("history_checkpoint_sec", "VMON_HISTORY_CHECKPOINT_SEC"),
+	("history_retention", "VMON_HISTORY_RETENTION"),
+	("history_max_age_sec", "VMON_HISTORY_MAX_AGE_SEC"),
+	("template_ttl_sec", "VMON_TEMPLATE_TTL_SEC"),
 	("replicate_sec", "VMON_REPLICATE_SEC"),
 	("replicas", "VMON_REPLICAS"),
 	("replicate_concurrency", "VMON_REPLICATE_CONCURRENCY"),
@@ -305,10 +345,18 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("port", "--port"),
 	("token", "--token"),
 	("client_token", "--client-token"),
+	("tenant_tokens", "--tenant-tokens"),
+	("tenant_keys", "--tenant-keys"),
 	("function_artifact_max_bytes", "--function-artifact-max-bytes"),
 	("tls_cert", "--tls-cert"),
 	("tls_key", "--tls-key"),
+	("network_broker_socket", "--network-broker-socket"),
 	("idle_timeout", "--idle-timeout"),
+	("history_disk_sec", "--history-disk-sec"),
+	("history_checkpoint_sec", "--history-checkpoint-sec"),
+	("history_retention", "--history-retention"),
+	("history_max_age_sec", "--history-max-age-sec"),
+	("template_ttl_sec", "--template-ttl-sec"),
 	("replicate_sec", "--replicate-sec"),
 	("replicas", "--replicas"),
 	("replicate_concurrency", "--replicate-concurrency"),
@@ -559,6 +607,8 @@ fn apply_value(
 		"home" => config.home = expand_user(&coerce_string(key, value)?),
 		"token" => config.token = empty_string_as_none(key, value)?,
 		"client_token" => config.client_token = empty_string_as_none(key, value)?,
+		"tenant_tokens" => config.tenant_tokens = coerce_string_map(key, value)?,
+		"tenant_keys" => config.tenant_keys = coerce_string_map(key, value)?,
 		"function_artifact_max_bytes" => {
 			const MAX_ARTIFACT_BYTES: i64 = 1_i64 << 50;
 			let parsed = coerce_int(key, value)?;
@@ -570,6 +620,10 @@ fn apply_value(
 			config.function_artifact_max_bytes = parsed as u64;
 		},
 		"tls_cert" => config.tls_cert = empty_string_as_none(key, value)?,
+		"network_broker_socket" => {
+			config.network_broker_socket =
+				empty_string_as_none(key, value)?.map(|socket| expand_user(&socket));
+		},
 		"tls_key" => config.tls_key = empty_string_as_none(key, value)?,
 		"host" => {
 			let host = coerce_string(key, value)?.trim().to_owned();
@@ -588,6 +642,7 @@ fn apply_value(
 		},
 		"replicas" => config.replicas = non_negative_usize(key, value)?,
 		"warm_pool_size" => config.warm_pool_size = non_negative_usize(key, value)?,
+		"history_retention" => config.history_retention = non_negative_usize(key, value)?,
 		"replicate_concurrency" => {
 			let parsed = coerce_int(key, value)?;
 			if parsed <= 0 {
@@ -601,6 +656,12 @@ fn apply_value(
 			config.warm_images = coerce_warm_images(value, config.warm_pool_size)?;
 		},
 		"idle_timeout" => config.idle_timeout = positive_float(key, value)?,
+		"history_disk_sec" => config.history_disk_sec = non_negative_float(key, value)?,
+		"history_checkpoint_sec" => {
+			config.history_checkpoint_sec = non_negative_float(key, value)?;
+		},
+		"history_max_age_sec" => config.history_max_age_sec = non_negative_float(key, value)?,
+		"template_ttl_sec" => config.template_ttl_sec = non_negative_float(key, value)?,
 		"replicate_sec" => {
 			let parsed = coerce_float(key, value)?;
 			if parsed < 0.0 {
@@ -661,6 +722,34 @@ fn coerce_string(key: &str, value: RawValue<'_>) -> Result<String> {
 		RawValue::Toml(toml::Value::String(value)) => Ok(value.clone()),
 		RawValue::Toml(_) => Err(EngineError::invalid(format!("{key} must be a string"))),
 	}
+}
+
+fn coerce_string_map(key: &str, value: RawValue<'_>) -> Result<HashMap<String, String>> {
+	let map = match value {
+		RawValue::String(text) => serde_json::from_str::<HashMap<String, String>>(text)
+			.map_err(|_| EngineError::invalid(format!("{key} must be a JSON string map")))?,
+		RawValue::Toml(toml::Value::String(text)) => {
+			serde_json::from_str::<HashMap<String, String>>(text)
+				.map_err(|_| EngineError::invalid(format!("{key} must be a JSON string map")))?
+		},
+		RawValue::Toml(toml::Value::Table(table)) => table
+			.iter()
+			.map(|(entry_key, entry_value)| match entry_value {
+				toml::Value::String(value) => Ok((entry_key.clone(), value.clone())),
+				_ => Err(EngineError::invalid(format!("{key} values must be strings"))),
+			})
+			.collect::<Result<HashMap<_, _>>>()?,
+		RawValue::Toml(_) => {
+			return Err(EngineError::invalid(format!("{key} must be a string map")));
+		},
+	};
+	if map
+		.iter()
+		.any(|(entry_key, entry_value)| entry_key.is_empty() || entry_value.is_empty())
+	{
+		return Err(EngineError::invalid(format!("{key} entries must not be empty")));
+	}
+	Ok(map)
 }
 
 fn empty_string_as_none(key: &str, value: RawValue<'_>) -> Result<Option<String>> {
@@ -732,6 +821,14 @@ fn positive_float(key: &str, value: RawValue<'_>) -> Result<f64> {
 	let parsed = coerce_float(key, value)?;
 	if parsed <= 0.0 {
 		return Err(EngineError::invalid(format!("{key} must be positive")));
+	}
+	Ok(parsed)
+}
+
+fn non_negative_float(key: &str, value: RawValue<'_>) -> Result<f64> {
+	let parsed = coerce_float(key, value)?;
+	if !parsed.is_finite() || parsed < 0.0 {
+		return Err(EngineError::invalid(format!("{key} must be a finite non-negative number")));
 	}
 	Ok(parsed)
 }

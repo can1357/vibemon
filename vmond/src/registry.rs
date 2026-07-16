@@ -153,7 +153,7 @@ impl Registry {
 				.to_owned();
 			let status = if running {
 				"running".to_owned()
-			} else if matches!(saved_status.as_str(), "stopped" | "terminated") {
+			} else if matches!(saved_status.as_str(), "stopped" | "suspended" | "terminated") {
 				saved_status.clone()
 			} else {
 				"stopped".to_owned()
@@ -179,7 +179,7 @@ impl Registry {
 			if running {
 				let volume_names = volume_names(&meta);
 				if !volume_names.is_empty() {
-					lock_requests.push((id.clone(), volume_names));
+					lock_requests.push((name.clone(), volume_names));
 				}
 				if meta.get("tap").is_some_and(json_truthy) {
 					detail_object_mut(&mut record.detail)
@@ -594,6 +594,26 @@ mod tests {
 		assert_eq!(registry.find_by_idempotency_key("idem-dead"), Some("dead".to_owned()));
 		let dead_meta = read_meta_map(&home.meta_path("dead")).expect("dead meta");
 		assert_eq!(dead_meta.get("status"), Some(&json!("stopped")));
+
+		write_fixture(
+			&home,
+			"suspended",
+			json!({
+				"status": "suspended",
+				"pid": i32::MAX,
+				"suspend_recovery_point": "point-1"
+			}),
+		);
+		let suspended_registry = Registry::new();
+		suspended_registry.rehydrate(&home).expect("rehydrate suspended");
+		assert_eq!(
+			suspended_registry.get("suspended").expect("suspended record").status,
+			"suspended"
+		);
+		assert_eq!(
+			read_meta_map(&home.meta_path("suspended")).expect("suspended meta")["status"],
+			"suspended"
+		);
 
 		let terminated = registry.get("terminated").expect("terminated record");
 		assert_eq!(terminated.status, "terminated");

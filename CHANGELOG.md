@@ -29,6 +29,11 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added multi-tenant credential management with tenant-scoped token and key mapping
+- Added per-sandbox history retention policies for disks and checkpoints
+- Added system-wide audit logging for credential and key management operations
+- Added network broker socket support for privileged networking operations
+- Added template TTL configuration for automatic cleanup of unused images
 - Added tenant-scoped credential management APIs (`list`, `put`, `delete`)
 - Added restricted user-mode networking capability, allowing whitelists for specific host ports
 - Added configuration options for history retention policies and template TTL settings
@@ -199,6 +204,7 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Updated persistent volume removal to also purge corresponding encrypted volume archives
 - Made sandbox IDs the public routing contract; Python, TypeScript, and Go SDKs
 - Aligned Python and TypeScript sandbox lifecycle, exec, file, port, network,
 - Lowered the Python SDK requirement to 3.11 and added CI coverage for Python

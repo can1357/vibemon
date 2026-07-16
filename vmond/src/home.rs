@@ -117,6 +117,26 @@ impl Home {
 		self.root.join("network")
 	}
 
+	/// Return `$VMON_HOME/security`.
+	pub fn security_dir(&self) -> PathBuf {
+		self.root.join("security")
+	}
+
+	/// Return the customer-managed encryption-key directory.
+	pub fn keys_dir(&self) -> PathBuf {
+		self.security_dir().join("keys")
+	}
+
+	/// Return the encrypted credential-record directory.
+	pub fn credentials_dir(&self) -> PathBuf {
+		self.security_dir().join("credentials")
+	}
+
+	/// Return the append-only security audit log.
+	pub fn audit_log(&self) -> PathBuf {
+		self.security_dir().join("audit.jsonl")
+	}
+
 	/// Return `$VMON_HOME/vmond.sock`.
 	pub fn vmond_sock(&self) -> PathBuf {
 		self.root.join("vmond.sock")

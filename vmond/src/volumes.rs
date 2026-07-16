@@ -1,5 +1,4 @@
-//! Named volumes and request-scoped secrets. Port of python/vmon/volume.py +
-//! secret.py.
+//! Named persistent volumes and request-scoped in-memory secrets.
 
 use std::{
 	collections::BTreeMap,
@@ -23,7 +22,7 @@ const VOLUME_DIR_MODE: u32 = 0o700;
 const LOCK_FILE_MODE: u32 = 0o600;
 const LOCK_FILE_NAME: &str = ".lock";
 
-/// A persistent named host directory shared into guests by the engine.
+/// A persistent volume identity with a private host lock directory.
 #[derive(Clone, Debug)]
 pub struct Volume {
 	name:     String,
@@ -31,12 +30,12 @@ pub struct Volume {
 }
 
 impl Volume {
-	/// Validate a name and ensure its private host directory exists.
+	/// Validate a name and ensure its private lock directory exists.
 	pub fn new(name: &str) -> Result<Self> {
 		Self::new_in_home(crate::home::state_dir(), name)
 	}
 
-	/// Validate a name and ensure its private host directory exists under
+	/// Validate a name and ensure its private lock directory exists under
 	/// `home`.
 	pub fn new_in_home(home: impl AsRef<Path>, name: &str) -> Result<Self> {
 		validate_volume_name(name)?;
@@ -52,7 +51,7 @@ impl Volume {
 		&self.name
 	}
 
-	/// The private host directory backing this volume.
+	/// The private host directory containing this volume's writer lock.
 	pub fn path(&self) -> PathBuf {
 		self.host_dir.clone()
 	}
@@ -127,7 +126,8 @@ pub fn remove_volume(name: &str) -> Result<()> {
 /// Remove an unlocked volume directory from an explicit Vibemon home.
 pub fn remove_volume_in_home(home: impl AsRef<Path>, name: &str) -> Result<()> {
 	validate_volume_name(name)?;
-	let host_dir = home.as_ref().join("volumes").join(name);
+	let root = home.as_ref();
+	let host_dir = root.join("volumes").join(name);
 	match fs::symlink_metadata(&host_dir) {
 		Ok(_) => {},
 		Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -139,6 +139,21 @@ pub fn remove_volume_in_home(home: impl AsRef<Path>, name: &str) -> Result<()> {
 	let dir = open_volume_dir(&host_dir)?;
 	let lock_file = open_lock_file(&dir, name)?;
 	lock_exclusive_nonblocking(&lock_file, name)?;
+	let archive = root
+		.join("security")
+		.join("volumes")
+		.join(format!("{name}.venc"));
+	match fs::symlink_metadata(&archive) {
+		Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+			return Err(EngineError::invalid(format!(
+				"encrypted volume archive {} is not a regular file",
+				archive.display()
+			)));
+		},
+		Ok(_) => fs::remove_file(&archive)?,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+		Err(error) => return Err(error.into()),
+	}
 	fs::remove_dir_all(&host_dir)?;
 	Ok(())
 }

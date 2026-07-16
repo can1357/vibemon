@@ -6,16 +6,20 @@ pub mod assets;
 pub mod build;
 pub mod cas;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
 	collections::{BTreeMap, HashMap},
 	fs::{self, File},
+	hash::Hash,
 	io::{Read, Seek, SeekFrom},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
-	sync::{LazyLock, Mutex},
+	sync::{Arc, LazyLock},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -242,6 +246,85 @@ pub fn resolve_oci_reference(reference: &str, arch: Option<&str>) -> Result<Reso
 type PreparedImageCacheKey = (PathBuf, String, String);
 static PREPARED_IMAGES: LazyLock<Mutex<HashMap<PreparedImageCacheKey, PreparedImage>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
+static PREPARED_IMAGE_INSPECTIONS: LazyLock<
+	KeyedSingleflight<PreparedImageCacheKey, PreparedImage>,
+> = LazyLock::new(KeyedSingleflight::default);
+static TEMPLATE_MATERIALIZATIONS: LazyLock<KeyedSingleflight<PathBuf, CachedTemplate>> =
+	LazyLock::new(KeyedSingleflight::default);
+
+struct KeyedSingleflight<K, T> {
+	flights: Mutex<HashMap<K, Arc<SingleflightResult<T>>>>,
+}
+
+struct SingleflightResult<T> {
+	result:  Mutex<Option<Result<T>>>,
+	ready:   Condvar,
+	#[cfg(test)]
+	waiters: AtomicUsize,
+}
+
+impl<K, T> Default for KeyedSingleflight<K, T> {
+	fn default() -> Self {
+		Self { flights: Mutex::new(HashMap::new()) }
+	}
+}
+
+impl<K, T> KeyedSingleflight<K, T>
+where
+	K: Clone + Eq + Hash,
+	T: Clone,
+{
+	fn run(&self, key: K, produce: impl FnOnce() -> Result<T>) -> Result<T> {
+		let (flight, producer) = {
+			let mut flights = self.flights.lock();
+			if let Some(flight) = flights.get(&key) {
+				(Arc::clone(flight), false)
+			} else {
+				let flight = Arc::new(SingleflightResult {
+					result:               Mutex::new(None),
+					ready:                Condvar::new(),
+					#[cfg(test)]
+					waiters:              AtomicUsize::new(0),
+				});
+				flights.insert(key.clone(), Arc::clone(&flight));
+				(flight, true)
+			}
+		};
+		if producer {
+			let result = produce();
+			{
+				let mut completed = flight.result.lock();
+				*completed = Some(result.clone());
+			}
+			flight.ready.notify_all();
+			let mut flights = self.flights.lock();
+			if flights
+				.get(&key)
+				.is_some_and(|current| Arc::ptr_eq(current, &flight))
+			{
+				flights.remove(&key);
+			}
+			return result;
+		}
+		#[cfg(test)]
+		flight.waiters.fetch_add(1, Ordering::Relaxed);
+		let mut completed = flight.result.lock();
+		while completed.is_none() {
+			flight.ready.wait(&mut completed);
+		}
+		completed
+			.clone()
+			.ok_or_else(|| EngineError::engine("singleflight completed without a result"))?
+	}
+
+	#[cfg(test)]
+	fn waiter_count(&self, key: &K) -> usize {
+		let flights = self.flights.lock();
+		flights
+			.get(key)
+			.map_or(0, |flight| flight.waiters.load(Ordering::Relaxed))
+	}
+}
 
 /// Normalize an optional image reference, rejecting whitespace.
 pub fn parse_reference(reference: Option<&str>) -> Result<Option<String>> {
@@ -391,32 +474,10 @@ pub fn cached_template(
 	validate_template_request(request)?;
 	let prepared =
 		prepare_oci_image(request.image.as_deref(), request.dockerfile.as_deref(), &request.context)?;
-	let spec = prepared.spec.clone();
-	let image_digest = prepared.digest.clone();
 	let agent = ensure_agent(None)?;
 	let agent_digest = sha256_file(&agent)?;
-	let key = image_cache_key(&image_digest, request.disk_mb, &agent_digest);
-	let image_dir = crate::home::state_dir().join("images").join(key);
-	let rootfs_ext4 = image_dir.join("rootfs.ext4");
-	let spec_path = image_dir.join("spec.json");
-	fs::create_dir_all(&image_dir)?;
-
-	if !rootfs_ext4.is_file() {
-		let tmp = TempDir::new("vmon-image-")?;
-		let rootfs = tmp.path().join("rootfs");
-		fs::create_dir(&rootfs)?;
-		export_oci_image(&prepared, &rootfs, tmp.path())?;
-		inject_agent(&rootfs, &agent)?;
-		let tmp_ext4 = temp_file_in(&image_dir, ".rootfs.ext4.tmp-")?;
-		let build_result = mkfs_ext4(&rootfs, &tmp_ext4, request.disk_mb);
-		if build_result.is_ok() {
-			fs::rename(&tmp_ext4, &rootfs_ext4)?;
-		}
-		let _ = fs::remove_file(&tmp_ext4);
-		build_result?;
-	}
-	fs::write(&spec_path, serde_json::to_string_pretty(&spec)?)?;
-
+	let image_digest = prepared.digest.clone();
+	let image_key = image_cache_key(&image_digest, request.disk_mb, &agent_digest);
 	let tpl_name = template_name(
 		&image_digest,
 		request.disk_mb,
@@ -428,13 +489,68 @@ pub fn cached_template(
 		request.nic_slot,
 		request.tap_slot,
 	);
-	let tpl_dir = crate::home::state_dir().join("templates").join(&tpl_name);
+	let state_dir = crate::home::state_dir();
+	let tpl_dir = state_dir.join("templates").join(&tpl_name);
+	TEMPLATE_MATERIALIZATIONS.run(tpl_dir.clone(), || {
+		materialize_template(
+			booter,
+			request,
+			&prepared,
+			&agent,
+			&agent_digest,
+			&image_digest,
+			&image_key,
+			&tpl_name,
+			&state_dir,
+			tpl_dir,
+		)
+	})
+}
+
+#[expect(
+	clippy::too_many_arguments,
+	reason = "the request and prepared image retain their established shapes"
+)]
+fn materialize_template(
+	booter: &impl TemplateBooter,
+	request: &TemplateRequest,
+	prepared: &PreparedImage,
+	agent: &Path,
+	agent_digest: &str,
+	image_digest: &str,
+	image_key: &str,
+	tpl_name: &str,
+	state_dir: &Path,
+	tpl_dir: PathBuf,
+) -> Result<CachedTemplate> {
+	let spec = prepared.spec.clone();
+	let image_dir = state_dir.join("images").join(image_key);
+	let rootfs_ext4 = image_dir.join("rootfs.ext4");
+	let spec_path = image_dir.join("spec.json");
+	fs::create_dir_all(&image_dir)?;
+
+	if !rootfs_ext4.is_file() {
+		let tmp = TempDir::new("vmon-image-")?;
+		let rootfs = tmp.path().join("rootfs");
+		fs::create_dir(&rootfs)?;
+		export_oci_image(prepared, &rootfs, tmp.path())?;
+		inject_agent(&rootfs, agent)?;
+		let tmp_ext4 = temp_file_in(&image_dir, ".rootfs.ext4.tmp-")?;
+		let build_result = mkfs_ext4(&rootfs, &tmp_ext4, request.disk_mb);
+		if build_result.is_ok() {
+			fs::rename(&tmp_ext4, &rootfs_ext4)?;
+		}
+		let _ = fs::remove_file(&tmp_ext4);
+		build_result?;
+	}
+	fs::write(&spec_path, serde_json::to_string_pretty(&spec)?)?;
+
 	let mut template = CachedTemplate {
-		name:         tpl_name.clone(),
+		name:         tpl_name.to_owned(),
 		snapshot_dir: tpl_dir.clone(),
 		rootfs:       rootfs_ext4.clone(),
 		spec:         spec.clone(),
-		image_digest: image_digest.clone(),
+		image_digest: image_digest.to_owned(),
 		disk_mb:      request.disk_mb,
 		memory:       request.memory,
 		cpus:         request.cpus,
@@ -464,8 +580,8 @@ pub fn cached_template(
 	if tpl_dir.exists() {
 		fs::remove_dir_all(&tpl_dir)?;
 	}
-	let vm_name = template_vm_name(&tpl_name);
-	let slot_void = crate::home::state_dir().join("slot-void");
+	let vm_name = template_vm_name(tpl_name);
+	let slot_void = state_dir.join("slot-void");
 	fs::create_dir_all(&slot_void)?;
 	let volumes = (0..request.fs_slots)
 		.map(|i| TemplateVolume {
@@ -476,10 +592,10 @@ pub fn cached_template(
 		.collect();
 	let boot_spec = TemplateSpec {
 		vm_name,
-		template_name: tpl_name,
+		template_name: tpl_name.to_owned(),
 		template_dir: tpl_dir.clone(),
 		rootfs_ext4,
-		snapshot_root: crate::home::state_dir().join("templates"),
+		snapshot_root: state_dir.join("templates"),
 		image: spec.reference.clone(),
 		timeout: request.timeout,
 		memory: request.memory,
@@ -495,8 +611,8 @@ pub fn cached_template(
 	write_marker(
 		&marker,
 		&spec.reference,
-		&image_digest,
-		&agent_digest,
+		image_digest,
+		agent_digest,
 		request.disk_mb,
 		&kernel_sha,
 		request.fs_slots,
@@ -722,15 +838,23 @@ fn prepare_oci_image(
 	let arch = skopeo_arch(None);
 	if !built && is_registry_reference(&reference) {
 		let key = (crate::home::state_dir(), reference.clone(), arch.clone());
-		let mut prepared = PREPARED_IMAGES
-			.lock()
-			.map_err(|_| EngineError::engine("prepared image cache lock poisoned"))?;
-		if let Some(image) = prepared.get(&key) {
-			return Ok(image.clone());
+		{
+			let prepared = PREPARED_IMAGES.lock();
+			if let Some(image) = prepared.get(&key) {
+				return Ok(image.clone());
+			}
 		}
-		let image = inspect_prepared_image(reference, tools, arch)?;
-		prepared.insert(key, image.clone());
-		return Ok(image);
+		return PREPARED_IMAGE_INSPECTIONS.run(key.clone(), || {
+			let prepared = PREPARED_IMAGES.lock();
+			if let Some(image) = prepared.get(&key) {
+				return Ok(image.clone());
+			}
+			drop(prepared);
+			let image = inspect_prepared_image(reference, tools, arch)?;
+			let mut prepared = PREPARED_IMAGES.lock();
+			prepared.insert(key, image.clone());
+			Ok(image)
+		});
 	}
 	inspect_prepared_image(reference, tools, arch)
 }
@@ -752,7 +876,8 @@ fn inspect_prepared_image(
 	})
 }
 
-fn is_registry_reference(reference: &str) -> bool {
+/// Return whether a reference pulls from a registry rather than a host-local transport.
+pub fn is_registry_reference(reference: &str) -> bool {
 	reference.starts_with("docker://")
 		|| !IMAGE_TRANSPORT_PREFIXES
 			.iter()
@@ -1462,7 +1587,149 @@ impl Drop for TempDir {
 
 #[cfg(test)]
 mod tests {
+	use std::{
+		sync::{Arc, Barrier, mpsc},
+		thread,
+		time::{Duration, Instant},
+	};
+
 	use super::*;
+
+	fn wait_for_waiters(flights: &KeyedSingleflight<String, usize>, key: &str, expected: usize) {
+		let deadline = Instant::now() + Duration::from_secs(1);
+		while flights.waiter_count(&key.to_owned()) < expected {
+			assert!(Instant::now() < deadline, "waiters did not join the in-flight request");
+			thread::yield_now();
+		}
+	}
+
+	#[test]
+	fn same_key_singleflight_shares_one_materialization() {
+		const REQUESTS: usize = 4;
+		let flights = Arc::new(KeyedSingleflight::<String, usize>::default());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let start = Arc::new(Barrier::new(REQUESTS));
+		let (started_tx, started_rx) = mpsc::channel();
+		let (release_tx, release_rx) = mpsc::channel();
+		let release_rx = Arc::new(Mutex::new(release_rx));
+		let mut workers = Vec::new();
+
+		for _ in 0..REQUESTS {
+			let flights = Arc::clone(&flights);
+			let calls = Arc::clone(&calls);
+			let start = Arc::clone(&start);
+			let started_tx = started_tx.clone();
+			let release_rx = Arc::clone(&release_rx);
+			workers.push(thread::spawn(move || {
+				start.wait();
+				flights.run("same".to_owned(), || {
+					calls.fetch_add(1, Ordering::Relaxed);
+					started_tx.send(()).unwrap();
+					release_rx.lock().recv().unwrap();
+					Ok(42)
+				})
+			}));
+		}
+		drop(started_tx);
+
+		started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+		wait_for_waiters(&flights, "same", REQUESTS - 1);
+		release_tx.send(()).unwrap();
+		for worker in workers {
+			assert_eq!(worker.join().unwrap().unwrap(), 42);
+		}
+		assert_eq!(calls.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn independent_singleflight_keys_materialize_in_parallel() {
+		let flights = Arc::new(KeyedSingleflight::<String, usize>::default());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let start = Arc::new(Barrier::new(2));
+		let (started_tx, started_rx) = mpsc::channel();
+		let (release_tx, release_rx) = mpsc::channel();
+		let release_rx = Arc::new(Mutex::new(release_rx));
+		let mut workers = Vec::new();
+
+		for (key, result) in [("first", 1), ("second", 2)] {
+			let flights = Arc::clone(&flights);
+			let calls = Arc::clone(&calls);
+			let start = Arc::clone(&start);
+			let started_tx = started_tx.clone();
+			let release_rx = Arc::clone(&release_rx);
+			workers.push(thread::spawn(move || {
+				start.wait();
+				flights.run(key.to_owned(), || {
+					calls.fetch_add(1, Ordering::Relaxed);
+					started_tx.send(key).unwrap();
+					release_rx.lock().recv().unwrap();
+					Ok(result)
+				})
+			}));
+		}
+		drop(started_tx);
+
+		let mut started = vec![
+			started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+			started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+		];
+		started.sort_unstable();
+		assert_eq!(started, ["first", "second"]);
+		release_tx.send(()).unwrap();
+		release_tx.send(()).unwrap();
+		for worker in workers {
+			worker.join().unwrap().unwrap();
+		}
+		assert_eq!(calls.load(Ordering::Relaxed), 2);
+	}
+
+	#[test]
+	fn failed_singleflight_wakes_waiters_and_allows_retry() {
+		let flights = Arc::new(KeyedSingleflight::<String, usize>::default());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let start = Arc::new(Barrier::new(2));
+		let (started_tx, started_rx) = mpsc::channel();
+		let (release_tx, release_rx) = mpsc::channel();
+		let release_rx = Arc::new(Mutex::new(release_rx));
+		let mut workers = Vec::new();
+
+		for _ in 0..2 {
+			let flights = Arc::clone(&flights);
+			let calls = Arc::clone(&calls);
+			let start = Arc::clone(&start);
+			let started_tx = started_tx.clone();
+			let release_rx = Arc::clone(&release_rx);
+			workers.push(thread::spawn(move || {
+				start.wait();
+				flights.run("failing".to_owned(), || {
+					calls.fetch_add(1, Ordering::Relaxed);
+					started_tx.send(()).unwrap();
+					release_rx.lock().recv().unwrap();
+					Err(EngineError::engine("materialization failed"))
+				})
+			}));
+		}
+		drop(started_tx);
+
+		started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+		wait_for_waiters(&flights, "failing", 1);
+		release_tx.send(()).unwrap();
+		for worker in workers {
+			assert_eq!(worker.join().unwrap().unwrap_err().message, "materialization failed");
+		}
+		assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+		assert_eq!(
+			flights
+				.run("failing".to_owned(), || {
+					calls.fetch_add(1, Ordering::Relaxed);
+					Ok(99)
+				})
+				.unwrap(),
+			99
+		);
+		assert_eq!(calls.load(Ordering::Relaxed), 2);
+	}
 
 	#[test]
 	fn parse_reference_rejects_empty_and_whitespace() {
