@@ -40,6 +40,16 @@ class SandboxServiceStub:
                 request_serializer=vmon_dot_v1_dot_api__pb2.CreateSandboxRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
                 _registered_method=True)
+        self.BatchCreate = channel.stream_stream(
+                '/vmon.v1.SandboxService/BatchCreate',
+                request_serializer=vmon_dot_v1_dot_api__pb2.BatchCreateRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.BatchCreateResponse.FromString,
+                _registered_method=True)
+        self.Watch = channel.unary_stream(
+                '/vmon.v1.SandboxService/Watch',
+                request_serializer=vmon_dot_v1_dot_api__pb2.WatchSandboxRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
         self.List = channel.unary_unary(
                 '/vmon.v1.SandboxService/List',
                 request_serializer=vmon_dot_v1_dot_api__pb2.ListSandboxesRequest.SerializeToString,
@@ -214,6 +224,28 @@ class SandboxServiceServicer:
         - `invalid` (INVALID_ARGUMENT): The create spec is invalid or malformed.
         - `busy` (ABORTED): Required resources are locked.
         - `engine` (UNAVAILABLE): Hypervisor allocation or creation failed.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def BatchCreate(self, request_iterator, context):
+        """Creates sandboxes over one bidirectional stream. Each request is admitted
+        and placed independently; results stream back as they complete, tagged by
+        `seq` (responses may arrive out of order). Per-item failures ride the
+        response `error` — the stream itself only fails on transport/auth errors.
+        With `no_wait`, a result reports admission; readiness arrives via `Watch`.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Watch(self, request, context):
+        """Streams sandbox lifecycle transitions as engine event documents
+        (`{id, name, status, ...}`), starting with the current view when the
+        sandbox is already registered. Ends after the sandbox reports `running`
+        when `until_ready` is set, otherwise after any terminal state
+        (`stopped`, `terminated`, `failed`).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -545,6 +577,16 @@ def add_SandboxServiceServicer_to_server(servicer, server):
                     request_deserializer=vmon_dot_v1_dot_api__pb2.CreateSandboxRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
             ),
+            'BatchCreate': grpc.stream_stream_rpc_method_handler(
+                    servicer.BatchCreate,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.BatchCreateRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.BatchCreateResponse.SerializeToString,
+            ),
+            'Watch': grpc.unary_stream_rpc_method_handler(
+                    servicer.Watch,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.WatchSandboxRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
             'List': grpc.unary_unary_rpc_method_handler(
                     servicer.List,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.ListSandboxesRequest.FromString,
@@ -733,6 +775,60 @@ class SandboxService:
             target,
             '/vmon.v1.SandboxService/Create',
             vmon_dot_v1_dot_api__pb2.CreateSandboxRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BatchCreate(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/vmon.v1.SandboxService/BatchCreate',
+            vmon_dot_v1_dot_api__pb2.BatchCreateRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.BatchCreateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Watch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vmon.v1.SandboxService/Watch',
+            vmon_dot_v1_dot_api__pb2.WatchSandboxRequest.SerializeToString,
             vmon_dot_v1_dot_api__pb2.JsonView.FromString,
             options,
             channel_credentials,

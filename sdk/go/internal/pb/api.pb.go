@@ -1213,7 +1213,11 @@ func (x *SandboxRef) GetId() string {
 type CreateSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// SandboxCreate JSON document payload — matches the former REST schema.
-	SpecJson      string `protobuf:"bytes,1,opt,name=spec_json,json=specJson,proto3" json:"spec_json,omitempty"`
+	SpecJson string `protobuf:"bytes,1,opt,name=spec_json,json=specJson,proto3" json:"spec_json,omitempty"`
+	// Return as soon as the create is admitted and its identity is assigned
+	// (status `starting`), instead of blocking until the VM is ready. Boot
+	// progress, readiness, and failure arrive via `Watch`.
+	NoWait        bool `protobuf:"varint,2,opt,name=no_wait,json=noWait,proto3" json:"no_wait,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1255,6 +1259,274 @@ func (x *CreateSandboxRequest) GetSpecJson() string {
 	return ""
 }
 
+func (x *CreateSandboxRequest) GetNoWait() bool {
+	if x != nil {
+		return x.NoWait
+	}
+	return false
+}
+
+// BatchCreateRequest is one sequenced create in a BatchCreate stream.
+type BatchCreateRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Client-chosen correlation tag echoed on the matching response.
+	Seq uint64 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	// The create payload; `no_wait` applies per item.
+	Create        *CreateSandboxRequest `protobuf:"bytes,2,opt,name=create,proto3" json:"create,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchCreateRequest) Reset() {
+	*x = BatchCreateRequest{}
+	mi := &file_vmon_v1_api_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchCreateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchCreateRequest) ProtoMessage() {}
+
+func (x *BatchCreateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchCreateRequest.ProtoReflect.Descriptor instead.
+func (*BatchCreateRequest) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *BatchCreateRequest) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *BatchCreateRequest) GetCreate() *CreateSandboxRequest {
+	if x != nil {
+		return x.Create
+	}
+	return nil
+}
+
+// BatchCreateError carries one failed BatchCreate item's stable error.
+type BatchCreateError struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stable vmond error code (mirrors `vmon-code` metadata on unary RPCs).
+	Code string `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
+	// Human-readable failure description.
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchCreateError) Reset() {
+	*x = BatchCreateError{}
+	mi := &file_vmon_v1_api_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchCreateError) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchCreateError) ProtoMessage() {}
+
+func (x *BatchCreateError) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchCreateError.ProtoReflect.Descriptor instead.
+func (*BatchCreateError) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *BatchCreateError) GetCode() string {
+	if x != nil {
+		return x.Code
+	}
+	return ""
+}
+
+func (x *BatchCreateError) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// BatchCreateResponse reports one completed BatchCreate item.
+type BatchCreateResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Correlation tag from the matching BatchCreateRequest.
+	Seq uint64 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	// Item outcome: the sandbox view on success, the stable error otherwise.
+	//
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*BatchCreateResponse_Json
+	//	*BatchCreateResponse_Error
+	Outcome       isBatchCreateResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchCreateResponse) Reset() {
+	*x = BatchCreateResponse{}
+	mi := &file_vmon_v1_api_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchCreateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchCreateResponse) ProtoMessage() {}
+
+func (x *BatchCreateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchCreateResponse.ProtoReflect.Descriptor instead.
+func (*BatchCreateResponse) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BatchCreateResponse) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *BatchCreateResponse) GetOutcome() isBatchCreateResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *BatchCreateResponse) GetJson() string {
+	if x != nil {
+		if x, ok := x.Outcome.(*BatchCreateResponse_Json); ok {
+			return x.Json
+		}
+	}
+	return ""
+}
+
+func (x *BatchCreateResponse) GetError() *BatchCreateError {
+	if x != nil {
+		if x, ok := x.Outcome.(*BatchCreateResponse_Error); ok {
+			return x.Error
+		}
+	}
+	return nil
+}
+
+type isBatchCreateResponse_Outcome interface {
+	isBatchCreateResponse_Outcome()
+}
+
+type BatchCreateResponse_Json struct {
+	// JSON-serialized sandbox view (the admitted view when `no_wait`).
+	Json string `protobuf:"bytes,2,opt,name=json,proto3,oneof"`
+}
+
+type BatchCreateResponse_Error struct {
+	// Stable failure for this item; the stream stays open for others.
+	Error *BatchCreateError `protobuf:"bytes,3,opt,name=error,proto3,oneof"`
+}
+
+func (*BatchCreateResponse_Json) isBatchCreateResponse_Outcome() {}
+
+func (*BatchCreateResponse_Error) isBatchCreateResponse_Outcome() {}
+
+// WatchSandboxRequest selects a sandbox lifecycle event stream.
+type WatchSandboxRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The unique identifier of the target sandbox.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// End the stream once the sandbox reports `running`.
+	UntilReady    bool `protobuf:"varint,2,opt,name=until_ready,json=untilReady,proto3" json:"until_ready,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchSandboxRequest) Reset() {
+	*x = WatchSandboxRequest{}
+	mi := &file_vmon_v1_api_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchSandboxRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchSandboxRequest) ProtoMessage() {}
+
+func (x *WatchSandboxRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vmon_v1_api_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchSandboxRequest.ProtoReflect.Descriptor instead.
+func (*WatchSandboxRequest) Descriptor() ([]byte, []int) {
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *WatchSandboxRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *WatchSandboxRequest) GetUntilReady() bool {
+	if x != nil {
+		return x.UntilReady
+	}
+	return false
+}
+
 // ListSandboxesRequest specifies filters for listing sandbox instances.
 type ListSandboxesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1266,7 +1538,7 @@ type ListSandboxesRequest struct {
 
 func (x *ListSandboxesRequest) Reset() {
 	*x = ListSandboxesRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[4]
+	mi := &file_vmon_v1_api_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1278,7 +1550,7 @@ func (x *ListSandboxesRequest) String() string {
 func (*ListSandboxesRequest) ProtoMessage() {}
 
 func (x *ListSandboxesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[4]
+	mi := &file_vmon_v1_api_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1291,7 +1563,7 @@ func (x *ListSandboxesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSandboxesRequest.ProtoReflect.Descriptor instead.
 func (*ListSandboxesRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{4}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListSandboxesRequest) GetTags() []string {
@@ -1312,7 +1584,7 @@ type ListSandboxesResponse struct {
 
 func (x *ListSandboxesResponse) Reset() {
 	*x = ListSandboxesResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[5]
+	mi := &file_vmon_v1_api_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1324,7 +1596,7 @@ func (x *ListSandboxesResponse) String() string {
 func (*ListSandboxesResponse) ProtoMessage() {}
 
 func (x *ListSandboxesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[5]
+	mi := &file_vmon_v1_api_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1337,7 +1609,7 @@ func (x *ListSandboxesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSandboxesResponse.ProtoReflect.Descriptor instead.
 func (*ListSandboxesResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{5}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListSandboxesResponse) GetSandboxesJson() []string {
@@ -1360,7 +1632,7 @@ type StopSandboxRequest struct {
 
 func (x *StopSandboxRequest) Reset() {
 	*x = StopSandboxRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[6]
+	mi := &file_vmon_v1_api_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1372,7 +1644,7 @@ func (x *StopSandboxRequest) String() string {
 func (*StopSandboxRequest) ProtoMessage() {}
 
 func (x *StopSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[6]
+	mi := &file_vmon_v1_api_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1385,7 +1657,7 @@ func (x *StopSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopSandboxRequest.ProtoReflect.Descriptor instead.
 func (*StopSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{6}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *StopSandboxRequest) GetId() string {
@@ -1413,7 +1685,7 @@ type RollbackSandboxRequest struct {
 
 func (x *RollbackSandboxRequest) Reset() {
 	*x = RollbackSandboxRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[7]
+	mi := &file_vmon_v1_api_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1425,7 +1697,7 @@ func (x *RollbackSandboxRequest) String() string {
 func (*RollbackSandboxRequest) ProtoMessage() {}
 
 func (x *RollbackSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[7]
+	mi := &file_vmon_v1_api_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1438,7 +1710,7 @@ func (x *RollbackSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackSandboxRequest.ProtoReflect.Descriptor instead.
 func (*RollbackSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{7}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RollbackSandboxRequest) GetId() string {
@@ -1468,7 +1740,7 @@ type ExtendSandboxRequest struct {
 
 func (x *ExtendSandboxRequest) Reset() {
 	*x = ExtendSandboxRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[8]
+	mi := &file_vmon_v1_api_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1480,7 +1752,7 @@ func (x *ExtendSandboxRequest) String() string {
 func (*ExtendSandboxRequest) ProtoMessage() {}
 
 func (x *ExtendSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[8]
+	mi := &file_vmon_v1_api_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1493,7 +1765,7 @@ func (x *ExtendSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtendSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ExtendSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{8}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ExtendSandboxRequest) GetId() string {
@@ -1525,7 +1797,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[9]
+	mi := &file_vmon_v1_api_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1537,7 +1809,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[9]
+	mi := &file_vmon_v1_api_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1550,7 +1822,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{9}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *LogsRequest) GetId() string {
@@ -1585,7 +1857,7 @@ type LogChunk struct {
 
 func (x *LogChunk) Reset() {
 	*x = LogChunk{}
-	mi := &file_vmon_v1_api_proto_msgTypes[10]
+	mi := &file_vmon_v1_api_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1597,7 +1869,7 @@ func (x *LogChunk) String() string {
 func (*LogChunk) ProtoMessage() {}
 
 func (x *LogChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[10]
+	mi := &file_vmon_v1_api_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1610,7 +1882,7 @@ func (x *LogChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogChunk.ProtoReflect.Descriptor instead.
 func (*LogChunk) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{10}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *LogChunk) GetData() []byte {
@@ -1643,7 +1915,7 @@ type ExecStart struct {
 
 func (x *ExecStart) Reset() {
 	*x = ExecStart{}
-	mi := &file_vmon_v1_api_proto_msgTypes[11]
+	mi := &file_vmon_v1_api_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1655,7 +1927,7 @@ func (x *ExecStart) String() string {
 func (*ExecStart) ProtoMessage() {}
 
 func (x *ExecStart) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[11]
+	mi := &file_vmon_v1_api_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1668,7 +1940,7 @@ func (x *ExecStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecStart.ProtoReflect.Descriptor instead.
 func (*ExecStart) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{11}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ExecStart) GetCmd() []string {
@@ -1726,7 +1998,7 @@ type ExecCaptureRequest struct {
 
 func (x *ExecCaptureRequest) Reset() {
 	*x = ExecCaptureRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[12]
+	mi := &file_vmon_v1_api_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1738,7 +2010,7 @@ func (x *ExecCaptureRequest) String() string {
 func (*ExecCaptureRequest) ProtoMessage() {}
 
 func (x *ExecCaptureRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[12]
+	mi := &file_vmon_v1_api_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1751,7 +2023,7 @@ func (x *ExecCaptureRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecCaptureRequest.ProtoReflect.Descriptor instead.
 func (*ExecCaptureRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{12}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ExecCaptureRequest) GetId() string {
@@ -1785,7 +2057,7 @@ type ExecCaptureResponse struct {
 
 func (x *ExecCaptureResponse) Reset() {
 	*x = ExecCaptureResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[13]
+	mi := &file_vmon_v1_api_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1797,7 +2069,7 @@ func (x *ExecCaptureResponse) String() string {
 func (*ExecCaptureResponse) ProtoMessage() {}
 
 func (x *ExecCaptureResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[13]
+	mi := &file_vmon_v1_api_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1810,7 +2082,7 @@ func (x *ExecCaptureResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecCaptureResponse.ProtoReflect.Descriptor instead.
 func (*ExecCaptureResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{13}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ExecCaptureResponse) GetCode() int64 {
@@ -1860,7 +2132,7 @@ type ExecInput struct {
 
 func (x *ExecInput) Reset() {
 	*x = ExecInput{}
-	mi := &file_vmon_v1_api_proto_msgTypes[14]
+	mi := &file_vmon_v1_api_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1872,7 +2144,7 @@ func (x *ExecInput) String() string {
 func (*ExecInput) ProtoMessage() {}
 
 func (x *ExecInput) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[14]
+	mi := &file_vmon_v1_api_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1885,7 +2157,7 @@ func (x *ExecInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecInput.ProtoReflect.Descriptor instead.
 func (*ExecInput) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{14}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ExecInput) GetInput() isExecInput_Input {
@@ -1997,7 +2269,7 @@ type ExecOutput struct {
 
 func (x *ExecOutput) Reset() {
 	*x = ExecOutput{}
-	mi := &file_vmon_v1_api_proto_msgTypes[15]
+	mi := &file_vmon_v1_api_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2009,7 +2281,7 @@ func (x *ExecOutput) String() string {
 func (*ExecOutput) ProtoMessage() {}
 
 func (x *ExecOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[15]
+	mi := &file_vmon_v1_api_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2022,7 +2294,7 @@ func (x *ExecOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecOutput.ProtoReflect.Descriptor instead.
 func (*ExecOutput) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{15}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ExecOutput) GetOutput() isExecOutput_Output {
@@ -2097,7 +2369,7 @@ type FilePathRequest struct {
 
 func (x *FilePathRequest) Reset() {
 	*x = FilePathRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[16]
+	mi := &file_vmon_v1_api_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2109,7 +2381,7 @@ func (x *FilePathRequest) String() string {
 func (*FilePathRequest) ProtoMessage() {}
 
 func (x *FilePathRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[16]
+	mi := &file_vmon_v1_api_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2122,7 +2394,7 @@ func (x *FilePathRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FilePathRequest.ProtoReflect.Descriptor instead.
 func (*FilePathRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{16}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *FilePathRequest) GetId() string {
@@ -2150,7 +2422,7 @@ type FileContent struct {
 
 func (x *FileContent) Reset() {
 	*x = FileContent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[17]
+	mi := &file_vmon_v1_api_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2162,7 +2434,7 @@ func (x *FileContent) String() string {
 func (*FileContent) ProtoMessage() {}
 
 func (x *FileContent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[17]
+	mi := &file_vmon_v1_api_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2175,7 +2447,7 @@ func (x *FileContent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileContent.ProtoReflect.Descriptor instead.
 func (*FileContent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{17}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *FileContent) GetData() []byte {
@@ -2200,7 +2472,7 @@ type FileWriteRequest struct {
 
 func (x *FileWriteRequest) Reset() {
 	*x = FileWriteRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[18]
+	mi := &file_vmon_v1_api_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2212,7 +2484,7 @@ func (x *FileWriteRequest) String() string {
 func (*FileWriteRequest) ProtoMessage() {}
 
 func (x *FileWriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[18]
+	mi := &file_vmon_v1_api_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2225,7 +2497,7 @@ func (x *FileWriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileWriteRequest.ProtoReflect.Descriptor instead.
 func (*FileWriteRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{18}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *FileWriteRequest) GetId() string {
@@ -2264,7 +2536,7 @@ type FileDeleteRequest struct {
 
 func (x *FileDeleteRequest) Reset() {
 	*x = FileDeleteRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[19]
+	mi := &file_vmon_v1_api_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2276,7 +2548,7 @@ func (x *FileDeleteRequest) String() string {
 func (*FileDeleteRequest) ProtoMessage() {}
 
 func (x *FileDeleteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[19]
+	mi := &file_vmon_v1_api_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2289,7 +2561,7 @@ func (x *FileDeleteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileDeleteRequest.ProtoReflect.Descriptor instead.
 func (*FileDeleteRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{19}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *FileDeleteRequest) GetId() string {
@@ -2325,7 +2597,7 @@ type StringList struct {
 
 func (x *StringList) Reset() {
 	*x = StringList{}
-	mi := &file_vmon_v1_api_proto_msgTypes[20]
+	mi := &file_vmon_v1_api_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2337,7 +2609,7 @@ func (x *StringList) String() string {
 func (*StringList) ProtoMessage() {}
 
 func (x *StringList) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[20]
+	mi := &file_vmon_v1_api_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2350,7 +2622,7 @@ func (x *StringList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StringList.ProtoReflect.Descriptor instead.
 func (*StringList) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{20}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *StringList) GetValues() []string {
@@ -2377,7 +2649,7 @@ type NetworkSetRequest struct {
 
 func (x *NetworkSetRequest) Reset() {
 	*x = NetworkSetRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[21]
+	mi := &file_vmon_v1_api_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2389,7 +2661,7 @@ func (x *NetworkSetRequest) String() string {
 func (*NetworkSetRequest) ProtoMessage() {}
 
 func (x *NetworkSetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[21]
+	mi := &file_vmon_v1_api_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2402,7 +2674,7 @@ func (x *NetworkSetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkSetRequest.ProtoReflect.Descriptor instead.
 func (*NetworkSetRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{21}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *NetworkSetRequest) GetId() string {
@@ -2446,7 +2718,7 @@ type MigrateRequest struct {
 
 func (x *MigrateRequest) Reset() {
 	*x = MigrateRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[22]
+	mi := &file_vmon_v1_api_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2458,7 +2730,7 @@ func (x *MigrateRequest) String() string {
 func (*MigrateRequest) ProtoMessage() {}
 
 func (x *MigrateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[22]
+	mi := &file_vmon_v1_api_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2471,7 +2743,7 @@ func (x *MigrateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateRequest.ProtoReflect.Descriptor instead.
 func (*MigrateRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{22}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *MigrateRequest) GetId() string {
@@ -2503,7 +2775,7 @@ type SnapshotRequest struct {
 
 func (x *SnapshotRequest) Reset() {
 	*x = SnapshotRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[23]
+	mi := &file_vmon_v1_api_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2515,7 +2787,7 @@ func (x *SnapshotRequest) String() string {
 func (*SnapshotRequest) ProtoMessage() {}
 
 func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[23]
+	mi := &file_vmon_v1_api_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2528,7 +2800,7 @@ func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{23}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SnapshotRequest) GetId() string {
@@ -2565,7 +2837,7 @@ type SnapshotFsRequest struct {
 
 func (x *SnapshotFsRequest) Reset() {
 	*x = SnapshotFsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[24]
+	mi := &file_vmon_v1_api_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2577,7 +2849,7 @@ func (x *SnapshotFsRequest) String() string {
 func (*SnapshotFsRequest) ProtoMessage() {}
 
 func (x *SnapshotFsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[24]
+	mi := &file_vmon_v1_api_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2590,7 +2862,7 @@ func (x *SnapshotFsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotFsRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotFsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{24}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *SnapshotFsRequest) GetId() string {
@@ -2616,7 +2888,7 @@ type ListSnapshotsRequest struct {
 
 func (x *ListSnapshotsRequest) Reset() {
 	*x = ListSnapshotsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[25]
+	mi := &file_vmon_v1_api_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2628,7 +2900,7 @@ func (x *ListSnapshotsRequest) String() string {
 func (*ListSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[25]
+	mi := &file_vmon_v1_api_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2641,7 +2913,7 @@ func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{25}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{29}
 }
 
 // SnapshotList wraps the list of registered snapshots.
@@ -2655,7 +2927,7 @@ type SnapshotList struct {
 
 func (x *SnapshotList) Reset() {
 	*x = SnapshotList{}
-	mi := &file_vmon_v1_api_proto_msgTypes[26]
+	mi := &file_vmon_v1_api_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2667,7 +2939,7 @@ func (x *SnapshotList) String() string {
 func (*SnapshotList) ProtoMessage() {}
 
 func (x *SnapshotList) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[26]
+	mi := &file_vmon_v1_api_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2680,7 +2952,7 @@ func (x *SnapshotList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotList.ProtoReflect.Descriptor instead.
 func (*SnapshotList) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{26}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *SnapshotList) GetSnapshots() []string {
@@ -2700,7 +2972,7 @@ type SnapshotRef struct {
 
 func (x *SnapshotRef) Reset() {
 	*x = SnapshotRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[27]
+	mi := &file_vmon_v1_api_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2712,7 +2984,7 @@ func (x *SnapshotRef) String() string {
 func (*SnapshotRef) ProtoMessage() {}
 
 func (x *SnapshotRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[27]
+	mi := &file_vmon_v1_api_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2725,7 +2997,7 @@ func (x *SnapshotRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRef.ProtoReflect.Descriptor instead.
 func (*SnapshotRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{27}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SnapshotRef) GetName() string {
@@ -2752,7 +3024,7 @@ type RecoveryPoint struct {
 
 func (x *RecoveryPoint) Reset() {
 	*x = RecoveryPoint{}
-	mi := &file_vmon_v1_api_proto_msgTypes[28]
+	mi := &file_vmon_v1_api_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2764,7 +3036,7 @@ func (x *RecoveryPoint) String() string {
 func (*RecoveryPoint) ProtoMessage() {}
 
 func (x *RecoveryPoint) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[28]
+	mi := &file_vmon_v1_api_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2777,7 +3049,7 @@ func (x *RecoveryPoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryPoint.ProtoReflect.Descriptor instead.
 func (*RecoveryPoint) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{28}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RecoveryPoint) GetName() string {
@@ -2818,7 +3090,7 @@ type RecoveryPointList struct {
 
 func (x *RecoveryPointList) Reset() {
 	*x = RecoveryPointList{}
-	mi := &file_vmon_v1_api_proto_msgTypes[29]
+	mi := &file_vmon_v1_api_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2830,7 +3102,7 @@ func (x *RecoveryPointList) String() string {
 func (*RecoveryPointList) ProtoMessage() {}
 
 func (x *RecoveryPointList) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[29]
+	mi := &file_vmon_v1_api_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2843,7 +3115,7 @@ func (x *RecoveryPointList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryPointList.ProtoReflect.Descriptor instead.
 func (*RecoveryPointList) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{29}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *RecoveryPointList) GetPoints() []*RecoveryPoint {
@@ -2864,7 +3136,7 @@ type ListCredentialsRequest struct {
 
 func (x *ListCredentialsRequest) Reset() {
 	*x = ListCredentialsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[30]
+	mi := &file_vmon_v1_api_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2876,7 +3148,7 @@ func (x *ListCredentialsRequest) String() string {
 func (*ListCredentialsRequest) ProtoMessage() {}
 
 func (x *ListCredentialsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[30]
+	mi := &file_vmon_v1_api_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2889,7 +3161,7 @@ func (x *ListCredentialsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCredentialsRequest.ProtoReflect.Descriptor instead.
 func (*ListCredentialsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{30}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListCredentialsRequest) GetTenant() string {
@@ -2910,7 +3182,7 @@ type CredentialHeader struct {
 
 func (x *CredentialHeader) Reset() {
 	*x = CredentialHeader{}
-	mi := &file_vmon_v1_api_proto_msgTypes[31]
+	mi := &file_vmon_v1_api_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2922,7 +3194,7 @@ func (x *CredentialHeader) String() string {
 func (*CredentialHeader) ProtoMessage() {}
 
 func (x *CredentialHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[31]
+	mi := &file_vmon_v1_api_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2935,7 +3207,7 @@ func (x *CredentialHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialHeader.ProtoReflect.Descriptor instead.
 func (*CredentialHeader) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{31}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *CredentialHeader) GetName() string {
@@ -2968,7 +3240,7 @@ type PutCredentialRequest struct {
 
 func (x *PutCredentialRequest) Reset() {
 	*x = PutCredentialRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[32]
+	mi := &file_vmon_v1_api_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2980,7 +3252,7 @@ func (x *PutCredentialRequest) String() string {
 func (*PutCredentialRequest) ProtoMessage() {}
 
 func (x *PutCredentialRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[32]
+	mi := &file_vmon_v1_api_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2993,7 +3265,7 @@ func (x *PutCredentialRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutCredentialRequest.ProtoReflect.Descriptor instead.
 func (*PutCredentialRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{32}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *PutCredentialRequest) GetName() string {
@@ -3048,7 +3320,7 @@ type CredentialRef struct {
 
 func (x *CredentialRef) Reset() {
 	*x = CredentialRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[33]
+	mi := &file_vmon_v1_api_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3060,7 +3332,7 @@ func (x *CredentialRef) String() string {
 func (*CredentialRef) ProtoMessage() {}
 
 func (x *CredentialRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[33]
+	mi := &file_vmon_v1_api_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3073,7 +3345,7 @@ func (x *CredentialRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialRef.ProtoReflect.Descriptor instead.
 func (*CredentialRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{33}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *CredentialRef) GetName() string {
@@ -3095,7 +3367,7 @@ type DeleteCredentialRequest struct {
 
 func (x *DeleteCredentialRequest) Reset() {
 	*x = DeleteCredentialRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[34]
+	mi := &file_vmon_v1_api_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3107,7 +3379,7 @@ func (x *DeleteCredentialRequest) String() string {
 func (*DeleteCredentialRequest) ProtoMessage() {}
 
 func (x *DeleteCredentialRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[34]
+	mi := &file_vmon_v1_api_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3120,7 +3392,7 @@ func (x *DeleteCredentialRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteCredentialRequest.ProtoReflect.Descriptor instead.
 func (*DeleteCredentialRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{34}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *DeleteCredentialRequest) GetCredential() *CredentialRef {
@@ -3152,7 +3424,7 @@ type CredentialRecord struct {
 
 func (x *CredentialRecord) Reset() {
 	*x = CredentialRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[35]
+	mi := &file_vmon_v1_api_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3164,7 +3436,7 @@ func (x *CredentialRecord) String() string {
 func (*CredentialRecord) ProtoMessage() {}
 
 func (x *CredentialRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[35]
+	mi := &file_vmon_v1_api_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3177,7 +3449,7 @@ func (x *CredentialRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialRecord.ProtoReflect.Descriptor instead.
 func (*CredentialRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{35}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *CredentialRecord) GetName() string {
@@ -3232,7 +3504,7 @@ type CredentialList struct {
 
 func (x *CredentialList) Reset() {
 	*x = CredentialList{}
-	mi := &file_vmon_v1_api_proto_msgTypes[36]
+	mi := &file_vmon_v1_api_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3244,7 +3516,7 @@ func (x *CredentialList) String() string {
 func (*CredentialList) ProtoMessage() {}
 
 func (x *CredentialList) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[36]
+	mi := &file_vmon_v1_api_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3257,7 +3529,7 @@ func (x *CredentialList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialList.ProtoReflect.Descriptor instead.
 func (*CredentialList) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{36}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *CredentialList) GetCredentials() []*CredentialRecord {
@@ -3280,7 +3552,7 @@ type RestoreSnapshotRequest struct {
 
 func (x *RestoreSnapshotRequest) Reset() {
 	*x = RestoreSnapshotRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[37]
+	mi := &file_vmon_v1_api_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3292,7 +3564,7 @@ func (x *RestoreSnapshotRequest) String() string {
 func (*RestoreSnapshotRequest) ProtoMessage() {}
 
 func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[37]
+	mi := &file_vmon_v1_api_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3305,7 +3577,7 @@ func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{37}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *RestoreSnapshotRequest) GetName() string {
@@ -3335,7 +3607,7 @@ type ForkSnapshotRequest struct {
 
 func (x *ForkSnapshotRequest) Reset() {
 	*x = ForkSnapshotRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[38]
+	mi := &file_vmon_v1_api_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3347,7 +3619,7 @@ func (x *ForkSnapshotRequest) String() string {
 func (*ForkSnapshotRequest) ProtoMessage() {}
 
 func (x *ForkSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[38]
+	mi := &file_vmon_v1_api_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3360,7 +3632,7 @@ func (x *ForkSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*ForkSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{38}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ForkSnapshotRequest) GetName() string {
@@ -3386,7 +3658,7 @@ type ListVolumesRequest struct {
 
 func (x *ListVolumesRequest) Reset() {
 	*x = ListVolumesRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[39]
+	mi := &file_vmon_v1_api_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3398,7 +3670,7 @@ func (x *ListVolumesRequest) String() string {
 func (*ListVolumesRequest) ProtoMessage() {}
 
 func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[39]
+	mi := &file_vmon_v1_api_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3411,7 +3683,7 @@ func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumesRequest.ProtoReflect.Descriptor instead.
 func (*ListVolumesRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{39}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{43}
 }
 
 // VolumeList wraps the list of persistent volumes.
@@ -3425,7 +3697,7 @@ type VolumeList struct {
 
 func (x *VolumeList) Reset() {
 	*x = VolumeList{}
-	mi := &file_vmon_v1_api_proto_msgTypes[40]
+	mi := &file_vmon_v1_api_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3437,7 +3709,7 @@ func (x *VolumeList) String() string {
 func (*VolumeList) ProtoMessage() {}
 
 func (x *VolumeList) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[40]
+	mi := &file_vmon_v1_api_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3450,7 +3722,7 @@ func (x *VolumeList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeList.ProtoReflect.Descriptor instead.
 func (*VolumeList) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{40}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *VolumeList) GetVolumes() []string {
@@ -3471,7 +3743,7 @@ type VolumeRef struct {
 
 func (x *VolumeRef) Reset() {
 	*x = VolumeRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[41]
+	mi := &file_vmon_v1_api_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3483,7 +3755,7 @@ func (x *VolumeRef) String() string {
 func (*VolumeRef) ProtoMessage() {}
 
 func (x *VolumeRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[41]
+	mi := &file_vmon_v1_api_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3496,7 +3768,7 @@ func (x *VolumeRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeRef.ProtoReflect.Descriptor instead.
 func (*VolumeRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{41}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *VolumeRef) GetName() string {
@@ -3515,7 +3787,7 @@ type ListPoolsRequest struct {
 
 func (x *ListPoolsRequest) Reset() {
 	*x = ListPoolsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[42]
+	mi := &file_vmon_v1_api_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3527,7 +3799,7 @@ func (x *ListPoolsRequest) String() string {
 func (*ListPoolsRequest) ProtoMessage() {}
 
 func (x *ListPoolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[42]
+	mi := &file_vmon_v1_api_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3540,7 +3812,7 @@ func (x *ListPoolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPoolsRequest.ProtoReflect.Descriptor instead.
 func (*ListPoolsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{42}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{46}
 }
 
 // PoolSetRequest represents configuration for creating/updating a warm pool.
@@ -3556,7 +3828,7 @@ type PoolSetRequest struct {
 
 func (x *PoolSetRequest) Reset() {
 	*x = PoolSetRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[43]
+	mi := &file_vmon_v1_api_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3568,7 +3840,7 @@ func (x *PoolSetRequest) String() string {
 func (*PoolSetRequest) ProtoMessage() {}
 
 func (x *PoolSetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[43]
+	mi := &file_vmon_v1_api_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3581,7 +3853,7 @@ func (x *PoolSetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PoolSetRequest.ProtoReflect.Descriptor instead.
 func (*PoolSetRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{43}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *PoolSetRequest) GetReference() string {
@@ -3609,7 +3881,7 @@ type PoolRef struct {
 
 func (x *PoolRef) Reset() {
 	*x = PoolRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[44]
+	mi := &file_vmon_v1_api_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3621,7 +3893,7 @@ func (x *PoolRef) String() string {
 func (*PoolRef) ProtoMessage() {}
 
 func (x *PoolRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[44]
+	mi := &file_vmon_v1_api_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3634,7 +3906,7 @@ func (x *PoolRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PoolRef.ProtoReflect.Descriptor instead.
 func (*PoolRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{44}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *PoolRef) GetReference() string {
@@ -3653,7 +3925,7 @@ type InfoRequest struct {
 
 func (x *InfoRequest) Reset() {
 	*x = InfoRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[45]
+	mi := &file_vmon_v1_api_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3665,7 +3937,7 @@ func (x *InfoRequest) String() string {
 func (*InfoRequest) ProtoMessage() {}
 
 func (x *InfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[45]
+	mi := &file_vmon_v1_api_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3678,7 +3950,7 @@ func (x *InfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InfoRequest.ProtoReflect.Descriptor instead.
 func (*InfoRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{45}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{49}
 }
 
 // MeshStatusRequest represents a request for the mesh roster/status document.
@@ -3690,7 +3962,7 @@ type MeshStatusRequest struct {
 
 func (x *MeshStatusRequest) Reset() {
 	*x = MeshStatusRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[46]
+	mi := &file_vmon_v1_api_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3702,7 +3974,7 @@ func (x *MeshStatusRequest) String() string {
 func (*MeshStatusRequest) ProtoMessage() {}
 
 func (x *MeshStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[46]
+	mi := &file_vmon_v1_api_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3715,7 +3987,7 @@ func (x *MeshStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeshStatusRequest.ProtoReflect.Descriptor instead.
 func (*MeshStatusRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{46}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{50}
 }
 
 // EventsRequest represents a request to stream system events.
@@ -3727,7 +3999,7 @@ type EventsRequest struct {
 
 func (x *EventsRequest) Reset() {
 	*x = EventsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[47]
+	mi := &file_vmon_v1_api_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3739,7 +4011,7 @@ func (x *EventsRequest) String() string {
 func (*EventsRequest) ProtoMessage() {}
 
 func (x *EventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[47]
+	mi := &file_vmon_v1_api_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3752,7 +4024,7 @@ func (x *EventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventsRequest.ProtoReflect.Descriptor instead.
 func (*EventsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{47}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{51}
 }
 
 // Eof signals the completion of the standard input stream (EOF) from client to server.
@@ -3764,7 +4036,7 @@ type Eof struct {
 
 func (x *Eof) Reset() {
 	*x = Eof{}
-	mi := &file_vmon_v1_api_proto_msgTypes[48]
+	mi := &file_vmon_v1_api_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3776,7 +4048,7 @@ func (x *Eof) String() string {
 func (*Eof) ProtoMessage() {}
 
 func (x *Eof) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[48]
+	mi := &file_vmon_v1_api_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3789,7 +4061,7 @@ func (x *Eof) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Eof.ProtoReflect.Descriptor instead.
 func (*Eof) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{48}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{52}
 }
 
 // Resize defines the dimensions of a pseudoterminal (pty) window.
@@ -3807,7 +4079,7 @@ type Resize struct {
 
 func (x *Resize) Reset() {
 	*x = Resize{}
-	mi := &file_vmon_v1_api_proto_msgTypes[49]
+	mi := &file_vmon_v1_api_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3819,7 +4091,7 @@ func (x *Resize) String() string {
 func (*Resize) ProtoMessage() {}
 
 func (x *Resize) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[49]
+	mi := &file_vmon_v1_api_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3832,7 +4104,7 @@ func (x *Resize) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Resize.ProtoReflect.Descriptor instead.
 func (*Resize) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{49}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *Resize) GetRows() uint32 {
@@ -3862,7 +4134,7 @@ type Output struct {
 
 func (x *Output) Reset() {
 	*x = Output{}
-	mi := &file_vmon_v1_api_proto_msgTypes[50]
+	mi := &file_vmon_v1_api_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3874,7 +4146,7 @@ func (x *Output) String() string {
 func (*Output) ProtoMessage() {}
 
 func (x *Output) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[50]
+	mi := &file_vmon_v1_api_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3887,7 +4159,7 @@ func (x *Output) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Output.ProtoReflect.Descriptor instead.
 func (*Output) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{50}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *Output) GetStream() Stream {
@@ -3918,7 +4190,7 @@ type Exit struct {
 
 func (x *Exit) Reset() {
 	*x = Exit{}
-	mi := &file_vmon_v1_api_proto_msgTypes[51]
+	mi := &file_vmon_v1_api_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3930,7 +4202,7 @@ func (x *Exit) String() string {
 func (*Exit) ProtoMessage() {}
 
 func (x *Exit) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[51]
+	mi := &file_vmon_v1_api_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3943,7 +4215,7 @@ func (x *Exit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Exit.ProtoReflect.Descriptor instead.
 func (*Exit) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{51}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *Exit) GetCode() int64 {
@@ -3971,7 +4243,7 @@ type Ready struct {
 
 func (x *Ready) Reset() {
 	*x = Ready{}
-	mi := &file_vmon_v1_api_proto_msgTypes[52]
+	mi := &file_vmon_v1_api_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3983,7 +4255,7 @@ func (x *Ready) String() string {
 func (*Ready) ProtoMessage() {}
 
 func (x *Ready) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[52]
+	mi := &file_vmon_v1_api_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3996,7 +4268,7 @@ func (x *Ready) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ready.ProtoReflect.Descriptor instead.
 func (*Ready) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{52}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *Ready) GetSandboxId() string {
@@ -4019,7 +4291,7 @@ type Digest struct {
 
 func (x *Digest) Reset() {
 	*x = Digest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[53]
+	mi := &file_vmon_v1_api_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4031,7 +4303,7 @@ func (x *Digest) String() string {
 func (*Digest) ProtoMessage() {}
 
 func (x *Digest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[53]
+	mi := &file_vmon_v1_api_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4044,7 +4316,7 @@ func (x *Digest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Digest.ProtoReflect.Descriptor instead.
 func (*Digest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{53}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *Digest) GetAlgorithm() DigestAlgorithm {
@@ -4072,7 +4344,7 @@ type ArtifactRef struct {
 
 func (x *ArtifactRef) Reset() {
 	*x = ArtifactRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[54]
+	mi := &file_vmon_v1_api_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4084,7 +4356,7 @@ func (x *ArtifactRef) String() string {
 func (*ArtifactRef) ProtoMessage() {}
 
 func (x *ArtifactRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[54]
+	mi := &file_vmon_v1_api_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4097,7 +4369,7 @@ func (x *ArtifactRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactRef.ProtoReflect.Descriptor instead.
 func (*ArtifactRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{54}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *ArtifactRef) GetDigest() *Digest {
@@ -4136,7 +4408,7 @@ type ArtifactRecord struct {
 
 func (x *ArtifactRecord) Reset() {
 	*x = ArtifactRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[55]
+	mi := &file_vmon_v1_api_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4148,7 +4420,7 @@ func (x *ArtifactRecord) String() string {
 func (*ArtifactRecord) ProtoMessage() {}
 
 func (x *ArtifactRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[55]
+	mi := &file_vmon_v1_api_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4161,7 +4433,7 @@ func (x *ArtifactRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactRecord.ProtoReflect.Descriptor instead.
 func (*ArtifactRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{55}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *ArtifactRecord) GetRef() *ArtifactRef {
@@ -4271,7 +4543,7 @@ type PutArtifactHeader struct {
 
 func (x *PutArtifactHeader) Reset() {
 	*x = PutArtifactHeader{}
-	mi := &file_vmon_v1_api_proto_msgTypes[56]
+	mi := &file_vmon_v1_api_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4283,7 +4555,7 @@ func (x *PutArtifactHeader) String() string {
 func (*PutArtifactHeader) ProtoMessage() {}
 
 func (x *PutArtifactHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[56]
+	mi := &file_vmon_v1_api_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4296,7 +4568,7 @@ func (x *PutArtifactHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutArtifactHeader.ProtoReflect.Descriptor instead.
 func (*PutArtifactHeader) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{56}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *PutArtifactHeader) GetExpectedDigest() *Digest {
@@ -4383,7 +4655,7 @@ type PutArtifactRequest struct {
 
 func (x *PutArtifactRequest) Reset() {
 	*x = PutArtifactRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[57]
+	mi := &file_vmon_v1_api_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4395,7 +4667,7 @@ func (x *PutArtifactRequest) String() string {
 func (*PutArtifactRequest) ProtoMessage() {}
 
 func (x *PutArtifactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[57]
+	mi := &file_vmon_v1_api_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4408,7 +4680,7 @@ func (x *PutArtifactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutArtifactRequest.ProtoReflect.Descriptor instead.
 func (*PutArtifactRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{57}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *PutArtifactRequest) GetFrame() isPutArtifactRequest_Frame {
@@ -4471,7 +4743,7 @@ type GetArtifactRequest struct {
 
 func (x *GetArtifactRequest) Reset() {
 	*x = GetArtifactRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[58]
+	mi := &file_vmon_v1_api_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4483,7 +4755,7 @@ func (x *GetArtifactRequest) String() string {
 func (*GetArtifactRequest) ProtoMessage() {}
 
 func (x *GetArtifactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[58]
+	mi := &file_vmon_v1_api_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4496,7 +4768,7 @@ func (x *GetArtifactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetArtifactRequest.ProtoReflect.Descriptor instead.
 func (*GetArtifactRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{58}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *GetArtifactRequest) GetArtifact() *ArtifactRef {
@@ -4546,7 +4818,7 @@ type ByteRange struct {
 
 func (x *ByteRange) Reset() {
 	*x = ByteRange{}
-	mi := &file_vmon_v1_api_proto_msgTypes[59]
+	mi := &file_vmon_v1_api_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4558,7 +4830,7 @@ func (x *ByteRange) String() string {
 func (*ByteRange) ProtoMessage() {}
 
 func (x *ByteRange) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[59]
+	mi := &file_vmon_v1_api_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4571,7 +4843,7 @@ func (x *ByteRange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ByteRange.ProtoReflect.Descriptor instead.
 func (*ByteRange) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{59}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *ByteRange) GetOffset() uint64 {
@@ -4603,7 +4875,7 @@ type ArtifactChunk struct {
 
 func (x *ArtifactChunk) Reset() {
 	*x = ArtifactChunk{}
-	mi := &file_vmon_v1_api_proto_msgTypes[60]
+	mi := &file_vmon_v1_api_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4615,7 +4887,7 @@ func (x *ArtifactChunk) String() string {
 func (*ArtifactChunk) ProtoMessage() {}
 
 func (x *ArtifactChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[60]
+	mi := &file_vmon_v1_api_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4628,7 +4900,7 @@ func (x *ArtifactChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactChunk.ProtoReflect.Descriptor instead.
 func (*ArtifactChunk) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{60}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *ArtifactChunk) GetOffset() uint64 {
@@ -4669,7 +4941,7 @@ type PythonCodecMetadata struct {
 
 func (x *PythonCodecMetadata) Reset() {
 	*x = PythonCodecMetadata{}
-	mi := &file_vmon_v1_api_proto_msgTypes[61]
+	mi := &file_vmon_v1_api_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4681,7 +4953,7 @@ func (x *PythonCodecMetadata) String() string {
 func (*PythonCodecMetadata) ProtoMessage() {}
 
 func (x *PythonCodecMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[61]
+	mi := &file_vmon_v1_api_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4694,7 +4966,7 @@ func (x *PythonCodecMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PythonCodecMetadata.ProtoReflect.Descriptor instead.
 func (*PythonCodecMetadata) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{61}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *PythonCodecMetadata) GetImplementation() string {
@@ -4763,7 +5035,7 @@ type ValueEnvelope struct {
 
 func (x *ValueEnvelope) Reset() {
 	*x = ValueEnvelope{}
-	mi := &file_vmon_v1_api_proto_msgTypes[62]
+	mi := &file_vmon_v1_api_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4775,7 +5047,7 @@ func (x *ValueEnvelope) String() string {
 func (*ValueEnvelope) ProtoMessage() {}
 
 func (x *ValueEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[62]
+	mi := &file_vmon_v1_api_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4788,7 +5060,7 @@ func (x *ValueEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValueEnvelope.ProtoReflect.Descriptor instead.
 func (*ValueEnvelope) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{62}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *ValueEnvelope) GetSchemaVersion() uint32 {
@@ -4936,7 +5208,7 @@ type FunctionRef struct {
 
 func (x *FunctionRef) Reset() {
 	*x = FunctionRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[63]
+	mi := &file_vmon_v1_api_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4948,7 +5220,7 @@ func (x *FunctionRef) String() string {
 func (*FunctionRef) ProtoMessage() {}
 
 func (x *FunctionRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[63]
+	mi := &file_vmon_v1_api_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4961,7 +5233,7 @@ func (x *FunctionRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionRef.ProtoReflect.Descriptor instead.
 func (*FunctionRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{63}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *FunctionRef) GetNamespace() string {
@@ -4991,7 +5263,7 @@ type RevisionRef struct {
 
 func (x *RevisionRef) Reset() {
 	*x = RevisionRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[64]
+	mi := &file_vmon_v1_api_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5003,7 +5275,7 @@ func (x *RevisionRef) String() string {
 func (*RevisionRef) ProtoMessage() {}
 
 func (x *RevisionRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[64]
+	mi := &file_vmon_v1_api_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5016,7 +5288,7 @@ func (x *RevisionRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevisionRef.ProtoReflect.Descriptor instead.
 func (*RevisionRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{64}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *RevisionRef) GetFunction() *FunctionRef {
@@ -5049,7 +5321,7 @@ type FunctionSelector struct {
 
 func (x *FunctionSelector) Reset() {
 	*x = FunctionSelector{}
-	mi := &file_vmon_v1_api_proto_msgTypes[65]
+	mi := &file_vmon_v1_api_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5061,7 +5333,7 @@ func (x *FunctionSelector) String() string {
 func (*FunctionSelector) ProtoMessage() {}
 
 func (x *FunctionSelector) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[65]
+	mi := &file_vmon_v1_api_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5074,7 +5346,7 @@ func (x *FunctionSelector) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionSelector.ProtoReflect.Descriptor instead.
 func (*FunctionSelector) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{65}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *FunctionSelector) GetSelection() isFunctionSelector_Selection {
@@ -5133,7 +5405,7 @@ type AppRef struct {
 
 func (x *AppRef) Reset() {
 	*x = AppRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[66]
+	mi := &file_vmon_v1_api_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5145,7 +5417,7 @@ func (x *AppRef) String() string {
 func (*AppRef) ProtoMessage() {}
 
 func (x *AppRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[66]
+	mi := &file_vmon_v1_api_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5158,7 +5430,7 @@ func (x *AppRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppRef.ProtoReflect.Descriptor instead.
 func (*AppRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{66}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *AppRef) GetNamespace() string {
@@ -5188,7 +5460,7 @@ type AppRevisionRef struct {
 
 func (x *AppRevisionRef) Reset() {
 	*x = AppRevisionRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[67]
+	mi := &file_vmon_v1_api_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5200,7 +5472,7 @@ func (x *AppRevisionRef) String() string {
 func (*AppRevisionRef) ProtoMessage() {}
 
 func (x *AppRevisionRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[67]
+	mi := &file_vmon_v1_api_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5213,7 +5485,7 @@ func (x *AppRevisionRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppRevisionRef.ProtoReflect.Descriptor instead.
 func (*AppRevisionRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{67}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *AppRevisionRef) GetApp() *AppRef {
@@ -5246,7 +5518,7 @@ type AppSelector struct {
 
 func (x *AppSelector) Reset() {
 	*x = AppSelector{}
-	mi := &file_vmon_v1_api_proto_msgTypes[68]
+	mi := &file_vmon_v1_api_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5258,7 +5530,7 @@ func (x *AppSelector) String() string {
 func (*AppSelector) ProtoMessage() {}
 
 func (x *AppSelector) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[68]
+	mi := &file_vmon_v1_api_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5271,7 +5543,7 @@ func (x *AppSelector) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppSelector.ProtoReflect.Descriptor instead.
 func (*AppSelector) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{68}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *AppSelector) GetSelection() isAppSelector_Selection {
@@ -5350,7 +5622,7 @@ type PackageSpec struct {
 
 func (x *PackageSpec) Reset() {
 	*x = PackageSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[69]
+	mi := &file_vmon_v1_api_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5362,7 +5634,7 @@ func (x *PackageSpec) String() string {
 func (*PackageSpec) ProtoMessage() {}
 
 func (x *PackageSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[69]
+	mi := &file_vmon_v1_api_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5375,7 +5647,7 @@ func (x *PackageSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PackageSpec.ProtoReflect.Descriptor instead.
 func (*PackageSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{69}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *PackageSpec) GetSource() *ArtifactRef {
@@ -5500,7 +5772,7 @@ type ImageSpec struct {
 
 func (x *ImageSpec) Reset() {
 	*x = ImageSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[70]
+	mi := &file_vmon_v1_api_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5512,7 +5784,7 @@ func (x *ImageSpec) String() string {
 func (*ImageSpec) ProtoMessage() {}
 
 func (x *ImageSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[70]
+	mi := &file_vmon_v1_api_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5525,7 +5797,7 @@ func (x *ImageSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageSpec.ProtoReflect.Descriptor instead.
 func (*ImageSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{70}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *ImageSpec) GetSource() isImageSpec_Source {
@@ -5675,7 +5947,7 @@ type ResourceSpec struct {
 
 func (x *ResourceSpec) Reset() {
 	*x = ResourceSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[71]
+	mi := &file_vmon_v1_api_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5687,7 +5959,7 @@ func (x *ResourceSpec) String() string {
 func (*ResourceSpec) ProtoMessage() {}
 
 func (x *ResourceSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[71]
+	mi := &file_vmon_v1_api_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5700,7 +5972,7 @@ func (x *ResourceSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceSpec.ProtoReflect.Descriptor instead.
 func (*ResourceSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{71}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *ResourceSpec) GetCpus() uint32 {
@@ -5775,7 +6047,7 @@ type PythonCodeMetadata struct {
 
 func (x *PythonCodeMetadata) Reset() {
 	*x = PythonCodeMetadata{}
-	mi := &file_vmon_v1_api_proto_msgTypes[72]
+	mi := &file_vmon_v1_api_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5787,7 +6059,7 @@ func (x *PythonCodeMetadata) String() string {
 func (*PythonCodeMetadata) ProtoMessage() {}
 
 func (x *PythonCodeMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[72]
+	mi := &file_vmon_v1_api_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5800,7 +6072,7 @@ func (x *PythonCodeMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PythonCodeMetadata.ProtoReflect.Descriptor instead.
 func (*PythonCodeMetadata) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{72}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *PythonCodeMetadata) GetImplementation() string {
@@ -5871,7 +6143,7 @@ type PythonImageSource struct {
 
 func (x *PythonImageSource) Reset() {
 	*x = PythonImageSource{}
-	mi := &file_vmon_v1_api_proto_msgTypes[73]
+	mi := &file_vmon_v1_api_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5883,7 +6155,7 @@ func (x *PythonImageSource) String() string {
 func (*PythonImageSource) ProtoMessage() {}
 
 func (x *PythonImageSource) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[73]
+	mi := &file_vmon_v1_api_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5896,7 +6168,7 @@ func (x *PythonImageSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PythonImageSource.ProtoReflect.Descriptor instead.
 func (*PythonImageSource) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{73}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *PythonImageSource) GetPythonVersion() string {
@@ -5924,7 +6196,7 @@ type RegistryImageSource struct {
 
 func (x *RegistryImageSource) Reset() {
 	*x = RegistryImageSource{}
-	mi := &file_vmon_v1_api_proto_msgTypes[74]
+	mi := &file_vmon_v1_api_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5936,7 +6208,7 @@ func (x *RegistryImageSource) String() string {
 func (*RegistryImageSource) ProtoMessage() {}
 
 func (x *RegistryImageSource) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[74]
+	mi := &file_vmon_v1_api_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5949,7 +6221,7 @@ func (x *RegistryImageSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegistryImageSource.ProtoReflect.Descriptor instead.
 func (*RegistryImageSource) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{74}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *RegistryImageSource) GetReference() string {
@@ -5972,7 +6244,7 @@ type DockerfileImageSource struct {
 
 func (x *DockerfileImageSource) Reset() {
 	*x = DockerfileImageSource{}
-	mi := &file_vmon_v1_api_proto_msgTypes[75]
+	mi := &file_vmon_v1_api_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5984,7 +6256,7 @@ func (x *DockerfileImageSource) String() string {
 func (*DockerfileImageSource) ProtoMessage() {}
 
 func (x *DockerfileImageSource) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[75]
+	mi := &file_vmon_v1_api_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5997,7 +6269,7 @@ func (x *DockerfileImageSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DockerfileImageSource.ProtoReflect.Descriptor instead.
 func (*DockerfileImageSource) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{75}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *DockerfileImageSource) GetContext() *ArtifactRef {
@@ -6027,7 +6299,7 @@ type TemplateImageSource struct {
 
 func (x *TemplateImageSource) Reset() {
 	*x = TemplateImageSource{}
-	mi := &file_vmon_v1_api_proto_msgTypes[76]
+	mi := &file_vmon_v1_api_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6039,7 +6311,7 @@ func (x *TemplateImageSource) String() string {
 func (*TemplateImageSource) ProtoMessage() {}
 
 func (x *TemplateImageSource) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[76]
+	mi := &file_vmon_v1_api_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6052,7 +6324,7 @@ func (x *TemplateImageSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TemplateImageSource.ProtoReflect.Descriptor instead.
 func (*TemplateImageSource) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{76}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *TemplateImageSource) GetName() string {
@@ -6082,7 +6354,7 @@ type AptPackage struct {
 
 func (x *AptPackage) Reset() {
 	*x = AptPackage{}
-	mi := &file_vmon_v1_api_proto_msgTypes[77]
+	mi := &file_vmon_v1_api_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6094,7 +6366,7 @@ func (x *AptPackage) String() string {
 func (*AptPackage) ProtoMessage() {}
 
 func (x *AptPackage) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[77]
+	mi := &file_vmon_v1_api_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6107,7 +6379,7 @@ func (x *AptPackage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AptPackage.ProtoReflect.Descriptor instead.
 func (*AptPackage) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{77}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *AptPackage) GetName() string {
@@ -6143,7 +6415,7 @@ type UvPackage struct {
 
 func (x *UvPackage) Reset() {
 	*x = UvPackage{}
-	mi := &file_vmon_v1_api_proto_msgTypes[78]
+	mi := &file_vmon_v1_api_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6155,7 +6427,7 @@ func (x *UvPackage) String() string {
 func (*UvPackage) ProtoMessage() {}
 
 func (x *UvPackage) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[78]
+	mi := &file_vmon_v1_api_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6168,7 +6440,7 @@ func (x *UvPackage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UvPackage.ProtoReflect.Descriptor instead.
 func (*UvPackage) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{78}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *UvPackage) GetName() string {
@@ -6223,7 +6495,7 @@ type ImageBuildCommand struct {
 
 func (x *ImageBuildCommand) Reset() {
 	*x = ImageBuildCommand{}
-	mi := &file_vmon_v1_api_proto_msgTypes[79]
+	mi := &file_vmon_v1_api_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6235,7 +6507,7 @@ func (x *ImageBuildCommand) String() string {
 func (*ImageBuildCommand) ProtoMessage() {}
 
 func (x *ImageBuildCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[79]
+	mi := &file_vmon_v1_api_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6248,7 +6520,7 @@ func (x *ImageBuildCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageBuildCommand.ProtoReflect.Descriptor instead.
 func (*ImageBuildCommand) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{79}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *ImageBuildCommand) GetArgv() []string {
@@ -6273,7 +6545,7 @@ type LocalArtifactMount struct {
 
 func (x *LocalArtifactMount) Reset() {
 	*x = LocalArtifactMount{}
-	mi := &file_vmon_v1_api_proto_msgTypes[80]
+	mi := &file_vmon_v1_api_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6285,7 +6557,7 @@ func (x *LocalArtifactMount) String() string {
 func (*LocalArtifactMount) ProtoMessage() {}
 
 func (x *LocalArtifactMount) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[80]
+	mi := &file_vmon_v1_api_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6298,7 +6570,7 @@ func (x *LocalArtifactMount) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalArtifactMount.ProtoReflect.Descriptor instead.
 func (*LocalArtifactMount) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{80}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *LocalArtifactMount) GetArtifact() *ArtifactRef {
@@ -6337,7 +6609,7 @@ type FunctionVolumeMount struct {
 
 func (x *FunctionVolumeMount) Reset() {
 	*x = FunctionVolumeMount{}
-	mi := &file_vmon_v1_api_proto_msgTypes[81]
+	mi := &file_vmon_v1_api_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6349,7 +6621,7 @@ func (x *FunctionVolumeMount) String() string {
 func (*FunctionVolumeMount) ProtoMessage() {}
 
 func (x *FunctionVolumeMount) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[81]
+	mi := &file_vmon_v1_api_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6362,7 +6634,7 @@ func (x *FunctionVolumeMount) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionVolumeMount.ProtoReflect.Descriptor instead.
 func (*FunctionVolumeMount) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{81}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *FunctionVolumeMount) GetVolume() *VolumeRef {
@@ -6403,7 +6675,7 @@ type NetworkPolicy struct {
 
 func (x *NetworkPolicy) Reset() {
 	*x = NetworkPolicy{}
-	mi := &file_vmon_v1_api_proto_msgTypes[82]
+	mi := &file_vmon_v1_api_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6415,7 +6687,7 @@ func (x *NetworkPolicy) String() string {
 func (*NetworkPolicy) ProtoMessage() {}
 
 func (x *NetworkPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[82]
+	mi := &file_vmon_v1_api_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6428,7 +6700,7 @@ func (x *NetworkPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkPolicy.ProtoReflect.Descriptor instead.
 func (*NetworkPolicy) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{82}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *NetworkPolicy) GetBlockNetwork() bool {
@@ -6478,7 +6750,7 @@ type RetryPolicy struct {
 
 func (x *RetryPolicy) Reset() {
 	*x = RetryPolicy{}
-	mi := &file_vmon_v1_api_proto_msgTypes[83]
+	mi := &file_vmon_v1_api_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6490,7 +6762,7 @@ func (x *RetryPolicy) String() string {
 func (*RetryPolicy) ProtoMessage() {}
 
 func (x *RetryPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[83]
+	mi := &file_vmon_v1_api_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6503,7 +6775,7 @@ func (x *RetryPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetryPolicy.ProtoReflect.Descriptor instead.
 func (*RetryPolicy) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{83}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *RetryPolicy) GetMaxAttempts() uint32 {
@@ -6560,7 +6832,7 @@ type TimeoutSpec struct {
 
 func (x *TimeoutSpec) Reset() {
 	*x = TimeoutSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	mi := &file_vmon_v1_api_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6572,7 +6844,7 @@ func (x *TimeoutSpec) String() string {
 func (*TimeoutSpec) ProtoMessage() {}
 
 func (x *TimeoutSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[84]
+	mi := &file_vmon_v1_api_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6585,7 +6857,7 @@ func (x *TimeoutSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TimeoutSpec.ProtoReflect.Descriptor instead.
 func (*TimeoutSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{84}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *TimeoutSpec) GetExecutionMillis() uint64 {
@@ -6644,7 +6916,7 @@ type WorkerSpec struct {
 
 func (x *WorkerSpec) Reset() {
 	*x = WorkerSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[85]
+	mi := &file_vmon_v1_api_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6656,7 +6928,7 @@ func (x *WorkerSpec) String() string {
 func (*WorkerSpec) ProtoMessage() {}
 
 func (x *WorkerSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[85]
+	mi := &file_vmon_v1_api_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6669,7 +6941,7 @@ func (x *WorkerSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerSpec.ProtoReflect.Descriptor instead.
 func (*WorkerSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{85}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *WorkerSpec) GetMinWorkers() uint32 {
@@ -6727,7 +6999,7 @@ type ConcurrencySpec struct {
 
 func (x *ConcurrencySpec) Reset() {
 	*x = ConcurrencySpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[86]
+	mi := &file_vmon_v1_api_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6739,7 +7011,7 @@ func (x *ConcurrencySpec) String() string {
 func (*ConcurrencySpec) ProtoMessage() {}
 
 func (x *ConcurrencySpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[86]
+	mi := &file_vmon_v1_api_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6752,7 +7024,7 @@ func (x *ConcurrencySpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConcurrencySpec.ProtoReflect.Descriptor instead.
 func (*ConcurrencySpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{86}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *ConcurrencySpec) GetMaxConcurrentCalls() uint32 {
@@ -6784,7 +7056,7 @@ type BatchingSpec struct {
 
 func (x *BatchingSpec) Reset() {
 	*x = BatchingSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[87]
+	mi := &file_vmon_v1_api_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6796,7 +7068,7 @@ func (x *BatchingSpec) String() string {
 func (*BatchingSpec) ProtoMessage() {}
 
 func (x *BatchingSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[87]
+	mi := &file_vmon_v1_api_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6809,7 +7081,7 @@ func (x *BatchingSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchingSpec.ProtoReflect.Descriptor instead.
 func (*BatchingSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{87}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *BatchingSpec) GetEnabled() bool {
@@ -6850,7 +7122,7 @@ type SerializerSpec struct {
 
 func (x *SerializerSpec) Reset() {
 	*x = SerializerSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[88]
+	mi := &file_vmon_v1_api_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6862,7 +7134,7 @@ func (x *SerializerSpec) String() string {
 func (*SerializerSpec) ProtoMessage() {}
 
 func (x *SerializerSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[88]
+	mi := &file_vmon_v1_api_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6875,7 +7147,7 @@ func (x *SerializerSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SerializerSpec.ProtoReflect.Descriptor instead.
 func (*SerializerSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{88}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *SerializerSpec) GetInputSerializer() ValueSerializer {
@@ -6925,7 +7197,7 @@ type ReproducibilitySpec struct {
 
 func (x *ReproducibilitySpec) Reset() {
 	*x = ReproducibilitySpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[89]
+	mi := &file_vmon_v1_api_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6937,7 +7209,7 @@ func (x *ReproducibilitySpec) String() string {
 func (*ReproducibilitySpec) ProtoMessage() {}
 
 func (x *ReproducibilitySpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[89]
+	mi := &file_vmon_v1_api_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6950,7 +7222,7 @@ func (x *ReproducibilitySpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReproducibilitySpec.ProtoReflect.Descriptor instead.
 func (*ReproducibilitySpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{89}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *ReproducibilitySpec) GetBuildInputsDigest() *Digest {
@@ -7005,7 +7277,7 @@ type SecretRef struct {
 
 func (x *SecretRef) Reset() {
 	*x = SecretRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[90]
+	mi := &file_vmon_v1_api_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7017,7 +7289,7 @@ func (x *SecretRef) String() string {
 func (*SecretRef) ProtoMessage() {}
 
 func (x *SecretRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[90]
+	mi := &file_vmon_v1_api_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7030,7 +7302,7 @@ func (x *SecretRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretRef.ProtoReflect.Descriptor instead.
 func (*SecretRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{90}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *SecretRef) GetName() string {
@@ -7080,7 +7352,7 @@ type TransientSecretMaterial struct {
 
 func (x *TransientSecretMaterial) Reset() {
 	*x = TransientSecretMaterial{}
-	mi := &file_vmon_v1_api_proto_msgTypes[91]
+	mi := &file_vmon_v1_api_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7092,7 +7364,7 @@ func (x *TransientSecretMaterial) String() string {
 func (*TransientSecretMaterial) ProtoMessage() {}
 
 func (x *TransientSecretMaterial) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[91]
+	mi := &file_vmon_v1_api_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7105,7 +7377,7 @@ func (x *TransientSecretMaterial) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransientSecretMaterial.ProtoReflect.Descriptor instead.
 func (*TransientSecretMaterial) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{91}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *TransientSecretMaterial) GetSecret() *SecretRef {
@@ -7135,7 +7407,7 @@ type LifecycleHookRef struct {
 
 func (x *LifecycleHookRef) Reset() {
 	*x = LifecycleHookRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[92]
+	mi := &file_vmon_v1_api_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7147,7 +7419,7 @@ func (x *LifecycleHookRef) String() string {
 func (*LifecycleHookRef) ProtoMessage() {}
 
 func (x *LifecycleHookRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[92]
+	mi := &file_vmon_v1_api_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7160,7 +7432,7 @@ func (x *LifecycleHookRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LifecycleHookRef.ProtoReflect.Descriptor instead.
 func (*LifecycleHookRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{92}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *LifecycleHookRef) GetModule() string {
@@ -7214,7 +7486,7 @@ type LifecycleHooks struct {
 
 func (x *LifecycleHooks) Reset() {
 	*x = LifecycleHooks{}
-	mi := &file_vmon_v1_api_proto_msgTypes[93]
+	mi := &file_vmon_v1_api_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7226,7 +7498,7 @@ func (x *LifecycleHooks) String() string {
 func (*LifecycleHooks) ProtoMessage() {}
 
 func (x *LifecycleHooks) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[93]
+	mi := &file_vmon_v1_api_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7239,7 +7511,7 @@ func (x *LifecycleHooks) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LifecycleHooks.ProtoReflect.Descriptor instead.
 func (*LifecycleHooks) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{93}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *LifecycleHooks) GetInitializePresence() isLifecycleHooks_InitializePresence {
@@ -7375,7 +7647,7 @@ type FunctionSnapshotRef struct {
 
 func (x *FunctionSnapshotRef) Reset() {
 	*x = FunctionSnapshotRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[94]
+	mi := &file_vmon_v1_api_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7387,7 +7659,7 @@ func (x *FunctionSnapshotRef) String() string {
 func (*FunctionSnapshotRef) ProtoMessage() {}
 
 func (x *FunctionSnapshotRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[94]
+	mi := &file_vmon_v1_api_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7400,7 +7672,7 @@ func (x *FunctionSnapshotRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionSnapshotRef.ProtoReflect.Descriptor instead.
 func (*FunctionSnapshotRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{94}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *FunctionSnapshotRef) GetSnapshotId() string {
@@ -7441,7 +7713,7 @@ type FunctionSnapshotRecord struct {
 
 func (x *FunctionSnapshotRecord) Reset() {
 	*x = FunctionSnapshotRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[95]
+	mi := &file_vmon_v1_api_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7453,7 +7725,7 @@ func (x *FunctionSnapshotRecord) String() string {
 func (*FunctionSnapshotRecord) ProtoMessage() {}
 
 func (x *FunctionSnapshotRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[95]
+	mi := &file_vmon_v1_api_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7466,7 +7738,7 @@ func (x *FunctionSnapshotRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionSnapshotRecord.ProtoReflect.Descriptor instead.
 func (*FunctionSnapshotRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{95}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *FunctionSnapshotRecord) GetRef() *FunctionSnapshotRef {
@@ -7591,7 +7863,7 @@ type FunctionSpec struct {
 
 func (x *FunctionSpec) Reset() {
 	*x = FunctionSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[96]
+	mi := &file_vmon_v1_api_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7603,7 +7875,7 @@ func (x *FunctionSpec) String() string {
 func (*FunctionSpec) ProtoMessage() {}
 
 func (x *FunctionSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[96]
+	mi := &file_vmon_v1_api_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7616,7 +7888,7 @@ func (x *FunctionSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionSpec.ProtoReflect.Descriptor instead.
 func (*FunctionSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{96}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *FunctionSpec) GetFunction() *FunctionRef {
@@ -7751,7 +8023,7 @@ type FunctionRevision struct {
 
 func (x *FunctionRevision) Reset() {
 	*x = FunctionRevision{}
-	mi := &file_vmon_v1_api_proto_msgTypes[97]
+	mi := &file_vmon_v1_api_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7763,7 +8035,7 @@ func (x *FunctionRevision) String() string {
 func (*FunctionRevision) ProtoMessage() {}
 
 func (x *FunctionRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[97]
+	mi := &file_vmon_v1_api_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7776,7 +8048,7 @@ func (x *FunctionRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionRevision.ProtoReflect.Descriptor instead.
 func (*FunctionRevision) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{97}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *FunctionRevision) GetRef() *RevisionRef {
@@ -7863,7 +8135,7 @@ type FunctionRecord struct {
 
 func (x *FunctionRecord) Reset() {
 	*x = FunctionRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[98]
+	mi := &file_vmon_v1_api_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7875,7 +8147,7 @@ func (x *FunctionRecord) String() string {
 func (*FunctionRecord) ProtoMessage() {}
 
 func (x *FunctionRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[98]
+	mi := &file_vmon_v1_api_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7888,7 +8160,7 @@ func (x *FunctionRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FunctionRecord.ProtoReflect.Descriptor instead.
 func (*FunctionRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{98}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *FunctionRecord) GetFunction() *FunctionRef {
@@ -7927,7 +8199,7 @@ type RegisterFunctionRequest struct {
 
 func (x *RegisterFunctionRequest) Reset() {
 	*x = RegisterFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[99]
+	mi := &file_vmon_v1_api_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7939,7 +8211,7 @@ func (x *RegisterFunctionRequest) String() string {
 func (*RegisterFunctionRequest) ProtoMessage() {}
 
 func (x *RegisterFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[99]
+	mi := &file_vmon_v1_api_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7952,7 +8224,7 @@ func (x *RegisterFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterFunctionRequest.ProtoReflect.Descriptor instead.
 func (*RegisterFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{99}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *RegisterFunctionRequest) GetSpec() *FunctionSpec {
@@ -7987,7 +8259,7 @@ type GetFunctionRequest struct {
 
 func (x *GetFunctionRequest) Reset() {
 	*x = GetFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[100]
+	mi := &file_vmon_v1_api_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7999,7 +8271,7 @@ func (x *GetFunctionRequest) String() string {
 func (*GetFunctionRequest) ProtoMessage() {}
 
 func (x *GetFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[100]
+	mi := &file_vmon_v1_api_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8012,7 +8284,7 @@ func (x *GetFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFunctionRequest.ProtoReflect.Descriptor instead.
 func (*GetFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{100}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *GetFunctionRequest) GetFunction() *FunctionSelector {
@@ -8047,7 +8319,7 @@ type ListFunctionsRequest struct {
 
 func (x *ListFunctionsRequest) Reset() {
 	*x = ListFunctionsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[101]
+	mi := &file_vmon_v1_api_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8059,7 +8331,7 @@ func (x *ListFunctionsRequest) String() string {
 func (*ListFunctionsRequest) ProtoMessage() {}
 
 func (x *ListFunctionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[101]
+	mi := &file_vmon_v1_api_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8072,7 +8344,7 @@ func (x *ListFunctionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFunctionsRequest.ProtoReflect.Descriptor instead.
 func (*ListFunctionsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{101}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *ListFunctionsRequest) GetNamespacePresence() isListFunctionsRequest_NamespacePresence {
@@ -8156,7 +8428,7 @@ type ListFunctionsResponse struct {
 
 func (x *ListFunctionsResponse) Reset() {
 	*x = ListFunctionsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[102]
+	mi := &file_vmon_v1_api_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8168,7 +8440,7 @@ func (x *ListFunctionsResponse) String() string {
 func (*ListFunctionsResponse) ProtoMessage() {}
 
 func (x *ListFunctionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[102]
+	mi := &file_vmon_v1_api_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8181,7 +8453,7 @@ func (x *ListFunctionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFunctionsResponse.ProtoReflect.Descriptor instead.
 func (*ListFunctionsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{102}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *ListFunctionsResponse) GetRevisions() []*FunctionRevision {
@@ -8215,7 +8487,7 @@ type ActivateFunctionRequest struct {
 
 func (x *ActivateFunctionRequest) Reset() {
 	*x = ActivateFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[103]
+	mi := &file_vmon_v1_api_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8227,7 +8499,7 @@ func (x *ActivateFunctionRequest) String() string {
 func (*ActivateFunctionRequest) ProtoMessage() {}
 
 func (x *ActivateFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[103]
+	mi := &file_vmon_v1_api_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8240,7 +8512,7 @@ func (x *ActivateFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivateFunctionRequest.ProtoReflect.Descriptor instead.
 func (*ActivateFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{103}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *ActivateFunctionRequest) GetRevision() *RevisionRef {
@@ -8288,7 +8560,7 @@ type DeleteFunctionRequest struct {
 
 func (x *DeleteFunctionRequest) Reset() {
 	*x = DeleteFunctionRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[104]
+	mi := &file_vmon_v1_api_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8300,7 +8572,7 @@ func (x *DeleteFunctionRequest) String() string {
 func (*DeleteFunctionRequest) ProtoMessage() {}
 
 func (x *DeleteFunctionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[104]
+	mi := &file_vmon_v1_api_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8313,7 +8585,7 @@ func (x *DeleteFunctionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteFunctionRequest.ProtoReflect.Descriptor instead.
 func (*DeleteFunctionRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{104}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *DeleteFunctionRequest) GetRevision() *RevisionRef {
@@ -8336,7 +8608,7 @@ type AppFunctionBinding struct {
 
 func (x *AppFunctionBinding) Reset() {
 	*x = AppFunctionBinding{}
-	mi := &file_vmon_v1_api_proto_msgTypes[105]
+	mi := &file_vmon_v1_api_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8348,7 +8620,7 @@ func (x *AppFunctionBinding) String() string {
 func (*AppFunctionBinding) ProtoMessage() {}
 
 func (x *AppFunctionBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[105]
+	mi := &file_vmon_v1_api_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8361,7 +8633,7 @@ func (x *AppFunctionBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppFunctionBinding.ProtoReflect.Descriptor instead.
 func (*AppFunctionBinding) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{105}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *AppFunctionBinding) GetName() string {
@@ -8401,7 +8673,7 @@ type AppRevision struct {
 
 func (x *AppRevision) Reset() {
 	*x = AppRevision{}
-	mi := &file_vmon_v1_api_proto_msgTypes[106]
+	mi := &file_vmon_v1_api_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8413,7 +8685,7 @@ func (x *AppRevision) String() string {
 func (*AppRevision) ProtoMessage() {}
 
 func (x *AppRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[106]
+	mi := &file_vmon_v1_api_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8426,7 +8698,7 @@ func (x *AppRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppRevision.ProtoReflect.Descriptor instead.
 func (*AppRevision) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{106}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *AppRevision) GetRef() *AppRevisionRef {
@@ -8505,7 +8777,7 @@ type ActivateAppRequest struct {
 
 func (x *ActivateAppRequest) Reset() {
 	*x = ActivateAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[107]
+	mi := &file_vmon_v1_api_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8517,7 +8789,7 @@ func (x *ActivateAppRequest) String() string {
 func (*ActivateAppRequest) ProtoMessage() {}
 
 func (x *ActivateAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[107]
+	mi := &file_vmon_v1_api_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8530,7 +8802,7 @@ func (x *ActivateAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivateAppRequest.ProtoReflect.Descriptor instead.
 func (*ActivateAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{107}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *ActivateAppRequest) GetApp() *AppRef {
@@ -8592,7 +8864,7 @@ type GetAppRequest struct {
 
 func (x *GetAppRequest) Reset() {
 	*x = GetAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[108]
+	mi := &file_vmon_v1_api_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8604,7 +8876,7 @@ func (x *GetAppRequest) String() string {
 func (*GetAppRequest) ProtoMessage() {}
 
 func (x *GetAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[108]
+	mi := &file_vmon_v1_api_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8617,7 +8889,7 @@ func (x *GetAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppRequest.ProtoReflect.Descriptor instead.
 func (*GetAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{108}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *GetAppRequest) GetApp() *AppSelector {
@@ -8646,7 +8918,7 @@ type RollbackAppRequest struct {
 
 func (x *RollbackAppRequest) Reset() {
 	*x = RollbackAppRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[109]
+	mi := &file_vmon_v1_api_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8658,7 +8930,7 @@ func (x *RollbackAppRequest) String() string {
 func (*RollbackAppRequest) ProtoMessage() {}
 
 func (x *RollbackAppRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[109]
+	mi := &file_vmon_v1_api_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8671,7 +8943,7 @@ func (x *RollbackAppRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackAppRequest.ProtoReflect.Descriptor instead.
 func (*RollbackAppRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{109}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *RollbackAppRequest) GetTarget() *AppRevisionRef {
@@ -8726,7 +8998,7 @@ type ScheduleRef struct {
 
 func (x *ScheduleRef) Reset() {
 	*x = ScheduleRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	mi := &file_vmon_v1_api_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8738,7 +9010,7 @@ func (x *ScheduleRef) String() string {
 func (*ScheduleRef) ProtoMessage() {}
 
 func (x *ScheduleRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[110]
+	mi := &file_vmon_v1_api_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8751,7 +9023,7 @@ func (x *ScheduleRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleRef.ProtoReflect.Descriptor instead.
 func (*ScheduleRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{110}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *ScheduleRef) GetScheduleId() string {
@@ -8774,7 +9046,7 @@ type CronSchedule struct {
 
 func (x *CronSchedule) Reset() {
 	*x = CronSchedule{}
-	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	mi := &file_vmon_v1_api_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8786,7 +9058,7 @@ func (x *CronSchedule) String() string {
 func (*CronSchedule) ProtoMessage() {}
 
 func (x *CronSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[111]
+	mi := &file_vmon_v1_api_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8799,7 +9071,7 @@ func (x *CronSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CronSchedule.ProtoReflect.Descriptor instead.
 func (*CronSchedule) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{111}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *CronSchedule) GetExpression() string {
@@ -8829,7 +9101,7 @@ type PeriodSchedule struct {
 
 func (x *PeriodSchedule) Reset() {
 	*x = PeriodSchedule{}
-	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	mi := &file_vmon_v1_api_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8841,7 +9113,7 @@ func (x *PeriodSchedule) String() string {
 func (*PeriodSchedule) ProtoMessage() {}
 
 func (x *PeriodSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[112]
+	mi := &file_vmon_v1_api_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8854,7 +9126,7 @@ func (x *PeriodSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeriodSchedule.ProtoReflect.Descriptor instead.
 func (*PeriodSchedule) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{112}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *PeriodSchedule) GetPeriodMillis() uint64 {
@@ -8884,7 +9156,7 @@ type ScheduleTarget struct {
 
 func (x *ScheduleTarget) Reset() {
 	*x = ScheduleTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	mi := &file_vmon_v1_api_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8896,7 +9168,7 @@ func (x *ScheduleTarget) String() string {
 func (*ScheduleTarget) ProtoMessage() {}
 
 func (x *ScheduleTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[113]
+	mi := &file_vmon_v1_api_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8909,7 +9181,7 @@ func (x *ScheduleTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleTarget.ProtoReflect.Descriptor instead.
 func (*ScheduleTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{113}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *ScheduleTarget) GetFunction() *RevisionRef {
@@ -8952,7 +9224,7 @@ type ScheduleSpec struct {
 
 func (x *ScheduleSpec) Reset() {
 	*x = ScheduleSpec{}
-	mi := &file_vmon_v1_api_proto_msgTypes[114]
+	mi := &file_vmon_v1_api_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8964,7 +9236,7 @@ func (x *ScheduleSpec) String() string {
 func (*ScheduleSpec) ProtoMessage() {}
 
 func (x *ScheduleSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[114]
+	mi := &file_vmon_v1_api_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8977,7 +9249,7 @@ func (x *ScheduleSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleSpec.ProtoReflect.Descriptor instead.
 func (*ScheduleSpec) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{114}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *ScheduleSpec) GetName() string {
@@ -9081,7 +9353,7 @@ type ScheduleRecord struct {
 
 func (x *ScheduleRecord) Reset() {
 	*x = ScheduleRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[115]
+	mi := &file_vmon_v1_api_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9093,7 +9365,7 @@ func (x *ScheduleRecord) String() string {
 func (*ScheduleRecord) ProtoMessage() {}
 
 func (x *ScheduleRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[115]
+	mi := &file_vmon_v1_api_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9106,7 +9378,7 @@ func (x *ScheduleRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScheduleRecord.ProtoReflect.Descriptor instead.
 func (*ScheduleRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{115}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *ScheduleRecord) GetRef() *ScheduleRef {
@@ -9183,7 +9455,7 @@ type CreateScheduleRequest struct {
 
 func (x *CreateScheduleRequest) Reset() {
 	*x = CreateScheduleRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	mi := &file_vmon_v1_api_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9195,7 +9467,7 @@ func (x *CreateScheduleRequest) String() string {
 func (*CreateScheduleRequest) ProtoMessage() {}
 
 func (x *CreateScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[116]
+	mi := &file_vmon_v1_api_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9208,7 +9480,7 @@ func (x *CreateScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{116}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *CreateScheduleRequest) GetScheduleIdPresence() isCreateScheduleRequest_ScheduleIdPresence {
@@ -9277,7 +9549,7 @@ type ListSchedulesRequest struct {
 
 func (x *ListSchedulesRequest) Reset() {
 	*x = ListSchedulesRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[117]
+	mi := &file_vmon_v1_api_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9289,7 +9561,7 @@ func (x *ListSchedulesRequest) String() string {
 func (*ListSchedulesRequest) ProtoMessage() {}
 
 func (x *ListSchedulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[117]
+	mi := &file_vmon_v1_api_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9302,7 +9574,7 @@ func (x *ListSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListSchedulesRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{117}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *ListSchedulesRequest) GetAppPresence() isListSchedulesRequest_AppPresence {
@@ -9386,7 +9658,7 @@ type ListSchedulesResponse struct {
 
 func (x *ListSchedulesResponse) Reset() {
 	*x = ListSchedulesResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[118]
+	mi := &file_vmon_v1_api_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9398,7 +9670,7 @@ func (x *ListSchedulesResponse) String() string {
 func (*ListSchedulesResponse) ProtoMessage() {}
 
 func (x *ListSchedulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[118]
+	mi := &file_vmon_v1_api_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9411,7 +9683,7 @@ func (x *ListSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListSchedulesResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{118}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *ListSchedulesResponse) GetSchedules() []*ScheduleRecord {
@@ -9439,7 +9711,7 @@ type CallRef struct {
 
 func (x *CallRef) Reset() {
 	*x = CallRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[119]
+	mi := &file_vmon_v1_api_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9451,7 +9723,7 @@ func (x *CallRef) String() string {
 func (*CallRef) ProtoMessage() {}
 
 func (x *CallRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[119]
+	mi := &file_vmon_v1_api_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9464,7 +9736,7 @@ func (x *CallRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallRef.ProtoReflect.Descriptor instead.
 func (*CallRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{119}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *CallRef) GetCallId() string {
@@ -9485,7 +9757,7 @@ type ActorRef struct {
 
 func (x *ActorRef) Reset() {
 	*x = ActorRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[120]
+	mi := &file_vmon_v1_api_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9497,7 +9769,7 @@ func (x *ActorRef) String() string {
 func (*ActorRef) ProtoMessage() {}
 
 func (x *ActorRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[120]
+	mi := &file_vmon_v1_api_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9510,7 +9782,7 @@ func (x *ActorRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorRef.ProtoReflect.Descriptor instead.
 func (*ActorRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{120}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *ActorRef) GetActorId() string {
@@ -9533,7 +9805,7 @@ type InvocationArguments struct {
 
 func (x *InvocationArguments) Reset() {
 	*x = InvocationArguments{}
-	mi := &file_vmon_v1_api_proto_msgTypes[121]
+	mi := &file_vmon_v1_api_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9545,7 +9817,7 @@ func (x *InvocationArguments) String() string {
 func (*InvocationArguments) ProtoMessage() {}
 
 func (x *InvocationArguments) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[121]
+	mi := &file_vmon_v1_api_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9558,7 +9830,7 @@ func (x *InvocationArguments) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvocationArguments.ProtoReflect.Descriptor instead.
 func (*InvocationArguments) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{121}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *InvocationArguments) GetPositional() []*ValueEnvelope {
@@ -9588,7 +9860,7 @@ type ActorTarget struct {
 
 func (x *ActorTarget) Reset() {
 	*x = ActorTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[122]
+	mi := &file_vmon_v1_api_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9600,7 +9872,7 @@ func (x *ActorTarget) String() string {
 func (*ActorTarget) ProtoMessage() {}
 
 func (x *ActorTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[122]
+	mi := &file_vmon_v1_api_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9613,7 +9885,7 @@ func (x *ActorTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorTarget.ProtoReflect.Descriptor instead.
 func (*ActorTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{122}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *ActorTarget) GetActor() *ActorRef {
@@ -9645,7 +9917,7 @@ type ServiceTarget struct {
 
 func (x *ServiceTarget) Reset() {
 	*x = ServiceTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[123]
+	mi := &file_vmon_v1_api_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9657,7 +9929,7 @@ func (x *ServiceTarget) String() string {
 func (*ServiceTarget) ProtoMessage() {}
 
 func (x *ServiceTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[123]
+	mi := &file_vmon_v1_api_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9670,7 +9942,7 @@ func (x *ServiceTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServiceTarget.ProtoReflect.Descriptor instead.
 func (*ServiceTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{123}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *ServiceTarget) GetServiceKey() string {
@@ -9707,7 +9979,7 @@ type ParentEdge struct {
 
 func (x *ParentEdge) Reset() {
 	*x = ParentEdge{}
-	mi := &file_vmon_v1_api_proto_msgTypes[124]
+	mi := &file_vmon_v1_api_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9719,7 +9991,7 @@ func (x *ParentEdge) String() string {
 func (*ParentEdge) ProtoMessage() {}
 
 func (x *ParentEdge) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[124]
+	mi := &file_vmon_v1_api_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9732,7 +10004,7 @@ func (x *ParentEdge) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParentEdge.ProtoReflect.Descriptor instead.
 func (*ParentEdge) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{124}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *ParentEdge) GetCallId() string {
@@ -9767,7 +10039,7 @@ type CallTarget struct {
 
 func (x *CallTarget) Reset() {
 	*x = CallTarget{}
-	mi := &file_vmon_v1_api_proto_msgTypes[125]
+	mi := &file_vmon_v1_api_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9779,7 +10051,7 @@ func (x *CallTarget) String() string {
 func (*CallTarget) ProtoMessage() {}
 
 func (x *CallTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[125]
+	mi := &file_vmon_v1_api_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9792,7 +10064,7 @@ func (x *CallTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallTarget.ProtoReflect.Descriptor instead.
 func (*CallTarget) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{125}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *CallTarget) GetFunction() *RevisionRef {
@@ -9865,7 +10137,7 @@ type CallInput struct {
 
 func (x *CallInput) Reset() {
 	*x = CallInput{}
-	mi := &file_vmon_v1_api_proto_msgTypes[126]
+	mi := &file_vmon_v1_api_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9877,7 +10149,7 @@ func (x *CallInput) String() string {
 func (*CallInput) ProtoMessage() {}
 
 func (x *CallInput) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[126]
+	mi := &file_vmon_v1_api_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9890,7 +10162,7 @@ func (x *CallInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallInput.ProtoReflect.Descriptor instead.
 func (*CallInput) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{126}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *CallInput) GetIndex() uint64 {
@@ -9963,7 +10235,7 @@ type InputRef struct {
 
 func (x *InputRef) Reset() {
 	*x = InputRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[127]
+	mi := &file_vmon_v1_api_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9975,7 +10247,7 @@ func (x *InputRef) String() string {
 func (*InputRef) ProtoMessage() {}
 
 func (x *InputRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[127]
+	mi := &file_vmon_v1_api_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9988,7 +10260,7 @@ func (x *InputRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputRef.ProtoReflect.Descriptor instead.
 func (*InputRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{127}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *InputRef) GetInputId() string {
@@ -10022,7 +10294,7 @@ type CallGraph struct {
 
 func (x *CallGraph) Reset() {
 	*x = CallGraph{}
-	mi := &file_vmon_v1_api_proto_msgTypes[128]
+	mi := &file_vmon_v1_api_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10034,7 +10306,7 @@ func (x *CallGraph) String() string {
 func (*CallGraph) ProtoMessage() {}
 
 func (x *CallGraph) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[128]
+	mi := &file_vmon_v1_api_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10047,7 +10319,7 @@ func (x *CallGraph) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallGraph.ProtoReflect.Descriptor instead.
 func (*CallGraph) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{128}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *CallGraph) GetParents() []*ParentEdge {
@@ -10113,7 +10385,7 @@ type CreateCallRequest struct {
 
 func (x *CreateCallRequest) Reset() {
 	*x = CreateCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	mi := &file_vmon_v1_api_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10125,7 +10397,7 @@ func (x *CreateCallRequest) String() string {
 func (*CreateCallRequest) ProtoMessage() {}
 
 func (x *CreateCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[129]
+	mi := &file_vmon_v1_api_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10138,7 +10410,7 @@ func (x *CreateCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCallRequest.ProtoReflect.Descriptor instead.
 func (*CreateCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{129}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *CreateCallRequest) GetType() CallType {
@@ -10258,7 +10530,7 @@ type CallRecord struct {
 
 func (x *CallRecord) Reset() {
 	*x = CallRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	mi := &file_vmon_v1_api_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10270,7 +10542,7 @@ func (x *CallRecord) String() string {
 func (*CallRecord) ProtoMessage() {}
 
 func (x *CallRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[130]
+	mi := &file_vmon_v1_api_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10283,7 +10555,7 @@ func (x *CallRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallRecord.ProtoReflect.Descriptor instead.
 func (*CallRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{130}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *CallRecord) GetRef() *CallRef {
@@ -10420,7 +10692,7 @@ type StreamCallInputsRequest struct {
 
 func (x *StreamCallInputsRequest) Reset() {
 	*x = StreamCallInputsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[131]
+	mi := &file_vmon_v1_api_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10432,7 +10704,7 @@ func (x *StreamCallInputsRequest) String() string {
 func (*StreamCallInputsRequest) ProtoMessage() {}
 
 func (x *StreamCallInputsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[131]
+	mi := &file_vmon_v1_api_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10445,7 +10717,7 @@ func (x *StreamCallInputsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamCallInputsRequest.ProtoReflect.Descriptor instead.
 func (*StreamCallInputsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{131}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *StreamCallInputsRequest) GetFrame() isStreamCallInputsRequest_Frame {
@@ -10512,7 +10784,7 @@ type StreamCallInputsResponse struct {
 
 func (x *StreamCallInputsResponse) Reset() {
 	*x = StreamCallInputsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[132]
+	mi := &file_vmon_v1_api_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10524,7 +10796,7 @@ func (x *StreamCallInputsResponse) String() string {
 func (*StreamCallInputsResponse) ProtoMessage() {}
 
 func (x *StreamCallInputsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[132]
+	mi := &file_vmon_v1_api_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10537,7 +10809,7 @@ func (x *StreamCallInputsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamCallInputsResponse.ProtoReflect.Descriptor instead.
 func (*StreamCallInputsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{132}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *StreamCallInputsResponse) GetCall() *CallRef {
@@ -10601,7 +10873,7 @@ type CloseCallInputsRequest struct {
 
 func (x *CloseCallInputsRequest) Reset() {
 	*x = CloseCallInputsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[133]
+	mi := &file_vmon_v1_api_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10613,7 +10885,7 @@ func (x *CloseCallInputsRequest) String() string {
 func (*CloseCallInputsRequest) ProtoMessage() {}
 
 func (x *CloseCallInputsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[133]
+	mi := &file_vmon_v1_api_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10626,7 +10898,7 @@ func (x *CloseCallInputsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseCallInputsRequest.ProtoReflect.Descriptor instead.
 func (*CloseCallInputsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{133}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *CloseCallInputsRequest) GetCall() *CallRef {
@@ -10680,7 +10952,7 @@ type ListCallsRequest struct {
 
 func (x *ListCallsRequest) Reset() {
 	*x = ListCallsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[134]
+	mi := &file_vmon_v1_api_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10692,7 +10964,7 @@ func (x *ListCallsRequest) String() string {
 func (*ListCallsRequest) ProtoMessage() {}
 
 func (x *ListCallsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[134]
+	mi := &file_vmon_v1_api_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10705,7 +10977,7 @@ func (x *ListCallsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallsRequest.ProtoReflect.Descriptor instead.
 func (*ListCallsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{134}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *ListCallsRequest) GetFunctionPresence() isListCallsRequest_FunctionPresence {
@@ -10843,7 +11115,7 @@ type ListCallsResponse struct {
 
 func (x *ListCallsResponse) Reset() {
 	*x = ListCallsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[135]
+	mi := &file_vmon_v1_api_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10855,7 +11127,7 @@ func (x *ListCallsResponse) String() string {
 func (*ListCallsResponse) ProtoMessage() {}
 
 func (x *ListCallsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[135]
+	mi := &file_vmon_v1_api_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10868,7 +11140,7 @@ func (x *ListCallsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallsResponse.ProtoReflect.Descriptor instead.
 func (*ListCallsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{135}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *ListCallsResponse) GetCalls() []*CallRecord {
@@ -10898,7 +11170,7 @@ type GetCallResultRequest struct {
 
 func (x *GetCallResultRequest) Reset() {
 	*x = GetCallResultRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[136]
+	mi := &file_vmon_v1_api_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10910,7 +11182,7 @@ func (x *GetCallResultRequest) String() string {
 func (*GetCallResultRequest) ProtoMessage() {}
 
 func (x *GetCallResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[136]
+	mi := &file_vmon_v1_api_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10923,7 +11195,7 @@ func (x *GetCallResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCallResultRequest.ProtoReflect.Descriptor instead.
 func (*GetCallResultRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{136}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *GetCallResultRequest) GetCall() *CallRef {
@@ -10974,7 +11246,7 @@ type CallResult struct {
 
 func (x *CallResult) Reset() {
 	*x = CallResult{}
-	mi := &file_vmon_v1_api_proto_msgTypes[137]
+	mi := &file_vmon_v1_api_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10986,7 +11258,7 @@ func (x *CallResult) String() string {
 func (*CallResult) ProtoMessage() {}
 
 func (x *CallResult) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[137]
+	mi := &file_vmon_v1_api_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10999,7 +11271,7 @@ func (x *CallResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallResult.ProtoReflect.Descriptor instead.
 func (*CallResult) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{137}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *CallResult) GetCall() *CallRef {
@@ -11127,7 +11399,7 @@ type ResultCursor struct {
 
 func (x *ResultCursor) Reset() {
 	*x = ResultCursor{}
-	mi := &file_vmon_v1_api_proto_msgTypes[138]
+	mi := &file_vmon_v1_api_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11139,7 +11411,7 @@ func (x *ResultCursor) String() string {
 func (*ResultCursor) ProtoMessage() {}
 
 func (x *ResultCursor) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[138]
+	mi := &file_vmon_v1_api_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11152,7 +11424,7 @@ func (x *ResultCursor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResultCursor.ProtoReflect.Descriptor instead.
 func (*ResultCursor) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{138}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *ResultCursor) GetCall() *CallRef {
@@ -11182,7 +11454,7 @@ type EventCursor struct {
 
 func (x *EventCursor) Reset() {
 	*x = EventCursor{}
-	mi := &file_vmon_v1_api_proto_msgTypes[139]
+	mi := &file_vmon_v1_api_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11194,7 +11466,7 @@ func (x *EventCursor) String() string {
 func (*EventCursor) ProtoMessage() {}
 
 func (x *EventCursor) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[139]
+	mi := &file_vmon_v1_api_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11207,7 +11479,7 @@ func (x *EventCursor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventCursor.ProtoReflect.Descriptor instead.
 func (*EventCursor) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{139}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *EventCursor) GetCall() *CallRef {
@@ -11237,7 +11509,7 @@ type ListCallResultsRequest struct {
 
 func (x *ListCallResultsRequest) Reset() {
 	*x = ListCallResultsRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[140]
+	mi := &file_vmon_v1_api_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11249,7 +11521,7 @@ func (x *ListCallResultsRequest) String() string {
 func (*ListCallResultsRequest) ProtoMessage() {}
 
 func (x *ListCallResultsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[140]
+	mi := &file_vmon_v1_api_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11262,7 +11534,7 @@ func (x *ListCallResultsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallResultsRequest.ProtoReflect.Descriptor instead.
 func (*ListCallResultsRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{140}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *ListCallResultsRequest) GetCursor() *ResultCursor {
@@ -11294,7 +11566,7 @@ type ListCallResultsResponse struct {
 
 func (x *ListCallResultsResponse) Reset() {
 	*x = ListCallResultsResponse{}
-	mi := &file_vmon_v1_api_proto_msgTypes[141]
+	mi := &file_vmon_v1_api_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11306,7 +11578,7 @@ func (x *ListCallResultsResponse) String() string {
 func (*ListCallResultsResponse) ProtoMessage() {}
 
 func (x *ListCallResultsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[141]
+	mi := &file_vmon_v1_api_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11319,7 +11591,7 @@ func (x *ListCallResultsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCallResultsResponse.ProtoReflect.Descriptor instead.
 func (*ListCallResultsResponse) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{141}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *ListCallResultsResponse) GetResults() []*CallResult {
@@ -11356,7 +11628,7 @@ type WatchCallRequest struct {
 
 func (x *WatchCallRequest) Reset() {
 	*x = WatchCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[142]
+	mi := &file_vmon_v1_api_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11368,7 +11640,7 @@ func (x *WatchCallRequest) String() string {
 func (*WatchCallRequest) ProtoMessage() {}
 
 func (x *WatchCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[142]
+	mi := &file_vmon_v1_api_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11381,7 +11653,7 @@ func (x *WatchCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchCallRequest.ProtoReflect.Descriptor instead.
 func (*WatchCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{142}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *WatchCallRequest) GetCursor() *EventCursor {
@@ -11409,7 +11681,7 @@ type StatusEvent struct {
 
 func (x *StatusEvent) Reset() {
 	*x = StatusEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[143]
+	mi := &file_vmon_v1_api_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11421,7 +11693,7 @@ func (x *StatusEvent) String() string {
 func (*StatusEvent) ProtoMessage() {}
 
 func (x *StatusEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[143]
+	mi := &file_vmon_v1_api_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11434,7 +11706,7 @@ func (x *StatusEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusEvent.ProtoReflect.Descriptor instead.
 func (*StatusEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{143}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *StatusEvent) GetStatus() CallStatus {
@@ -11457,7 +11729,7 @@ type LogEvent struct {
 
 func (x *LogEvent) Reset() {
 	*x = LogEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[144]
+	mi := &file_vmon_v1_api_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11469,7 +11741,7 @@ func (x *LogEvent) String() string {
 func (*LogEvent) ProtoMessage() {}
 
 func (x *LogEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[144]
+	mi := &file_vmon_v1_api_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11482,7 +11754,7 @@ func (x *LogEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEvent.ProtoReflect.Descriptor instead.
 func (*LogEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{144}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{148}
 }
 
 func (x *LogEvent) GetStream() LogStream {
@@ -11528,7 +11800,7 @@ type AttemptEvent struct {
 
 func (x *AttemptEvent) Reset() {
 	*x = AttemptEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[145]
+	mi := &file_vmon_v1_api_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11540,7 +11812,7 @@ func (x *AttemptEvent) String() string {
 func (*AttemptEvent) ProtoMessage() {}
 
 func (x *AttemptEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[145]
+	mi := &file_vmon_v1_api_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11553,7 +11825,7 @@ func (x *AttemptEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptEvent.ProtoReflect.Descriptor instead.
 func (*AttemptEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{145}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{149}
 }
 
 func (x *AttemptEvent) GetAttemptId() string {
@@ -11680,7 +11952,7 @@ type CallEvent struct {
 
 func (x *CallEvent) Reset() {
 	*x = CallEvent{}
-	mi := &file_vmon_v1_api_proto_msgTypes[146]
+	mi := &file_vmon_v1_api_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11692,7 +11964,7 @@ func (x *CallEvent) String() string {
 func (*CallEvent) ProtoMessage() {}
 
 func (x *CallEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[146]
+	mi := &file_vmon_v1_api_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11705,7 +11977,7 @@ func (x *CallEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallEvent.ProtoReflect.Descriptor instead.
 func (*CallEvent) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{146}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{150}
 }
 
 func (x *CallEvent) GetCall() *CallRef {
@@ -11977,7 +12249,7 @@ type ErrorFrame struct {
 
 func (x *ErrorFrame) Reset() {
 	*x = ErrorFrame{}
-	mi := &file_vmon_v1_api_proto_msgTypes[147]
+	mi := &file_vmon_v1_api_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11989,7 +12261,7 @@ func (x *ErrorFrame) String() string {
 func (*ErrorFrame) ProtoMessage() {}
 
 func (x *ErrorFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[147]
+	mi := &file_vmon_v1_api_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12002,7 +12274,7 @@ func (x *ErrorFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorFrame.ProtoReflect.Descriptor instead.
 func (*ErrorFrame) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{147}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{151}
 }
 
 func (x *ErrorFrame) GetFile() string {
@@ -12080,7 +12352,7 @@ type CallError struct {
 
 func (x *CallError) Reset() {
 	*x = CallError{}
-	mi := &file_vmon_v1_api_proto_msgTypes[148]
+	mi := &file_vmon_v1_api_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12092,7 +12364,7 @@ func (x *CallError) String() string {
 func (*CallError) ProtoMessage() {}
 
 func (x *CallError) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[148]
+	mi := &file_vmon_v1_api_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12105,7 +12377,7 @@ func (x *CallError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallError.ProtoReflect.Descriptor instead.
 func (*CallError) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{148}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{152}
 }
 
 func (x *CallError) GetCode() string {
@@ -12206,7 +12478,7 @@ type AttemptStats struct {
 
 func (x *AttemptStats) Reset() {
 	*x = AttemptStats{}
-	mi := &file_vmon_v1_api_proto_msgTypes[149]
+	mi := &file_vmon_v1_api_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12218,7 +12490,7 @@ func (x *AttemptStats) String() string {
 func (*AttemptStats) ProtoMessage() {}
 
 func (x *AttemptStats) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[149]
+	mi := &file_vmon_v1_api_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12231,7 +12503,7 @@ func (x *AttemptStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptStats.ProtoReflect.Descriptor instead.
 func (*AttemptStats) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{149}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{153}
 }
 
 func (x *AttemptStats) GetAttemptId() string {
@@ -12327,7 +12599,7 @@ type CallStats struct {
 
 func (x *CallStats) Reset() {
 	*x = CallStats{}
-	mi := &file_vmon_v1_api_proto_msgTypes[150]
+	mi := &file_vmon_v1_api_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12339,7 +12611,7 @@ func (x *CallStats) String() string {
 func (*CallStats) ProtoMessage() {}
 
 func (x *CallStats) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[150]
+	mi := &file_vmon_v1_api_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12352,7 +12624,7 @@ func (x *CallStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallStats.ProtoReflect.Descriptor instead.
 func (*CallStats) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{150}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{154}
 }
 
 func (x *CallStats) GetQueueMillis() uint64 {
@@ -12419,7 +12691,7 @@ type CancelCallRequest struct {
 
 func (x *CancelCallRequest) Reset() {
 	*x = CancelCallRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[151]
+	mi := &file_vmon_v1_api_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12431,7 +12703,7 @@ func (x *CancelCallRequest) String() string {
 func (*CancelCallRequest) ProtoMessage() {}
 
 func (x *CancelCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[151]
+	mi := &file_vmon_v1_api_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12444,7 +12716,7 @@ func (x *CancelCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelCallRequest.ProtoReflect.Descriptor instead.
 func (*CancelCallRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{151}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{155}
 }
 
 func (x *CancelCallRequest) GetCall() *CallRef {
@@ -12479,7 +12751,7 @@ type ActorCheckpointRef struct {
 
 func (x *ActorCheckpointRef) Reset() {
 	*x = ActorCheckpointRef{}
-	mi := &file_vmon_v1_api_proto_msgTypes[152]
+	mi := &file_vmon_v1_api_proto_msgTypes[156]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12491,7 +12763,7 @@ func (x *ActorCheckpointRef) String() string {
 func (*ActorCheckpointRef) ProtoMessage() {}
 
 func (x *ActorCheckpointRef) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[152]
+	mi := &file_vmon_v1_api_proto_msgTypes[156]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12504,7 +12776,7 @@ func (x *ActorCheckpointRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorCheckpointRef.ProtoReflect.Descriptor instead.
 func (*ActorCheckpointRef) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{152}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{156}
 }
 
 func (x *ActorCheckpointRef) GetCheckpointId() string {
@@ -12541,7 +12813,7 @@ type ActorRecord struct {
 
 func (x *ActorRecord) Reset() {
 	*x = ActorRecord{}
-	mi := &file_vmon_v1_api_proto_msgTypes[153]
+	mi := &file_vmon_v1_api_proto_msgTypes[157]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12553,7 +12825,7 @@ func (x *ActorRecord) String() string {
 func (*ActorRecord) ProtoMessage() {}
 
 func (x *ActorRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[153]
+	mi := &file_vmon_v1_api_proto_msgTypes[157]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12566,7 +12838,7 @@ func (x *ActorRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorRecord.ProtoReflect.Descriptor instead.
 func (*ActorRecord) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{153}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{157}
 }
 
 func (x *ActorRecord) GetRef() *ActorRef {
@@ -12659,7 +12931,7 @@ type ActorCheckpoint struct {
 
 func (x *ActorCheckpoint) Reset() {
 	*x = ActorCheckpoint{}
-	mi := &file_vmon_v1_api_proto_msgTypes[154]
+	mi := &file_vmon_v1_api_proto_msgTypes[158]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12671,7 +12943,7 @@ func (x *ActorCheckpoint) String() string {
 func (*ActorCheckpoint) ProtoMessage() {}
 
 func (x *ActorCheckpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[154]
+	mi := &file_vmon_v1_api_proto_msgTypes[158]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12684,7 +12956,7 @@ func (x *ActorCheckpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActorCheckpoint.ProtoReflect.Descriptor instead.
 func (*ActorCheckpoint) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{154}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{158}
 }
 
 func (x *ActorCheckpoint) GetRef() *ActorCheckpointRef {
@@ -12751,7 +13023,7 @@ type CreateActorRequest struct {
 
 func (x *CreateActorRequest) Reset() {
 	*x = CreateActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[155]
+	mi := &file_vmon_v1_api_proto_msgTypes[159]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12763,7 +13035,7 @@ func (x *CreateActorRequest) String() string {
 func (*CreateActorRequest) ProtoMessage() {}
 
 func (x *CreateActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[155]
+	mi := &file_vmon_v1_api_proto_msgTypes[159]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12776,7 +13048,7 @@ func (x *CreateActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateActorRequest.ProtoReflect.Descriptor instead.
 func (*CreateActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{155}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{159}
 }
 
 func (x *CreateActorRequest) GetFunction() *RevisionRef {
@@ -12856,7 +13128,7 @@ type CheckpointActorRequest struct {
 
 func (x *CheckpointActorRequest) Reset() {
 	*x = CheckpointActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[156]
+	mi := &file_vmon_v1_api_proto_msgTypes[160]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12868,7 +13140,7 @@ func (x *CheckpointActorRequest) String() string {
 func (*CheckpointActorRequest) ProtoMessage() {}
 
 func (x *CheckpointActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[156]
+	mi := &file_vmon_v1_api_proto_msgTypes[160]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12881,7 +13153,7 @@ func (x *CheckpointActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointActorRequest.ProtoReflect.Descriptor instead.
 func (*CheckpointActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{156}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{160}
 }
 
 func (x *CheckpointActorRequest) GetActor() *ActorRef {
@@ -12913,7 +13185,7 @@ type RestoreActorRequest struct {
 
 func (x *RestoreActorRequest) Reset() {
 	*x = RestoreActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[157]
+	mi := &file_vmon_v1_api_proto_msgTypes[161]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12925,7 +13197,7 @@ func (x *RestoreActorRequest) String() string {
 func (*RestoreActorRequest) ProtoMessage() {}
 
 func (x *RestoreActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[157]
+	mi := &file_vmon_v1_api_proto_msgTypes[161]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12938,7 +13210,7 @@ func (x *RestoreActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreActorRequest.ProtoReflect.Descriptor instead.
 func (*RestoreActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{157}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{161}
 }
 
 func (x *RestoreActorRequest) GetActor() *ActorRef {
@@ -12977,7 +13249,7 @@ type ForkActorRequest struct {
 
 func (x *ForkActorRequest) Reset() {
 	*x = ForkActorRequest{}
-	mi := &file_vmon_v1_api_proto_msgTypes[158]
+	mi := &file_vmon_v1_api_proto_msgTypes[162]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12989,7 +13261,7 @@ func (x *ForkActorRequest) String() string {
 func (*ForkActorRequest) ProtoMessage() {}
 
 func (x *ForkActorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vmon_v1_api_proto_msgTypes[158]
+	mi := &file_vmon_v1_api_proto_msgTypes[162]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13002,7 +13274,7 @@ func (x *ForkActorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkActorRequest.ProtoReflect.Descriptor instead.
 func (*ForkActorRequest) Descriptor() ([]byte, []int) {
-	return file_vmon_v1_api_proto_rawDescGZIP(), []int{158}
+	return file_vmon_v1_api_proto_rawDescGZIP(), []int{162}
 }
 
 func (x *ForkActorRequest) GetCheckpoint() *ActorCheckpointRef {
@@ -13036,9 +13308,25 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	"\x02Ok\"\x1c\n" +
 	"\n" +
 	"SandboxRef\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"3\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"L\n" +
 	"\x14CreateSandboxRequest\x12\x1b\n" +
-	"\tspec_json\x18\x01 \x01(\tR\bspecJson\"*\n" +
+	"\tspec_json\x18\x01 \x01(\tR\bspecJson\x12\x17\n" +
+	"\ano_wait\x18\x02 \x01(\bR\x06noWait\"]\n" +
+	"\x12BatchCreateRequest\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x04R\x03seq\x125\n" +
+	"\x06create\x18\x02 \x01(\v2\x1d.vmon.v1.CreateSandboxRequestR\x06create\"@\n" +
+	"\x10BatchCreateError\x12\x12\n" +
+	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"{\n" +
+	"\x13BatchCreateResponse\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x14\n" +
+	"\x04json\x18\x02 \x01(\tH\x00R\x04json\x121\n" +
+	"\x05error\x18\x03 \x01(\v2\x19.vmon.v1.BatchCreateErrorH\x00R\x05errorB\t\n" +
+	"\aoutcome\"F\n" +
+	"\x13WatchSandboxRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
+	"\vuntil_ready\x18\x02 \x01(\bR\n" +
+	"untilReady\"*\n" +
 	"\x14ListSandboxesRequest\x12\x12\n" +
 	"\x04tags\x18\x01 \x03(\tR\x04tags\">\n" +
 	"\x15ListSandboxesResponse\x12%\n" +
@@ -13984,9 +14272,11 @@ const file_vmon_v1_api_proto_rawDesc = "" +
 	" ATTEMPT_FAILURE_KIND_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19ATTEMPT_FAILURE_KIND_USER\x10\x01\x12'\n" +
 	"#ATTEMPT_FAILURE_KIND_INFRASTRUCTURE\x10\x02\x12\"\n" +
-	"\x1eATTEMPT_FAILURE_KIND_CANCELLED\x10\x032\xed\f\n" +
+	"\x1eATTEMPT_FAILURE_KIND_CANCELLED\x10\x032\xf7\r\n" +
 	"\x0eSandboxService\x12:\n" +
-	"\x06Create\x12\x1d.vmon.v1.CreateSandboxRequest\x1a\x11.vmon.v1.JsonView\x12E\n" +
+	"\x06Create\x12\x1d.vmon.v1.CreateSandboxRequest\x1a\x11.vmon.v1.JsonView\x12L\n" +
+	"\vBatchCreate\x12\x1b.vmon.v1.BatchCreateRequest\x1a\x1c.vmon.v1.BatchCreateResponse(\x010\x01\x12:\n" +
+	"\x05Watch\x12\x1c.vmon.v1.WatchSandboxRequest\x1a\x11.vmon.v1.JsonView0\x01\x12E\n" +
 	"\x04List\x12\x1d.vmon.v1.ListSandboxesRequest\x1a\x1e.vmon.v1.ListSandboxesResponse\x12-\n" +
 	"\x03Get\x12\x13.vmon.v1.SandboxRef\x1a\x11.vmon.v1.JsonView\x126\n" +
 	"\x04Stop\x12\x1b.vmon.v1.StopSandboxRequest\x1a\x11.vmon.v1.JsonView\x120\n" +
@@ -14090,7 +14380,7 @@ func file_vmon_v1_api_proto_rawDescGZIP() []byte {
 }
 
 var file_vmon_v1_api_proto_enumTypes = make([]protoimpl.EnumInfo, 18)
-var file_vmon_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 171)
+var file_vmon_v1_api_proto_msgTypes = make([]protoimpl.MessageInfo, 175)
 var file_vmon_v1_api_proto_goTypes = []any{
 	(Stream)(0),                      // 0: vmon.v1.Stream
 	(DigestAlgorithm)(0),             // 1: vmon.v1.DigestAlgorithm
@@ -14114,543 +14404,553 @@ var file_vmon_v1_api_proto_goTypes = []any{
 	(*Ok)(nil),                       // 19: vmon.v1.Ok
 	(*SandboxRef)(nil),               // 20: vmon.v1.SandboxRef
 	(*CreateSandboxRequest)(nil),     // 21: vmon.v1.CreateSandboxRequest
-	(*ListSandboxesRequest)(nil),     // 22: vmon.v1.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),    // 23: vmon.v1.ListSandboxesResponse
-	(*StopSandboxRequest)(nil),       // 24: vmon.v1.StopSandboxRequest
-	(*RollbackSandboxRequest)(nil),   // 25: vmon.v1.RollbackSandboxRequest
-	(*ExtendSandboxRequest)(nil),     // 26: vmon.v1.ExtendSandboxRequest
-	(*LogsRequest)(nil),              // 27: vmon.v1.LogsRequest
-	(*LogChunk)(nil),                 // 28: vmon.v1.LogChunk
-	(*ExecStart)(nil),                // 29: vmon.v1.ExecStart
-	(*ExecCaptureRequest)(nil),       // 30: vmon.v1.ExecCaptureRequest
-	(*ExecCaptureResponse)(nil),      // 31: vmon.v1.ExecCaptureResponse
-	(*ExecInput)(nil),                // 32: vmon.v1.ExecInput
-	(*ExecOutput)(nil),               // 33: vmon.v1.ExecOutput
-	(*FilePathRequest)(nil),          // 34: vmon.v1.FilePathRequest
-	(*FileContent)(nil),              // 35: vmon.v1.FileContent
-	(*FileWriteRequest)(nil),         // 36: vmon.v1.FileWriteRequest
-	(*FileDeleteRequest)(nil),        // 37: vmon.v1.FileDeleteRequest
-	(*StringList)(nil),               // 38: vmon.v1.StringList
-	(*NetworkSetRequest)(nil),        // 39: vmon.v1.NetworkSetRequest
-	(*MigrateRequest)(nil),           // 40: vmon.v1.MigrateRequest
-	(*SnapshotRequest)(nil),          // 41: vmon.v1.SnapshotRequest
-	(*SnapshotFsRequest)(nil),        // 42: vmon.v1.SnapshotFsRequest
-	(*ListSnapshotsRequest)(nil),     // 43: vmon.v1.ListSnapshotsRequest
-	(*SnapshotList)(nil),             // 44: vmon.v1.SnapshotList
-	(*SnapshotRef)(nil),              // 45: vmon.v1.SnapshotRef
-	(*RecoveryPoint)(nil),            // 46: vmon.v1.RecoveryPoint
-	(*RecoveryPointList)(nil),        // 47: vmon.v1.RecoveryPointList
-	(*ListCredentialsRequest)(nil),   // 48: vmon.v1.ListCredentialsRequest
-	(*CredentialHeader)(nil),         // 49: vmon.v1.CredentialHeader
-	(*PutCredentialRequest)(nil),     // 50: vmon.v1.PutCredentialRequest
-	(*CredentialRef)(nil),            // 51: vmon.v1.CredentialRef
-	(*DeleteCredentialRequest)(nil),  // 52: vmon.v1.DeleteCredentialRequest
-	(*CredentialRecord)(nil),         // 53: vmon.v1.CredentialRecord
-	(*CredentialList)(nil),           // 54: vmon.v1.CredentialList
-	(*RestoreSnapshotRequest)(nil),   // 55: vmon.v1.RestoreSnapshotRequest
-	(*ForkSnapshotRequest)(nil),      // 56: vmon.v1.ForkSnapshotRequest
-	(*ListVolumesRequest)(nil),       // 57: vmon.v1.ListVolumesRequest
-	(*VolumeList)(nil),               // 58: vmon.v1.VolumeList
-	(*VolumeRef)(nil),                // 59: vmon.v1.VolumeRef
-	(*ListPoolsRequest)(nil),         // 60: vmon.v1.ListPoolsRequest
-	(*PoolSetRequest)(nil),           // 61: vmon.v1.PoolSetRequest
-	(*PoolRef)(nil),                  // 62: vmon.v1.PoolRef
-	(*InfoRequest)(nil),              // 63: vmon.v1.InfoRequest
-	(*MeshStatusRequest)(nil),        // 64: vmon.v1.MeshStatusRequest
-	(*EventsRequest)(nil),            // 65: vmon.v1.EventsRequest
-	(*Eof)(nil),                      // 66: vmon.v1.Eof
-	(*Resize)(nil),                   // 67: vmon.v1.Resize
-	(*Output)(nil),                   // 68: vmon.v1.Output
-	(*Exit)(nil),                     // 69: vmon.v1.Exit
-	(*Ready)(nil),                    // 70: vmon.v1.Ready
-	(*Digest)(nil),                   // 71: vmon.v1.Digest
-	(*ArtifactRef)(nil),              // 72: vmon.v1.ArtifactRef
-	(*ArtifactRecord)(nil),           // 73: vmon.v1.ArtifactRecord
-	(*PutArtifactHeader)(nil),        // 74: vmon.v1.PutArtifactHeader
-	(*PutArtifactRequest)(nil),       // 75: vmon.v1.PutArtifactRequest
-	(*GetArtifactRequest)(nil),       // 76: vmon.v1.GetArtifactRequest
-	(*ByteRange)(nil),                // 77: vmon.v1.ByteRange
-	(*ArtifactChunk)(nil),            // 78: vmon.v1.ArtifactChunk
-	(*PythonCodecMetadata)(nil),      // 79: vmon.v1.PythonCodecMetadata
-	(*ValueEnvelope)(nil),            // 80: vmon.v1.ValueEnvelope
-	(*FunctionRef)(nil),              // 81: vmon.v1.FunctionRef
-	(*RevisionRef)(nil),              // 82: vmon.v1.RevisionRef
-	(*FunctionSelector)(nil),         // 83: vmon.v1.FunctionSelector
-	(*AppRef)(nil),                   // 84: vmon.v1.AppRef
-	(*AppRevisionRef)(nil),           // 85: vmon.v1.AppRevisionRef
-	(*AppSelector)(nil),              // 86: vmon.v1.AppSelector
-	(*PackageSpec)(nil),              // 87: vmon.v1.PackageSpec
-	(*ImageSpec)(nil),                // 88: vmon.v1.ImageSpec
-	(*ResourceSpec)(nil),             // 89: vmon.v1.ResourceSpec
-	(*PythonCodeMetadata)(nil),       // 90: vmon.v1.PythonCodeMetadata
-	(*PythonImageSource)(nil),        // 91: vmon.v1.PythonImageSource
-	(*RegistryImageSource)(nil),      // 92: vmon.v1.RegistryImageSource
-	(*DockerfileImageSource)(nil),    // 93: vmon.v1.DockerfileImageSource
-	(*TemplateImageSource)(nil),      // 94: vmon.v1.TemplateImageSource
-	(*AptPackage)(nil),               // 95: vmon.v1.AptPackage
-	(*UvPackage)(nil),                // 96: vmon.v1.UvPackage
-	(*ImageBuildCommand)(nil),        // 97: vmon.v1.ImageBuildCommand
-	(*LocalArtifactMount)(nil),       // 98: vmon.v1.LocalArtifactMount
-	(*FunctionVolumeMount)(nil),      // 99: vmon.v1.FunctionVolumeMount
-	(*NetworkPolicy)(nil),            // 100: vmon.v1.NetworkPolicy
-	(*RetryPolicy)(nil),              // 101: vmon.v1.RetryPolicy
-	(*TimeoutSpec)(nil),              // 102: vmon.v1.TimeoutSpec
-	(*WorkerSpec)(nil),               // 103: vmon.v1.WorkerSpec
-	(*ConcurrencySpec)(nil),          // 104: vmon.v1.ConcurrencySpec
-	(*BatchingSpec)(nil),             // 105: vmon.v1.BatchingSpec
-	(*SerializerSpec)(nil),           // 106: vmon.v1.SerializerSpec
-	(*ReproducibilitySpec)(nil),      // 107: vmon.v1.ReproducibilitySpec
-	(*SecretRef)(nil),                // 108: vmon.v1.SecretRef
-	(*TransientSecretMaterial)(nil),  // 109: vmon.v1.TransientSecretMaterial
-	(*LifecycleHookRef)(nil),         // 110: vmon.v1.LifecycleHookRef
-	(*LifecycleHooks)(nil),           // 111: vmon.v1.LifecycleHooks
-	(*FunctionSnapshotRef)(nil),      // 112: vmon.v1.FunctionSnapshotRef
-	(*FunctionSnapshotRecord)(nil),   // 113: vmon.v1.FunctionSnapshotRecord
-	(*FunctionSpec)(nil),             // 114: vmon.v1.FunctionSpec
-	(*FunctionRevision)(nil),         // 115: vmon.v1.FunctionRevision
-	(*FunctionRecord)(nil),           // 116: vmon.v1.FunctionRecord
-	(*RegisterFunctionRequest)(nil),  // 117: vmon.v1.RegisterFunctionRequest
-	(*GetFunctionRequest)(nil),       // 118: vmon.v1.GetFunctionRequest
-	(*ListFunctionsRequest)(nil),     // 119: vmon.v1.ListFunctionsRequest
-	(*ListFunctionsResponse)(nil),    // 120: vmon.v1.ListFunctionsResponse
-	(*ActivateFunctionRequest)(nil),  // 121: vmon.v1.ActivateFunctionRequest
-	(*DeleteFunctionRequest)(nil),    // 122: vmon.v1.DeleteFunctionRequest
-	(*AppFunctionBinding)(nil),       // 123: vmon.v1.AppFunctionBinding
-	(*AppRevision)(nil),              // 124: vmon.v1.AppRevision
-	(*ActivateAppRequest)(nil),       // 125: vmon.v1.ActivateAppRequest
-	(*GetAppRequest)(nil),            // 126: vmon.v1.GetAppRequest
-	(*RollbackAppRequest)(nil),       // 127: vmon.v1.RollbackAppRequest
-	(*ScheduleRef)(nil),              // 128: vmon.v1.ScheduleRef
-	(*CronSchedule)(nil),             // 129: vmon.v1.CronSchedule
-	(*PeriodSchedule)(nil),           // 130: vmon.v1.PeriodSchedule
-	(*ScheduleTarget)(nil),           // 131: vmon.v1.ScheduleTarget
-	(*ScheduleSpec)(nil),             // 132: vmon.v1.ScheduleSpec
-	(*ScheduleRecord)(nil),           // 133: vmon.v1.ScheduleRecord
-	(*CreateScheduleRequest)(nil),    // 134: vmon.v1.CreateScheduleRequest
-	(*ListSchedulesRequest)(nil),     // 135: vmon.v1.ListSchedulesRequest
-	(*ListSchedulesResponse)(nil),    // 136: vmon.v1.ListSchedulesResponse
-	(*CallRef)(nil),                  // 137: vmon.v1.CallRef
-	(*ActorRef)(nil),                 // 138: vmon.v1.ActorRef
-	(*InvocationArguments)(nil),      // 139: vmon.v1.InvocationArguments
-	(*ActorTarget)(nil),              // 140: vmon.v1.ActorTarget
-	(*ServiceTarget)(nil),            // 141: vmon.v1.ServiceTarget
-	(*ParentEdge)(nil),               // 142: vmon.v1.ParentEdge
-	(*CallTarget)(nil),               // 143: vmon.v1.CallTarget
-	(*CallInput)(nil),                // 144: vmon.v1.CallInput
-	(*InputRef)(nil),                 // 145: vmon.v1.InputRef
-	(*CallGraph)(nil),                // 146: vmon.v1.CallGraph
-	(*CreateCallRequest)(nil),        // 147: vmon.v1.CreateCallRequest
-	(*CallRecord)(nil),               // 148: vmon.v1.CallRecord
-	(*StreamCallInputsRequest)(nil),  // 149: vmon.v1.StreamCallInputsRequest
-	(*StreamCallInputsResponse)(nil), // 150: vmon.v1.StreamCallInputsResponse
-	(*CloseCallInputsRequest)(nil),   // 151: vmon.v1.CloseCallInputsRequest
-	(*ListCallsRequest)(nil),         // 152: vmon.v1.ListCallsRequest
-	(*ListCallsResponse)(nil),        // 153: vmon.v1.ListCallsResponse
-	(*GetCallResultRequest)(nil),     // 154: vmon.v1.GetCallResultRequest
-	(*CallResult)(nil),               // 155: vmon.v1.CallResult
-	(*ResultCursor)(nil),             // 156: vmon.v1.ResultCursor
-	(*EventCursor)(nil),              // 157: vmon.v1.EventCursor
-	(*ListCallResultsRequest)(nil),   // 158: vmon.v1.ListCallResultsRequest
-	(*ListCallResultsResponse)(nil),  // 159: vmon.v1.ListCallResultsResponse
-	(*WatchCallRequest)(nil),         // 160: vmon.v1.WatchCallRequest
-	(*StatusEvent)(nil),              // 161: vmon.v1.StatusEvent
-	(*LogEvent)(nil),                 // 162: vmon.v1.LogEvent
-	(*AttemptEvent)(nil),             // 163: vmon.v1.AttemptEvent
-	(*CallEvent)(nil),                // 164: vmon.v1.CallEvent
-	(*ErrorFrame)(nil),               // 165: vmon.v1.ErrorFrame
-	(*CallError)(nil),                // 166: vmon.v1.CallError
-	(*AttemptStats)(nil),             // 167: vmon.v1.AttemptStats
-	(*CallStats)(nil),                // 168: vmon.v1.CallStats
-	(*CancelCallRequest)(nil),        // 169: vmon.v1.CancelCallRequest
-	(*ActorCheckpointRef)(nil),       // 170: vmon.v1.ActorCheckpointRef
-	(*ActorRecord)(nil),              // 171: vmon.v1.ActorRecord
-	(*ActorCheckpoint)(nil),          // 172: vmon.v1.ActorCheckpoint
-	(*CreateActorRequest)(nil),       // 173: vmon.v1.CreateActorRequest
-	(*CheckpointActorRequest)(nil),   // 174: vmon.v1.CheckpointActorRequest
-	(*RestoreActorRequest)(nil),      // 175: vmon.v1.RestoreActorRequest
-	(*ForkActorRequest)(nil),         // 176: vmon.v1.ForkActorRequest
-	nil,                              // 177: vmon.v1.ExecStart.EnvEntry
-	nil,                              // 178: vmon.v1.ImageSpec.EnvironmentEntry
-	nil,                              // 179: vmon.v1.ReproducibilitySpec.EnvironmentEntry
-	nil,                              // 180: vmon.v1.FunctionSpec.LabelsEntry
-	nil,                              // 181: vmon.v1.ScheduleSpec.LabelsEntry
-	nil,                              // 182: vmon.v1.InvocationArguments.NamedEntry
-	nil,                              // 183: vmon.v1.CreateCallRequest.LabelsEntry
-	nil,                              // 184: vmon.v1.CallRecord.LabelsEntry
-	nil,                              // 185: vmon.v1.CallError.DetailsEntry
-	nil,                              // 186: vmon.v1.ActorRecord.LabelsEntry
-	nil,                              // 187: vmon.v1.CreateActorRequest.LabelsEntry
-	nil,                              // 188: vmon.v1.ForkActorRequest.LabelsEntry
+	(*BatchCreateRequest)(nil),       // 22: vmon.v1.BatchCreateRequest
+	(*BatchCreateError)(nil),         // 23: vmon.v1.BatchCreateError
+	(*BatchCreateResponse)(nil),      // 24: vmon.v1.BatchCreateResponse
+	(*WatchSandboxRequest)(nil),      // 25: vmon.v1.WatchSandboxRequest
+	(*ListSandboxesRequest)(nil),     // 26: vmon.v1.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),    // 27: vmon.v1.ListSandboxesResponse
+	(*StopSandboxRequest)(nil),       // 28: vmon.v1.StopSandboxRequest
+	(*RollbackSandboxRequest)(nil),   // 29: vmon.v1.RollbackSandboxRequest
+	(*ExtendSandboxRequest)(nil),     // 30: vmon.v1.ExtendSandboxRequest
+	(*LogsRequest)(nil),              // 31: vmon.v1.LogsRequest
+	(*LogChunk)(nil),                 // 32: vmon.v1.LogChunk
+	(*ExecStart)(nil),                // 33: vmon.v1.ExecStart
+	(*ExecCaptureRequest)(nil),       // 34: vmon.v1.ExecCaptureRequest
+	(*ExecCaptureResponse)(nil),      // 35: vmon.v1.ExecCaptureResponse
+	(*ExecInput)(nil),                // 36: vmon.v1.ExecInput
+	(*ExecOutput)(nil),               // 37: vmon.v1.ExecOutput
+	(*FilePathRequest)(nil),          // 38: vmon.v1.FilePathRequest
+	(*FileContent)(nil),              // 39: vmon.v1.FileContent
+	(*FileWriteRequest)(nil),         // 40: vmon.v1.FileWriteRequest
+	(*FileDeleteRequest)(nil),        // 41: vmon.v1.FileDeleteRequest
+	(*StringList)(nil),               // 42: vmon.v1.StringList
+	(*NetworkSetRequest)(nil),        // 43: vmon.v1.NetworkSetRequest
+	(*MigrateRequest)(nil),           // 44: vmon.v1.MigrateRequest
+	(*SnapshotRequest)(nil),          // 45: vmon.v1.SnapshotRequest
+	(*SnapshotFsRequest)(nil),        // 46: vmon.v1.SnapshotFsRequest
+	(*ListSnapshotsRequest)(nil),     // 47: vmon.v1.ListSnapshotsRequest
+	(*SnapshotList)(nil),             // 48: vmon.v1.SnapshotList
+	(*SnapshotRef)(nil),              // 49: vmon.v1.SnapshotRef
+	(*RecoveryPoint)(nil),            // 50: vmon.v1.RecoveryPoint
+	(*RecoveryPointList)(nil),        // 51: vmon.v1.RecoveryPointList
+	(*ListCredentialsRequest)(nil),   // 52: vmon.v1.ListCredentialsRequest
+	(*CredentialHeader)(nil),         // 53: vmon.v1.CredentialHeader
+	(*PutCredentialRequest)(nil),     // 54: vmon.v1.PutCredentialRequest
+	(*CredentialRef)(nil),            // 55: vmon.v1.CredentialRef
+	(*DeleteCredentialRequest)(nil),  // 56: vmon.v1.DeleteCredentialRequest
+	(*CredentialRecord)(nil),         // 57: vmon.v1.CredentialRecord
+	(*CredentialList)(nil),           // 58: vmon.v1.CredentialList
+	(*RestoreSnapshotRequest)(nil),   // 59: vmon.v1.RestoreSnapshotRequest
+	(*ForkSnapshotRequest)(nil),      // 60: vmon.v1.ForkSnapshotRequest
+	(*ListVolumesRequest)(nil),       // 61: vmon.v1.ListVolumesRequest
+	(*VolumeList)(nil),               // 62: vmon.v1.VolumeList
+	(*VolumeRef)(nil),                // 63: vmon.v1.VolumeRef
+	(*ListPoolsRequest)(nil),         // 64: vmon.v1.ListPoolsRequest
+	(*PoolSetRequest)(nil),           // 65: vmon.v1.PoolSetRequest
+	(*PoolRef)(nil),                  // 66: vmon.v1.PoolRef
+	(*InfoRequest)(nil),              // 67: vmon.v1.InfoRequest
+	(*MeshStatusRequest)(nil),        // 68: vmon.v1.MeshStatusRequest
+	(*EventsRequest)(nil),            // 69: vmon.v1.EventsRequest
+	(*Eof)(nil),                      // 70: vmon.v1.Eof
+	(*Resize)(nil),                   // 71: vmon.v1.Resize
+	(*Output)(nil),                   // 72: vmon.v1.Output
+	(*Exit)(nil),                     // 73: vmon.v1.Exit
+	(*Ready)(nil),                    // 74: vmon.v1.Ready
+	(*Digest)(nil),                   // 75: vmon.v1.Digest
+	(*ArtifactRef)(nil),              // 76: vmon.v1.ArtifactRef
+	(*ArtifactRecord)(nil),           // 77: vmon.v1.ArtifactRecord
+	(*PutArtifactHeader)(nil),        // 78: vmon.v1.PutArtifactHeader
+	(*PutArtifactRequest)(nil),       // 79: vmon.v1.PutArtifactRequest
+	(*GetArtifactRequest)(nil),       // 80: vmon.v1.GetArtifactRequest
+	(*ByteRange)(nil),                // 81: vmon.v1.ByteRange
+	(*ArtifactChunk)(nil),            // 82: vmon.v1.ArtifactChunk
+	(*PythonCodecMetadata)(nil),      // 83: vmon.v1.PythonCodecMetadata
+	(*ValueEnvelope)(nil),            // 84: vmon.v1.ValueEnvelope
+	(*FunctionRef)(nil),              // 85: vmon.v1.FunctionRef
+	(*RevisionRef)(nil),              // 86: vmon.v1.RevisionRef
+	(*FunctionSelector)(nil),         // 87: vmon.v1.FunctionSelector
+	(*AppRef)(nil),                   // 88: vmon.v1.AppRef
+	(*AppRevisionRef)(nil),           // 89: vmon.v1.AppRevisionRef
+	(*AppSelector)(nil),              // 90: vmon.v1.AppSelector
+	(*PackageSpec)(nil),              // 91: vmon.v1.PackageSpec
+	(*ImageSpec)(nil),                // 92: vmon.v1.ImageSpec
+	(*ResourceSpec)(nil),             // 93: vmon.v1.ResourceSpec
+	(*PythonCodeMetadata)(nil),       // 94: vmon.v1.PythonCodeMetadata
+	(*PythonImageSource)(nil),        // 95: vmon.v1.PythonImageSource
+	(*RegistryImageSource)(nil),      // 96: vmon.v1.RegistryImageSource
+	(*DockerfileImageSource)(nil),    // 97: vmon.v1.DockerfileImageSource
+	(*TemplateImageSource)(nil),      // 98: vmon.v1.TemplateImageSource
+	(*AptPackage)(nil),               // 99: vmon.v1.AptPackage
+	(*UvPackage)(nil),                // 100: vmon.v1.UvPackage
+	(*ImageBuildCommand)(nil),        // 101: vmon.v1.ImageBuildCommand
+	(*LocalArtifactMount)(nil),       // 102: vmon.v1.LocalArtifactMount
+	(*FunctionVolumeMount)(nil),      // 103: vmon.v1.FunctionVolumeMount
+	(*NetworkPolicy)(nil),            // 104: vmon.v1.NetworkPolicy
+	(*RetryPolicy)(nil),              // 105: vmon.v1.RetryPolicy
+	(*TimeoutSpec)(nil),              // 106: vmon.v1.TimeoutSpec
+	(*WorkerSpec)(nil),               // 107: vmon.v1.WorkerSpec
+	(*ConcurrencySpec)(nil),          // 108: vmon.v1.ConcurrencySpec
+	(*BatchingSpec)(nil),             // 109: vmon.v1.BatchingSpec
+	(*SerializerSpec)(nil),           // 110: vmon.v1.SerializerSpec
+	(*ReproducibilitySpec)(nil),      // 111: vmon.v1.ReproducibilitySpec
+	(*SecretRef)(nil),                // 112: vmon.v1.SecretRef
+	(*TransientSecretMaterial)(nil),  // 113: vmon.v1.TransientSecretMaterial
+	(*LifecycleHookRef)(nil),         // 114: vmon.v1.LifecycleHookRef
+	(*LifecycleHooks)(nil),           // 115: vmon.v1.LifecycleHooks
+	(*FunctionSnapshotRef)(nil),      // 116: vmon.v1.FunctionSnapshotRef
+	(*FunctionSnapshotRecord)(nil),   // 117: vmon.v1.FunctionSnapshotRecord
+	(*FunctionSpec)(nil),             // 118: vmon.v1.FunctionSpec
+	(*FunctionRevision)(nil),         // 119: vmon.v1.FunctionRevision
+	(*FunctionRecord)(nil),           // 120: vmon.v1.FunctionRecord
+	(*RegisterFunctionRequest)(nil),  // 121: vmon.v1.RegisterFunctionRequest
+	(*GetFunctionRequest)(nil),       // 122: vmon.v1.GetFunctionRequest
+	(*ListFunctionsRequest)(nil),     // 123: vmon.v1.ListFunctionsRequest
+	(*ListFunctionsResponse)(nil),    // 124: vmon.v1.ListFunctionsResponse
+	(*ActivateFunctionRequest)(nil),  // 125: vmon.v1.ActivateFunctionRequest
+	(*DeleteFunctionRequest)(nil),    // 126: vmon.v1.DeleteFunctionRequest
+	(*AppFunctionBinding)(nil),       // 127: vmon.v1.AppFunctionBinding
+	(*AppRevision)(nil),              // 128: vmon.v1.AppRevision
+	(*ActivateAppRequest)(nil),       // 129: vmon.v1.ActivateAppRequest
+	(*GetAppRequest)(nil),            // 130: vmon.v1.GetAppRequest
+	(*RollbackAppRequest)(nil),       // 131: vmon.v1.RollbackAppRequest
+	(*ScheduleRef)(nil),              // 132: vmon.v1.ScheduleRef
+	(*CronSchedule)(nil),             // 133: vmon.v1.CronSchedule
+	(*PeriodSchedule)(nil),           // 134: vmon.v1.PeriodSchedule
+	(*ScheduleTarget)(nil),           // 135: vmon.v1.ScheduleTarget
+	(*ScheduleSpec)(nil),             // 136: vmon.v1.ScheduleSpec
+	(*ScheduleRecord)(nil),           // 137: vmon.v1.ScheduleRecord
+	(*CreateScheduleRequest)(nil),    // 138: vmon.v1.CreateScheduleRequest
+	(*ListSchedulesRequest)(nil),     // 139: vmon.v1.ListSchedulesRequest
+	(*ListSchedulesResponse)(nil),    // 140: vmon.v1.ListSchedulesResponse
+	(*CallRef)(nil),                  // 141: vmon.v1.CallRef
+	(*ActorRef)(nil),                 // 142: vmon.v1.ActorRef
+	(*InvocationArguments)(nil),      // 143: vmon.v1.InvocationArguments
+	(*ActorTarget)(nil),              // 144: vmon.v1.ActorTarget
+	(*ServiceTarget)(nil),            // 145: vmon.v1.ServiceTarget
+	(*ParentEdge)(nil),               // 146: vmon.v1.ParentEdge
+	(*CallTarget)(nil),               // 147: vmon.v1.CallTarget
+	(*CallInput)(nil),                // 148: vmon.v1.CallInput
+	(*InputRef)(nil),                 // 149: vmon.v1.InputRef
+	(*CallGraph)(nil),                // 150: vmon.v1.CallGraph
+	(*CreateCallRequest)(nil),        // 151: vmon.v1.CreateCallRequest
+	(*CallRecord)(nil),               // 152: vmon.v1.CallRecord
+	(*StreamCallInputsRequest)(nil),  // 153: vmon.v1.StreamCallInputsRequest
+	(*StreamCallInputsResponse)(nil), // 154: vmon.v1.StreamCallInputsResponse
+	(*CloseCallInputsRequest)(nil),   // 155: vmon.v1.CloseCallInputsRequest
+	(*ListCallsRequest)(nil),         // 156: vmon.v1.ListCallsRequest
+	(*ListCallsResponse)(nil),        // 157: vmon.v1.ListCallsResponse
+	(*GetCallResultRequest)(nil),     // 158: vmon.v1.GetCallResultRequest
+	(*CallResult)(nil),               // 159: vmon.v1.CallResult
+	(*ResultCursor)(nil),             // 160: vmon.v1.ResultCursor
+	(*EventCursor)(nil),              // 161: vmon.v1.EventCursor
+	(*ListCallResultsRequest)(nil),   // 162: vmon.v1.ListCallResultsRequest
+	(*ListCallResultsResponse)(nil),  // 163: vmon.v1.ListCallResultsResponse
+	(*WatchCallRequest)(nil),         // 164: vmon.v1.WatchCallRequest
+	(*StatusEvent)(nil),              // 165: vmon.v1.StatusEvent
+	(*LogEvent)(nil),                 // 166: vmon.v1.LogEvent
+	(*AttemptEvent)(nil),             // 167: vmon.v1.AttemptEvent
+	(*CallEvent)(nil),                // 168: vmon.v1.CallEvent
+	(*ErrorFrame)(nil),               // 169: vmon.v1.ErrorFrame
+	(*CallError)(nil),                // 170: vmon.v1.CallError
+	(*AttemptStats)(nil),             // 171: vmon.v1.AttemptStats
+	(*CallStats)(nil),                // 172: vmon.v1.CallStats
+	(*CancelCallRequest)(nil),        // 173: vmon.v1.CancelCallRequest
+	(*ActorCheckpointRef)(nil),       // 174: vmon.v1.ActorCheckpointRef
+	(*ActorRecord)(nil),              // 175: vmon.v1.ActorRecord
+	(*ActorCheckpoint)(nil),          // 176: vmon.v1.ActorCheckpoint
+	(*CreateActorRequest)(nil),       // 177: vmon.v1.CreateActorRequest
+	(*CheckpointActorRequest)(nil),   // 178: vmon.v1.CheckpointActorRequest
+	(*RestoreActorRequest)(nil),      // 179: vmon.v1.RestoreActorRequest
+	(*ForkActorRequest)(nil),         // 180: vmon.v1.ForkActorRequest
+	nil,                              // 181: vmon.v1.ExecStart.EnvEntry
+	nil,                              // 182: vmon.v1.ImageSpec.EnvironmentEntry
+	nil,                              // 183: vmon.v1.ReproducibilitySpec.EnvironmentEntry
+	nil,                              // 184: vmon.v1.FunctionSpec.LabelsEntry
+	nil,                              // 185: vmon.v1.ScheduleSpec.LabelsEntry
+	nil,                              // 186: vmon.v1.InvocationArguments.NamedEntry
+	nil,                              // 187: vmon.v1.CreateCallRequest.LabelsEntry
+	nil,                              // 188: vmon.v1.CallRecord.LabelsEntry
+	nil,                              // 189: vmon.v1.CallError.DetailsEntry
+	nil,                              // 190: vmon.v1.ActorRecord.LabelsEntry
+	nil,                              // 191: vmon.v1.CreateActorRequest.LabelsEntry
+	nil,                              // 192: vmon.v1.ForkActorRequest.LabelsEntry
 }
 var file_vmon_v1_api_proto_depIdxs = []int32{
-	177, // 0: vmon.v1.ExecStart.env:type_name -> vmon.v1.ExecStart.EnvEntry
-	29,  // 1: vmon.v1.ExecCaptureRequest.exec:type_name -> vmon.v1.ExecStart
-	29,  // 2: vmon.v1.ExecInput.start:type_name -> vmon.v1.ExecStart
-	66,  // 3: vmon.v1.ExecInput.eof:type_name -> vmon.v1.Eof
-	67,  // 4: vmon.v1.ExecInput.resize:type_name -> vmon.v1.Resize
-	68,  // 5: vmon.v1.ExecOutput.chunk:type_name -> vmon.v1.Output
-	69,  // 6: vmon.v1.ExecOutput.exit:type_name -> vmon.v1.Exit
-	70,  // 7: vmon.v1.ExecOutput.ready:type_name -> vmon.v1.Ready
-	38,  // 8: vmon.v1.NetworkSetRequest.cidr_allow:type_name -> vmon.v1.StringList
-	38,  // 9: vmon.v1.NetworkSetRequest.domain_allow:type_name -> vmon.v1.StringList
-	46,  // 10: vmon.v1.RecoveryPointList.points:type_name -> vmon.v1.RecoveryPoint
-	49,  // 11: vmon.v1.PutCredentialRequest.headers:type_name -> vmon.v1.CredentialHeader
-	51,  // 12: vmon.v1.DeleteCredentialRequest.credential:type_name -> vmon.v1.CredentialRef
-	53,  // 13: vmon.v1.CredentialList.credentials:type_name -> vmon.v1.CredentialRecord
-	0,   // 14: vmon.v1.Output.stream:type_name -> vmon.v1.Stream
-	1,   // 15: vmon.v1.Digest.algorithm:type_name -> vmon.v1.DigestAlgorithm
-	71,  // 16: vmon.v1.ArtifactRef.digest:type_name -> vmon.v1.Digest
-	72,  // 17: vmon.v1.ArtifactRecord.ref:type_name -> vmon.v1.ArtifactRef
-	71,  // 18: vmon.v1.PutArtifactHeader.expected_digest:type_name -> vmon.v1.Digest
-	74,  // 19: vmon.v1.PutArtifactRequest.header:type_name -> vmon.v1.PutArtifactHeader
-	72,  // 20: vmon.v1.GetArtifactRequest.artifact:type_name -> vmon.v1.ArtifactRef
-	77,  // 21: vmon.v1.GetArtifactRequest.range:type_name -> vmon.v1.ByteRange
-	2,   // 22: vmon.v1.ValueEnvelope.serializer:type_name -> vmon.v1.ValueSerializer
-	3,   // 23: vmon.v1.ValueEnvelope.compression:type_name -> vmon.v1.ValueCompression
-	71,  // 24: vmon.v1.ValueEnvelope.checksum:type_name -> vmon.v1.Digest
-	72,  // 25: vmon.v1.ValueEnvelope.artifact:type_name -> vmon.v1.ArtifactRef
-	79,  // 26: vmon.v1.ValueEnvelope.python:type_name -> vmon.v1.PythonCodecMetadata
-	81,  // 27: vmon.v1.RevisionRef.function:type_name -> vmon.v1.FunctionRef
-	81,  // 28: vmon.v1.FunctionSelector.current:type_name -> vmon.v1.FunctionRef
-	82,  // 29: vmon.v1.FunctionSelector.pinned:type_name -> vmon.v1.RevisionRef
-	84,  // 30: vmon.v1.AppRevisionRef.app:type_name -> vmon.v1.AppRef
-	84,  // 31: vmon.v1.AppSelector.current:type_name -> vmon.v1.AppRef
-	85,  // 32: vmon.v1.AppSelector.pinned:type_name -> vmon.v1.AppRevisionRef
-	72,  // 33: vmon.v1.PackageSpec.source:type_name -> vmon.v1.ArtifactRef
-	72,  // 34: vmon.v1.PackageSpec.lockfile:type_name -> vmon.v1.ArtifactRef
-	71,  // 35: vmon.v1.PackageSpec.content_digest:type_name -> vmon.v1.Digest
-	5,   // 36: vmon.v1.PackageSpec.mode:type_name -> vmon.v1.PackageMode
-	90,  // 37: vmon.v1.PackageSpec.python:type_name -> vmon.v1.PythonCodeMetadata
-	91,  // 38: vmon.v1.ImageSpec.python:type_name -> vmon.v1.PythonImageSource
-	92,  // 39: vmon.v1.ImageSpec.registry:type_name -> vmon.v1.RegistryImageSource
-	93,  // 40: vmon.v1.ImageSpec.dockerfile:type_name -> vmon.v1.DockerfileImageSource
-	94,  // 41: vmon.v1.ImageSpec.template:type_name -> vmon.v1.TemplateImageSource
-	95,  // 42: vmon.v1.ImageSpec.apt_packages:type_name -> vmon.v1.AptPackage
-	96,  // 43: vmon.v1.ImageSpec.uv_packages:type_name -> vmon.v1.UvPackage
-	97,  // 44: vmon.v1.ImageSpec.commands:type_name -> vmon.v1.ImageBuildCommand
-	178, // 45: vmon.v1.ImageSpec.environment:type_name -> vmon.v1.ImageSpec.EnvironmentEntry
-	98,  // 46: vmon.v1.ImageSpec.local_artifact_mounts:type_name -> vmon.v1.LocalArtifactMount
-	71,  // 47: vmon.v1.ImageSpec.resolved_oci_digest:type_name -> vmon.v1.Digest
-	6,   // 48: vmon.v1.ResourceSpec.architecture:type_name -> vmon.v1.CpuArchitecture
-	7,   // 49: vmon.v1.ResourceSpec.high_availability:type_name -> vmon.v1.HighAvailabilityPolicy
-	99,  // 50: vmon.v1.ResourceSpec.volume_mounts:type_name -> vmon.v1.FunctionVolumeMount
-	100, // 51: vmon.v1.ResourceSpec.network:type_name -> vmon.v1.NetworkPolicy
-	72,  // 52: vmon.v1.DockerfileImageSource.context:type_name -> vmon.v1.ArtifactRef
-	72,  // 53: vmon.v1.LocalArtifactMount.artifact:type_name -> vmon.v1.ArtifactRef
-	59,  // 54: vmon.v1.FunctionVolumeMount.volume:type_name -> vmon.v1.VolumeRef
-	2,   // 55: vmon.v1.SerializerSpec.input_serializer:type_name -> vmon.v1.ValueSerializer
-	2,   // 56: vmon.v1.SerializerSpec.result_serializer:type_name -> vmon.v1.ValueSerializer
-	3,   // 57: vmon.v1.SerializerSpec.compression:type_name -> vmon.v1.ValueCompression
-	71,  // 58: vmon.v1.ReproducibilitySpec.build_inputs_digest:type_name -> vmon.v1.Digest
-	179, // 59: vmon.v1.ReproducibilitySpec.environment:type_name -> vmon.v1.ReproducibilitySpec.EnvironmentEntry
-	108, // 60: vmon.v1.TransientSecretMaterial.secret:type_name -> vmon.v1.SecretRef
-	110, // 61: vmon.v1.LifecycleHooks.initialize:type_name -> vmon.v1.LifecycleHookRef
-	110, // 62: vmon.v1.LifecycleHooks.shutdown:type_name -> vmon.v1.LifecycleHookRef
-	110, // 63: vmon.v1.LifecycleHooks.snapshot:type_name -> vmon.v1.LifecycleHookRef
-	110, // 64: vmon.v1.LifecycleHooks.restore:type_name -> vmon.v1.LifecycleHookRef
-	112, // 65: vmon.v1.FunctionSnapshotRecord.ref:type_name -> vmon.v1.FunctionSnapshotRef
-	82,  // 66: vmon.v1.FunctionSnapshotRecord.revision:type_name -> vmon.v1.RevisionRef
-	72,  // 67: vmon.v1.FunctionSnapshotRecord.artifact:type_name -> vmon.v1.ArtifactRef
-	71,  // 68: vmon.v1.FunctionSnapshotRecord.runner_digest:type_name -> vmon.v1.Digest
-	71,  // 69: vmon.v1.FunctionSnapshotRecord.image_digest:type_name -> vmon.v1.Digest
-	71,  // 70: vmon.v1.FunctionSnapshotRecord.package_digest:type_name -> vmon.v1.Digest
-	110, // 71: vmon.v1.FunctionSnapshotRecord.initialize_hook:type_name -> vmon.v1.LifecycleHookRef
-	81,  // 72: vmon.v1.FunctionSpec.function:type_name -> vmon.v1.FunctionRef
-	87,  // 73: vmon.v1.FunctionSpec.package:type_name -> vmon.v1.PackageSpec
-	88,  // 74: vmon.v1.FunctionSpec.image:type_name -> vmon.v1.ImageSpec
-	89,  // 75: vmon.v1.FunctionSpec.resources:type_name -> vmon.v1.ResourceSpec
-	101, // 76: vmon.v1.FunctionSpec.retry:type_name -> vmon.v1.RetryPolicy
-	102, // 77: vmon.v1.FunctionSpec.timeouts:type_name -> vmon.v1.TimeoutSpec
-	103, // 78: vmon.v1.FunctionSpec.workers:type_name -> vmon.v1.WorkerSpec
-	104, // 79: vmon.v1.FunctionSpec.concurrency:type_name -> vmon.v1.ConcurrencySpec
-	105, // 80: vmon.v1.FunctionSpec.batching:type_name -> vmon.v1.BatchingSpec
-	106, // 81: vmon.v1.FunctionSpec.serializer:type_name -> vmon.v1.SerializerSpec
-	4,   // 82: vmon.v1.FunctionSpec.lifecycle:type_name -> vmon.v1.FunctionLifecycle
-	107, // 83: vmon.v1.FunctionSpec.reproducibility:type_name -> vmon.v1.ReproducibilitySpec
-	180, // 84: vmon.v1.FunctionSpec.labels:type_name -> vmon.v1.FunctionSpec.LabelsEntry
-	108, // 85: vmon.v1.FunctionSpec.secrets:type_name -> vmon.v1.SecretRef
-	111, // 86: vmon.v1.FunctionSpec.lifecycle_hooks:type_name -> vmon.v1.LifecycleHooks
-	82,  // 87: vmon.v1.FunctionRevision.ref:type_name -> vmon.v1.RevisionRef
-	114, // 88: vmon.v1.FunctionRevision.spec:type_name -> vmon.v1.FunctionSpec
-	71,  // 89: vmon.v1.FunctionRevision.spec_digest:type_name -> vmon.v1.Digest
-	16,  // 90: vmon.v1.FunctionRevision.status:type_name -> vmon.v1.FunctionRevisionStatus
-	108, // 91: vmon.v1.FunctionRevision.unavailable_secrets:type_name -> vmon.v1.SecretRef
-	113, // 92: vmon.v1.FunctionRevision.snapshot:type_name -> vmon.v1.FunctionSnapshotRecord
-	81,  // 93: vmon.v1.FunctionRecord.function:type_name -> vmon.v1.FunctionRef
-	82,  // 94: vmon.v1.FunctionRecord.current:type_name -> vmon.v1.RevisionRef
-	114, // 95: vmon.v1.RegisterFunctionRequest.spec:type_name -> vmon.v1.FunctionSpec
-	109, // 96: vmon.v1.RegisterFunctionRequest.transient_secrets:type_name -> vmon.v1.TransientSecretMaterial
-	83,  // 97: vmon.v1.GetFunctionRequest.function:type_name -> vmon.v1.FunctionSelector
-	81,  // 98: vmon.v1.ListFunctionsRequest.function:type_name -> vmon.v1.FunctionRef
-	115, // 99: vmon.v1.ListFunctionsResponse.revisions:type_name -> vmon.v1.FunctionRevision
-	82,  // 100: vmon.v1.ActivateFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
-	82,  // 101: vmon.v1.ActivateFunctionRequest.expected_current:type_name -> vmon.v1.RevisionRef
-	82,  // 102: vmon.v1.DeleteFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
-	82,  // 103: vmon.v1.AppFunctionBinding.revision:type_name -> vmon.v1.RevisionRef
-	85,  // 104: vmon.v1.AppRevision.ref:type_name -> vmon.v1.AppRevisionRef
-	123, // 105: vmon.v1.AppRevision.functions:type_name -> vmon.v1.AppFunctionBinding
-	71,  // 106: vmon.v1.AppRevision.content_digest:type_name -> vmon.v1.Digest
-	85,  // 107: vmon.v1.AppRevision.previous:type_name -> vmon.v1.AppRevisionRef
-	84,  // 108: vmon.v1.ActivateAppRequest.app:type_name -> vmon.v1.AppRef
-	123, // 109: vmon.v1.ActivateAppRequest.functions:type_name -> vmon.v1.AppFunctionBinding
-	85,  // 110: vmon.v1.ActivateAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
-	86,  // 111: vmon.v1.GetAppRequest.app:type_name -> vmon.v1.AppSelector
-	85,  // 112: vmon.v1.RollbackAppRequest.target:type_name -> vmon.v1.AppRevisionRef
-	85,  // 113: vmon.v1.RollbackAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
-	82,  // 114: vmon.v1.ScheduleTarget.function:type_name -> vmon.v1.RevisionRef
-	80,  // 115: vmon.v1.ScheduleTarget.input:type_name -> vmon.v1.ValueEnvelope
-	85,  // 116: vmon.v1.ScheduleSpec.app:type_name -> vmon.v1.AppRevisionRef
-	131, // 117: vmon.v1.ScheduleSpec.target:type_name -> vmon.v1.ScheduleTarget
-	129, // 118: vmon.v1.ScheduleSpec.cron:type_name -> vmon.v1.CronSchedule
-	130, // 119: vmon.v1.ScheduleSpec.period:type_name -> vmon.v1.PeriodSchedule
-	15,  // 120: vmon.v1.ScheduleSpec.status:type_name -> vmon.v1.ScheduleStatus
-	181, // 121: vmon.v1.ScheduleSpec.labels:type_name -> vmon.v1.ScheduleSpec.LabelsEntry
-	128, // 122: vmon.v1.ScheduleRecord.ref:type_name -> vmon.v1.ScheduleRef
-	132, // 123: vmon.v1.ScheduleRecord.spec:type_name -> vmon.v1.ScheduleSpec
-	132, // 124: vmon.v1.CreateScheduleRequest.spec:type_name -> vmon.v1.ScheduleSpec
-	84,  // 125: vmon.v1.ListSchedulesRequest.app:type_name -> vmon.v1.AppRef
-	81,  // 126: vmon.v1.ListSchedulesRequest.function:type_name -> vmon.v1.FunctionRef
-	133, // 127: vmon.v1.ListSchedulesResponse.schedules:type_name -> vmon.v1.ScheduleRecord
-	80,  // 128: vmon.v1.InvocationArguments.positional:type_name -> vmon.v1.ValueEnvelope
-	182, // 129: vmon.v1.InvocationArguments.named:type_name -> vmon.v1.InvocationArguments.NamedEntry
-	138, // 130: vmon.v1.ActorTarget.actor:type_name -> vmon.v1.ActorRef
-	139, // 131: vmon.v1.ServiceTarget.constructor:type_name -> vmon.v1.InvocationArguments
-	82,  // 132: vmon.v1.CallTarget.function:type_name -> vmon.v1.RevisionRef
-	140, // 133: vmon.v1.CallTarget.actor:type_name -> vmon.v1.ActorTarget
-	141, // 134: vmon.v1.CallTarget.service:type_name -> vmon.v1.ServiceTarget
-	80,  // 135: vmon.v1.CallInput.value:type_name -> vmon.v1.ValueEnvelope
-	139, // 136: vmon.v1.CallInput.arguments:type_name -> vmon.v1.InvocationArguments
-	142, // 137: vmon.v1.CallGraph.parents:type_name -> vmon.v1.ParentEdge
-	8,   // 138: vmon.v1.CreateCallRequest.type:type_name -> vmon.v1.CallType
-	143, // 139: vmon.v1.CreateCallRequest.target:type_name -> vmon.v1.CallTarget
-	144, // 140: vmon.v1.CreateCallRequest.inputs:type_name -> vmon.v1.CallInput
-	146, // 141: vmon.v1.CreateCallRequest.graph:type_name -> vmon.v1.CallGraph
-	183, // 142: vmon.v1.CreateCallRequest.labels:type_name -> vmon.v1.CreateCallRequest.LabelsEntry
-	137, // 143: vmon.v1.CallRecord.ref:type_name -> vmon.v1.CallRef
-	8,   // 144: vmon.v1.CallRecord.type:type_name -> vmon.v1.CallType
-	143, // 145: vmon.v1.CallRecord.target:type_name -> vmon.v1.CallTarget
-	9,   // 146: vmon.v1.CallRecord.status:type_name -> vmon.v1.CallStatus
-	146, // 147: vmon.v1.CallRecord.graph:type_name -> vmon.v1.CallGraph
-	166, // 148: vmon.v1.CallRecord.error:type_name -> vmon.v1.CallError
-	168, // 149: vmon.v1.CallRecord.stats:type_name -> vmon.v1.CallStats
-	184, // 150: vmon.v1.CallRecord.labels:type_name -> vmon.v1.CallRecord.LabelsEntry
-	156, // 151: vmon.v1.CallRecord.result_cursor:type_name -> vmon.v1.ResultCursor
-	137, // 152: vmon.v1.StreamCallInputsRequest.call:type_name -> vmon.v1.CallRef
-	144, // 153: vmon.v1.StreamCallInputsRequest.input:type_name -> vmon.v1.CallInput
-	137, // 154: vmon.v1.StreamCallInputsResponse.call:type_name -> vmon.v1.CallRef
-	145, // 155: vmon.v1.StreamCallInputsResponse.last_input:type_name -> vmon.v1.InputRef
-	137, // 156: vmon.v1.CloseCallInputsRequest.call:type_name -> vmon.v1.CallRef
-	81,  // 157: vmon.v1.ListCallsRequest.function:type_name -> vmon.v1.FunctionRef
-	9,   // 158: vmon.v1.ListCallsRequest.status:type_name -> vmon.v1.CallStatus
-	138, // 159: vmon.v1.ListCallsRequest.actor:type_name -> vmon.v1.ActorRef
-	148, // 160: vmon.v1.ListCallsResponse.calls:type_name -> vmon.v1.CallRecord
-	137, // 161: vmon.v1.GetCallResultRequest.call:type_name -> vmon.v1.CallRef
-	137, // 162: vmon.v1.CallResult.call:type_name -> vmon.v1.CallRef
-	80,  // 163: vmon.v1.CallResult.value:type_name -> vmon.v1.ValueEnvelope
-	166, // 164: vmon.v1.CallResult.error:type_name -> vmon.v1.CallError
-	137, // 165: vmon.v1.ResultCursor.call:type_name -> vmon.v1.CallRef
-	137, // 166: vmon.v1.EventCursor.call:type_name -> vmon.v1.CallRef
-	156, // 167: vmon.v1.ListCallResultsRequest.cursor:type_name -> vmon.v1.ResultCursor
-	155, // 168: vmon.v1.ListCallResultsResponse.results:type_name -> vmon.v1.CallResult
-	156, // 169: vmon.v1.ListCallResultsResponse.next_cursor:type_name -> vmon.v1.ResultCursor
-	157, // 170: vmon.v1.WatchCallRequest.cursor:type_name -> vmon.v1.EventCursor
-	9,   // 171: vmon.v1.StatusEvent.status:type_name -> vmon.v1.CallStatus
-	11,  // 172: vmon.v1.LogEvent.stream:type_name -> vmon.v1.LogStream
-	12,  // 173: vmon.v1.AttemptEvent.status:type_name -> vmon.v1.AttemptStatus
-	13,  // 174: vmon.v1.AttemptEvent.startup:type_name -> vmon.v1.StartupKind
-	166, // 175: vmon.v1.AttemptEvent.error:type_name -> vmon.v1.CallError
-	17,  // 176: vmon.v1.AttemptEvent.failure_kind:type_name -> vmon.v1.AttemptFailureKind
-	137, // 177: vmon.v1.CallEvent.call:type_name -> vmon.v1.CallRef
-	10,  // 178: vmon.v1.CallEvent.type:type_name -> vmon.v1.CallEventType
-	161, // 179: vmon.v1.CallEvent.status:type_name -> vmon.v1.StatusEvent
-	162, // 180: vmon.v1.CallEvent.log:type_name -> vmon.v1.LogEvent
-	155, // 181: vmon.v1.CallEvent.yield_result:type_name -> vmon.v1.CallResult
-	155, // 182: vmon.v1.CallEvent.result:type_name -> vmon.v1.CallResult
-	163, // 183: vmon.v1.CallEvent.attempt_event:type_name -> vmon.v1.AttemptEvent
-	166, // 184: vmon.v1.CallEvent.error:type_name -> vmon.v1.CallError
-	150, // 185: vmon.v1.CallEvent.input_closed:type_name -> vmon.v1.StreamCallInputsResponse
-	169, // 186: vmon.v1.CallEvent.cancel_requested:type_name -> vmon.v1.CancelCallRequest
-	165, // 187: vmon.v1.CallError.frames:type_name -> vmon.v1.ErrorFrame
-	166, // 188: vmon.v1.CallError.cause:type_name -> vmon.v1.CallError
-	185, // 189: vmon.v1.CallError.details:type_name -> vmon.v1.CallError.DetailsEntry
-	13,  // 190: vmon.v1.AttemptStats.startup:type_name -> vmon.v1.StartupKind
-	17,  // 191: vmon.v1.AttemptStats.failure_kind:type_name -> vmon.v1.AttemptFailureKind
-	167, // 192: vmon.v1.CallStats.attempts:type_name -> vmon.v1.AttemptStats
-	137, // 193: vmon.v1.CancelCallRequest.call:type_name -> vmon.v1.CallRef
-	138, // 194: vmon.v1.ActorRecord.ref:type_name -> vmon.v1.ActorRef
-	82,  // 195: vmon.v1.ActorRecord.function:type_name -> vmon.v1.RevisionRef
-	14,  // 196: vmon.v1.ActorRecord.status:type_name -> vmon.v1.ActorStatus
-	170, // 197: vmon.v1.ActorRecord.latest_checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	186, // 198: vmon.v1.ActorRecord.labels:type_name -> vmon.v1.ActorRecord.LabelsEntry
-	170, // 199: vmon.v1.ActorCheckpoint.ref:type_name -> vmon.v1.ActorCheckpointRef
-	138, // 200: vmon.v1.ActorCheckpoint.actor:type_name -> vmon.v1.ActorRef
-	82,  // 201: vmon.v1.ActorCheckpoint.function:type_name -> vmon.v1.RevisionRef
-	80,  // 202: vmon.v1.ActorCheckpoint.state:type_name -> vmon.v1.ValueEnvelope
-	82,  // 203: vmon.v1.CreateActorRequest.function:type_name -> vmon.v1.RevisionRef
-	80,  // 204: vmon.v1.CreateActorRequest.initial_value:type_name -> vmon.v1.ValueEnvelope
-	139, // 205: vmon.v1.CreateActorRequest.initial_arguments:type_name -> vmon.v1.InvocationArguments
-	187, // 206: vmon.v1.CreateActorRequest.labels:type_name -> vmon.v1.CreateActorRequest.LabelsEntry
-	138, // 207: vmon.v1.CheckpointActorRequest.actor:type_name -> vmon.v1.ActorRef
-	138, // 208: vmon.v1.RestoreActorRequest.actor:type_name -> vmon.v1.ActorRef
-	170, // 209: vmon.v1.RestoreActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	170, // 210: vmon.v1.ForkActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
-	188, // 211: vmon.v1.ForkActorRequest.labels:type_name -> vmon.v1.ForkActorRequest.LabelsEntry
-	80,  // 212: vmon.v1.InvocationArguments.NamedEntry.value:type_name -> vmon.v1.ValueEnvelope
-	21,  // 213: vmon.v1.SandboxService.Create:input_type -> vmon.v1.CreateSandboxRequest
-	22,  // 214: vmon.v1.SandboxService.List:input_type -> vmon.v1.ListSandboxesRequest
-	20,  // 215: vmon.v1.SandboxService.Get:input_type -> vmon.v1.SandboxRef
-	24,  // 216: vmon.v1.SandboxService.Stop:input_type -> vmon.v1.StopSandboxRequest
-	20,  // 217: vmon.v1.SandboxService.Remove:input_type -> vmon.v1.SandboxRef
-	20,  // 218: vmon.v1.SandboxService.Terminate:input_type -> vmon.v1.SandboxRef
-	20,  // 219: vmon.v1.SandboxService.Pause:input_type -> vmon.v1.SandboxRef
-	20,  // 220: vmon.v1.SandboxService.Resume:input_type -> vmon.v1.SandboxRef
-	20,  // 221: vmon.v1.SandboxService.Suspend:input_type -> vmon.v1.SandboxRef
-	26,  // 222: vmon.v1.SandboxService.Extend:input_type -> vmon.v1.ExtendSandboxRequest
-	20,  // 223: vmon.v1.SandboxService.Metrics:input_type -> vmon.v1.SandboxRef
-	27,  // 224: vmon.v1.SandboxService.Logs:input_type -> vmon.v1.LogsRequest
-	30,  // 225: vmon.v1.SandboxService.ExecCapture:input_type -> vmon.v1.ExecCaptureRequest
-	32,  // 226: vmon.v1.SandboxService.Exec:input_type -> vmon.v1.ExecInput
-	32,  // 227: vmon.v1.SandboxService.Shell:input_type -> vmon.v1.ExecInput
-	20,  // 228: vmon.v1.SandboxService.Attach:input_type -> vmon.v1.SandboxRef
-	34,  // 229: vmon.v1.SandboxService.FileRead:input_type -> vmon.v1.FilePathRequest
-	36,  // 230: vmon.v1.SandboxService.FileWrite:input_type -> vmon.v1.FileWriteRequest
-	37,  // 231: vmon.v1.SandboxService.FileDelete:input_type -> vmon.v1.FileDeleteRequest
-	34,  // 232: vmon.v1.SandboxService.FileList:input_type -> vmon.v1.FilePathRequest
-	34,  // 233: vmon.v1.SandboxService.FileStat:input_type -> vmon.v1.FilePathRequest
-	20,  // 234: vmon.v1.SandboxService.NetworkGet:input_type -> vmon.v1.SandboxRef
-	39,  // 235: vmon.v1.SandboxService.NetworkSet:input_type -> vmon.v1.NetworkSetRequest
-	20,  // 236: vmon.v1.SandboxService.Tunnels:input_type -> vmon.v1.SandboxRef
-	40,  // 237: vmon.v1.SandboxService.Migrate:input_type -> vmon.v1.MigrateRequest
-	41,  // 238: vmon.v1.SandboxService.Snapshot:input_type -> vmon.v1.SnapshotRequest
-	42,  // 239: vmon.v1.SandboxService.SnapshotFs:input_type -> vmon.v1.SnapshotFsRequest
-	20,  // 240: vmon.v1.SandboxService.History:input_type -> vmon.v1.SandboxRef
-	25,  // 241: vmon.v1.SandboxService.Rollback:input_type -> vmon.v1.RollbackSandboxRequest
-	43,  // 242: vmon.v1.SnapshotService.List:input_type -> vmon.v1.ListSnapshotsRequest
-	55,  // 243: vmon.v1.SnapshotService.Restore:input_type -> vmon.v1.RestoreSnapshotRequest
-	56,  // 244: vmon.v1.SnapshotService.Fork:input_type -> vmon.v1.ForkSnapshotRequest
-	45,  // 245: vmon.v1.SnapshotService.Delete:input_type -> vmon.v1.SnapshotRef
-	48,  // 246: vmon.v1.CredentialService.List:input_type -> vmon.v1.ListCredentialsRequest
-	50,  // 247: vmon.v1.CredentialService.Put:input_type -> vmon.v1.PutCredentialRequest
-	52,  // 248: vmon.v1.CredentialService.Delete:input_type -> vmon.v1.DeleteCredentialRequest
-	57,  // 249: vmon.v1.VolumeService.List:input_type -> vmon.v1.ListVolumesRequest
-	59,  // 250: vmon.v1.VolumeService.Create:input_type -> vmon.v1.VolumeRef
-	59,  // 251: vmon.v1.VolumeService.Delete:input_type -> vmon.v1.VolumeRef
-	60,  // 252: vmon.v1.PoolService.List:input_type -> vmon.v1.ListPoolsRequest
-	61,  // 253: vmon.v1.PoolService.Set:input_type -> vmon.v1.PoolSetRequest
-	62,  // 254: vmon.v1.PoolService.Delete:input_type -> vmon.v1.PoolRef
-	63,  // 255: vmon.v1.SystemService.Info:input_type -> vmon.v1.InfoRequest
-	65,  // 256: vmon.v1.SystemService.Events:input_type -> vmon.v1.EventsRequest
-	64,  // 257: vmon.v1.SystemService.MeshStatus:input_type -> vmon.v1.MeshStatusRequest
-	75,  // 258: vmon.v1.ArtifactService.Put:input_type -> vmon.v1.PutArtifactRequest
-	76,  // 259: vmon.v1.ArtifactService.Get:input_type -> vmon.v1.GetArtifactRequest
-	72,  // 260: vmon.v1.ArtifactService.Stat:input_type -> vmon.v1.ArtifactRef
-	117, // 261: vmon.v1.FunctionService.Register:input_type -> vmon.v1.RegisterFunctionRequest
-	118, // 262: vmon.v1.FunctionService.Get:input_type -> vmon.v1.GetFunctionRequest
-	119, // 263: vmon.v1.FunctionService.List:input_type -> vmon.v1.ListFunctionsRequest
-	121, // 264: vmon.v1.FunctionService.Activate:input_type -> vmon.v1.ActivateFunctionRequest
-	122, // 265: vmon.v1.FunctionService.Delete:input_type -> vmon.v1.DeleteFunctionRequest
-	125, // 266: vmon.v1.FunctionService.ActivateApp:input_type -> vmon.v1.ActivateAppRequest
-	126, // 267: vmon.v1.FunctionService.GetApp:input_type -> vmon.v1.GetAppRequest
-	127, // 268: vmon.v1.FunctionService.RollbackApp:input_type -> vmon.v1.RollbackAppRequest
-	134, // 269: vmon.v1.FunctionService.CreateSchedule:input_type -> vmon.v1.CreateScheduleRequest
-	128, // 270: vmon.v1.FunctionService.GetSchedule:input_type -> vmon.v1.ScheduleRef
-	135, // 271: vmon.v1.FunctionService.ListSchedules:input_type -> vmon.v1.ListSchedulesRequest
-	128, // 272: vmon.v1.FunctionService.DeleteSchedule:input_type -> vmon.v1.ScheduleRef
-	147, // 273: vmon.v1.CallService.Create:input_type -> vmon.v1.CreateCallRequest
-	149, // 274: vmon.v1.CallService.StreamInputs:input_type -> vmon.v1.StreamCallInputsRequest
-	151, // 275: vmon.v1.CallService.CloseInputs:input_type -> vmon.v1.CloseCallInputsRequest
-	137, // 276: vmon.v1.CallService.Get:input_type -> vmon.v1.CallRef
-	152, // 277: vmon.v1.CallService.List:input_type -> vmon.v1.ListCallsRequest
-	154, // 278: vmon.v1.CallService.GetResult:input_type -> vmon.v1.GetCallResultRequest
-	158, // 279: vmon.v1.CallService.ListResults:input_type -> vmon.v1.ListCallResultsRequest
-	160, // 280: vmon.v1.CallService.Watch:input_type -> vmon.v1.WatchCallRequest
-	169, // 281: vmon.v1.CallService.Cancel:input_type -> vmon.v1.CancelCallRequest
-	173, // 282: vmon.v1.ActorService.Create:input_type -> vmon.v1.CreateActorRequest
-	138, // 283: vmon.v1.ActorService.Get:input_type -> vmon.v1.ActorRef
-	174, // 284: vmon.v1.ActorService.Checkpoint:input_type -> vmon.v1.CheckpointActorRequest
-	175, // 285: vmon.v1.ActorService.Restore:input_type -> vmon.v1.RestoreActorRequest
-	176, // 286: vmon.v1.ActorService.Fork:input_type -> vmon.v1.ForkActorRequest
-	138, // 287: vmon.v1.ActorService.Delete:input_type -> vmon.v1.ActorRef
-	18,  // 288: vmon.v1.SandboxService.Create:output_type -> vmon.v1.JsonView
-	23,  // 289: vmon.v1.SandboxService.List:output_type -> vmon.v1.ListSandboxesResponse
-	18,  // 290: vmon.v1.SandboxService.Get:output_type -> vmon.v1.JsonView
-	18,  // 291: vmon.v1.SandboxService.Stop:output_type -> vmon.v1.JsonView
-	18,  // 292: vmon.v1.SandboxService.Remove:output_type -> vmon.v1.JsonView
-	18,  // 293: vmon.v1.SandboxService.Terminate:output_type -> vmon.v1.JsonView
-	18,  // 294: vmon.v1.SandboxService.Pause:output_type -> vmon.v1.JsonView
-	18,  // 295: vmon.v1.SandboxService.Resume:output_type -> vmon.v1.JsonView
-	18,  // 296: vmon.v1.SandboxService.Suspend:output_type -> vmon.v1.JsonView
-	18,  // 297: vmon.v1.SandboxService.Extend:output_type -> vmon.v1.JsonView
-	18,  // 298: vmon.v1.SandboxService.Metrics:output_type -> vmon.v1.JsonView
-	28,  // 299: vmon.v1.SandboxService.Logs:output_type -> vmon.v1.LogChunk
-	31,  // 300: vmon.v1.SandboxService.ExecCapture:output_type -> vmon.v1.ExecCaptureResponse
-	33,  // 301: vmon.v1.SandboxService.Exec:output_type -> vmon.v1.ExecOutput
-	33,  // 302: vmon.v1.SandboxService.Shell:output_type -> vmon.v1.ExecOutput
-	33,  // 303: vmon.v1.SandboxService.Attach:output_type -> vmon.v1.ExecOutput
-	35,  // 304: vmon.v1.SandboxService.FileRead:output_type -> vmon.v1.FileContent
-	19,  // 305: vmon.v1.SandboxService.FileWrite:output_type -> vmon.v1.Ok
-	19,  // 306: vmon.v1.SandboxService.FileDelete:output_type -> vmon.v1.Ok
-	18,  // 307: vmon.v1.SandboxService.FileList:output_type -> vmon.v1.JsonView
-	18,  // 308: vmon.v1.SandboxService.FileStat:output_type -> vmon.v1.JsonView
-	18,  // 309: vmon.v1.SandboxService.NetworkGet:output_type -> vmon.v1.JsonView
-	18,  // 310: vmon.v1.SandboxService.NetworkSet:output_type -> vmon.v1.JsonView
-	18,  // 311: vmon.v1.SandboxService.Tunnels:output_type -> vmon.v1.JsonView
-	18,  // 312: vmon.v1.SandboxService.Migrate:output_type -> vmon.v1.JsonView
-	18,  // 313: vmon.v1.SandboxService.Snapshot:output_type -> vmon.v1.JsonView
-	18,  // 314: vmon.v1.SandboxService.SnapshotFs:output_type -> vmon.v1.JsonView
-	47,  // 315: vmon.v1.SandboxService.History:output_type -> vmon.v1.RecoveryPointList
-	18,  // 316: vmon.v1.SandboxService.Rollback:output_type -> vmon.v1.JsonView
-	44,  // 317: vmon.v1.SnapshotService.List:output_type -> vmon.v1.SnapshotList
-	18,  // 318: vmon.v1.SnapshotService.Restore:output_type -> vmon.v1.JsonView
-	18,  // 319: vmon.v1.SnapshotService.Fork:output_type -> vmon.v1.JsonView
-	19,  // 320: vmon.v1.SnapshotService.Delete:output_type -> vmon.v1.Ok
-	54,  // 321: vmon.v1.CredentialService.List:output_type -> vmon.v1.CredentialList
-	53,  // 322: vmon.v1.CredentialService.Put:output_type -> vmon.v1.CredentialRecord
-	19,  // 323: vmon.v1.CredentialService.Delete:output_type -> vmon.v1.Ok
-	58,  // 324: vmon.v1.VolumeService.List:output_type -> vmon.v1.VolumeList
-	19,  // 325: vmon.v1.VolumeService.Create:output_type -> vmon.v1.Ok
-	19,  // 326: vmon.v1.VolumeService.Delete:output_type -> vmon.v1.Ok
-	18,  // 327: vmon.v1.PoolService.List:output_type -> vmon.v1.JsonView
-	18,  // 328: vmon.v1.PoolService.Set:output_type -> vmon.v1.JsonView
-	19,  // 329: vmon.v1.PoolService.Delete:output_type -> vmon.v1.Ok
-	18,  // 330: vmon.v1.SystemService.Info:output_type -> vmon.v1.JsonView
-	18,  // 331: vmon.v1.SystemService.Events:output_type -> vmon.v1.JsonView
-	18,  // 332: vmon.v1.SystemService.MeshStatus:output_type -> vmon.v1.JsonView
-	73,  // 333: vmon.v1.ArtifactService.Put:output_type -> vmon.v1.ArtifactRecord
-	78,  // 334: vmon.v1.ArtifactService.Get:output_type -> vmon.v1.ArtifactChunk
-	73,  // 335: vmon.v1.ArtifactService.Stat:output_type -> vmon.v1.ArtifactRecord
-	115, // 336: vmon.v1.FunctionService.Register:output_type -> vmon.v1.FunctionRevision
-	115, // 337: vmon.v1.FunctionService.Get:output_type -> vmon.v1.FunctionRevision
-	120, // 338: vmon.v1.FunctionService.List:output_type -> vmon.v1.ListFunctionsResponse
-	116, // 339: vmon.v1.FunctionService.Activate:output_type -> vmon.v1.FunctionRecord
-	19,  // 340: vmon.v1.FunctionService.Delete:output_type -> vmon.v1.Ok
-	124, // 341: vmon.v1.FunctionService.ActivateApp:output_type -> vmon.v1.AppRevision
-	124, // 342: vmon.v1.FunctionService.GetApp:output_type -> vmon.v1.AppRevision
-	124, // 343: vmon.v1.FunctionService.RollbackApp:output_type -> vmon.v1.AppRevision
-	133, // 344: vmon.v1.FunctionService.CreateSchedule:output_type -> vmon.v1.ScheduleRecord
-	133, // 345: vmon.v1.FunctionService.GetSchedule:output_type -> vmon.v1.ScheduleRecord
-	136, // 346: vmon.v1.FunctionService.ListSchedules:output_type -> vmon.v1.ListSchedulesResponse
-	19,  // 347: vmon.v1.FunctionService.DeleteSchedule:output_type -> vmon.v1.Ok
-	148, // 348: vmon.v1.CallService.Create:output_type -> vmon.v1.CallRecord
-	150, // 349: vmon.v1.CallService.StreamInputs:output_type -> vmon.v1.StreamCallInputsResponse
-	148, // 350: vmon.v1.CallService.CloseInputs:output_type -> vmon.v1.CallRecord
-	148, // 351: vmon.v1.CallService.Get:output_type -> vmon.v1.CallRecord
-	153, // 352: vmon.v1.CallService.List:output_type -> vmon.v1.ListCallsResponse
-	155, // 353: vmon.v1.CallService.GetResult:output_type -> vmon.v1.CallResult
-	159, // 354: vmon.v1.CallService.ListResults:output_type -> vmon.v1.ListCallResultsResponse
-	164, // 355: vmon.v1.CallService.Watch:output_type -> vmon.v1.CallEvent
-	148, // 356: vmon.v1.CallService.Cancel:output_type -> vmon.v1.CallRecord
-	171, // 357: vmon.v1.ActorService.Create:output_type -> vmon.v1.ActorRecord
-	171, // 358: vmon.v1.ActorService.Get:output_type -> vmon.v1.ActorRecord
-	172, // 359: vmon.v1.ActorService.Checkpoint:output_type -> vmon.v1.ActorCheckpoint
-	171, // 360: vmon.v1.ActorService.Restore:output_type -> vmon.v1.ActorRecord
-	171, // 361: vmon.v1.ActorService.Fork:output_type -> vmon.v1.ActorRecord
-	19,  // 362: vmon.v1.ActorService.Delete:output_type -> vmon.v1.Ok
-	288, // [288:363] is the sub-list for method output_type
-	213, // [213:288] is the sub-list for method input_type
-	213, // [213:213] is the sub-list for extension type_name
-	213, // [213:213] is the sub-list for extension extendee
-	0,   // [0:213] is the sub-list for field type_name
+	21,  // 0: vmon.v1.BatchCreateRequest.create:type_name -> vmon.v1.CreateSandboxRequest
+	23,  // 1: vmon.v1.BatchCreateResponse.error:type_name -> vmon.v1.BatchCreateError
+	181, // 2: vmon.v1.ExecStart.env:type_name -> vmon.v1.ExecStart.EnvEntry
+	33,  // 3: vmon.v1.ExecCaptureRequest.exec:type_name -> vmon.v1.ExecStart
+	33,  // 4: vmon.v1.ExecInput.start:type_name -> vmon.v1.ExecStart
+	70,  // 5: vmon.v1.ExecInput.eof:type_name -> vmon.v1.Eof
+	71,  // 6: vmon.v1.ExecInput.resize:type_name -> vmon.v1.Resize
+	72,  // 7: vmon.v1.ExecOutput.chunk:type_name -> vmon.v1.Output
+	73,  // 8: vmon.v1.ExecOutput.exit:type_name -> vmon.v1.Exit
+	74,  // 9: vmon.v1.ExecOutput.ready:type_name -> vmon.v1.Ready
+	42,  // 10: vmon.v1.NetworkSetRequest.cidr_allow:type_name -> vmon.v1.StringList
+	42,  // 11: vmon.v1.NetworkSetRequest.domain_allow:type_name -> vmon.v1.StringList
+	50,  // 12: vmon.v1.RecoveryPointList.points:type_name -> vmon.v1.RecoveryPoint
+	53,  // 13: vmon.v1.PutCredentialRequest.headers:type_name -> vmon.v1.CredentialHeader
+	55,  // 14: vmon.v1.DeleteCredentialRequest.credential:type_name -> vmon.v1.CredentialRef
+	57,  // 15: vmon.v1.CredentialList.credentials:type_name -> vmon.v1.CredentialRecord
+	0,   // 16: vmon.v1.Output.stream:type_name -> vmon.v1.Stream
+	1,   // 17: vmon.v1.Digest.algorithm:type_name -> vmon.v1.DigestAlgorithm
+	75,  // 18: vmon.v1.ArtifactRef.digest:type_name -> vmon.v1.Digest
+	76,  // 19: vmon.v1.ArtifactRecord.ref:type_name -> vmon.v1.ArtifactRef
+	75,  // 20: vmon.v1.PutArtifactHeader.expected_digest:type_name -> vmon.v1.Digest
+	78,  // 21: vmon.v1.PutArtifactRequest.header:type_name -> vmon.v1.PutArtifactHeader
+	76,  // 22: vmon.v1.GetArtifactRequest.artifact:type_name -> vmon.v1.ArtifactRef
+	81,  // 23: vmon.v1.GetArtifactRequest.range:type_name -> vmon.v1.ByteRange
+	2,   // 24: vmon.v1.ValueEnvelope.serializer:type_name -> vmon.v1.ValueSerializer
+	3,   // 25: vmon.v1.ValueEnvelope.compression:type_name -> vmon.v1.ValueCompression
+	75,  // 26: vmon.v1.ValueEnvelope.checksum:type_name -> vmon.v1.Digest
+	76,  // 27: vmon.v1.ValueEnvelope.artifact:type_name -> vmon.v1.ArtifactRef
+	83,  // 28: vmon.v1.ValueEnvelope.python:type_name -> vmon.v1.PythonCodecMetadata
+	85,  // 29: vmon.v1.RevisionRef.function:type_name -> vmon.v1.FunctionRef
+	85,  // 30: vmon.v1.FunctionSelector.current:type_name -> vmon.v1.FunctionRef
+	86,  // 31: vmon.v1.FunctionSelector.pinned:type_name -> vmon.v1.RevisionRef
+	88,  // 32: vmon.v1.AppRevisionRef.app:type_name -> vmon.v1.AppRef
+	88,  // 33: vmon.v1.AppSelector.current:type_name -> vmon.v1.AppRef
+	89,  // 34: vmon.v1.AppSelector.pinned:type_name -> vmon.v1.AppRevisionRef
+	76,  // 35: vmon.v1.PackageSpec.source:type_name -> vmon.v1.ArtifactRef
+	76,  // 36: vmon.v1.PackageSpec.lockfile:type_name -> vmon.v1.ArtifactRef
+	75,  // 37: vmon.v1.PackageSpec.content_digest:type_name -> vmon.v1.Digest
+	5,   // 38: vmon.v1.PackageSpec.mode:type_name -> vmon.v1.PackageMode
+	94,  // 39: vmon.v1.PackageSpec.python:type_name -> vmon.v1.PythonCodeMetadata
+	95,  // 40: vmon.v1.ImageSpec.python:type_name -> vmon.v1.PythonImageSource
+	96,  // 41: vmon.v1.ImageSpec.registry:type_name -> vmon.v1.RegistryImageSource
+	97,  // 42: vmon.v1.ImageSpec.dockerfile:type_name -> vmon.v1.DockerfileImageSource
+	98,  // 43: vmon.v1.ImageSpec.template:type_name -> vmon.v1.TemplateImageSource
+	99,  // 44: vmon.v1.ImageSpec.apt_packages:type_name -> vmon.v1.AptPackage
+	100, // 45: vmon.v1.ImageSpec.uv_packages:type_name -> vmon.v1.UvPackage
+	101, // 46: vmon.v1.ImageSpec.commands:type_name -> vmon.v1.ImageBuildCommand
+	182, // 47: vmon.v1.ImageSpec.environment:type_name -> vmon.v1.ImageSpec.EnvironmentEntry
+	102, // 48: vmon.v1.ImageSpec.local_artifact_mounts:type_name -> vmon.v1.LocalArtifactMount
+	75,  // 49: vmon.v1.ImageSpec.resolved_oci_digest:type_name -> vmon.v1.Digest
+	6,   // 50: vmon.v1.ResourceSpec.architecture:type_name -> vmon.v1.CpuArchitecture
+	7,   // 51: vmon.v1.ResourceSpec.high_availability:type_name -> vmon.v1.HighAvailabilityPolicy
+	103, // 52: vmon.v1.ResourceSpec.volume_mounts:type_name -> vmon.v1.FunctionVolumeMount
+	104, // 53: vmon.v1.ResourceSpec.network:type_name -> vmon.v1.NetworkPolicy
+	76,  // 54: vmon.v1.DockerfileImageSource.context:type_name -> vmon.v1.ArtifactRef
+	76,  // 55: vmon.v1.LocalArtifactMount.artifact:type_name -> vmon.v1.ArtifactRef
+	63,  // 56: vmon.v1.FunctionVolumeMount.volume:type_name -> vmon.v1.VolumeRef
+	2,   // 57: vmon.v1.SerializerSpec.input_serializer:type_name -> vmon.v1.ValueSerializer
+	2,   // 58: vmon.v1.SerializerSpec.result_serializer:type_name -> vmon.v1.ValueSerializer
+	3,   // 59: vmon.v1.SerializerSpec.compression:type_name -> vmon.v1.ValueCompression
+	75,  // 60: vmon.v1.ReproducibilitySpec.build_inputs_digest:type_name -> vmon.v1.Digest
+	183, // 61: vmon.v1.ReproducibilitySpec.environment:type_name -> vmon.v1.ReproducibilitySpec.EnvironmentEntry
+	112, // 62: vmon.v1.TransientSecretMaterial.secret:type_name -> vmon.v1.SecretRef
+	114, // 63: vmon.v1.LifecycleHooks.initialize:type_name -> vmon.v1.LifecycleHookRef
+	114, // 64: vmon.v1.LifecycleHooks.shutdown:type_name -> vmon.v1.LifecycleHookRef
+	114, // 65: vmon.v1.LifecycleHooks.snapshot:type_name -> vmon.v1.LifecycleHookRef
+	114, // 66: vmon.v1.LifecycleHooks.restore:type_name -> vmon.v1.LifecycleHookRef
+	116, // 67: vmon.v1.FunctionSnapshotRecord.ref:type_name -> vmon.v1.FunctionSnapshotRef
+	86,  // 68: vmon.v1.FunctionSnapshotRecord.revision:type_name -> vmon.v1.RevisionRef
+	76,  // 69: vmon.v1.FunctionSnapshotRecord.artifact:type_name -> vmon.v1.ArtifactRef
+	75,  // 70: vmon.v1.FunctionSnapshotRecord.runner_digest:type_name -> vmon.v1.Digest
+	75,  // 71: vmon.v1.FunctionSnapshotRecord.image_digest:type_name -> vmon.v1.Digest
+	75,  // 72: vmon.v1.FunctionSnapshotRecord.package_digest:type_name -> vmon.v1.Digest
+	114, // 73: vmon.v1.FunctionSnapshotRecord.initialize_hook:type_name -> vmon.v1.LifecycleHookRef
+	85,  // 74: vmon.v1.FunctionSpec.function:type_name -> vmon.v1.FunctionRef
+	91,  // 75: vmon.v1.FunctionSpec.package:type_name -> vmon.v1.PackageSpec
+	92,  // 76: vmon.v1.FunctionSpec.image:type_name -> vmon.v1.ImageSpec
+	93,  // 77: vmon.v1.FunctionSpec.resources:type_name -> vmon.v1.ResourceSpec
+	105, // 78: vmon.v1.FunctionSpec.retry:type_name -> vmon.v1.RetryPolicy
+	106, // 79: vmon.v1.FunctionSpec.timeouts:type_name -> vmon.v1.TimeoutSpec
+	107, // 80: vmon.v1.FunctionSpec.workers:type_name -> vmon.v1.WorkerSpec
+	108, // 81: vmon.v1.FunctionSpec.concurrency:type_name -> vmon.v1.ConcurrencySpec
+	109, // 82: vmon.v1.FunctionSpec.batching:type_name -> vmon.v1.BatchingSpec
+	110, // 83: vmon.v1.FunctionSpec.serializer:type_name -> vmon.v1.SerializerSpec
+	4,   // 84: vmon.v1.FunctionSpec.lifecycle:type_name -> vmon.v1.FunctionLifecycle
+	111, // 85: vmon.v1.FunctionSpec.reproducibility:type_name -> vmon.v1.ReproducibilitySpec
+	184, // 86: vmon.v1.FunctionSpec.labels:type_name -> vmon.v1.FunctionSpec.LabelsEntry
+	112, // 87: vmon.v1.FunctionSpec.secrets:type_name -> vmon.v1.SecretRef
+	115, // 88: vmon.v1.FunctionSpec.lifecycle_hooks:type_name -> vmon.v1.LifecycleHooks
+	86,  // 89: vmon.v1.FunctionRevision.ref:type_name -> vmon.v1.RevisionRef
+	118, // 90: vmon.v1.FunctionRevision.spec:type_name -> vmon.v1.FunctionSpec
+	75,  // 91: vmon.v1.FunctionRevision.spec_digest:type_name -> vmon.v1.Digest
+	16,  // 92: vmon.v1.FunctionRevision.status:type_name -> vmon.v1.FunctionRevisionStatus
+	112, // 93: vmon.v1.FunctionRevision.unavailable_secrets:type_name -> vmon.v1.SecretRef
+	117, // 94: vmon.v1.FunctionRevision.snapshot:type_name -> vmon.v1.FunctionSnapshotRecord
+	85,  // 95: vmon.v1.FunctionRecord.function:type_name -> vmon.v1.FunctionRef
+	86,  // 96: vmon.v1.FunctionRecord.current:type_name -> vmon.v1.RevisionRef
+	118, // 97: vmon.v1.RegisterFunctionRequest.spec:type_name -> vmon.v1.FunctionSpec
+	113, // 98: vmon.v1.RegisterFunctionRequest.transient_secrets:type_name -> vmon.v1.TransientSecretMaterial
+	87,  // 99: vmon.v1.GetFunctionRequest.function:type_name -> vmon.v1.FunctionSelector
+	85,  // 100: vmon.v1.ListFunctionsRequest.function:type_name -> vmon.v1.FunctionRef
+	119, // 101: vmon.v1.ListFunctionsResponse.revisions:type_name -> vmon.v1.FunctionRevision
+	86,  // 102: vmon.v1.ActivateFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
+	86,  // 103: vmon.v1.ActivateFunctionRequest.expected_current:type_name -> vmon.v1.RevisionRef
+	86,  // 104: vmon.v1.DeleteFunctionRequest.revision:type_name -> vmon.v1.RevisionRef
+	86,  // 105: vmon.v1.AppFunctionBinding.revision:type_name -> vmon.v1.RevisionRef
+	89,  // 106: vmon.v1.AppRevision.ref:type_name -> vmon.v1.AppRevisionRef
+	127, // 107: vmon.v1.AppRevision.functions:type_name -> vmon.v1.AppFunctionBinding
+	75,  // 108: vmon.v1.AppRevision.content_digest:type_name -> vmon.v1.Digest
+	89,  // 109: vmon.v1.AppRevision.previous:type_name -> vmon.v1.AppRevisionRef
+	88,  // 110: vmon.v1.ActivateAppRequest.app:type_name -> vmon.v1.AppRef
+	127, // 111: vmon.v1.ActivateAppRequest.functions:type_name -> vmon.v1.AppFunctionBinding
+	89,  // 112: vmon.v1.ActivateAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
+	90,  // 113: vmon.v1.GetAppRequest.app:type_name -> vmon.v1.AppSelector
+	89,  // 114: vmon.v1.RollbackAppRequest.target:type_name -> vmon.v1.AppRevisionRef
+	89,  // 115: vmon.v1.RollbackAppRequest.expected_current:type_name -> vmon.v1.AppRevisionRef
+	86,  // 116: vmon.v1.ScheduleTarget.function:type_name -> vmon.v1.RevisionRef
+	84,  // 117: vmon.v1.ScheduleTarget.input:type_name -> vmon.v1.ValueEnvelope
+	89,  // 118: vmon.v1.ScheduleSpec.app:type_name -> vmon.v1.AppRevisionRef
+	135, // 119: vmon.v1.ScheduleSpec.target:type_name -> vmon.v1.ScheduleTarget
+	133, // 120: vmon.v1.ScheduleSpec.cron:type_name -> vmon.v1.CronSchedule
+	134, // 121: vmon.v1.ScheduleSpec.period:type_name -> vmon.v1.PeriodSchedule
+	15,  // 122: vmon.v1.ScheduleSpec.status:type_name -> vmon.v1.ScheduleStatus
+	185, // 123: vmon.v1.ScheduleSpec.labels:type_name -> vmon.v1.ScheduleSpec.LabelsEntry
+	132, // 124: vmon.v1.ScheduleRecord.ref:type_name -> vmon.v1.ScheduleRef
+	136, // 125: vmon.v1.ScheduleRecord.spec:type_name -> vmon.v1.ScheduleSpec
+	136, // 126: vmon.v1.CreateScheduleRequest.spec:type_name -> vmon.v1.ScheduleSpec
+	88,  // 127: vmon.v1.ListSchedulesRequest.app:type_name -> vmon.v1.AppRef
+	85,  // 128: vmon.v1.ListSchedulesRequest.function:type_name -> vmon.v1.FunctionRef
+	137, // 129: vmon.v1.ListSchedulesResponse.schedules:type_name -> vmon.v1.ScheduleRecord
+	84,  // 130: vmon.v1.InvocationArguments.positional:type_name -> vmon.v1.ValueEnvelope
+	186, // 131: vmon.v1.InvocationArguments.named:type_name -> vmon.v1.InvocationArguments.NamedEntry
+	142, // 132: vmon.v1.ActorTarget.actor:type_name -> vmon.v1.ActorRef
+	143, // 133: vmon.v1.ServiceTarget.constructor:type_name -> vmon.v1.InvocationArguments
+	86,  // 134: vmon.v1.CallTarget.function:type_name -> vmon.v1.RevisionRef
+	144, // 135: vmon.v1.CallTarget.actor:type_name -> vmon.v1.ActorTarget
+	145, // 136: vmon.v1.CallTarget.service:type_name -> vmon.v1.ServiceTarget
+	84,  // 137: vmon.v1.CallInput.value:type_name -> vmon.v1.ValueEnvelope
+	143, // 138: vmon.v1.CallInput.arguments:type_name -> vmon.v1.InvocationArguments
+	146, // 139: vmon.v1.CallGraph.parents:type_name -> vmon.v1.ParentEdge
+	8,   // 140: vmon.v1.CreateCallRequest.type:type_name -> vmon.v1.CallType
+	147, // 141: vmon.v1.CreateCallRequest.target:type_name -> vmon.v1.CallTarget
+	148, // 142: vmon.v1.CreateCallRequest.inputs:type_name -> vmon.v1.CallInput
+	150, // 143: vmon.v1.CreateCallRequest.graph:type_name -> vmon.v1.CallGraph
+	187, // 144: vmon.v1.CreateCallRequest.labels:type_name -> vmon.v1.CreateCallRequest.LabelsEntry
+	141, // 145: vmon.v1.CallRecord.ref:type_name -> vmon.v1.CallRef
+	8,   // 146: vmon.v1.CallRecord.type:type_name -> vmon.v1.CallType
+	147, // 147: vmon.v1.CallRecord.target:type_name -> vmon.v1.CallTarget
+	9,   // 148: vmon.v1.CallRecord.status:type_name -> vmon.v1.CallStatus
+	150, // 149: vmon.v1.CallRecord.graph:type_name -> vmon.v1.CallGraph
+	170, // 150: vmon.v1.CallRecord.error:type_name -> vmon.v1.CallError
+	172, // 151: vmon.v1.CallRecord.stats:type_name -> vmon.v1.CallStats
+	188, // 152: vmon.v1.CallRecord.labels:type_name -> vmon.v1.CallRecord.LabelsEntry
+	160, // 153: vmon.v1.CallRecord.result_cursor:type_name -> vmon.v1.ResultCursor
+	141, // 154: vmon.v1.StreamCallInputsRequest.call:type_name -> vmon.v1.CallRef
+	148, // 155: vmon.v1.StreamCallInputsRequest.input:type_name -> vmon.v1.CallInput
+	141, // 156: vmon.v1.StreamCallInputsResponse.call:type_name -> vmon.v1.CallRef
+	149, // 157: vmon.v1.StreamCallInputsResponse.last_input:type_name -> vmon.v1.InputRef
+	141, // 158: vmon.v1.CloseCallInputsRequest.call:type_name -> vmon.v1.CallRef
+	85,  // 159: vmon.v1.ListCallsRequest.function:type_name -> vmon.v1.FunctionRef
+	9,   // 160: vmon.v1.ListCallsRequest.status:type_name -> vmon.v1.CallStatus
+	142, // 161: vmon.v1.ListCallsRequest.actor:type_name -> vmon.v1.ActorRef
+	152, // 162: vmon.v1.ListCallsResponse.calls:type_name -> vmon.v1.CallRecord
+	141, // 163: vmon.v1.GetCallResultRequest.call:type_name -> vmon.v1.CallRef
+	141, // 164: vmon.v1.CallResult.call:type_name -> vmon.v1.CallRef
+	84,  // 165: vmon.v1.CallResult.value:type_name -> vmon.v1.ValueEnvelope
+	170, // 166: vmon.v1.CallResult.error:type_name -> vmon.v1.CallError
+	141, // 167: vmon.v1.ResultCursor.call:type_name -> vmon.v1.CallRef
+	141, // 168: vmon.v1.EventCursor.call:type_name -> vmon.v1.CallRef
+	160, // 169: vmon.v1.ListCallResultsRequest.cursor:type_name -> vmon.v1.ResultCursor
+	159, // 170: vmon.v1.ListCallResultsResponse.results:type_name -> vmon.v1.CallResult
+	160, // 171: vmon.v1.ListCallResultsResponse.next_cursor:type_name -> vmon.v1.ResultCursor
+	161, // 172: vmon.v1.WatchCallRequest.cursor:type_name -> vmon.v1.EventCursor
+	9,   // 173: vmon.v1.StatusEvent.status:type_name -> vmon.v1.CallStatus
+	11,  // 174: vmon.v1.LogEvent.stream:type_name -> vmon.v1.LogStream
+	12,  // 175: vmon.v1.AttemptEvent.status:type_name -> vmon.v1.AttemptStatus
+	13,  // 176: vmon.v1.AttemptEvent.startup:type_name -> vmon.v1.StartupKind
+	170, // 177: vmon.v1.AttemptEvent.error:type_name -> vmon.v1.CallError
+	17,  // 178: vmon.v1.AttemptEvent.failure_kind:type_name -> vmon.v1.AttemptFailureKind
+	141, // 179: vmon.v1.CallEvent.call:type_name -> vmon.v1.CallRef
+	10,  // 180: vmon.v1.CallEvent.type:type_name -> vmon.v1.CallEventType
+	165, // 181: vmon.v1.CallEvent.status:type_name -> vmon.v1.StatusEvent
+	166, // 182: vmon.v1.CallEvent.log:type_name -> vmon.v1.LogEvent
+	159, // 183: vmon.v1.CallEvent.yield_result:type_name -> vmon.v1.CallResult
+	159, // 184: vmon.v1.CallEvent.result:type_name -> vmon.v1.CallResult
+	167, // 185: vmon.v1.CallEvent.attempt_event:type_name -> vmon.v1.AttemptEvent
+	170, // 186: vmon.v1.CallEvent.error:type_name -> vmon.v1.CallError
+	154, // 187: vmon.v1.CallEvent.input_closed:type_name -> vmon.v1.StreamCallInputsResponse
+	173, // 188: vmon.v1.CallEvent.cancel_requested:type_name -> vmon.v1.CancelCallRequest
+	169, // 189: vmon.v1.CallError.frames:type_name -> vmon.v1.ErrorFrame
+	170, // 190: vmon.v1.CallError.cause:type_name -> vmon.v1.CallError
+	189, // 191: vmon.v1.CallError.details:type_name -> vmon.v1.CallError.DetailsEntry
+	13,  // 192: vmon.v1.AttemptStats.startup:type_name -> vmon.v1.StartupKind
+	17,  // 193: vmon.v1.AttemptStats.failure_kind:type_name -> vmon.v1.AttemptFailureKind
+	171, // 194: vmon.v1.CallStats.attempts:type_name -> vmon.v1.AttemptStats
+	141, // 195: vmon.v1.CancelCallRequest.call:type_name -> vmon.v1.CallRef
+	142, // 196: vmon.v1.ActorRecord.ref:type_name -> vmon.v1.ActorRef
+	86,  // 197: vmon.v1.ActorRecord.function:type_name -> vmon.v1.RevisionRef
+	14,  // 198: vmon.v1.ActorRecord.status:type_name -> vmon.v1.ActorStatus
+	174, // 199: vmon.v1.ActorRecord.latest_checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	190, // 200: vmon.v1.ActorRecord.labels:type_name -> vmon.v1.ActorRecord.LabelsEntry
+	174, // 201: vmon.v1.ActorCheckpoint.ref:type_name -> vmon.v1.ActorCheckpointRef
+	142, // 202: vmon.v1.ActorCheckpoint.actor:type_name -> vmon.v1.ActorRef
+	86,  // 203: vmon.v1.ActorCheckpoint.function:type_name -> vmon.v1.RevisionRef
+	84,  // 204: vmon.v1.ActorCheckpoint.state:type_name -> vmon.v1.ValueEnvelope
+	86,  // 205: vmon.v1.CreateActorRequest.function:type_name -> vmon.v1.RevisionRef
+	84,  // 206: vmon.v1.CreateActorRequest.initial_value:type_name -> vmon.v1.ValueEnvelope
+	143, // 207: vmon.v1.CreateActorRequest.initial_arguments:type_name -> vmon.v1.InvocationArguments
+	191, // 208: vmon.v1.CreateActorRequest.labels:type_name -> vmon.v1.CreateActorRequest.LabelsEntry
+	142, // 209: vmon.v1.CheckpointActorRequest.actor:type_name -> vmon.v1.ActorRef
+	142, // 210: vmon.v1.RestoreActorRequest.actor:type_name -> vmon.v1.ActorRef
+	174, // 211: vmon.v1.RestoreActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	174, // 212: vmon.v1.ForkActorRequest.checkpoint:type_name -> vmon.v1.ActorCheckpointRef
+	192, // 213: vmon.v1.ForkActorRequest.labels:type_name -> vmon.v1.ForkActorRequest.LabelsEntry
+	84,  // 214: vmon.v1.InvocationArguments.NamedEntry.value:type_name -> vmon.v1.ValueEnvelope
+	21,  // 215: vmon.v1.SandboxService.Create:input_type -> vmon.v1.CreateSandboxRequest
+	22,  // 216: vmon.v1.SandboxService.BatchCreate:input_type -> vmon.v1.BatchCreateRequest
+	25,  // 217: vmon.v1.SandboxService.Watch:input_type -> vmon.v1.WatchSandboxRequest
+	26,  // 218: vmon.v1.SandboxService.List:input_type -> vmon.v1.ListSandboxesRequest
+	20,  // 219: vmon.v1.SandboxService.Get:input_type -> vmon.v1.SandboxRef
+	28,  // 220: vmon.v1.SandboxService.Stop:input_type -> vmon.v1.StopSandboxRequest
+	20,  // 221: vmon.v1.SandboxService.Remove:input_type -> vmon.v1.SandboxRef
+	20,  // 222: vmon.v1.SandboxService.Terminate:input_type -> vmon.v1.SandboxRef
+	20,  // 223: vmon.v1.SandboxService.Pause:input_type -> vmon.v1.SandboxRef
+	20,  // 224: vmon.v1.SandboxService.Resume:input_type -> vmon.v1.SandboxRef
+	20,  // 225: vmon.v1.SandboxService.Suspend:input_type -> vmon.v1.SandboxRef
+	30,  // 226: vmon.v1.SandboxService.Extend:input_type -> vmon.v1.ExtendSandboxRequest
+	20,  // 227: vmon.v1.SandboxService.Metrics:input_type -> vmon.v1.SandboxRef
+	31,  // 228: vmon.v1.SandboxService.Logs:input_type -> vmon.v1.LogsRequest
+	34,  // 229: vmon.v1.SandboxService.ExecCapture:input_type -> vmon.v1.ExecCaptureRequest
+	36,  // 230: vmon.v1.SandboxService.Exec:input_type -> vmon.v1.ExecInput
+	36,  // 231: vmon.v1.SandboxService.Shell:input_type -> vmon.v1.ExecInput
+	20,  // 232: vmon.v1.SandboxService.Attach:input_type -> vmon.v1.SandboxRef
+	38,  // 233: vmon.v1.SandboxService.FileRead:input_type -> vmon.v1.FilePathRequest
+	40,  // 234: vmon.v1.SandboxService.FileWrite:input_type -> vmon.v1.FileWriteRequest
+	41,  // 235: vmon.v1.SandboxService.FileDelete:input_type -> vmon.v1.FileDeleteRequest
+	38,  // 236: vmon.v1.SandboxService.FileList:input_type -> vmon.v1.FilePathRequest
+	38,  // 237: vmon.v1.SandboxService.FileStat:input_type -> vmon.v1.FilePathRequest
+	20,  // 238: vmon.v1.SandboxService.NetworkGet:input_type -> vmon.v1.SandboxRef
+	43,  // 239: vmon.v1.SandboxService.NetworkSet:input_type -> vmon.v1.NetworkSetRequest
+	20,  // 240: vmon.v1.SandboxService.Tunnels:input_type -> vmon.v1.SandboxRef
+	44,  // 241: vmon.v1.SandboxService.Migrate:input_type -> vmon.v1.MigrateRequest
+	45,  // 242: vmon.v1.SandboxService.Snapshot:input_type -> vmon.v1.SnapshotRequest
+	46,  // 243: vmon.v1.SandboxService.SnapshotFs:input_type -> vmon.v1.SnapshotFsRequest
+	20,  // 244: vmon.v1.SandboxService.History:input_type -> vmon.v1.SandboxRef
+	29,  // 245: vmon.v1.SandboxService.Rollback:input_type -> vmon.v1.RollbackSandboxRequest
+	47,  // 246: vmon.v1.SnapshotService.List:input_type -> vmon.v1.ListSnapshotsRequest
+	59,  // 247: vmon.v1.SnapshotService.Restore:input_type -> vmon.v1.RestoreSnapshotRequest
+	60,  // 248: vmon.v1.SnapshotService.Fork:input_type -> vmon.v1.ForkSnapshotRequest
+	49,  // 249: vmon.v1.SnapshotService.Delete:input_type -> vmon.v1.SnapshotRef
+	52,  // 250: vmon.v1.CredentialService.List:input_type -> vmon.v1.ListCredentialsRequest
+	54,  // 251: vmon.v1.CredentialService.Put:input_type -> vmon.v1.PutCredentialRequest
+	56,  // 252: vmon.v1.CredentialService.Delete:input_type -> vmon.v1.DeleteCredentialRequest
+	61,  // 253: vmon.v1.VolumeService.List:input_type -> vmon.v1.ListVolumesRequest
+	63,  // 254: vmon.v1.VolumeService.Create:input_type -> vmon.v1.VolumeRef
+	63,  // 255: vmon.v1.VolumeService.Delete:input_type -> vmon.v1.VolumeRef
+	64,  // 256: vmon.v1.PoolService.List:input_type -> vmon.v1.ListPoolsRequest
+	65,  // 257: vmon.v1.PoolService.Set:input_type -> vmon.v1.PoolSetRequest
+	66,  // 258: vmon.v1.PoolService.Delete:input_type -> vmon.v1.PoolRef
+	67,  // 259: vmon.v1.SystemService.Info:input_type -> vmon.v1.InfoRequest
+	69,  // 260: vmon.v1.SystemService.Events:input_type -> vmon.v1.EventsRequest
+	68,  // 261: vmon.v1.SystemService.MeshStatus:input_type -> vmon.v1.MeshStatusRequest
+	79,  // 262: vmon.v1.ArtifactService.Put:input_type -> vmon.v1.PutArtifactRequest
+	80,  // 263: vmon.v1.ArtifactService.Get:input_type -> vmon.v1.GetArtifactRequest
+	76,  // 264: vmon.v1.ArtifactService.Stat:input_type -> vmon.v1.ArtifactRef
+	121, // 265: vmon.v1.FunctionService.Register:input_type -> vmon.v1.RegisterFunctionRequest
+	122, // 266: vmon.v1.FunctionService.Get:input_type -> vmon.v1.GetFunctionRequest
+	123, // 267: vmon.v1.FunctionService.List:input_type -> vmon.v1.ListFunctionsRequest
+	125, // 268: vmon.v1.FunctionService.Activate:input_type -> vmon.v1.ActivateFunctionRequest
+	126, // 269: vmon.v1.FunctionService.Delete:input_type -> vmon.v1.DeleteFunctionRequest
+	129, // 270: vmon.v1.FunctionService.ActivateApp:input_type -> vmon.v1.ActivateAppRequest
+	130, // 271: vmon.v1.FunctionService.GetApp:input_type -> vmon.v1.GetAppRequest
+	131, // 272: vmon.v1.FunctionService.RollbackApp:input_type -> vmon.v1.RollbackAppRequest
+	138, // 273: vmon.v1.FunctionService.CreateSchedule:input_type -> vmon.v1.CreateScheduleRequest
+	132, // 274: vmon.v1.FunctionService.GetSchedule:input_type -> vmon.v1.ScheduleRef
+	139, // 275: vmon.v1.FunctionService.ListSchedules:input_type -> vmon.v1.ListSchedulesRequest
+	132, // 276: vmon.v1.FunctionService.DeleteSchedule:input_type -> vmon.v1.ScheduleRef
+	151, // 277: vmon.v1.CallService.Create:input_type -> vmon.v1.CreateCallRequest
+	153, // 278: vmon.v1.CallService.StreamInputs:input_type -> vmon.v1.StreamCallInputsRequest
+	155, // 279: vmon.v1.CallService.CloseInputs:input_type -> vmon.v1.CloseCallInputsRequest
+	141, // 280: vmon.v1.CallService.Get:input_type -> vmon.v1.CallRef
+	156, // 281: vmon.v1.CallService.List:input_type -> vmon.v1.ListCallsRequest
+	158, // 282: vmon.v1.CallService.GetResult:input_type -> vmon.v1.GetCallResultRequest
+	162, // 283: vmon.v1.CallService.ListResults:input_type -> vmon.v1.ListCallResultsRequest
+	164, // 284: vmon.v1.CallService.Watch:input_type -> vmon.v1.WatchCallRequest
+	173, // 285: vmon.v1.CallService.Cancel:input_type -> vmon.v1.CancelCallRequest
+	177, // 286: vmon.v1.ActorService.Create:input_type -> vmon.v1.CreateActorRequest
+	142, // 287: vmon.v1.ActorService.Get:input_type -> vmon.v1.ActorRef
+	178, // 288: vmon.v1.ActorService.Checkpoint:input_type -> vmon.v1.CheckpointActorRequest
+	179, // 289: vmon.v1.ActorService.Restore:input_type -> vmon.v1.RestoreActorRequest
+	180, // 290: vmon.v1.ActorService.Fork:input_type -> vmon.v1.ForkActorRequest
+	142, // 291: vmon.v1.ActorService.Delete:input_type -> vmon.v1.ActorRef
+	18,  // 292: vmon.v1.SandboxService.Create:output_type -> vmon.v1.JsonView
+	24,  // 293: vmon.v1.SandboxService.BatchCreate:output_type -> vmon.v1.BatchCreateResponse
+	18,  // 294: vmon.v1.SandboxService.Watch:output_type -> vmon.v1.JsonView
+	27,  // 295: vmon.v1.SandboxService.List:output_type -> vmon.v1.ListSandboxesResponse
+	18,  // 296: vmon.v1.SandboxService.Get:output_type -> vmon.v1.JsonView
+	18,  // 297: vmon.v1.SandboxService.Stop:output_type -> vmon.v1.JsonView
+	18,  // 298: vmon.v1.SandboxService.Remove:output_type -> vmon.v1.JsonView
+	18,  // 299: vmon.v1.SandboxService.Terminate:output_type -> vmon.v1.JsonView
+	18,  // 300: vmon.v1.SandboxService.Pause:output_type -> vmon.v1.JsonView
+	18,  // 301: vmon.v1.SandboxService.Resume:output_type -> vmon.v1.JsonView
+	18,  // 302: vmon.v1.SandboxService.Suspend:output_type -> vmon.v1.JsonView
+	18,  // 303: vmon.v1.SandboxService.Extend:output_type -> vmon.v1.JsonView
+	18,  // 304: vmon.v1.SandboxService.Metrics:output_type -> vmon.v1.JsonView
+	32,  // 305: vmon.v1.SandboxService.Logs:output_type -> vmon.v1.LogChunk
+	35,  // 306: vmon.v1.SandboxService.ExecCapture:output_type -> vmon.v1.ExecCaptureResponse
+	37,  // 307: vmon.v1.SandboxService.Exec:output_type -> vmon.v1.ExecOutput
+	37,  // 308: vmon.v1.SandboxService.Shell:output_type -> vmon.v1.ExecOutput
+	37,  // 309: vmon.v1.SandboxService.Attach:output_type -> vmon.v1.ExecOutput
+	39,  // 310: vmon.v1.SandboxService.FileRead:output_type -> vmon.v1.FileContent
+	19,  // 311: vmon.v1.SandboxService.FileWrite:output_type -> vmon.v1.Ok
+	19,  // 312: vmon.v1.SandboxService.FileDelete:output_type -> vmon.v1.Ok
+	18,  // 313: vmon.v1.SandboxService.FileList:output_type -> vmon.v1.JsonView
+	18,  // 314: vmon.v1.SandboxService.FileStat:output_type -> vmon.v1.JsonView
+	18,  // 315: vmon.v1.SandboxService.NetworkGet:output_type -> vmon.v1.JsonView
+	18,  // 316: vmon.v1.SandboxService.NetworkSet:output_type -> vmon.v1.JsonView
+	18,  // 317: vmon.v1.SandboxService.Tunnels:output_type -> vmon.v1.JsonView
+	18,  // 318: vmon.v1.SandboxService.Migrate:output_type -> vmon.v1.JsonView
+	18,  // 319: vmon.v1.SandboxService.Snapshot:output_type -> vmon.v1.JsonView
+	18,  // 320: vmon.v1.SandboxService.SnapshotFs:output_type -> vmon.v1.JsonView
+	51,  // 321: vmon.v1.SandboxService.History:output_type -> vmon.v1.RecoveryPointList
+	18,  // 322: vmon.v1.SandboxService.Rollback:output_type -> vmon.v1.JsonView
+	48,  // 323: vmon.v1.SnapshotService.List:output_type -> vmon.v1.SnapshotList
+	18,  // 324: vmon.v1.SnapshotService.Restore:output_type -> vmon.v1.JsonView
+	18,  // 325: vmon.v1.SnapshotService.Fork:output_type -> vmon.v1.JsonView
+	19,  // 326: vmon.v1.SnapshotService.Delete:output_type -> vmon.v1.Ok
+	58,  // 327: vmon.v1.CredentialService.List:output_type -> vmon.v1.CredentialList
+	57,  // 328: vmon.v1.CredentialService.Put:output_type -> vmon.v1.CredentialRecord
+	19,  // 329: vmon.v1.CredentialService.Delete:output_type -> vmon.v1.Ok
+	62,  // 330: vmon.v1.VolumeService.List:output_type -> vmon.v1.VolumeList
+	19,  // 331: vmon.v1.VolumeService.Create:output_type -> vmon.v1.Ok
+	19,  // 332: vmon.v1.VolumeService.Delete:output_type -> vmon.v1.Ok
+	18,  // 333: vmon.v1.PoolService.List:output_type -> vmon.v1.JsonView
+	18,  // 334: vmon.v1.PoolService.Set:output_type -> vmon.v1.JsonView
+	19,  // 335: vmon.v1.PoolService.Delete:output_type -> vmon.v1.Ok
+	18,  // 336: vmon.v1.SystemService.Info:output_type -> vmon.v1.JsonView
+	18,  // 337: vmon.v1.SystemService.Events:output_type -> vmon.v1.JsonView
+	18,  // 338: vmon.v1.SystemService.MeshStatus:output_type -> vmon.v1.JsonView
+	77,  // 339: vmon.v1.ArtifactService.Put:output_type -> vmon.v1.ArtifactRecord
+	82,  // 340: vmon.v1.ArtifactService.Get:output_type -> vmon.v1.ArtifactChunk
+	77,  // 341: vmon.v1.ArtifactService.Stat:output_type -> vmon.v1.ArtifactRecord
+	119, // 342: vmon.v1.FunctionService.Register:output_type -> vmon.v1.FunctionRevision
+	119, // 343: vmon.v1.FunctionService.Get:output_type -> vmon.v1.FunctionRevision
+	124, // 344: vmon.v1.FunctionService.List:output_type -> vmon.v1.ListFunctionsResponse
+	120, // 345: vmon.v1.FunctionService.Activate:output_type -> vmon.v1.FunctionRecord
+	19,  // 346: vmon.v1.FunctionService.Delete:output_type -> vmon.v1.Ok
+	128, // 347: vmon.v1.FunctionService.ActivateApp:output_type -> vmon.v1.AppRevision
+	128, // 348: vmon.v1.FunctionService.GetApp:output_type -> vmon.v1.AppRevision
+	128, // 349: vmon.v1.FunctionService.RollbackApp:output_type -> vmon.v1.AppRevision
+	137, // 350: vmon.v1.FunctionService.CreateSchedule:output_type -> vmon.v1.ScheduleRecord
+	137, // 351: vmon.v1.FunctionService.GetSchedule:output_type -> vmon.v1.ScheduleRecord
+	140, // 352: vmon.v1.FunctionService.ListSchedules:output_type -> vmon.v1.ListSchedulesResponse
+	19,  // 353: vmon.v1.FunctionService.DeleteSchedule:output_type -> vmon.v1.Ok
+	152, // 354: vmon.v1.CallService.Create:output_type -> vmon.v1.CallRecord
+	154, // 355: vmon.v1.CallService.StreamInputs:output_type -> vmon.v1.StreamCallInputsResponse
+	152, // 356: vmon.v1.CallService.CloseInputs:output_type -> vmon.v1.CallRecord
+	152, // 357: vmon.v1.CallService.Get:output_type -> vmon.v1.CallRecord
+	157, // 358: vmon.v1.CallService.List:output_type -> vmon.v1.ListCallsResponse
+	159, // 359: vmon.v1.CallService.GetResult:output_type -> vmon.v1.CallResult
+	163, // 360: vmon.v1.CallService.ListResults:output_type -> vmon.v1.ListCallResultsResponse
+	168, // 361: vmon.v1.CallService.Watch:output_type -> vmon.v1.CallEvent
+	152, // 362: vmon.v1.CallService.Cancel:output_type -> vmon.v1.CallRecord
+	175, // 363: vmon.v1.ActorService.Create:output_type -> vmon.v1.ActorRecord
+	175, // 364: vmon.v1.ActorService.Get:output_type -> vmon.v1.ActorRecord
+	176, // 365: vmon.v1.ActorService.Checkpoint:output_type -> vmon.v1.ActorCheckpoint
+	175, // 366: vmon.v1.ActorService.Restore:output_type -> vmon.v1.ActorRecord
+	175, // 367: vmon.v1.ActorService.Fork:output_type -> vmon.v1.ActorRecord
+	19,  // 368: vmon.v1.ActorService.Delete:output_type -> vmon.v1.Ok
+	292, // [292:369] is the sub-list for method output_type
+	215, // [215:292] is the sub-list for method input_type
+	215, // [215:215] is the sub-list for extension type_name
+	215, // [215:215] is the sub-list for extension extendee
+	0,   // [0:215] is the sub-list for field type_name
 }
 
 func init() { file_vmon_v1_api_proto_init() }
@@ -14658,158 +14958,162 @@ func file_vmon_v1_api_proto_init() {
 	if File_vmon_v1_api_proto != nil {
 		return
 	}
-	file_vmon_v1_api_proto_msgTypes[6].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[9].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[11].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[6].OneofWrappers = []any{
+		(*BatchCreateResponse_Json)(nil),
+		(*BatchCreateResponse_Error)(nil),
+	}
+	file_vmon_v1_api_proto_msgTypes[10].OneofWrappers = []any{}
 	file_vmon_v1_api_proto_msgTypes[13].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[14].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[15].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[17].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[18].OneofWrappers = []any{
 		(*ExecInput_Start)(nil),
 		(*ExecInput_ShellParamsJson)(nil),
 		(*ExecInput_Stdin)(nil),
 		(*ExecInput_Eof)(nil),
 		(*ExecInput_Resize)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[15].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[19].OneofWrappers = []any{
 		(*ExecOutput_Chunk)(nil),
 		(*ExecOutput_Exit)(nil),
 		(*ExecOutput_Ready)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[21].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[23].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[24].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[30].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[32].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[25].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[27].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[28].OneofWrappers = []any{}
 	file_vmon_v1_api_proto_msgTypes[34].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[35].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[51].OneofWrappers = []any{}
-	file_vmon_v1_api_proto_msgTypes[55].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[36].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[38].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[39].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[55].OneofWrappers = []any{}
+	file_vmon_v1_api_proto_msgTypes[59].OneofWrappers = []any{
 		(*ArtifactRecord_MediaType)(nil),
 		(*ArtifactRecord_ExpiresAtUnixMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[56].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[60].OneofWrappers = []any{
 		(*PutArtifactHeader_MediaType)(nil),
 		(*PutArtifactHeader_TtlMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[57].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[61].OneofWrappers = []any{
 		(*PutArtifactRequest_Header)(nil),
 		(*PutArtifactRequest_Data)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[58].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[62].OneofWrappers = []any{
 		(*GetArtifactRequest_Range)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[62].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[66].OneofWrappers = []any{
 		(*ValueEnvelope_InlineData)(nil),
 		(*ValueEnvelope_Artifact)(nil),
 		(*ValueEnvelope_Python)(nil),
 		(*ValueEnvelope_TypeName)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[65].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[69].OneofWrappers = []any{
 		(*FunctionSelector_Current)(nil),
 		(*FunctionSelector_Pinned)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[68].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[72].OneofWrappers = []any{
 		(*AppSelector_Current)(nil),
 		(*AppSelector_Pinned)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[69].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[73].OneofWrappers = []any{
 		(*PackageSpec_Lockfile)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[70].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[74].OneofWrappers = []any{
 		(*ImageSpec_Python)(nil),
 		(*ImageSpec_Registry)(nil),
 		(*ImageSpec_Dockerfile)(nil),
 		(*ImageSpec_Template)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[72].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[76].OneofWrappers = []any{
 		(*PythonCodeMetadata_CloudpickleVersion)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[78].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[82].OneofWrappers = []any{
 		(*UvPackage_IndexUrl)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[90].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[94].OneofWrappers = []any{
 		(*SecretRef_Version)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[93].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[97].OneofWrappers = []any{
 		(*LifecycleHooks_Initialize)(nil),
 		(*LifecycleHooks_Shutdown)(nil),
 		(*LifecycleHooks_Snapshot)(nil),
 		(*LifecycleHooks_Restore)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[95].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[99].OneofWrappers = []any{
 		(*FunctionSnapshotRecord_InitializeHook)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[97].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[101].OneofWrappers = []any{
 		(*FunctionRevision_Snapshot)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[101].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[105].OneofWrappers = []any{
 		(*ListFunctionsRequest_Namespace)(nil),
 		(*ListFunctionsRequest_Function)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[103].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[107].OneofWrappers = []any{
 		(*ActivateFunctionRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[106].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[110].OneofWrappers = []any{
 		(*AppRevision_Previous)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[107].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[111].OneofWrappers = []any{
 		(*ActivateAppRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[109].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[113].OneofWrappers = []any{
 		(*RollbackAppRequest_ExpectedCurrent)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[114].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[118].OneofWrappers = []any{
 		(*ScheduleSpec_Cron)(nil),
 		(*ScheduleSpec_Period)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[115].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[119].OneofWrappers = []any{
 		(*ScheduleRecord_NextRunUnixMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[116].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[120].OneofWrappers = []any{
 		(*CreateScheduleRequest_ScheduleId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[117].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[121].OneofWrappers = []any{
 		(*ListSchedulesRequest_App)(nil),
 		(*ListSchedulesRequest_Function)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[125].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[129].OneofWrappers = []any{
 		(*CallTarget_Actor)(nil),
 		(*CallTarget_Service)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[126].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[130].OneofWrappers = []any{
 		(*CallInput_Value)(nil),
 		(*CallInput_Arguments)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[128].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[132].OneofWrappers = []any{
 		(*CallGraph_RootCallId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[129].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[133].OneofWrappers = []any{
 		(*CreateCallRequest_ResultTtlMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[130].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[134].OneofWrappers = []any{
 		(*CallRecord_Error)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[131].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[135].OneofWrappers = []any{
 		(*StreamCallInputsRequest_Call)(nil),
 		(*StreamCallInputsRequest_Input)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[132].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[136].OneofWrappers = []any{
 		(*StreamCallInputsResponse_LastInput)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[134].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[138].OneofWrappers = []any{
 		(*ListCallsRequest_Function)(nil),
 		(*ListCallsRequest_Status)(nil),
 		(*ListCallsRequest_Actor)(nil),
 		(*ListCallsRequest_CreatedAfterUnixMillis)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[137].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[141].OneofWrappers = []any{
 		(*CallResult_Value)(nil),
 		(*CallResult_Error)(nil),
 		(*CallResult_YieldIndex)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[145].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[149].OneofWrappers = []any{
 		(*AttemptEvent_Error)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[146].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[150].OneofWrappers = []any{
 		(*CallEvent_Status)(nil),
 		(*CallEvent_Log)(nil),
 		(*CallEvent_YieldResult)(nil),
@@ -14822,16 +15126,16 @@ func file_vmon_v1_api_proto_init() {
 		(*CallEvent_InputIndex)(nil),
 		(*CallEvent_AttemptId)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[147].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[151].OneofWrappers = []any{
 		(*ErrorFrame_Code)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[148].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[152].OneofWrappers = []any{
 		(*CallError_Cause)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[153].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[157].OneofWrappers = []any{
 		(*ActorRecord_LatestCheckpoint)(nil),
 	}
-	file_vmon_v1_api_proto_msgTypes[155].OneofWrappers = []any{
+	file_vmon_v1_api_proto_msgTypes[159].OneofWrappers = []any{
 		(*CreateActorRequest_InitialValue)(nil),
 		(*CreateActorRequest_InitialArguments)(nil),
 	}
@@ -14841,7 +15145,7 @@ func file_vmon_v1_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vmon_v1_api_proto_rawDesc), len(file_vmon_v1_api_proto_rawDesc)),
 			NumEnums:      18,
-			NumMessages:   171,
+			NumMessages:   175,
 			NumExtensions: 0,
 			NumServices:   10,
 		},

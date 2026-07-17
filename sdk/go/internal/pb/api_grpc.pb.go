@@ -20,6 +20,8 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	SandboxService_Create_FullMethodName      = "/vmon.v1.SandboxService/Create"
+	SandboxService_BatchCreate_FullMethodName = "/vmon.v1.SandboxService/BatchCreate"
+	SandboxService_Watch_FullMethodName       = "/vmon.v1.SandboxService/Watch"
 	SandboxService_List_FullMethodName        = "/vmon.v1.SandboxService/List"
 	SandboxService_Get_FullMethodName         = "/vmon.v1.SandboxService/Get"
 	SandboxService_Stop_FullMethodName        = "/vmon.v1.SandboxService/Stop"
@@ -65,6 +67,18 @@ type SandboxServiceClient interface {
 	//   - `busy` (ABORTED): Required resources are locked.
 	//   - `engine` (UNAVAILABLE): Hypervisor allocation or creation failed.
 	Create(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Creates sandboxes over one bidirectional stream. Each request is admitted
+	// and placed independently; results stream back as they complete, tagged by
+	// `seq` (responses may arrive out of order). Per-item failures ride the
+	// response `error` — the stream itself only fails on transport/auth errors.
+	// With `no_wait`, a result reports admission; readiness arrives via `Watch`.
+	BatchCreate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BatchCreateRequest, BatchCreateResponse], error)
+	// Streams sandbox lifecycle transitions as engine event documents
+	// (`{id, name, status, ...}`), starting with the current view when the
+	// sandbox is already registered. Ends after the sandbox reports `running`
+	// when `until_ready` is set, otherwise after any terminal state
+	// (`stopped`, `terminated`, `failed`).
+	Watch(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[JsonView], error)
 	// Lists all registered microVM sandboxes, optionally filtered by tags.
 	//
 	// Replaces: GET /v1/sandboxes
@@ -263,6 +277,38 @@ func (c *sandboxServiceClient) Create(ctx context.Context, in *CreateSandboxRequ
 	return out, nil
 }
 
+func (c *sandboxServiceClient) BatchCreate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BatchCreateRequest, BatchCreateResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[0], SandboxService_BatchCreate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[BatchCreateRequest, BatchCreateResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_BatchCreateClient = grpc.BidiStreamingClient[BatchCreateRequest, BatchCreateResponse]
+
+func (c *sandboxServiceClient) Watch(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[JsonView], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[1], SandboxService_Watch_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchSandboxRequest, JsonView]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_WatchClient = grpc.ServerStreamingClient[JsonView]
+
 func (c *sandboxServiceClient) List(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListSandboxesResponse)
@@ -365,7 +411,7 @@ func (c *sandboxServiceClient) Metrics(ctx context.Context, in *SandboxRef, opts
 
 func (c *sandboxServiceClient) Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[0], SandboxService_Logs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[2], SandboxService_Logs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +440,7 @@ func (c *sandboxServiceClient) ExecCapture(ctx context.Context, in *ExecCaptureR
 
 func (c *sandboxServiceClient) Exec(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[1], SandboxService_Exec_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[3], SandboxService_Exec_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +453,7 @@ type SandboxService_ExecClient = grpc.BidiStreamingClient[ExecInput, ExecOutput]
 
 func (c *sandboxServiceClient) Shell(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[2], SandboxService_Shell_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[4], SandboxService_Shell_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +466,7 @@ type SandboxService_ShellClient = grpc.BidiStreamingClient[ExecInput, ExecOutput
 
 func (c *sandboxServiceClient) Attach(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[3], SandboxService_Attach_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[5], SandboxService_Attach_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -582,6 +628,18 @@ type SandboxServiceServer interface {
 	//   - `busy` (ABORTED): Required resources are locked.
 	//   - `engine` (UNAVAILABLE): Hypervisor allocation or creation failed.
 	Create(context.Context, *CreateSandboxRequest) (*JsonView, error)
+	// Creates sandboxes over one bidirectional stream. Each request is admitted
+	// and placed independently; results stream back as they complete, tagged by
+	// `seq` (responses may arrive out of order). Per-item failures ride the
+	// response `error` — the stream itself only fails on transport/auth errors.
+	// With `no_wait`, a result reports admission; readiness arrives via `Watch`.
+	BatchCreate(grpc.BidiStreamingServer[BatchCreateRequest, BatchCreateResponse]) error
+	// Streams sandbox lifecycle transitions as engine event documents
+	// (`{id, name, status, ...}`), starting with the current view when the
+	// sandbox is already registered. Ends after the sandbox reports `running`
+	// when `until_ready` is set, otherwise after any terminal state
+	// (`stopped`, `terminated`, `failed`).
+	Watch(*WatchSandboxRequest, grpc.ServerStreamingServer[JsonView]) error
 	// Lists all registered microVM sandboxes, optionally filtered by tags.
 	//
 	// Replaces: GET /v1/sandboxes
@@ -773,6 +831,12 @@ type UnimplementedSandboxServiceServer struct{}
 func (UnimplementedSandboxServiceServer) Create(context.Context, *CreateSandboxRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
 }
+func (UnimplementedSandboxServiceServer) BatchCreate(grpc.BidiStreamingServer[BatchCreateRequest, BatchCreateResponse]) error {
+	return status.Error(codes.Unimplemented, "method BatchCreate not implemented")
+}
+func (UnimplementedSandboxServiceServer) Watch(*WatchSandboxRequest, grpc.ServerStreamingServer[JsonView]) error {
+	return status.Error(codes.Unimplemented, "method Watch not implemented")
+}
 func (UnimplementedSandboxServiceServer) List(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method List not implemented")
 }
@@ -895,6 +959,24 @@ func _SandboxService_Create_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _SandboxService_BatchCreate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SandboxServiceServer).BatchCreate(&grpc.GenericServerStream[BatchCreateRequest, BatchCreateResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_BatchCreateServer = grpc.BidiStreamingServer[BatchCreateRequest, BatchCreateResponse]
+
+func _SandboxService_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchSandboxRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(SandboxServiceServer).Watch(m, &grpc.GenericServerStream[WatchSandboxRequest, JsonView]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_WatchServer = grpc.ServerStreamingServer[JsonView]
 
 func _SandboxService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListSandboxesRequest)
@@ -1473,6 +1555,17 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "BatchCreate",
+			Handler:       _SandboxService_BatchCreate_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "Watch",
+			Handler:       _SandboxService_Watch_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "Logs",
 			Handler:       _SandboxService_Logs_Handler,

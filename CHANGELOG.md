@@ -29,6 +29,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added `no_wait` option to sandbox creation to return once admitted instead of waiting for readiness
+- Added `BatchCreate` RPC for creating multiple sandboxes over a single bidirectional stream
+- Added `Watch` RPC to stream sandbox lifecycle transitions until ready or terminal
 - Worker exposes `vmon_server_network_bytes_total` Prometheus metrics with ingress/egress direction labels on Linux
 - Added a standalone fleet dashboard service (`vmon-dashboard`) that visualizes orchestration metrics — concurrent sandboxes, creation rate, CPU/memory allocation, network throughput, and live worker count — by aggregating Redis worker heartbeats and Prometheus worker metrics into live charts
 - Added `vmon net-broker` systemd service to AWS worker deployment for privileged networking

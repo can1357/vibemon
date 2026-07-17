@@ -238,10 +238,46 @@ class SandboxRef(_message.Message):
     def __init__(self, id: _Optional[str] = ...) -> None: ...
 
 class CreateSandboxRequest(_message.Message):
-    __slots__ = ("spec_json",)
+    __slots__ = ("spec_json", "no_wait")
     SPEC_JSON_FIELD_NUMBER: _ClassVar[int]
+    NO_WAIT_FIELD_NUMBER: _ClassVar[int]
     spec_json: str
-    def __init__(self, spec_json: _Optional[str] = ...) -> None: ...
+    no_wait: bool
+    def __init__(self, spec_json: _Optional[str] = ..., no_wait: _Optional[bool] = ...) -> None: ...
+
+class BatchCreateRequest(_message.Message):
+    __slots__ = ("seq", "create")
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    CREATE_FIELD_NUMBER: _ClassVar[int]
+    seq: int
+    create: CreateSandboxRequest
+    def __init__(self, seq: _Optional[int] = ..., create: _Optional[_Union[CreateSandboxRequest, _Mapping]] = ...) -> None: ...
+
+class BatchCreateError(_message.Message):
+    __slots__ = ("code", "message")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    code: str
+    message: str
+    def __init__(self, code: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
+
+class BatchCreateResponse(_message.Message):
+    __slots__ = ("seq", "json", "error")
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    JSON_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    seq: int
+    json: str
+    error: BatchCreateError
+    def __init__(self, seq: _Optional[int] = ..., json: _Optional[str] = ..., error: _Optional[_Union[BatchCreateError, _Mapping]] = ...) -> None: ...
+
+class WatchSandboxRequest(_message.Message):
+    __slots__ = ("id", "until_ready")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    UNTIL_READY_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    until_ready: bool
+    def __init__(self, id: _Optional[str] = ..., until_ready: _Optional[bool] = ...) -> None: ...
 
 class ListSandboxesRequest(_message.Message):
     __slots__ = ("tags",)
