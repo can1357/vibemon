@@ -20,6 +20,7 @@ pub mod image;
 pub mod mesh;
 pub mod models;
 pub mod net;
+pub mod orch;
 pub mod pools;
 pub mod portable_history;
 mod postgres;

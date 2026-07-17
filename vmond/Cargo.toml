@@ -16,6 +16,7 @@ chrono = "0.4"
 chacha20poly1305 = "0.10"
 chrono-tz = "0.10"
 cron = "0.15"
+dashmap = "6"
 flume = { version = "0.11", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
