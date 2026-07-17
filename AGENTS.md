@@ -27,6 +27,8 @@ vmon-agent (guest agent, Linux guest only)
 
 **Control plane:** Unix-socket JSON protocol (`ping`, `info`, `pause`, `resume`, `snapshot`, `quit`, `metrics`, `extend`). The socket thread never touches the `Vmm` directly — requests cross a `flume` channel to the owner thread. `PauseGate` quiesces vCPUs via an RT signal without `SA_RESTART` on Linux (handler is a no-op; `EINTR` rechecks run state) and via a backend kicker callback on HVF.
 
+**Orchestration (v2, `vmond/src/orch/`):** a horizontally-scalable scheduling layer beside the mesh. `vmon sched` servers keep an in-memory worker table fed from Redis (self-expiring `vmon:o:w:<wid>` keys + `vmon:o:workers` stream, followed by a hand-rolled RESP client in `orch/redis.rs`), place creates with power-of-two-choices, and forward directly to the owning `vmon serve` worker's gRPC endpoint — no datastore on the create path. Workers publish batched heartbeats (`orch/worker.rs`) and reject creates with `busy` when full; schedulers penalize and retry elsewhere. Sandbox routes (`vmon:o:sb:<sid>`) are written asynchronously; created/fetched views gain `node` + `endpoint` (the owning worker's URL). A `SET NX PX` leader lease gates the controller janitor (marks sandboxes of dead workers `lost`) and the HPA-like autoscaler (drain keys + `sh -c` scale hooks with `VMON_SCALE_*`/`VMON_DRAIN_WIDS`/`VMON_IDLE_WIDS`). `--redis` omitted embeds the dev-only mini-redis (`orch/miniredis.rs`); the hermetic end-to-end lives in `orch/e2e_tests.rs` (no hypervisor needed).
+
 ## Key Directories
 
 - `src/` — Rust top-level `vmon` binary: CLI (`cli.rs`), local/remote tonic transport (`transport.rs`), and context storage (`contexts.rs`).
@@ -37,7 +39,7 @@ vmon-agent (guest agent, Linux guest only)
   - `vmm/src/os/` — OS primitives (`EventFd`: real `eventfd(2)` on Linux, pipe-backed shim on macOS).
   - `vmm/src/devices/`, `vmm/src/snapshot/`.
 - `proto/` — `vmon-proto` crate and the API contract: `vmon/v1/api.proto` (five gRPC services; the ONLY API) and `vmon/v1/bridge.proto` (browser WS bridge framing). Rust code generates at build time via protox + tonic; client codegen is checked in.
-- `vmond/` — Rust server/engine crate used by `vmon serve`: gRPC services (`api/grpc.rs`), WS bridge (`api/bridge.rs`), remaining HTTP surfaces (healthz, metrics, ports proxy, static UI), registry, image pipeline, mesh, pools, volumes, lazy S3 access (`s3.rs`, `engine/s3proxy.rs`), and VM spawn/control.
+- `vmond/` — Rust server/engine crate used by `vmon serve`: gRPC services (`api/grpc.rs`), WS bridge (`api/bridge.rs`), remaining HTTP surfaces (healthz, metrics, ports proxy, static UI), registry, image pipeline, mesh, pools, volumes, lazy S3 access (`s3.rs`, `engine/s3proxy.rs`), VM spawn/control, and the v2 orchestration layer (`orch/`: scheduler + worker publisher + controller + autoscaler, served by `vmon sched`).
 - `agent/` — `vmon-agent` guest agent crate (Linux guest only).
 - `tests/` — Rust integration tests; shared helpers in `tests/common/mod.rs`.
 - `sdk/py/vmon/` — thin Python SDK only (`_endpoint.py`, `client.py`, `driver.py`, `process.py`, `sandbox.py`, `remote.py`, `_remote_source.py`, `_remote_runner.py`, `cls.py`, `volume.py`, `secret.py`, `context.py`, `wsframe.py`, `v1/` generated protobuf/gRPC code, `__init__.py`).
@@ -46,6 +48,7 @@ vmon-agent (guest agent, Linux guest only)
 - `sdk/go/` — Go SDK (`go test`, `google.golang.org/grpc`; `github.com/coder/websocket` only for the ports tunnel).
 - `ui/` — React + Vite + TypeScript web panel; **builds into `vmond/web/`** for Rust embedding.
 - `demo/` — runnable demo and asset-fetch scripts (Ubuntu/arm64 boots, OCI→ext4, Lima bridge for macOS).
+- `deploy/aws/` — Pulumi (TypeScript/bun) stack: scheduler EC2 + bare-metal worker ASG (EC2 exposes `/dev/kvm` only on `*.metal`) + one state VM running Redis and Postgres; the vmon autoscaler drives the ASG through `scale-up.sh`/`scale-down.sh` hooks (worker ids are EC2 instance ids).
 
 ## Development Commands
 
@@ -138,7 +141,7 @@ A repo-root uv **workspace** (root `pyproject.toml` with `[tool.uv.workspace] me
 - **Python:** `>=3.14`; **`uv`** for everything, run from the repo root or `sdk/py` (`uv run`, `uv sync`). Build backend is `setuptools`; dev deps live in `[dependency-groups]`. Runtime dependencies are the gRPC stack (`grpcio`, `protobuf`) plus `httpx` for the ports proxy.
 - **UI + TS SDK:** **bun** for everything (`bun.lock`; no `package-lock.json`). React/Vite/TS power the UI, which builds into `vmond/web/`; the TypeScript SDK lives in `sdk/ts` with `bun run typecheck` and `bun test`.
 - **Go SDK:** Go 1.23+ with standard `go fmt`/`go vet`/`go test`; runtime dependencies are `google.golang.org/grpc`/`google.golang.org/protobuf` plus `github.com/coder/websocket` for the ports tunnel.
-- **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`. The Rust CLI/server locates the `vmon` binary from cargo target dirs, `$VMON_BIN`, or `PATH`.
+- **Env vars:** `VMON_HOME`, `VMON_BIN`, `VMON_KERNEL`, `VMON_AGENT`, `VMON_API_TOKEN`, `VMON_CLIENT_TOKEN`, `VMON_CONFIG`, `VMON_CONTEXT`, `VMON_REPLICATE_SEC`, `VMON_RESTORE_QUORUM`, `VMON_ORCH_REDIS`, `VMON_ORCH_URL`, `VMON_ORCH_ID`, `VMON_ORCH_HEARTBEAT_SEC`, `VMON_ORCH_DEAD_AFTER_SEC`, `VMON_ORCH_MAX_SANDBOXES`, `VMON_BOOT_CONCURRENCY` (concurrent local VM boots; 0 = 4× host CPUs), `VMON_WORKER_TOKEN` (sched → worker bearer). The Rust CLI/server locates the `vmon` binary from cargo target dirs, `$VMON_BIN`, or `PATH`.
 
 ## Testing & QA
 

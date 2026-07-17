@@ -57,6 +57,24 @@ vmon vmm \
 
 `--net` accepts only `user`. Other attachments include `--mac ADDR`, `--fs-tag TAG --fs-dir DIR`, repeatable `--volume TAG:HOST_DIR`, `--rng`, and `--console-agent`. `--agent-sock PATH` bridges the host to the virtio-console agent through a Unix socket on Linux/macOS or a local named pipe on Windows.
 
+### NVIDIA SR-IOV vGPU passthrough
+
+On x86_64 Linux/KVM, `--vfio-gpu` assigns a pre-created NVIDIA SR-IOV virtual function through NVIDIA's vendor-specific VFIO cdev interface. The host must run NVIDIA vGPU Manager, enable IOMMU and SR-IOV, create the virtual function, select a nonzero `current_vgpu_type`, and expose its `vfio-dev` cdev. Whole physical GPUs, legacy `vfio-pci` group devices, and mdev devices are not accepted.
+
+```sh
+sudo vmon vmm \
+  --kernel /path/to/kernel \
+  --rootfs /path/to/disk.img \
+  --vfio-gpu /sys/bus/pci/devices/0000:3d:00.4 \
+  --vm-uuid 12345678-9abc-def0-1122-334455667788 \
+  --sandbox-uid 65534 --sandbox-gid 65534 \
+  --cmdline "console=ttyS0 root=/dev/vda rw"
+```
+
+The launcher must be able to open `/dev/iommu` and the function's VFIO cdev before dropping privileges. Repeat `--vfio-gpu` to assign up to eight functions. `--vm-uuid` is required, must be non-nil, and should remain stable for NVIDIA guest licensing. The option is independent of `--transport`, which controls only virtio devices.
+
+GPU assignment supports fresh boots only. Restore, fork, lazy memory paging, pause, and snapshot are rejected because VFIO device state is not serializable. Install an NVIDIA guest driver compatible with the host vGPU Manager release.
+
 ### Proxy-backed remote filesystems
 
 `--remote-fs <tag>:<endpoint>` is a repeatable, direct VMM attachment for a read-only virtio-fs filesystem served by an operator-managed proxy. The endpoint is a Unix socket on Linux/macOS and a local named-pipe-derived path on Windows. The tag must match `[a-z0-9_]{1,32}` and share the same namespace as `--volume` tags. The endpoint path must be absolute.

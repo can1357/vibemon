@@ -75,7 +75,8 @@ fn require_perf_e2e() -> bool {
 		});
 		let mut sandboxes = grpc.sandboxes();
 		let spec_json = body.to_string();
-		let create_res = grpc.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json }));
+		let create_res =
+			grpc.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json, no_wait: false }));
 		if let Ok(res) = create_res {
 			let view: Value = serde_json::from_str(&res.into_inner().json).unwrap();
 			let rid = view["id"].as_str().unwrap().to_owned();
@@ -213,7 +214,10 @@ fn create_sandbox(server: &Server, extra: Value) -> Value {
 	let grpc = server.grpc();
 	let mut sandboxes = grpc.sandboxes();
 	let view = grpc
-		.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json: body.to_string() }))
+		.block_on(
+			sandboxes
+				.create(pb::CreateSandboxRequest { spec_json: body.to_string(), no_wait: false }),
+		)
 		.unwrap_or_else(|status| {
 			panic!(
 				"create failed: {}; log tail:\n{}",

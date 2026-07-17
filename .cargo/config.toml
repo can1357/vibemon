@@ -1,2 +1,7 @@
 # Keep cargo host-native by default. Cross-target checks/builds pass
 # `--target ...` explicitly so both x86_64 and aarch64 paths are exercised.
+
+[clippy]
+# Exclude vendored third-party crates from linting — they ship with their own
+# warnings silenced and are not part of this workspace's lint surface.
+excludes = ["vendor/"]

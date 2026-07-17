@@ -2,6 +2,8 @@
 //! monitor; every other subcommand is the user-facing CLI or Rust daemon.
 
 #[cfg(not(target_os = "windows"))]
+mod bench;
+#[cfg(not(target_os = "windows"))]
 mod cli;
 #[cfg(not(target_os = "windows"))]
 mod contexts;

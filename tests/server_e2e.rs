@@ -339,7 +339,10 @@ fn create_sandbox(server: &Server, extra: Value) -> Value {
 	let grpc = server.grpc();
 	let mut sandboxes = grpc.sandboxes();
 	let view = grpc
-		.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json: body.to_string() }))
+		.block_on(
+			sandboxes
+				.create(pb::CreateSandboxRequest { spec_json: body.to_string(), no_wait: false }),
+		)
 		.unwrap_or_else(|status| {
 			panic!(
 				"create failed: {}; log tail:\n{}",

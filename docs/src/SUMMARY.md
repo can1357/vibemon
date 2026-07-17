@@ -51,6 +51,7 @@
 # Reference
 
 - [API Surface](reference/api.md)
+  - [Legacy `ModalClient` Protocol Design](reference/modal-legacy-protocol.md)
 - [DSN Reference](reference/dsn.md)
 - [Environment Variables](reference/environment.md)
 - [Error Codes](reference/errors.md)

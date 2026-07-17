@@ -200,6 +200,7 @@ pub fn create(server: &Server, name: &str) -> String {
 					"memory": 256,
 				})
 				.to_string(),
+				no_wait:   false,
 			}),
 		)
 		.unwrap_or_else(|status| {

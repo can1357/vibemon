@@ -130,6 +130,10 @@ enum Commands {
 	},
 	/// Serve the gRPC control plane and web/HTTP endpoints.
 	Serve(ServeArgs),
+	/// Serve the horizontally-scalable sandbox scheduler (orch layer).
+	Sched(SchedArgs),
+	/// Benchmark sandbox launch throughput against a scheduler or worker.
+	Bench(BenchArgs),
 	/// Run the narrow privileged Linux network broker.
 	NetBroker(NetBrokerArgs),
 	/// Manage remote API contexts.
@@ -454,6 +458,21 @@ struct ServeArgs {
 	mesh_w_region: Option<f64>,
 	#[arg(long)]
 	mesh_w_inflight: Option<f64>,
+	#[arg(long)]
+	orch_redis: Option<String>,
+	#[arg(long)]
+	orch_url: Option<String>,
+	#[arg(long)]
+	orch_id: Option<String>,
+	#[arg(long)]
+	orch_heartbeat_sec: Option<f64>,
+	#[arg(long)]
+	orch_dead_after_sec: Option<f64>,
+	#[arg(long)]
+	orch_max_sandboxes: Option<u64>,
+	/// Maximum concurrently booting sandboxes (0 = 4x host CPUs).
+	#[arg(long)]
+	boot_concurrency: Option<usize>,
 }
 #[derive(Args)]
 struct NetBrokerArgs {
@@ -602,11 +621,181 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Doctor(args) => Ok(cmd_doctor(args)),
 		Commands::Daemon { command } => cmd_daemon(command),
 		Commands::Serve(args) => cmd_serve(args, transport_options),
+		Commands::Sched(args) => cmd_sched(args),
 		Commands::NetBroker(args) => cmd_net_broker(args),
 		Commands::Context { command } => cmd_context(command),
+		Commands::Bench(args) => cmd_bench(args),
 		Commands::Mesh { command } => cmd_mesh(command, transport_options),
 		Commands::Completion(args) => Ok(cmd_completion(args)),
 	}
+}
+
+/// `vmon bench` drives production create or snapshot-fork RPCs and reports
+/// throughput, latency percentiles, placement distribution, and error taxonomy.
+#[derive(Args)]
+struct BenchArgs {
+	/// Scheduler (or worker) base URL, e.g. <http://host:8100>.
+	#[arg(long)]
+	server:               String,
+	/// Bearer token (falls back to $`VMON_API_TOKEN`).
+	#[arg(long)]
+	token:                Option<String>,
+	/// Total measured requests.
+	#[arg(long, conflicts_with = "target_rps")]
+	count:                Option<usize>,
+	/// Concurrent in-flight requests in ordinary closed-loop mode.
+	#[arg(long, default_value_t = 32)]
+	concurrency:          usize,
+	/// Client HTTP/2 connections (0 = size automatically from the load).
+	#[arg(long, default_value_t = 0)]
+	connections:          usize,
+	/// Open-loop schedule→drain→report→cleanup repetitions.
+	#[arg(long, default_value_t = 1)]
+	waves:                usize,
+	/// Guest image.
+	#[arg(long, default_value = "alpine")]
+	image:                String,
+	/// Named snapshot to fork instead of creating from an image.
+	#[arg(long, conflicts_with = "target_rps")]
+	snapshot:             Option<String>,
+	/// Guest memory in MiB.
+	#[arg(long, default_value_t = 128)]
+	memory:               u32,
+	/// Guest vCPUs.
+	#[arg(long, default_value_t = 1)]
+	cpus:                 u32,
+	/// Per-request deadline in seconds.
+	#[arg(long, default_value_t = 120.0)]
+	timeout_sec:          f64,
+	/// Untimed warmup requests.
+	#[arg(long, default_value_t = 4)]
+	warmup:               usize,
+	/// Full-scale create rate mapped onto live scheduler memory.
+	#[arg(long, requires = "reference_memory_mib")]
+	target_rps:           Option<f64>,
+	/// Full-scale memory capacity represented by --target-rps.
+	#[arg(long, visible_alias = "capacity-memory-mib", requires = "target_rps")]
+	reference_memory_mib: Option<u64>,
+	/// Fraction of current memory capacity available to the burst.
+	#[arg(long, visible_alias = "headroom", default_value_t = 0.8)]
+	memory_headroom:      f64,
+	/// Keep launched sandboxes instead of removing them.
+	#[arg(long)]
+	keep:                 bool,
+	/// Emit a machine-readable JSON summary line.
+	#[arg(long)]
+	json:                 bool,
+}
+fn cmd_bench(args: BenchArgs) -> Result<i32> {
+	let scaled = match (args.target_rps, args.reference_memory_mib) {
+		(Some(target_rps), Some(reference_memory_mib)) => Some(crate::bench::ScaledBurstOptions {
+			target_rps,
+			reference_memory_mib,
+			headroom: args.memory_headroom,
+		}),
+		(None, None) => None,
+		_ => {
+			return Err(CliError::new(
+				"--target-rps and --reference-memory-mib must be supplied together",
+			));
+		},
+	};
+	crate::bench::run(crate::bench::BenchOptions {
+		server: args.server,
+		token: args.token.or_else(|| {
+			std::env::var("VMON_API_TOKEN")
+				.ok()
+				.filter(|value| !value.is_empty())
+		}),
+		count: args.count.unwrap_or(200).max(1),
+		concurrency: args.concurrency.max(1),
+		connections: args.connections,
+		waves: args.waves.max(1),
+		image: args.image,
+		memory: args.memory.max(32),
+		cpus: args.cpus.max(1),
+		timeout: Duration::from_secs_f64(args.timeout_sec.max(1.0)),
+		warmup: args.warmup,
+		keep: args.keep,
+		json: args.json,
+		scaled,
+		snapshot: args.snapshot,
+	})
+}
+
+/// `vmon sched` flags: the scheduler front of the orchestration layer.
+/// Workers join by running `vmon serve --orch-redis <same-redis>`.
+#[derive(Args)]
+struct SchedArgs {
+	/// TCP bind address.
+	#[arg(long, default_value = "127.0.0.1:8100")]
+	listen:                 String,
+	/// Redis URL shared with workers (falls back to $`VMON_ORCH_REDIS`);
+	/// omitted spawns an embedded dev-only instance and prints its URL.
+	#[arg(long)]
+	redis:                  Option<String>,
+	/// Inbound bearer token, required for non-loopback binds (falls back to
+	/// $`VMON_API_TOKEN`).
+	#[arg(long)]
+	token:                  Option<String>,
+	/// Bearer token presented to workers — their `--token` (falls back to
+	/// $`VMON_WORKER_TOKEN`).
+	#[arg(long)]
+	worker_token:           Option<String>,
+	/// Worker liveness window in seconds (match workers' --orch-dead-after-sec).
+	#[arg(long, default_value_t = 5.0)]
+	dead_after_sec:         f64,
+	/// Deadline for one worker create attempt, in seconds.
+	#[arg(long, default_value_t = 60.0)]
+	create_timeout_sec:     f64,
+	/// Additional placement attempts after a rejected create.
+	#[arg(long, default_value_t = 3)]
+	create_retries:         usize,
+	/// Autoscaler: minimum worker count.
+	#[arg(long, default_value_t = 0)]
+	autoscale_min:          u64,
+	/// Autoscaler: maximum worker count (0 disables the autoscaler).
+	#[arg(long, default_value_t = 0)]
+	autoscale_max:          u64,
+	/// Autoscaler: target memory utilization (0, 1].
+	#[arg(long, default_value_t = 0.7)]
+	autoscale_target_util:  f64,
+	/// Autoscaler: decision cadence in seconds.
+	#[arg(long, default_value_t = 15.0)]
+	autoscale_interval_sec: f64,
+	/// Hook run to add workers (env: `VMON_SCALE_DESIRED/DELTA/LIVE`).
+	#[arg(long)]
+	scale_up_cmd:           Option<String>,
+	/// Hook run after draining workers (env adds `VMON_DRAIN_WIDS`).
+	#[arg(long)]
+	scale_down_cmd:         Option<String>,
+}
+
+fn cmd_sched(args: SchedArgs) -> Result<i32> {
+	let seconds = |value: f64| Duration::from_secs_f64(value.max(0.1));
+	let autoscaler = (args.autoscale_max > 0).then(|| vmond::orch::autoscaler::AutoscalerOptions {
+		min: args.autoscale_min,
+		max: args.autoscale_max,
+		target_util: args.autoscale_target_util.clamp(0.05, 1.0),
+		interval: seconds(args.autoscale_interval_sec),
+		scale_up_cmd: args.scale_up_cmd,
+		scale_down_cmd: args.scale_down_cmd,
+		..Default::default()
+	});
+	let env_fallback = |explicit: Option<String>, var: &str| {
+		explicit.or_else(|| std::env::var(var).ok().filter(|value| !value.is_empty()))
+	};
+	vmond::orch::server::serve_scheduler(vmond::orch::server::SchedulerOptions {
+		listen: args.listen,
+		redis_url: env_fallback(args.redis, "VMON_ORCH_REDIS"),
+		token: env_fallback(args.token, "VMON_API_TOKEN"),
+		worker_token: env_fallback(args.worker_token, "VMON_WORKER_TOKEN"),
+		dead_after: seconds(args.dead_after_sec),
+		create_timeout: seconds(args.create_timeout_sec),
+		create_retries: args.create_retries,
+		autoscaler,
+	})?;
+	Ok(0)
 }
 
 fn cmd_net_broker(args: NetBrokerArgs) -> Result<i32> {
@@ -1288,7 +1477,8 @@ fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
 	}
 	let grpc = client.grpc()?;
 	let mut sandboxes = grpc.sandboxes();
-	let request = pb::CreateSandboxRequest { spec_json: Value::Object(body).to_string() };
+	let request =
+		pb::CreateSandboxRequest { spec_json: Value::Object(body).to_string(), no_wait: false };
 	let view = json_view(
 		grpc
 			.block_on(sandboxes.create(request))
@@ -1487,6 +1677,7 @@ fn function_shell(grpc: &Grpc, reference: &str, options: &TransportOptions) -> R
 						"timeout": 300.0,
 					})
 					.to_string(),
+					no_wait:   false,
 				}),
 			)
 			.map_err(status_error)?
@@ -2368,6 +2559,13 @@ impl ServeArgs {
 		insert_override(&mut overrides, "mesh_w_local", self.mesh_w_local);
 		insert_override(&mut overrides, "mesh_w_region", self.mesh_w_region);
 		insert_override(&mut overrides, "mesh_w_inflight", self.mesh_w_inflight);
+		insert_override(&mut overrides, "orch_redis", self.orch_redis);
+		insert_override(&mut overrides, "orch_url", self.orch_url);
+		insert_override(&mut overrides, "orch_id", self.orch_id);
+		insert_override(&mut overrides, "orch_heartbeat_sec", self.orch_heartbeat_sec);
+		insert_override(&mut overrides, "orch_dead_after_sec", self.orch_dead_after_sec);
+		insert_override(&mut overrides, "orch_max_sandboxes", self.orch_max_sandboxes);
+		insert_override(&mut overrides, "boot_concurrency", self.boot_concurrency);
 		overrides
 	}
 }

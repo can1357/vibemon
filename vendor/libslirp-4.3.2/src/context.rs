@@ -276,7 +276,7 @@ extern "C" fn timer_mod_handler<H: Handler>(
         (*(opaque as *mut Inner<H>))
             .handler
             .timer_mod(&mut timer, expire_time);
-        Box::into_raw(timer);
+        let _ = Box::into_raw(timer);
     }
 }
 

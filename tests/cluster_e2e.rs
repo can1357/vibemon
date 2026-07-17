@@ -929,7 +929,10 @@ fn create_sandbox(node: &NodeProc, body: &Value) -> Result<Value, String> {
 	let grpc = node.grpc()?;
 	let mut sandboxes = grpc.sandboxes();
 	let view = grpc
-		.block_on(sandboxes.create(pb::CreateSandboxRequest { spec_json: body.to_string() }))
+		.block_on(
+			sandboxes
+				.create(pb::CreateSandboxRequest { spec_json: body.to_string(), no_wait: false }),
+		)
 		.map_err(|status| common::api::status_detail(&status))?
 		.into_inner();
 	serde_json::from_str(&view.json).map_err(|err| format!("invalid create view JSON: {err}"))
