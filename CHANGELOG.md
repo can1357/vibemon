@@ -29,6 +29,17 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Worker exposes `vmon_server_network_bytes_total` Prometheus metrics with ingress/egress direction labels on Linux
+- Added a standalone fleet dashboard service (`vmon-dashboard`) that visualizes orchestration metrics — concurrent sandboxes, creation rate, CPU/memory allocation, network throughput, and live worker count — by aggregating Redis worker heartbeats and Prometheus worker metrics into live charts
+- Added `vmon net-broker` systemd service to AWS worker deployment for privileged networking
+- Added `iptables-nft` installation to AWS worker user data for network broker support
+- Added container registry security policy (`/etc/containers/policy.json`) for image verification
+- Added `vmon sched` horizontally-scalable scheduler process with in-memory worker table, Redis-fed placement, and direct-to-worker gRPC forwarding
+- Enhanced `vmon bench` with memory-scaled open-loop burst mode, distinct offered/accepted/ready metrics, capacity-aware request planning, and closed-loop steady-state testing
+- Added `--orch-redis`, `--orch-url`, `--orch-id`, `--orch-heartbeat-sec`, `--orch-dead-after-sec`, and `--orch-max-sandboxes` CLI flags for orchestration layer configuration
+- Added `--vm-uuid` VMM flag to expose a stable SMBIOS system UUID (required by NVIDIA vGPU guests)
+- Added `--vfio-gpu` VMM flag for NVIDIA SR-IOV vGPU assignment on x86_64 Linux
+- Added embedded in-process Redis (`--embed-redis`) for single-host development without an external Redis daemon
 - Added multi-tenant credential management with tenant-scoped token and key mapping
 - Added per-sandbox history retention policies for disks and checkpoints
 - Added system-wide audit logging for credential and key management operations
@@ -208,6 +219,13 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Open-loop benchmark admission throughput now uses the admission decision window instead of the full readiness drain
+- AWS workers now preallocate a configurable network slot pool (`netSlots`, default 256)
+- Dashboard now displays host network bandwidth (ingress/egress bytes per second) aggregated across workers when available
+- Dashboard shows count of live backing worker VMs reporting heartbeats
+- Increased VFIO high MMIO region size to support vGPU devices with larger memory requirements
+- Updated AWS worker deployment to run as dedicated `vmon` user/group with proper permissions
+- Updated AWS worker to require `vmon-netbroker.service` for privileged network operations
 - Updated persistent volume removal to also purge corresponding encrypted volume archives
 - Made sandbox IDs the public routing contract; Python, TypeScript, and Go SDKs
 - Aligned Python and TypeScript sandbox lifecycle, exec, file, port, network,
@@ -285,6 +303,11 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed detached creates rejected during preparation failing to publish a terminal lifecycle event
+- Fixed `BatchCreate` workers accepting missing payloads and schedulers hiding inbound stream failures
+- Fixed potential interrupt stability issues during VFIO vGPU device initialization by disabling MSI/MSIX interrupts before configuration
+- Fixed nested virtualization (KVM-on-cloud-VM) guest boot panics by clamping guest XCR0 and stripping unsupported xstate components (AVX-512/AMX) from CPUID leaves
+- Fixed clippy lint warnings in vendored third-party crates by excluding `vendor/` from the lint surface
 - Fixed race condition in S3 mount usage during sandbox initialization
 - Improved naming stability and collision resistance for worker and template sandboxes
 - Fixed local OCI reference validation to restrict path access to server image caches

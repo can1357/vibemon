@@ -35,6 +35,20 @@ service SandboxService {
   //   - `engine` (UNAVAILABLE): Hypervisor allocation or creation failed.
   rpc Create(CreateSandboxRequest) returns (JsonView);
 
+  // Creates sandboxes over one bidirectional stream. Each request is admitted
+  // and placed independently; results stream back as they complete, tagged by
+  // `seq` (responses may arrive out of order). Per-item failures ride the
+  // response `error` — the stream itself only fails on transport/auth errors.
+  // With `no_wait`, a result reports admission; readiness arrives via `Watch`.
+  rpc BatchCreate(stream BatchCreateRequest) returns (stream BatchCreateResponse);
+
+  // Streams sandbox lifecycle transitions as engine event documents
+  // (`{id, name, status, ...}`), starting with the current view when the
+  // sandbox is already registered. Ends after the sandbox reports `running`
+  // when `until_ready` is set, otherwise after any terminal state
+  // (`stopped`, `terminated`, `failed`).
+  rpc Watch(WatchSandboxRequest) returns (stream JsonView);
+
   // Lists all registered microVM sandboxes, optionally filtered by tags.
   //
   // Replaces: GET /v1/sandboxes
@@ -366,6 +380,47 @@ message SandboxRef {
 message CreateSandboxRequest {
   // SandboxCreate JSON document payload — matches the former REST schema.
   string spec_json = 1;
+  // Return as soon as the create is admitted and its identity is assigned
+  // (status `starting`), instead of blocking until the VM is ready. Boot
+  // progress, readiness, and failure arrive via `Watch`.
+  bool no_wait = 2;
+}
+
+// BatchCreateRequest is one sequenced create in a BatchCreate stream.
+message BatchCreateRequest {
+  // Client-chosen correlation tag echoed on the matching response.
+  uint64 seq = 1;
+  // The create payload; `no_wait` applies per item.
+  CreateSandboxRequest create = 2;
+}
+
+// BatchCreateError carries one failed BatchCreate item's stable error.
+message BatchCreateError {
+  // Stable vmond error code (mirrors `vmon-code` metadata on unary RPCs).
+  string code = 1;
+  // Human-readable failure description.
+  string message = 2;
+}
+
+// BatchCreateResponse reports one completed BatchCreate item.
+message BatchCreateResponse {
+  // Correlation tag from the matching BatchCreateRequest.
+  uint64 seq = 1;
+  // Item outcome: the sandbox view on success, the stable error otherwise.
+  oneof outcome {
+    // JSON-serialized sandbox view (the admitted view when `no_wait`).
+    string json = 2;
+    // Stable failure for this item; the stream stays open for others.
+    BatchCreateError error = 3;
+  }
+}
+
+// WatchSandboxRequest selects a sandbox lifecycle event stream.
+message WatchSandboxRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+  // End the stream once the sandbox reports `running`.
+  bool until_ready = 2;
 }
 
 // ListSandboxesRequest specifies filters for listing sandbox instances.
