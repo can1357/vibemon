@@ -19,7 +19,10 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	tap::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, Tap, VNET_HDR_SIZE},
-	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
+	virtio::{
+		Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, WorkerWaitSource,
+		descriptor_range_valid,
+	},
 };
 #[cfg(target_os = "macos")]
 mod user;
@@ -170,17 +173,25 @@ impl Net {
 		}
 	}
 
-	fn process_tx(&mut self) -> Result<()> {
+	fn process_tx(&mut self) -> Result<QueuePass> {
 		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let Some(tx_queue) = self.tx_queue.as_mut() else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let backend = &mut self.backend;
 
+		// Bound one pass: TX chains complete inline, so a spinning guest could
+		// otherwise keep the available ring non-empty forever and starve the
+		// shared worker's other devices.
+		let mut budget = QUEUE_PASS_BUDGET;
 		let mut signalled = false;
-		while let Some(chain) = tx_queue.pop_descriptor_chain(&mem) {
+		while budget != 0 {
+			let Some(chain) = tx_queue.pop_descriptor_chain(&mem) else {
+				break;
+			};
+			budget -= 1;
 			let head = chain.head_index();
 			if let Some(packet) = gather_tx_frame(&mem, chain)
 				&& packet.len() > VNET_HDR_SIZE
@@ -205,7 +216,11 @@ impl Net {
 		if signalled {
 			interrupt.signal_used_queue()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn process_rx(&mut self) -> Result<()> {
@@ -221,7 +236,21 @@ impl Net {
 		let backend = &mut self.backend;
 		let buf = &mut self.rx_buf;
 		let mut signalled = false;
+		// One bounded pass on unix: the tap/user backend wait source is a
+		// level-triggered fd, so returning early re-fires poll and lets the
+		// shared device loop service other devices in between. Windows keeps
+		// one worker thread per device with an auto-reset event source and
+		// drains fully, exactly as before.
+		#[cfg(unix)]
+		let mut budget = QUEUE_PASS_BUDGET;
 		loop {
+			#[cfg(unix)]
+			{
+				if budget == 0 {
+					break;
+				}
+				budget -= 1;
+			}
 			match backend.read(buf) {
 				Ok(0) => break,
 				Ok(n) => {
@@ -306,7 +335,7 @@ impl VirtioDevice for Net {
 		self.backend.worker_wait_sources()
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		// A single ioeventfd backs both queues; the driver notifies after
 		// queueing TX frames (and RX buffers). RX is driven by tap readability.
 		let _ = (RX_QUEUE, TX_QUEUE);

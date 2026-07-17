@@ -569,6 +569,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -875,6 +889,12 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -1232,6 +1252,23 @@ dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "iommufd-bindings"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd7de3a04f6fd55f171a6682852f7aa360bb848a85e0c610513349e006b3c139"
+
+[[package]]
+name = "iommufd-ioctls"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8050f03ef0c6979597140b6d20da076931fb7a06389b8b0eb971b8f65b271748"
+dependencies = [
+ "iommufd-bindings",
+ "thiserror",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -3281,6 +3318,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vfio-bindings"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "188dac3057a0cbc94470085204c84b82ff7ec5dac629a514323cd133d1f9abe0"
+
+[[package]]
+name = "vfio-ioctls"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b1110f3ab5703a0f788d569b1b4a2436e8cc434f384b3ef5d77283f8ee03d8"
+dependencies = [
+ "byteorder",
+ "iommufd-bindings",
+ "iommufd-ioctls",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "log",
+ "thiserror",
+ "vfio-bindings",
+ "vm-memory",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "virtio-bindings"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3330,6 +3392,7 @@ dependencies = [
  "clap",
  "flume",
  "io-uring",
+ "iommufd-ioctls",
  "kvm-bindings",
  "kvm-ioctls",
  "landlock",
@@ -3348,6 +3411,8 @@ dependencies = [
  "squib-gic",
  "tracing",
  "tracing-subscriber",
+ "vfio-bindings",
+ "vfio-ioctls",
  "virtio-bindings",
  "virtio-queue",
  "vm-fdt",
@@ -3429,6 +3494,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "dashmap",
  "flume",
  "futures-util",
  "hex",

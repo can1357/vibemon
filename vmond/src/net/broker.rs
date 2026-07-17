@@ -8,7 +8,7 @@ use std::{fs, os::unix::fs::MetadataExt};
 
 use serde::{Deserialize, Serialize};
 
-use super::TapLease;
+use super::{TapLease, slots::SlotSpec};
 #[cfg(target_os = "linux")]
 use crate::security::CREDENTIAL_GATEWAY_PORT;
 use crate::{EngineError, Result};
@@ -37,6 +37,20 @@ pub enum Request {
 		egress_allow:         Option<Vec<String>>,
 		egress_allow_domains: Option<Vec<String>>,
 	},
+	/// Create a batch of pooled slot TAPs with the base policy plus the
+	/// pooled-slot nftables skeleton preinstalled. `reset` wipes and
+	/// recreates the slot table (first batch of a pool fill).
+	PreallocateSlots { slots: Vec<SlotSpec>, reset: bool },
+	/// Apply a custom egress policy to one pooled slot as a single batched
+	/// `nft -f -` invocation.
+	ClaimSlot {
+		slot:                 SlotSpec,
+		egress_allow:         Vec<String>,
+		egress_allow_domains: Vec<String>,
+		already_custom:       bool,
+	},
+	/// Reset one pooled slot's dynamic policy back to the preinstalled base.
+	RecycleSlot { slot: SlotSpec },
 }
 
 /// A validated TAP identity sent to the broker.
@@ -130,21 +144,29 @@ pub fn serve(socket: &Path, owner_uid: Option<u32>) -> Result<()> {
 		}
 		fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
 		let socket_uid = fs::metadata(socket)?.uid();
+		// Connections are short-lived request/response pairs from the single
+		// authorized owner uid, so unbounded detached spawn is acceptable here.
 		for connection in listener.incoming() {
 			match connection {
 				Ok(mut stream) => {
-					let response = match peer_uid(&stream) {
-						Ok(peer_uid) if peer_uid == socket_uid => {
-							match read_frame::<_, Request>(&mut stream)
-								.and_then(|request| dispatch(request, peer_uid))
-							{
-								Ok(response) => response,
-								Err(error) => Response::Error(error.to_string()),
-							}
-						},
-						_ => Response::Error("network broker caller is not the socket owner".to_owned()),
-					};
-					let _ = write_frame(&mut stream, &response);
+					let _ = std::thread::Builder::new()
+						.name("vmon-net-broker-conn".to_owned())
+						.spawn(move || {
+							let response = match peer_uid(&stream) {
+								Ok(peer_uid) if peer_uid == socket_uid => {
+									match read_frame::<_, Request>(&mut stream)
+										.and_then(|request| dispatch(request, peer_uid))
+									{
+										Ok(response) => response,
+										Err(error) => Response::Error(error.to_string()),
+									}
+								},
+								_ => Response::Error(
+									"network broker caller is not the socket owner".to_owned(),
+								),
+							};
+							let _ = write_frame(&mut stream, &response);
+						});
 				},
 				Err(error) => return Err(EngineError::from(error)),
 			}
@@ -236,7 +258,45 @@ fn dispatch(request: Request, owner_uid: u32) -> Result<Response> {
 			)?;
 			Ok(Response::Ok)
 		},
+		Request::PreallocateSlots { slots, reset } => {
+			if slots.is_empty() || slots.len() > 1024 {
+				return Err(EngineError::invalid("network broker slot batch must hold 1..=1024 slots"));
+			}
+			for slot in &slots {
+				validate_slot(slot)?;
+			}
+			super::preallocate_slots_direct(&slots, reset, owner_uid)?;
+			Ok(Response::Ok)
+		},
+		Request::ClaimSlot { slot, egress_allow, egress_allow_domains, already_custom } => {
+			validate_slot(&slot)?;
+			validate(
+				&slot.name,
+				&slot.guest_ip,
+				&slot.host_ip,
+				slot.prefix,
+				Some(&egress_allow),
+				Some(&egress_allow_domains),
+			)?;
+			super::claim_slot_direct(&slot, &egress_allow, &egress_allow_domains, already_custom)?;
+			Ok(Response::Ok)
+		},
+		Request::RecycleSlot { slot } => {
+			validate_slot(&slot)?;
+			super::recycle_slot_direct(&slot)?;
+			Ok(Response::Ok)
+		},
 	}
+}
+
+/// Validate a pooled slot's identity: name derives from the index (so nft
+/// set names cannot diverge from the TAP) and addresses form a valid lease.
+#[cfg(any(test, target_os = "linux"))]
+fn validate_slot(slot: &SlotSpec) -> Result<()> {
+	if slot.name != super::slots::slot_tap_name(slot.index) {
+		return Err(EngineError::invalid("slot TAP name does not match its index"));
+	}
+	validate(&slot.name, &slot.guest_ip, &slot.host_ip, slot.prefix, None, None)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -383,6 +443,35 @@ mod tests {
 		write_frame(&mut bytes, &request).unwrap();
 		assert_eq!(read_frame::<_, Request>(&mut bytes.as_slice()).unwrap(), request);
 		assert!(read_frame::<_, Request>(&mut [0, 1, 0, 1].as_slice()).is_err());
+	}
+
+	#[test]
+	fn slot_protocol_round_trip_and_identity_validation() {
+		let slot = SlotSpec {
+			index:    0,
+			name:     super::super::slots::slot_tap_name(0),
+			guest_ip: "172.20.0.2".to_owned(),
+			host_ip:  "172.20.0.1".to_owned(),
+			prefix:   30,
+		};
+		let request = Request::ClaimSlot {
+			slot:                 slot.clone(),
+			egress_allow:         vec!["203.0.113.0/24".to_owned()],
+			egress_allow_domains: vec!["example.com".to_owned()],
+			already_custom:       false,
+		};
+		let mut bytes = Vec::new();
+		write_frame(&mut bytes, &request).unwrap();
+		assert_eq!(read_frame::<_, Request>(&mut bytes.as_slice()).unwrap(), request);
+
+		assert!(validate_slot(&slot).is_ok());
+		// Index/name divergence would let set names drift from the TAP.
+		let mut mismatched = slot.clone();
+		mismatched.index = 7;
+		assert!(validate_slot(&mismatched).is_err());
+		let mut bad_ip = slot;
+		bad_ip.guest_ip = "10.0.0.2".to_owned();
+		assert!(validate_slot(&bad_ip).is_err());
 	}
 
 	#[test]

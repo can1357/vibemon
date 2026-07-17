@@ -1,29 +1,56 @@
-//! Host networking: TAP leases, iptables, egress, tunnels. Port of
-//! python/vmon/net.py.
+//! Host networking: preallocated slot pool, in-memory /30 lease allocator,
+//! per-create TAP setup, egress policy, and loopback tunnels. Port of
+//! python/vmon/net.py, redesigned so per-create networking cost does not
+//! scale with create rate.
+//!
+//! # Fast paths
+//! - `block_network=true` sandboxes (the default) never reach this module on
+//!   the spawn path: the engine gates every `setup_sandbox_network` call on
+//!   `network_required()` (`!block_network || credentials_requested`), and
+//!   teardown consults `lease_for`, which returns `None` without touching any
+//!   allocator or broker state. Blocked-network creates therefore perform zero
+//!   host networking work.
+//! - IP leases live in an in-memory allocator (`LeaseStore`) loaded once per
+//!   journal path. Allocate/release mutate memory and hand a snapshot to a
+//!   background writer thread; the on-disk JSON map keeps its historical format
+//!   and remains the crash-recovery journal. No flock/parse happens on the
+//!   create hot path.
+//! - With a warm slot pool (`--net-slots N` / `VMON_NET_SLOTS`, default off),
+//!   claiming networking for a sandbox with the DEFAULT policy runs zero
+//!   external commands and zero broker round trips: the TAP, addresses, and
+//!   base rules were installed at pool fill, and teardown recycles the slot
+//!   instead of deleting it. See [`slots`].
+//!
+//! # When external commands run
+//! - Pool fill (serve start): one broker batch per slot chunk (TAP creation +
+//!   iptables base rules) plus one `nft -f -` installing the slot skeleton.
+//! - Custom egress/inbound policy on a pooled slot: ONE broker round trip
+//!   executing one batched `nft -f -` that fills the slot's named sets.
+//!   Recycling a custom-policy slot is likewise one batched invocation.
+//! - Non-pooled (pool cold or exhausted) sandboxes use the original per-create
+//!   broker path: iptables rule-per-sandbox setup and exact-delete teardown,
+//!   exactly as before. The sweep to nftables-everything is out of scope;
+//!   iptables remains the mechanism for non-pooled TAPs.
 
 pub mod broker;
 pub mod policy;
+pub mod slots;
 
 #[cfg(target_os = "linux")]
-use std::collections::{HashMap, btree_map::Entry};
+use std::collections::btree_map::Entry;
 #[cfg(target_os = "linux")]
 use std::process::Command;
-#[cfg(target_os = "linux")]
-use std::sync::LazyLock;
-#[cfg(any(test, target_os = "linux"))]
-use std::sync::mpsc;
-#[cfg(any(test, target_os = "linux"))]
-use std::thread::{self, JoinHandle};
 #[cfg(any(test, target_os = "linux"))]
 use std::time::Duration;
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt,
 	fs::{self, File, OpenOptions},
-	io::{Read, Seek, SeekFrom, Write},
+	io::{Seek, SeekFrom, Write},
 	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 	path::PathBuf,
-	sync::Arc,
+	sync::{Arc, LazyLock, mpsc},
+	thread,
 };
 
 use parking_lot::Mutex;
@@ -43,6 +70,8 @@ use crate::security::CREDENTIAL_GATEWAY_PORT;
 const CAP_NET_ADMIN: u32 = 12;
 #[cfg(target_os = "linux")]
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+#[cfg(target_os = "linux")]
+const PROC_NET_DEV: &str = "/proc/net/dev";
 #[cfg(any(test, target_os = "linux"))]
 const RULE_PREFIX: &str = "vmon";
 const POOL_BASE: Ipv4Addr = Ipv4Addr::new(172, 20, 0, 0);
@@ -61,6 +90,48 @@ pub const USER_NET_PREFIX: u8 = 24;
 pub const USER_NET_GATEWAY: &str = "10.0.2.2";
 /// DNS servers exposed by libslirp.
 pub const USER_NET_DNS: [&str; 1] = ["10.0.2.3"];
+
+/// Returns cumulative received and transmitted bytes on non-loopback host
+/// interfaces.
+///
+/// Linux reads the kernel's `/proc/net/dev` counters; unsupported platforms and
+/// unreadable counter files report no available counters.
+pub(crate) fn host_network_bytes() -> Option<(u64, u64)> {
+	#[cfg(target_os = "linux")]
+	{
+		parse_proc_net_dev(&fs::read_to_string(PROC_NET_DEV).ok()?)
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		None
+	}
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_proc_net_dev(contents: &str) -> Option<(u64, u64)> {
+	let mut ingress = 0_u64;
+	let mut egress = 0_u64;
+
+	for row in contents.lines() {
+		let Some((interface, columns)) = row.rsplit_once(':') else {
+			continue;
+		};
+		if interface.trim() == "lo" {
+			continue;
+		}
+		let mut columns = columns.split_whitespace();
+		let Some(received) = columns.next().and_then(|value| value.parse::<u64>().ok()) else {
+			continue;
+		};
+		let Some(transmitted) = columns.nth(7).and_then(|value| value.parse::<u64>().ok()) else {
+			continue;
+		};
+		ingress = ingress.saturating_add(received);
+		egress = egress.saturating_add(transmitted);
+	}
+
+	Some((ingress, egress))
+}
 
 #[cfg(any(test, target_os = "linux"))]
 static START_INSTANT: std::sync::LazyLock<std::time::Instant> =
@@ -362,18 +433,39 @@ pub fn allocate_guest_config(name: &str) -> Result<GuestConfig> {
 }
 
 /// Allocate or return the persisted guest network config with custom DNS.
+///
+/// Warm slot pool: claims a preallocated slot purely in memory. Otherwise
+/// falls back to the in-memory /30 allocator (journal-backed).
 pub fn allocate_guest_config_with_dns(name: &str, dns: &[&str]) -> Result<GuestConfig> {
-	LeaseStore::default().allocate(name, dns)
+	if let Some(config) = slots::pool_lookup(name) {
+		return Ok(config);
+	}
+	let store = LeaseStore::default();
+	if let Some(config) = store.lease_for(name) {
+		return Ok(config);
+	}
+	if let Some(config) = slots::pool_claim(name, dns) {
+		return Ok(config);
+	}
+	store.allocate(name, dns)
 }
 
-/// Release a sandbox's persisted guest network config.
+/// Release a sandbox's guest network config (slot binding or persisted lease).
 pub fn release_guest_config(name: &str) -> Result<()> {
+	if let Some((slot, custom)) = slots::pool_release_name(name) {
+		// Normal flows recycle through `teardown_tap` first; this path only
+		// fires when setup failed before the TAP was touched.
+		if custom {
+			broker_request(broker::Request::RecycleSlot { slot })?;
+		}
+		return Ok(());
+	}
 	LeaseStore::default().release(name)
 }
 
-/// Return the persisted lease for a sandbox without allocating one.
+/// Return the lease for a sandbox without allocating one.
 pub fn lease_for(name: &str) -> Option<GuestConfig> {
-	LeaseStore::default().lease_for(name)
+	slots::pool_lookup(name).or_else(|| LeaseStore::default().lease_for(name))
 }
 
 /// Return the deterministic TAP name for a sandbox name.
@@ -407,7 +499,18 @@ pub fn has_net_admin() -> bool {
 pub const fn has_net_admin() -> bool {
 	false
 }
+/// Test seam: when installed, every broker round trip is routed through this
+/// handler instead of the Unix socket, letting tests count and answer them.
+#[cfg(test)]
+pub(crate) static BROKER_STUB: LazyLock<
+	Mutex<Option<Box<dyn FnMut(&broker::Request) -> Result<Option<TapLease>> + Send>>>,
+> = LazyLock::new(|| Mutex::new(None));
+
 fn broker_request(request: broker::Request) -> Result<Option<TapLease>> {
+	#[cfg(test)]
+	if let Some(stub) = BROKER_STUB.lock().as_mut() {
+		return stub(&request);
+	}
 	#[cfg(target_os = "linux")]
 	{
 		let socket = BROKER_SOCKET
@@ -550,8 +653,13 @@ pub(crate) fn allow_credential_gateway_direct(lease: &TapLease) -> Result<()> {
 	iptables_ensure(&credential_gateway_rule(IptablesAction::Insert, lease))
 }
 
-/// Ask the configured broker to create/configure a TAP and its NAT/FORWARD
-/// rules.
+/// Configure forwarding policy for a TAP.
+///
+/// Pooled slots: the TAP and base rules already exist, so the default policy
+/// returns without any broker round trip; a custom policy (any `egress_allow`
+/// or `egress_allow_domains`, including empty deny-all lists) is applied as
+/// one batched broker request that fills the slot's nftables sets.
+/// Non-pooled TAPs go through the original per-create broker setup.
 pub fn setup_tap(
 	name: &str,
 	guest_ip: &str,
@@ -561,6 +669,29 @@ pub fn setup_tap(
 	egress_allow_domains: Option<&[String]>,
 	previous_egress_allow: Option<&[String]>,
 ) -> Result<TapLease> {
+	if let Some((slot, already_custom)) = slots::pool_slot_for_tap(name) {
+		if slot.guest_ip != guest_ip || slot.host_ip != host_ip || slot.prefix != prefix {
+			return Err(EngineError::invalid("slot TAP addresses do not match its claim"));
+		}
+		let lease = TapLease::new(name, guest_ip, host_ip, prefix, egress_allow)?;
+		let domains = clean_domains(egress_allow_domains);
+		let restricted = egress_allow.is_some() || !domains.is_empty();
+		// Recycle semantics replace exact-delete bookkeeping on slots.
+		let _ = previous_egress_allow;
+		if restricted {
+			broker_request(broker::Request::ClaimSlot {
+				slot,
+				egress_allow: lease.egress_allow.clone(),
+				egress_allow_domains: domains,
+				already_custom,
+			})?;
+			slots::pool_set_custom(name, true);
+		} else if already_custom {
+			broker_request(broker::Request::RecycleSlot { slot })?;
+			slots::pool_set_custom(name, false);
+		}
+		return Ok(lease);
+	}
 	let response = broker_request(broker::Request::Setup {
 		name: name.to_owned(),
 		guest_ip: guest_ip.to_owned(),
@@ -703,7 +834,7 @@ pub(crate) fn setup_tap_direct(
 		if !domains.is_empty() {
 			start_domain_refresher(
 				&lease.name,
-				&lease.guest_cidr(),
+				RefreshTarget::Iptables { guest_cidr: lease.guest_cidr() },
 				domains,
 				rules,
 				next_idx,
@@ -727,7 +858,13 @@ pub(crate) fn setup_tap_direct(
 	Ok(lease)
 }
 
-/// Ask the configured broker to remove a TAP and its exact policy rules.
+/// Remove a TAP's forwarding policy.
+///
+/// Pooled slots are RECYCLED: the slot returns to the free list and only a
+/// custom policy costs one broker round trip (flushing the slot's dynamic set
+/// elements); the TAP device and base rules stay installed for the next
+/// claim. Non-pooled TAPs are deleted with their exact policy rules as
+/// before.
 pub fn teardown_tap(
 	name: &str,
 	guest_ip: Option<&str>,
@@ -736,6 +873,12 @@ pub fn teardown_tap(
 	egress_allow: Option<&[String]>,
 	egress_allow_domains: Option<&[String]>,
 ) -> Result<()> {
+	if let Some((slot, custom)) = slots::pool_recycle_tap(name) {
+		if custom {
+			broker_request(broker::Request::RecycleSlot { slot })?;
+		}
+		return Ok(());
+	}
 	broker_request(broker::Request::Teardown {
 		name: name.to_owned(),
 		guest_ip: guest_ip.map(str::to_owned),
@@ -822,6 +965,181 @@ pub(crate) fn teardown_tap_direct(
 	Ok(())
 }
 
+/// Slots per `PreallocateSlots` broker frame (frames are capped at 64 KiB).
+const SLOT_BATCH: usize = 200;
+
+/// Configure the preallocated network slot pool (`0` disables pooling).
+///
+/// Filling runs on a background thread so serve start is not delayed; until
+/// the pool is warm (or when it is exhausted), creates use the per-create
+/// path unchanged. A failed fill logs a warning and leaves pooling off.
+pub fn configure_slot_pool(count: usize) {
+	if count == 0 {
+		return;
+	}
+	thread::Builder::new()
+		.name("vmon-net-slot-fill".to_owned())
+		.spawn(move || match fill_slot_pool(count) {
+			Ok(()) => tracing::info!(count, "network slot pool ready"),
+			Err(error) => {
+				tracing::warn!(
+					%error,
+					"network slot pool preallocation failed; using per-create networking"
+				);
+			},
+		})
+		.map(drop)
+		.unwrap_or_else(|error| tracing::warn!(%error, "spawning network slot fill failed"));
+}
+
+/// Carve slot leases from the in-memory allocator and preallocate their TAPs
+/// plus base policy through the broker in batches.
+fn fill_slot_pool(count: usize) -> Result<()> {
+	let store = LeaseStore::default();
+	let mut specs = Vec::with_capacity(count);
+	for index in 0..u32::try_from(count).map_err(|_| EngineError::invalid("net_slots too large"))? {
+		let tap = slots::slot_tap_name(index);
+		let config =
+			store.allocate_with_tap(&slots::slot_lease_name(index), &DEFAULT_DNS, Some(&tap))?;
+		specs.push(slots::SlotSpec {
+			index,
+			name: tap,
+			guest_ip: config.guest_ip,
+			host_ip: config.host_ip,
+			prefix: config.prefix,
+		});
+	}
+	// Slot reservations must reach the journal before the TAPs exist.
+	store.flush()?;
+	for (batch, chunk) in specs.chunks(SLOT_BATCH).enumerate() {
+		broker_request(broker::Request::PreallocateSlots {
+			slots: chunk.to_vec(),
+			reset: batch == 0,
+		})?;
+	}
+	slots::pool_install(specs);
+	Ok(())
+}
+
+/// Broker side: create a batch of slot TAPs with base rules, then install the
+/// pooled-slot nftables skeleton in one `nft -f -` invocation.
+#[cfg(target_os = "linux")]
+pub(crate) fn preallocate_slots_direct(
+	specs: &[slots::SlotSpec],
+	reset: bool,
+	owner_uid: u32,
+) -> Result<()> {
+	for spec in specs {
+		setup_tap_direct(
+			&spec.name,
+			&spec.guest_ip,
+			&spec.host_ip,
+			spec.prefix,
+			None,
+			None,
+			None,
+			owner_uid,
+		)?;
+	}
+	run_nft(&slots::pool_init_payload(specs, reset))
+}
+
+/// Broker side: apply a custom egress policy to one pooled slot.
+///
+/// Resolves domain allowlists, then executes ONE `nft -f -` batch carrying
+/// every element operation. Starts a set-targeted domain refresher when
+/// domains are present.
+#[cfg(target_os = "linux")]
+pub(crate) fn claim_slot_direct(
+	slot: &slots::SlotSpec,
+	egress_allow: &[String],
+	egress_allow_domains: &[String],
+	already_custom: bool,
+) -> Result<()> {
+	// Policy replacement: drop any refresher from the previous claim.
+	let _ = stop_domain_refresher(&slot.name);
+	let mut elements = Vec::with_capacity(egress_allow.len());
+	for cidr in egress_allow {
+		let net = cidr.parse::<CidrNet>()?;
+		if matches!(net, CidrNet::V6 { .. }) {
+			return Err(EngineError::invalid("pooled slot egress allows IPv4 CIDRs only"));
+		}
+		elements.push(net.to_string());
+	}
+	let domains = clean_domains(Some(egress_allow_domains));
+	let mut rules = BTreeMap::new();
+	let mut next_idx = 0;
+	if !domains.is_empty() {
+		let mut policy = policy::EgressPolicy::new(policy::SystemResolver, &domains, egress_allow)?;
+		let now = START_INSTANT.elapsed();
+		for domain in &domains {
+			for ip in policy.resolve_allowed(domain, now)? {
+				let IpAddr::V4(ip) = ip else { continue };
+				let ip = ip.to_string();
+				if let Entry::Vacant(entry) = rules.entry(ip.clone()) {
+					entry.insert(next_idx);
+					next_idx += 1;
+					elements.push(ip);
+				}
+			}
+		}
+	}
+	run_nft(&slots::claim_payload(slot, &elements, already_custom))?;
+	if !domains.is_empty() {
+		start_domain_refresher(
+			&slot.name,
+			RefreshTarget::NftSet { set: slot.egress_set() },
+			domains,
+			rules,
+			next_idx,
+			egress_allow.to_vec(),
+		)?;
+	}
+	Ok(())
+}
+
+/// Broker side: reset one pooled slot back to the preinstalled base policy.
+#[cfg(target_os = "linux")]
+pub(crate) fn recycle_slot_direct(slot: &slots::SlotSpec) -> Result<()> {
+	let _ = stop_domain_refresher(&slot.name);
+	run_nft(&slots::recycle_payload(slot))
+}
+
+/// Execute one batched nftables program via `nft -f -`.
+#[cfg(target_os = "linux")]
+fn run_nft(payload: &str) -> Result<()> {
+	use std::process::Stdio;
+	// nft -f applies the batch transactionally; concurrent nft processes can
+	// race ruleset generation updates, so serialize spawn-to-wait per process.
+	static NFT_LOCK: Mutex<()> = Mutex::new(());
+	if payload.is_empty() {
+		return Ok(());
+	}
+	let _guard = NFT_LOCK.lock();
+	let mut child = Command::new("nft")
+		.args(["-f", "-"])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::null())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|error| EngineError::engine(format!("spawning nft failed: {error}")))?;
+	child
+		.stdin
+		.take()
+		.ok_or_else(|| EngineError::engine("nft stdin unavailable"))?
+		.write_all(payload.as_bytes())?;
+	let output = child.wait_with_output()?;
+	if output.status.success() {
+		Ok(())
+	} else {
+		Err(EngineError::engine(format!(
+			"nft -f failed with status {}: {}",
+			output.status.code().unwrap_or(-1),
+			String::from_utf8_lossy(&output.stderr).trim()
+		)))
+	}
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LeaseEntry {
 	network: String,
@@ -829,9 +1147,107 @@ struct LeaseEntry {
 	tap:     Option<String>,
 }
 
+/// Handle to the in-memory /30 lease allocator behind one journal path.
+///
+/// The journal (a JSON map in the historical on-disk format) is parsed ONCE
+/// per path; allocate/release hit memory and enqueue a snapshot for a
+/// background writer thread that rewrites the file under an exclusive flock.
+/// Existing deployments keep their leases; the per-operation flock + parse is
+/// gone from the hot path.
 struct LeaseStore {
 	path: PathBuf,
 }
+
+/// In-memory lease table plus the free list of /30 network blocks.
+struct LeaseAllocator {
+	leases: BTreeMap<String, LeaseEntry>,
+	free:   BTreeSet<u32>,
+}
+
+impl LeaseAllocator {
+	/// Parse the journal (or start empty) and derive the free-block set.
+	fn load(path: &std::path::Path) -> Result<Self> {
+		let leases = match fs::read_to_string(path) {
+			Ok(raw) if !raw.trim().is_empty() => {
+				serde_json::from_str::<BTreeMap<String, LeaseEntry>>(&raw)?
+			},
+			_ => BTreeMap::new(),
+		};
+		let mut free = (0..POOL_SIZE)
+			.step_by(LEASE_STEP as usize)
+			.map(|offset| u32::from(POOL_BASE) + offset)
+			.collect::<BTreeSet<u32>>();
+		for entry in leases.values() {
+			if let Some(base) = lease_network_base(&entry.network) {
+				free.remove(&base);
+			}
+		}
+		Ok(Self { leases, free })
+	}
+
+	/// Allocate (or return) the lease for `name`; `true` when state changed.
+	fn allocate(
+		&mut self,
+		name: &str,
+		dns: &[&str],
+		tap: Option<&str>,
+	) -> Result<(GuestConfig, bool)> {
+		if let Some(entry) = self.leases.get(name) {
+			return Ok((config_from_entry(name, entry, dns)?, false));
+		}
+		let Some(base) = self.free.pop_first() else {
+			return Err(EngineError::engine(format!(
+				"no free /30 networks left in {POOL_BASE}/{POOL_PREFIX}"
+			)));
+		};
+		let entry = LeaseEntry {
+			network: format!("{}/{LEASE_PREFIX}", Ipv4Addr::from(base)),
+			tap:     Some(tap.map_or_else(|| tap_name(name), str::to_owned)),
+		};
+		let config = config_from_entry(name, &entry, dns)?;
+		self.leases.insert(name.to_owned(), entry);
+		Ok((config, true))
+	}
+
+	/// Release `name`'s lease; `true` when a lease was actually removed.
+	fn release(&mut self, name: &str) -> bool {
+		let Some(entry) = self.leases.remove(name) else {
+			return false;
+		};
+		if let Some(base) = lease_network_base(&entry.network) {
+			self.free.insert(base);
+		}
+		true
+	}
+
+	fn snapshot(&self) -> Result<String> {
+		let mut json = serde_json::to_string_pretty(&self.leases)?;
+		json.push('\n');
+		Ok(json)
+	}
+}
+
+/// The base address of a stored `/30` lease network, if well-formed.
+fn lease_network_base(network: &str) -> Option<u32> {
+	match network.parse::<CidrNet>().ok()? {
+		CidrNet::V4 { network, prefix: LEASE_PREFIX } => Some(u32::from(network)),
+		_ => None,
+	}
+}
+
+enum JournalMsg {
+	Persist(String),
+	Flush(mpsc::Sender<()>),
+}
+
+/// Loaded allocator + journal writer for one lease file.
+struct LeaseState {
+	alloc:  Mutex<LeaseAllocator>,
+	writer: mpsc::Sender<JournalMsg>,
+}
+
+static LEASE_STATES: LazyLock<Mutex<HashMap<PathBuf, Arc<LeaseState>>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl LeaseStore {
 	const fn new(path: PathBuf) -> Self {
@@ -842,71 +1258,115 @@ impl LeaseStore {
 		Self::new(crate::home::state_dir().join("network").join("leases.json"))
 	}
 
+	/// Load (once) the allocator + writer thread behind this journal path.
+	fn state(&self) -> Result<Arc<LeaseState>> {
+		if let Some(state) = LEASE_STATES.lock().get(&self.path) {
+			return Ok(Arc::clone(state));
+		}
+		// Load outside the map lock; racing loaders converge on one entry.
+		let alloc = LeaseAllocator::load(&self.path)?;
+		let mut states = LEASE_STATES.lock();
+		if let Some(state) = states.get(&self.path) {
+			return Ok(Arc::clone(state));
+		}
+		let (writer, rx) = mpsc::channel::<JournalMsg>();
+		let path = self.path.clone();
+		thread::Builder::new()
+			.name("vmon-lease-journal".to_owned())
+			.spawn(move || journal_writer(&path, &rx))?;
+		let state = Arc::new(LeaseState { alloc: Mutex::new(alloc), writer });
+		states.insert(self.path.clone(), Arc::clone(&state));
+		Ok(state)
+	}
+
 	fn allocate(&self, name: &str, dns: &[&str]) -> Result<GuestConfig> {
-		self.update(|leases| {
-			if !leases.contains_key(name) {
-				let used = leases
-					.values()
-					.map(|entry| entry.network.as_str())
-					.collect::<BTreeSet<_>>();
-				let Some(network) = first_free_network(&used) else {
-					return Err(EngineError::engine(format!(
-						"no free /30 networks left in {POOL_BASE}/{POOL_PREFIX}"
-					)));
-				};
-				leases.insert(name.to_owned(), LeaseEntry { network, tap: Some(tap_name(name)) });
-			}
-			let Some(entry) = leases.get(name) else {
-				return Err(EngineError::engine("lease allocation failed"));
-			};
-			config_from_entry(name, entry, dns)
-		})
+		self.allocate_with_tap(name, dns, None)
+	}
+
+	fn allocate_with_tap(&self, name: &str, dns: &[&str], tap: Option<&str>) -> Result<GuestConfig> {
+		let state = self.state()?;
+		let mut alloc = state.alloc.lock();
+		let (config, dirty) = alloc.allocate(name, dns, tap)?;
+		if dirty {
+			let snapshot = alloc.snapshot()?;
+			drop(alloc);
+			let _ = state.writer.send(JournalMsg::Persist(snapshot));
+		}
+		Ok(config)
 	}
 
 	fn release(&self, name: &str) -> Result<()> {
-		self.update(|leases| {
-			leases.remove(name);
-			Ok(())
-		})
+		let state = self.state()?;
+		let mut alloc = state.alloc.lock();
+		if alloc.release(name) {
+			let snapshot = alloc.snapshot()?;
+			drop(alloc);
+			let _ = state.writer.send(JournalMsg::Persist(snapshot));
+		}
+		Ok(())
 	}
 
 	fn lease_for(&self, name: &str) -> Option<GuestConfig> {
-		let raw = fs::read_to_string(&self.path).ok()?;
-		let leases = serde_json::from_str::<BTreeMap<String, LeaseEntry>>(&raw).ok()?;
-		let entry = leases.get(name)?;
+		let state = self.state().ok()?;
+		let alloc = state.alloc.lock();
+		let entry = alloc.leases.get(name)?;
 		config_from_entry(name, entry, &DEFAULT_DNS).ok()
 	}
 
-	fn update<T>(
-		&self,
-		callback: impl FnOnce(&mut BTreeMap<String, LeaseEntry>) -> Result<T>,
-	) -> Result<T> {
-		if let Some(parent) = self.path.parent() {
-			fs::create_dir_all(parent)?;
-		}
-		let mut file = OpenOptions::new()
-			.read(true)
-			.write(true)
-			.create(true)
-			.truncate(false)
-			.open(&self.path)?;
-		let _lock = FileLock::exclusive(&file)?;
-		file.seek(SeekFrom::Start(0))?;
-		let mut raw = String::new();
-		file.read_to_string(&mut raw)?;
-		let mut leases = if raw.trim().is_empty() {
-			BTreeMap::new()
-		} else {
-			serde_json::from_str::<BTreeMap<String, LeaseEntry>>(&raw)?
-		};
-		let result = callback(&mut leases)?;
-		file.seek(SeekFrom::Start(0))?;
-		file.set_len(0)?;
-		let json = serde_json::to_string_pretty(&leases)?;
-		file.write_all(json.as_bytes())?;
-		file.write_all(b"\n")?;
-		Ok(result)
+	/// Block until every queued journal snapshot reached disk.
+	fn flush(&self) -> Result<()> {
+		let state = self.state()?;
+		let (ack, done) = mpsc::channel();
+		state
+			.writer
+			.send(JournalMsg::Flush(ack))
+			.map_err(|_| EngineError::engine("lease journal writer exited"))?;
+		done
+			.recv()
+			.map_err(|_| EngineError::engine("lease journal writer exited"))
 	}
+}
+
+/// Writer-thread loop: coalesce queued snapshots and rewrite the journal.
+fn journal_writer(path: &std::path::Path, rx: &mpsc::Receiver<JournalMsg>) {
+	while let Ok(message) = rx.recv() {
+		let mut latest = None;
+		let mut acks = Vec::new();
+		let mut queue = Some(message);
+		while let Some(message) = queue.take() {
+			match message {
+				JournalMsg::Persist(snapshot) => latest = Some(snapshot),
+				JournalMsg::Flush(ack) => acks.push(ack),
+			}
+			queue = rx.try_recv().ok();
+		}
+		if let Some(snapshot) = latest
+			&& let Err(error) = write_journal(path, &snapshot)
+		{
+			tracing::warn!(path = %path.display(), %error, "writing network lease journal failed");
+		}
+		for ack in acks {
+			let _ = ack.send(());
+		}
+	}
+}
+
+/// Rewrite the journal file under an exclusive flock (crash-recovery format).
+fn write_journal(path: &std::path::Path, snapshot: &str) -> Result<()> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	let mut file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(false)
+		.open(path)?;
+	let _lock = FileLock::exclusive(&file)?;
+	file.set_len(0)?;
+	file.seek(SeekFrom::Start(0))?;
+	file.write_all(snapshot.as_bytes())?;
+	Ok(())
 }
 
 struct FileLock {
@@ -1005,18 +1465,6 @@ fn parse_ipv4(value: &str) -> Result<Ipv4Addr> {
 		IpAddr::V4(addr) => Ok(addr),
 		IpAddr::V6(_) => Err(EngineError::invalid("sandbox TAP networking supports IPv4 only")),
 	}
-}
-
-fn first_free_network(used: &BTreeSet<&str>) -> Option<String> {
-	let base = u32::from(POOL_BASE);
-	for offset in (0..POOL_SIZE).step_by(LEASE_STEP as usize) {
-		let network = Ipv4Addr::from(base + offset);
-		let candidate = format!("{network}/{LEASE_PREFIX}");
-		if !used.contains(candidate.as_str()) {
-			return Some(candidate);
-		}
-	}
-	None
 }
 
 fn config_from_entry(name: &str, entry: &LeaseEntry, dns: &[&str]) -> Result<GuestConfig> {
@@ -1316,7 +1764,6 @@ fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
 	items.into_iter().map(str::to_owned).collect()
 }
 
-#[cfg(target_os = "linux")]
 fn clean_domains(domains: Option<&[String]>) -> Vec<String> {
 	domains
 		.unwrap_or(&[])
@@ -1330,14 +1777,13 @@ fn clean_domains(domains: Option<&[String]>) -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn start_domain_refresher(
 	name: &str,
-	guest_cidr: &str,
+	target: RefreshTarget,
 	domains: Vec<String>,
 	rules: BTreeMap<String, usize>,
 	next_idx: usize,
 	trusted: Vec<String>,
 ) -> Result<()> {
-	let refresher =
-		DomainRefresher::new(name, guest_cidr, domains, rules, next_idx, trusted).start()?;
+	let refresher = DomainRefresher::new(name, target, domains, rules, next_idx, trusted).start()?;
 	REFRESHERS.lock().insert(name.to_owned(), refresher);
 	Ok(())
 }
@@ -1348,17 +1794,29 @@ fn stop_domain_refresher(name: &str) -> BTreeMap<String, usize> {
 	refresher.map_or_else(BTreeMap::new, DomainRefresher::stop)
 }
 
+/// Where a domain refresher applies resolved addresses.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Clone, Debug)]
+enum RefreshTarget {
+	/// Per-IP iptables FORWARD rules (non-pooled TAPs).
+	Iptables { guest_cidr: String },
+	/// Elements of a pooled slot's nftables egress set, updated as one
+	/// batched `nft -f -` invocation per refresh cycle.
+	#[allow(dead_code)]
+	NftSet { set: String },
+}
+
 #[cfg(any(test, target_os = "linux"))]
 struct DomainRefresher {
-	name:       String,
-	guest_cidr: String,
-	domains:    Vec<String>,
-	trusted:    Vec<String>,
-	rules:      Arc<Mutex<BTreeMap<String, usize>>>,
-	next_idx:   Arc<Mutex<usize>>,
-	stop_tx:    mpsc::Sender<()>,
-	stop_rx:    Option<mpsc::Receiver<()>>,
-	thread:     Option<JoinHandle<()>>,
+	name:     String,
+	target:   RefreshTarget,
+	domains:  Vec<String>,
+	trusted:  Vec<String>,
+	rules:    Arc<Mutex<BTreeMap<String, usize>>>,
+	next_idx: Arc<Mutex<usize>>,
+	stop_tx:  mpsc::Sender<()>,
+	stop_rx:  Option<mpsc::Receiver<()>>,
+	thread:   Option<thread::JoinHandle<()>>,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -1367,7 +1825,7 @@ impl DomainRefresher {
 
 	fn new(
 		name: &str,
-		guest_cidr: &str,
+		target: RefreshTarget,
 		domains: Vec<String>,
 		rules: BTreeMap<String, usize>,
 		next_idx: usize,
@@ -1376,7 +1834,7 @@ impl DomainRefresher {
 		let (stop_tx, stop_rx) = mpsc::channel();
 		Self {
 			name: name.to_owned(),
-			guest_cidr: guest_cidr.to_owned(),
+			target,
 			domains,
 			trusted,
 			rules: Arc::new(Mutex::new(rules)),
@@ -1392,16 +1850,15 @@ impl DomainRefresher {
 			return Err(EngineError::engine("domain refresher already started"));
 		};
 		let name = self.name.clone();
-		#[cfg(target_os = "linux")]
-		let guest_cidr = self.guest_cidr.clone();
-		#[cfg(not(target_os = "linux"))]
-		let _ = &self.guest_cidr;
+		let target = self.target.clone();
 		let domains = self.domains.clone();
 		let trusted = self.trusted.clone();
 		let rules = Arc::clone(&self.rules);
 		let next_idx = Arc::clone(&self.next_idx);
 		let thread_name = format!("vmon-egress-dns-{name}");
 		let thread = thread::Builder::new().name(thread_name).spawn(move || {
+			#[cfg(not(target_os = "linux"))]
+			let _ = &name;
 			let Ok(mut policy) = policy::EgressPolicy::new(policy::SystemResolver, &domains, &trusted)
 			else {
 				return;
@@ -1426,32 +1883,14 @@ impl DomainRefresher {
 				}
 
 				if refresh_failed {
-					#[cfg(target_os = "linux")]
-					{
-						let to_delete = {
-							let rules_guard = rules.lock();
-							rules_guard.clone()
-						};
-						for (ip, idx) in to_delete {
-							let _ = iptables_delete(&domain_rule(
-								IptablesAction::Delete,
-								&name,
-								&guest_cidr,
-								&ip,
-								idx,
-							));
-						}
-					}
-					{
-						let mut rules_guard = rules.lock();
-						rules_guard.clear();
-					}
+					// Fail closed: drop every previously allowed address.
+					Self::purge(&name, &target, &rules.lock().clone());
+					rules.lock().clear();
 					break;
 				}
 
 				let mut to_add = Vec::new();
 				let mut to_remove = Vec::new();
-
 				{
 					let rules_guard = rules.lock();
 					for ip in rules_guard.keys() {
@@ -1466,55 +1905,108 @@ impl DomainRefresher {
 					}
 				}
 
-				// 1. Add refreshed/new rules FIRST (only on success, update rules map after)
-				for ip in to_add {
-					let idx = {
-						let mut next_idx_guard = next_idx.lock();
-						let current = *next_idx_guard;
-						*next_idx_guard += 1;
-						current
-					};
-					#[cfg(target_os = "linux")]
-					let res = iptables_ensure(&domain_rule(IptablesAction::Insert, &name, &guest_cidr, &ip, idx));
-					#[cfg(not(target_os = "linux"))]
-					let res: Result<(), EngineError> = Ok(());
-
-					if res.is_ok() {
-						let mut rules_guard = rules.lock();
-						rules_guard.insert(ip.clone(), idx);
-					}
-				}
-
-				// 2. Delete stale rules SECOND (only on success, update rules map after)
-				for ip in to_remove {
-					let idx = {
-						let rules_guard = rules.lock();
-						rules_guard.get(&ip).copied()
-					};
-					if let Some(idx) = idx {
-						#[cfg(not(target_os = "linux"))]
-						let _ = idx;
+				match &target {
+					RefreshTarget::NftSet { set } => {
+						// One batched nft invocation covers adds and removes.
+						if to_add.is_empty() && to_remove.is_empty() {
+							continue;
+						}
 						#[cfg(target_os = "linux")]
-						let res = iptables_delete(&domain_rule(
-							IptablesAction::Delete,
-							&name,
-							&guest_cidr,
-							&ip,
-							idx,
-						));
+						let res = run_nft(&slots::update_set_payload(set, &to_add, &to_remove));
 						#[cfg(not(target_os = "linux"))]
-						let res: Result<(), EngineError> = Ok(());
-
+						let res: Result<()> = {
+							let _ = set;
+							Ok(())
+						};
 						if res.is_ok() {
 							let mut rules_guard = rules.lock();
-							rules_guard.remove(&ip);
+							for ip in to_add {
+								let idx = {
+									let mut next_idx_guard = next_idx.lock();
+									let current = *next_idx_guard;
+									*next_idx_guard += 1;
+									current
+								};
+								rules_guard.insert(ip, idx);
+							}
+							for ip in &to_remove {
+								rules_guard.remove(ip);
+							}
 						}
-					}
+					},
+					RefreshTarget::Iptables { guest_cidr } => {
+						#[cfg(not(target_os = "linux"))]
+						let _ = guest_cidr;
+						// 1. Add refreshed/new rules FIRST.
+						for ip in to_add {
+							let idx = {
+								let mut next_idx_guard = next_idx.lock();
+								let current = *next_idx_guard;
+								*next_idx_guard += 1;
+								current
+							};
+							#[cfg(target_os = "linux")]
+							let res = iptables_ensure(&domain_rule(
+								IptablesAction::Insert,
+								&name,
+								guest_cidr,
+								&ip,
+								idx,
+							));
+							#[cfg(not(target_os = "linux"))]
+							let res: Result<()> = Ok(());
+							if res.is_ok() {
+								rules.lock().insert(ip.clone(), idx);
+							}
+						}
+						// 2. Delete stale rules SECOND.
+						for ip in to_remove {
+							let idx = rules.lock().get(&ip).copied();
+							if let Some(idx) = idx {
+								#[cfg(not(target_os = "linux"))]
+								let _ = idx;
+								#[cfg(target_os = "linux")]
+								let res = iptables_delete(&domain_rule(
+									IptablesAction::Delete,
+									&name,
+									guest_cidr,
+									&ip,
+									idx,
+								));
+								#[cfg(not(target_os = "linux"))]
+								let res: Result<()> = Ok(());
+								if res.is_ok() {
+									rules.lock().remove(&ip);
+								}
+							}
+						}
+					},
 				}
 			}
 		})?;
 		self.thread = Some(thread);
 		Ok(self)
+	}
+
+	/// Remove every applied address for `target` (fail-closed cleanup).
+	fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
+		#[cfg(not(target_os = "linux"))]
+		let _ = (name, target, applied);
+		#[cfg(target_os = "linux")]
+		match target {
+			RefreshTarget::NftSet { set } => {
+				let remove = applied.keys().cloned().collect::<Vec<_>>();
+				if !remove.is_empty() {
+					let _ = run_nft(&slots::update_set_payload(set, &[], &remove));
+				}
+			},
+			RefreshTarget::Iptables { guest_cidr } => {
+				for (ip, idx) in applied {
+					let _ =
+						iptables_delete(&domain_rule(IptablesAction::Delete, name, guest_cidr, ip, *idx));
+				}
+			},
+		}
 	}
 
 	fn stop(mut self) -> BTreeMap<String, usize> {
@@ -1523,15 +2015,10 @@ impl DomainRefresher {
 			let _ = thread.join();
 		}
 		let rules = self.rules.lock().clone();
-		#[cfg(target_os = "linux")]
-		for (ip, idx) in &rules {
-			let _ = iptables_delete(&domain_rule(
-				IptablesAction::Delete,
-				&self.name,
-				&self.guest_cidr,
-				ip,
-				*idx,
-			));
+		// Slot sets are flushed by the claim/recycle payloads that follow a
+		// stop; only iptables targets need exact-delete cleanup here.
+		if matches!(self.target, RefreshTarget::Iptables { .. }) {
+			Self::purge(&self.name, &self.target, &rules);
 		}
 		rules
 	}
@@ -1581,8 +2068,12 @@ fn iptables_delete(rule: &[String]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_iptables(rule: &[String], check: bool) -> Result<RunOutput> {
-	let mut command = Vec::with_capacity(rule.len() + 1);
+	// Concurrent iptables invocations contend on the xtables lock and fail
+	// with exit 4; -w makes every ensure/check/delete wait instead.
+	let mut command = Vec::with_capacity(rule.len() + 3);
 	command.push("iptables".to_owned());
+	command.push("-w".to_owned());
+	command.push("5".to_owned());
 	command.extend(rule.iter().cloned());
 	run(&command, check)
 }
@@ -1635,7 +2126,171 @@ fn run(argv: &[String], check: bool) -> Result<RunOutput> {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use super::*;
+
+	/// Serializes tests that touch the global slot pool / broker stub.
+	static TEST_ENV: Mutex<()> = Mutex::new(());
+
+	/// Installs a broker stub that counts calls and records request kinds;
+	/// uninstalls on drop even when the test panics.
+	struct StubGuard {
+		calls: Arc<AtomicUsize>,
+		kinds: Arc<Mutex<Vec<&'static str>>>,
+	}
+
+	impl StubGuard {
+		fn install() -> Self {
+			let calls = Arc::new(AtomicUsize::new(0));
+			let kinds = Arc::new(Mutex::new(Vec::new()));
+			let stub_calls = Arc::clone(&calls);
+			let stub_kinds = Arc::clone(&kinds);
+			*BROKER_STUB.lock() = Some(Box::new(move |request| {
+				stub_calls.fetch_add(1, Ordering::SeqCst);
+				stub_kinds.lock().push(match request {
+					broker::Request::Setup { .. } => "setup",
+					broker::Request::AllowCredential { .. } => "allow-credential",
+					broker::Request::Teardown { .. } => "teardown",
+					broker::Request::PreallocateSlots { .. } => "preallocate",
+					broker::Request::ClaimSlot { .. } => "claim",
+					broker::Request::RecycleSlot { .. } => "recycle",
+				});
+				Ok(None)
+			}));
+			Self { calls, kinds }
+		}
+
+		fn calls(&self) -> usize {
+			self.calls.load(Ordering::SeqCst)
+		}
+	}
+
+	impl Drop for StubGuard {
+		fn drop(&mut self) {
+			*BROKER_STUB.lock() = None;
+			slots::pool_reset();
+		}
+	}
+
+	fn test_slot(index: u32) -> slots::SlotSpec {
+		let base = u32::from(POOL_BASE) + index * LEASE_STEP;
+		slots::SlotSpec {
+			index,
+			name: slots::slot_tap_name(index),
+			guest_ip: Ipv4Addr::from(base + 2).to_string(),
+			host_ip: Ipv4Addr::from(base + 1).to_string(),
+			prefix: LEASE_PREFIX,
+		}
+	}
+
+	#[test]
+	fn slot_claim_recycle_reuses_tap_without_broker_requests() {
+		let _env = TEST_ENV.lock();
+		slots::pool_reset();
+		let stub = StubGuard::install();
+		slots::pool_install(vec![test_slot(0)]);
+
+		// Default-policy claim: zero broker round trips end to end.
+		let config = allocate_guest_config("vmon-nettest-slot-a").unwrap();
+		assert_eq!(config.tap, slots::slot_tap_name(0));
+		let lease =
+			setup_tap(&config.tap, &config.guest_ip, &config.host_ip, config.prefix, None, None, None)
+				.unwrap();
+		assert_eq!(lease.name, config.tap);
+		assert_eq!(lease_for("vmon-nettest-slot-a").unwrap().tap, config.tap);
+		teardown_tap(
+			&config.tap,
+			Some(&config.guest_ip),
+			Some(&config.host_ip),
+			config.prefix,
+			None,
+			None,
+		)
+		.unwrap();
+		release_guest_config("vmon-nettest-slot-a").unwrap();
+		assert_eq!(stub.calls(), 0);
+
+		// Recycled slot serves the next sandbox with the same TAP and lease.
+		let reused = allocate_guest_config("vmon-nettest-slot-b").unwrap();
+		assert_eq!(reused.tap, config.tap);
+		assert_eq!(reused.guest_ip, config.guest_ip);
+		assert_eq!(reused.host_ip, config.host_ip);
+		assert_eq!(stub.calls(), 0);
+
+		// A custom egress policy costs exactly one batched broker request,
+		// and recycling it exactly one more.
+		let allow = vec!["203.0.113.0/24".to_owned()];
+		setup_tap(
+			&reused.tap,
+			&reused.guest_ip,
+			&reused.host_ip,
+			reused.prefix,
+			Some(&allow),
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(stub.calls(), 1);
+		teardown_tap(
+			&reused.tap,
+			Some(&reused.guest_ip),
+			Some(&reused.host_ip),
+			reused.prefix,
+			Some(&allow),
+			None,
+		)
+		.unwrap();
+		release_guest_config("vmon-nettest-slot-b").unwrap();
+		assert_eq!(stub.calls(), 2);
+		assert_eq!(*stub.kinds.lock(), vec!["claim", "recycle"]);
+	}
+
+	#[test]
+	fn block_network_path_leaves_net_state_untouched() {
+		let _env = TEST_ENV.lock();
+		slots::pool_reset();
+		let stub = StubGuard::install();
+		slots::pool_install(vec![test_slot(0)]);
+		let free_before = slots::pool_free_len();
+
+		// The engine's spawn path performs NO net calls for block_network
+		// sandboxes; teardown only consults `lease_for`, which must not
+		// allocate, claim, or reach the broker.
+		assert!(lease_for("vmon-nettest-blocked").is_none());
+
+		assert_eq!(slots::pool_free_len(), free_before);
+		assert_eq!(stub.calls(), 0);
+	}
+
+	#[test]
+	fn in_memory_allocator_survives_journal_reload() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("network").join("leases.json");
+		let store = LeaseStore::new(path.clone());
+
+		let alpha = store.allocate("alpha", &DEFAULT_DNS).unwrap();
+		let beta = store.allocate("beta", &DEFAULT_DNS).unwrap();
+		assert_eq!(store.allocate("alpha", &DEFAULT_DNS).unwrap(), alpha);
+		store.release("beta").unwrap();
+		store.release("beta").unwrap(); // releasing twice is a no-op
+		store.flush().unwrap();
+
+		// Reload the journal from disk as a fresh allocator (daemon restart).
+		let mut reloaded = LeaseAllocator::load(&path).unwrap();
+		assert!(reloaded.leases.contains_key("alpha"));
+		assert!(!reloaded.leases.contains_key("beta"));
+
+		// Idempotent re-allocate: alpha keeps its block across the reload.
+		let (alpha_again, dirty) = reloaded.allocate("alpha", &DEFAULT_DNS, None).unwrap();
+		assert!(!dirty);
+		assert_eq!(alpha_again, alpha);
+
+		// Beta's freed block is the lowest available again.
+		let (gamma, dirty) = reloaded.allocate("gamma", &DEFAULT_DNS, None).unwrap();
+		assert!(dirty);
+		assert_eq!(gamma.network, beta.network);
+	}
 
 	#[test]
 	fn lease_allocation_persistence_release_roundtrip() {
@@ -1654,6 +2309,7 @@ mod tests {
 		assert_eq!(store.allocate("alpha", &DEFAULT_DNS).unwrap(), first);
 		assert_eq!(store.lease_for("alpha").as_ref(), Some(&first));
 
+		store.flush().unwrap();
 		let raw = fs::read_to_string(dir.path().join("network").join("leases.json")).unwrap();
 		let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
 		assert_eq!(value["alpha"]["network"], "172.20.0.0/30");
@@ -1760,7 +2416,7 @@ mod tests {
 		let next_idx = 2;
 		let refresher = DomainRefresher::new(
 			"test-sb",
-			"10.0.2.15/32",
+			RefreshTarget::Iptables { guest_cidr: "10.0.2.15/32".to_owned() },
 			vec!["api.example.com".to_owned()],
 			rules,
 			next_idx,
@@ -1818,5 +2474,17 @@ mod tests {
 			"-j".to_owned(),
 			"ACCEPT".to_owned(),
 		]);
+	}
+	#[test]
+	fn proc_net_dev_parser_skips_loopback_and_malformed_rows() {
+		let counters = parse_proc_net_dev(
+			"Inter-|   Receive                                                |  Transmit\nface \
+			 |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo \
+			 colls carrier compressed\nlo: 999 0 0 0 0 0 0 0 999 0 0 0 0 0 0 0\neth0: \
+			 18446744073709551615 0 0 0 0 0 0 0 7 0 0 0 0 0 0 0\nmalformed: 3 0 0\nwlan0: 1 0 0 0 0 \
+			 0 0 0 18446744073709551615 0 0 0 0 0 0 0\nbad-value: x 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0\n",
+		);
+
+		assert_eq!(counters, Some((u64::MAX, u64::MAX)));
 	}
 }

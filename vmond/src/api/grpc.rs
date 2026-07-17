@@ -32,6 +32,7 @@ use crate::{
 	api::{
 		error::{ApiError, ApiResult, join_error},
 		routes::compact_json,
+		sandbox_stream,
 		state::{ApiState, PRINCIPAL_KEY_HEADER, PRINCIPAL_ROLE_HEADER, PRINCIPAL_TENANT_HEADER},
 		validation,
 	},
@@ -53,7 +54,7 @@ use crate::{
 pub(super) const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const MESH_HOP_KEY: &str = "x-vmon-mesh-hop";
 
-type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+pub(super) type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 const ARTIFACT_CHUNK_SIZE: usize = 64 * 1024;
 
 fn stream_verified_artifact(
@@ -334,7 +335,7 @@ fn request_principal<T>(request: &Request<T>) -> Result<Principal, Status> {
 		.cloned()
 		.map_or_else(|| metadata_principal(request.metadata()), Ok)
 }
-fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Result<(), Status> {
+fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Result<(), ApiError> {
 	if principal.is_admin() {
 		return Ok(());
 	}
@@ -351,18 +352,16 @@ fn scope_sandbox_create(principal: &Principal, body: &mut SandboxCreate) -> Resu
 			.is_some_and(|mounts| !mounts.is_empty())
 		|| body.pool_size != 0
 	{
-		return Err(status_from(&ApiError::forbidden(
+		return Err(ApiError::forbidden(
 			"tenant sandboxes cannot use host-local templates, builds, mounts, volumes, or pools",
-		)));
+		));
 	}
 	if body
 		.image
 		.as_deref()
 		.is_some_and(|reference| !image::is_registry_reference(reference))
 	{
-		return Err(status_from(&ApiError::forbidden(
-			"tenant sandboxes require a registry image reference",
-		)));
+		return Err(ApiError::forbidden("tenant sandboxes require a registry image reference"));
 	}
 	body.owner_tenant.clone_from(&principal.tenant);
 	body.encryption_key_id.clone_from(&principal.key_id);
@@ -669,6 +668,102 @@ impl GrpcApi {
 			.map_err(|err| status_from(&ApiError::from(err)))
 	}
 
+	/// Shared create pipeline for unary `Create` and streamed `BatchCreate`:
+	/// parse, validate, tenant-scope, admit, then boot via mesh or engine.
+	///
+	/// With `no_wait` the sandbox name is assigned here and the boot moves to
+	/// a detached task together with the admission guard; the admitted
+	/// identity is returned immediately with status `starting`.
+	async fn create_sandbox_pipeline(
+		&self,
+		principal: &Principal,
+		mesh_hop: bool,
+		request: pb::CreateSandboxRequest,
+	) -> Result<Value, ApiError> {
+		let value: Value = serde_json::from_str(&request.spec_json)
+			.map_err(|_| ApiError::invalid("invalid request"))?;
+		validation::validate_create_value(&value)?;
+		let mut body: SandboxCreate = validation::from_value(value)?;
+		scope_sandbox_create(principal, &mut body)?;
+		validation::validate_create(&body)?;
+		if request.no_wait && body.name.as_deref().is_none_or(str::is_empty) {
+			body.name = Some(sandbox_stream::generate_sid());
+		}
+		let value = serde_json::to_value(&body).map_err(|error| {
+			ApiError::from(crate::EngineError::engine(format!("serializing sandbox create: {error}")))
+		})?;
+		// Orch mode: reserve an admission slot so schedulers get a
+		// deterministic busy rejection; the guard spans the boot, detached
+		// or not.
+		let admit = match self.state.orch_worker.as_ref() {
+			Some(worker) => Some(worker.admit()?),
+			None => None,
+		};
+		let mesh = self
+			.state
+			.mesh
+			.clone()
+			.filter(|mesh| mesh.mesh_enabled() && !mesh_hop);
+		if request.no_wait {
+			let sid = body.name.clone().unwrap_or_default();
+			let owner_tenant = body.owner_tenant.clone();
+			// Detached boot: the admission guard moves with it, so the slot
+			// stays held until the boot settles. Failures only warn here —
+			// the facade publishes the `failed` event Watch clients consume.
+			if let Some(mesh) = mesh {
+				let params = value.as_object().cloned().unwrap_or_default();
+				let boot_sid = sid.clone();
+				tokio::spawn(async move {
+					let _admit = admit;
+					if let Err(error) = mesh.create_sandbox(params).await {
+						tracing::warn!(sid = %boot_sid, %error, "no_wait mesh sandbox create failed");
+					}
+				});
+			} else {
+				let engine = self.state.engine.clone();
+				let boot_gate = self.state.boot_gate.clone();
+				let boot_sid = sid.clone();
+				tokio::spawn(async move {
+					// Queue behind the boot gate without pinning a blocking-pool
+					// thread; the admission slot stays reserved while queued.
+					let Ok(permit) = boot_gate.acquire_owned().await else {
+						return; // the gate is never closed
+					};
+					let _ = tokio::task::spawn_blocking(move || {
+						let _admit = admit;
+						let _permit = permit;
+						if let Err(error) = engine.create(body) {
+							tracing::warn!(sid = %boot_sid, %error, "no_wait sandbox create failed");
+						}
+					})
+					.await;
+				});
+			}
+			return Ok(json!({
+				"id": sid,
+				"name": sid,
+				"status": "starting",
+				"owner_tenant": owner_tenant,
+			}));
+		}
+		let _admit = admit;
+		if let Some(mesh) = mesh {
+			mesh
+				.create_sandbox(value.as_object().cloned().unwrap_or_default())
+				.await
+				.map_err(ApiError::from)
+		} else {
+			let engine = self.state.engine.clone();
+			// Local boots are CPU-heavy; the gate bounds their concurrency while
+			// the caller's gRPC deadline still governs the wait.
+			let _permit = self.state.boot_gate.acquire().await.ok();
+			tokio::task::spawn_blocking(move || engine.create(body))
+				.await
+				.map_err(join_error)?
+				.map_err(ApiError::from)
+		}
+	}
+
 	fn admit_function_ha(&self, spec: &pb::FunctionSpec) -> Result<(), Status> {
 		let nodes = self
 			.state
@@ -935,7 +1030,7 @@ fn terminal_call_status(status: i32) -> bool {
 	)
 }
 
-fn json_view(value: &Value) -> pb::JsonView {
+pub(super) fn json_view(value: &Value) -> pb::JsonView {
 	pb::JsonView { json: compact_json(value) }
 }
 
@@ -2058,9 +2153,102 @@ fn credential_record(metadata: CredentialMetadata) -> pb::CredentialRecord {
 #[tonic::async_trait]
 impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	type AttachStream = BoxStream<pb::ExecOutput>;
+	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
 	type ShellStream = BoxStream<pb::ExecOutput>;
+	type WatchStream = BoxStream<pb::JsonView>;
+
+	/// BatchCreate: run each streamed item through the unary create pipeline
+	/// concurrently, reporting per-item outcomes as they finish (out of
+	/// order). The stream itself only fails on transport or auth errors.
+	async fn batch_create(
+		&self,
+		request: Request<Streaming<pb::BatchCreateRequest>>,
+	) -> Result<Response<Self::BatchCreateStream>, Status> {
+		/// In-process bound on concurrently admitted batch items; admission
+		/// and gRPC flow control are the real gates, this only bounds memory.
+		const BATCH_CREATE_CONCURRENCY: usize = 1024;
+		let principal = request_principal(&request)?;
+		let (metadata, _, mut inbound) = request.into_parts();
+		let mesh_hop = is_mesh_hop(&metadata);
+		let api = self.clone();
+		let (tx, out) = mpsc::channel::<Result<pb::BatchCreateResponse, Status>>(256);
+		tokio::spawn(async move {
+			let slots = Arc::new(tokio::sync::Semaphore::new(BATCH_CREATE_CONCURRENCY));
+			loop {
+				let item = match inbound.message().await {
+					Ok(Some(item)) => item,
+					Ok(None) => break,
+					Err(status) => {
+						let _ = tx.send(Err(status)).await;
+						break;
+					},
+				};
+				let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+					break;
+				};
+				let api = api.clone();
+				let principal = principal.clone();
+				let tx = tx.clone();
+				tokio::spawn(async move {
+					let _permit = permit;
+					let outcome = match item.create {
+						Some(create) => {
+							match api
+								.create_sandbox_pipeline(&principal, mesh_hop, create)
+								.await
+							{
+								Ok(view) => pb::batch_create_response::Outcome::Json(compact_json(&view)),
+								Err(error) => {
+									pb::batch_create_response::Outcome::Error(pb::BatchCreateError {
+										code:    error.code().to_owned(),
+										message: error.message().to_owned(),
+									})
+								},
+							}
+						},
+						None => pb::batch_create_response::Outcome::Error(pb::BatchCreateError {
+							code:    "invalid".to_owned(),
+							message: "batch item carries no create payload".to_owned(),
+						}),
+					};
+					let _ = tx
+						.send(Ok(pb::BatchCreateResponse { seq: item.seq, outcome: Some(outcome) }))
+						.await;
+				});
+			}
+			// Dropping this sender closes the outbound stream once every
+			// outstanding item task has reported.
+		});
+		Ok(Response::new(Box::pin(ReceiverStream::new(out))))
+	}
+
+	/// Watch one sandbox's lifecycle as JsonView frames.
+	///
+	/// The bus is subscribed before the initial `get`, so no transition is
+	/// lost between the snapshot frame and the event stream. Unknown sids
+	/// wait for their first event only with `until_ready` (the client's
+	/// deadline governs). Named creates rejected during facade preparation
+	/// publish the same terminal `failed` event as launch failures.
+	async fn watch(
+		&self,
+		request: Request<pb::WatchSandboxRequest>,
+	) -> Result<Response<Self::WatchStream>, Status> {
+		let pb::WatchSandboxRequest { id, until_ready } = request.into_inner();
+		let events = self.state.engine.subscribe_events();
+		let engine = self.state.engine.clone();
+		let lookup = id.clone();
+		let initial = match tokio::task::spawn_blocking(move || engine.get(&lookup))
+			.await
+			.map_err(|err| status_from(&join_error(err)))?
+		{
+			Ok(view) => Some(view),
+			Err(error) if error.code == ErrorCode::NotFound && until_ready => None,
+			Err(error) => return Err(status_from(&ApiError::from(error))),
+		};
+		Ok(Response::new(sandbox_stream::watch_stream(id, until_ready, initial, events)))
+	}
 
 	async fn create(
 		&self,
@@ -2068,24 +2256,10 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	) -> Result<Response<pb::JsonView>, Status> {
 		let principal = request_principal(&request)?;
 		let (metadata, _, message) = request.into_parts();
-		let value: Value = serde_json::from_str(&message.spec_json)
-			.map_err(|_| Status::from(ApiError::invalid("invalid request")))?;
-		validation::validate_create_value(&value)?;
-		let mut body: SandboxCreate = validation::from_value(value)?;
-		scope_sandbox_create(&principal, &mut body)?;
-		validation::validate_create(&body)?;
-		let value = serde_json::to_value(&body)
-			.map_err(|error| Status::internal(format!("serializing sandbox create: {error}")))?;
-		let view = if let Some(mesh) = self.state.mesh.clone().filter(|mesh| mesh.mesh_enabled())
-			&& !is_mesh_hop(&metadata)
-		{
-			mesh
-				.create_sandbox(value.as_object().cloned().unwrap_or_default())
-				.await
-				.map_err(|err| status_from(&ApiError::from(err)))?
-		} else {
-			self.engine_call(move |engine| engine.create(body)).await?
-		};
+		let view = self
+			.create_sandbox_pipeline(&principal, is_mesh_hop(&metadata), message)
+			.await
+			.map_err(|error| status_from(&error))?;
 		Ok(Response::new(json_view(&view)))
 	}
 

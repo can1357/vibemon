@@ -24,7 +24,10 @@ use crate::{
 	memory::GuestMemoryMmap,
 	os::EventFd,
 	result::{Result, err},
-	virtio::{Interrupt, VirtioDevice, WorkerWaitSource, descriptor_range_valid},
+	virtio::{
+		Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, WorkerWaitSource,
+		descriptor_range_valid,
+	},
 };
 
 const QUEUE_SIZE: u16 = 64;
@@ -196,8 +199,10 @@ impl Console {
 	}
 
 	/// Drain the transmit queue (guest -> host): append each chain's readable
-	/// descriptor bytes to `output`. Returns whether any buffer was used.
-	fn drain_tx(&mut self) -> Result<bool> {
+	/// descriptor bytes to `output`. Consumes at most `*budget` chains (a
+	/// spinning guest could otherwise keep the pass alive forever). Returns
+	/// whether any buffer was used.
+	fn drain_tx(&mut self, budget: &mut usize) -> Result<bool> {
 		let Some(mem) = self.mem.clone() else {
 			return Ok(false);
 		};
@@ -214,10 +219,11 @@ impl Console {
 			used |= pending_used;
 			produced |= pending_produced;
 
-			while self.pending_tx.is_none() && out.len() < OUTPUT_CAP {
+			while self.pending_tx.is_none() && out.len() < OUTPUT_CAP && *budget != 0 {
 				let Some(chain) = tx_queue.pop_descriptor_chain(&mem) else {
 					break;
 				};
+				*budget -= 1;
 				let head = chain.head_index();
 				let mut descs = Vec::new();
 				let mut valid = true;
@@ -254,8 +260,9 @@ impl Console {
 
 	/// Fill the receive queue (host -> guest) from `input`: while bytes remain
 	/// and an RX chain is available, copy as many as fit into the chain's
-	/// writable descriptors. Returns whether any buffer was used.
-	fn fill_rx(&mut self) -> Result<bool> {
+	/// writable descriptors. Consumes at most `*budget` chains. Returns whether
+	/// any buffer was used.
+	fn fill_rx(&mut self, budget: &mut usize) -> Result<bool> {
 		let Some(mem) = self.mem.clone() else {
 			return Ok(false);
 		};
@@ -265,10 +272,11 @@ impl Console {
 		let mut inp = self.input.lock();
 
 		let mut used = false;
-		while !inp.is_empty() {
+		while !inp.is_empty() && *budget != 0 {
 			let Some(chain) = rx_queue.pop_descriptor_chain(&mem) else {
 				break;
 			};
+			*budget -= 1;
 			let head = chain.head_index();
 			let mut descs = Vec::new();
 			let mut valid = true;
@@ -377,28 +385,44 @@ impl VirtioDevice for Console {
 		vec![event_wait_source(&self.input_evt), event_wait_source(&self.drain_resume_evt)]
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		// The guest rang the doorbell after queueing TX data (and possibly fresh
 		// RX buffers). Drain TX, then top up RX from any pending host input.
 		let _ = (RX_QUEUE, TX_QUEUE);
-		let tx_used = self.drain_tx()?;
-		let rx_used = self.fill_rx()?;
+		let mut budget = QUEUE_PASS_BUDGET;
+		let tx_used = self.drain_tx(&mut budget)?;
+		let rx_used = self.fill_rx(&mut budget)?;
 		if tx_used || rx_used {
 			self.signal_used()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn process_worker_source(&mut self, index: usize) -> Result<()> {
 		if index == 0 {
 			let _ = self.input_evt.read();
-			if self.fill_rx()? {
+			let mut budget = QUEUE_PASS_BUDGET;
+			if self.fill_rx(&mut budget)? {
 				self.signal_used()?;
+			}
+			if budget == 0 {
+				// Bounded pass exhausted: re-arm our own wake source so the
+				// remaining input is delivered on a later wake without
+				// monopolizing the shared device loop.
+				let _ = self.input_evt.write(1);
 			}
 		} else if index == 1 {
 			let _ = self.drain_resume_evt.read();
-			if self.drain_tx()? {
+			let mut budget = QUEUE_PASS_BUDGET;
+			if self.drain_tx(&mut budget)? {
 				self.signal_used()?;
+			}
+			if budget == 0 {
+				let _ = self.drain_resume_evt.write(1);
 			}
 		}
 		Ok(())
@@ -417,7 +441,15 @@ impl VirtioDevice for Console {
 	}
 
 	fn drain(&mut self) -> Result<()> {
-		let used = self.drain_tx()?;
+		// A snapshot quiesce must drain to completion, not one bounded pass.
+		let mut used = false;
+		loop {
+			let mut budget = QUEUE_PASS_BUDGET;
+			used |= self.drain_tx(&mut budget)?;
+			if budget != 0 {
+				break;
+			}
+		}
 		if used {
 			self.signal_used()?;
 		}
@@ -506,8 +538,8 @@ mod tests {
 		let mem = guest_mem();
 		let queue = queue_with_descs(&mem, &[SplitDescriptor::new(0x4000, 64, 0, 0)]);
 		let mut console = console_with_rx(mem, queue, b"ping");
-
-		assert!(console.fill_rx().expect("fill_rx"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(console.fill_rx(&mut budget).expect("fill_rx"));
 
 		let remaining: Vec<u8> = console.input.lock().iter().copied().collect();
 		assert_eq!(remaining, b"ping");
@@ -525,8 +557,8 @@ mod tests {
 			0,
 		)]);
 		let mut console = console_with_rx(mem, queue, b"pong");
-
-		assert!(console.fill_rx().expect("fill_rx"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(console.fill_rx(&mut budget).expect("fill_rx"));
 
 		let remaining: Vec<u8> = console.input.lock().iter().copied().collect();
 		assert_eq!(remaining, b"pong");
@@ -543,8 +575,8 @@ mod tests {
 		let mut console = Console::new().expect("console");
 		console.mem = Some(mem);
 		console.tx_queue = Some(queue);
-
-		assert!(console.drain_tx().expect("drain_tx"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(console.drain_tx(&mut budget).expect("drain_tx"));
 
 		assert!(console.output.lock().is_empty());
 		assert_eq!(used_len(console.mem.as_ref().expect("mem")), 0);
@@ -560,8 +592,8 @@ mod tests {
 		console.mem = Some(mem);
 		console.tx_queue = Some(queue);
 		console.output.lock().resize(OUTPUT_CAP, b'x');
-
-		assert!(!console.drain_tx().expect("drain_tx"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(!console.drain_tx(&mut budget).expect("drain_tx"));
 		assert_eq!(console.output.lock().len(), OUTPUT_CAP);
 		assert_eq!(used_idx(console.mem.as_ref().expect("mem")), 0);
 

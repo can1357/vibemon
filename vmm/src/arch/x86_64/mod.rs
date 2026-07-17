@@ -8,6 +8,7 @@ mod interrupts;
 pub mod mptable;
 mod msr;
 mod regs;
+pub mod smbios;
 #[cfg(target_os = "linux")]
 pub mod state;
 #[cfg(target_os = "windows")]

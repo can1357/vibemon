@@ -50,7 +50,7 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	snapshot::FsStateSer,
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid},
 };
 
 pub(super) const QUEUE_SIZE: u16 = 64;
@@ -1958,18 +1958,26 @@ impl VirtioDevice for Fs {
 		Ok(())
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let mut used = false;
 		let read_only = self.read_only;
 		let state = &mut self.state;
+		// Bound one pass: FUSE requests complete inline, so a spinning guest
+		// could otherwise keep the rings non-empty forever and starve the
+		// shared worker's other devices.
+		let mut budget = QUEUE_PASS_BUDGET;
 
 		// hiprio (queue 0): FORGET/BATCH_FORGET/INTERRUPT. They never produce a
 		// reply, but FORGET still needs to age inode-table entries out.
 		if let Some(hq) = self.hiprio_queue.as_mut() {
-			while let Some(chain) = hq.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = hq.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				let head = chain.head_index();
 				if let Some((req, _)) = split_chain(&mem, chain) {
 					state.dispatch(&mem, &req, &[], read_only);
@@ -1983,7 +1991,11 @@ impl VirtioDevice for Fs {
 		// request queue (queue 1): service FUSE. Disjoint borrows — the inode
 		// table (`state`) and the queue are separate fields of `self`.
 		if let Some(rq) = self.req_queue.as_mut() {
-			while let Some(chain) = rq.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = rq.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				let head = chain.head_index();
 				let written = match split_chain(&mem, chain) {
 					Some((req, writable)) => state.dispatch(&mem, &req, &writable, read_only),
@@ -1998,7 +2010,11 @@ impl VirtioDevice for Fs {
 		if used {
 			interrupt.signal_used_queue()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {

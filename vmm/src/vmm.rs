@@ -5,6 +5,16 @@
 //! paused-then-snapshotted VM through [`Vmm::restore`] without booting a
 //! kernel. Once running, an optional Unix control socket drives
 //! pause/resume/snapshot.
+//!
+//! ## Per-VM thread census
+//!
+//! A running VM owns: one thread per vCPU, ONE shared virtio device event-loop
+//! thread (`vmon-virtio`, every device multiplexed over a single poll set —
+//! see [`crate::virtio::run_shared_worker`]), and the main thread which runs
+//! the run/control loop. Optional helpers (pager handler, agent bridge,
+//! deadline timer) add at most one thread each. Windows builds
+//! (vmm_windows.rs) keep one worker thread per device instead, because
+//! `WaitForMultipleObjects` caps a wait set at 64 handles.
 
 use std::{
 	collections::VecDeque,
@@ -30,6 +40,13 @@ use serde_json::json;
 use tracing::{error, info, warn};
 use vmon_agent::proto;
 
+#[cfg(target_arch = "x86_64")]
+use crate::devices::pci::{PciEcam, PciFunction, PciMmioDispatcher, PciRoot};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::devices::vfio::{
+	PCI_HIGH_MMIO_SIZE, PCI_HIGH_MMIO_START, PreopenedVfio, VfioPciDevice, VfioPciResources,
+	attach_gpu_devices, normalize_gpu_paths, preopen_gpu_devices,
+};
 #[cfg(target_arch = "aarch64")]
 use crate::hv::Gic;
 #[cfg(target_arch = "x86_64")]
@@ -38,7 +55,7 @@ use crate::layout::{
 	PCI_VIRTIO_MMIO_SIZE, PCI_VIRTIO_MMIO_START,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::virtio::pci::{PciCommonState, PciEcam, PciMmioDispatcher, PciRoot, PciTransport};
+use crate::virtio::pci::{PciCommonState, PciTransport};
 use crate::{
 	arch,
 	config::{BootMode, Config, MAX_COUNT, Transport},
@@ -55,14 +72,14 @@ use crate::{
 	},
 	tap::Tap,
 	virtio::{
-		Interrupt, VirtioDevice, WorkerControl,
+		DeviceWorker, Interrupt, VirtioDevice, WorkerControl,
 		block::Block,
 		console::OUTPUT_CAP,
 		fs::Fs,
 		mmio::{MmioState, MmioTransport},
 		net::Net,
 		remotefs::RemoteFs,
-		run_worker,
+		run_shared_worker,
 	},
 };
 
@@ -73,6 +90,11 @@ const PAUSE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PAUSE_VCPU_PARK_TIMEOUT: Duration = Duration::from_secs(5);
 const PAUSE_WORKER_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_VCPU_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+type PreopenedGpuResources = Option<PreopenedVfio>;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+type PreopenedGpuResources = ();
 
 #[cfg(target_arch = "x86_64")]
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1";
@@ -85,21 +107,6 @@ static ORIG_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
 type ConsoleInput = (Arc<Mutex<VecDeque<u8>>>, EventFd);
 type ConsoleOutput = (Arc<Mutex<Vec<u8>>>, EventFd, EventFd);
-
-/// Everything needed to start one virtio device's worker thread.
-struct WorkerSpec {
-	device:           Arc<Mutex<dyn VirtioDevice>>,
-	queue_evt:        EventFd,
-	kill_evt:         EventFd,
-	pause_evt:        EventFd,
-	resume_evt:       EventFd,
-	ack_evt:          EventFd,
-	failure_evt:      EventFd,
-	failure_msg:      Arc<Mutex<Option<String>>>,
-	pause_requested:  Arc<AtomicBool>,
-	pause_generation: Arc<AtomicU64>,
-	ack_generation:   Arc<AtomicU64>,
-}
 
 enum DeviceTransport {
 	Mmio(Arc<Mutex<MmioTransport>>),
@@ -138,7 +145,6 @@ struct DeviceHandle {
 	ack_evt:          EventFd,
 	failure_evt:      EventFd,
 	failure_msg:      Arc<Mutex<Option<String>>>,
-	kill_evt:         EventFd,
 	pause_requested:  Arc<AtomicBool>,
 	pause_generation: Arc<AtomicU64>,
 	ack_generation:   Arc<AtomicU64>,
@@ -195,8 +201,12 @@ pub struct Vmm {
 	mmio_bus:         Arc<Bus>,
 	serial:           Arc<Mutex<SerialDevice>>,
 	devices:          Vec<DeviceHandle>,
-	worker_specs:     Vec<WorkerSpec>,
-	worker_handles:   Vec<JoinHandle<()>>,
+	device_workers:   Vec<DeviceWorker>,
+	device_loop:      Option<JoinHandle<()>>,
+	/// VM-global kill event terminating the shared device loop.
+	worker_kill_evt:  EventFd,
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+	vfio_devices:     Vec<Arc<VfioPciDevice>>,
 	/// Host end of the virtio-console agent channel (input buffer + wake
 	/// eventfd), present when `--console-agent` is set. Used to push bytes into
 	/// the guest.
@@ -327,7 +337,12 @@ impl VmmExit {
 }
 
 /// Build (or restore) a guest and run it, optionally under a control socket.
-pub fn run(config: Config) -> Result<()> {
+pub fn run(
+	#[allow(unused_mut, reason = "NVIDIA VFIO paths are normalized only on x86_64 Linux")]
+	mut config: Config,
+) -> Result<()> {
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+	normalize_gpu_paths(&mut config.vfio_gpus)?;
 	// --fork-from with --count > 1: this process is the fanout parent. It must
 	// spawn children before any per-child jail, control, or agent sockets exist.
 	if let Some(dir) = &config.fork_from
@@ -482,6 +497,19 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 		}
 	};
 
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+	let preopened_gpu = match preopen_gpu_devices(&config.vfio_gpus) {
+		Ok(resources) => resources,
+		Err(e) => {
+			write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
+			cleanup_agent_socket(agent_socket.as_ref());
+			cleanup_control_server(control_server.as_ref());
+			return Err(e);
+		},
+	};
+	#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+	let preopened_gpu = ();
+
 	// Privilege phase: no_new_privs + uid/gid drop. Run BEFORE the VMM opens
 	// /dev/kvm and backing files so every fd is owned by the unprivileged
 	// sandbox uid rather than root. Under --jail the operator must grant that
@@ -503,7 +531,7 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	} else if let Some(dir) = config.fork_from.clone() {
 		Vmm::fork_from(&dir, &config)
 	} else {
-		Vmm::build(config.clone())
+		Vmm::build(config.clone(), preopened_gpu)
 	};
 	let mut vmm = match build_result {
 		Ok(vmm) => vmm,
@@ -1263,17 +1291,32 @@ fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> 
 }
 
 fn machine_info(vmm: &Vmm) -> MachineInfo {
+	let devices = {
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		{
+			let mut devices = vmm
+				.devices
+				.iter()
+				.map(|device| device_kind_name(device.kind))
+				.collect::<Vec<_>>();
+			devices.extend(std::iter::repeat_n("nvidia-vgpu", vmm.vfio_devices.len()));
+			devices
+		}
+		#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+		{
+			vmm.devices
+				.iter()
+				.map(|device| device_kind_name(device.kind))
+				.collect::<Vec<_>>()
+		}
+	};
 	MachineInfo {
-		cpus:          vmm.cpus,
-		mem_mib:       vmm.mem_mib,
-		state:         vmm.gate.state(),
-		devices:       vmm
-			.devices
-			.iter()
-			.map(|device| device_kind_name(device.kind))
-			.collect(),
+		cpus: vmm.cpus,
+		mem_mib: vmm.mem_mib,
+		state: vmm.gate.state(),
+		devices,
 		deadline_unix: earliest_deadline(vmm.deadline, vmm.owner_deadline).map(deadline_to_unix),
-		uptime_ms:     vmm.started_at.elapsed().as_millis() as u64,
+		uptime_ms: vmm.started_at.elapsed().as_millis() as u64,
 	}
 }
 
@@ -1686,7 +1729,9 @@ impl Vmm {
 
 	/// Fresh boot: create the VM, load the kernel, build the device model, and
 	/// configure vCPU registers — everything up to (not including) thread spawn.
-	fn build(config: Config) -> Result<Self> {
+	fn build(config: Config, preopened_gpu: PreopenedGpuResources) -> Result<Self> {
+		#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+		let () = preopened_gpu;
 		let mem_bytes = config
 			.mem_mib
 			.checked_mul(1 << 20)
@@ -1756,27 +1801,23 @@ impl Vmm {
 		let serial = setup_serial(&vm, &mut mmio_bus, None)?;
 
 		#[cfg(target_arch = "x86_64")]
-		let (pci_root, pci_mmio) = if config.transport == Transport::Pci {
-			let root = Arc::new(Mutex::new(PciRoot::new()));
-			let mmio = Arc::new(Mutex::new(PciMmioDispatcher::new(PCI_VIRTIO_MMIO_START)));
-			pio_bus.register(PCI_CONFIG_IO_BASE, PCI_CONFIG_IO_SIZE, root.clone());
-			mmio_bus.register(
-				PCI_ECAM_BASE,
-				PCI_ECAM_SIZE,
-				Arc::new(Mutex::new(PciEcam::new(root.clone()))),
-			);
-			mmio_bus.register(PCI_VIRTIO_MMIO_START, PCI_VIRTIO_MMIO_SIZE, mmio.clone());
-			(Some(root), Some(mmio))
-		} else {
-			(None, None)
-		};
+		let (pci_root, mut pci_mmio) =
+			if config.transport == Transport::Pci || !config.vfio_gpus.is_empty() {
+				let mmio = (config.transport == Transport::Pci)
+					.then(|| Arc::new(Mutex::new(PciMmioDispatcher::new(PCI_VIRTIO_MMIO_START))));
+				(Some(Arc::new(Mutex::new(PciRoot::new()))), mmio)
+			} else {
+				(None, None)
+			};
+		#[cfg(target_arch = "x86_64")]
+		let mut pci_mmio_base = PCI_VIRTIO_MMIO_START;
 
 		let mut cmdline = config
 			.cmdline
 			.clone()
 			.unwrap_or_else(|| DEFAULT_CMDLINE.to_string());
 		let mut devices: Vec<DeviceHandle> = Vec::new();
-		let mut workers: Vec<WorkerSpec> = Vec::new();
+		let mut workers: Vec<DeviceWorker> = Vec::new();
 		let mut virtio_infos: Vec<(u64, u32)> = Vec::new();
 		let mut gsi = IRQ_BASE;
 		let mut mmio_base = MMIO_MEM_START;
@@ -2155,6 +2196,10 @@ impl Vmm {
 					)?;
 					push_virtio_cmdline(&mut cmdline, mmio_base, gsi);
 					virtio_infos.push((mmio_base, gsi));
+					#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+					{
+						mmio_base += MMIO_DEVICE_SIZE;
+					}
 				},
 				Transport::Pci => {
 					#[cfg(target_arch = "x86_64")]
@@ -2173,11 +2218,71 @@ impl Vmm {
 							&mut workers,
 							&mut devices,
 						)?;
+						pci_slot += 1;
+						pci_bar_base += PCI_VIRTIO_BAR_SIZE;
 					}
 					#[cfg(not(target_arch = "x86_64"))]
 					unreachable!("--transport pci is rejected during config parsing");
 				},
 			}
+		}
+
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		let (vfio_devices, pci_high_mmio) = if let Some(preopened) = preopened_gpu {
+			if pci_mmio.is_none() {
+				pci_bar_base = mmio_base;
+				pci_mmio_base = mmio_base;
+				pci_mmio = Some(Arc::new(Mutex::new(PciMmioDispatcher::new(pci_mmio_base))));
+			}
+			let mut resources = VfioPciResources::new(pci_bar_base, PCI_ECAM_BASE)?;
+			let high_base = PCI_HIGH_MMIO_START;
+			let high_size = PCI_HIGH_MMIO_SIZE;
+			let high_mmio = Arc::new(Mutex::new(PciMmioDispatcher::new(high_base)));
+			let assigned = attach_gpu_devices(preopened, vm.clone(), &mut resources)?;
+			for gpu in &assigned {
+				if pci_slot >= 32 {
+					return Err(err("NVIDIA vGPU exhausted guest PCI slots"));
+				}
+				let function: Arc<dyn PciFunction> = gpu.clone();
+				pci_root
+					.as_ref()
+					.expect("VFIO requires PCI root")
+					.lock()
+					.register(pci_slot, 0, function.clone())?;
+				pci_mmio
+					.as_ref()
+					.expect("VFIO requires PCI MMIO")
+					.lock()
+					.register(function.clone());
+				high_mmio.lock().register(function);
+				pci_slot += 1;
+			}
+			(assigned, Some((high_mmio, high_base, high_size)))
+		} else {
+			(Vec::new(), None)
+		};
+
+		#[cfg(target_arch = "x86_64")]
+		if let (Some(root), Some(mmio)) = (&pci_root, &pci_mmio) {
+			pio_bus.register(PCI_CONFIG_IO_BASE, PCI_CONFIG_IO_SIZE, root.clone());
+			mmio_bus.register(
+				PCI_ECAM_BASE,
+				PCI_ECAM_SIZE,
+				Arc::new(Mutex::new(PciEcam::new(root.clone()))),
+			);
+			let pci_mmio_size = PCI_ECAM_BASE
+				.checked_sub(pci_mmio_base)
+				.ok_or_else(|| err("PCI MMIO aperture overlaps ECAM"))?;
+			mmio_bus.register(pci_mmio_base, pci_mmio_size, mmio.clone());
+			#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+			if let Some((high_mmio, base, size)) = pci_high_mmio {
+				mmio_bus.register(base, size, high_mmio);
+			}
+		}
+
+		#[cfg(target_arch = "x86_64")]
+		if let Some(uuid) = config.vm_uuid {
+			arch::smbios::setup_system_uuid(vm.memory(), uuid)?;
 		}
 
 		#[cfg(target_arch = "x86_64")]
@@ -2216,8 +2321,11 @@ impl Vmm {
 			mmio_bus: Arc::new(mmio_bus),
 			serial,
 			devices,
-			worker_specs: workers,
-			worker_handles: Vec::new(),
+			device_workers: workers,
+			device_loop: None,
+			worker_kill_evt: EventFd::new(EFD_NONBLOCK)?,
+			#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+			vfio_devices,
 			console_input,
 			console_output,
 			timeout_secs: config.timeout_secs,
@@ -2384,7 +2492,7 @@ impl Vmm {
 		}
 
 		let mut devices: Vec<DeviceHandle> = Vec::new();
-		let mut workers: Vec<WorkerSpec> = Vec::new();
+		let mut workers: Vec<DeviceWorker> = Vec::new();
 		let mut console_input = None;
 		let mut console_output = None;
 		for ds in &snap.devices {
@@ -2530,8 +2638,11 @@ impl Vmm {
 			mmio_bus: Arc::new(mmio_bus),
 			serial,
 			devices,
-			worker_specs: workers,
-			worker_handles: Vec::new(),
+			device_workers: workers,
+			device_loop: None,
+			worker_kill_evt: EventFd::new(EFD_NONBLOCK)?,
+			#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+			vfio_devices: Vec::new(),
 			console_input,
 			console_output,
 			timeout_secs: config.timeout_secs,
@@ -2555,37 +2666,31 @@ impl Vmm {
 	/// mode.
 	fn start(&mut self) -> Result<()> {
 		setup_console(self.serial.clone());
-		for spec in self.worker_specs.drain(..) {
-			let failure_evt_for_thread = spec.failure_evt.try_clone()?;
-			let failure_msg_for_thread = spec.failure_msg.clone();
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		for gpu in &self.vfio_devices {
+			gpu.start_interrupts()?;
+		}
+		let device_workers = std::mem::take(&mut self.device_workers);
+		if !device_workers.is_empty() {
 			let gate = self.gate.clone();
 			let exit_reason = self.exit_reason.clone();
-			let control = WorkerControl {
-				pause_evt:        spec.pause_evt,
-				resume_evt:       spec.resume_evt,
-				ack_evt:          spec.ack_evt,
-				failure_evt:      spec.failure_evt,
-				failure_msg:      spec.failure_msg,
-				pause_requested:  spec.pause_requested,
-				pause_generation: spec.pause_generation,
-				ack_generation:   spec.ack_generation,
-			};
-			let device = spec.device;
-			let queue_evt = spec.queue_evt;
-			let kill_evt = spec.kill_evt;
-			self.worker_handles.push(thread::spawn(move || {
-				if let Err(e) = run_worker(device, queue_evt, kill_evt, control) {
-					crate::metrics::record_device_worker_error();
-					let message = format!("device worker exited: {e}");
-					*failure_msg_for_thread.lock() = Some(message.clone());
-					let _ = failure_evt_for_thread.write(1);
-					set_exit_reason(&exit_reason, VmmExit::Killed);
-					gate.set_state(RunState::Stopping);
-					gate.signal_all_vcpus();
-					restore_terminal();
-					error!("{message}");
-				}
-			}));
+			let kill_evt = self.worker_kill_evt.try_clone()?;
+			let handle = thread::Builder::new()
+				.name("vmon-virtio".into())
+				.spawn(move || {
+					// A failing device records its failure_msg/failure_evt inside
+					// the loop before the error propagates here.
+					if let Err(e) = run_shared_worker(device_workers, kill_evt) {
+						crate::metrics::record_device_worker_error();
+						set_exit_reason(&exit_reason, VmmExit::Killed);
+						gate.set_state(RunState::Stopping);
+						gate.signal_all_vcpus();
+						restore_terminal();
+						error!("shared device worker exited: {e}");
+					}
+				})
+				.map_err(|e| err(format!("spawning shared device worker failed: {e}")))?;
+			self.device_loop = Some(handle);
 		}
 
 		// XSAVE2 buffer size for full extended-state capture. `Cap::Xsave2` is an
@@ -3007,6 +3112,7 @@ impl Vmm {
 				// Live machine fields (the lifecycle test asserts cpus/mem_mib/
 				// state/device_count) merged onto the process-global counters.
 				let info = machine_info(self);
+				let device_count = info.devices.len();
 				let mut metrics = crate::metrics::snapshot_json();
 				if let Some(obj) = metrics.as_object_mut() {
 					obj.insert("cpus".into(), json!(info.cpus));
@@ -3015,9 +3121,9 @@ impl Vmm {
 					obj.insert("deadline_unix".into(), json!(info.deadline_unix));
 					obj.insert("uptime_ms".into(), json!(info.uptime_ms));
 					obj.insert("devices".into(), json!(info.devices));
-					obj.insert("device_count".into(), json!(self.devices.len()));
+					obj.insert("device_count".into(), json!(device_count));
 					obj.insert("vcpu_threads".into(), json!(self.vcpu_handles.len()));
-					obj.insert("worker_threads".into(), json!(self.worker_handles.len()));
+					obj.insert("worker_threads".into(), json!(usize::from(self.device_loop.is_some())));
 					obj.insert("parked_vcpus".into(), json!(self.gate.parked_count()));
 				}
 				Ok(metrics)
@@ -3055,6 +3161,10 @@ impl Vmm {
 			RunState::Paused => return Ok(()),
 			RunState::Stopping => return Err(err("pause failed: VM is stopping")),
 			RunState::Running => {},
+		}
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		if !self.vfio_devices.is_empty() {
+			return Err(err("pause is not supported while an NVIDIA vGPU is attached"));
 		}
 
 		// Reset the parked counter BEFORE publishing Paused: a vCPU only bumps
@@ -3096,9 +3206,7 @@ impl Vmm {
 		for tx in &self.vcpu_cmd_txs {
 			let _ = tx.send(VcpuCmd::Stop);
 		}
-		for d in &self.devices {
-			let _ = d.kill_evt.write(1);
-		}
+		let _ = self.worker_kill_evt.write(1);
 		Err(err(format!("pause failed; VM is stopping: {cause}")))
 	}
 
@@ -3108,9 +3216,7 @@ impl Vmm {
 		for tx in &self.vcpu_cmd_txs {
 			let _ = tx.send(VcpuCmd::Stop);
 		}
-		for d in &self.devices {
-			let _ = d.kill_evt.write(1);
-		}
+		let _ = self.worker_kill_evt.write(1);
 		Err(err(format!("resume failed; VM is stopping: {cause}")))
 	}
 
@@ -3430,6 +3536,10 @@ impl Vmm {
 	/// snapshot. User-mode NAT devices serialize libslirp's guest-visible state;
 	/// in-flight host-side sockets are intentionally not carried across restore.
 	fn snapshot(&self, dir: &Path, name: &str, base: Option<&str>, track: bool) -> Result<()> {
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		if !self.vfio_devices.is_empty() {
+			return Err(err("full VM snapshots are not supported while an NVIDIA vGPU is attached"));
+		}
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
 			RunState::Paused => {},
@@ -3629,10 +3739,14 @@ impl Vmm {
 				join_error = Some("vCPU thread panicked during shutdown");
 			}
 		}
-		for d in &self.devices {
-			let _ = d.kill_evt.write(1);
+		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+		for gpu in &self.vfio_devices {
+			if gpu.stop_interrupts().is_err() && join_error.is_none() {
+				join_error = Some("NVIDIA vGPU interrupt shutdown failed");
+			}
 		}
-		for h in self.worker_handles.drain(..) {
+		let _ = self.worker_kill_evt.write(1);
+		if let Some(h) = self.device_loop.take() {
 			if h.join().is_err() && join_error.is_none() {
 				join_error = Some("device worker thread panicked during shutdown");
 			}
@@ -3947,7 +4061,8 @@ fn build_serial_device(
 }
 
 /// Wire one virtio-mmio device: irqfd, queue-notify ioeventfd, transport on the
-/// MMIO bus, worker control eventfds, and the [`DeviceHandle`]/[`WorkerSpec`].
+/// MMIO bus, worker control eventfds, and the
+/// [`DeviceHandle`]/[`DeviceWorker`].
 ///
 /// `saved` selects the transport constructor: `None` -> fresh `new` (boot);
 /// `Some(state)` -> `from_state` + `reactivate` (restore), with `int_status`
@@ -3966,7 +4081,7 @@ fn wire_device(
 	mmio_base: u64,
 	saved: Option<&MmioState>,
 	int_status: u32,
-	workers: &mut Vec<WorkerSpec>,
+	workers: &mut Vec<DeviceWorker>,
 	devices: &mut Vec<DeviceHandle>,
 ) -> Result<()> {
 	let irq_line = vm.irq_line(gsi)?;
@@ -4002,7 +4117,6 @@ fn wire_device(
 	let ack_evt = EventFd::new(0)?;
 	let failure_evt = EventFd::new(0)?;
 	let failure_msg = Arc::new(Mutex::new(None));
-	let kill_evt = EventFd::new(EFD_NONBLOCK)?;
 	let pause_requested = Arc::new(AtomicBool::new(false));
 	let pause_generation = Arc::new(AtomicU64::new(0));
 	let ack_generation = Arc::new(AtomicU64::new(0));
@@ -4021,23 +4135,23 @@ fn wire_device(
 		ack_evt: ack_evt.try_clone()?,
 		failure_evt: failure_evt.try_clone()?,
 		failure_msg: failure_msg.clone(),
-		kill_evt: kill_evt.try_clone()?,
 		pause_requested: pause_requested.clone(),
 		pause_generation: pause_generation.clone(),
 		ack_generation: ack_generation.clone(),
 	});
-	workers.push(WorkerSpec {
+	workers.push(DeviceWorker {
 		device,
 		queue_evt,
-		kill_evt,
-		pause_evt,
-		resume_evt,
-		ack_evt,
-		failure_evt,
-		failure_msg,
-		pause_requested,
-		pause_generation,
-		ack_generation,
+		control: WorkerControl {
+			pause_evt,
+			resume_evt,
+			ack_evt,
+			failure_evt,
+			failure_msg,
+			pause_requested,
+			pause_generation,
+			ack_generation,
+		},
 	});
 	Ok(())
 }
@@ -4057,7 +4171,7 @@ fn wire_pci_device(
 	pci_slot: u8,
 	bar_base: u64,
 	saved: Option<&DeviceState>,
-	workers: &mut Vec<WorkerSpec>,
+	workers: &mut Vec<DeviceWorker>,
 	devices: &mut Vec<DeviceHandle>,
 ) -> Result<()> {
 	let irq_line = vm.irq_line(gsi)?;
@@ -4107,8 +4221,9 @@ fn wire_pci_device(
 	};
 	let transport = Arc::new(Mutex::new(transport));
 	PciTransport::attach_interrupt_notifier(&transport, &interrupt);
-	pci_root.lock().register(pci_slot, transport.clone());
-	pci_mmio.lock().register(transport.clone());
+	let function: Arc<dyn PciFunction> = transport.clone();
+	pci_root.lock().register(pci_slot, 0, function.clone())?;
+	pci_mmio.lock().register(function);
 
 	// Pause/ack eventfds are level-triggered; the VMM polls them before reading.
 	let pause_evt = EventFd::new(0)?;
@@ -4116,7 +4231,6 @@ fn wire_pci_device(
 	let ack_evt = EventFd::new(0)?;
 	let failure_evt = EventFd::new(0)?;
 	let failure_msg = Arc::new(Mutex::new(None));
-	let kill_evt = EventFd::new(EFD_NONBLOCK)?;
 	let pause_requested = Arc::new(AtomicBool::new(false));
 	let pause_generation = Arc::new(AtomicU64::new(0));
 	let ack_generation = Arc::new(AtomicU64::new(0));
@@ -4135,23 +4249,23 @@ fn wire_pci_device(
 		ack_evt: ack_evt.try_clone()?,
 		failure_evt: failure_evt.try_clone()?,
 		failure_msg: failure_msg.clone(),
-		kill_evt: kill_evt.try_clone()?,
 		pause_requested: pause_requested.clone(),
 		pause_generation: pause_generation.clone(),
 		ack_generation: ack_generation.clone(),
 	});
-	workers.push(WorkerSpec {
+	workers.push(DeviceWorker {
 		device,
 		queue_evt,
-		kill_evt,
-		pause_evt,
-		resume_evt,
-		ack_evt,
-		failure_evt,
-		failure_msg,
-		pause_requested,
-		pause_generation,
-		ack_generation,
+		control: WorkerControl {
+			pause_evt,
+			resume_evt,
+			ack_evt,
+			failure_evt,
+			failure_msg,
+			pause_requested,
+			pause_generation,
+			ack_generation,
+		},
 	});
 	Ok(())
 }

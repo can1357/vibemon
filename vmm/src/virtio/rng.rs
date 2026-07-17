@@ -26,7 +26,7 @@ use vm_memory::{Address, Bytes};
 use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid},
 };
 
 const QUEUE_SIZE: u16 = 64;
@@ -113,8 +113,10 @@ impl Rng {
 	}
 
 	/// Fill each posted request buffer with host entropy and return it on the
-	/// used ring. Returns whether any buffer was used.
-	fn process_requestq(&mut self) -> Result<bool> {
+	/// used ring. Consumes at most `*budget` chains per call (a spinning guest
+	/// could otherwise keep the pass alive forever). Returns whether any buffer
+	/// was used.
+	fn process_requestq(&mut self, budget: &mut usize) -> Result<bool> {
 		let Some(mem) = self.mem.clone() else {
 			return Ok(false);
 		};
@@ -123,7 +125,11 @@ impl Rng {
 		};
 		let mut used = false;
 		let mut buf = [0u8; ENTROPY_CHUNK as usize];
-		while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+		while *budget != 0 {
+			let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+				break;
+			};
+			*budget -= 1;
 			let head = chain.head_index();
 			let mut written = 0u32;
 			for d in chain {
@@ -209,11 +215,16 @@ impl VirtioDevice for Rng {
 		Ok(())
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
-		if self.process_requestq()? {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
+		let mut budget = QUEUE_PASS_BUDGET;
+		if self.process_requestq(&mut budget)? {
 			self.signal_used()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {
@@ -299,8 +310,8 @@ mod tests {
 			0,
 		)]);
 		let mut rng = rng_with_queue(mem, queue);
-
-		assert!(rng.process_requestq().expect("process"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(rng.process_requestq(&mut budget).expect("process"));
 
 		let mem = rng.mem.as_ref().expect("mem");
 		assert_eq!(used_len(mem), len);
@@ -318,8 +329,8 @@ mod tests {
 		// chain is still completed, with zero bytes written.
 		let queue = queue_with_descs(&mem, &[SplitDescriptor::new(BUF_ADDR, 64, 0, 0)]);
 		let mut rng = rng_with_queue(mem, queue);
-
-		assert!(rng.process_requestq().expect("process"));
+		let mut budget = QUEUE_PASS_BUDGET;
+		assert!(rng.process_requestq(&mut budget).expect("process"));
 
 		let mem = rng.mem.as_ref().expect("mem");
 		assert_eq!(used_len(mem), 0);

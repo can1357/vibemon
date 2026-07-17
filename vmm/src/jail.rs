@@ -7,6 +7,8 @@
 //! enters the normal VMM lifecycle. Stage-B filters/drop happen after backends
 //! open.
 
+#[cfg(target_arch = "x86_64")]
+use crate::devices::vfio::gpu_cdev_path;
 use crate::{config::Config, result::Result};
 pub fn fork_into_jail(config: &Config) -> Result<()> {
 	require_root()?;
@@ -288,6 +290,14 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 		bind_remote_socket(chroot, &m.sock)?;
 	}
 	bind_optional(chroot, config.netns.as_deref(), true)?;
+	#[cfg(target_arch = "x86_64")]
+	if !config.vfio_gpus.is_empty() {
+		bind_path(chroot, Path::new("/dev/iommu"), false)?;
+		for gpu in &config.vfio_gpus {
+			bind_path(chroot, gpu, true)?;
+			bind_path(chroot, &gpu_cdev_path(gpu)?, false)?;
+		}
+	}
 
 	if let Some(snapshot_root) = &config.snapshot_root {
 		create_dir(snapshot_root, 0o700)?;

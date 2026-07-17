@@ -33,7 +33,7 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	snapshot::FsStateSer,
-	virtio::{Interrupt, VirtioDevice, descriptor_range_valid},
+	virtio::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid},
 };
 
 const QUEUE_SIZE: u16 = 64;
@@ -585,20 +585,28 @@ impl VirtioDevice for Fs {
 		Ok(())
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		let Some(mem) = self.mem.clone() else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let Some(interrupt) = self.interrupt.clone() else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		if self.queues.len() <= 1 {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		}
 		let mut queue = self.queues.remove(1);
+		// Bound one pass: FUSE requests complete inline, so a spinning guest
+		// could otherwise keep the ring non-empty forever; `run_worker` re-arms
+		// the queue event on `Budgeted`.
+		let mut budget = QUEUE_PASS_BUDGET;
 		let processed = (|| -> Result<bool> {
 			let mut signal = false;
-			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				let head = chain.head_index();
 				let descriptors: Vec<_> = chain.collect();
 				let mut request = Vec::new();
@@ -671,7 +679,11 @@ impl VirtioDevice for Fs {
 		if processed? {
 			interrupt.signal_used_queue()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {

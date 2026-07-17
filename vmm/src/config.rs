@@ -16,6 +16,8 @@ const DEFAULT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 pub const MAX_COUNT: u32 = 32;
 pub const MAX_CPUS: u8 = 64;
 pub const MAX_MEM_MIB: usize = 64 * 1024;
+/// Maximum NVIDIA vGPU virtual functions assignable to one guest.
+pub const MAX_VFIO_GPUS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -110,6 +112,18 @@ pub struct Config {
 	pub mac: [u8; 6],
 	/// virtio transport (`mmio` everywhere, `pci` on `x86_64` only).
 	pub transport: Transport,
+	/// Pre-created NVIDIA SR-IOV vGPU virtual functions assigned through VFIO.
+	#[cfg_attr(
+		not(all(target_os = "linux", target_arch = "x86_64")),
+		allow(dead_code, reason = "VFIO assignment exists only on x86_64 Linux")
+	)]
+	pub vfio_gpus: Vec<PathBuf>,
+	/// Stable RFC 4122 VM UUID exposed to NVIDIA's guest driver through SMBIOS.
+	#[cfg_attr(
+		not(target_arch = "x86_64"),
+		allow(dead_code, reason = "SMBIOS UUID publication exists only on x86_64")
+	)]
+	pub vm_uuid: Option<[u8; 16]>,
 	/// One read-only virtio-fs mount tag exposed to the guest.
 	pub fs_tag: Option<String>,
 	/// Host directory backing the read-only virtio-fs share.
@@ -282,6 +296,14 @@ struct CliArgs {
 	/// Virtio transport: mmio|pci (pci x86_64 only)
 	#[arg(long, value_name = "KIND", value_parser = parse_transport, default_value = "mmio")]
 	transport: Transport,
+
+	/// Pre-created NVIDIA SR-IOV vGPU VF sysfs path; repeatable
+	#[arg(long = "vfio-gpu", value_name = "SYSFS")]
+	vfio_gpus: Vec<PathBuf>,
+
+	/// Stable VM UUID required by NVIDIA vGPU guests
+	#[arg(long, value_name = "UUID", value_parser = parse_uuid)]
+	vm_uuid: Option<[u8; 16]>,
 
 	/// virtio-fs mount tag (requires --fs-dir)
 	#[arg(long, value_name = "TAG")]
@@ -609,6 +631,42 @@ impl Config {
 		if transport == Transport::Pci && !cfg!(target_arch = "x86_64") {
 			bail!("--transport pci is only supported on x86_64");
 		}
+		if !cli.vfio_gpus.is_empty() {
+			if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+				bail!("--vfio-gpu requires an x86_64 Linux KVM host");
+			}
+			if cli.vfio_gpus.len() > MAX_VFIO_GPUS {
+				bail!(
+					"at most {MAX_VFIO_GPUS} --vfio-gpu functions are supported (got {})",
+					cli.vfio_gpus.len()
+				);
+			}
+			if cli.vm_uuid.is_none() {
+				bail!("--vfio-gpu requires --vm-uuid");
+			}
+			if boot_mode != BootMode::Direct {
+				bail!("--vfio-gpu currently requires --boot-mode direct");
+			}
+			if cli.restore.is_some() || cli.fork_from.is_some() {
+				bail!("--vfio-gpu cannot be combined with --restore or --fork-from");
+			}
+			if mem_target_mib.is_some() || cli.remote_page_url.is_some() {
+				bail!("--vfio-gpu cannot be combined with guest-memory paging");
+			}
+			let mut seen = Vec::with_capacity(cli.vfio_gpus.len());
+			for path in &cli.vfio_gpus {
+				if !path.is_absolute() || !path.starts_with("/sys/bus/pci/devices") {
+					bail!(
+						"--vfio-gpu must name an absolute SR-IOV VF under /sys/bus/pci/devices (got {})",
+						path.display()
+					);
+				}
+				if seen.contains(path) {
+					bail!("--vfio-gpu paths must be unique");
+				}
+				seen.push(path.clone());
+			}
+		}
 		if count > 1 && cli.fork_from.is_none() {
 			bail!("--count greater than 1 requires --fork-from");
 		}
@@ -739,6 +797,8 @@ impl Config {
 			mac_specified,
 			mac,
 			transport,
+			vfio_gpus: cli.vfio_gpus,
+			vm_uuid: cli.vm_uuid,
 			fs_tag: cli.fs_tag,
 			fs_dir: cli.fs_dir,
 			api_sock: cli.api_sock,
@@ -838,6 +898,44 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
 		bail!("invalid MAC {s} (guest MAC must be unicast)");
 	}
 	Ok(mac)
+}
+
+fn parse_uuid(value: &str) -> Result<[u8; 16]> {
+	let bytes = value.as_bytes();
+	if bytes.len() != 36
+		|| bytes[8] != b'-'
+		|| bytes[13] != b'-'
+		|| bytes[18] != b'-'
+		|| bytes[23] != b'-'
+	{
+		bail!("invalid UUID {value:?} (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)");
+	}
+	let mut uuid = [0u8; 16];
+	let mut source = 0;
+	for byte in &mut uuid {
+		while matches!(source, 8 | 13 | 18 | 23) {
+			source += 1;
+		}
+		let high = hex_nibble(bytes[source])
+			.ok_or_else(|| err(format!("invalid hexadecimal digit in UUID {value:?}")))?;
+		let low = hex_nibble(bytes[source + 1])
+			.ok_or_else(|| err(format!("invalid hexadecimal digit in UUID {value:?}")))?;
+		*byte = high << 4 | low;
+		source += 2;
+	}
+	if uuid == [0; 16] {
+		bail!("--vm-uuid must not be the nil UUID");
+	}
+	Ok(uuid)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
+	}
 }
 
 fn parse_transport(s: &str) -> Result<Transport> {
@@ -1628,6 +1726,64 @@ mod tests {
 				"shared:/srv/d",
 			],
 			"--volume tags must be unique",
+		);
+	}
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+	#[test]
+	fn validates_nvidia_vfio_launch_contract() {
+		const GPU: &str = "/sys/bus/pci/devices/0000:3d:00.4";
+		const UUID: &str = "12345678-9abc-def0-1122-334455667788";
+		let cfg = parse_config(&[
+			"vmon",
+			"--no-sandbox",
+			"--kernel",
+			"k",
+			"--vfio-gpu",
+			GPU,
+			"--vm-uuid",
+			UUID,
+		])
+		.expect("valid NVIDIA vGPU flags");
+		assert_eq!(cfg.vfio_gpus, [PathBuf::from(GPU)]);
+		assert_eq!(
+			cfg.vm_uuid,
+			Some([
+				0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+				0x77, 0x88,
+			])
+		);
+
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--vfio-gpu", GPU],
+			"--vfio-gpu requires --vm-uuid",
+		);
+		assert_config_err_contains(
+			&["vmon", "--boot-mode", "uefi", "--firmware", "fw", "--vfio-gpu", GPU, "--vm-uuid", UUID],
+			"--vfio-gpu currently requires --boot-mode direct",
+		);
+		assert_config_err_contains(
+			&["vmon", "--restore", "snap", "--vfio-gpu", GPU, "--vm-uuid", UUID],
+			"--vfio-gpu cannot be combined with --restore or --fork-from",
+		);
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--mem",
+				"256",
+				"--mem-target-mib",
+				"128",
+				"--vfio-gpu",
+				GPU,
+				"--vm-uuid",
+				UUID,
+			],
+			"--vfio-gpu cannot be combined with guest-memory paging",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--vm-uuid", "00000000-0000-0000-0000-000000000000"],
+			"--vm-uuid must not be the nil UUID",
 		);
 	}
 }

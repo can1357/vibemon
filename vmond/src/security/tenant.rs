@@ -165,7 +165,7 @@ fn split_tokens(tokens: Option<String>) -> Vec<Vec<u8>> {
 		.collect()
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 	let mut different = left.len() ^ right.len();
 	let width = left.len().max(right.len());
 	for index in 0..width {

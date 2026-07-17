@@ -6,9 +6,14 @@
 use std::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
+use kvm_bindings::{
+	CpuId, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY, kvm_create_device,
+	kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_pit_config,
+};
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{IoEventAddress, Kvm, NoDatamatch, VmFd};
+#[cfg(target_arch = "x86_64")]
+use vfio_ioctls::VfioDeviceFd;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
 #[cfg(target_arch = "aarch64")]
@@ -133,6 +138,15 @@ impl Vm {
 	/// Create a backend-owned vCPU with the given index.
 	pub fn create_vcpu(&self, id: u8) -> Result<Vcpu> {
 		Ok(Vcpu::new(self.fd.clone(), self.fd.create_vcpu(u64::from(id))?))
+	}
+
+	/// Create the KVM/VFIO association used by assigned PCI devices.
+	#[cfg(target_arch = "x86_64")]
+	pub fn create_vfio_device(&self) -> Result<VfioDeviceFd> {
+		let mut request =
+			kvm_create_device { type_: kvm_device_type_KVM_DEV_TYPE_VFIO, fd: 0, flags: 0 };
+		let device = self.fd.create_device(&mut request)?;
+		Ok(VfioDeviceFd::new_from_kvm(device))
 	}
 
 	/// Create an irqfd-backed trigger for guest interrupt line `gsi`.

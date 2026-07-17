@@ -171,6 +171,11 @@ pub trait EngineApi: Send + Sync + 'static {
 	// -- sandboxes --------------------------------------------------------
 	fn create(&self, params: SandboxCreate) -> Result<Value>;
 	fn list(&self, tags: Option<HashMap<String, String>>) -> Result<Vec<Value>>;
+	/// Return cached sandbox views without runtime probes for orchestration
+	/// heartbeats.
+	fn orchestration_inventory(&self) -> Result<Vec<Value>> {
+		self.list(None)
+	}
 	fn get(&self, id: &str) -> Result<Value>;
 	fn stop(&self, id: &str) -> Result<Value>;
 	/// Stop a sandbox while preserving a caller-owned process return code.

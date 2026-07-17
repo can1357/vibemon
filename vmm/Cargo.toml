@@ -38,6 +38,11 @@ io-uring = "0.7"
 landlock = "0.4"
 seccompiler = "0.5"
 
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+iommufd-ioctls = "0.2"
+vfio-bindings = "=0.6.2"
+vfio-ioctls = { version = "0.7", features = ["vfio_cdev"] }
+
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 libwhp = { git = "https://github.com/insula-rs/libwhp", rev = "3ee2119fa8a889cccbc223b0858bd1cdb1635975" }
 libslirp = { version = "4.3.2", default-features = false }

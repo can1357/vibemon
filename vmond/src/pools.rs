@@ -25,6 +25,11 @@ use crate::{
 const REFILL_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_PING_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REFILL_BATCH: usize = 32;
+/// Pool members are parked paused by default: a claim is then just
+/// rename + resume, with zero guest activity (and zero timeout drift) while
+/// the clone waits in the deque. Members whose runtime cannot pause stay
+/// running and are claimed without a resume.
+const POOL_MEMBERS_PAUSED: bool = true;
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Format the portable template key used by placement and pool APIs.
@@ -55,6 +60,12 @@ pub struct PoolStats {
 	pub size:   usize,
 }
 
+/// One parked clone plus whether its vCPUs are currently paused.
+struct PooledVm {
+	vm:     SandboxVm,
+	paused: bool,
+}
+
 /// A background-filled deque of restored/forked, agent-pinged VMs.
 pub struct WarmPool {
 	template:     PathBuf,
@@ -62,9 +73,10 @@ pub struct WarmPool {
 	size:         AtomicUsize,
 	fork:         bool,
 	agent:        bool,
+	paused:       bool,
 	ping_timeout: Duration,
 	runtime:      Arc<dyn SandboxRuntime>,
-	ready:        Mutex<VecDeque<SandboxVm>>,
+	ready:        Mutex<VecDeque<PooledVm>>,
 	stop:         AtomicBool,
 	hits:         AtomicU64,
 	misses:       AtomicU64,
@@ -83,7 +95,15 @@ impl WarmPool {
 		size: usize,
 		runtime: Arc<dyn SandboxRuntime>,
 	) -> Result<Arc<Self>> {
-		Self::with_runtime_options(template, size, true, true, DEFAULT_PING_TIMEOUT, runtime)
+		Self::with_runtime_options(
+			template,
+			size,
+			true,
+			true,
+			POOL_MEMBERS_PAUSED,
+			DEFAULT_PING_TIMEOUT,
+			runtime,
+		)
 	}
 
 	/// Start a configurable refiller, mostly used by tests and restore-only
@@ -95,7 +115,15 @@ impl WarmPool {
 		agent: bool,
 		ping_timeout: Duration,
 	) -> Result<Arc<Self>> {
-		Self::with_runtime_options(template, size, fork, agent, ping_timeout, Arc::new(VmonRuntime))
+		Self::with_runtime_options(
+			template,
+			size,
+			fork,
+			agent,
+			POOL_MEMBERS_PAUSED,
+			ping_timeout,
+			Arc::new(VmonRuntime),
+		)
 	}
 
 	fn with_runtime_options(
@@ -103,6 +131,7 @@ impl WarmPool {
 		size: usize,
 		fork: bool,
 		agent: bool,
+		paused: bool,
 		ping_timeout: Duration,
 		runtime: Arc<dyn SandboxRuntime>,
 	) -> Result<Arc<Self>> {
@@ -114,6 +143,7 @@ impl WarmPool {
 			size: AtomicUsize::new(size),
 			fork,
 			agent,
+			paused,
 			ping_timeout,
 			runtime,
 			ready: Mutex::new(VecDeque::new()),
@@ -140,26 +170,39 @@ impl WarmPool {
 		self.size.store(size, Ordering::Relaxed);
 		let mut ready = self.ready.lock();
 		while ready.len() > size {
-			if let Some(vm) = ready.pop_back() {
-				self.teardown(vm);
+			if let Some(member) = ready.pop_back() {
+				self.teardown(member.vm);
 			}
 		}
 	}
 
-	/// Pop a ready clone in O(1), optionally renaming it to the requested
-	/// sandbox name.
-	pub fn claim(&self, name: Option<&str>) -> Result<Option<SandboxVm>> {
-		let Some(vm) = self.ready.lock().pop_front() else {
-			self.misses.fetch_add(1, Ordering::Relaxed);
-			return Ok(None);
-		};
-		self.hits.fetch_add(1, Ordering::Relaxed);
-		if let Some(name) = name
-			&& vm.name() != name
-		{
-			return rename_vm(vm, name).map(Some);
+	/// Pop a ready clone in O(1): rename it to the requested sandbox name and
+	/// bring its vCPUs into the wanted state (paused members resume unless the
+	/// caller stages a paused candidate). A member that cannot reach the
+	/// wanted state is torn down and the next one is tried; the claim only
+	/// misses when the deque is empty.
+	pub fn claim(&self, name: Option<&str>, want_paused: bool) -> Result<Option<SandboxVm>> {
+		loop {
+			let Some(PooledVm { vm, paused }) = self.ready.lock().pop_front() else {
+				self.misses.fetch_add(1, Ordering::Relaxed);
+				return Ok(None);
+			};
+			let vm = match name {
+				Some(name) if vm.name() != name => rename_vm(vm, name)?,
+				_ => vm,
+			};
+			let transition = match (paused, want_paused) {
+				(true, false) => self.runtime.resume(&vm),
+				(false, true) => self.runtime.pause(&vm),
+				_ => Ok(()),
+			};
+			if transition.is_err() {
+				self.teardown(vm);
+				continue;
+			}
+			self.hits.fetch_add(1, Ordering::Relaxed);
+			return Ok(Some(vm));
 		}
-		Ok(Some(vm))
 	}
 
 	/// Snapshot hit/miss counters and ready depth.
@@ -181,8 +224,8 @@ impl WarmPool {
 			let _ = handle.join();
 		}
 		let parked = self.ready.lock().drain(..).collect::<Vec<_>>();
-		for vm in parked {
-			self.teardown(vm);
+		for member in parked {
+			self.teardown(member.vm);
 		}
 	}
 
@@ -219,20 +262,20 @@ impl WarmPool {
 		{
 			let mut ready = self.ready.lock();
 			let target = self.size.load(Ordering::Relaxed);
-			for vm in spawned {
+			for member in spawned {
 				if self.stop.load(Ordering::Relaxed) || ready.len() >= target {
-					overflow.push(vm);
+					overflow.push(member);
 				} else {
-					ready.push_back(vm);
+					ready.push_back(member);
 				}
 			}
 		}
-		for vm in overflow {
-			self.teardown(vm);
+		for member in overflow {
+			self.teardown(member.vm);
 		}
 	}
 
-	fn spawn_one(&self) -> Option<SandboxVm> {
+	fn spawn_one(&self) -> Option<PooledVm> {
 		let vm_name = pooled_name(&self.template);
 		let vm = self.runtime.sandbox(&vm_name);
 		let mut spec = if self.fork {
@@ -241,7 +284,9 @@ impl WarmPool {
 			LaunchSpec::restore(vm.api_sock(), &self.template)
 		};
 		// Pool VMs must not share the template's writable image: overlay it so
-		// each claimed sandbox owns a checkpointable per-VM disk.
+		// each claimed sandbox owns a checkpointable per-VM disk. The VMM
+		// materializes the overlay copy-on-write (reflink where the filesystem
+		// supports it); the template image itself stays immutable.
 		if self.has_rootfs {
 			let base_disk = self.template.join("rootfs.img");
 			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
@@ -265,7 +310,11 @@ impl WarmPool {
 				return None;
 			}
 		}
-		Some(vm)
+		// Park the member paused so a waiting clone burns no guest CPU and a
+		// claim is exactly rename + resume. A runtime that cannot pause keeps
+		// the member running; claims then skip the resume.
+		let paused = self.paused && self.runtime.pause(&vm).is_ok();
+		Some(PooledVm { vm, paused })
 	}
 
 	fn teardown(&self, vm: SandboxVm) {
@@ -344,7 +393,6 @@ fn rename_vm(vm: SandboxVm, name: &str) -> Result<SandboxVm> {
 	if new_dir.exists() {
 		return Err(crate::EngineError::busy(format!("sandbox '{name}' already exists")));
 	}
-	fs::create_dir_all(parent)?;
 	fs::rename(old_dir, &new_dir)?;
 	let renamed = SandboxVm::from_dir(name.to_owned(), new_dir);
 	let mut meta = serde_json::Map::new();
@@ -393,6 +441,7 @@ mod tests {
 	use std::time::Instant;
 
 	use super::*;
+	use crate::engine::spawn::LaunchMode;
 
 	#[test]
 	fn template_key_uses_locked_format() {
@@ -530,6 +579,7 @@ mod tests {
 			1,
 			false,
 			false,
+			false,
 			Duration::ZERO,
 			backend,
 		)?;
@@ -618,6 +668,7 @@ mod tests {
 			32,
 			false,
 			false,
+			false,
 			Duration::ZERO,
 			backend,
 		)?;
@@ -652,6 +703,239 @@ mod tests {
 			elapsed_concurrent < elapsed_seq,
 			"Parallel pool refill took longer than sequential baseline"
 		);
+		Ok(())
+	}
+
+	/// Runtime with a working pause/resume control plane. Launch (the template
+	/// build/boot path) panics when invoked on the claiming thread: a claim
+	/// must be exactly rename + resume, never a rebuild.
+	#[derive(Debug)]
+	struct PausingRuntime {
+		root:        PathBuf,
+		claimer:     thread::ThreadId,
+		events:      Mutex<Vec<String>>,
+		specs:       Mutex<Vec<LaunchSpec>>,
+		fail_resume: AtomicBool,
+	}
+
+	impl PausingRuntime {
+		fn new(root: PathBuf) -> Arc<Self> {
+			Arc::new(Self {
+				root,
+				claimer: thread::current().id(),
+				events: Mutex::new(Vec::new()),
+				specs: Mutex::new(Vec::new()),
+				fail_resume: AtomicBool::new(false),
+			})
+		}
+
+		fn events(&self) -> Vec<String> {
+			self.events.lock().clone()
+		}
+	}
+
+	impl SandboxRuntime for PausingRuntime {
+		fn name(&self) -> &'static str {
+			"pausing"
+		}
+
+		fn sandbox(&self, name: &str) -> SandboxVm {
+			SandboxVm::from_dir(name, self.root.join(name))
+		}
+
+		fn launch(&self, vm: &SandboxVm, spec: &LaunchSpec) -> Result<()> {
+			assert_ne!(
+				thread::current().id(),
+				self.claimer,
+				"template build/launch path invoked during a warm-pool claim"
+			);
+			fs::create_dir_all(vm.dir())?;
+			self.events.lock().push(format!("launch:{}", vm.name()));
+			self.specs.lock().push(spec.clone());
+			Ok(())
+		}
+
+		fn stop(&self, vm: &SandboxVm, _wait: bool) -> Result<()> {
+			self.events.lock().push(format!("stop:{}", vm.name()));
+			Ok(())
+		}
+
+		fn remove(&self, vm: &SandboxVm) -> Result<()> {
+			self.events.lock().push(format!("remove:{}", vm.name()));
+			let _ = fs::remove_dir_all(vm.dir());
+			Ok(())
+		}
+
+		fn is_running(&self, _vm: &SandboxVm) -> Result<bool> {
+			Ok(true)
+		}
+
+		fn pause(&self, vm: &SandboxVm) -> Result<()> {
+			self.events.lock().push(format!("pause:{}", vm.name()));
+			Ok(())
+		}
+
+		fn resume(&self, vm: &SandboxVm) -> Result<()> {
+			if self.fail_resume.load(Ordering::Relaxed) {
+				return Err(crate::EngineError::engine("resume rejected by test"));
+			}
+			self.events.lock().push(format!("resume:{}", vm.name()));
+			Ok(())
+		}
+	}
+
+	fn paused_pool_with_member(
+		runtime: &Arc<PausingRuntime>,
+		template: &Path,
+	) -> Result<Arc<WarmPool>> {
+		let backend: Arc<dyn SandboxRuntime> = Arc::clone(runtime) as Arc<dyn SandboxRuntime>;
+		let pool =
+			WarmPool::with_runtime_options(template, 1, true, false, true, Duration::ZERO, backend)?;
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while pool.stats().ready == 0 && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(1));
+		}
+		assert_eq!(pool.stats().ready, 1, "refiller failed to park a member");
+		Ok(pool)
+	}
+
+	#[test]
+	fn claim_is_rename_plus_resume_without_template_rebuild() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let template = tmp.path().join("template");
+		fs::create_dir_all(&template)?;
+		fs::write(template.join("rootfs.img"), b"base")?;
+		let runtime = PausingRuntime::new(tmp.path().join("vms"));
+		let pool = paused_pool_with_member(&runtime, &template)?;
+
+		// PausingRuntime::launch panics on this thread: the claim below proves
+		// no OCI/template/build work happens inside the claim window.
+		let vm = pool
+			.claim(Some("wanted"), false)?
+			.expect("parked member claims");
+		assert_eq!(vm.name(), "wanted");
+		assert!(vm.dir().ends_with("vms/wanted"), "claim renames the VM directory");
+		assert!(vm.dir().is_dir());
+		let events = runtime.events();
+		assert!(
+			events.iter().any(|event| event.starts_with("pause:_pool-")),
+			"refiller parks members paused: {events:?}"
+		);
+		assert_eq!(
+			events.last().map(String::as_str),
+			Some("resume:wanted"),
+			"claim resumes the renamed clone: {events:?}"
+		);
+		assert_eq!(pool.stats().hits, 1);
+		pool.shutdown();
+		Ok(())
+	}
+
+	#[test]
+	fn paused_claim_keeps_member_paused_and_running_member_gets_paused() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let template = tmp.path().join("template");
+		fs::create_dir_all(&template)?;
+		let runtime = PausingRuntime::new(tmp.path().join("vms"));
+		let pool = paused_pool_with_member(&runtime, &template)?;
+
+		// A staged (start-paused) claim of a paused member transitions nothing.
+		let vm = pool
+			.claim(Some("staged"), true)?
+			.expect("parked member claims");
+		assert_eq!(vm.name(), "staged");
+		let events = runtime.events();
+		assert!(
+			!events.iter().any(|event| event == "resume:staged"),
+			"staged claim must not resume: {events:?}"
+		);
+		pool.shutdown();
+
+		// A running member (unpaused pool) claimed for staging gets paused.
+		let backend: Arc<dyn SandboxRuntime> = Arc::clone(&runtime) as Arc<dyn SandboxRuntime>;
+		let pool =
+			WarmPool::with_runtime_options(&template, 1, true, false, false, Duration::ZERO, backend)?;
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while pool.stats().ready == 0 && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(1));
+		}
+		let vm = pool
+			.claim(Some("staged-2"), true)?
+			.expect("running member claims");
+		assert_eq!(vm.name(), "staged-2");
+		assert!(
+			runtime
+				.events()
+				.iter()
+				.any(|event| event == "pause:staged-2"),
+			"staging a running member pauses it: {:?}",
+			runtime.events()
+		);
+		pool.shutdown();
+		Ok(())
+	}
+
+	#[test]
+	fn claim_miss_and_unresumable_member_fall_back_to_boot_path() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let template = tmp.path().join("template");
+		fs::create_dir_all(&template)?;
+		let runtime = PausingRuntime::new(tmp.path().join("vms"));
+
+		// Empty pool: a claim is a miss, so facade::claim_or_launch_vm falls
+		// through to the full restore/boot path.
+		let backend: Arc<dyn SandboxRuntime> = Arc::clone(&runtime) as Arc<dyn SandboxRuntime>;
+		let empty =
+			WarmPool::with_runtime_options(&template, 0, true, false, true, Duration::ZERO, backend)?;
+		assert!(empty.claim(Some("missed"), false)?.is_none());
+		assert_eq!(empty.stats(), PoolStats { ready: 0, hits: 0, misses: 1, size: 0 });
+		empty.shutdown();
+
+		// A member whose vCPUs cannot resume is torn down instead of being
+		// handed out; the exhausted deque then reports a miss.
+		let pool = paused_pool_with_member(&runtime, &template)?;
+		runtime.fail_resume.store(true, Ordering::Relaxed);
+		assert!(pool.claim(Some("dead"), false)?.is_none());
+		let events = runtime.events();
+		assert!(
+			events.iter().any(|event| event == "stop:dead")
+				&& events.iter().any(|event| event == "remove:dead"),
+			"unresumable member is torn down: {events:?}"
+		);
+		assert_eq!(pool.stats().hits, 0);
+		pool.shutdown();
+		Ok(())
+	}
+
+	#[test]
+	fn clone_disks_use_cow_overlay_of_template_image() -> Result<()> {
+		let tmp = tempfile::tempdir()?;
+		let template = tmp.path().join("template");
+		fs::create_dir_all(&template)?;
+		fs::write(template.join("rootfs.img"), b"base")?;
+		let runtime = PausingRuntime::new(tmp.path().join("vms"));
+		let pool = paused_pool_with_member(&runtime, &template)?;
+		pool.shutdown();
+
+		let specs = runtime.specs.lock();
+		let spec = specs.first().expect("refiller captured a launch spec");
+		assert_eq!(
+			spec.mode,
+			LaunchMode::Fork { snapshot: template.clone() },
+			"pool members fork from the template snapshot (CoW memory), not boot"
+		);
+		assert_eq!(
+			spec.disk_overlay_of.as_deref(),
+			Some(template.join("rootfs.img").as_path()),
+			"clone disks overlay the immutable template image"
+		);
+		let rootfs = spec.rootfs.clone().expect("overlay names a per-VM rootfs");
+		assert!(
+			rootfs.starts_with(tmp.path().join("vms")) && rootfs.ends_with("rootfs.img"),
+			"overlay writes land in the clone's own directory: {}",
+			rootfs.display()
+		);
+		assert_ne!(rootfs, template.join("rootfs.img"));
 		Ok(())
 	}
 }

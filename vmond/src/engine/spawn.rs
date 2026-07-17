@@ -831,6 +831,20 @@ pub trait SandboxRuntime: Send + Sync {
 
 	/// Report whether a sandbox is still running.
 	fn is_running(&self, vm: &SandboxVm) -> Result<bool>;
+
+	/// Pause a running sandbox's vCPUs so it can be parked (warm pools park
+	/// members paused). Backends without a pause control plane keep the
+	/// default: callers fall back to running members.
+	fn pause(&self, vm: &SandboxVm) -> Result<()> {
+		let _ = vm;
+		Err(EngineError::invalid("sandbox runtime does not support pause"))
+	}
+
+	/// Resume a sandbox previously paused via [`Self::pause`].
+	fn resume(&self, vm: &SandboxVm) -> Result<()> {
+		let _ = vm;
+		Err(EngineError::invalid("sandbox runtime does not support resume"))
+	}
 }
 
 /// Runtime backed by the built-in `vmon vmm` process.
@@ -856,6 +870,14 @@ impl SandboxRuntime for VmonRuntime {
 
 	fn is_running(&self, vm: &SandboxVm) -> Result<bool> {
 		vm.is_running()
+	}
+
+	fn pause(&self, vm: &SandboxVm) -> Result<()> {
+		vm.pause()
+	}
+
+	fn resume(&self, vm: &SandboxVm) -> Result<()> {
+		vm.resume()
 	}
 }
 
@@ -1132,6 +1154,20 @@ impl SandboxVm {
 		updates.insert("status".to_owned(), json!("failed"));
 		updates.insert("returncode".to_owned(), json!(returncode));
 		self.save_meta(updates)
+	}
+
+	/// Pause all vCPUs and device workers via the control socket.
+	pub fn pause(&self) -> Result<()> {
+		ControlClient::connect(self.control_sock()?, STOP_CONTROL_TIMEOUT)?
+			.pause()
+			.map(|_| ())
+	}
+
+	/// Resume a paused VMM via the control socket.
+	pub fn resume(&self) -> Result<()> {
+		ControlClient::connect(self.control_sock()?, STOP_CONTROL_TIMEOUT)?
+			.resume()
+			.map(|_| ())
 	}
 
 	/// Stop the VMM with quit, SIGTERM, then SIGKILL escalation.

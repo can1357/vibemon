@@ -43,8 +43,8 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	virtio::{
-		DiskCapture, DiskCaptureMethod, Interrupt, VirtioDevice, WorkerWaitSource,
-		descriptor_range_valid,
+		DiskCapture, DiskCaptureMethod, Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice,
+		WorkerWaitSource, descriptor_range_valid,
 	},
 };
 
@@ -657,16 +657,20 @@ impl VirtioDevice for Block {
 		}
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let Some(queue) = self.queue.as_mut() else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let disk = &self.disk;
 		let capacity = self.capacity_sectors;
 		let read_only = self.read_only;
+		// Bound one pass: inline completions recycle descriptors, so a spinning
+		// guest could otherwise keep the available ring non-empty forever and
+		// starve the shared worker's other devices.
+		let mut budget = QUEUE_PASS_BUDGET;
 
 		#[cfg(target_os = "linux")]
 		{
@@ -677,7 +681,11 @@ impl VirtioDevice for Block {
 
 			let mut any_submitted = false;
 			let mut sync_used = false;
-			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				match linux::process_chain(
 					disk, capacity, read_only, &mem, queue, ring, pending, next_token, chain,
 				)? {
@@ -701,7 +709,11 @@ impl VirtioDevice for Block {
 		#[cfg(any(target_os = "macos", target_os = "windows"))]
 		{
 			let mut sync_used = false;
-			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				match sync_io::process_chain(disk, capacity, read_only, &mem, queue, chain)? {
 					Outcome::Synchronous => sync_used = true,
 				}
@@ -710,7 +722,11 @@ impl VirtioDevice for Block {
 				interrupt.signal_used_queue()?;
 			}
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn process_worker_source(&mut self, _index: usize) -> Result<()> {

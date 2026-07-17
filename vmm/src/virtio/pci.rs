@@ -15,7 +15,7 @@ use virtio_queue::{Queue, QueueState, QueueT};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::{
-	devices::BusDevice,
+	devices::{BusDevice, pci::PciFunction},
 	layout::PCI_VIRTIO_BAR_SIZE,
 	memory::GuestMemoryMmap,
 	result::{Result, err},
@@ -92,199 +92,6 @@ const MSIX_VECTOR_MASKED: u32 = 0x0000_0001;
 const MSIX_TABLE_SIZE_MASK: u16 = 0x07ff;
 const MSIX_FUNCTION_MASK: u16 = 0x4000;
 const MSIX_ENABLE: u16 = 0x8000;
-
-/// Legacy PCI config mechanism #1 (0xcf8/0xcfc) host bridge.
-pub struct PciRoot {
-	config_address: u32,
-	functions:      Vec<PciFunction>,
-}
-
-struct PciFunction {
-	bus:       u8,
-	device:    u8,
-	function:  u8,
-	transport: Arc<Mutex<PciTransport>>,
-}
-
-impl PciRoot {
-	pub const fn new() -> Self {
-		Self { config_address: 0, functions: Vec::new() }
-	}
-
-	/// Register a single-function device on bus 0 at `device`.
-	pub fn register(&mut self, device: u8, transport: Arc<Mutex<PciTransport>>) {
-		self
-			.functions
-			.push(PciFunction { bus: 0, device, function: 0, transport });
-	}
-
-	fn selected(&self) -> Option<(usize, &PciFunction)> {
-		if self.config_address & 0x8000_0000 == 0 {
-			return None;
-		}
-		let bus = ((self.config_address >> 16) & 0xff) as u8;
-		let dev = ((self.config_address >> 11) & 0x1f) as u8;
-		let func = ((self.config_address >> 8) & 0x07) as u8;
-		let reg = (self.config_address & 0xfc) as usize;
-		self
-			.functions
-			.iter()
-			.find(|f| f.bus == bus && f.device == dev && f.function == func)
-			.map(|f| (reg, f))
-	}
-
-	fn read_config_data(&self, byte_offset: usize, data: &mut [u8]) {
-		data.fill(0xff);
-		let Some((reg, function)) = self.selected() else {
-			return;
-		};
-		function
-			.transport
-			.lock()
-			.read_config(reg + byte_offset, data);
-	}
-
-	#[allow(
-		clippy::needless_pass_by_ref_mut,
-		reason = "PCI config write path keeps &mut self for transport API symmetry"
-	)]
-	fn write_config_data(&mut self, byte_offset: usize, data: &[u8]) {
-		let Some((reg, function)) = self.selected() else {
-			return;
-		};
-		function
-			.transport
-			.lock()
-			.write_config(reg + byte_offset, data);
-	}
-
-	fn ecam_selected(&self, offset: u64) -> Option<(usize, &PciFunction)> {
-		let bus = ((offset >> 20) & 0xff) as u8;
-		let dev = ((offset >> 15) & 0x1f) as u8;
-		let func = ((offset >> 12) & 0x07) as u8;
-		let reg = (offset & 0xfff) as usize;
-		self
-			.functions
-			.iter()
-			.find(|f| f.bus == bus && f.device == dev && f.function == func)
-			.map(|f| (reg, f))
-	}
-
-	pub fn read_ecam(&self, offset: u64, data: &mut [u8]) {
-		data.fill(0xff);
-		let Some((reg, function)) = self.ecam_selected(offset) else {
-			return;
-		};
-		if reg >= 256 {
-			return;
-		}
-		function.transport.lock().read_config(reg, data);
-	}
-
-	#[allow(
-		clippy::needless_pass_by_ref_mut,
-		reason = "ECAM config write path keeps &mut self for transport API symmetry"
-	)]
-	pub fn write_ecam(&mut self, offset: u64, data: &[u8]) {
-		let Some((reg, function)) = self.ecam_selected(offset) else {
-			return;
-		};
-		if reg >= 256 {
-			return;
-		}
-		function.transport.lock().write_config(reg, data);
-	}
-}
-
-/// `PCIe` ECAM/MMCONFIG view of [`PciRoot`].
-pub struct PciEcam {
-	root: Arc<Mutex<PciRoot>>,
-}
-
-impl PciEcam {
-	pub const fn new(root: Arc<Mutex<PciRoot>>) -> Self {
-		Self { root }
-	}
-}
-
-impl BusDevice for PciEcam {
-	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		self.root.lock().read_ecam(offset, data);
-	}
-
-	fn write(&mut self, offset: u64, data: &[u8]) {
-		self.root.lock().write_ecam(offset, data);
-	}
-}
-
-impl BusDevice for PciRoot {
-	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		if offset < 4 {
-			let bytes = self.config_address.to_le_bytes();
-			copy_from(&bytes, offset as usize, data, 0);
-		} else if offset < 8 {
-			self.read_config_data((offset - 4) as usize, data);
-		} else {
-			data.fill(0xff);
-		}
-	}
-
-	fn write(&mut self, offset: u64, data: &[u8]) {
-		if offset < 4 {
-			let mut bytes = self.config_address.to_le_bytes();
-			overlay(&mut bytes, offset as usize, data);
-			self.config_address = u32::from_le_bytes(bytes);
-		} else if offset < 8 {
-			self.write_config_data((offset - 4) as usize, data);
-		}
-	}
-}
-
-/// MMIO aperture dispatcher for guest-assigned virtio-pci BAR addresses.
-pub struct PciMmioDispatcher {
-	aperture_base: u64,
-	functions:     Vec<Arc<Mutex<PciTransport>>>,
-}
-
-impl PciMmioDispatcher {
-	pub const fn new(aperture_base: u64) -> Self {
-		Self { aperture_base, functions: Vec::new() }
-	}
-
-	pub fn register(&mut self, transport: Arc<Mutex<PciTransport>>) {
-		self.functions.push(transport);
-	}
-}
-
-impl BusDevice for PciMmioDispatcher {
-	fn read(&mut self, offset: u64, data: &mut [u8]) {
-		let Some(addr) = self.aperture_base.checked_add(offset) else {
-			data.fill(0xff);
-			return;
-		};
-		for transport in &self.functions {
-			let mut transport = transport.lock();
-			if let Some(bar_offset) = transport.bar_offset(addr) {
-				transport.read_bar(bar_offset, data);
-				return;
-			}
-		}
-		data.fill(0xff);
-	}
-
-	fn write(&mut self, offset: u64, data: &[u8]) {
-		let Some(addr) = self.aperture_base.checked_add(offset) else {
-			return;
-		};
-		for transport in &self.functions {
-			let mut transport = transport.lock();
-			if let Some(bar_offset) = transport.bar_offset(addr) {
-				transport.write_bar(bar_offset, data);
-				return;
-			}
-		}
-	}
-}
 
 #[derive(Clone, Copy)]
 struct MsixEntry {
@@ -1049,6 +856,34 @@ impl BusDevice for PciTransport {
 		if self.memory_enabled() {
 			self.write_bar(offset, data);
 		}
+	}
+}
+
+impl PciFunction for Mutex<PciTransport> {
+	fn read_config(&self, offset: usize, data: &mut [u8]) {
+		self.lock().read_config(offset, data);
+	}
+
+	fn write_config(&self, offset: usize, data: &[u8]) {
+		self.lock().write_config(offset, data);
+	}
+
+	fn read_bar(&self, addr: u64, data: &mut [u8]) -> bool {
+		let mut transport = self.lock();
+		let Some(offset) = transport.bar_offset(addr) else {
+			return false;
+		};
+		transport.read_bar(offset, data);
+		true
+	}
+
+	fn write_bar(&self, addr: u64, data: &[u8]) -> bool {
+		let mut transport = self.lock();
+		let Some(offset) = transport.bar_offset(addr) else {
+			return false;
+		};
+		transport.write_bar(offset, data);
+		true
 	}
 }
 

@@ -179,6 +179,7 @@ struct EngineInner {
 	restore_handoff: Mutex<Option<Weak<dyn OwnershipHandoff>>>,
 	capture_locks: Mutex<HashMap<String, Arc<CaptureLock>>>,
 	pools: PoolRegistry,
+	template_memo: Mutex<HashMap<TemplateMemoKey, CachedTemplate>>,
 	events: Mutex<Vec<Sender<Value>>>,
 	event_sequence: AtomicU64,
 	counters: Counters,
@@ -191,6 +192,7 @@ struct EngineInner {
 	portable_ownership: Mutex<Option<PortableOwnership>>,
 	maintenance_busy: Mutex<HashSet<String>>,
 	pending_migration_staging: Mutex<HashMap<String, Arc<TransientDir>>>,
+	snapshot_sources: Mutex<HashMap<String, SnapshotSource>>,
 	pending_replica_exports: Mutex<HashMap<String, Arc<ReplicaExport>>>,
 	portable_gc_last: Mutex<Instant>,
 	#[cfg(test)]
@@ -410,6 +412,7 @@ impl Drop for JournalTemp {
 	}
 }
 
+#[derive(Clone)]
 struct SnapshotSource {
 	path:  PathBuf,
 	guard: Option<Arc<TransientDir>>,
@@ -524,6 +527,21 @@ struct CreatePlan {
 	host_slot:            bool,
 	networked_warm:       bool,
 	networked_warm_linux: bool,
+}
+
+/// Identity of a memoized image-template resolution. The boot-verify timeout
+/// is deliberately excluded: it never changes which template is produced.
+/// Dockerfile builds are never memoized — their inputs live outside the key.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct TemplateMemoKey {
+	image:     Option<String>,
+	disk_mb:   u64,
+	memory:    u64,
+	cpus:      u64,
+	fs_slots:  u64,
+	host_slot: bool,
+	nic_slot:  bool,
+	tap_slot:  bool,
 }
 #[cfg(test)]
 type TestRestoreExecutor = dyn Fn(&Engine, Map<String, Value>, &Path, bool, Option<Arc<AtomicBool>>) -> Result<Value>
@@ -716,6 +734,7 @@ impl Engine {
 				#[cfg(test)]
 				rollback_resume_executor: Mutex::new(None),
 				pools: PoolRegistry::new(),
+				template_memo: Mutex::new(HashMap::new()),
 				events: Mutex::new(Vec::new()),
 				event_sequence: AtomicU64::new(0),
 				counters: Counters::default(),
@@ -726,6 +745,7 @@ impl Engine {
 				credentials,
 				audit,
 				maintenance_busy: Mutex::new(HashSet::new()),
+				snapshot_sources: Mutex::new(HashMap::new()),
 				portable_gc_last: Mutex::new(
 					Instant::now()
 						.checked_sub(Duration::from_mins(1))
@@ -2394,6 +2414,22 @@ impl Engine {
 			};
 			return Ok((template_dir, None, Some(template.clone()), template.clone()));
 		}
+		let memo_key = params.dockerfile.is_none().then(|| TemplateMemoKey {
+			image: params.image.clone(),
+			disk_mb: u64::from(params.disk_mb),
+			memory: u64::from(params.memory),
+			cpus: u64::from(params.cpus),
+			fs_slots,
+			host_slot,
+			nic_slot,
+			tap_slot,
+		});
+		if let Some(key) = &memo_key
+			&& let Some(cached) = self.lookup_template_memo(key)
+		{
+			let pool_key = template_key_for_cached(&cached);
+			return Ok((cached.snapshot_dir, Some(cached.spec), Some(cached.name), pool_key));
+		}
 		let request = TemplateRequest {
 			image: params.image.clone(),
 			dockerfile: params.dockerfile.as_ref().map(PathBuf::from),
@@ -2408,8 +2444,26 @@ impl Engine {
 			tap_slot,
 		};
 		let cached = image::cached_template(self, &request)?;
+		if let Some(key) = memo_key {
+			self.inner.template_memo.lock().insert(key, cached.clone());
+		}
 		let key = template_key_for_cached(&cached);
 		Ok((cached.snapshot_dir, Some(cached.spec), Some(cached.name), key))
+	}
+
+	/// Return a memoized template only while its on-disk snapshot is still
+	/// materialized (two stats); a template invalidated behind our back drops
+	/// out of the memo and takes the full resolution path again.
+	fn lookup_template_memo(&self, key: &TemplateMemoKey) -> Option<CachedTemplate> {
+		let mut memo = self.inner.template_memo.lock();
+		let cached = memo.get(key)?;
+		if snapshot_state_present(&cached.snapshot_dir)
+			&& cached.snapshot_dir.join("rootfs.img").is_file()
+		{
+			return Some(cached.clone());
+		}
+		memo.remove(key);
+		None
 	}
 
 	fn resolve_volumes(
@@ -2777,6 +2831,17 @@ impl Engine {
 			self.rollback_uncommitted_runtime(&vm, &mut runtime);
 			return Err(error);
 		}
+		// Heartbeats use canonical resource keys after a worker restart; VMM
+		// metadata calls memory `mem`, and paused candidates return before setup.
+		let resource_meta = Map::from_iter([
+			("cpus".to_owned(), json!(plan.params.cpus)),
+			("memory".to_owned(), json!(plan.params.memory)),
+			("disk_mb".to_owned(), json!(plan.params.disk_mb)),
+		]);
+		if let Err(error) = vm.save_meta(resource_meta) {
+			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			return Err(error);
+		}
 		runtime.volume_locks = plan
 			.volume_specs
 			.iter_mut()
@@ -2970,7 +3035,7 @@ impl Engine {
 				}
 			}
 			if let Some(pool) = self.inner.pools.get(&plan.pool_key)
-				&& let Some(vm) = pool.claim(Some(&plan.sid))?
+				&& let Some(vm) = pool.claim(Some(&plan.sid), start_paused)?
 			{
 				if plan.networked_warm {
 					runtime.network_spec = Some(json!({
@@ -3547,12 +3612,18 @@ impl Engine {
 				"snapshot {name:?} is not a regular encrypted archive"
 			)));
 		}
+		let mut sources = self.inner.snapshot_sources.lock();
+		if let Some(source) = sources.get(name) {
+			return Ok(source.clone());
+		}
 		let runtime_root = self.home().security_dir().join("runtime");
 		fs::create_dir_all(&runtime_root)?;
 		fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
 		let extract_root = runtime_root.join(format!("snapshot-{}", random_hex(24)));
 		let path = EncryptedArchive::open(&archive, &extract_root, &self.inner.keyring)?;
-		Ok(SnapshotSource { path, guard: Some(Arc::new(TransientDir(extract_root))) })
+		let source = SnapshotSource { path, guard: Some(Arc::new(TransientDir(extract_root))) };
+		sources.insert(name.to_owned(), source.clone());
+		Ok(source)
 	}
 
 	fn recovery_root(&self, id: &str) -> Result<PathBuf> {
@@ -4409,6 +4480,11 @@ impl Engine {
 		snapshot_source: Option<Arc<TransientDir>>,
 	) -> Result<(SandboxVm, VmRecord)> {
 		self.ensure_snapshot_target_available(&name)?;
+		// Launch performs authoritative validation; this early read only carries
+		// snapshot capacity into the orchestration heartbeat.
+		let snapshot_resources = vmm::snapshot::read_snapshot_metadata(snapshot_dir)
+			.ok()
+			.map(|image| (image.snapshot().cpus, image.snapshot().mem_mib));
 		let vm = self.sandbox(&name);
 		let result = (|| {
 			let mut runtime = RuntimeState {
@@ -4540,6 +4616,10 @@ impl Engine {
 
 			let mut detail = vm.meta()?;
 			detail.insert("block_network".to_owned(), json!(options.block_network.unwrap_or(true)));
+			if let Some((cpus, memory)) = snapshot_resources {
+				detail.insert("cpus".to_owned(), json!(cpus));
+				detail.insert("memory".to_owned(), json!(memory));
+			}
 			detail.insert("workdir".to_owned(), json!(runtime.workdir));
 			detail.insert("env_names".to_owned(), json!(runtime.env.keys().collect::<Vec<_>>()));
 			detail.insert("secret_names".to_owned(), json!(options.secret_names));
@@ -4704,6 +4784,19 @@ impl Engine {
 		let payload = Value::Object(data);
 		let mut subscribers = self.inner.events.lock();
 		subscribers.retain(|sender| sender.send(payload.clone()).is_ok());
+	}
+
+	fn publish_create_failure(&self, sid: &str, error: &EngineError) {
+		self.publish_event(
+			"failed",
+			Map::from_iter([
+				("id".to_owned(), json!(sid)),
+				("name".to_owned(), json!(sid)),
+				("status".to_owned(), json!("failed")),
+				("code".to_owned(), json!(error.code.as_str())),
+				("error".to_owned(), json!(&error.message)),
+			]),
+		);
 	}
 
 	fn publish_record_event(&self, event_type: &str, record: &VmRecord) {
@@ -6251,8 +6344,17 @@ impl EngineApi for Engine {
 			}
 			self.inner.registry.remove_idempotency_for(key, &name);
 		}
+		let requested_sid = params.name.clone().filter(|name| !name.is_empty());
 		let request_time = Instant::now();
-		let mut plan = self.prepare_create(params)?;
+		let mut plan = match self.prepare_create(params) {
+			Ok(plan) => plan,
+			Err(error) => {
+				if let Some(sid) = requested_sid {
+					self.publish_create_failure(&sid, &error);
+				}
+				return Err(error);
+			},
+		};
 		self.publish_event(
 			"creating",
 			Map::from_iter([
@@ -6265,16 +6367,7 @@ impl EngineApi for Engine {
 		let (vm, runtime) = match self.launch_create(&mut plan, false) {
 			Ok(result) => result,
 			Err(err) => {
-				self.publish_event(
-					"failed",
-					Map::from_iter([
-						("id".to_owned(), json!(plan.sid)),
-						("name".to_owned(), json!(plan.sid)),
-						("status".to_owned(), json!("failed")),
-						("code".to_owned(), json!(err.code.as_str())),
-						("error".to_owned(), json!(&err.message)),
-					]),
-				);
+				self.publish_create_failure(&plan.sid, &err);
 				drop(plan);
 				return Err(err);
 			},
@@ -6444,6 +6537,16 @@ impl EngineApi for Engine {
 			.collect())
 	}
 
+	fn orchestration_inventory(&self) -> Result<Vec<Value>> {
+		Ok(self
+			.inner
+			.registry
+			.list()
+			.into_iter()
+			.map(|record| record.view())
+			.collect())
+	}
+
 	fn get(&self, id: &str) -> Result<Value> {
 		Ok(self.get_record(id, false)?.view())
 	}
@@ -6518,11 +6621,13 @@ impl EngineApi for Engine {
 				.begin_delete(id, &delete.owner, delete.epoch)?;
 		}
 		self.teardown(&record)?;
+		let vm = self.sandbox(&record.name);
 		if let Some(delete) = delete {
 			Self::commit_portable_delete_after_history(
 				|| {
 					self.delete_portable_history(id, &delete.owner, delete.epoch)?;
-					self.delete_local_recovery_history(id)
+					self.delete_local_recovery_history(id)?;
+					self.remove_sandbox(&vm)
 				},
 				|| {
 					delete
@@ -6532,6 +6637,7 @@ impl EngineApi for Engine {
 			)?;
 		} else {
 			self.delete_local_recovery_history(id)?;
+			self.remove_sandbox(&vm)?;
 		}
 		self.inner.registry.remove(id);
 		Ok(json!({ "name": id, "removed": true }))
@@ -8100,6 +8206,7 @@ impl EngineApi for Engine {
 				"snapshot {snapshot:?} is not a regular encrypted archive"
 			)));
 		}
+		self.inner.snapshot_sources.lock().remove(snapshot);
 		fs::remove_file(archive)?;
 		Ok(())
 	}
@@ -8364,6 +8471,16 @@ impl EngineApi for Engine {
 			"# TYPE vmon_server_pool_misses counter".to_owned(),
 			format!("vmon_server_pool_misses {pool_misses}"),
 		]);
+		if let Some((ingress, egress)) = net::host_network_bytes() {
+			lines.extend([
+				"# HELP vmon_server_network_bytes_total Cumulative bytes received or transmitted by \
+				 the worker host on non-loopback network interfaces."
+					.to_owned(),
+				"# TYPE vmon_server_network_bytes_total counter".to_owned(),
+				format!("vmon_server_network_bytes_total{{direction=\"ingress\"}} {ingress}"),
+				format!("vmon_server_network_bytes_total{{direction=\"egress\"}} {egress}"),
+			]);
+		}
 		format!("{}\n", lines.join("\n"))
 	}
 
@@ -10221,18 +10338,27 @@ mod tests {
 	}
 
 	#[test]
-	fn removing_a_sandbox_deletes_its_local_recovery_history() {
+	fn removing_a_sandbox_deletes_its_local_state() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
-		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "running"));
-		fs::create_dir_all(engine.sandbox("sandbox").dir()).expect("runtime directory");
-		let recovery = engine.recovery_root("sandbox").expect("recovery root");
+		let record = VmRecord::new("stable-id", "vm-directory", "running");
+		engine
+			.inner
+			.registry
+			.insert_persisted(engine.home(), record)
+			.expect("persist record");
+		let runtime_dir = engine.sandbox("vm-directory").dir().to_path_buf();
+		let recovery = engine.recovery_root("stable-id").expect("recovery root");
 		fs::create_dir_all(&recovery).expect("recovery directory");
 		fs::write(recovery.join("point.venc"), b"point").expect("recovery point");
 
-		engine.remove("sandbox").expect("remove sandbox");
+		engine.remove("stable-id").expect("remove sandbox");
 
 		assert!(!recovery.exists(), "sandbox removal retained local recovery history");
+		assert!(!runtime_dir.exists(), "sandbox removal retained its runtime directory");
+		let restarted = Registry::new();
+		restarted.rehydrate(engine.home()).expect("rehydrate");
+		assert!(restarted.list().is_empty(), "removed sandbox was rehydrated");
 	}
 
 	#[test]
@@ -10404,6 +10530,32 @@ mod tests {
 			Engine::with_runtime(config_for(temp), runtime.clone()).expect("snapshot engine");
 		(engine, runtime, home)
 	}
+
+	#[test]
+	fn create_resources_survive_worker_rehydrate() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let template = checkpoint_fixture(&temp, "template");
+		fs::write(template.join("current-generation"), b"1\n").expect("generation");
+		let params = Map::from_iter([
+			("name".to_owned(), json!("sandbox")),
+			("template".to_owned(), json!(template)),
+			("cpus".to_owned(), json!(2)),
+			("memory".to_owned(), json!(768)),
+			("disk_mb".to_owned(), json!(1024)),
+		]);
+
+		engine
+			.mesh_create_from_params_paused(params)
+			.expect("create paused candidate");
+		let restarted = Registry::new();
+		restarted.rehydrate(engine.home()).expect("rehydrate");
+
+		let restored = restarted.get("sandbox").expect("sandbox record");
+		assert_eq!(restored.detail["cpus"], 2);
+		assert_eq!(restored.detail["memory"], 768);
+		assert_eq!(restored.detail["disk_mb"], 1024);
+	}
 	fn seal_test_snapshot(engine: &Engine, name: &str) {
 		let source = engine.snapshot_dir(&format!(".{name}-source"));
 		fs::create_dir_all(&source).expect("snapshot source");
@@ -10418,6 +10570,28 @@ mod tests {
 		)
 		.expect("seal test snapshot");
 		fs::remove_dir_all(source).expect("remove snapshot source");
+	}
+
+	#[test]
+	fn named_snapshot_source_is_decrypted_once_until_delete() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		seal_test_snapshot(&engine, "base");
+
+		let first = engine.open_snapshot("base").expect("first open");
+		let second = engine.open_snapshot("base").expect("cached open");
+		assert_eq!(first.path, second.path);
+		assert!(Arc::ptr_eq(
+			first.guard.as_ref().expect("first guard"),
+			second.guard.as_ref().expect("second guard")
+		));
+		let extracted = first.path.clone();
+		drop(first);
+		drop(second);
+		assert!(extracted.exists(), "cache must retain the decrypted template");
+
+		engine.snapshot_delete("base").expect("delete snapshot");
+		assert!(!extracted.exists(), "deleting a snapshot must evict its decrypted template");
 	}
 
 	#[test]
@@ -10746,6 +10920,73 @@ mod tests {
 	}
 
 	#[test]
+	fn template_memo_short_circuits_image_resolution() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let tpl_dir = temp.path().join("templates").join("tpl-memo");
+		fs::create_dir_all(&tpl_dir).expect("template dir");
+		fs::write(tpl_dir.join("current-generation"), b"1").expect("generation marker");
+		fs::write(tpl_dir.join("rootfs.img"), b"base").expect("base disk");
+		let cached = CachedTemplate {
+			name:         "tpl-memo".to_owned(),
+			snapshot_dir: tpl_dir.clone(),
+			rootfs:       tpl_dir.join("rootfs.img"),
+			spec:         image::ImageConfig {
+				reference:  "memo/unresolvable:1".to_owned(),
+				entrypoint: Vec::new(),
+				cmd:        Vec::new(),
+				env:        Vec::new(),
+				workdir:    "/".to_owned(),
+				user:       String::new(),
+			},
+			image_digest: "sha256:0".to_owned(),
+			disk_mb:      1024,
+			memory:       512,
+			cpus:         1,
+			fs_slots:     0,
+			host_slot:    false,
+			nic_slot:     false,
+			tap_slot:     false,
+			digest:       String::new(),
+		};
+		let key = TemplateMemoKey {
+			image:     Some("memo/unresolvable:1".to_owned()),
+			disk_mb:   1024,
+			memory:    512,
+			cpus:      1,
+			fs_slots:  0,
+			host_slot: false,
+			nic_slot:  false,
+			tap_slot:  false,
+		};
+		engine
+			.inner
+			.template_memo
+			.lock()
+			.insert(key.clone(), cached);
+		// The reference is deliberately unresolvable: falling through to the
+		// OCI/template pipeline would fail this resolve. A memo hit must not
+		// touch that pipeline at all.
+		let params =
+			SandboxCreate { image: Some("memo/unresolvable:1".to_owned()), ..valid_create() };
+		let (dir, spec, name, pool_key) = engine
+			.resolve_template(&params, 0, false, false, false)
+			.expect("memoized template resolves without the image pipeline");
+		assert_eq!(dir, tpl_dir);
+		assert_eq!(spec.map(|spec| spec.reference).as_deref(), Some("memo/unresolvable:1"));
+		assert_eq!(name.as_deref(), Some("tpl-memo"));
+		assert_eq!(
+			pool_key,
+			template_key("memo/unresolvable:1", 1024, 512, 1, 0, false, false, false)
+		);
+		// An invalidated on-disk snapshot drops out of the memo.
+		fs::remove_file(tpl_dir.join("current-generation")).expect("invalidate template");
+		assert!(engine.lookup_template_memo(&key).is_none());
+		assert!(engine.inner.template_memo.lock().is_empty());
+		engine.shutdown();
+	}
+
+	#[test]
 	fn exec_capture_timeout_is_capped_at_sixty_seconds() {
 		assert_eq!(clamp_exec_timeout(None), Duration::from_mins(1));
 		assert_eq!(clamp_exec_timeout(Some(120.0)), Duration::from_mins(1));
@@ -10771,6 +11012,31 @@ mod tests {
 			})
 			.expect_err("remote page rejected");
 		assert_eq!(err.message, "remote_page_* fields are server-internal");
+	}
+
+	#[test]
+	fn named_create_publishes_failure_when_preparation_is_rejected() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let events = engine.subscribe_events();
+
+		let error = engine
+			.create(SandboxCreate {
+				name: Some("rejected-create".to_owned()),
+				ha: Some("bad".to_owned()),
+				..valid_create()
+			})
+			.expect_err("invalid named create");
+
+		let event = events
+			.recv_timeout(Duration::from_secs(1))
+			.expect("failed lifecycle event");
+		assert_eq!(event["type"], "failed");
+		assert_eq!(event["id"], "rejected-create");
+		assert_eq!(event["name"], "rejected-create");
+		assert_eq!(event["status"], "failed");
+		assert_eq!(event["code"], error.code.as_str());
+		assert_eq!(event["error"], error.message);
 	}
 
 	#[test]

@@ -1716,7 +1716,7 @@ mod tests {
 		use vmon_proto::v1 as pb;
 
 		use crate::{
-			api::{ApiState, GrpcApi, Transport},
+			api::{ApiState, GrpcApi, Transport, boot_gate},
 			function::FunctionDomain,
 			mesh::routes::MeshControl,
 		};
@@ -1799,6 +1799,8 @@ mod tests {
 			auth_failures: Arc::new(AtomicU64::new(0)),
 			transport:     Transport::Unix,
 			mesh:          Some(rt_a.clone()),
+			orch_worker:   None,
+			boot_gate:     boot_gate(&rt_a.config),
 		};
 		let api_a = GrpcApi::new(state_a);
 
@@ -1813,6 +1815,8 @@ mod tests {
 			auth_failures: Arc::new(AtomicU64::new(0)),
 			transport:     Transport::Unix,
 			mesh:          Some(rt_b.clone()),
+			orch_worker:   None,
+			boot_gate:     boot_gate(&rt_b.config),
 		};
 		let api_b = GrpcApi::new(state_b);
 

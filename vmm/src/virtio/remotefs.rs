@@ -174,7 +174,7 @@ use vm_memory::GuestAddress;
 
 #[cfg(not(target_os = "windows"))]
 use super::fs;
-use super::{Interrupt, VirtioDevice};
+use super::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice};
 
 #[cfg(target_os = "windows")]
 mod remote_fuse {
@@ -1144,15 +1144,23 @@ impl VirtioDevice for RemoteFs {
 		Ok(())
 	}
 
-	fn process_queue_notify(&mut self) -> Result<()> {
+	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		let (Some(mem), Some(interrupt)) = (self.mem.clone(), self.interrupt.clone()) else {
-			return Ok(());
+			return Ok(QueuePass::Drained);
 		};
 		let mut used = false;
 		let state = &mut self.state;
+		// Bound one pass: each request is a blocking proxy round-trip and
+		// completes inline, so a spinning guest (or slow proxy) could
+		// otherwise hold the shared worker indefinitely.
+		let mut budget = QUEUE_PASS_BUDGET;
 
 		if let Some(queue) = self.hiprio_queue.as_mut() {
-			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				let head = chain.head_index();
 				if let Some((req, _)) = fs::split_chain(&mem, chain) {
 					state.dispatch(&mem, &req, &[]);
@@ -1165,7 +1173,11 @@ impl VirtioDevice for RemoteFs {
 		}
 
 		if let Some(queue) = self.req_queue.as_mut() {
-			while let Some(chain) = queue.pop_descriptor_chain(&mem) {
+			while budget != 0 {
+				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+					break;
+				};
+				budget -= 1;
 				let head = chain.head_index();
 				let written = match fs::split_chain(&mem, chain) {
 					Some((req, writable)) => state.dispatch(&mem, &req, &writable),
@@ -1181,7 +1193,11 @@ impl VirtioDevice for RemoteFs {
 		if used {
 			interrupt.signal_used_queue()?;
 		}
-		Ok(())
+		Ok(if budget == 0 {
+			QueuePass::Budgeted
+		} else {
+			QueuePass::Drained
+		})
 	}
 
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {

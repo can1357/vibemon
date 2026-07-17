@@ -8,6 +8,7 @@ mod bridge;
 mod error;
 mod grpc;
 mod routes;
+mod sandbox_stream;
 mod server;
 mod state;
 mod validation;
@@ -19,7 +20,7 @@ pub use error::{ApiError, ErrorBody};
 #[cfg(test)]
 pub(crate) use grpc::GrpcApi;
 #[cfg(test)]
-pub(crate) use state::{ApiState, Transport};
+pub(crate) use state::{ApiState, Transport, boot_gate};
 
 /// Serve the v1 API over `$VMON_HOME/vmond.sock` and optional TCP.
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> crate::Result<()>
@@ -703,6 +704,7 @@ mod tests {
 						"idempotency_key": "create-once"
 					})
 					.to_string(),
+					no_wait:   false,
 				},
 				"client-token",
 			))
@@ -722,6 +724,7 @@ mod tests {
 			.create(authed(
 				pb::CreateSandboxRequest {
 					spec_json: json!({"template": "/host/template"}).to_string(),
+					no_wait:   false,
 				},
 				"client-token",
 			))
@@ -754,7 +757,7 @@ mod tests {
 		for (payload, message) in cases {
 			let status = client
 				.create(authed(
-					pb::CreateSandboxRequest { spec_json: payload.to_string() },
+					pb::CreateSandboxRequest { spec_json: payload.to_string(), no_wait: false },
 					"admin-token",
 				))
 				.await
@@ -808,6 +811,7 @@ mod tests {
 				pb::CreateSandboxRequest {
 					spec_json: json!({"name": "sb-1", "block_network": false, "ports": [8080]})
 						.to_string(),
+					no_wait:   false,
 				},
 				"admin-token",
 			))

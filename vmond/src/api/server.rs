@@ -1,6 +1,6 @@
 use std::{
 	collections::HashMap, fs, hash::BuildHasher, net::IpAddr, os::unix::fs::PermissionsExt,
-	sync::Arc,
+	sync::Arc, time::Duration,
 };
 
 use tokio::{net::TcpListener, sync::broadcast};
@@ -17,6 +17,7 @@ use crate::{
 	home::{Home, OwnerLock},
 	mesh::runtime::MeshRuntime,
 	net,
+	orch::worker::{OrchWorker, OrchWorkerOptions, load_or_create_worker_id},
 };
 
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> Result<()>
@@ -28,6 +29,7 @@ where
 	let config = resolve_serve_config(&overrides)?;
 	validate_tcp_auth(&config)?;
 	net::configure_broker_socket(config.network_broker_socket.clone());
+	net::configure_slot_pool(config.net_slots);
 	let home = Home::new(config.home.clone());
 	let owner = OwnerLock::acquire(&home)?;
 	let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -68,6 +70,10 @@ async fn run_listeners(
 	let functions = FunctionDomain::open(home.clone(), engine_api.clone(), &config)?;
 	let base_state = ApiState::new(engine_api, functions.clone(), config.clone(), Transport::Unix)
 		.with_mesh(mesh.clone());
+	let base_state = match start_orch_worker(&home, &config, &base_state)? {
+		Some(worker) => base_state.with_orch_worker(worker),
+		None => base_state,
+	};
 	let uds_router = routes::router(base_state.with_transport(Transport::Unix));
 	let (shutdown_tx, _) = broadcast::channel::<()>(4);
 	let signal_tx = shutdown_tx.clone();
@@ -119,6 +125,46 @@ async fn run_listeners(
 	} else {
 		Ok(())
 	}
+}
+
+/// When `orch_redis` is configured, build this node's [`OrchWorker`] and
+/// start its heartbeat publisher on the current runtime.
+fn start_orch_worker(
+	home: &Home,
+	config: &ServeConfig,
+	state: &ApiState,
+) -> Result<Option<Arc<OrchWorker>>> {
+	let Some(redis_url) = config.orch_redis.clone() else {
+		return Ok(None);
+	};
+	let url = match config.orch_url.clone() {
+		Some(url) => url,
+		None if tcp_enabled(config) => {
+			crate::mesh::state::default_advertise(&config.host, config.port)
+		},
+		None => {
+			return Err(EngineError::invalid("orch mode requires --orch-url or a TCP listener"));
+		},
+	};
+	let wid = match config.orch_id.clone() {
+		Some(wid) => wid,
+		None => load_or_create_worker_id(home)?,
+	};
+	let caps = crate::mesh::state::probe_caps();
+	let (backend, arch) = crate::mesh::state::probe_compat();
+	let worker = OrchWorker::new(OrchWorkerOptions {
+		redis_url,
+		wid,
+		url,
+		arch,
+		backend,
+		caps: crate::orch::Resources { vcpus: caps.vcpus, mem_mib: caps.mem_mib },
+		heartbeat: Duration::from_secs_f64(config.orch_heartbeat_sec),
+		dead_after: Duration::from_secs_f64(config.orch_dead_after_sec),
+		max_sandboxes: config.orch_max_sandboxes,
+	})?;
+	drop(worker.spawn(state.engine.clone()));
+	Ok(Some(worker))
 }
 
 /// Install the process-wide tracing subscriber for `vmon serve`.

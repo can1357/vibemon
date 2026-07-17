@@ -89,6 +89,11 @@ pub struct ServeConfig {
 	pub tls_key: Option<String>,
 	/// Unix socket for the externally managed privileged network broker.
 	pub network_broker_socket: Option<PathBuf>,
+	/// Preallocated network slot pool size; zero disables pooling.
+	pub net_slots: usize,
+	/// Maximum concurrently booting sandboxes; zero sizes the gate from the
+	/// host CPU count. Admission is unaffected — queued boots wait here.
+	pub boot_concurrency: usize,
 	/// Idle sandbox timeout in seconds.
 	pub idle_timeout: f64,
 	/// Live disk-history capture cadence in seconds; zero disables it.
@@ -131,6 +136,18 @@ pub struct ServeConfig {
 	pub mesh_w_region: f64,
 	/// Placement penalty for inflight creates.
 	pub mesh_w_inflight: f64,
+	/// Orchestration Redis URL; enables the v2 worker publisher when set.
+	pub orch_redis: Option<String>,
+	/// Advertised worker base URL for the orchestration layer.
+	pub orch_url: Option<String>,
+	/// Stable orchestration worker id override.
+	pub orch_id: Option<String>,
+	/// Orchestration heartbeat cadence in seconds.
+	pub orch_heartbeat_sec: f64,
+	/// Age in seconds after which an unrefreshed worker key expires.
+	pub orch_dead_after_sec: f64,
+	/// Maximum concurrent sandboxes admitted in orch mode; zero is unlimited.
+	pub orch_max_sandboxes: u64,
 	/// Cluster substrate mode.
 	pub cluster_mode: ClusterMode,
 	/// `PostgreSQL` connection URL.
@@ -222,6 +239,8 @@ impl Default for ServeConfig {
 			tls_cert: None,
 			tls_key: None,
 			network_broker_socket: None,
+			net_slots: 0,
+			boot_concurrency: 0,
 			idle_timeout: 300.0,
 			history_disk_sec: 300.0,
 			history_checkpoint_sec: 3600.0,
@@ -243,6 +262,12 @@ impl Default for ServeConfig {
 			mesh_w_local: 50.0,
 			mesh_w_region: 30.0,
 			mesh_w_inflight: 80.0,
+			orch_redis: None,
+			orch_url: None,
+			orch_id: None,
+			orch_heartbeat_sec: 1.0,
+			orch_dead_after_sec: 5.0,
+			orch_max_sandboxes: 0,
 			cluster_mode: ClusterMode::default(),
 			postgres_url: None,
 			s3_endpoint: None,
@@ -271,6 +296,8 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"tls_cert",
 	"tls_key",
 	"network_broker_socket",
+	"net_slots",
+	"boot_concurrency",
 	"idle_timeout",
 	"history_disk_sec",
 	"history_checkpoint_sec",
@@ -292,6 +319,12 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"mesh_w_local",
 	"mesh_w_region",
 	"mesh_w_inflight",
+	"orch_redis",
+	"orch_url",
+	"orch_id",
+	"orch_heartbeat_sec",
+	"orch_dead_after_sec",
+	"orch_max_sandboxes",
 	"cluster_mode",
 	"postgres_url",
 	"s3_endpoint",
@@ -317,6 +350,8 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("tls_cert", "VMON_TLS_CERT"),
 	("tls_key", "VMON_TLS_KEY"),
 	("network_broker_socket", "VMON_NETWORK_BROKER_SOCKET"),
+	("net_slots", "VMON_NET_SLOTS"),
+	("boot_concurrency", "VMON_BOOT_CONCURRENCY"),
 	("idle_timeout", "VMON_IDLE_TIMEOUT"),
 	("history_disk_sec", "VMON_HISTORY_DISK_SEC"),
 	("history_checkpoint_sec", "VMON_HISTORY_CHECKPOINT_SEC"),
@@ -338,6 +373,12 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("mesh_w_local", "VMON_MESH_W_LOCAL"),
 	("mesh_w_region", "VMON_MESH_W_REGION"),
 	("mesh_w_inflight", "VMON_MESH_W_INFLIGHT"),
+	("orch_redis", "VMON_ORCH_REDIS"),
+	("orch_url", "VMON_ORCH_URL"),
+	("orch_id", "VMON_ORCH_ID"),
+	("orch_heartbeat_sec", "VMON_ORCH_HEARTBEAT_SEC"),
+	("orch_dead_after_sec", "VMON_ORCH_DEAD_AFTER_SEC"),
+	("orch_max_sandboxes", "VMON_ORCH_MAX_SANDBOXES"),
 	("cluster_mode", "VMON_CLUSTER_MODE"),
 	("postgres_url", "VMON_POSTGRES_URL"),
 	("s3_endpoint", "VMON_S3_ENDPOINT"),
@@ -363,6 +404,8 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("tls_cert", "--tls-cert"),
 	("tls_key", "--tls-key"),
 	("network_broker_socket", "--network-broker-socket"),
+	("net_slots", "--net-slots"),
+	("boot_concurrency", "--boot-concurrency"),
 	("idle_timeout", "--idle-timeout"),
 	("history_disk_sec", "--history-disk-sec"),
 	("history_checkpoint_sec", "--history-checkpoint-sec"),
@@ -384,6 +427,12 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("mesh_w_local", "--mesh-w-local"),
 	("mesh_w_region", "--mesh-w-region"),
 	("mesh_w_inflight", "--mesh-w-inflight"),
+	("orch_redis", "--orch-redis"),
+	("orch_url", "--orch-url"),
+	("orch_id", "--orch-id"),
+	("orch_heartbeat_sec", "--orch-heartbeat-sec"),
+	("orch_dead_after_sec", "--orch-dead-after-sec"),
+	("orch_max_sandboxes", "--orch-max-sandboxes"),
 	("cluster_mode", "--cluster-mode"),
 	("postgres_url", "--postgres-url"),
 	("s3_endpoint", "--s3-endpoint"),
@@ -658,6 +707,8 @@ fn apply_value(
 			config.network_broker_socket =
 				empty_string_as_none(key, value)?.map(|socket| expand_user(&socket));
 		},
+		"net_slots" => config.net_slots = non_negative_usize(key, value)?,
+		"boot_concurrency" => config.boot_concurrency = non_negative_usize(key, value)?,
 		"tls_key" => config.tls_key = empty_string_as_none(key, value)?,
 		"host" => {
 			let host = coerce_string(key, value)?.trim().to_owned();
@@ -714,6 +765,18 @@ fn apply_value(
 		"mesh_w_local" => config.mesh_w_local = positive_float(key, value)?,
 		"mesh_w_region" => config.mesh_w_region = positive_float(key, value)?,
 		"mesh_w_inflight" => config.mesh_w_inflight = positive_float(key, value)?,
+		"orch_redis" => config.orch_redis = empty_string_as_none(key, value)?,
+		"orch_url" => config.orch_url = empty_string_as_none(key, value)?,
+		"orch_id" => config.orch_id = empty_string_as_none(key, value)?,
+		"orch_heartbeat_sec" => config.orch_heartbeat_sec = positive_float(key, value)?,
+		"orch_dead_after_sec" => config.orch_dead_after_sec = positive_float(key, value)?,
+		"orch_max_sandboxes" => {
+			let parsed = coerce_int(key, value)?;
+			if parsed < 0 {
+				return Err(EngineError::invalid("orch_max_sandboxes must be non-negative"));
+			}
+			config.orch_max_sandboxes = parsed as u64;
+		},
 		"cluster_mode" => {
 			config.cluster_mode = ClusterMode::parse(&coerce_string(key, value)?)?;
 		},
@@ -1288,5 +1351,51 @@ mod tests {
 		assert_eq!(config.s3_secret_key.as_deref(), Some("secret"));
 		assert_eq!(config.portable_history_key_id.as_deref(), Some("cluster-recovery"));
 		assert_eq!(config.s3_prefix.as_deref(), Some("pre/"));
+	}
+
+	#[test]
+	fn orch_knobs_defaults_overlays_and_validation() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+		let config = resolve_serve_config(&HashMap::new()).expect("default config");
+		assert_eq!(config.orch_redis, None);
+		assert_eq!(config.orch_url, None);
+		assert_eq!(config.orch_id, None);
+		assert_eq!(config.orch_heartbeat_sec, 1.0);
+		assert_eq!(config.orch_dead_after_sec, 5.0);
+		assert_eq!(config.orch_max_sandboxes, 0);
+		assert_eq!(config.source("orch_redis"), Some(ConfigSource::Default));
+
+		EnvGuard::set("VMON_ORCH_REDIS", "redis://cache:6379");
+		EnvGuard::set("VMON_ORCH_MAX_SANDBOXES", "16");
+		let env_config = resolve_serve_config(&HashMap::new()).expect("env config");
+		assert_eq!(env_config.orch_redis.as_deref(), Some("redis://cache:6379"));
+		assert_eq!(env_config.orch_max_sandboxes, 16);
+		assert_eq!(env_config.source("orch_redis"), Some(ConfigSource::Env));
+		assert_eq!(env_config.source("orch_max_sandboxes"), Some(ConfigSource::Env));
+
+		// A CLI empty string disables the env-provided endpoint.
+		let cli_config = resolve_serve_config(&HashMap::from([
+			("orch_redis".to_owned(), String::new()),
+			("orch_url".to_owned(), "http://worker:8000".to_owned()),
+			("orch_id".to_owned(), "w-stable".to_owned()),
+			("orch_heartbeat_sec".to_owned(), "0.5".to_owned()),
+			("orch_dead_after_sec".to_owned(), "2.5".to_owned()),
+		]))
+		.expect("cli config");
+		assert_eq!(cli_config.orch_redis, None);
+		assert_eq!(cli_config.orch_url.as_deref(), Some("http://worker:8000"));
+		assert_eq!(cli_config.orch_id.as_deref(), Some("w-stable"));
+		assert_eq!(cli_config.orch_heartbeat_sec, 0.5);
+		assert_eq!(cli_config.orch_dead_after_sec, 2.5);
+		assert_eq!(cli_config.source("orch_url"), Some(ConfigSource::Flag));
+
+		for (key, value) in
+			[("orch_heartbeat_sec", "0"), ("orch_dead_after_sec", "-1"), ("orch_max_sandboxes", "-2")]
+		{
+			let overrides = HashMap::from([(key.to_owned(), value.to_owned())]);
+			let err = resolve_serve_config(&overrides).expect_err("bad orch value");
+			assert!(err.message.contains(key), "expected {key:?} in error {:?}", err.message);
+		}
 	}
 }

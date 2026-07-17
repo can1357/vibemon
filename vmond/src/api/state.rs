@@ -16,7 +16,10 @@ use axum::{
 	response::Response,
 	serve::Listener,
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::{
+	net::{UnixListener, UnixStream},
+	sync::Semaphore,
+};
 
 use super::error::ApiError;
 use crate::{
@@ -46,6 +49,22 @@ pub struct ApiState {
 	pub auth_failures: Arc<AtomicU64>,
 	pub transport:     Transport,
 	pub mesh:          Option<Arc<MeshRuntime>>,
+	pub orch_worker:   Option<Arc<crate::orch::worker::OrchWorker>>,
+	/// Bounds concurrently booting local sandboxes; see [`boot_gate`].
+	pub boot_gate:     Arc<Semaphore>,
+}
+
+/// Size the local boot gate from `boot_concurrency` (zero derives 4× the
+/// host's logical CPUs). Admission stays instant — the gate only queues the
+/// CPU-heavy VM boots so a create burst cannot thrash the host or exhaust
+/// the blocking thread pool.
+pub fn boot_gate(config: &ServeConfig) -> Arc<Semaphore> {
+	let permits = if config.boot_concurrency == 0 {
+		std::thread::available_parallelism().map_or(16, std::num::NonZero::get) * 4
+	} else {
+		config.boot_concurrency
+	};
+	Arc::new(Semaphore::new(permits))
 }
 
 impl ApiState {
@@ -55,6 +74,7 @@ impl ApiState {
 		config: ServeConfig,
 		transport: Transport,
 	) -> Self {
+		let boot_gate = boot_gate(&config);
 		Self {
 			engine,
 			functions,
@@ -62,6 +82,8 @@ impl ApiState {
 			auth_failures: Arc::new(AtomicU64::new(0)),
 			transport,
 			mesh: None,
+			orch_worker: None,
+			boot_gate,
 		}
 	}
 
@@ -71,6 +93,10 @@ impl ApiState {
 
 	pub fn with_mesh(&self, mesh: Arc<MeshRuntime>) -> Self {
 		Self { mesh: Some(mesh), ..self.clone() }
+	}
+
+	pub fn with_orch_worker(&self, worker: Arc<crate::orch::worker::OrchWorker>) -> Self {
+		Self { orch_worker: Some(worker), ..self.clone() }
 	}
 
 	pub fn count_auth_failure(&self) {
