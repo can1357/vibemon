@@ -1,6 +1,6 @@
 [package]
 name = "vmond"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "Vibemon server core: engine, image pipeline, v1 HTTP API, mesh"
 license.workspace = true
