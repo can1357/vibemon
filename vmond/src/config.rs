@@ -88,7 +88,8 @@ pub struct ServeConfig {
 	pub tls_cert: Option<String>,
 	/// TLS private-key path.
 	pub tls_key: Option<String>,
-	/// Unix socket for the externally managed privileged network broker.
+	/// Unix socket for an externally managed privileged network broker. When
+	/// unset, `vmon serve` self-hosts the broker if it holds net-admin.
 	pub network_broker_socket: Option<PathBuf>,
 	/// Preallocated network slot pool size; zero disables pooling.
 	pub net_slots: usize,

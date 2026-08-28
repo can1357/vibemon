@@ -1,6 +1,6 @@
 use std::{
 	collections::HashMap, fs, hash::BuildHasher, net::IpAddr, os::unix::fs::PermissionsExt,
-	sync::Arc, time::Duration,
+	path::PathBuf, sync::Arc, time::Duration,
 };
 
 use tokio::{net::TcpListener, sync::broadcast};
@@ -20,6 +20,36 @@ use crate::{
 	orch::worker::{OrchWorker, OrchWorkerOptions, load_or_create_worker_id},
 };
 
+/// The externally configured broker socket, or a broker self-hosted on a
+/// thread when this process already holds net-admin. Linux TAP networking
+/// stays disabled when neither is available.
+fn resolve_network_broker(config: &ServeConfig) -> Result<Option<PathBuf>> {
+	if config.network_broker_socket.is_some() {
+		return Ok(config.network_broker_socket.clone());
+	}
+	if !net::has_direct_net_admin() {
+		return Ok(None);
+	}
+	let socket = config.home.join("net-broker.sock");
+	fs::create_dir_all(&config.home)?;
+	let broker_socket = socket.clone();
+	std::thread::Builder::new()
+		.name("vmon-net-broker".to_owned())
+		.spawn(move || {
+			if let Err(error) = net::broker::serve(&broker_socket, None) {
+				tracing::error!(%error, "self-hosted network broker stopped");
+			}
+		})
+		.map_err(EngineError::from)?;
+	for _ in 0..100 {
+		if socket.exists() {
+			return Ok(Some(socket));
+		}
+		std::thread::sleep(Duration::from_millis(20));
+	}
+	Err(EngineError::engine("self-hosted network broker did not come up"))
+}
+
 pub fn serve<S>(overrides: HashMap<String, String, S>) -> Result<()>
 where
 	S: BuildHasher,
@@ -28,7 +58,7 @@ where
 	init_logging();
 	let config = resolve_serve_config(&overrides)?;
 	validate_tcp_auth(&config)?;
-	net::configure_broker_socket(config.network_broker_socket.clone());
+	net::configure_broker_socket(resolve_network_broker(&config)?);
 	net::configure_slot_pool(config.net_slots);
 	let home = Home::new(config.home.clone());
 	let owner = OwnerLock::acquire(&home)?;

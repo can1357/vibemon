@@ -657,6 +657,19 @@ pub fn has_net_admin() -> bool {
 pub const fn has_net_admin() -> bool {
 	false
 }
+/// Return whether this process itself holds net-admin (root or
+/// `CAP_NET_ADMIN`) and can self-host the privileged broker.
+#[cfg(target_os = "linux")]
+pub fn has_direct_net_admin() -> bool {
+	has_net_admin_direct()
+}
+
+/// Return whether this process itself holds net-admin (root or
+/// `CAP_NET_ADMIN`) and can self-host the privileged broker.
+#[cfg(not(target_os = "linux"))]
+pub const fn has_direct_net_admin() -> bool {
+	false
+}
 /// Test seam: when installed, every broker round trip is routed through this
 /// handler instead of the Unix socket, letting tests count and answer them.
 #[cfg(test)]
