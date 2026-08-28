@@ -2747,6 +2747,11 @@ impl Engine {
 				"allow_host_gateway cannot be combined with host-brokered credentials",
 			));
 		}
+		if params.allow_host_gateway && params.block_network {
+			return Err(EngineError::invalid(
+				"allow_host_gateway requires networking and cannot be combined with block_network",
+			));
+		}
 		validate_cidrs("egress_allow", params.egress_allow.as_deref())?;
 		validate_cidrs("inbound_cidr_allowlist", params.inbound_cidr_allowlist.as_deref())?;
 		validate_domains("egress_allow_domains", params.egress_allow_domains.as_deref())?;
@@ -13132,11 +13137,14 @@ mod tests {
 			err.message,
 			"allow_host_gateway cannot be combined with host-brokered credentials"
 		);
-		assert!(network_required(&SandboxCreate {
-			block_network: true,
-			allow_host_gateway: true,
-			..valid_create()
-		}));
+		let err = engine
+			.create(SandboxCreate { allow_host_gateway: true, block_network: true, ..valid_create() })
+			.expect_err("gateway without networking");
+		assert_eq!(
+			err.message,
+			"allow_host_gateway requires networking and cannot be combined with block_network"
+		);
+		assert!(network_required(&SandboxCreate { allow_host_gateway: true, ..valid_create() }));
 		let err = engine
 			.create(SandboxCreate {
 				remote_page_url: Some("http://peer".to_owned()),

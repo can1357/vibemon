@@ -516,15 +516,17 @@ fn client_served_host_gateway_roundtrip_and_detach() {
 	if !require_server_e2e() || !common::supports_tap() {
 		return;
 	}
-	if std::env::var("VMON_TAP").is_err() {
-		eprintln!("SKIP client_served_host_gateway_roundtrip_and_detach: VMON_TAP not set");
+	// vmond allocates the sandbox TAP itself, which requires root. Run this
+	// case through the sudo lane (isolated CARGO_TARGET_DIR, like smoke-jail).
+	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
+	if unsafe { libc::geteuid() } != 0 {
+		eprintln!("SKIP client_served_host_gateway_roundtrip_and_detach: TAP allocation needs root");
 		return;
 	}
 	let server = Server::start(&HOME);
 	let view = create_sandbox(
 		&server,
 		json!({
-			"block_network": true,
 			"allow_host_gateway": true,
 		}),
 	);
@@ -533,8 +535,7 @@ fn client_served_host_gateway_roundtrip_and_detach() {
 		.pointer("/network/guest_config/host_ip")
 		.and_then(Value::as_str)
 		.map(str::to_owned)
-		.or_else(|| std::env::var("VMON_HOST_IP").ok())
-		.unwrap_or_else(|| "192.168.249.1".to_owned());
+		.expect("created TAP sandbox reports its host ip");
 	let unattached_url = format!("http://{host_ip}:17973");
 	let (exit, ..) =
 		exec(&server, &id, &["/bin/sh", "-c", &format!("wget -T 2 -qO- {unattached_url}")]);
