@@ -517,7 +517,10 @@ fn client_served_host_gateway_roundtrip_and_detach() {
 		return;
 	}
 	// vmond allocates the sandbox TAP itself, which requires root. Run this
-	// case through the sudo lane (isolated CARGO_TARGET_DIR, like smoke-jail).
+	// case through the sudo lane (isolated CARGO_TARGET_DIR, like smoke-jail),
+	// with VMON_NO_SANDBOX=1 unless sandbox UID/GID mapping is configured:
+	// sudo env VMON_E2E=1 VMON_NO_SANDBOX=1 CARGO_TARGET_DIR=target/sudo \
+	//   HOME="$HOME" PATH="$PATH" cargo test --test server_e2e client_served
 	// SAFETY: `geteuid` has no preconditions and only reads process credentials.
 	if unsafe { libc::geteuid() } != 0 {
 		eprintln!("SKIP client_served_host_gateway_roundtrip_and_detach: TAP allocation needs root");
