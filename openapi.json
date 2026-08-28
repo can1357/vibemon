@@ -1501,6 +1501,10 @@
               "null"
             ]
           },
+          "allow_host_gateway": {
+            "type": "boolean",
+            "description": "Permit only the fixed host gateway TCP port on this sandbox's TAP."
+          },
           "block_network": {
             "type": "boolean"
           },

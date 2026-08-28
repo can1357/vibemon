@@ -18,9 +18,10 @@ vmon --context local ps
 
 The primary commands are:
 
-- `vmon run [IMAGE] [CMD...]` boots an image, streams its output unless `--detach` is used, and accepts `--name`, `--mem`, `--cpus`, `--disk-mb`, `--timeout`, `--block-network`, and `--arch`.
+- `vmon run [IMAGE] [CMD...]` boots an image, streams its output unless `--detach` is used, and accepts `--name`, `--mem`, `--cpus`, `--disk-mb`, `--timeout`, `--block-network`, `--arch`, and `--allow-host-gateway`. The last flag permits only the fixed host gateway TCP port on that sandbox's TAP.
+- `vmon gateway NAME --to TARGET` binds that opted-in TAP address while attached and relays each guest TCP connection to a runner-owned `host:port`, `:port`, or `http(s)://host[:port]` target. The listener is removed when the command exits.
 - `vmon ps`, `logs NAME [-f]`, `stop NAME`, `rm NAME`, `pause NAME`, `resume NAME`, `suspend NAME`, `history NAME`, `rollback NAME POINT`, `extend NAME SECS`, and `stats NAME` inspect or change a sandbox. Pause retains the live VM; suspend releases it only after committing a durable checkpoint.
-- `vmon exec NAME [CMD...]` runs a command in an agent-enabled sandbox; add `--tty` for a PTY. `vmon shell` opens or attaches a shell and can create a fresh shell with `--image`; `-e KEY=VALUE` sets a variable and bare `-e KEY` copies it from the host.
+- `vmon exec NAME [CMD...]` runs a command in an agent-enabled sandbox. Use `--tty` for a PTY or `--pipe` for raw bidirectional stdin/stdout suitable for JSON-RPC and other machine protocols; `--workdir`, `--env`, and `--timeout` configure the guest process. `vmon shell` opens or attaches a shell and can create a fresh shell with `--image`.
 - `vmon cp SRC DST` transfers a file between the host and guest. `vmon fs list NAME[:PATH]` and `vmon fs stat NAME[:PATH]` inspect guest paths.
 - `vmon snapshot NAME SNAPSHOT [--stop]`, `vmon restore SNAPSHOT [--name NAME] [--agent] [--detach] [--arch ...]`, and `vmon fork SNAPSHOT [--count N] [--arch ...]` operate managed snapshots. See [Snapshots, Restore, and Fork](snapshots.md).
 - `vmon volume ls|rm NAME` and `vmon pool ls|set|rm` operate managed volumes and warm pools. See [Storage and Volumes](storage.md).

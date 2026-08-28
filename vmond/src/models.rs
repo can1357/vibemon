@@ -56,6 +56,9 @@ pub struct SandboxCreate {
 	pub egress_allow: Option<Vec<String>>,
 	pub egress_allow_domains: Option<Vec<String>>,
 	pub inbound_cidr_allowlist: Option<Vec<String>>,
+	/// Allow the fixed host gateway port on this sandbox's TAP.
+	#[serde(default)]
+	pub allow_host_gateway: bool,
 	/// Single routed NIC attachment to a VPC.
 	pub nics: Option<Vec<NicSpec>>,
 	pub readiness_probe: Option<Value>,
@@ -119,6 +122,7 @@ impl Default for SandboxCreate {
 			egress_allow: None,
 			egress_allow_domains: None,
 			inbound_cidr_allowlist: None,
+			allow_host_gateway: false,
 			nics: None,
 			readiness_probe: None,
 			pool_size: 0,

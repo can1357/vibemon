@@ -12,7 +12,7 @@ mod common;
 
 use std::{
 	fs,
-	io::{Read, Write},
+	io::{BufRead, BufReader, Read, Write},
 	net::{TcpListener, TcpStream},
 	os::unix::{fs::DirBuilderExt, net::UnixStream},
 	path::{Path, PathBuf},
@@ -328,6 +328,65 @@ fn write_s3_fixture_response(stream: &mut TcpStream, status: &str, body: &[u8]) 
 	stream.write_all(body).expect("write fake S3 body");
 }
 
+struct LocalHttp {
+	port: u16,
+	stop: Arc<AtomicBool>,
+	task: Option<JoinHandle<()>>,
+}
+
+impl LocalHttp {
+	fn start(body: &'static [u8]) -> Self {
+		let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local HTTP fixture");
+		let port = listener.local_addr().expect("fixture address").port();
+		listener.set_nonblocking(true).expect("nonblocking fixture");
+		let stop = Arc::new(AtomicBool::new(false));
+		let thread_stop = Arc::clone(&stop);
+		let task = thread::spawn(move || {
+			while !thread_stop.load(Ordering::Relaxed) {
+				match listener.accept() {
+					Ok((mut stream, _)) => {
+						stream
+							.set_read_timeout(Some(Duration::from_secs(5)))
+							.expect("fixture read timeout");
+						let mut request = Vec::new();
+						let mut chunk = [0_u8; 1024];
+						while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+							match stream.read(&mut chunk) {
+								Ok(0) => break,
+								Ok(count) => request.extend_from_slice(&chunk[..count]),
+								Err(_) => break,
+							}
+						}
+						let head = format!(
+							"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+							body.len()
+						);
+						stream
+							.write_all(head.as_bytes())
+							.expect("fixture response headers");
+						stream.write_all(body).expect("fixture response body");
+					},
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					},
+					Err(error) => panic!("HTTP fixture accept failed: {error}"),
+				}
+			}
+		});
+		Self { port, stop, task: Some(task) }
+	}
+}
+
+impl Drop for LocalHttp {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::Relaxed);
+		let _ = TcpStream::connect(("127.0.0.1", self.port));
+		if let Some(task) = self.task.take() {
+			task.join().expect("join HTTP fixture");
+		}
+	}
+}
+
 /// Create a block-network sandbox from the e2e image; first call in the
 /// process pays the template build (generous server-side wait).
 fn create_sandbox(server: &Server, extra: Value) -> Value {
@@ -449,6 +508,77 @@ fn create_exec_roundtrip() {
 		.into_inner();
 	assert_eq!(String::from_utf8_lossy(&out.stdout), "/tmp-m1");
 
+	remove_sandbox(&server, &id);
+}
+
+#[test]
+fn client_served_host_gateway_roundtrip_and_detach() {
+	if !require_server_e2e() || !common::supports_tap() {
+		return;
+	}
+	if std::env::var("VMON_TAP").is_err() {
+		eprintln!("SKIP client_served_host_gateway_roundtrip_and_detach: VMON_TAP not set");
+		return;
+	}
+	let server = Server::start(&HOME);
+	let view = create_sandbox(
+		&server,
+		json!({
+			"block_network": true,
+			"allow_host_gateway": true,
+		}),
+	);
+	let id = sandbox_id(&view);
+	let host_ip = view
+		.pointer("/network/guest_config/host_ip")
+		.and_then(Value::as_str)
+		.map(str::to_owned)
+		.or_else(|| std::env::var("VMON_HOST_IP").ok())
+		.unwrap_or_else(|| "192.168.249.1".to_owned());
+	let unattached_url = format!("http://{host_ip}:17973");
+	let (exit, ..) =
+		exec(&server, &id, &["/bin/sh", "-c", &format!("wget -T 2 -qO- {unattached_url}")]);
+	assert_ne!(exit, 0, "gateway port accepted a connection before attach");
+
+	let fixture = LocalHttp::start(b"gateway-e2e");
+	let mut gateway = Command::new(env!("CARGO_BIN_EXE_vmon"))
+		.arg("gateway")
+		.arg(&id)
+		.arg("--to")
+		.arg(format!("http://127.0.0.1:{}", fixture.port))
+		.env("VMON_HOME", HOME.as_os_str())
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::inherit())
+		.spawn()
+		.expect("spawn vmon gateway");
+	let mut reader = BufReader::new(gateway.stdout.take().expect("gateway stdout"));
+	let mut ready_line = String::new();
+	reader
+		.read_line(&mut ready_line)
+		.expect("read gateway ready");
+	let ready_url = ready_line
+		.trim()
+		.strip_prefix("ready ")
+		.expect("gateway ready line")
+		.to_owned();
+	assert!(ready_url.ends_with(":17973"), "unexpected ready URL: {ready_url}");
+
+	let (exit, stdout, stderr) =
+		exec(&server, &id, &["/bin/sh", "-c", &format!("wget -T 5 -qO- {ready_url}")]);
+	assert_eq!(exit, 0, "guest gateway request failed: {stderr}");
+	assert_eq!(stdout, "gateway-e2e");
+
+	drop(reader);
+	// SAFETY: the signal targets the live gateway child spawned above.
+	unsafe {
+		libc::kill(gateway.id() as i32, libc::SIGTERM);
+	}
+	let status = gateway.wait().expect("wait for gateway detach");
+	assert!(status.success(), "gateway exited with {status}");
+
+	let (exit, ..) = exec(&server, &id, &["/bin/sh", "-c", &format!("wget -T 2 -qO- {ready_url}")]);
+	assert_ne!(exit, 0, "gateway port accepted a connection after detach");
 	remove_sandbox(&server, &id);
 }
 

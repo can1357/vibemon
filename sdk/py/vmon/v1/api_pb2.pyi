@@ -412,6 +412,60 @@ class ExecOutput(_message.Message):
     pty: PtySession
     def __init__(self, chunk: _Optional[_Union[Output, _Mapping]] = ..., exit: _Optional[_Union[Exit, _Mapping]] = ..., ready: _Optional[_Union[Ready, _Mapping]] = ..., pty: _Optional[_Union[PtySession, _Mapping]] = ...) -> None: ...
 
+class HostGatewayInput(_message.Message):
+    __slots__ = ("attach", "data", "close")
+    ATTACH_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    CLOSE_FIELD_NUMBER: _ClassVar[int]
+    attach: HostGatewayAttach
+    data: HostGatewayData
+    close: HostGatewayClose
+    def __init__(self, attach: _Optional[_Union[HostGatewayAttach, _Mapping]] = ..., data: _Optional[_Union[HostGatewayData, _Mapping]] = ..., close: _Optional[_Union[HostGatewayClose, _Mapping]] = ...) -> None: ...
+
+class HostGatewayOutput(_message.Message):
+    __slots__ = ("ready", "open", "data", "close")
+    READY_FIELD_NUMBER: _ClassVar[int]
+    OPEN_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    CLOSE_FIELD_NUMBER: _ClassVar[int]
+    ready: HostGatewayReady
+    open: HostGatewayOpen
+    data: HostGatewayData
+    close: HostGatewayClose
+    def __init__(self, ready: _Optional[_Union[HostGatewayReady, _Mapping]] = ..., open: _Optional[_Union[HostGatewayOpen, _Mapping]] = ..., data: _Optional[_Union[HostGatewayData, _Mapping]] = ..., close: _Optional[_Union[HostGatewayClose, _Mapping]] = ...) -> None: ...
+
+class HostGatewayAttach(_message.Message):
+    __slots__ = ("sandbox_id",)
+    SANDBOX_ID_FIELD_NUMBER: _ClassVar[int]
+    sandbox_id: str
+    def __init__(self, sandbox_id: _Optional[str] = ...) -> None: ...
+
+class HostGatewayReady(_message.Message):
+    __slots__ = ("url",)
+    URL_FIELD_NUMBER: _ClassVar[int]
+    url: str
+    def __init__(self, url: _Optional[str] = ...) -> None: ...
+
+class HostGatewayOpen(_message.Message):
+    __slots__ = ("conn",)
+    CONN_FIELD_NUMBER: _ClassVar[int]
+    conn: int
+    def __init__(self, conn: _Optional[int] = ...) -> None: ...
+
+class HostGatewayData(_message.Message):
+    __slots__ = ("conn", "data")
+    CONN_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    conn: int
+    data: bytes
+    def __init__(self, conn: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class HostGatewayClose(_message.Message):
+    __slots__ = ("conn",)
+    CONN_FIELD_NUMBER: _ClassVar[int]
+    conn: int
+    def __init__(self, conn: _Optional[int] = ...) -> None: ...
+
 class PtyOpenStart(_message.Message):
     __slots__ = ("sandbox_id", "session_id", "cols", "rows", "exec", "env", "workdir")
     class EnvEntry(_message.Message):

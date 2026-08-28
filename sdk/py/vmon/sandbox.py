@@ -182,6 +182,7 @@ def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         "tags",
         "fs_dir",
         "block_network",
+        "allow_host_gateway",
         "ports",
         "egress_allow",
         "egress_allow_domains",

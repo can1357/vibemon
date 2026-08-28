@@ -287,6 +287,7 @@ The sandbox control plane is Rust-owned. `vmon serve` starts the `vmond` engine,
 | Command | What it does |
 | --- | --- |
 | `vmon suspend NAME` / `history NAME` / `rollback NAME POINT` | Durably suspend a sandbox, list its retained disk/checkpoint recovery points, or restore its identity to one point. `vmon resume NAME` restores the committed suspend checkpoint. |
+| `vmon gateway NAME --to TARGET` | Relays an opted-in sandbox's fixed TAP gateway to a runner-owned TCP or HTTP(S) target for the lifetime of the command. |
 | `vmon doctor` | Prints the local prerequisite checklist (vmon binary, macOS codesign entitlement, HVF/KVM, `skopeo`, `umoci`, `mkfs.ext4`, guest kernel, guest agent, daemon, and host environment) and exits non-zero on hard failures. `vmon doctor --serve --config PATH` validates the resolved `vmon serve` config surface. |
 | `vmon completion [bash|zsh|fish]` | Prints a sourceable shell-completion script; load it with `eval "$(vmon completion zsh)"` (or `bash`/`fish`). |
 

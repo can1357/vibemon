@@ -338,6 +338,7 @@ class SandboxAPI:
         tags: dict[str, str] | None = None,
         fs_dir: str | None = None,
         block_network: bool = False,
+        allow_host_gateway: bool = False,
         ports: Sequence[int] | None = None,
         egress_allow: Sequence[str] | None = None,
         egress_allow_domains: Sequence[str] | None = None,
@@ -381,6 +382,7 @@ class SandboxAPI:
                 else None,
                 "fs_dir": fs_dir,
                 "block_network": bool(block_network),
+                "allow_host_gateway": True if allow_host_gateway else None,
                 "ports": [int(port) for port in ports] if ports is not None else None,
                 "egress_allow": list(egress_allow) if egress_allow is not None else None,
                 "egress_allow_domains": list(egress_allow_domains)

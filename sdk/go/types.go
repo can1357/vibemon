@@ -230,6 +230,8 @@ type SandboxCreateRequest struct {
 	FilesystemDirectory string `json:"fs_dir,omitempty"`
 	// BlockNetwork disables guest network access.
 	BlockNetwork bool `json:"block_network"`
+	// AllowHostGateway permits only the fixed host gateway TCP port on this sandbox's TAP.
+	AllowHostGateway bool `json:"allow_host_gateway,omitempty"`
 	// Ports lists guest TCP ports to expose.
 	Ports []uint16 `json:"ports,omitempty"`
 	// EgressAllow lists allowed destination CIDRs.

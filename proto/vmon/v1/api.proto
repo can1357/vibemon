@@ -153,6 +153,17 @@ service SandboxService {
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
   //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
   rpc Exec(stream ExecInput) returns (stream ExecOutput);
+  // Attaches a client-served TCP gateway to a sandbox's private TAP network.
+  // The first `HostGatewayInput` message sent MUST contain `attach`; the server
+  // emits `ready` before accepting guest connections.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  //   - `invalid` (INVALID_ARGUMENT): Host gateway access was not enabled at creation.
+  //   - `unsupported` (UNIMPLEMENTED): The sandbox does not use Linux TAP networking.
+  //   - `busy` (ABORTED): Another gateway client is already attached.
+  rpc HostGateway(stream HostGatewayInput) returns (stream HostGatewayOutput);
 
   // Opens an interactive shell session inside the guest.
   // The first `ExecInput` message sent MUST contain the `shell_params_json` payload.
@@ -667,6 +678,72 @@ message ExecOutput {
     // Session metadata; emitted exactly once as the first frame of PtyOpen and PtyAttach.
     PtySession pty = 4;
   }
+}
+
+// HostGatewayInput represents the client-to-server side of a TCP gateway.
+message HostGatewayInput {
+  // The gateway input event.
+  oneof input {
+    // Required first frame identifying the target sandbox.
+    HostGatewayAttach attach = 1;
+
+    // Bytes received from the client-owned upstream connection.
+    HostGatewayData data = 2;
+
+    // Closes the identified connection.
+    HostGatewayClose close = 3;
+  }
+}
+
+// HostGatewayOutput represents the server-to-client side of a TCP gateway.
+message HostGatewayOutput {
+  // The gateway output event.
+  oneof output {
+    // Emitted exactly once after the private listener is bound.
+    HostGatewayReady ready = 1;
+
+    // Requests that the client open an upstream connection.
+    HostGatewayOpen open = 2;
+
+    // Bytes received from the guest connection.
+    HostGatewayData data = 3;
+
+    // Reports that the guest connection has closed.
+    HostGatewayClose close = 4;
+  }
+}
+
+// HostGatewayAttach selects the sandbox whose private gateway is attached.
+message HostGatewayAttach {
+  // The unique identifier of the target sandbox.
+  string sandbox_id = 1;
+}
+
+// HostGatewayReady reports the guest-visible listener URL.
+message HostGatewayReady {
+  // Guest-visible URL for the fixed TAP gateway listener.
+  string url = 1;
+}
+
+// HostGatewayOpen identifies a newly accepted guest TCP connection.
+message HostGatewayOpen {
+  // Server-assigned connection identifier.
+  uint64 conn = 1;
+}
+
+// HostGatewayData carries bytes for one gateway connection.
+message HostGatewayData {
+  // Server-assigned connection identifier.
+  uint64 conn = 1;
+
+  // Raw TCP payload.
+  bytes data = 2;
+}
+
+// HostGatewayClose closes one gateway connection.
+message HostGatewayClose {
+  // Server-assigned connection identifier.
+  uint64 conn = 1;
 }
 
 // PtyOpenStart opens a server-persistent PTY session inside a sandbox.

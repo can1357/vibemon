@@ -759,6 +759,7 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 	type AttachStream = BoxStream<pb::ExecOutput>;
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
+	type HostGatewayStream = BoxStream<pb::HostGatewayOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
 	type PtyAttachStream = BoxStream<pb::ExecOutput>;
 	type PtyOpenStream = BoxStream<pb::ExecOutput>;
@@ -1054,6 +1055,37 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 		let outbound = tokio_stream::once(first)
 			.chain(tokio_stream::StreamExt::filter_map(inbound, |frame| frame.ok()));
 		client.exec(self.core.request(outbound)).await.map(relay)
+	}
+
+	async fn host_gateway(
+		&self,
+		request: Request<Streaming<pb::HostGatewayInput>>,
+	) -> Result<Response<Self::HostGatewayStream>, Status> {
+		let mut inbound = request.into_inner();
+		let first = inbound.message().await?.ok_or_else(|| {
+			coded(Code::InvalidArgument, "invalid", false, "empty host gateway stream")
+		})?;
+		let sid = match &first.input {
+			Some(pb::host_gateway_input::Input::Attach(attach)) if !attach.sandbox_id.is_empty() => {
+				attach.sandbox_id.clone()
+			},
+			_ => {
+				return Err(coded(
+					Code::InvalidArgument,
+					"invalid",
+					false,
+					"first host gateway frame must be an attach payload naming a sandbox",
+				));
+			},
+		};
+		let (_wid, url) = self.core.resolve_sandbox(&sid).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		let outbound = tokio_stream::once(first)
+			.chain(tokio_stream::StreamExt::filter_map(inbound, |frame| frame.ok()));
+		client
+			.host_gateway(self.core.request(outbound))
+			.await
+			.map(relay)
 	}
 
 	async fn pty_open(

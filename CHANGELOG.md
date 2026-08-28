@@ -29,6 +29,9 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added raw bidirectional `vmon exec --pipe` with guest workdir, environment, and timeout controls for machine protocols
+- Added a per-sandbox `--allow-host-gateway` TAP rule for runner-owned host proxies without exposing arbitrary host ports
+- Added `vmon gateway NAME --to TARGET` and the bidirectional `HostGateway` API for client-served sandbox host gateways
 - Added support for publishing and lazy-consuming cloud disk exports (`gs://`, `s3://`) with range-addressable virtio-fs base mounts
 - Added Go SDK support for persistent PTY sessions, VM resizing, and VPC management
 - Added Freestyle compatibility facades for TypeScript, Python, and Go SDKs

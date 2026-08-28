@@ -52,6 +52,14 @@ exact URL with the credential name and an HTTPS target; do not derive, log, or
 persist a replacement URL. The capability in the path authorizes access to
 that sandbox's attached names only.
 
+`vmon run --allow-host-gateway` installs the same narrowly scoped TAP rule
+without starting the credential broker: only TCP port 17973 on that sandbox's
+host TAP address becomes reachable from its guest /32. It is mutually exclusive
+with attached credential names. `vmon gateway NAME --to TARGET` is the sanctioned
+runner-owned proxy: it binds the TAP address only while the client is attached,
+relays each guest connection to the selected runner target, and removes the
+listener on detach. Never use it as a general host-service exposure mechanism.
+
 ```sh
 curl --fail-with-body --request POST "$VMON_CREDENTIAL_GATEWAY" \
   --header 'content-type: application/json' \

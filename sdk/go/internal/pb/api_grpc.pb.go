@@ -36,6 +36,7 @@ const (
 	SandboxService_Logs_FullMethodName           = "/vmon.v1.SandboxService/Logs"
 	SandboxService_ExecCapture_FullMethodName    = "/vmon.v1.SandboxService/ExecCapture"
 	SandboxService_Exec_FullMethodName           = "/vmon.v1.SandboxService/Exec"
+	SandboxService_HostGateway_FullMethodName    = "/vmon.v1.SandboxService/HostGateway"
 	SandboxService_Shell_FullMethodName          = "/vmon.v1.SandboxService/Shell"
 	SandboxService_Attach_FullMethodName         = "/vmon.v1.SandboxService/Attach"
 	SandboxService_FileRead_FullMethodName       = "/vmon.v1.SandboxService/FileRead"
@@ -177,6 +178,17 @@ type SandboxServiceClient interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
 	Exec(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error)
+	// Attaches a client-served TCP gateway to a sandbox's private TAP network.
+	// The first `HostGatewayInput` message sent MUST contain `attach`; the server
+	// emits `ready` before accepting guest connections.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `invalid` (INVALID_ARGUMENT): Host gateway access was not enabled at creation.
+	//   - `unsupported` (UNIMPLEMENTED): The sandbox does not use Linux TAP networking.
+	//   - `busy` (ABORTED): Another gateway client is already attached.
+	HostGateway(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[HostGatewayInput, HostGatewayOutput], error)
 	// Opens an interactive shell session inside the guest.
 	// The first `ExecInput` message sent MUST contain the `shell_params_json` payload.
 	// The server emits a `Ready` frame containing the resolved sandbox ID before streaming I/O.
@@ -531,9 +543,22 @@ func (c *sandboxServiceClient) Exec(ctx context.Context, opts ...grpc.CallOption
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SandboxService_ExecClient = grpc.BidiStreamingClient[ExecInput, ExecOutput]
 
+func (c *sandboxServiceClient) HostGateway(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[HostGatewayInput, HostGatewayOutput], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[4], SandboxService_HostGateway_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[HostGatewayInput, HostGatewayOutput]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_HostGatewayClient = grpc.BidiStreamingClient[HostGatewayInput, HostGatewayOutput]
+
 func (c *sandboxServiceClient) Shell(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[4], SandboxService_Shell_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[5], SandboxService_Shell_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +571,7 @@ type SandboxService_ShellClient = grpc.BidiStreamingClient[ExecInput, ExecOutput
 
 func (c *sandboxServiceClient) Attach(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[5], SandboxService_Attach_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[6], SandboxService_Attach_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -705,7 +730,7 @@ func (c *sandboxServiceClient) Resize(ctx context.Context, in *ResizeSandboxRequ
 
 func (c *sandboxServiceClient) PtyOpen(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[6], SandboxService_PtyOpen_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[7], SandboxService_PtyOpen_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +743,7 @@ type SandboxService_PtyOpenClient = grpc.BidiStreamingClient[ExecInput, ExecOutp
 
 func (c *sandboxServiceClient) PtyAttach(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[7], SandboxService_PtyAttach_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[8], SandboxService_PtyAttach_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -877,6 +902,17 @@ type SandboxServiceServer interface {
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
 	Exec(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error
+	// Attaches a client-served TCP gateway to a sandbox's private TAP network.
+	// The first `HostGatewayInput` message sent MUST contain `attach`; the server
+	// emits `ready` before accepting guest connections.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `invalid` (INVALID_ARGUMENT): Host gateway access was not enabled at creation.
+	//   - `unsupported` (UNIMPLEMENTED): The sandbox does not use Linux TAP networking.
+	//   - `busy` (ABORTED): Another gateway client is already attached.
+	HostGateway(grpc.BidiStreamingServer[HostGatewayInput, HostGatewayOutput]) error
 	// Opens an interactive shell session inside the guest.
 	// The first `ExecInput` message sent MUST contain the `shell_params_json` payload.
 	// The server emits a `Ready` frame containing the resolved sandbox ID before streaming I/O.
@@ -1087,6 +1123,9 @@ func (UnimplementedSandboxServiceServer) ExecCapture(context.Context, *ExecCaptu
 }
 func (UnimplementedSandboxServiceServer) Exec(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error {
 	return status.Error(codes.Unimplemented, "method Exec not implemented")
+}
+func (UnimplementedSandboxServiceServer) HostGateway(grpc.BidiStreamingServer[HostGatewayInput, HostGatewayOutput]) error {
+	return status.Error(codes.Unimplemented, "method HostGateway not implemented")
 }
 func (UnimplementedSandboxServiceServer) Shell(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error {
 	return status.Error(codes.Unimplemented, "method Shell not implemented")
@@ -1441,6 +1480,13 @@ func _SandboxService_Exec_Handler(srv interface{}, stream grpc.ServerStream) err
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SandboxService_ExecServer = grpc.BidiStreamingServer[ExecInput, ExecOutput]
+
+func _SandboxService_HostGateway_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SandboxServiceServer).HostGateway(&grpc.GenericServerStream[HostGatewayInput, HostGatewayOutput]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_HostGatewayServer = grpc.BidiStreamingServer[HostGatewayInput, HostGatewayOutput]
 
 func _SandboxService_Shell_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(SandboxServiceServer).Shell(&grpc.GenericServerStream[ExecInput, ExecOutput]{ServerStream: stream})
@@ -1928,6 +1974,12 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Exec",
 			Handler:       _SandboxService_Exec_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "HostGateway",
+			Handler:       _SandboxService_HostGateway_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

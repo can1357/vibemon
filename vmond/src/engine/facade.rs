@@ -32,6 +32,8 @@ use tokio::{
 };
 use vmm::snapshot::is_safe_snapshot_name;
 
+#[cfg(target_os = "linux")]
+use crate::security::HostGatewayClaims;
 use crate::{
 	config::{ClusterMode, ServeConfig, WarmImage},
 	engine::{
@@ -72,7 +74,7 @@ use crate::{
 	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
 	security::{
 		AuditEvent, AuditLog, CREDENTIAL_GATEWAY_PORT, CredentialGateway, CredentialProvider,
-		CredentialStore, EncryptedArchive, Keyring,
+		CredentialStore, EncryptedArchive, HostGateway, Keyring,
 		credentials::{Credential, CredentialMetadata},
 	},
 	volumes::{self, Secret, Volume, VolumeLock},
@@ -232,6 +234,8 @@ struct EngineInner {
 	sandbox_runtime: Arc<dyn SandboxRuntime>,
 	keyring: Arc<Keyring>,
 	credentials: Arc<CredentialStore>,
+	#[cfg(target_os = "linux")]
+	host_gateway_claims: HostGatewayClaims,
 	portable_history: Option<Arc<PortableHistory>>,
 	portable_ownership: Mutex<Option<PortableOwnership>>,
 	maintenance_busy: Mutex<HashSet<String>>,
@@ -1008,6 +1012,8 @@ impl Engine {
 				sandbox_runtime,
 				keyring,
 				credentials,
+				#[cfg(target_os = "linux")]
+				host_gateway_claims: HostGatewayClaims::default(),
 				audit,
 				maintenance_busy: Mutex::new(HashSet::new()),
 				maintenance_changed: Condvar::new(),
@@ -2736,6 +2742,11 @@ impl Engine {
 			return Err(EngineError::invalid("ports cannot be exposed when block_network=True"));
 		}
 		validate_ports(params.ports.as_deref())?;
+		if params.allow_host_gateway && credentials_requested(params) {
+			return Err(EngineError::invalid(
+				"allow_host_gateway cannot be combined with host-brokered credentials",
+			));
+		}
 		validate_cidrs("egress_allow", params.egress_allow.as_deref())?;
 		validate_cidrs("inbound_cidr_allowlist", params.inbound_cidr_allowlist.as_deref())?;
 		validate_domains("egress_allow_domains", params.egress_allow_domains.as_deref())?;
@@ -3335,7 +3346,15 @@ impl Engine {
 			runtime,
 			bind_ip,
 			guest_ip,
-		)
+		)?;
+		if cfg!(target_os = "linux") && plan.params.allow_host_gateway {
+			runtime
+				.network
+				.as_ref()
+				.ok_or_else(|| EngineError::engine("host gateway requires a TAP network"))?
+				.allow_credential_gateway()?;
+		}
+		Ok(())
 	}
 
 	fn start_credential_gateway_for(
@@ -3596,6 +3615,7 @@ impl Engine {
 			meta.insert("volumes".to_owned(), volumes_meta(&plan.volume_specs));
 			meta.insert("s3_mounts".to_owned(), s3_mounts_meta(&plan.s3_specs));
 			meta.insert("block_network".to_owned(), json!(plan.params.block_network));
+			meta.insert("allow_host_gateway".to_owned(), json!(plan.params.allow_host_gateway));
 			meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
 			meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
 			if let Some(idle_timeout_secs) = plan.params.idle_timeout_secs {
@@ -7427,6 +7447,7 @@ impl EngineApi for Engine {
 		detail.insert("memory".to_owned(), json!(plan.params.memory));
 		detail.insert("disk_mb".to_owned(), json!(plan.params.disk_mb));
 		detail.insert("block_network".to_owned(), json!(plan.params.block_network));
+		detail.insert("allow_host_gateway".to_owned(), json!(plan.params.allow_host_gateway));
 		detail.insert("egress_allow".to_owned(), json!(plan.params.egress_allow));
 		detail.insert("egress_allow_domains".to_owned(), json!(plan.params.egress_allow_domains));
 		detail.insert("inbound_cidr_allowlist".to_owned(), json!(plan.params.inbound_cidr_allowlist));
@@ -9308,6 +9329,56 @@ impl EngineApi for Engine {
 		self
 			.agent_for(id)?
 			.fs_stat(Path::new(path), AGENT_REQUEST_TIMEOUT)
+	}
+
+	fn host_gateway_attach(&self, id: &str) -> Result<HostGateway> {
+		let record = self
+			.inner
+			.registry
+			.get(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.status != "running" {
+			return Err(EngineError::not_running(format!("sandbox '{id}' is not running")));
+		}
+		if record
+			.detail
+			.get("allow_host_gateway")
+			.and_then(Value::as_bool)
+			!= Some(true)
+		{
+			return Err(EngineError::invalid(format!(
+				"sandbox '{id}' was not created with allow_host_gateway"
+			)));
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			Err(EngineError::unsupported("client-served host gateways require Linux TAP networking"))
+		}
+		#[cfg(target_os = "linux")]
+		{
+			let host_ip = {
+				let runtimes = self.inner.runtimes.lock();
+				let runtime = runtimes.get(&record.name).ok_or_else(|| {
+					EngineError::not_running(format!("sandbox '{id}' has no live runtime"))
+				})?;
+				let network = runtime.network.as_ref().ok_or_else(|| {
+					EngineError::unsupported("host gateway requires a Linux TAP network")
+				})?;
+				network
+					.guest_config
+					.host_ip
+					.parse::<IpAddr>()
+					.map_err(|_| EngineError::engine("allocated host gateway is not an IP address"))?
+			};
+			let claim = self.inner.host_gateway_claims.claim(&record.id)?;
+			HostGateway::start(
+				&self.inner.net_runtime,
+				host_ip,
+				host_ip,
+				CREDENTIAL_GATEWAY_PORT,
+				claim,
+			)
+		}
 	}
 
 	fn network_get(&self, id: &str) -> Result<Value> {
@@ -11337,6 +11408,7 @@ fn credentials_requested(params: &SandboxCreate) -> bool {
 fn network_required(params: &SandboxCreate) -> bool {
 	!params.block_network
 		|| credentials_requested(params)
+		|| params.allow_host_gateway
 		|| params.nics.as_ref().is_some_and(|nics| !nics.is_empty())
 }
 
@@ -11346,6 +11418,7 @@ fn reject_macos_host_network_features(params: &SandboxCreate) -> Result<()> {
 	}
 	for (feature, requested) in [
 		("ports", params.ports.as_ref().is_some_and(|v| !v.is_empty())),
+		("allow_host_gateway", params.allow_host_gateway),
 		("egress_allow", params.egress_allow.as_ref().is_some_and(|v| !v.is_empty())),
 		(
 			"egress_allow_domains",
@@ -11851,6 +11924,22 @@ mod tests {
 		let (engine, _home) = Engine::new_test(config_for(&temp));
 		let error = engine.cold_start("missing").expect_err("unknown sandbox");
 		assert_eq!(error.code, crate::error::ErrorCode::NotFound);
+	}
+
+	#[test]
+	fn host_gateway_attach_validates_sandbox_and_opt_in() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let error = engine
+			.host_gateway_attach("missing")
+			.expect_err("unknown sandbox must fail");
+		assert_eq!(error.code, crate::error::ErrorCode::NotFound);
+
+		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "running"));
+		let error = engine
+			.host_gateway_attach("sandbox")
+			.expect_err("gateway requires explicit opt-in");
+		assert_eq!(error.code, crate::error::ErrorCode::Invalid);
 	}
 
 	#[test]
@@ -13032,6 +13121,22 @@ mod tests {
 			.create(SandboxCreate { block_network: true, ports: Some(vec![80]), ..valid_create() })
 			.expect_err("bad ports");
 		assert_eq!(err.message, "ports cannot be exposed when block_network=True");
+		let err = engine
+			.create(SandboxCreate {
+				allow_host_gateway: true,
+				credentials: Some(vec!["brokered".to_owned()]),
+				..valid_create()
+			})
+			.expect_err("conflicting host gateways");
+		assert_eq!(
+			err.message,
+			"allow_host_gateway cannot be combined with host-brokered credentials"
+		);
+		assert!(network_required(&SandboxCreate {
+			block_network: true,
+			allow_host_gateway: true,
+			..valid_create()
+		}));
 		let err = engine
 			.create(SandboxCreate {
 				remote_page_url: Some("http://peer".to_owned()),

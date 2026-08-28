@@ -122,6 +122,7 @@ impl pb::sandbox_service_server::SandboxService for StubWorker {
 	type AttachStream = BoxStream<pb::ExecOutput>;
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
+	type HostGatewayStream = BoxStream<pb::HostGatewayOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
 	type PtyAttachStream = BoxStream<pb::ExecOutput>;
 	type PtyOpenStream = BoxStream<pb::ExecOutput>;
@@ -221,6 +222,13 @@ impl pb::sandbox_service_server::SandboxService for StubWorker {
 			stdout: format!("echo-from-{}", self.state.wid).into_bytes(),
 			stderr: Vec::new(),
 		}))
+	}
+
+	async fn host_gateway(
+		&self,
+		_request: Request<Streaming<pb::HostGatewayInput>>,
+	) -> Result<Response<Self::HostGatewayStream>, Status> {
+		stub_unimplemented()
 	}
 
 	async fn exec(

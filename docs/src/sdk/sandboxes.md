@@ -36,12 +36,12 @@ with vmon.connect() as client:
     )
 ```
 
-The request also supports `timeout_secs`, `fs_dir`, `block_network`, `egress_allow`, `egress_allow_domains`, `inbound_cidr_allowlist`, `readiness_probe`, `pool_size`, `ha`, `arch`, and `idempotency_key`. These configure the daemon request, not the local Python runtime.
+The request also supports `timeout_secs`, `fs_dir`, `block_network`, `allow_host_gateway`, `egress_allow`, `egress_allow_domains`, `inbound_cidr_allowlist`, `readiness_probe`, `pool_size`, `ha`, `arch`, and `idempotency_key`. `allow_host_gateway` exposes only the fixed, per-TAP host gateway port described in [Security](../platform/security.md#credential-broker). These configure the daemon request, not the local Python runtime.
 
 </div>
 <div data-sdk-language="go">
 
-`SandboxCreateRequest` carries the image or template choice and optional resource, environment, network, port, and storage settings. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create-request timeout in seconds. Use `Secrets` for secret bundles, `Credentials` for host-brokered credential names, and `S3Mounts` for S3-backed guest filesystems.
+`SandboxCreateRequest` carries the image or template choice and optional resource, environment, network, port, and storage settings, including the narrowly scoped `AllowHostGateway` flag. `TimeoutSeconds` is the sandbox idle timeout; it is distinct from `Timeout`, the create-request timeout in seconds. Use `Secrets` for secret bundles, `Credentials` for host-brokered credential names, and `S3Mounts` for S3-backed guest filesystems.
 
 ```go
 idleTimeout := uint64(900)
@@ -70,7 +70,7 @@ All Go operations take a `context.Context`. Cancellation or expiry ends the in-f
 </div>
 <div data-sdk-language="typescript">
 
-TypeScript sends a `SandboxCreateRequestWithSecrets`. It accepts fields including `image`, `command`, `env`, `workdir`, resource values, `ports`, `volumes`, `credentials`, tags, and creation-time network fields such as `block_network`, `egress_allow`, and `egress_allow_domains`.
+TypeScript sends a `SandboxCreateRequestWithSecrets`. It accepts fields including `image`, `command`, `env`, `workdir`, resource values, `ports`, `volumes`, `credentials`, tags, and creation-time network fields such as `block_network`, `allow_host_gateway`, `egress_allow`, and `egress_allow_domains`.
 
 ```ts
 import { connect } from "@stencil-hq/vibemon";

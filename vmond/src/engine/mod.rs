@@ -27,7 +27,10 @@ use crate::{
 	EngineError,
 	error::Result,
 	models::{ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
-	security::credentials::{Credential, CredentialMetadata},
+	security::{
+		HostGateway,
+		credentials::{Credential, CredentialMetadata},
+	},
 };
 /// Mesh-routing handoff for a portable restore. The staged epoch is
 /// deliberately non-serving until the VM is ready and `PostgreSQL` finalizes
@@ -271,6 +274,9 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn file_stat(&self, id: &str, path: &str) -> Result<Value>;
 
 	// -- networking -------------------------------------------------------
+	fn host_gateway_attach(&self, _id: &str) -> Result<HostGateway> {
+		Err(EngineError::unsupported("client-served host gateways are unavailable"))
+	}
 	fn network_get(&self, id: &str) -> Result<Value>;
 	fn network_set(&self, id: &str, policy: NetworkBody) -> Result<Value>;
 	/// Returns `{"tunnels": {...}, "connect_token": "…"}`.

@@ -120,6 +120,11 @@ class SandboxServiceStub:
                 request_serializer=vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
                 _registered_method=True)
+        self.HostGateway = channel.stream_stream(
+                '/vmon.v1.SandboxService/HostGateway',
+                request_serializer=vmon_dot_v1_dot_api__pb2.HostGatewayInput.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.HostGatewayOutput.FromString,
+                _registered_method=True)
         self.Shell = channel.stream_stream(
                 '/vmon.v1.SandboxService/Shell',
                 request_serializer=vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
@@ -442,6 +447,22 @@ class SandboxServiceServicer:
         Errors:
         - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
         - `not_running` (FAILED_PRECONDITION): The sandbox is not running or guest agent is unreachable.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HostGateway(self, request_iterator, context):
+        """Attaches a client-served TCP gateway to a sandbox's private TAP network.
+        The first `HostGatewayInput` message sent MUST contain `attach`; the server
+        emits `ready` before accepting guest connections.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+        - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+        - `invalid` (INVALID_ARGUMENT): Host gateway access was not enabled at creation.
+        - `unsupported` (UNIMPLEMENTED): The sandbox does not use Linux TAP networking.
+        - `busy` (ABORTED): Another gateway client is already attached.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -789,6 +810,11 @@ def add_SandboxServiceServicer_to_server(servicer, server):
                     servicer.Exec,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.ExecInput.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.ExecOutput.SerializeToString,
+            ),
+            'HostGateway': grpc.stream_stream_rpc_method_handler(
+                    servicer.HostGateway,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.HostGatewayInput.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.HostGatewayOutput.SerializeToString,
             ),
             'Shell': grpc.stream_stream_rpc_method_handler(
                     servicer.Shell,
@@ -1376,6 +1402,33 @@ class SandboxService:
             '/vmon.v1.SandboxService/Exec',
             vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
             vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HostGateway(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/vmon.v1.SandboxService/HostGateway',
+            vmon_dot_v1_dot_api__pb2.HostGatewayInput.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.HostGatewayOutput.FromString,
             options,
             channel_credentials,
             insecure,

@@ -47,7 +47,7 @@ use crate::{
 	},
 	models::{ExecBody, ExtendBody, ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
 	security::{
-		Principal,
+		HostGateway, HostGatewayCommand, HostGatewayEvent, Principal,
 		credentials::{Credential, CredentialMetadata},
 	},
 };
@@ -1073,6 +1073,22 @@ fn require_exec_start(frame: Option<pb::ExecInput>) -> Result<pb::ExecStart, Sta
 	}
 }
 
+/// The mandatory first frame of a client-served host gateway stream.
+fn require_host_gateway_attach(
+	frame: Option<pb::HostGatewayInput>,
+) -> Result<pb::HostGatewayAttach, Status> {
+	match frame.and_then(|frame| frame.input) {
+		Some(pb::host_gateway_input::Input::Attach(attach)) => {
+			if attach.sandbox_id.is_empty() {
+				Err(ApiError::invalid("host gateway attach requires sandbox_id").into())
+			} else {
+				Ok(attach)
+			}
+		},
+		_ => Err(ApiError::invalid("first host gateway frame must be attach").into()),
+	}
+}
+
 /// The mandatory first `ExecInput` of `Shell`: the shell params JSON document
 /// (an object; empty text counts as `{}`).
 fn require_shell_params(frame: Option<pb::ExecInput>) -> Result<Value, Status> {
@@ -1262,6 +1278,79 @@ fn pump_exec(
 			() = input => {},
 		}
 		shell_cleanup(&engine, cleanup).await;
+	});
+	Box::pin(ReceiverStream::new(out_rx))
+}
+
+fn pump_host_gateway(
+	mut gateway: HostGateway,
+	mut inbound: Streaming<pb::HostGatewayInput>,
+) -> BoxStream<pb::HostGatewayOutput> {
+	let ready = gateway.endpoint().to_owned();
+	let commands = gateway.commands();
+	let mut events = gateway.take_events();
+	let (out_tx, out_rx) = mpsc::channel::<Result<pb::HostGatewayOutput, Status>>(32);
+	tokio::spawn(async move {
+		let _gateway = gateway;
+		if out_tx
+			.send(Ok(pb::HostGatewayOutput {
+				output: Some(pb::host_gateway_output::Output::Ready(pb::HostGatewayReady {
+					url: ready,
+				})),
+			}))
+			.await
+			.is_err()
+		{
+			return;
+		}
+		let output_tx = out_tx.clone();
+		let output = async move {
+			while let Some(event) = events.recv().await {
+				let output = match event {
+					HostGatewayEvent::Open { conn } => {
+						pb::host_gateway_output::Output::Open(pb::HostGatewayOpen { conn })
+					},
+					HostGatewayEvent::Data { conn, data } => {
+						pb::host_gateway_output::Output::Data(pb::HostGatewayData { conn, data })
+					},
+					HostGatewayEvent::Close { conn } => {
+						pb::host_gateway_output::Output::Close(pb::HostGatewayClose { conn })
+					},
+				};
+				if output_tx
+					.send(Ok(pb::HostGatewayOutput { output: Some(output) }))
+					.await
+					.is_err()
+				{
+					break;
+				}
+			}
+		};
+		let input = async move {
+			loop {
+				let Ok(Some(frame)) = inbound.message().await else {
+					break;
+				};
+				let command = match frame.input {
+					Some(pb::host_gateway_input::Input::Data(data)) => {
+						Some(HostGatewayCommand::Data { conn: data.conn, data: data.data })
+					},
+					Some(pb::host_gateway_input::Input::Close(close)) => {
+						Some(HostGatewayCommand::Close { conn: close.conn })
+					},
+					Some(pb::host_gateway_input::Input::Attach(_)) | None => None,
+				};
+				if let Some(command) = command
+					&& commands.send(command).await.is_err()
+				{
+					break;
+				}
+			}
+		};
+		tokio::select! {
+			() = output => {},
+			() = input => {},
+		}
 	});
 	Box::pin(ReceiverStream::new(out_rx))
 }
@@ -2271,6 +2360,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	type AttachStream = BoxStream<pb::ExecOutput>;
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
+	type HostGatewayStream = BoxStream<pb::HostGatewayOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
 	type PtyAttachStream = BoxStream<pb::ExecOutput>;
 	type PtyOpenStream = BoxStream<pb::ExecOutput>;
@@ -2701,6 +2791,29 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 			.engine_call(move |engine| engine.exec_stream(&id, exec_request))
 			.await?;
 		Ok(Response::new(pump_exec(self.state.engine.clone(), stream, inbound, None, None)))
+	}
+
+	async fn host_gateway(
+		&self,
+		request: Request<Streaming<pb::HostGatewayInput>>,
+	) -> Result<Response<Self::HostGatewayStream>, Status> {
+		let (metadata, _, mut inbound) = request.into_parts();
+		let attach = require_host_gateway_attach(inbound.message().await?)?;
+		if let Some(target) = self.forward_target(&metadata, &attach.sandbox_id).await? {
+			let first =
+				pb::HostGatewayInput { input: Some(pb::host_gateway_input::Input::Attach(attach)) };
+			let outbound = tokio_stream::once(first).chain(inbound.filter_map(|frame| frame.ok()));
+			return target
+				.sandbox_client()
+				.host_gateway(target.request(outbound))
+				.await
+				.map(relay_stream);
+		}
+		let id = attach.sandbox_id;
+		let gateway = self
+			.engine_call(move |engine| engine.host_gateway_attach(&id))
+			.await?;
+		Ok(Response::new(pump_host_gateway(gateway, inbound)))
 	}
 
 	async fn pty_open(

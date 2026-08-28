@@ -79,6 +79,8 @@ enum Commands {
 	Ps,
 	/// Run a command inside an agent-enabled sandbox.
 	Exec(ExecArgs),
+	/// Serve a runner-owned target through a sandbox's private host gateway.
+	Gateway(GatewayArgs),
 	/// Run or attach to an interactive shell.
 	Shell(ShellArgs),
 	/// Copy a file between host and guest.
@@ -215,51 +217,147 @@ enum CallCommands {
 #[derive(Args)]
 struct RunArgs {
 	/// OCI/container image reference.
-	image:         Option<String>,
+	image:              Option<String>,
 	/// Command to run in the sandbox.
 	#[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "CMD")]
-	cmd:           Vec<String>,
+	cmd:                Vec<String>,
 	/// Dockerfile to build server-side before running.
 	#[arg(short = 'f', long)]
-	dockerfile:    Option<String>,
+	dockerfile:         Option<String>,
 	/// Dockerfile build context.
 	#[arg(long = "context", default_value = ".")]
-	build_context: String,
+	build_context:      String,
 	/// Sandbox name.
 	#[arg(long)]
-	name:          Option<String>,
+	name:               Option<String>,
 	/// Guest RAM in MiB.
 	#[arg(long, default_value_t = 512)]
-	mem:           u32,
+	mem:                u32,
 	/// vCPU count.
 	#[arg(long, default_value_t = 1)]
-	cpus:          u32,
+	cpus:               u32,
 	/// Sandbox disk size in MiB.
 	#[arg(long, default_value_t = 1024)]
-	disk_mb:       u32,
+	disk_mb:            u32,
 	/// Create timeout in seconds.
 	#[arg(long, default_value_t = 300.0)]
-	timeout:       f64,
+	timeout:            f64,
 	/// Leave the sandbox running in the background.
 	#[arg(short, long)]
-	detach:        bool,
+	detach:             bool,
+	/// Allow the fixed host gateway port on this sandbox's TAP.
+	#[arg(long)]
+	allow_host_gateway: bool,
 	/// Boot without networking.
 	#[arg(long)]
-	block_network: bool,
+	block_network:      bool,
 	/// Request an owner architecture.
 	#[arg(long, value_enum)]
-	arch:          Option<Arch>,
+	arch:               Option<Arch>,
 }
 
 #[derive(Args)]
 struct ExecArgs {
-	name: String,
+	name:    String,
 	/// Allocate a PTY and stream over the interactive exec protocol.
 	#[arg(short = 't', long)]
-	tty:  bool,
+	tty:     bool,
+	/// Stream raw stdin/stdout without allocating a PTY.
+	#[arg(long, conflicts_with = "tty")]
+	pipe:    bool,
+	/// Working directory inside the guest.
+	#[arg(short = 'w', long)]
+	workdir: Option<String>,
+	/// Environment variable KEY=VALUE; bare KEY copies it from the host.
+	#[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+	env:     Vec<String>,
+	/// Process timeout in seconds.
+	#[arg(long)]
+	timeout: Option<f64>,
 	/// Command to run.
 	#[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "CMD")]
-	cmd:  Vec<String>,
+	cmd:     Vec<String>,
+}
+
+#[derive(Args)]
+struct GatewayArgs {
+	/// Sandbox name.
+	name:   String,
+	/// Runner-owned target (`host:port`, `:port`, or an HTTP(S) URL).
+	#[arg(long = "to")]
+	target: GatewayTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayTarget {
+	host: String,
+	port: u16,
+}
+
+impl GatewayTarget {
+	fn address(&self) -> String {
+		if self.host.contains(':') {
+			format!("[{}]:{}", self.host, self.port)
+		} else {
+			format!("{}:{}", self.host, self.port)
+		}
+	}
+}
+
+impl std::str::FromStr for GatewayTarget {
+	type Err = String;
+
+	fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+		let (authority, default_port) = if let Some(rest) = value.strip_prefix("http://") {
+			(rest, Some(80))
+		} else if let Some(rest) = value.strip_prefix("https://") {
+			(rest, Some(443))
+		} else if value.contains("://") {
+			return Err("gateway target URL must use http or https".to_owned());
+		} else {
+			(value, None)
+		};
+		if authority.contains(['/', '?', '#']) {
+			return Err("gateway target URL must not contain a path, query, or fragment".to_owned());
+		}
+		let (host, port) = if let Some(authority) = authority.strip_prefix('[') {
+			let end = authority
+				.find(']')
+				.ok_or_else(|| "gateway target has an invalid IPv6 address".to_owned())?;
+			let host = &authority[..end];
+			let suffix = &authority[end + 1..];
+			let port = if suffix.is_empty() {
+				default_port.ok_or_else(|| "gateway target requires a port".to_owned())?
+			} else {
+				suffix
+					.strip_prefix(':')
+					.ok_or_else(|| "gateway target has an invalid port".to_owned())?
+					.parse::<u16>()
+					.map_err(|_| "gateway target has an invalid port".to_owned())?
+			};
+			(host.to_owned(), port)
+		} else if let Some((host, port)) = authority.rsplit_once(':') {
+			(
+				if host.is_empty() {
+					"127.0.0.1".to_owned()
+				} else {
+					host.to_owned()
+				},
+				port
+					.parse::<u16>()
+					.map_err(|_| "gateway target has an invalid port".to_owned())?,
+			)
+		} else {
+			(
+				authority.to_owned(),
+				default_port.ok_or_else(|| "gateway target requires a port".to_owned())?,
+			)
+		};
+		if host.is_empty() || port == 0 {
+			return Err("gateway target requires a non-empty host and nonzero port".to_owned());
+		}
+		Ok(Self { host, port })
+	}
 }
 
 #[derive(Args)]
@@ -630,6 +728,7 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Call { command } => cmd_call(command, transport_options),
 		Commands::Ps => cmd_ps(transport_options),
 		Commands::Exec(args) => cmd_exec(args, transport_options),
+		Commands::Gateway(args) => cmd_gateway(args, transport_options),
 		Commands::Shell(args) => cmd_shell(args, transport_options),
 		Commands::Cp(args) => cmd_cp(args, transport_options),
 		Commands::Logs(args) => cmd_logs(args, transport_options),
@@ -1488,6 +1587,7 @@ fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
 			|| args.name.is_some()
 			|| args.detach
 			|| args.block_network
+			|| args.allow_host_gateway
 			|| args.arch.is_some()
 		{
 			return err("sandbox options cannot be used with a durable function target");
@@ -1508,6 +1608,7 @@ fn cmd_run(args: RunArgs, options: &TransportOptions) -> Result<i32> {
 	body.insert("disk_mb".to_owned(), json!(args.disk_mb));
 	body.insert("timeout".to_owned(), json!(args.timeout));
 	body.insert("block_network".to_owned(), json!(args.block_network));
+	body.insert("allow_host_gateway".to_owned(), json!(args.allow_host_gateway));
 	if let Some(arch) = args.arch {
 		body.insert("arch".to_owned(), json!(arch.as_str()));
 	}
@@ -1578,14 +1679,36 @@ fn cmd_exec(args: ExecArgs, options: &TransportOptions) -> Result<i32> {
 	}
 	let client = client(options, true)?;
 	let grpc = client.grpc()?;
+	let start = pb::ExecStart {
+		sandbox_id: args.name.clone(),
+		cmd:        argv,
+		workdir:    args.workdir,
+		env:        parse_env(&args.env)?,
+		timeout:    args.timeout,
+		tty:        args.tty,
+	};
 	if args.tty {
-		return pump_exec(&grpc, ExecRpc::Exec, exec_start(&args.name, argv, true), true, true, true);
+		return pump_exec(
+			&grpc,
+			ExecRpc::Exec,
+			pb::exec_input::Input::Start(start),
+			true,
+			true,
+			true,
+		);
+	}
+	if args.pipe {
+		return pump_exec(
+			&grpc,
+			ExecRpc::Exec,
+			pb::exec_input::Input::Start(start),
+			false,
+			true,
+			false,
+		);
 	}
 	let mut sandboxes = grpc.sandboxes();
-	let request = pb::ExecCaptureRequest {
-		id:   args.name,
-		exec: Some(pb::ExecStart { cmd: argv, ..Default::default() }),
-	};
+	let request = pb::ExecCaptureRequest { id: args.name, exec: Some(start) };
 	let response = grpc
 		.block_on(sandboxes.exec_capture(request))
 		.map_err(status_error)?
@@ -1595,6 +1718,165 @@ fn cmd_exec(args: ExecArgs, options: &TransportOptions) -> Result<i32> {
 	io::stderr().write_all(&response.stderr)?;
 	io::stderr().flush()?;
 	Ok(clamp_exit(response.code))
+}
+
+enum GatewayConnectionCommand {
+	Data(Vec<u8>),
+	Close,
+}
+
+const fn gateway_input(input: pb::host_gateway_input::Input) -> pb::HostGatewayInput {
+	pb::HostGatewayInput { input: Some(input) }
+}
+
+async fn relay_gateway_connection(
+	conn: u64,
+	target: String,
+	mut commands: tokio::sync::mpsc::Receiver<GatewayConnectionCommand>,
+	outbound: tokio::sync::mpsc::Sender<pb::HostGatewayInput>,
+) -> u64 {
+	use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+	let mut target_stream = match tokio::net::TcpStream::connect(&target).await {
+		Ok(stream) => stream,
+		Err(error) => {
+			eprintln!("gateway connection {conn}: failed to dial {target}: {error}");
+			let _ = outbound
+				.send(gateway_input(pb::host_gateway_input::Input::Close(pb::HostGatewayClose {
+					conn,
+				})))
+				.await;
+			return conn;
+		},
+	};
+	let mut buffer = vec![0_u8; 64 * 1024];
+	loop {
+		tokio::select! {
+			read = target_stream.read(&mut buffer) => match read {
+				Ok(0) => break,
+				Ok(count) => {
+					if outbound
+						.send(gateway_input(pb::host_gateway_input::Input::Data(
+							pb::HostGatewayData {
+								conn,
+								data: buffer[..count].to_vec(),
+							},
+						)))
+						.await
+						.is_err()
+					{
+						return conn;
+					}
+				},
+				Err(error) => {
+					eprintln!("gateway connection {conn}: target read failed: {error}");
+					break;
+				},
+			},
+			command = commands.recv() => match command {
+				Some(GatewayConnectionCommand::Data(data)) => {
+					if let Err(error) = target_stream.write_all(&data).await {
+						eprintln!("gateway connection {conn}: target write failed: {error}");
+						break;
+					}
+				},
+				Some(GatewayConnectionCommand::Close) | None => return conn,
+			},
+		}
+	}
+	let _ = outbound
+		.send(gateway_input(pb::host_gateway_input::Input::Close(pb::HostGatewayClose { conn })))
+		.await;
+	conn
+}
+
+fn cmd_gateway(args: GatewayArgs, options: &TransportOptions) -> Result<i32> {
+	let client = client(options, true)?;
+	let grpc = client.grpc()?;
+	let target = args.target.address();
+	let rpc_grpc = grpc.clone();
+	grpc.block_on(async move {
+		let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(64);
+		outbound_tx
+			.send(gateway_input(pb::host_gateway_input::Input::Attach(pb::HostGatewayAttach {
+				sandbox_id: args.name,
+			})))
+			.await
+			.map_err(|_| CliError::new("gateway stream closed before attach"))?;
+		let mut sandboxes = rpc_grpc.sandboxes();
+		let mut inbound = sandboxes
+			.host_gateway(ReceiverStream::new(outbound_rx))
+			.await
+			.map_err(status_error)?
+			.into_inner();
+		let first = inbound
+			.message()
+			.await
+			.map_err(status_error)?
+			.ok_or_else(|| CliError::new("gateway stream ended before ready"))?;
+		let Some(pb::host_gateway_output::Output::Ready(ready)) = first.output else {
+			return err("gateway server did not send ready as its first frame");
+		};
+		println!("ready {}", ready.url);
+		io::stdout().flush()?;
+
+		let mut connections =
+			HashMap::<u64, tokio::sync::mpsc::Sender<GatewayConnectionCommand>>::new();
+		let mut tasks = tokio::task::JoinSet::new();
+		let interrupt = tokio::signal::ctrl_c();
+		tokio::pin!(interrupt);
+		let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+			.map_err(|error| CliError::new(format!("installing SIGTERM handler: {error}")))?;
+		let result = loop {
+			tokio::select! {
+				frame = inbound.message() => match frame {
+					Ok(Some(frame)) => match frame.output {
+						Some(pb::host_gateway_output::Output::Open(open)) => {
+							let (tx, rx) = tokio::sync::mpsc::channel(32);
+							connections.insert(open.conn, tx);
+							tasks.spawn(relay_gateway_connection(
+								open.conn,
+								target.clone(),
+								rx,
+								outbound_tx.clone(),
+							));
+						},
+						Some(pb::host_gateway_output::Output::Data(data)) => {
+							if let Some(connection) = connections.get(&data.conn)
+								&& connection
+									.send(GatewayConnectionCommand::Data(data.data))
+									.await
+									.is_err()
+							{
+								connections.remove(&data.conn);
+							}
+						},
+						Some(pb::host_gateway_output::Output::Close(close)) => {
+							if let Some(connection) = connections.remove(&close.conn) {
+								let _ = connection.send(GatewayConnectionCommand::Close).await;
+							}
+						},
+						Some(pb::host_gateway_output::Output::Ready(_)) | None => {
+							break err("invalid gateway output frame");
+						},
+					},
+					Ok(None) => break Ok(0),
+					Err(status) => break Err(status_error(status)),
+				},
+				completed = tasks.join_next(), if !tasks.is_empty() => {
+					if let Some(Ok(conn)) = completed {
+						connections.remove(&conn);
+					}
+				},
+				_ = &mut interrupt => break Ok(0),
+				_ = terminate.recv() => break Ok(0),
+			}
+		};
+		tasks.abort_all();
+		connections.clear();
+		drop(outbound_tx);
+		result
+	})
 }
 
 fn cmd_shell(args: ShellArgs, options: &TransportOptions) -> Result<i32> {
@@ -2951,6 +3233,13 @@ mod durable_cli_tests {
 		};
 		assert_eq!(run.image.as_deref(), Some("alpine"));
 		assert_eq!(run.cmd, ["echo", "ok"]);
+		assert!(!run.allow_host_gateway);
+
+		let run = Cli::try_parse_from(["vmon", "run", "--allow-host-gateway", "alpine"]).unwrap();
+		let Commands::Run(run) = run.command else {
+			panic!("expected run")
+		};
+		assert!(run.allow_host_gateway);
 
 		let serve = Cli::try_parse_from(["vmon", "serve", "--port", "9000"]).unwrap();
 		let Commands::Serve(serve) = serve.command else {
@@ -2969,6 +3258,62 @@ mod durable_cli_tests {
 		assert!(
 			Cli::try_parse_from(["vmon", "serve", "--function-artifact-max-bytes", "0",]).is_err()
 		);
+	}
+	#[test]
+	fn exec_pipe_is_raw_streaming_and_conflicts_with_tty() {
+		let command = Cli::try_parse_from([
+			"vmon",
+			"exec",
+			"--pipe",
+			"--workdir",
+			"/app",
+			"--env",
+			"HOME=/root",
+			"--timeout",
+			"12",
+			"box",
+			"--",
+			"cat",
+		])
+		.unwrap();
+		let Commands::Exec(exec) = command.command else {
+			panic!("expected exec")
+		};
+		assert!(exec.pipe);
+		assert!(!exec.tty);
+		assert_eq!(exec.workdir.as_deref(), Some("/app"));
+		assert_eq!(exec.env, ["HOME=/root"]);
+		assert_eq!(exec.timeout, Some(12.0));
+		assert_eq!(exec.name, "box");
+		assert_eq!(exec.cmd, ["cat"]);
+		assert!(
+			Cli::try_parse_from(["vmon", "exec", "--pipe", "--tty", "box", "--", "cat"]).is_err()
+		);
+	}
+
+	#[test]
+	fn gateway_target_forms_parse_and_to_is_required() {
+		for (target, expected) in [
+			("service.internal:4000", GatewayTarget {
+				host: "service.internal".to_owned(),
+				port: 4000,
+			}),
+			(":4000", GatewayTarget { host: "127.0.0.1".to_owned(), port: 4000 }),
+			("http://127.0.0.1:4000", GatewayTarget { host: "127.0.0.1".to_owned(), port: 4000 }),
+			("https://service.internal", GatewayTarget {
+				host: "service.internal".to_owned(),
+				port: 443,
+			}),
+		] {
+			let command =
+				Cli::try_parse_from(["vmon", "gateway", "box", "--to", target]).expect("gateway");
+			let Commands::Gateway(gateway) = command.command else {
+				panic!("expected gateway")
+			};
+			assert_eq!(gateway.name, "box");
+			assert_eq!(gateway.target, expected);
+		}
+		assert!(Cli::try_parse_from(["vmon", "gateway", "box"]).is_err());
 	}
 
 	#[test]

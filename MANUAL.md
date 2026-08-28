@@ -141,7 +141,8 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 | `build` | build a Dockerfile into a local OCI layout | `vmon build -f Dockerfile -t demo:latest .` |
 | `run -d` | run detached (background) | `vmon run -d --name web nginx` |
 | `shell` | drop into an ephemeral interactive shell (attach a running VM, warm-boot a snapshot, or boot a fresh image) | `vmon shell` · `vmon shell web` · `vmon shell --image alpine` |
-| `exec` | run a command in a running microVM (`-t` for an interactive PTY) | `vmon exec web sh -lc 'echo hi'` |
+| `exec` | run a command in a running microVM (`-t` for a PTY, `--pipe` for raw bidirectional stdio) | `vmon exec web sh -lc 'echo hi'` |
+| `gateway` | serve a runner-owned TCP target through an opted-in sandbox's fixed TAP gateway | `vmon gateway web --to http://127.0.0.1:4000` |
 | `cp` | copy files host↔guest | `vmon cp web:/etc/os-release ./` |
 | `ls` | list files in a microVM's guest filesystem (`<name>[:<path>]`) | `vmon ls web:/etc` |
 | `ps` | list microVMs | `vmon ps` |
@@ -163,6 +164,8 @@ hypervisor host (an Apple-silicon Mac with HVF, or Linux with `/dev/kvm`).
 
 Useful `run` flags: `--name`, `--mem <MiB>` (default 512), `--cpus` (default 1),
 `--disk-mb` (default 1024), `--timeout <s>` (default 300), `--arch x86_64|aarch64`,
+`--allow-host-gateway` (permit only the fixed host gateway port on this TAP for
+`vmon gateway NAME --to TARGET`),
 and `--block-network` (boot with no NIC; optional — a networked sandbox otherwise
 gets outbound egress via TAP on Linux or user-mode NAT on macOS, and
 `--block-network` also lets `vmon run` skip the root-only TAP setup on Linux).

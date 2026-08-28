@@ -20,6 +20,8 @@ export interface S3MountSpec {
 /** Sandbox creation request accepted by the gRPC create operation. */
 export interface SandboxCreateRequest {
   arch?: string | null;
+  /** Permit only the fixed host gateway TCP port on this sandbox's TAP. */
+  allow_host_gateway?: boolean;
   block_network?: boolean;
   command?: string[] | null;
   context?: string;
