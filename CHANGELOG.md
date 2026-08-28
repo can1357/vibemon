@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## 0.3.1
+
+### Added
+
+- Added `vmon serve` self-hosting of the privileged Linux network broker when it runs with net-admin, removing the separately managed `vmon net-broker` requirement for TAP networking
+
 ## 0.3.0
 
 ### Breaking Changes
@@ -29,7 +35,6 @@ All notable changes to this project are recorded here.
 
 ### Added
 
-- Added `vmon serve` self-hosting of the privileged Linux network broker when it runs with net-admin, removing the separately managed `vmon net-broker` requirement for TAP networking
 - Added raw bidirectional `vmon exec --pipe` with guest workdir, environment, and timeout controls for machine protocols
 - Added a per-sandbox `--allow-host-gateway` TAP rule for runner-owned host proxies without exposing arbitrary host ports
 - Added `vmon gateway NAME --to TARGET` and the bidirectional `HostGateway` API for client-served sandbox host gateways
