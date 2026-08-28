@@ -528,6 +528,7 @@ fn client_served_host_gateway_roundtrip_and_detach() {
 		&server,
 		json!({
 			"allow_host_gateway": true,
+			"block_network": false,
 		}),
 	);
 	let id = sandbox_id(&view);
