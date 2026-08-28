@@ -415,6 +415,54 @@ const tunnels = await sandbox.tunnels();
 </div>
 </div>
 
+## Host gateways
+
+A sandbox created with `allow_host_gateway` can relay its private fixed TAP listener to a TCP target owned by the SDK process. The relay exists only while its handle remains open. Targets accept `host:port`, `:port` for `127.0.0.1`, or an `http(s)://host[:port]` URL. It is unavailable on hosts without the Linux TAP path; see [Security](../platform/security.md#credential-broker).
+
+<div class="sdk-snippets" data-sdk-snippets>
+<div data-sdk-language="python">
+
+`host_gateway()` blocks until the listener is ready. The returned handle is a context manager; `url` is the guest-visible listener URL.
+
+```python
+with sandbox.host_gateway("http://127.0.0.1:8080") as gateway:
+    print(gateway.url)
+    # Run guest work that connects to gateway.url here.
+```
+
+</div>
+<div data-sdk-language="go">
+
+`HostGateway` returns after the listener is ready. Close the handle to remove the private listener and its runner-side connections.
+
+```go
+gateway, err := sandbox.HostGateway(ctx, "http://127.0.0.1:8080")
+if err != nil {
+    return err
+}
+defer gateway.Close()
+fmt.Println(gateway.URL)
+```
+
+</div>
+<div data-sdk-language="typescript">
+
+`hostGateway()` resolves after the listener is ready. Close the handle when guest work no longer needs the runner-side target.
+
+```ts
+const gateway = await sandbox.hostGateway("http://127.0.0.1:8080");
+try {
+  console.log(gateway.url);
+  // Run guest work that connects to gateway.url here.
+} finally {
+  gateway.close();
+  await gateway.closed;
+}
+```
+
+</div>
+</div>
+
 ## Metrics, logs, and console access
 
 Metrics are snapshots of daemon-reported runtime data. Log and console streaming capabilities differ by SDK; close live streams when they are no longer needed.
