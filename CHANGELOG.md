@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- Fixed the /30 lease allocator re-issuing subnet blocks still claimed by crash-orphaned TAP interfaces, which black-holed guest return traffic
+
 ## 0.3.1
 
 ### Added

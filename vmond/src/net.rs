@@ -1363,11 +1363,25 @@ impl LeaseAllocator {
 		name: &str,
 		dns: &[&str],
 		tap: Option<&str>,
+		claimed: &BTreeSet<u32>,
 	) -> Result<(GuestConfig, bool)> {
 		if let Some(entry) = self.leases.get(name) {
 			return Ok((config_from_entry(name, entry, dns)?, false));
 		}
-		let Some(base) = self.free.pop_first() else {
+		let mut base = None;
+		let mut skipped = Vec::new();
+		while let Some(candidate) = self.free.pop_first() {
+			if claimed.contains(&candidate) {
+				skipped.push(candidate);
+				continue;
+			}
+			base = Some(candidate);
+			break;
+		}
+		for candidate in skipped {
+			self.free.insert(candidate);
+		}
+		let Some(base) = base else {
 			return Err(EngineError::engine(format!(
 				"no free /30 networks left in {POOL_BASE}/{POOL_PREFIX}"
 			)));
@@ -1405,6 +1419,44 @@ fn lease_network_base(network: &str) -> Option<u32> {
 		CidrNet::V4 { network, prefix: LEASE_PREFIX } => Some(u32::from(network)),
 		_ => None,
 	}
+}
+/// The /30 bases inside the lease pool currently claimed by host interface
+/// addresses. A crashed VMM leaves its TAP (and subnet claim) behind while a
+/// fresh journal knows nothing about it; re-issuing such a block would give
+/// two interfaces the same host address and break guest return routing.
+#[cfg(target_os = "linux")]
+fn host_claimed_lease_bases() -> BTreeSet<u32> {
+	let mut claimed = BTreeSet::new();
+	let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+	// SAFETY: getifaddrs allocates a linked list that is walked read-only and
+	// released with freeifaddrs before returning.
+	unsafe {
+		if libc::getifaddrs(&raw mut list) != 0 {
+			return claimed;
+		}
+		let mut cursor = list;
+		while !cursor.is_null() {
+			let entry = &*cursor;
+			cursor = entry.ifa_next;
+			let addr = entry.ifa_addr;
+			if addr.is_null() || (*addr).sa_family != libc::AF_INET as libc::sa_family_t {
+				continue;
+			}
+			let ip = u32::from_be((*addr.cast::<libc::sockaddr_in>()).sin_addr.s_addr);
+			let pool = u32::from(POOL_BASE);
+			if ip >= pool && ip - pool < POOL_SIZE {
+				claimed.insert(ip & !(LEASE_STEP - 1));
+			}
+		}
+		libc::freeifaddrs(list);
+	}
+	claimed
+}
+
+/// Non-Linux hosts have no TAP leases to collide with.
+#[cfg(not(target_os = "linux"))]
+const fn host_claimed_lease_bases() -> BTreeSet<u32> {
+	BTreeSet::new()
 }
 
 enum JournalMsg {
@@ -1456,9 +1508,19 @@ impl LeaseStore {
 	}
 
 	fn allocate_with_tap(&self, name: &str, dns: &[&str], tap: Option<&str>) -> Result<GuestConfig> {
+		self.allocate_with_claims(name, dns, tap, &host_claimed_lease_bases())
+	}
+
+	fn allocate_with_claims(
+		&self,
+		name: &str,
+		dns: &[&str],
+		tap: Option<&str>,
+		claimed: &BTreeSet<u32>,
+	) -> Result<GuestConfig> {
 		let state = self.state()?;
 		let mut alloc = state.alloc.lock();
-		let (config, dirty) = alloc.allocate(name, dns, tap)?;
+		let (config, dirty) = alloc.allocate(name, dns, tap, claimed)?;
 		if dirty {
 			let snapshot = alloc.snapshot()?;
 			drop(alloc);
@@ -2543,9 +2605,18 @@ mod tests {
 		let path = dir.path().join("network").join("leases.json");
 		let store = LeaseStore::new(path.clone());
 
-		let alpha = store.allocate("alpha", &DEFAULT_DNS).unwrap();
-		let beta = store.allocate("beta", &DEFAULT_DNS).unwrap();
-		assert_eq!(store.allocate("alpha", &DEFAULT_DNS).unwrap(), alpha);
+		let alpha = store
+			.allocate_with_claims("alpha", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
+		let beta = store
+			.allocate_with_claims("beta", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
+		assert_eq!(
+			store
+				.allocate_with_claims("alpha", &DEFAULT_DNS, None, &BTreeSet::new())
+				.unwrap(),
+			alpha
+		);
 		store.release("beta").unwrap();
 		store.release("beta").unwrap(); // releasing twice is a no-op
 		store.flush().unwrap();
@@ -2556,14 +2627,50 @@ mod tests {
 		assert!(!reloaded.leases.contains_key("beta"));
 
 		// Idempotent re-allocate: alpha keeps its block across the reload.
-		let (alpha_again, dirty) = reloaded.allocate("alpha", &DEFAULT_DNS, None).unwrap();
+		let (alpha_again, dirty) = reloaded
+			.allocate("alpha", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
 		assert!(!dirty);
 		assert_eq!(alpha_again, alpha);
 
 		// Beta's freed block is the lowest available again.
-		let (gamma, dirty) = reloaded.allocate("gamma", &DEFAULT_DNS, None).unwrap();
+		let (gamma, dirty) = reloaded
+			.allocate("gamma", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
 		assert!(dirty);
 		assert_eq!(gamma.network, beta.network);
+	}
+	#[test]
+	fn allocator_skips_blocks_claimed_by_host_interfaces() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("network").join("leases.json");
+		let mut alloc = LeaseAllocator::load(&path).unwrap();
+
+		// A crash-orphaned TAP still claims the first /30; allocation must
+		// jump over it instead of double-assigning 172.20.0.1.
+		let claimed = BTreeSet::from([u32::from(Ipv4Addr::new(172, 20, 0, 0))]);
+		let (config, dirty) = alloc
+			.allocate("alpha", &DEFAULT_DNS, None, &claimed)
+			.unwrap();
+		assert!(dirty);
+		assert_eq!(config.network, "172.20.0.4/30");
+
+		// The skipped block stays free: once the orphan is gone it is the
+		// lowest available again.
+		let (config, _) = alloc
+			.allocate("beta", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
+		assert_eq!(config.network, "172.20.0.0/30");
+
+		// Exhaustion still reports cleanly when every block is claimed.
+		let all = (0..POOL_SIZE)
+			.step_by(LEASE_STEP as usize)
+			.map(|offset| u32::from(POOL_BASE) + offset)
+			.collect::<BTreeSet<u32>>();
+		let err = alloc
+			.allocate("gamma", &DEFAULT_DNS, None, &all)
+			.expect_err("every block claimed");
+		assert!(err.message.contains("no free /30 networks"));
 	}
 
 	#[test]
@@ -2571,16 +2678,25 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let store = LeaseStore::new(dir.path().join("network").join("leases.json"));
 
-		let first = store.allocate("alpha", &DEFAULT_DNS).unwrap();
+		let first = store
+			.allocate_with_claims("alpha", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
 		assert_eq!(first.network, "172.20.0.0/30");
 		assert_eq!(first.host_ip, "172.20.0.1");
 		assert_eq!(first.guest_ip, "172.20.0.2");
 		assert_eq!(first.prefix, 30);
 		assert_eq!(first.tap, tap_name("alpha"));
 
-		let second = store.allocate("beta", &DEFAULT_DNS).unwrap();
+		let second = store
+			.allocate_with_claims("beta", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
 		assert_eq!(second.network, "172.20.0.4/30");
-		assert_eq!(store.allocate("alpha", &DEFAULT_DNS).unwrap(), first);
+		assert_eq!(
+			store
+				.allocate_with_claims("alpha", &DEFAULT_DNS, None, &BTreeSet::new())
+				.unwrap(),
+			first
+		);
 		assert_eq!(store.lease_for("alpha").as_ref(), Some(&first));
 
 		store.flush().unwrap();
@@ -2591,7 +2707,9 @@ mod tests {
 
 		store.release("alpha").unwrap();
 		assert_eq!(store.lease_for("alpha"), None);
-		let reused = store.allocate("gamma", &DEFAULT_DNS).unwrap();
+		let reused = store
+			.allocate_with_claims("gamma", &DEFAULT_DNS, None, &BTreeSet::new())
+			.unwrap();
 		assert_eq!(reused.network, "172.20.0.0/30");
 		assert_eq!(store.lease_for("beta"), Some(second));
 	}
