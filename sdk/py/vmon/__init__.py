@@ -1,6 +1,6 @@
 """Typed Python SDK for vmon sandboxes and durable functions."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from ._endpoint import WebSocketConnection
 from .app import App, AppBinding, AppManifest, AppRevision, Cron, Period, Schedule

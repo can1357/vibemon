@@ -1,6 +1,6 @@
 [package]
 name = "vmon"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Vibemon — small KVM/HVF-based Linux microVM monitor"
 readme = "README.md"
