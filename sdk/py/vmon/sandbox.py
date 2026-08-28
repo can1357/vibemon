@@ -24,6 +24,7 @@ from ._endpoint import (
 )
 from .driver import response_endpoint
 from .errors import APIError, ProtocolError
+from .host_gateway import HostGateway
 from .process import (
     ConsoleStream,
     LogStream,
@@ -686,6 +687,20 @@ class Sandbox:
         )
         return ConsoleStream(responses, self._endpoint)
 
+    def host_gateway(self, target: str) -> HostGateway:
+        """Relay the sandbox's private host gateway to a runner-owned TCP target."""
+
+        def starter(
+            inputs: Iterable[api_pb2.HostGatewayInput],
+        ) -> tuple[Any, str | None]:
+            responses = self._rpc(
+                lambda stubs: stubs.sandbox.HostGateway(inputs),
+                stream=True,
+            )
+            return responses, self._endpoint
+
+        return HostGateway(starter, self.id, target)
+
     @overload
     def logs(self, follow: Literal[False] = False) -> str: ...
 
@@ -1192,6 +1207,10 @@ class _AsyncSandbox:
 
     async def attach(self) -> ConsoleStream:
         return await asyncio.to_thread(self._sandbox.attach)
+
+    async def host_gateway(self, target: str) -> HostGateway:
+        """Relay the private host gateway without blocking the event loop during setup."""
+        return await asyncio.to_thread(self._sandbox.host_gateway, target)
 
     async def logs(self, follow: bool = False) -> str | LogStream:
         if follow:

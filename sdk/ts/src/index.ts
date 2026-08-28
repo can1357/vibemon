@@ -58,6 +58,7 @@ export {
   type FunctionValueAdapter,
   RemoteFunction,
 } from "./functions";
+export type { HostGateway } from "./host-gateway";
 export type {
   EventRecord,
   ExecExit,

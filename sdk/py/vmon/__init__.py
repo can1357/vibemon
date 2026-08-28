@@ -23,6 +23,7 @@ from .decorators import CurrentCall, batched, concurrent, current_call
 from .driver import Driver, MeshDriver, parse_dsn
 from .errors import ActorLostError, APIError, ProtocolError, RemoteFunctionError, TransportError
 from .freestyle import Freestyle, freestyle
+from .host_gateway import HostGateway
 from .image import Image, ImageError, ImageSource, ImageStep
 from .models import (
     EventRecord,
@@ -140,6 +141,7 @@ __all__ = [
     "GeneratorRemoteFunction",
     "HighAvailabilityPolicy",
     "Health",
+    "HostGateway",
     "Image",
     "ImageError",
     "ImageSource",

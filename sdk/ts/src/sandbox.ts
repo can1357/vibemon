@@ -12,6 +12,8 @@ import type { Client } from "./client";
 import type { DriverRequestOptions, DriverResponse, RpcStream } from "./driver";
 import { APIError, apiError, ProtocolError, parseResponseJson } from "./errors";
 import { SandboxService } from "./gen/vmon/v1/api_pb";
+import type { HostGateway } from "./host-gateway";
+import { openHostGateway } from "./host-gateway";
 import type {
   ExecRequest,
   ExecResult,
@@ -126,6 +128,12 @@ export class Sandbox {
         },
       },
       { onStdout, onStderr },
+    );
+  }
+  /** Relay the sandbox-private host gateway to a runner-owned TCP target. */
+  async hostGateway(target: string): Promise<HostGateway> {
+    return openHostGateway(this.id, target, (inputs) =>
+      channelFor(this).duplex(SandboxService.method.hostGateway, inputs),
     );
   }
   /** Open a server-persistent PTY session. */
